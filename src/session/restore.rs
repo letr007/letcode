@@ -82,18 +82,25 @@ pub fn prepare_resume_package(
     sessions_dir: impl AsRef<Path>,
     session_id: impl Into<String>,
 ) -> Result<PreparedResume> {
-    use crate::session::lifecycle::{load_session_records, open_resume_transcript};
+    use crate::session::lifecycle::{
+        load_session_records_with_fingerprint, open_resume_transcript_with_records_at_fingerprint,
+    };
 
     let sessions_dir = sessions_dir.as_ref();
     let session_id = session_id.into();
-    let records = load_session_records(sessions_dir, &session_id)?;
+    let (records, fingerprint) = load_session_records_with_fingerprint(sessions_dir, &session_id)?;
     let snapshot = project_runtime_restore_snapshot_with_children(
         session_id.clone(),
         records.clone(),
         default_resume_cursor(),
         sessions_dir,
     )?;
-    let mut recorder = open_resume_transcript(sessions_dir, &session_id)?;
+    let mut recorder = open_resume_transcript_with_records_at_fingerprint(
+        sessions_dir,
+        &session_id,
+        &records,
+        &fingerprint,
+    )?;
     recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
     Ok(PreparedResume {
         session_id,

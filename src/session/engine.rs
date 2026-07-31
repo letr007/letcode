@@ -1510,9 +1510,11 @@ async fn run_engine_loop<C>(
                     }
                     SessionEngineCommand::ResumeSession(prefix) => {
                         if subagent_runtime.is_running() {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                                "Wait for the active subagent to finish before resuming another session",
-                            )));
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(
+                                    "Wait for the active subagent to finish before resuming another session",
+                                ),
+                            ));
                             continue;
                         }
 

@@ -318,6 +318,7 @@ pub struct TuiRuntime {
     queued_prompts: VecDeque<UserMessageSubmission>,
     queued_prompt_lifecycle: QueuedPromptLifecycle,
     session_turn_active: bool,
+    session_resume_pending: bool,
     current_turn_output_tokens: u64,
     history_selection: Option<usize>,
     history_draft: Option<ComposerDraft>,
@@ -349,6 +350,7 @@ impl TuiRuntime {
             queued_prompts: VecDeque::new(),
             queued_prompt_lifecycle: QueuedPromptLifecycle::default(),
             session_turn_active: false,
+            session_resume_pending: false,
             current_turn_output_tokens: 0,
             history_selection: None,
             history_draft: None,
@@ -653,7 +655,7 @@ impl TuiRuntime {
 
     fn handle_session_event_stream_closed(&mut self) {
         self.flush_assistant_delta_buffer();
-        if self.has_active_or_pending_session_turn() {
+        if self.has_active_or_pending_session_turn() || self.session_resume_pending {
             self.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
                 "TUI session event stream closed unexpectedly",
             )));
@@ -847,6 +849,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::Error(_) => {
                 self.interrupt_confirmation_pending = false;
+                self.session_resume_pending = false;
                 self.queued_prompt_lifecycle.record_error();
             }
             SessionTransportEvent::FastModeChanged { enabled } => {
@@ -949,12 +952,14 @@ impl TuiRuntime {
                         runtime_context.clone(),
                     )
                 {
+                    self.session_resume_pending = false;
                     self.state.show_toast(
                         format!("Context projection failed: {error}"),
                         ToastKind::Error,
                     );
                     return;
                 }
+                self.session_resume_pending = false;
                 self.state.session_id = Some(session_id.clone());
                 self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear_if_parent();
@@ -1886,9 +1891,13 @@ impl TuiRuntime {
             SessionCommand::NavigateHistory { target_entry_id } => Ok(Some(
                 SubmittedCommand::Runtime(RuntimeCommand::NavigateHistory { target_entry_id }),
             )),
-            SessionCommand::ResumeSession(session_id) => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ResumeSession(session_id),
-            ))),
+            SessionCommand::ResumeSession(session_id) => {
+                self.session_resume_pending = true;
+                self.state.show_toast("Resuming session", ToastKind::Info);
+                Ok(Some(SubmittedCommand::Runtime(
+                    RuntimeCommand::ResumeSession(session_id),
+                )))
+            }
             SessionCommand::NewSession => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
@@ -8027,6 +8036,15 @@ mod tests {
             command,
             Some(RuntimeCommand::ResumeSession("abc123".into()))
         );
+        assert!(runtime.session_resume_pending);
+        assert_eq!(
+            runtime
+                .state()
+                .toast
+                .as_ref()
+                .map(|toast| toast.message.as_str()),
+            Some("Resuming session")
+        );
         assert!(runtime.state().input_buffer.is_empty());
     }
 
@@ -8311,6 +8329,7 @@ mod tests {
     #[test]
     fn session_resumed_event_replaces_timeline_not_appends() {
         let mut runtime = runtime();
+        runtime.session_resume_pending = true;
         runtime
             .state_mut()
             .timeline
@@ -8344,6 +8363,54 @@ mod tests {
         ));
 
         assert!(runtime.state().active_session);
+        assert!(!runtime.session_resume_pending);
+    }
+
+    #[test]
+    fn session_error_clears_pending_idle_resume() {
+        let mut runtime = runtime();
+        runtime.session_resume_pending = true;
+
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+            "resume failed",
+        )));
+
+        assert!(!runtime.session_resume_pending);
+        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
+            item,
+            TimelineItem::Error(error) if error.message == "resume failed"
+        )));
+    }
+
+    #[test]
+    fn session_resume_projection_failure_clears_pending_and_reports_error() {
+        let mut runtime = runtime();
+        runtime.session_resume_pending = true;
+
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
+            session_id: "session-1".into(),
+            branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+            messages: Vec::new(),
+            records: vec![TranscriptRecord {
+                session_id: "different-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: "old prompt".into(),
+                },
+            }],
+            evidence_count: 0,
+            model_id: None,
+            token_usage: None,
+            runtime_context: event_context("session-1", 1),
+        });
+
+        assert!(!runtime.session_resume_pending);
+        assert!(runtime.state().toast.as_ref().is_some_and(|toast| {
+            toast.kind == ToastKind::Error
+                && toast.message.starts_with("Context projection failed:")
+        }));
     }
 
     #[test]
@@ -11532,6 +11599,29 @@ mod tests {
         runtime.try_drain_session_events();
 
         assert!(!runtime.session_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
+            item,
+            TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
+        )));
+    }
+
+    #[test]
+    fn closed_session_transport_event_stream_reports_pending_idle_resume() {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            event_rx,
+            vec![AvailableModel::new("m1", "M1")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.session_resume_pending = true;
+        drop(event_tx);
+
+        runtime.try_drain_session_events();
+
+        assert!(!runtime.session_resume_pending);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
         assert!(runtime.state().timeline.items().iter().any(|item| matches!(
             item,

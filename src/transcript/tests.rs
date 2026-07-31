@@ -377,6 +377,11 @@ fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() 
         .unwrap();
     assert!(read_records(&path).is_err());
     fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let records = read_records(&path).unwrap();
+    assert!(
+        TranscriptRecorder::open_existing_with_records(&base_dir, recorder.session_id(), &records,)
+            .is_err()
+    );
     assert!(TranscriptRecorder::open_existing(&base_dir, recorder.session_id()).is_err());
 }
 
@@ -831,6 +836,109 @@ fn write_summary_still_restores_legacy_write_observed_state() {
             .active_experiment
             .as_ref()
             .is_some_and(|experiment| experiment.writes_observed)
+    );
+}
+
+#[test]
+fn open_existing_with_records_preserves_sequence_and_context_scope() {
+    let base_dir = journal_test_dir("open-with-records");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .append_metadata(TranscriptEvent::ContextExperimentStarted {
+            branch_id: "branch-1".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 0,
+        })
+        .expect("start experiment");
+    recorder.set_current_context_branch_id(Some("branch-1".into()));
+    recorder
+        .record_tool_execution_summary(ToolExecutionSummaryEvent {
+            turn_id: 1,
+            call_id: "call-write".into(),
+            name: "fs__write".into(),
+            status: "executed".into(),
+            rejection: None,
+            effect_kind: "write".into(),
+            primary_path: Some("src/lib.rs".into()),
+            command: None,
+        })
+        .expect("record write");
+    let session_id = recorder.session_id().to_string();
+    let path = recorder.path().to_path_buf();
+    let records = read_records(&path).expect("load records");
+    drop(recorder);
+
+    let mut reopened =
+        TranscriptRecorder::open_existing_with_records(&base_dir, &session_id, &records)
+            .expect("open using records");
+    assert_eq!(
+        reopened.active_context_experiment(),
+        Some(ActiveContextExperiment {
+            branch_id: "branch-1".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 0,
+            writes_observed: true,
+        })
+    );
+    reopened
+        .record_user_message("continued")
+        .expect("append after records-backed open");
+
+    assert_eq!(
+        read_records(path)
+            .expect("read appended records")
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn open_existing_with_records_rejects_mismatched_session_records() {
+    let base_dir = journal_test_dir("open-with-records-session-mismatch");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_user_message("message")
+        .expect("record message");
+    let session_id = recorder.session_id().to_string();
+    let mut records = read_records(recorder.path()).expect("load records");
+    records[0].session_id = "other-session".into();
+    drop(recorder);
+
+    let result = TranscriptRecorder::open_existing_with_records(&base_dir, &session_id, &records);
+    assert!(result.is_err());
+    let error = result.err().expect("mismatched records must be rejected");
+    assert!(error.to_string().contains("different session"));
+}
+
+#[test]
+fn open_existing_with_records_rejects_stale_committed_frontier() {
+    let base_dir = journal_test_dir("open-with-records-stale-frontier");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_user_message("loaded")
+        .expect("record loaded message");
+    let session_id = recorder.session_id().to_string();
+    let (records, fingerprint) =
+        read_records_with_fingerprint(recorder.path()).expect("load records");
+    recorder
+        .record_assistant_message("appended later")
+        .expect("append after load");
+    drop(recorder);
+
+    let result = TranscriptRecorder::open_existing_with_records_at_fingerprint(
+        &base_dir,
+        &session_id,
+        &records,
+        &fingerprint,
+    );
+    assert!(result.is_err());
+    let error = result.err().expect("stale records must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("changed after records were loaded")
     );
 }
 

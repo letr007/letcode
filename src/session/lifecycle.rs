@@ -18,8 +18,9 @@ use crate::session::context_scope::{apply_prepared_context_scope, prepare_contex
 use crate::session::restore::project_runtime_restore_snapshot_with_children;
 use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
 use crate::transcript::{
-    ROOT_CONTEXT_BRANCH_ID, TranscriptRecord, TranscriptRecorder, list_sessions, read_records,
-    remove_empty_session_file, resolve_session_id,
+    ROOT_CONTEXT_BRANCH_ID, TranscriptFileFingerprint, TranscriptRecord, TranscriptRecorder,
+    list_sessions, read_records, read_records_with_fingerprint, remove_empty_session_file,
+    resolve_session_id,
 };
 
 /// Create a new on-disk session transcript and record the session-started event.
@@ -231,12 +232,43 @@ pub fn load_session_records(
     read_records(sessions_dir.as_ref().join(format!("{session_id}.jsonl")))
 }
 
+pub(crate) fn load_session_records_with_fingerprint(
+    sessions_dir: impl AsRef<Path>,
+    session_id: &str,
+) -> Result<(Vec<TranscriptRecord>, TranscriptFileFingerprint)> {
+    read_records_with_fingerprint(sessions_dir.as_ref().join(format!("{session_id}.jsonl")))
+}
+
 /// Open an existing session transcript for resume (append-safe open).
 pub fn open_resume_transcript(
     sessions_dir: impl AsRef<Path>,
     session_id: &str,
 ) -> Result<TranscriptRecorder> {
     TranscriptRecorder::open_existing(sessions_dir.as_ref(), session_id)
+}
+
+/// Open an existing session transcript for resume using records already loaded
+/// from that transcript.
+pub fn open_resume_transcript_with_records(
+    sessions_dir: impl AsRef<Path>,
+    session_id: &str,
+    records: &[TranscriptRecord],
+) -> Result<TranscriptRecorder> {
+    TranscriptRecorder::open_existing_with_records(sessions_dir.as_ref(), session_id, records)
+}
+
+pub(crate) fn open_resume_transcript_with_records_at_fingerprint(
+    sessions_dir: impl AsRef<Path>,
+    session_id: &str,
+    records: &[TranscriptRecord],
+    fingerprint: &TranscriptFileFingerprint,
+) -> Result<TranscriptRecorder> {
+    TranscriptRecorder::open_existing_with_records_at_fingerprint(
+        sessions_dir.as_ref(),
+        session_id,
+        records,
+        fingerprint,
+    )
 }
 
 /// After a successful resume/new swap, remove the previous path when it is a

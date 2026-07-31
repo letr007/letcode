@@ -66,6 +66,24 @@ mod tests {
             .any(|item| matches!(item, crate::tui::TimelineItem::Error(error) if error.message == SESSION_ENGINE_UNAVAILABLE_MESSAGE)));
     }
 
+    #[test]
+    fn failed_resume_dispatch_clears_pending_state() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/resume session-1");
+        let command = runtime
+            .handle_input_action(crate::tui::InputAction::Submit)
+            .expect("resume command succeeds")
+            .expect("resume command is dispatched");
+        assert!(runtime.session_resume_pending);
+
+        let (engine, ingress, _egress) = SessionEngine::new();
+        drop(engine);
+        dispatch_command(&mut runtime, command, &ingress, true);
+
+        assert!(!runtime.session_resume_pending);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+    }
+
     #[tokio::test]
     async fn dispatch_ignores_submit_family_for_mouse_path() {
         let mut runtime = runtime();

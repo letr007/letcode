@@ -32,6 +32,12 @@ mod model;
 
 pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptFileFingerprint {
+    content_len: usize,
+    content_digest: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalContinuationSource {
@@ -292,29 +298,98 @@ impl TranscriptRecorder {
     }
 
     pub fn open_existing(base_dir: impl AsRef<Path>, session_id: &str) -> Result<Self> {
-        fs::create_dir_all(base_dir.as_ref())?;
+        let base_dir = base_dir.as_ref();
+        fs::create_dir_all(base_dir)?;
+        let file_path = session_path(base_dir, session_id);
+        let (records, fingerprint) = read_records_with_fingerprint(&file_path)?;
+        Self::open_existing_with_records_at_fingerprint(
+            base_dir,
+            session_id,
+            &records,
+            &fingerprint,
+        )
+    }
 
-        let file_path = session_path(base_dir.as_ref(), session_id);
-        let records = read_records(&file_path)?;
+    /// Open an existing session transcript for append using records already
+    /// loaded from that transcript. The transcript must still match the loaded
+    /// records, otherwise resume fails instead of appending from a stale
+    /// sequence frontier.
+    pub fn open_existing_with_records(
+        base_dir: impl AsRef<Path>,
+        session_id: &str,
+        records: &[TranscriptRecord],
+    ) -> Result<Self> {
+        let base_dir = base_dir.as_ref();
+        fs::create_dir_all(base_dir)?;
+        let file_path = session_path(base_dir, session_id);
+        let content = fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
+        Self::open_existing_with_records_and_content(base_dir, session_id, records, &content)
+    }
+
+    pub(crate) fn open_existing_with_records_at_fingerprint(
+        base_dir: impl AsRef<Path>,
+        session_id: &str,
+        records: &[TranscriptRecord],
+        fingerprint: &TranscriptFileFingerprint,
+    ) -> Result<Self> {
+        let base_dir = base_dir.as_ref();
+        fs::create_dir_all(base_dir)?;
+        let file_path = session_path(base_dir, session_id);
+        let content = fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
         ensure!(
-            !has_uncommitted_transaction_tail(&file_path)?,
+            transcript_file_fingerprint(&content) == *fingerprint,
+            "transcript changed after records were loaded; retry resume"
+        );
+        ensure!(
+            !content_tail_is_uncommitted_transaction(&file_path, &content)?,
+            "transcript has an uncommitted transaction tail and cannot safely accept new records"
+        );
+        Self::open_existing_with_validated_records(base_dir, session_id, records)
+    }
+
+    fn open_existing_with_records_and_content(
+        base_dir: &Path,
+        session_id: &str,
+        records: &[TranscriptRecord],
+        content: &str,
+    ) -> Result<Self> {
+        let file_path = session_path(base_dir, session_id);
+        ensure!(
+            !content_tail_is_uncommitted_transaction(&file_path, content)?,
             "transcript has an uncommitted transaction tail and cannot safely accept new records"
         );
         ensure!(
             records.iter().all(|record| record.session_id == session_id),
             "transcript contains records for a different session"
         );
+        let current_records = parse_records_content(&file_path, content, false)?;
+        ensure!(
+            transcript_records_match(&current_records, records)?,
+            "transcript changed after records were loaded; retry resume"
+        );
+        Self::open_existing_with_validated_records(base_dir, session_id, records)
+    }
+
+    fn open_existing_with_validated_records(
+        base_dir: &Path,
+        session_id: &str,
+        records: &[TranscriptRecord],
+    ) -> Result<Self> {
+        ensure!(
+            records.iter().all(|record| record.session_id == session_id),
+            "transcript contains records for a different session"
+        );
+        let file_path = session_path(base_dir, session_id);
         let sequence = records
             .iter()
             .map(|record| record.sequence)
             .max()
             .unwrap_or(0);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
+        let file = OpenOptions::new().append(true).open(&file_path)?;
 
-        let context_scope_state = Arc::new(Mutex::new(reconstruct_context_scope_state(&records)?));
+        let context_scope_state = Arc::new(Mutex::new(reconstruct_context_scope_state(records)?));
 
         Ok(Self {
             session_id: session_id.to_string(),
@@ -1428,6 +1503,27 @@ pub fn read_records(path: impl AsRef<Path>) -> Result<Vec<TranscriptRecord>> {
     read_records_inner(path, false)
 }
 
+pub(crate) fn read_records_with_fingerprint(
+    path: impl AsRef<Path>,
+) -> Result<(Vec<TranscriptRecord>, TranscriptFileFingerprint)> {
+    let path = path.as_ref();
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    let records = parse_records_content(path, &content, false)?;
+    Ok((records, transcript_file_fingerprint(&content)))
+}
+
+fn transcript_file_fingerprint(content: &str) -> TranscriptFileFingerprint {
+    TranscriptFileFingerprint {
+        content_len: content.len(),
+        content_digest: journal_payload_digest(content.as_bytes()),
+    }
+}
+
+fn content_tail_is_uncommitted_transaction(path: &Path, content: &str) -> Result<bool> {
+    Ok(scan_transcript_content(path, content)?.has_uncommitted_transaction_tail)
+}
+
 pub(crate) fn read_records_allow_partial_tail(
     path: impl AsRef<Path>,
 ) -> Result<Vec<TranscriptRecord>> {
@@ -1441,6 +1537,14 @@ fn read_records_inner(
     let path = path.as_ref();
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    parse_records_content(path, &content, allow_partial_tail)
+}
+
+fn parse_records_content(
+    path: &Path,
+    content: &str,
+    allow_partial_tail: bool,
+) -> Result<Vec<TranscriptRecord>> {
     let has_complete_tail = content.ends_with('\n');
     let mut last_non_empty_line = None;
     for (index, line) in content.lines().enumerate() {
@@ -1584,10 +1688,28 @@ fn read_records_inner(
     Ok(records.into_iter().map(|entry| entry.record).collect())
 }
 
-fn has_uncommitted_transaction_tail(path: &Path) -> Result<bool> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read transcript {}", path.display()))?;
-    let mut pending = false;
+fn transcript_records_match(
+    current: &[TranscriptRecord],
+    expected: &[TranscriptRecord],
+) -> Result<bool> {
+    if current.len() != expected.len() {
+        return Ok(false);
+    }
+    for (current, expected) in current.iter().zip(expected) {
+        if serde_json::to_vec(current)? != serde_json::to_vec(expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+struct TranscriptContentState {
+    has_uncommitted_transaction_tail: bool,
+}
+
+fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptContentState> {
+    let mut pending_transaction: Option<PendingTransaction> = None;
+
     for (index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -1600,27 +1722,99 @@ fn has_uncommitted_transaction_tail(path: &Path) -> Result<bool> {
             )
         })? {
             ParsedJournalLine::Record(entry) => match transaction_fields(&entry.v1)? {
-                Some(_) => {
+                Some((transaction_id, transaction_index, transaction_count)) => {
                     ensure!(
-                        !pending
-                            || entry
-                                .v1
-                                .as_ref()
-                                .and_then(|record| record.transaction_index)
-                                != Some(0),
+                        transaction_count > 0,
+                        "transcript transaction count must be positive"
+                    );
+                    let pending = pending_transaction.get_or_insert_with(|| PendingTransaction {
+                        transaction_id: transaction_id.clone(),
+                        transaction_count,
+                        base_revision: entry.v1.as_ref().unwrap().base_revision,
+                        payload: Vec::new(),
+                        entries: Vec::new(),
+                    });
+                    ensure!(
+                        pending.transaction_id == transaction_id,
                         "transcript transaction is interrupted by a different transaction"
                     );
-                    pending = true;
+                    ensure!(
+                        pending.transaction_count == transaction_count,
+                        "transcript transaction count changes mid-transaction"
+                    );
+                    ensure!(
+                        transaction_index == pending.entries.len(),
+                        "transcript transaction records are not contiguous"
+                    );
+                    ensure!(
+                        transaction_index < transaction_count,
+                        "transcript transaction index exceeds its count"
+                    );
+                    pending
+                        .payload
+                        .extend(serialize_journal_record(entry.v1.as_ref().unwrap())?);
+                    pending.payload.push(b'\n');
+                    pending.entries.push(entry);
                 }
                 None => ensure!(
-                    !pending,
+                    pending_transaction.is_none(),
                     "transcript transaction is missing its commit marker before another record"
                 ),
             },
-            ParsedJournalLine::Commit(_) => pending = false,
+            ParsedJournalLine::Commit(commit) => {
+                let pending = pending_transaction
+                    .take()
+                    .ok_or_else(|| anyhow!("transcript transaction commit has no records"))?;
+                ensure!(
+                    commit.schema_version == JOURNAL_SCHEMA_VERSION,
+                    "unsupported transcript journal schema version {}",
+                    commit.schema_version
+                );
+                ensure!(
+                    commit.journal_entry == JOURNAL_TRANSACTION_COMMIT,
+                    "unknown transcript journal entry '{}'",
+                    commit.journal_entry
+                );
+                ensure!(
+                    commit.transaction_id == pending.transaction_id,
+                    "transcript transaction commit id does not match records"
+                );
+                ensure!(
+                    commit.transaction_count == pending.transaction_count
+                        && pending.entries.len() == pending.transaction_count,
+                    "transcript transaction commit count does not match records"
+                );
+                ensure!(
+                    commit.base_revision == pending.base_revision,
+                    "transcript transaction commit base revision does not match records"
+                );
+                let last_payload_revision = pending
+                    .entries
+                    .last()
+                    .and_then(|entry| entry.v1.as_ref())
+                    .ok_or_else(|| anyhow!("transcript transaction commit has no payload records"))?
+                    .resulting_revision;
+                ensure!(
+                    commit.resulting_revision == last_payload_revision,
+                    "transcript transaction commit resulting revision does not match payload records"
+                );
+                ensure!(
+                    commit.resulting_revision
+                        == commit.base_revision + u64::try_from(commit.transaction_count).unwrap(),
+                    "transcript transaction commit revision does not match count"
+                );
+                ensure!(
+                    commit.payload_length == pending.payload.len()
+                        && commit.payload_digest == journal_payload_digest(&pending.payload),
+                    "transcript transaction commit payload does not match records"
+                );
+            }
         }
     }
-    Ok(pending)
+
+    Ok(TranscriptContentState {
+        has_uncommitted_transaction_tail: pending_transaction.is_some(),
+    })
 }
 
 #[derive(Debug)]
