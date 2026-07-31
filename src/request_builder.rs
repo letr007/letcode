@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(test)]
 #[path = "request_builder/context_view_adapter.rs"]
 mod context_view_adapter;
 #[path = "request_builder/history_budget.rs"]
@@ -12,18 +13,23 @@ mod provider_serialization;
 #[path = "request_builder/runtime_projection.rs"]
 mod runtime_projection;
 use crate::config::{ApiProtocol, PromptCacheConfig, PromptCacheRetention};
+#[cfg(test)]
 use crate::context_view::ContextViewProjection;
+#[cfg(test)]
+use crate::protocol_frames::ProtocolFrameItem;
 use crate::protocol_frames::{
-    ProtocolFrame, ProtocolFrameItem, history_items_from_frames, validate_history_items_complete,
+    ProtocolFrame, history_items_from_frames, validate_history_items_complete,
 };
 pub use crate::protocol_frames::{
     ProtocolItem as HistoryItem, ProtocolToolCall as HistoryToolCall,
 };
 #[cfg(test)]
+use crate::runtime_context::RuntimeFrameKind;
+#[cfg(test)]
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrame, RuntimeFrameProvenance, RuntimeSource,
 };
-use crate::runtime_context::{PromptContributorKind, RuntimeFrameKind, RuntimeSnapshot};
+use crate::runtime_context::{PromptContributorKind, RuntimeSnapshot};
 #[cfg(test)]
 use crate::user_content::{UserImageAttachment, UserMessageContent};
 #[cfg(test)]
@@ -452,7 +458,6 @@ pub(crate) enum LogicalRequestUnitCategory {
     ToolCall,
     ToolOutput,
     Evidence,
-    Unknown,
 }
 
 /// The first non-shared boundary between two comparable provider requests.
@@ -482,7 +487,6 @@ impl LogicalRequestUnitCategory {
             Self::ToolCall => "tool_call",
             Self::ToolOutput => "tool_output",
             Self::Evidence => "evidence",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -667,6 +671,7 @@ fn effective_input_budget_tokens_for_tool_tokens(
     capped_input_budget.saturating_sub(tools_tokens).max(1)
 }
 
+#[cfg(test)]
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     build_request_with_policy(input, None, None)
 }
@@ -679,6 +684,7 @@ pub(crate) fn build_request_with_policy(
     build_request_with_frozen_and_policy(input, frozen_evidence, policy)
 }
 
+#[cfg(test)]
 pub(crate) fn build_request_with_frozen(
     input: RequestBuilderInput<'_>,
     frozen_evidence: Option<&FrozenEvidence>,
@@ -772,6 +778,7 @@ pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<B
     })
 }
 
+#[cfg(test)]
 fn runtime_frame_kind(item: &ProtocolFrameItem) -> RuntimeFrameKind {
     match item {
         ProtocolFrameItem::ContextSummary { .. } => RuntimeFrameKind::Summary,
@@ -912,6 +919,7 @@ pub(crate) fn rebuild_request_from_plan(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn context_view_history_adapter(
     context_view: &ContextViewProjection,
     history: &[HistoryItem],
@@ -940,6 +948,7 @@ fn protected_start_index_for_snapshot(
     runtime_projection::protected_start_index_for_snapshot(snapshot, frames)
 }
 
+#[cfg(test)]
 fn assemble_context_view_sections(
     context_view: &ContextViewProjection,
     history: &[HistoryItem],
@@ -1066,6 +1075,7 @@ fn prompt_cache_report(
 
 /// Provider-visible cache identity. Values are serialized through the same
 /// protocol conversion helpers used to construct the final request.
+#[cfg(test)]
 pub(crate) fn canonical_cache_input(
     namespace: &str,
     protocol: ApiProtocol,
@@ -1086,6 +1096,7 @@ pub(crate) fn canonical_cache_input(
     )
 }
 
+#[cfg(test)]
 fn canonical_bytes(value: &Value) -> Vec<u8> {
     prompt_cache::canonical_bytes(value)
 }

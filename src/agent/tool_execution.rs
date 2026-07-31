@@ -893,7 +893,7 @@ where
         })
         .await?;
 
-        let mut output = if is_subagent_tool_name(&call.name) {
+        let output = if is_subagent_tool_name(&call.name) {
             agent
                 .execute_subagent_tool_for_call(&call.name, &args, Some(call.call_id.clone()))
                 .await

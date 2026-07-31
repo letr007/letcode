@@ -1070,17 +1070,6 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String
     }
 }
 
-fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<session::PreparedContextScope> {
-    session::prepare_context_scope(recorder)
-}
-
-fn apply_prepared_context_scope<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
-    prepared: session::PreparedContextScope,
-) {
-    session::apply_prepared_context_scope(agent, prepared)
-}
-
 fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
     recorder: &TranscriptRecorder,

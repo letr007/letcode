@@ -4,15 +4,27 @@ use super::{
     collect_branch_path_records, context_scope_revision, resolve_active_branch_id,
     resolve_branch_context, restore_history_projection, runtime_projection_records,
 };
+#[cfg(test)]
 use crate::context_view::{self, ContextBlockKind, ContextBlockSource};
 use crate::protocol_frames::analyze_history_items;
+#[cfg(test)]
 use crate::request_builder::HistoryItem;
+#[cfg(test)]
+use crate::transcript::LogicalCheckpointSourceSpanV1;
+use crate::transcript::{LogicalCheckpointAuditSourceV1, LogicalCheckpointEventV1};
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CheckpointWorkflowProjection {
+    todos: Vec<crate::agent::TodoItem>,
+    auto_continue: crate::agent::AutoContinueState,
+}
 use crate::transcript::{
-    LogicalCheckpointAuditSourceV1, LogicalCheckpointEventV1, LogicalCheckpointSourceSpanV1,
     TranscriptEvent, TranscriptRecord, render_checkpoint_continuation_v1, render_checkpoint_v1,
 };
 use anyhow::{anyhow, ensure};
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 pub(crate) fn validate_logical_checkpoint_candidate(
     session_id: &str,
@@ -335,6 +347,7 @@ pub(crate) fn prepare_logical_checkpoint_candidate(
     Ok(event)
 }
 
+#[cfg(test)]
 fn checkpoint_retained_items(
     journal_records: &[TranscriptRecord],
     scope: &ResolvedBranchContext,
@@ -519,6 +532,7 @@ fn checkpoint_retained_items(
     Ok(items)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(super) struct CoveredCallGroup {
     pub(super) call_id: String,
@@ -529,6 +543,7 @@ pub(super) struct CoveredCallGroup {
 
 /// Builds the exact covered protocol index from assistant declarations and
 /// finished outputs in the closed history closure.
+#[cfg(test)]
 fn covered_call_groups(
     records: &[TranscriptRecord],
     closure: &[LogicalCheckpointSourceSpanV1],
@@ -573,6 +588,7 @@ fn covered_call_groups(
 
 /// Classifies native metadata by the lifecycle segment active when it was
 /// recorded; metadata itself intentionally has no history source span.
+#[cfg(test)]
 fn native_event_segments(records: &[TranscriptRecord]) -> BTreeMap<u64, (u64, u64)> {
     let mut active = None;
     let mut result = BTreeMap::new();
@@ -608,6 +624,7 @@ fn native_event_segments(records: &[TranscriptRecord]) -> BTreeMap<u64, (u64, u6
 
 /// A source fact may name a call only when that identifier resolves
 /// unambiguously to one exact covered declaration and finished output.
+#[cfg(test)]
 pub(super) fn validate_current_fact_provenance<'a>(
     records: &[TranscriptRecord],
     start: u64,
@@ -694,13 +711,14 @@ pub(super) fn validate_current_fact_provenance<'a>(
     Ok(matches[0])
 }
 
+#[cfg(test)]
 fn current_workflow_item(
     records: &[TranscriptRecord],
     groups: &[CoveredCallGroup],
     source_segments: &BTreeMap<u64, (u64, u64)>,
     turn_id: u64,
     segment_id: u64,
-    inherited: Option<crate::transcript::CheckpointWorkflowProjection>,
+    inherited: Option<CheckpointWorkflowProjection>,
 ) -> anyhow::Result<Option<crate::transcript::LogicalCheckpointRetainedItemV1>> {
     let mut workflow = inherited.unwrap_or_default();
     let mut source = None;
@@ -790,20 +808,6 @@ pub(super) fn validate_logical_checkpoint_record(
         record.sequence,
         event,
     )
-}
-
-fn validate_logical_checkpoints(
-    session_id: &str,
-    all_records: &[TranscriptRecord],
-    visible: &[TranscriptRecord],
-) -> anyhow::Result<()> {
-    for record in visible {
-        let TranscriptEvent::LogicalCheckpoint(event) = &record.event else {
-            continue;
-        };
-        validate_logical_checkpoint_record(session_id, all_records, record, event)?;
-    }
-    Ok(())
 }
 
 fn valid_checkpoint_id(id: &str) -> bool {

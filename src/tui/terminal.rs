@@ -112,10 +112,6 @@ impl OwnedTerminal {
         })
     }
 
-    pub fn terminal(&self) -> &TuiTerminal {
-        &self.terminal
-    }
-
     pub fn terminal_mut(&mut self) -> &mut TuiTerminal {
         &mut self.terminal
     }

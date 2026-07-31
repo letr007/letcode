@@ -1,7 +1,9 @@
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+#[cfg(test)]
+use ratatui::text::Line;
 use ratatui::{
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Span,
 };
 use std::sync::OnceLock;
 use syntect::{
@@ -14,7 +16,6 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::tui::{
     measure::display_width,
     theme::Theme,
-    transcript_ratatui,
     transcript_render::{
         Break, CopyJoin, Document, Line as RenderLine, SourceRange, Span as RenderSpan,
     },
@@ -34,12 +35,15 @@ impl MarkdownRenderOptions {
 }
 
 /// Legacy Ratatui bridge. The semantic document is the sole Markdown renderer.
-pub fn render_markdown(
+#[cfg(test)]
+pub(crate) fn render_markdown(
     markdown: &str,
     theme: Theme,
     options: MarkdownRenderOptions,
 ) -> Vec<Line<'static>> {
-    transcript_ratatui::document_to_ratatui(&render_markdown_document(markdown, theme, options))
+    crate::tui::transcript_ratatui::document_to_ratatui(&render_markdown_document(
+        markdown, theme, options,
+    ))
 }
 
 /// Render Markdown directly into renderer-neutral semantic lines. Every visible

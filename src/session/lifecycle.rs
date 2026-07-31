@@ -54,6 +54,7 @@ pub fn replace_live_transcript(
 ///
 /// Does **not** reset the agent or re-apply context scope — callers do that
 /// with their prepare/apply helpers, then optionally remove the old empty file.
+#[cfg(test)]
 pub fn start_new_transcript_session(
     live: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: impl AsRef<Path>,
@@ -225,6 +226,7 @@ pub fn resolve_session_prefix(
 }
 
 /// Load transcript records for an existing session file.
+#[cfg(test)]
 pub fn load_session_records(
     sessions_dir: impl AsRef<Path>,
     session_id: &str,
@@ -240,6 +242,7 @@ pub(crate) fn load_session_records_with_fingerprint(
 }
 
 /// Open an existing session transcript for resume (append-safe open).
+#[cfg(test)]
 pub fn open_resume_transcript(
     sessions_dir: impl AsRef<Path>,
     session_id: &str,
@@ -249,6 +252,7 @@ pub fn open_resume_transcript(
 
 /// Open an existing session transcript for resume using records already loaded
 /// from that transcript.
+#[cfg(test)]
 pub fn open_resume_transcript_with_records(
     sessions_dir: impl AsRef<Path>,
     session_id: &str,

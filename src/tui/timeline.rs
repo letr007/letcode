@@ -5,9 +5,10 @@ use super::events::{
     UserMessageEvent,
 };
 use crate::agent::{
-    AutoContinueState, ConversationMessage, ConversationRole, TodoItem,
-    agent_name_for_subagent_tool, is_subagent_tool_name,
+    AutoContinueState, TodoItem, agent_name_for_subagent_tool, is_subagent_tool_name,
 };
+#[cfg(test)]
+use crate::agent::{ConversationMessage, ConversationRole};
 use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
 
@@ -27,6 +28,7 @@ pub enum TimelineItem {
     Compaction(CompactionView),
 }
 
+#[cfg(test)]
 impl TimelineItem {
     pub fn blocks(&self) -> Vec<DisplayBlock> {
         match self {
@@ -170,6 +172,7 @@ pub struct ContextOpenDetailView {
     pub lines: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayBlock {
     Paragraph {
@@ -204,6 +207,7 @@ pub struct MessageView {
     pub queued: bool,
 }
 
+#[cfg(test)]
 impl MessageView {
     pub fn display_text(&self) -> String {
         if self.attachments.is_empty() {
@@ -261,6 +265,7 @@ pub enum ToolExecutionStatus {
     Failed,
 }
 
+#[cfg(test)]
 impl ToolExecutionStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -273,6 +278,7 @@ impl ToolExecutionStatus {
     }
 }
 
+#[cfg(test)]
 fn is_runtime_context_section(text: &str) -> bool {
     matches!(
         text.lines().next(),
@@ -374,6 +380,7 @@ pub enum PermissionPromptStatus {
     Denied,
 }
 
+#[cfg(test)]
 impl PermissionPromptStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -426,10 +433,12 @@ impl Default for Timeline {
 }
 
 impl Timeline {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn from_conversation(messages: Vec<ConversationMessage>) -> Self {
         let mut timeline = Self::new();
         for message in messages {
@@ -444,9 +453,7 @@ impl Timeline {
                     queued: false,
                 })),
                 ConversationRole::Summary if is_runtime_context_section(&message.content) => {}
-                ConversationRole::Summary => {
-                    timeline.push_restored_compaction(message.content);
-                }
+                ConversationRole::Summary => timeline.push_restored_compaction(message.content),
                 ConversationRole::Assistant => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
@@ -941,23 +948,6 @@ impl Timeline {
         }));
     }
 
-    pub fn active_tool_calls(&self) -> Vec<(String, String)> {
-        self.items
-            .iter()
-            .filter_map(|item| match item {
-                TimelineItem::Tool(tool)
-                    if matches!(
-                        tool.status,
-                        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
-                    ) =>
-                {
-                    Some((tool.call_id.clone(), tool.name.clone()))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     pub fn push_permission_request(&mut self, event: PermissionRequestEvent) {
         self.push_item(TimelineItem::Permission(PermissionView::from_request(
             event,
@@ -1122,6 +1112,7 @@ impl Timeline {
         }
     }
 
+    #[cfg(test)]
     pub fn active_tool(&self) -> Option<&ToolView> {
         self.items.iter().rev().find_map(|item| match item {
             TimelineItem::Tool(tool)

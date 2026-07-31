@@ -381,10 +381,12 @@ impl PermissionPolicy {
         self.mode = mode;
     }
 
+    #[cfg(test)]
     pub fn check(&self, tool: &str, args: &Value) -> PermissionDecision {
         self.check_with_directive(tool, args, ExecutionDirective::None)
     }
 
+    #[cfg(test)]
     pub fn check_with_directive(
         &self,
         tool: &str,
@@ -445,6 +447,7 @@ pub fn is_internal_tool(tool: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn restricted_by_directive(
     tool: &str,
     args: &Value,

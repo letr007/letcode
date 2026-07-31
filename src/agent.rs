@@ -21,9 +21,11 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
+#[cfg(test)]
+use crate::permission::ToolScope;
 use crate::permission::{
     ExecutionDirective, PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
-    PermissionSessionState, ToolScope, restricted_by_directive_with_class,
+    PermissionSessionState, restricted_by_directive_with_class,
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
@@ -80,11 +82,13 @@ pub(crate) use catalog::{
 pub(crate) use catalog::{SubagentCatalogEntry, subagent_catalog_entry_by_agent_name};
 pub use events::{
     AgentEvent, CacheUsageReport, CompactionAttemptOutcome, CompactionBlocker,
-    CompactionCheckpoint, CompactionFileOperations, CompactionNoProgress, CompactionTrigger,
-    ContextCompactionEvent, LlmRequestErrorClass, LlmRequestTelemetry, LlmRequestTelemetryPhase,
-    LlmRetryLifecycle, ManualCompactionOutcome, ProviderUsageCompleteness, TokenUsageEstimate,
-    ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
+    CompactionNoProgress, CompactionTrigger, ContextCompactionEvent, LlmRequestErrorClass,
+    LlmRequestTelemetry, LlmRequestTelemetryPhase, LlmRetryLifecycle, ManualCompactionOutcome,
+    ProviderUsageCompleteness, TokenUsageEstimate, ToolExecutionSummaryEvent, TurnFinalizedEvent,
+    TurnStartedEvent, ValidationAdvisory,
 };
+#[cfg(test)]
+pub(crate) use events::{CompactionCheckpoint, CompactionFileOperations};
 pub use workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 
 #[cfg(test)]
@@ -180,6 +184,7 @@ struct ActiveEpoch {
 struct ActiveEpochPreview {
     epoch: ActiveEpoch,
     build: crate::request_builder::BuildResult,
+    #[cfg(test)]
     transition: ActiveEpochTransition,
 }
 
@@ -404,9 +409,6 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 - 保留并逐字引用重要的路径、命令、错误信息、标识符、接口名、配置键、测试名。
 - 每个 section 均必须存在；无内容写「无」。
 - 不得输出保留标记 `[retained-facts:v1]`。"#;
-const NO_HISTORICAL_ITEMS_FOR_COMPACTION: &str =
-    "no historical items available for context compaction";
-const NO_OLDER_ITEMS_AFTER_TAIL: &str = "no older items remain after preserving recent tail";
 const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
 const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
 const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
@@ -453,6 +455,7 @@ pub struct Agent<C: Config> {
 }
 
 impl AgentFactory {
+    #[cfg(test)]
     pub fn create_child<C: Config + Clone>(
         parent: &Agent<C>,
         template: &AgentTemplate,
@@ -716,6 +719,7 @@ impl<C: Config> Agent<C> {
                 protocol_prefix_digest: protocol_prefix_digest(&self.protocol_frames),
                 observation,
             },
+            #[cfg(test)]
             transition,
         })
     }
@@ -1024,10 +1028,12 @@ impl<C: Config> Agent<C> {
         })
     }
 
+    #[cfg(test)]
     pub fn tool_scope(&self) -> ToolScope {
         self.tools.scope()
     }
 
+    #[cfg(test)]
     pub(crate) fn max_tool_calls_limit(&self) -> Option<usize> {
         self.max_tool_calls
     }
@@ -1108,6 +1114,7 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn restore_session_context(
         &mut self,
         messages: Vec<ConversationMessage>,
@@ -1125,6 +1132,7 @@ impl<C: Config> Agent<C> {
         self.restore_session_history(history, evidence, max_turn_id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn restore_session_history(
         &mut self,
         history: Vec<HistoryItem>,
@@ -1158,6 +1166,7 @@ impl<C: Config> Agent<C> {
     /// Discard all state that belongs to the current session before creating a
     /// new one. Unlike compatibility rebuilds used by restore and checkout,
     /// this deliberately does not preserve runtime snapshot metadata.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset_for_new_session(&mut self) {
         self.protocol_frames.clear();
         self.history.clear();
@@ -1515,6 +1524,7 @@ impl<C: Config> Agent<C> {
     /// Replace the active runtime with the provider's canonical projection.
     /// Unlike refresh, a context scope transition must not retain frames,
     /// contributors, or protocol identity from the outgoing scope.
+    #[cfg(test)]
     fn replace_runtime_snapshot_from_provider(&mut self) -> Result<()> {
         let provider = self.runtime_snapshot_provider.as_ref().ok_or_else(|| {
             anyhow!("successful context scope transition requires a runtime snapshot provider")
@@ -1541,6 +1551,7 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn history_items(&self) -> Vec<HistoryItem> {
         crate::protocol_frames::history_items_from_frames(&self.protocol_frames)
     }
@@ -1558,6 +1569,7 @@ impl<C: Config> Agent<C> {
         self.append_protocol_frame_with_history_item(frame, item)
     }
 
+    #[cfg(test)]
     pub(super) fn replace_history(&mut self, history: Vec<HistoryItem>) -> Result<()> {
         let old_history = self.history.clone();
         let transcript = crate::protocol_frames::analyze_history_items(
@@ -1578,21 +1590,6 @@ impl<C: Config> Agent<C> {
             &mut self.protocol_frames,
             &self.runtime_snapshot,
         );
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
-        Ok(())
-    }
-
-    /// Single mutation gate for history-first compact/prune installs.
-    /// Always invalidates the warm active epoch.
-    pub(crate) fn install_history(
-        &mut self,
-        history: Vec<HistoryItem>,
-        current_turn_start_index: Option<usize>,
-    ) -> Result<()> {
-        self.history = history;
-        self.turn.current_turn_start_index = current_turn_start_index;
-        self.publish_history_to_protocol_mirrors()?;
         self.clear_active_epoch();
         self.clear_provider_usage_anchor();
         Ok(())
@@ -1645,6 +1642,7 @@ impl<C: Config> Agent<C> {
     /// Seed protocol mirrors from a snapshot that was constructed as the
     /// protocol source (tests / restore helpers). Prefer
     /// `publish_history_to_protocol_mirrors` for normal live paths.
+    #[cfg(test)]
     pub(super) fn adopt_snapshot_as_history_seed(&mut self) -> Result<()> {
         self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
         self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
@@ -1660,6 +1658,7 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn append_protocol_frame(
         &mut self,
         frame: crate::protocol_frames::ProtocolFrame,
@@ -2028,6 +2027,7 @@ impl<C: Config> Agent<C> {
         .await
     }
 
+    #[cfg(test)]
     pub async fn run_stream_content_async<F, E, A, Dfut, Efut, Afut>(
         &mut self,
         user_content: UserMessageContent,
@@ -2139,6 +2139,7 @@ impl<C: Config> Agent<C> {
         tool_execution::execute_tool_call(self, call, on_event, approve).await
     }
 
+    #[cfg(test)]
     async fn execute_subagent_tool(&self, tool_name: &str, args: &Value) -> ToolResult {
         self.execute_subagent_tool_for_call(tool_name, args, None)
             .await
@@ -2534,10 +2535,6 @@ impl<C: Config> Agent<C> {
         evidence_memory::remember_tool_evidence(self, record)
     }
 
-    fn next_evidence_sequence(&self) -> u64 {
-        evidence_memory::next_evidence_sequence(self)
-    }
-
     pub async fn run_stream<F, E, A>(
         &mut self,
         user_input: &str,
@@ -2585,6 +2582,7 @@ impl<C: Config> Agent<C> {
         .await
     }
 
+    #[cfg(test)]
     pub async fn compact_session_async<E, Efut>(
         &mut self,
         on_event: E,
@@ -2613,6 +2611,7 @@ impl<C: Config> Agent<C> {
         compaction::compact_session_stream_async(self, on_event, on_start, on_delta).await
     }
 
+    #[cfg(test)]
     async fn run_oai_comp_stream_async<F, E, A, Dfut, Efut, Afut>(
         &mut self,
         user_input: &str,
@@ -2640,11 +2639,13 @@ impl<C: Config> Agent<C> {
         .await
     }
 
+    #[cfg(test)]
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
         self.try_prepare_turn_prelude(user_input)
             .expect("test/internal turn prelude should resolve selected skills")
     }
 
+    #[cfg(test)]
     fn try_prepare_turn_prelude(&mut self, user_input: &str) -> Result<Vec<PromptMessage>> {
         self.try_prepare_turn_prelude_with_skills(user_input, &[])
     }
@@ -3382,43 +3383,6 @@ fn output_edited_paths(output: &ToolResult) -> Vec<String> {
         .collect()
 }
 
-fn required_tool_output_string(output: &ToolResult, field: &str) -> Result<String> {
-    let data = output
-        .data
-        .as_ref()
-        .ok_or_else(|| anyhow!("tool output is missing data"))?;
-    let value = data
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("tool output field '{field}' must be a string"))?;
-    let value = value.trim();
-    ensure!(
-        !value.is_empty(),
-        "tool output field '{field}' must not be empty"
-    );
-    Ok(value.to_string())
-}
-
-fn optional_tool_output_string(output: &ToolResult, field: &str) -> Result<Option<String>> {
-    let Some(data) = output.data.as_ref() else {
-        return Ok(None);
-    };
-    match data.get(field) {
-        Some(Value::String(value)) => {
-            let value = value.trim();
-            ensure!(
-                !value.is_empty(),
-                "tool output field '{field}' must not be empty when provided"
-            );
-            Ok(Some(value.to_string()))
-        }
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(anyhow!(
-            "tool output field '{field}' must be string or null"
-        )),
-    }
-}
-
 fn shell_command_succeeded(output: &ToolResult) -> bool {
     if !output.ok {
         return false;
@@ -3847,21 +3811,6 @@ fn remap_runtime_snapshot_frame_ids(
         if let Some(mapped) = remap.get(id) {
             *id = *mapped;
         }
-    }
-}
-
-fn merge_runtime_provenance(
-    provider: &mut RuntimeFrameProvenance,
-    durable: &RuntimeFrameProvenance,
-) {
-    if provider.source_span.is_none() {
-        provider.source_span = durable.source_span;
-    }
-    if provider.source_id.is_none() {
-        provider.source_id = durable.source_id.clone();
-    }
-    if provider.label.is_none() {
-        provider.label = durable.label.clone();
     }
 }
 
@@ -4328,13 +4277,6 @@ fn capped_tool_call_limit(
     }
 }
 
-fn is_workflow_control_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "workflow__todos" | "workflow__auto_continue" | "agent__reconcile"
-    )
-}
-
 fn is_cancelled_subagent_record(record: &ToolExecutionRecord) -> bool {
     is_subagent_tool_name(&record.tool_name)
         && record
@@ -4690,18 +4632,6 @@ fn compact_indexed_chat_tool_calls(
     tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall>,
 ) -> Vec<ChatCompletionMessageToolCall> {
     tool_calls.into_values().collect()
-}
-
-fn build_tool_call_name_index(history: &[HistoryItem]) -> HashMap<String, String> {
-    let mut call_names = HashMap::new();
-    for item in history {
-        if let HistoryItem::AssistantToolCalls { calls, .. } = item {
-            for call in calls {
-                call_names.insert(call.call_id.clone(), call.name.clone());
-            }
-        }
-    }
-    call_names
 }
 
 async fn emit_tool_call_pending_if_ready<E, Efut>(

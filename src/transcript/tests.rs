@@ -3,6 +3,7 @@ use crate::config::ApiProtocol;
 use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
 use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
 use crate::subagent::StructuredSubagentResult;
+use crate::tool_names;
 use crate::transcript::transcript_projection::{
     SessionContextCursor, project_runtime_restore_snapshot,
 };

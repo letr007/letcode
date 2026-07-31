@@ -43,7 +43,7 @@ pub(super) fn context_view_history_adapter(
         .collect::<BTreeSet<_>>();
     let pinned_blocks = sorted_blocks
         .iter()
-        .filter(|(id, block)| {
+        .filter(|(id, _block)| {
             !context_view.is_compacted(id)
                 && is_pinned_visible(context_view, id)
                 && !protected_ids.contains(id.as_str())

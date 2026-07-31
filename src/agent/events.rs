@@ -98,6 +98,7 @@ impl ContextCompactionEvent {
     }
 
     /// Constructs a legacy index-based event for compatibility callers.
+    #[cfg(test)]
     pub fn checkpointed(
         summary: impl Into<String>,
         tail_start_index: usize,
@@ -488,12 +489,16 @@ impl CacheUsageReport {
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
     ContextCompactionStarted {
+        #[allow(dead_code)]
+        // Event payload retained for consumers that distinguish compaction triggers.
         trigger: CompactionTrigger,
     },
     ContextCompactionNoProgress(CompactionNoProgress),
     /// A technical failure occurred after `ContextCompactionStarted`. Details
     /// remain in the returned `Result`, never in this diagnostic event.
     ContextCompactionFailed {
+        #[allow(dead_code)]
+        // Event payload retained for consumers that distinguish compaction triggers.
         trigger: CompactionTrigger,
     },
     ContextCompactionDelta {

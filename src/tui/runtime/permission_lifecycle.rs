@@ -21,10 +21,7 @@ pub(crate) struct PermissionLifecycleController {
 }
 
 impl PermissionLifecycleController {
-    pub(crate) fn pending(&self) -> Option<&PendingPermission> {
-        self.pending.as_ref()
-    }
-
+    #[cfg(test)]
     pub(crate) fn handle(&self) -> Option<&RunnerPermissionRequest> {
         self.pending
             .as_ref()
@@ -96,6 +93,7 @@ impl PermissionLifecycleController {
             .is_some_and(|pending| pending.is_parent())
     }
 
+    #[cfg(test)]
     pub(crate) fn child_session_id(&self) -> Option<&str> {
         self.pending
             .as_ref()

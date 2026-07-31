@@ -659,6 +659,7 @@ fn validate_compaction_runtime_state<C: Config>(agent: &Agent<C>) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn render_compaction_prompt(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],

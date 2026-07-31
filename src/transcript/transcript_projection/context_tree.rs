@@ -2,6 +2,7 @@ use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 use anyhow::Context;
 
+#[cfg(test)]
 pub(crate) fn project_context_tree(
     records: &[TranscriptRecord],
 ) -> anyhow::Result<ContextTreeState> {

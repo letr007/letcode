@@ -36,7 +36,6 @@ pub enum InputAction {
     ScrollToBottom,
     MouseScrollUp,
     MouseScrollDown,
-    MouseClick,
     MouseSelectionStart(u16, u16),
     MouseSelectionDrag(u16, u16),
     MouseSelectionEnd(u16, u16),

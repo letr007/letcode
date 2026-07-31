@@ -644,6 +644,7 @@ impl SessionCoordinator {
     }
 
     /// Whether this command is currently handled as idle work by the coordinator.
+    #[cfg(test)]
     pub fn is_idle_command(command: &SessionCommand) -> bool {
         matches!(
             command,
@@ -661,6 +662,7 @@ impl SessionCoordinator {
     }
 
     /// Exhaustive ownership table for migration tracking.
+    #[cfg(test)]
     pub fn ownership(command: &SessionCommand) -> CommandOwnership {
         match command {
             SessionCommand::ShowHistoryTree
@@ -685,6 +687,7 @@ impl SessionCoordinator {
 }
 
 /// Where a [`SessionCommand`] is executed today.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOwnership {
     /// Fully handled by [`SessionCoordinator::dispatch_idle_command`].

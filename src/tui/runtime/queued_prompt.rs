@@ -38,6 +38,7 @@ impl QueuedPromptLifecycle {
         matches!(self, Self::InFlight(_))
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatched_prompt(&self) -> Option<&str> {
         match self {
             Self::Idle { .. } => None,
@@ -52,6 +53,7 @@ impl QueuedPromptLifecycle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_accepted(&self) -> bool {
         matches!(
             self,
@@ -59,6 +61,7 @@ impl QueuedPromptLifecycle {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn failed_after_accept(&self) -> bool {
         matches!(
             self,

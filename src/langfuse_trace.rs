@@ -6,9 +6,6 @@ use tracing::{Span, field};
 
 use crate::agent::LlmRequestTelemetry;
 use crate::agent::{CacheUsageReport, ToolEffectKind, ToolExecutionRecord, ToolExecutionStatus};
-use crate::request_builder::BudgetReport;
-use crate::request_builder::prompt_plan::PromptPlan;
-
 pub const TARGET: &str = "letcode::langfuse";
 
 /// The cache-specific Langfuse metadata for one request iteration.  This
@@ -320,8 +317,9 @@ pub fn llm_iteration_span(
     )
 }
 
+#[allow(dead_code)] // Deprecated compatibility entry point retained for external integrations.
 #[deprecated(note = "use record_llm_request_telemetry")]
-pub fn record_llm_request_budget(span: &Span, budget: &BudgetReport) {
+pub fn record_llm_request_budget(span: &Span, budget: &crate::request_builder::BudgetReport) {
     span.record(
         "letcode.request.estimated_tokens",
         budget.estimated_request_tokens,
@@ -432,8 +430,12 @@ pub fn record_llm_request_budget(span: &Span, budget: &BudgetReport) {
     );
 }
 
+#[allow(dead_code)] // Deprecated compatibility entry point retained for external integrations.
 #[deprecated(note = "use record_llm_request_telemetry")]
-pub fn record_llm_prompt_plan(span: &Span, prompt_plan: &PromptPlan) {
+pub fn record_llm_prompt_plan(
+    span: &Span,
+    prompt_plan: &crate::request_builder::prompt_plan::PromptPlan,
+) {
     span.record(
         "letcode.prompt.segments",
         as_u64(prompt_plan.segments.len()),
@@ -458,8 +460,13 @@ pub fn record_llm_prompt_plan(span: &Span, prompt_plan: &PromptPlan) {
     }
 }
 
+#[allow(dead_code)] // Deprecated compatibility entry point retained for external integrations.
 #[deprecated(note = "use record_llm_request_telemetry")]
-pub fn record_llm_cache_metadata(span: &Span, cache: &CacheUsageReport, prompt_plan: &PromptPlan) {
+pub fn record_llm_cache_metadata(
+    span: &Span,
+    cache: &CacheUsageReport,
+    prompt_plan: &crate::request_builder::prompt_plan::PromptPlan,
+) {
     let metadata =
         cache_metadata_projection(cache, prompt_plan.token_report().first_volatile_index);
     span.record(
@@ -526,6 +533,7 @@ pub fn record_llm_cache_metadata(span: &Span, cache: &CacheUsageReport, prompt_p
     }
 }
 
+#[allow(dead_code)] // Deprecated compatibility entry point retained for external integrations.
 #[deprecated(note = "use record_llm_request_telemetry")]
 pub fn record_llm_usage(
     span: &Span,
@@ -543,7 +551,12 @@ pub fn record_llm_usage(
         safe_usage_details_json(input_tokens, output_tokens, cached_tokens, total_tokens);
     span.record("langfuse.observation.usage_details", usage_details.as_str());
     let cache_report = cache_report.with_actual_cached_tokens(cached_tokens);
-    record_llm_cache_metadata_actual_usage(span, &cache_report);
+    if let Some(actual_cached_tokens) = cache_report.actual_cached_tokens {
+        span.record(
+            "langfuse.observation.metadata.cache_actual_cached_tokens",
+            actual_cached_tokens,
+        );
+    }
 }
 
 /// Projects the durable, scalar request telemetry into the iteration generation.
@@ -836,15 +849,6 @@ pub(crate) fn record_llm_request_telemetry(span: &Span, telemetry: &LlmRequestTe
                 .to_string()
             };
         span.record("langfuse.observation.usage_details", usage_details.as_str());
-    }
-}
-
-fn record_llm_cache_metadata_actual_usage(span: &Span, cache: &CacheUsageReport) {
-    if let Some(actual_cached_tokens) = cache.actual_cached_tokens {
-        span.record(
-            "langfuse.observation.metadata.cache_actual_cached_tokens",
-            actual_cached_tokens,
-        );
     }
 }
 

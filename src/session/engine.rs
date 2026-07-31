@@ -185,8 +185,10 @@ impl SessionEngineEventEgress {
 /// A started engine owns the agent, transcript, MCP discovery, and execution
 /// loop. The frontend receives only its command ingress and event egress.
 pub struct SessionEngine {
-    control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
-    event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
+    #[cfg(test)]
+    control_rx: Option<mpsc::UnboundedReceiver<SessionEngineControl>>,
+    #[cfg(test)]
+    event_tx: Option<mpsc::UnboundedSender<SessionTransportEvent>>,
     ingress: Option<SessionEngineIngress>,
     event_rx: Option<mpsc::UnboundedReceiver<SessionTransportEvent>>,
     engine_task: Option<JoinHandle<()>>,
@@ -217,14 +219,15 @@ pub struct SessionEngineProjection {
 }
 
 impl SessionEngine {
+    #[cfg(test)]
     pub(crate) fn new() -> (Self, SessionEngineIngress, SessionEngineEventEgress) {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let ingress = SessionEngineIngress { control_tx };
         (
             Self {
-                control_rx,
-                event_tx,
+                control_rx: Some(control_rx),
+                event_tx: Some(event_tx),
                 ingress: None,
                 event_rx: None,
                 engine_task: None,
@@ -286,10 +289,10 @@ impl SessionEngine {
         ));
         Ok((
             Self {
-                control_rx: mpsc::unbounded_channel().1,
-                // The backend loop owns the only sender after startup so event
-                // egress closes exactly when backend execution ends.
-                event_tx: mpsc::unbounded_channel().0,
+                #[cfg(test)]
+                control_rx: None,
+                #[cfg(test)]
+                event_tx: None,
                 ingress: Some(ingress),
                 event_rx: Some(event_rx),
                 engine_task: Some(task),
@@ -317,6 +320,7 @@ impl SessionEngine {
     }
 
     /// Request backend termination while retaining ownership for a later join.
+    #[cfg(test)]
     pub fn request_shutdown(&self) -> Result<(), SessionEngineIngressError> {
         self.ingress
             .as_ref()
@@ -370,33 +374,52 @@ impl SessionEngine {
 
     /// Compatibility lifecycle convenience for callers that have not yet
     /// separated shutdown request from joining.
+    #[cfg(test)]
     pub async fn shutdown(self) -> Result<()> {
         self.request_shutdown()?;
         self.join().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn recv_control(&mut self) -> Option<SessionEngineControl> {
-        self.control_rx.recv().await
+        self.control_rx
+            .as_mut()
+            .expect("test engine control receiver unavailable")
+            .recv()
+            .await
     }
 
+    #[cfg(test)]
     pub(crate) fn try_recv_control(
         &mut self,
     ) -> Result<SessionEngineControl, mpsc::error::TryRecvError> {
-        self.control_rx.try_recv()
+        self.control_rx
+            .as_mut()
+            .expect("test engine control receiver unavailable")
+            .try_recv()
     }
 
+    #[cfg(test)]
     pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<SessionTransportEvent> {
-        self.event_tx.clone()
+        self.event_tx
+            .as_ref()
+            .expect("test engine event sender unavailable")
+            .clone()
     }
 
     /// Transfer internal control and event endpoints to the session executor.
+    #[cfg(test)]
     pub(crate) fn into_session_executor_parts(
         self,
     ) -> (
         mpsc::UnboundedReceiver<SessionEngineControl>,
         mpsc::UnboundedSender<SessionTransportEvent>,
     ) {
-        (self.control_rx, self.event_tx)
+        (
+            self.control_rx
+                .expect("test engine control receiver unavailable"),
+            self.event_tx.expect("test engine event sender unavailable"),
+        )
     }
 }
 

@@ -283,32 +283,10 @@ impl SubagentPool {
         cancelled
     }
 
-    pub fn cancel_agent(&self, agent_name: &str) -> bool {
-        let Ok(mut map) = self.active_by_agent.lock() else {
-            return false;
-        };
-        let Some(slot) = map.get_mut(agent_name) else {
-            return false;
-        };
-        if let Some(tx) = slot.cancel.take() {
-            let _ = tx.send(());
-            true
-        } else {
-            false
-        }
-    }
-
     pub fn is_running(&self) -> bool {
         self.active_by_agent
             .lock()
             .map(|map| !map.is_empty())
-            .unwrap_or(false)
-    }
-
-    pub fn is_agent_running(&self, agent_name: &str) -> bool {
-        self.active_by_agent
-            .lock()
-            .map(|map| map.contains_key(agent_name))
             .unwrap_or(false)
     }
 
@@ -317,15 +295,6 @@ impl SubagentPool {
         map.values()
             .map(|slot| slot.child.clone())
             .min_by_key(|child| (child.pool_ordinal, child.child_session_id.clone()))
-    }
-
-    pub fn active_children(&self) -> Vec<ChildSessionSummary> {
-        let Ok(map) = self.active_by_agent.lock() else {
-            return Vec::new();
-        };
-        let mut children: Vec<_> = map.values().map(|slot| slot.child.clone()).collect();
-        sort_child_session_summaries(&mut children);
-        children
     }
 
     pub fn child_sessions(
@@ -719,26 +688,6 @@ impl SubagentPool {
         }
         format!(
             "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel"
-        )
-    }
-
-    fn busy_error_message(&self) -> String {
-        let children = self.active_children();
-        if children.is_empty() {
-            return "subagent pool is busy: wait for completion or cancel the active child".into();
-        }
-        let detail = children
-            .into_iter()
-            .map(|child| {
-                format!(
-                    "{}#{}:{}",
-                    child.agent_name, child.pool_ordinal, child.child_session_id
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "subagent pool has active children [{detail}]; per-role single-active is enforced and queueing is unsupported"
         )
     }
 }
@@ -1156,19 +1105,6 @@ fn excerpt(raw: &str) -> String {
         "subagent produced empty output".into()
     } else {
         excerpt
-    }
-}
-
-fn legacy_task_input(task: String) -> NormalizedSubagentInput {
-    NormalizedSubagentInput {
-        objective: task,
-        success_criteria: Vec::new(),
-        allowed_paths: Vec::new(),
-        forbidden_paths: Vec::new(),
-        owned_paths: Vec::new(),
-        timeout_secs: None,
-        max_tool_calls: None,
-        target_child_session_id: None,
     }
 }
 

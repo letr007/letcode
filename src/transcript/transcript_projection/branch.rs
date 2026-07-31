@@ -1,4 +1,6 @@
-use super::{ContextBranchInfo, ResolvedBranchContext, SessionContextCursor};
+#[cfg(test)]
+use super::ContextBranchInfo;
+use super::{ResolvedBranchContext, SessionContextCursor};
 use crate::transcript::{ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord};
 use anyhow::{anyhow, ensure};
 use std::collections::BTreeMap;
@@ -7,6 +9,7 @@ use std::collections::BTreeMap;
 struct BranchDefinition {
     parent_branch_id: Option<String>,
     base_sequence: u64,
+    #[cfg(test)]
     label: Option<String>,
 }
 
@@ -23,6 +26,7 @@ pub(super) struct BranchIndex {
     branch_tips: BTreeMap<String, u64>,
 }
 
+#[cfg(test)]
 pub(crate) fn list_context_branches(
     records: &[TranscriptRecord],
     current_branch_id: Option<&str>,
@@ -103,6 +107,7 @@ pub(super) fn build_branch_index(records: &[TranscriptRecord]) -> anyhow::Result
         BranchDefinition {
             parent_branch_id: None,
             base_sequence: 0,
+            #[cfg(test)]
             label: None,
         },
     );
@@ -116,7 +121,10 @@ pub(super) fn build_branch_index(records: &[TranscriptRecord]) -> anyhow::Result
                 branch_id,
                 parent_branch_id,
                 base_sequence,
+                #[cfg(test)]
                 label,
+                #[cfg(not(test))]
+                    label: _,
             } => {
                 ensure!(
                     !index.definitions.contains_key(branch_id),
@@ -140,6 +148,7 @@ pub(super) fn build_branch_index(records: &[TranscriptRecord]) -> anyhow::Result
                     BranchDefinition {
                         parent_branch_id: Some(parent_branch_id.clone()),
                         base_sequence: *base_sequence,
+                        #[cfg(test)]
                         label: label.clone(),
                     },
                 );

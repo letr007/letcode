@@ -183,6 +183,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     }
 }
 
+#[cfg(test)]
 fn visible_transcript_lines(
     lines: &[Line<'static>],
     visible_rows: u16,
@@ -203,7 +204,8 @@ pub fn transcript_row_count(state: &TuiState, theme: Theme, width: usize) -> usi
     transcript_lines(state, theme, width).len()
 }
 
-pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Line<'static>> {
+#[cfg(test)]
+pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let items = state.active_timeline().items();
 
@@ -1244,12 +1246,6 @@ fn user_prompt_padding_style(theme: Theme) -> ratatui::style::Style {
         .bg(theme.element_bg)
 }
 
-fn element_muted_style(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.muted_text)
-        .bg(theme.element_bg)
-}
-
 fn queued_badge_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(theme.root_bg)
@@ -1479,6 +1475,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
         TranscriptRecord {
             session_id: "s".into(),
@@ -1489,6 +1486,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn context_records() -> Vec<TranscriptRecord> {
         vec![
             record(

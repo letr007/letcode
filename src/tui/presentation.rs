@@ -1,8 +1,4 @@
-use serde_json::Value;
-
 use crate::agent::is_subagent_tool_name;
-use crate::tool_format::format_tool_call;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPresentation {
     Hidden,
@@ -16,32 +12,6 @@ pub enum ToolPresentationStatus {
     Running,
     Succeeded,
     Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolPresentationContext {
-    pub name: String,
-    pub status: ToolPresentationStatus,
-    pub args: Option<Value>,
-    pub output: Option<Value>,
-}
-
-impl ToolPresentationContext {
-    pub fn new(name: impl Into<String>, status: ToolPresentationStatus) -> Self {
-        Self {
-            name: name.into(),
-            status,
-            args: None,
-            output: None,
-        }
-    }
-
-    pub fn summary(&self) -> String {
-        self.args
-            .as_ref()
-            .map(|args| format_tool_call(&self.name, args))
-            .unwrap_or_else(|| self.name.clone())
-    }
 }
 
 /// Render-facing context for TUI timeline tool items.
@@ -73,10 +43,6 @@ impl ToolTextPresentationContext {
 pub struct PresentationPolicy;
 
 impl PresentationPolicy {
-    pub fn tool_presentation(&self, context: &ToolPresentationContext) -> ToolPresentation {
-        tool_presentation_impl(&context.name, context.status, is_quiet_success(context))
-    }
-
     pub fn tool_presentation_text(
         &self,
         context: &ToolTextPresentationContext,
@@ -157,23 +123,6 @@ fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
-fn is_quiet_success(context: &ToolPresentationContext) -> bool {
-    if context.status != ToolPresentationStatus::Succeeded {
-        return false;
-    }
-
-    let Some(output) = context.output.as_ref() else {
-        return true;
-    };
-
-    output.is_null()
-        || output.as_object().is_some_and(|obj| obj.is_empty())
-        || output
-            .get("result")
-            .and_then(Value::as_str)
-            .is_some_and(str::is_empty)
-}
-
 fn is_quiet_success_text(output: Option<&str>) -> bool {
     let Some(output) = output else {
         return true;
@@ -184,18 +133,6 @@ fn is_quiet_success_text(output: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn read_tool_running_is_inline() {
-        let policy = PresentationPolicy;
-        let mut context = ToolPresentationContext::new("fs__read", ToolPresentationStatus::Running);
-        context.args = Some(json!({"path": "src/main.rs"}));
-
-        assert_eq!(context.summary(), "fs__read src/main.rs");
-        assert_eq!(policy.tool_presentation(&context), ToolPresentation::Inline);
-    }
-
     #[test]
     fn completed_question_is_never_hidden_as_a_quiet_success() {
         let policy = PresentationPolicy;
@@ -204,62 +141,6 @@ mod tests {
 
         assert_eq!(
             policy.tool_presentation_text(&context),
-            ToolPresentation::CompactCard
-        );
-    }
-
-    #[test]
-    fn command_tool_success_is_compact_card() {
-        let policy = PresentationPolicy;
-        let mut context =
-            ToolPresentationContext::new("shell__exec", ToolPresentationStatus::Succeeded);
-        context.args = Some(json!({"command": "cargo check"}));
-        context.output = Some(json!({"stdout": "ok"}));
-
-        assert_eq!(
-            policy.tool_presentation(&context),
-            ToolPresentation::CompactCard
-        );
-    }
-
-    #[test]
-    fn quiet_success_can_be_hidden() {
-        let policy = PresentationPolicy;
-        let mut context =
-            ToolPresentationContext::new("util__echo", ToolPresentationStatus::Succeeded);
-        context.output = Some(json!({}));
-
-        assert_eq!(policy.tool_presentation(&context), ToolPresentation::Hidden);
-    }
-
-    #[test]
-    fn quiet_success_write_like_tools_are_never_hidden() {
-        let policy = PresentationPolicy;
-        let mut context =
-            ToolPresentationContext::new("fs__write", ToolPresentationStatus::Succeeded);
-        context.output = Some(json!({}));
-        assert_eq!(
-            policy.tool_presentation(&context),
-            ToolPresentation::CompactCard
-        );
-
-        let mut unknown =
-            ToolPresentationContext::new("some_unknown_tool", ToolPresentationStatus::Succeeded);
-        unknown.output = Some(json!({}));
-        assert_eq!(
-            policy.tool_presentation(&unknown),
-            ToolPresentation::CompactCard
-        );
-    }
-
-    #[test]
-    fn failures_are_never_hidden() {
-        let policy = PresentationPolicy;
-        let mut context = ToolPresentationContext::new("fs__read", ToolPresentationStatus::Failed);
-        context.output = Some(json!({"error": "not found"}));
-
-        assert_eq!(
-            policy.tool_presentation(&context),
             ToolPresentation::CompactCard
         );
     }
@@ -308,30 +189,9 @@ mod tests {
             ),
         ] {
             for tool_name in ["workflow__todos", "workflow__auto_continue"] {
-                let context = ToolPresentationContext::new(tool_name, status);
-                assert_eq!(policy.tool_presentation(&context), expected);
-
                 let text_context = ToolTextPresentationContext::new(tool_name, status);
                 assert_eq!(policy.tool_presentation_text(&text_context), expected);
             }
-        }
-    }
-
-    #[test]
-    fn subagent_tools_always_use_compact_cards_for_status_surfaces() {
-        let policy = PresentationPolicy;
-
-        for status in [
-            ToolPresentationStatus::Pending,
-            ToolPresentationStatus::Running,
-            ToolPresentationStatus::Succeeded,
-            ToolPresentationStatus::Failed,
-        ] {
-            let context = ToolPresentationContext::new("agent__fixer", status);
-            assert_eq!(
-                policy.tool_presentation(&context),
-                ToolPresentation::CompactCard
-            );
         }
     }
 }

@@ -9,10 +9,7 @@ use serde_json::Value;
 
 use super::super::state::TuiState;
 use crate::tui::{
-    measure::{
-        CursorVisualPosition, cursor_visual_position, display_width, wrap_text_to_width,
-        wrapped_row_count,
-    },
+    measure::{display_width, wrap_text_to_width},
     surface,
     theme::Theme,
     timeline::PermissionView,
@@ -45,8 +42,9 @@ struct ComposerCursorPulse {
 const CURSOR_FRAME_INTERVAL_MS: usize = 33;
 const CURSOR_CYCLE_DURATION_MS: usize = 1_000;
 
-impl From<CursorVisualPosition> for ComposerCursor {
-    fn from(value: CursorVisualPosition) -> Self {
+#[cfg(test)]
+impl From<crate::tui::measure::CursorVisualPosition> for ComposerCursor {
+    fn from(value: crate::tui::measure::CursorVisualPosition) -> Self {
         Self {
             row: value.row,
             column: value.column,
@@ -54,19 +52,26 @@ impl From<CursorVisualPosition> for ComposerCursor {
     }
 }
 
-pub fn composer_row_count(input: &str, width: usize) -> usize {
-    wrapped_row_count(input, width)
+#[cfg(test)]
+pub(crate) fn composer_row_count(input: &str, width: usize) -> usize {
+    crate::tui::measure::wrapped_row_count(input, width)
 }
 
-pub fn composer_cursor_position(
+#[cfg(test)]
+pub(crate) fn composer_cursor_position(
     input: &str,
     width: usize,
     cursor_byte_index: usize,
 ) -> ComposerCursor {
-    cursor_visual_position(input, width, cursor_byte_index).into()
+    crate::tui::measure::cursor_visual_position(input, width, cursor_byte_index).into()
 }
 
-pub fn composer_metrics(input: &str, width: usize, cursor_byte_index: usize) -> ComposerMetrics {
+#[cfg(test)]
+pub(crate) fn composer_metrics(
+    input: &str,
+    width: usize,
+    cursor_byte_index: usize,
+) -> ComposerMetrics {
     let cursor = composer_cursor_position(input, width, cursor_byte_index);
     let row_count = composer_row_count(input, width).max(cursor.row.saturating_add(1));
 
@@ -742,10 +747,6 @@ fn mix_color_f32(from: Color, to: Color, mix: f32) -> Color {
         ),
         _ => to,
     }
-}
-
-fn mix_channel(from: u8, to: u8, mix_percent: u8) -> u8 {
-    mix_channel_f32(from, to, f32::from(mix_percent.min(100)) / 100.0)
 }
 
 fn mix_channel_f32(from: u8, to: u8, mix: f32) -> u8 {

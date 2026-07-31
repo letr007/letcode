@@ -7,7 +7,7 @@ use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage, Tod
 use crate::context_tree::ContextTreeState;
 use crate::context_view::{ContextViewProjection, SummaryArtifact};
 use crate::runtime_context::RuntimeActiveContext;
-use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
+use crate::user_content::{UserMessageContent, UserMessageSubmission};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -123,12 +123,6 @@ pub struct ContextSummaryUpdatedEvent {
     pub summaries: Vec<SummaryArtifact>,
 }
 
-impl SessionEvent {
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Quit | Self::Interrupted)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPendingEvent {
     pub call_id: String,
@@ -170,6 +164,7 @@ pub struct TokenUsageEvent {
 }
 
 impl TokenUsageEvent {
+    #[cfg(test)]
     pub fn new(used_tokens: u64, context_window_tokens: u64) -> Self {
         Self::with_breakdown(used_tokens, context_window_tokens, used_tokens, 0, 0)
     }
@@ -206,6 +201,7 @@ pub struct UserMessageEvent {
 }
 
 impl UserMessageEvent {
+    #[cfg(test)]
     pub fn new(content: impl Into<String>) -> Self {
         Self::from_submission(UserMessageSubmission::new(
             "live-user-message",
@@ -213,6 +209,7 @@ impl UserMessageEvent {
         ))
     }
 
+    #[cfg(test)]
     pub fn queued(content: impl Into<String>) -> Self {
         Self::queued_submission(UserMessageSubmission::new(
             "queued-user-message",
@@ -236,14 +233,6 @@ impl UserMessageEvent {
             content: submission.content,
             queued: true,
         }
-    }
-
-    pub fn text(&self) -> &str {
-        &self.content.text
-    }
-
-    pub fn attachments(&self) -> &[UserImageAttachment] {
-        &self.content.attachments
     }
 }
 
@@ -308,7 +297,11 @@ pub struct NoticeEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
     Info,
+    #[allow(dead_code)]
+    // Retained for frontend event compatibility; current production notices use Info.
     Success,
+    #[allow(dead_code)]
+    // Retained for frontend event compatibility; current production notices use Info.
     RecoverableError,
 }
 
@@ -323,14 +316,6 @@ impl NoticeEvent {
     pub fn info(message: impl Into<String>) -> Self {
         Self::new(message, NoticeKind::Info)
     }
-
-    pub fn success(message: impl Into<String>) -> Self {
-        Self::new(message, NoticeKind::Success)
-    }
-
-    pub fn recoverable_error(message: impl Into<String>) -> Self {
-        Self::new(message, NoticeKind::RecoverableError)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +326,7 @@ pub struct ProcessIssueEvent {
 }
 
 impl ProcessIssueEvent {
+    #[cfg(test)]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -359,6 +345,7 @@ pub struct ToolStartedEvent {
 }
 
 impl ToolStartedEvent {
+    #[cfg(test)]
     pub fn new(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -426,6 +413,7 @@ impl AutoContinueChangedEvent {
 }
 
 impl ToolFinishedEvent {
+    #[cfg(test)]
     pub fn new(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -487,6 +475,7 @@ pub struct PermissionResolutionEvent {
 }
 
 impl PermissionResolutionEvent {
+    #[cfg(test)]
     pub fn approved(call_id: impl Into<String>) -> Self {
         Self {
             call_id: call_id.into(),

@@ -22,10 +22,6 @@ impl SourceRange {
             end,
         }
     }
-
-    pub const fn is_empty(self) -> bool {
-        self.start >= self.end
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

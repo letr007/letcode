@@ -1,8 +1,9 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CursorVisualPosition {
+pub(crate) struct CursorVisualPosition {
     pub row: usize,
     pub column: usize,
 }
@@ -35,6 +36,7 @@ pub fn resolved_scroll_offset(
 }
 
 /// Whether we're at the transcript bottom using bottom-relative scroll offset.
+#[cfg(test)]
 pub fn is_at_bottom(total_rows: usize, viewport_rows: u16, scroll_offset: u16) -> bool {
     max_scroll(total_rows, viewport_rows) == 0 || scroll_offset == 0
 }
@@ -121,7 +123,8 @@ pub fn wrapped_row_count(text: &str, width: usize) -> usize {
     wrap_text_to_width(text, width).len().max(1)
 }
 
-pub fn cursor_visual_position(
+#[cfg(test)]
+pub(crate) fn cursor_visual_position(
     text: &str,
     width: usize,
     cursor_byte_index: usize,
@@ -130,7 +133,8 @@ pub fn cursor_visual_position(
     end_cursor_visual_position(&text[..cursor_byte_index], width)
 }
 
-pub fn end_cursor_visual_position(text: &str, width: usize) -> CursorVisualPosition {
+#[cfg(test)]
+pub(crate) fn end_cursor_visual_position(text: &str, width: usize) -> CursorVisualPosition {
     let lines = split_lines_preserving_trailing(text);
     let mut row = 0usize;
     let mut column = 0usize;
@@ -160,6 +164,7 @@ pub fn end_cursor_visual_position(text: &str, width: usize) -> CursorVisualPosit
     CursorVisualPosition { row, column }
 }
 
+#[cfg(test)]
 fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
     if text.is_char_boundary(index) {
         return index;

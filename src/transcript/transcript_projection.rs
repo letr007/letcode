@@ -1,11 +1,12 @@
 use crate::agent::ConversationMessage;
+#[cfg(test)]
 use crate::context_view::{self, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
-use crate::protocol_frames::{ProtocolFrame, history_items_to_frames};
+use crate::protocol_frames::ProtocolFrame;
+#[cfg(test)]
+use crate::protocol_frames::history_items_to_frames;
 use crate::request_builder::HistoryItem;
-use crate::runtime_context::{
-    FrameVisibility, RuntimeFrame, RuntimeFrameKind, RuntimeSnapshot, RuntimeSource,
-};
+use crate::runtime_context::RuntimeSnapshot;
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
 use anyhow::ensure;
 
@@ -22,7 +23,9 @@ use crate::transcript::{
 #[path = "transcript_projection/context_tree.rs"]
 mod context_tree;
 
-pub(crate) use context_tree::{project_context_tree, replay_context_tree};
+#[cfg(test)]
+pub(crate) use context_tree::project_context_tree;
+pub(crate) use context_tree::replay_context_tree;
 
 #[path = "transcript_projection/job_board.rs"]
 mod job_board;
@@ -32,13 +35,18 @@ pub(crate) use job_board::{project_child_session_summaries, project_job_board};
 #[path = "transcript_projection/branch.rs"]
 mod branch;
 
-pub(crate) use branch::{effective_branch_id_at_frontier, list_context_branches};
+pub(crate) use branch::effective_branch_id_at_frontier;
+
+#[cfg(test)]
+pub(crate) use branch::list_context_branches;
 
 #[path = "transcript_projection/session_tree.rs"]
 mod session_tree;
 
+#[cfg(test)]
+pub(crate) use session_tree::HistoryNavigationState;
 pub(crate) use session_tree::{
-    HistoryNavigationState, SessionHistoryEntry, SessionHistoryEntryKind, history_navigation_state,
+    SessionHistoryEntry, SessionHistoryEntryKind, history_navigation_state,
     project_session_history_tree,
 };
 
@@ -65,6 +73,8 @@ mod checkpoint;
 
 #[cfg(test)]
 pub(crate) use checkpoint::prepare_logical_checkpoint_candidate;
+
+#[cfg(test)]
 pub(crate) use checkpoint::validate_logical_checkpoint_candidate;
 
 use checkpoint::validate_logical_checkpoint_record;
@@ -88,21 +98,31 @@ pub(crate) struct SessionContextCursor {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRestoreSnapshot {
+    #[allow(dead_code)] // Retained for serde-compatible session restore snapshots.
     pub session_id: String,
+    #[allow(dead_code)] // Retained for branch-aware restore diagnostics.
     pub branch_id: String,
+    #[allow(dead_code)] // Retained as part of the durable navigation cursor.
     pub leaf_sequence: u64,
     pub records: Vec<TranscriptRecord>,
+    #[allow(dead_code)] // Retained for the complete session restore projection.
     pub messages: Vec<ConversationMessage>,
+    #[allow(dead_code)] // Retained for the complete session restore projection.
     pub history: Vec<HistoryItem>,
+    #[allow(dead_code)] // Retained for evidence-aware session restoration.
     pub evidence: Vec<EvidenceRecord>,
+    #[allow(dead_code)] // Retained for model restoration compatibility.
     pub latest_model: Option<String>,
+    #[allow(dead_code)] // Retained for turn-sequence restoration compatibility.
     pub max_turn_id: u64,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeRestoreSnapshot {
+    #[allow(dead_code)] // Retained for serde-compatible runtime restore snapshots.
     pub session_id: String,
     pub branch_id: String,
+    #[allow(dead_code)] // Retained as part of the durable navigation cursor.
     pub leaf_sequence: u64,
     pub records: Vec<TranscriptRecord>,
     pub protocol_frames: Vec<ProtocolFrame>,
@@ -111,12 +131,7 @@ pub(crate) struct RuntimeRestoreSnapshot {
     pub max_turn_id: u64,
 }
 
-impl SessionRestoreSnapshot {
-    pub(crate) fn evidence_count(&self) -> usize {
-        self.evidence.len()
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBranchInfo {
     pub branch_id: String,
@@ -126,6 +141,7 @@ pub struct ContextBranchInfo {
     pub is_current: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn project_session_restore_snapshot(
     session_id: String,
     records: Vec<TranscriptRecord>,
@@ -140,12 +156,14 @@ pub(crate) fn project_session_restore_snapshot(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn project_context_view(
     records: &[TranscriptRecord],
 ) -> anyhow::Result<ContextViewProjection> {
     context_view::project_context_view(records)
 }
 
+#[allow(dead_code)] // Production transcript validation uses this branch-aware projection path.
 pub(crate) fn project_context_tree_for_active_branch(
     records: &[TranscriptRecord],
     current_branch_id: Option<&str>,
@@ -299,6 +317,7 @@ pub(crate) fn project_runtime_restore_snapshot(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn restore_session_protocol_frames_projection(
     records: &[TranscriptRecord],
 ) -> anyhow::Result<Vec<ProtocolFrame>> {

@@ -9,7 +9,7 @@ use crate::context_view::{
 use crate::evidence::{EvidenceKind, EvidenceSource};
 use crate::protocol_frames::history_items_from_frames;
 use crate::request_builder::HistoryToolCall;
-use crate::runtime_context::{RuntimeFrameId, RuntimeFrameKind, SourceSpan};
+use crate::runtime_context::{FrameVisibility, RuntimeFrameId, RuntimeFrameKind, SourceSpan};
 use crate::tool::ToolResult;
 use crate::transcript::LogicalCheckpointRetainedItemV1;
 use crate::user_content::UserMessageContent;

@@ -4,13 +4,13 @@
 //! entries (permissions, user input, session commands). Agent events enter the
 //! transcript only through this module.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::agent::AgentEvent;
-use crate::tool_names;
 use crate::transcript::TranscriptRecorder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // ReplaceScope is consumed by session runner projection updates.
 pub enum ContextProjection {
     None,
     Advance,

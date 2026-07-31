@@ -15,17 +15,18 @@ use crate::agent::{
     LlmRequestTelemetry, LlmRequestTelemetryPhase, TodoItem, ToolExecutionSummaryEvent,
     TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
+#[cfg(test)]
 use crate::context_tree::{
     ContextBlockRef, ContextNodeId, ContextNodeStatus, ContextSourceRef, ContextTreeOp,
 };
+#[cfg(test)]
+use crate::evidence::restore_evidence_records;
 use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
-    restore_evidence_records,
 };
 use crate::request_builder::{HistoryItem, HistoryToolCall};
 use crate::subagent::StructuredSubagentResult;
 use crate::tool::ToolResult;
-use crate::tool_names;
 use crate::user_content::UserMessageContent;
 
 mod model;
@@ -95,14 +96,6 @@ pub struct LogicalCheckpointRetainedItemV1 {
 pub struct LogicalCheckpointSourceSpanV1 {
     pub start_sequence: u64,
     pub end_sequence: u64,
-}
-
-/// Typed workflow data encoded in checkpoint retained items. It remains part
-/// of event-model validation even though recorder-side preparation was removed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CheckpointWorkflowProjection {
-    pub todos: Vec<TodoItem>,
-    pub auto_continue: AutoContinueState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +307,7 @@ impl TranscriptRecorder {
     /// loaded from that transcript. The transcript must still match the loaded
     /// records, otherwise resume fails instead of appending from a stale
     /// sequence frontier.
+    #[cfg(test)]
     pub fn open_existing_with_records(
         base_dir: impl AsRef<Path>,
         session_id: &str,
@@ -349,6 +343,7 @@ impl TranscriptRecorder {
         Self::open_existing_with_validated_records(base_dir, session_id, records)
     }
 
+    #[cfg(test)]
     fn open_existing_with_records_and_content(
         base_dir: &Path,
         session_id: &str,
@@ -470,6 +465,7 @@ impl TranscriptRecorder {
             .and_then(|state| state.active_experiment.clone())
     }
 
+    #[cfg(test)]
     pub fn record_context_branch_created(
         &mut self,
         branch_id: impl Into<String>,
@@ -485,6 +481,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_branch_summary(
         &mut self,
         branch_id: impl Into<String>,
@@ -498,6 +495,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_checkout(
         &mut self,
         branch_id: impl Into<String>,
@@ -548,6 +546,7 @@ impl TranscriptRecorder {
         ])
     }
 
+    #[cfg(test)]
     pub fn record_context_experiment_returned(
         &mut self,
         branch_id: impl Into<String>,
@@ -569,6 +568,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_node_created(
         &mut self,
         node_id: impl Into<String>,
@@ -588,10 +588,12 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_node_activated(&mut self, node_id: impl Into<String>) -> Result<()> {
         self.activate_context_node(node_id)
     }
 
+    #[cfg(test)]
     pub fn create_context_node(
         &mut self,
         node_id: impl Into<String>,
@@ -621,18 +623,22 @@ impl TranscriptRecorder {
         )
     }
 
+    #[cfg(test)]
     pub fn activate_context_node(&mut self, node_id: impl Into<String>) -> Result<()> {
         self.record_context_node_status_change(node_id.into(), ContextNodeStatus::Active)
     }
 
+    #[cfg(test)]
     pub fn suspend_context_node(&mut self, node_id: impl Into<String>) -> Result<()> {
         self.record_context_node_status_change(node_id.into(), ContextNodeStatus::Inactive)
     }
 
+    #[cfg(test)]
     pub fn terminalize_context_node(&mut self, node_id: impl Into<String>) -> Result<()> {
         self.record_context_node_status_change(node_id.into(), ContextNodeStatus::Archived)
     }
 
+    #[cfg(test)]
     pub fn record_context_node_lifecycle(
         &mut self,
         node_id: impl Into<String>,
@@ -644,6 +650,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_view_operation_metadata(
         &mut self,
         operation: impl Into<String>,
@@ -659,6 +666,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_summary_artifact_metadata(
         &mut self,
         node_id: impl Into<String>,
@@ -684,6 +692,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_context_tool_pending_metadata(
         &mut self,
         _tool_name: impl AsRef<str>,
@@ -740,6 +749,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_subagent_result(
         &mut self,
         run_id: impl Into<String>,
@@ -812,6 +822,7 @@ impl TranscriptRecorder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn record_subagent_reconciliation(
         &mut self,
         run_id: impl Into<String>,
@@ -1013,6 +1024,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_tool_call_finished_and_apply_context_control(
         &mut self,
         call_id: impl Into<String>,
@@ -1036,6 +1048,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_permission_decision(
         &mut self,
         tool: impl Into<String>,
@@ -1241,23 +1254,13 @@ impl TranscriptRecorder {
         self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
     }
 
-    fn active_context_snapshot(&self) -> Result<transcript_projection::SessionRestoreSnapshot> {
-        transcript_projection::build_session_context_snapshot(
-            self.session_id().to_string(),
-            read_records(self.path())?,
-            transcript_projection::SessionContextCursor {
-                branch_id: self.current_context_branch_id().map(str::to_string),
-                leaf_sequence: None,
-            },
-        )
-    }
-
     fn set_active_context_experiment(&self, experiment: Option<ActiveContextExperiment>) {
         if let Ok(mut state) = self.context_scope_state.lock() {
             state.active_experiment = experiment;
         }
     }
 
+    #[cfg(test)]
     fn record_context_node_status_change(
         &mut self,
         node_id: String,
@@ -1270,6 +1273,7 @@ impl TranscriptRecorder {
         self.record_context_node_lifecycle(node_id, status)
     }
 
+    #[cfg(test)]
     fn current_context_tree_state(&self) -> Result<crate::context_tree::ContextTreeState> {
         let records = read_records(self.path())?;
         transcript_projection::project_context_tree_for_active_branch(
@@ -1278,6 +1282,7 @@ impl TranscriptRecorder {
         )
     }
 
+    #[cfg(test)]
     fn current_active_context_node_id(&self) -> Result<String> {
         self.current_context_tree_state()?
             .active_node_id()
@@ -1285,6 +1290,7 @@ impl TranscriptRecorder {
             .ok_or_else(|| anyhow!("context tree has no active node"))
     }
 
+    #[cfg(test)]
     fn validate_context_tree_op(&self, op: ContextTreeOp) -> Result<()> {
         let mut state = self.current_context_tree_state()?;
         state.apply(&op)
@@ -1498,10 +1504,6 @@ fn journal_payload_digest(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn context_node_id_for_branch(branch_id: &str) -> String {
-    format!("branch/{branch_id}")
-}
-
 #[allow(dead_code)]
 pub fn read_records(path: impl AsRef<Path>) -> Result<Vec<TranscriptRecord>> {
     read_records_inner(path, false)
@@ -1692,6 +1694,7 @@ fn parse_records_content(
     Ok(records.into_iter().map(|entry| entry.record).collect())
 }
 
+#[cfg(test)]
 fn transcript_records_match(
     current: &[TranscriptRecord],
     expected: &[TranscriptRecord],
@@ -2188,6 +2191,7 @@ pub fn list_child_sessions_for_parent(
     )
 }
 
+#[cfg(test)]
 pub fn read_child_session_records(
     base_dir: impl AsRef<Path>,
     child_session_id: &str,
@@ -2215,6 +2219,7 @@ pub fn restore_job_board(
     transcript_projection::project_job_board(&child_sessions_dir(base_dir), parent_records)
 }
 
+#[cfg(test)]
 pub fn restore_session_history(records: &[TranscriptRecord]) -> Result<Vec<HistoryItem>> {
     transcript_projection::validate_context_projection_events(records)?;
     Ok(transcript_projection::restore_session_history_projection(
@@ -2222,12 +2227,14 @@ pub fn restore_session_history(records: &[TranscriptRecord]) -> Result<Vec<Histo
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn restore_session_protocol_frames(
     records: &[TranscriptRecord],
 ) -> Result<Vec<crate::protocol_frames::ProtocolFrame>> {
     transcript_projection::restore_session_protocol_frames_projection(records)
 }
 
+#[cfg(test)]
 pub(crate) fn restore_runtime_snapshot(
     records: &[TranscriptRecord],
 ) -> Result<crate::runtime_context::RuntimeSnapshot> {
@@ -2247,6 +2254,7 @@ pub(crate) fn restore_runtime_snapshot(
     .snapshot)
 }
 
+#[cfg(test)]
 pub fn restore_compacted_conversation_messages(
     records: &[TranscriptRecord],
 ) -> Result<Vec<ConversationMessage>> {
@@ -2256,6 +2264,7 @@ pub fn restore_compacted_conversation_messages(
         .collect())
 }
 
+#[cfg(test)]
 pub fn restore_conversation_messages(
     records: &[TranscriptRecord],
 ) -> Result<Vec<ConversationMessage>> {
@@ -2266,6 +2275,7 @@ pub fn restore_latest_model(records: &[TranscriptRecord]) -> Option<String> {
     transcript_projection::restore_latest_model_projection(records)
 }
 
+#[cfg(test)]
 pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
     restore_evidence_records(records)
 }
@@ -2302,6 +2312,7 @@ pub fn restore_latest_auto_continue_state(
     latest
 }
 
+#[cfg(test)]
 pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
     transcript_projection::restore_max_turn_id_projection(records)
 }
@@ -2423,6 +2434,7 @@ pub(crate) fn sync_recorder_branch(recorder: &mut TranscriptRecorder, branch_id:
     }
 }
 
+#[cfg(test)]
 fn required_context_return_string(data: &Value, field: &str) -> Result<String> {
     let value = data
         .get(field)
@@ -2436,6 +2448,7 @@ fn required_context_return_string(data: &Value, field: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+#[cfg(test)]
 fn optional_context_return_string(data: &Value, field: &str) -> Result<Option<String>> {
     match data.get(field) {
         Some(Value::String(value)) => {
@@ -2499,46 +2512,6 @@ fn reconstruct_context_scope_state(records: &[TranscriptRecord]) -> Result<Conte
         }
     }
     Ok(state)
-}
-
-fn slugify_branch_label(label: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = false;
-    for ch in label.chars().flat_map(|ch| ch.to_lowercase()) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-fn next_context_branch_id(
-    branches: &[transcript_projection::ContextBranchInfo],
-    label: Option<&str>,
-) -> String {
-    let existing = branches
-        .iter()
-        .map(|branch| branch.branch_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let base = label
-        .map(slugify_branch_label)
-        .filter(|slug| !slug.is_empty())
-        .unwrap_or_else(|| "branch".into());
-    if !existing.contains(base.as_str()) {
-        return base;
-    }
-    let mut suffix = 2u64;
-    loop {
-        let candidate = format!("{base}-{suffix}");
-        if !existing.contains(candidate.as_str()) {
-            return candidate;
-        }
-        suffix += 1;
-    }
 }
 
 pub(crate) fn format_context_experiment_return(
@@ -2614,6 +2587,7 @@ fn append_history_item_from_transcript_record(record: &TranscriptRecord) -> Opti
     }
 }
 
+#[cfg(test)]
 fn required_metadata_string(metadata: &Value, field: &str) -> Result<String> {
     metadata
         .get(field)
@@ -2622,6 +2596,7 @@ fn required_metadata_string(metadata: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("invalid pending metadata: missing string field '{field}'"))
 }
 
+#[cfg(test)]
 fn optional_metadata_string(metadata: &Value, field: &str) -> Option<String> {
     metadata
         .get(field)
@@ -2629,6 +2604,7 @@ fn optional_metadata_string(metadata: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[cfg(test)]
 fn optional_metadata_u32(metadata: &Value, field: &str) -> Result<Option<u32>> {
     metadata
         .get(field)
@@ -2651,6 +2627,7 @@ fn optional_metadata_u32(metadata: &Value, field: &str) -> Result<Option<u32>> {
         .map(|value| value.flatten())
 }
 
+#[cfg(test)]
 fn optional_metadata_u64(metadata: &Value, field: &str) -> Result<Option<u64>> {
     metadata
         .get(field)

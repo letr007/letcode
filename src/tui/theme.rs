@@ -148,51 +148,12 @@ impl Theme {
         Style::default().bg(self.root_bg).fg(self.text)
     }
 
-    pub fn surface_style(self) -> Style {
-        Style::default().bg(self.surface_bg).fg(self.text)
-    }
-
     pub fn elevated_style(self) -> Style {
         Style::default().bg(self.elevated_bg).fg(self.text)
     }
 
-    pub fn element_style(self) -> Style {
-        Style::default().bg(self.element_bg).fg(self.text)
-    }
-
-    pub fn border_style(self) -> Style {
-        Style::default().fg(self.border).bg(self.surface_bg)
-    }
-
-    pub fn title_style(self) -> Style {
-        Style::default()
-            .fg(self.accent)
-            .bg(self.surface_bg)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    pub fn muted_style(self) -> Style {
-        Style::default().fg(self.muted_text).bg(self.surface_bg)
-    }
-
-    pub fn dim_style(self) -> Style {
-        Style::default().fg(self.dim_text).bg(self.root_bg)
-    }
-
     pub fn user_style(self) -> Style {
         Style::default().fg(self.user).bg(self.surface_bg)
-    }
-
-    pub fn assistant_style(self) -> Style {
-        Style::default().fg(self.assistant).bg(self.surface_bg)
-    }
-
-    pub fn success_style(self) -> Style {
-        Style::default().fg(self.success).bg(self.surface_bg)
-    }
-
-    pub fn warning_style(self) -> Style {
-        Style::default().fg(self.warning).bg(self.surface_bg)
     }
 
     pub fn error_style(self) -> Style {

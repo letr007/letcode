@@ -8,14 +8,18 @@ use super::slash;
 use super::theme::{Theme, ThemeName};
 use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TimelineItem, TodoView};
 use super::transcript_render::Interaction;
-use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage};
+#[cfg(test)]
+use crate::agent::ConversationMessage;
+use crate::agent::{AutoContinueState, CacheUsageReport};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
-    self, ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
+    ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
 };
 use crate::runtime_context::RuntimeActiveContext;
 use crate::skills::SkillCard;
 use crate::tool::{QuestionOption, QuestionRequest, QuestionResponse, QuestionSpec};
+
+#[cfg(test)]
 use crate::transcript::transcript_projection;
 use crate::transcript::{
     TranscriptEvent, TranscriptRecord, restore_latest_auto_continue_state,
@@ -42,6 +46,7 @@ impl ComposerToken {
         }
     }
 
+    #[cfg(test)]
     pub fn image(&self) -> Option<&UserImageAttachment> {
         match self {
             Self::Image(attachment) => Some(attachment),
@@ -49,6 +54,7 @@ impl ComposerToken {
         }
     }
 
+    #[cfg(test)]
     pub fn skill_name(&self) -> Option<&str> {
         match self {
             Self::Image(_) => None,
@@ -146,6 +152,7 @@ impl ToastState {
         }
     }
 
+    #[cfg(test)]
     pub fn ticks_remaining(&self) -> u8 {
         self.ticks_remaining
     }
@@ -209,6 +216,8 @@ pub enum DialogKind {
     SessionPicker,
     HistoryTree,
     ContextPicker,
+    #[allow(dead_code)] // Context detail is constructed by runtime dialog routing.
+    #[allow(dead_code)] // Context detail is constructed by runtime dialog routing.
     ContextDetail,
     McpPicker,
     McpToolsPicker,
@@ -1465,6 +1474,7 @@ impl TuiState {
         };
     }
 
+    #[cfg(test)]
     pub fn transcript_scroll_offset(&self) -> u16 {
         self.transcript_scroll
     }
@@ -1505,6 +1515,7 @@ impl TuiState {
         }
     }
 
+    #[cfg(test)]
     pub fn transcript_is_at_bottom(&self, total_rows: usize, viewport_rows: u16) -> bool {
         measure::is_at_bottom(total_rows, viewport_rows, self.transcript_scroll)
     }
@@ -1523,14 +1534,6 @@ impl TuiState {
     pub fn scroll_transcript_down(&mut self, rows: u16) {
         self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
         self.auto_scroll = self.transcript_scroll == 0;
-    }
-
-    pub fn scroll_transcript_page_up(&mut self) {
-        self.scroll_transcript_up(10);
-    }
-
-    pub fn scroll_transcript_page_down(&mut self) {
-        self.scroll_transcript_down(10);
     }
 
     pub fn scroll_transcript_to_bottom(&mut self) {
@@ -1574,6 +1577,7 @@ impl TuiState {
         self.toast.as_ref()
     }
 
+    #[cfg(test)]
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
         self.context = ContextPaneState::default();
@@ -1585,11 +1589,13 @@ impl TuiState {
         self.reset_after_session_timeline_replace();
     }
 
+    #[cfg(test)]
     pub fn replace_session_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
         self.try_replace_session_timeline_from_records(records)
             .expect("context projection should be valid when replacing session timeline");
     }
 
+    #[cfg(test)]
     pub fn try_replace_session_timeline_from_records(
         &mut self,
         records: &[TranscriptRecord],
@@ -1645,6 +1651,7 @@ impl TuiState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn replace_child_timeline_from_records(
         &mut self,
         records: &[TranscriptRecord],
@@ -1667,6 +1674,7 @@ impl TuiState {
         .expect("context projection should be valid when replacing child timeline");
     }
 
+    #[cfg(test)]
     pub fn try_replace_child_timeline_from_records(
         &mut self,
         records: &[TranscriptRecord],
@@ -1777,11 +1785,13 @@ impl TuiState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn refresh_child_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
         self.try_refresh_child_timeline_from_records(records)
             .expect("context projection should be valid when refreshing child timeline");
     }
 
+    #[cfg(test)]
     pub fn try_refresh_child_timeline_from_records(
         &mut self,
         records: &[TranscriptRecord],
@@ -1798,6 +1808,7 @@ impl TuiState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn try_refresh_child_timeline_from_records_with_runtime_context(
         &mut self,
         records: &[TranscriptRecord],
@@ -1836,6 +1847,7 @@ impl TuiState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn child_view_has_live_stream(&self) -> bool {
         self.child_timeline
             .as_ref()
@@ -1912,6 +1924,7 @@ impl TuiState {
         self.active_tool_call_id = Some(permission.call_id.clone());
     }
 
+    #[cfg(test)]
     pub fn apply_child_session_event(&mut self, child_session_id: &str, event: SessionEvent) {
         self.apply_child_session_event_with_agent(child_session_id, None, None, event);
     }
@@ -2054,12 +2067,6 @@ impl TuiState {
             .with_tool_event_acceptance(accepts_tool_events),
             event,
         );
-    }
-
-    fn on_user_message(&mut self, message: UserMessageEvent) {
-        self.active_session = true;
-        self.timeline.push_user_message(message);
-        self.begin_user_turn_state();
     }
 
     fn on_permission_requested(&mut self, request: PermissionRequestEvent) {
@@ -2459,13 +2466,6 @@ fn column_to_char_offset(text: &str, target_col: u16) -> usize {
     offset
 }
 
-fn slice_chars(text: &str, start: usize, end: usize) -> String {
-    text.chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
-}
-
 struct EventProjection<'a> {
     active_session: &'a mut bool,
     latest_auto_continue: &'a mut AutoContinueState,
@@ -2830,6 +2830,7 @@ fn compact_child_projection_text(text: &str) -> String {
     truncated
 }
 
+#[cfg(test)]
 fn project_child_timeline_state(records: &[TranscriptRecord]) -> Result<ChildTranscriptState> {
     Ok(ChildTranscriptState {
         session_id: records
@@ -2844,6 +2845,7 @@ fn project_child_timeline_state(records: &[TranscriptRecord]) -> Result<ChildTra
     })
 }
 
+#[cfg(test)]
 fn project_context_pane(records: &[TranscriptRecord]) -> Result<ContextPaneState> {
     let tree = transcript_projection::project_context_tree(records)?;
     let view = transcript_projection::project_context_view(records)?;

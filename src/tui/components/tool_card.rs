@@ -1,7 +1,6 @@
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::Line,
-};
+use ratatui::style::{Color, Modifier, Style};
+#[cfg(test)]
+use ratatui::text::Line;
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -14,7 +13,6 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{PermissionPromptStatus, PermissionView, ToolExecutionStatus, ToolView},
-    transcript_ratatui,
     transcript_render::{Break, CopyJoin, Document, SemanticLine, SemanticSpan},
 };
 
@@ -184,18 +182,24 @@ pub fn permission_card_details(permission: &PermissionView) -> ToolCardDetails {
 /// Render a compact tool card into pre-wrapped transcript lines.
 ///
 /// The caller is responsible for inserting blank spacer lines between timeline items.
-pub fn render_tool_card_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+#[cfg(test)]
+pub(crate) fn render_tool_card_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
     render_tool_card_lines_with_frame(tool, theme, width, 0, false)
 }
 
-pub fn render_tool_card_lines_with_frame(
+#[cfg(test)]
+pub(crate) fn render_tool_card_lines_with_frame(
     tool: &ToolView,
     theme: Theme,
     width: usize,
     frame: usize,
     expanded_output: bool,
 ) -> Vec<Line<'static>> {
-    transcript_ratatui::document_to_ratatui(&render_tool_card_document(
+    crate::tui::transcript_ratatui::document_to_ratatui(&render_tool_card_document(
         tool,
         theme,
         width,
@@ -236,12 +240,13 @@ pub fn render_tool_card_document(
     document
 }
 
-pub fn render_permission_card_lines(
+#[cfg(test)]
+pub(crate) fn render_permission_card_lines(
     permission: &PermissionView,
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    transcript_ratatui::document_to_ratatui(&render_permission_card_document(
+    crate::tui::transcript_ratatui::document_to_ratatui(&render_permission_card_document(
         permission, theme, width,
     ))
 }

@@ -42,11 +42,11 @@ pub use events::{
 #[allow(unused_imports)]
 pub use input::{InputAction, apply_edit_action, map_key_event};
 #[allow(unused_imports)]
-pub use presentation::{PresentationPolicy, ToolPresentation, ToolPresentationContext};
+pub use presentation::{PresentationPolicy, ToolPresentation};
 #[allow(unused_imports)]
 pub use render::render;
 #[allow(unused_imports)]
-pub use runtime::{NoopDrawer, RuntimeCommand, RuntimeDrawer, StartupToast, TuiRuntime, run_tui};
+pub use runtime::{RuntimeCommand, RuntimeDrawer, StartupToast, TuiRuntime, run_tui};
 #[allow(unused_imports)]
 pub use state::{AppPhase, SelectionAnchor, TextSelection, TuiState};
 #[allow(unused_imports)]
@@ -55,6 +55,6 @@ pub use terminal::{OwnedTerminal, TerminalGuard, TuiTerminal};
 pub use theme::{Theme, ThemeName};
 #[allow(unused_imports)]
 pub use timeline::{
-    DisplayBlock, ErrorView, MessageRole, MessageView, PermissionPromptStatus, PermissionView,
-    ReasoningView, Timeline, TimelineItem, ToolExecutionStatus, ToolView,
+    ErrorView, MessageRole, MessageView, PermissionPromptStatus, PermissionView, ReasoningView,
+    Timeline, TimelineItem, ToolExecutionStatus, ToolView,
 };

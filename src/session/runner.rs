@@ -203,9 +203,17 @@ pub(crate) enum SessionTransportEvent {
     },
     CompactionFailed,
     RuntimeContextUpdated(RuntimeContextUpdatedEvent),
+    #[allow(dead_code)]
+    // Transport variants retained for context projection consumers.
     ContextTreeUpdated(ContextTreeUpdatedEvent),
+    #[allow(dead_code)]
+    // Transport variants retained for context projection consumers.
     ContextViewUpdated(ContextViewUpdatedEvent),
+    #[allow(dead_code)]
+    // Transport variants retained for context projection consumers.
     ContextDetailOpened(ContextDetailOpenedEvent),
+    #[allow(dead_code)]
+    // Transport variants retained for context projection consumers.
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     McpToolsDiscovered(Vec<crate::mcp::McpServerCatalogEntry>),
     McpServerUpdated(crate::mcp::McpServerCatalogEntry),
@@ -217,6 +225,8 @@ pub(crate) enum SessionTransportEvent {
         name: String,
         tools: Vec<crate::mcp::McpToolCatalogEntry>,
     },
+    #[allow(dead_code)]
+    // Retained so frontends can distinguish discovery failure from diagnostics.
     McpDiscoveryUnavailable(String),
     McpDiagnostic(String),
     SessionTitleUpdated {
@@ -234,6 +244,8 @@ pub(crate) enum SessionTransportEvent {
         token_usage: Option<TokenUsageEvent>,
         runtime_context: RuntimeActiveContext,
     },
+    #[allow(dead_code)]
+    // Branch changes are consumed by the TUI transport projection.
     ContextBranchChanged {
         branch_id: String,
     },
@@ -493,6 +505,7 @@ where
 }
 
 impl<C: Config> AgentRunner<C> {
+    #[cfg(test)]
     pub fn subagent_event_sender(event_tx: SessionTransportEventSender) -> SubagentEventSender<C>
     where
         C: Clone + Send + Sync + 'static,
@@ -500,6 +513,7 @@ impl<C: Config> AgentRunner<C> {
         subagent_event_sender(event_tx)
     }
 
+    #[cfg(test)]
     pub fn new(event_tx: SessionTransportEventSender) -> Self {
         Self {
             event_tx: Some(event_tx),
@@ -548,6 +562,7 @@ impl<C: Config> AgentRunner<C> {
         self_
     }
 
+    #[cfg(test)]
     pub fn silent_with_transcript(transcript: Arc<Mutex<TranscriptRecorder>>) -> Self {
         Self {
             event_tx: None,
@@ -611,6 +626,7 @@ impl<C: Config> AgentRunner<C> {
         self.run_prompt_with_options(agent, prompt, true).await
     }
 
+    #[cfg(test)]
     pub async fn run_internal_prompt(
         &self,
         agent: &mut Agent<C>,
@@ -1297,12 +1313,14 @@ impl<C: Config> AgentRunner<C> {
         }
     }
 
+    #[cfg(test)]
     pub fn record_model_changed(&self, previous_model: &str, new_model: &str) -> Result<()> {
         self.record(|recorder| {
             recorder.record_model_changed(previous_model.to_string(), new_model.to_string())
         })
     }
 
+    #[cfg(test)]
     pub fn record_permission_mode_changed(
         &self,
         previous_mode: &str,

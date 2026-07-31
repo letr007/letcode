@@ -36,9 +36,9 @@ use super::state::{
 };
 use super::terminal::OwnedTerminal;
 use super::theme::ThemeName;
-use crate::session::{
-    RunnerPermissionRequest, RunnerQuestionRequest, SessionEngine, SessionTransportEvent,
-};
+#[cfg(test)]
+use crate::session::RunnerPermissionRequest;
+use crate::session::{RunnerQuestionRequest, SessionEngine, SessionTransportEvent};
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/history_tree_dialog.rs"]
@@ -199,6 +199,7 @@ pub struct AvailableModel {
 }
 
 impl AvailableModel {
+    #[cfg(test)]
     pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -209,6 +210,7 @@ impl AvailableModel {
         }
     }
 
+    #[cfg(test)]
     pub fn with_context_window(
         id: impl Into<String>,
         label: impl Into<String>,
@@ -298,15 +300,6 @@ pub trait RuntimeDrawer {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
 }
 
-#[derive(Debug, Default)]
-pub struct NoopDrawer;
-
-impl RuntimeDrawer for NoopDrawer {
-    fn draw(&mut self, _state: &mut TuiState) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 pub struct TuiRuntime {
     state: TuiState,
     session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
@@ -368,6 +361,7 @@ impl TuiRuntime {
         &self.state
     }
 
+    #[cfg(test)]
     pub fn state_mut(&mut self) -> &mut TuiState {
         &mut self.state
     }
@@ -388,10 +382,12 @@ impl TuiRuntime {
         self.state.show_toast(message, kind);
     }
 
+    #[cfg(test)]
     pub fn submitted_prompts(&self) -> &[String] {
         &self.submitted_prompts
     }
 
+    #[cfg(test)]
     pub fn pending_permission_handle(&self) -> Option<&RunnerPermissionRequest> {
         self.permission_lifecycle.handle()
     }
@@ -629,10 +625,6 @@ impl TuiRuntime {
         {
             question.custom_edit_cursor = question.custom_edit_text.len();
         }
-    }
-
-    pub fn into_state(self) -> TuiState {
-        self.state
     }
 
     pub fn try_drain_session_events(&mut self) {
@@ -939,12 +931,12 @@ impl TuiRuntime {
                 branch_id,
                 messages,
                 records,
-                evidence_count,
+                evidence_count: _,
                 model_id,
                 token_usage,
                 runtime_context,
             } => {
-                let message_count = messages.len();
+                let _message_count = messages.len();
                 if let Err(error) = self
                     .state
                     .try_replace_session_timeline_from_records_with_runtime_context(
@@ -1141,10 +1133,6 @@ impl TuiRuntime {
             .matches_call(call_id, child_session_id)
     }
 
-    fn pending_permission_belongs_to_parent(&self) -> bool {
-        self.permission_lifecycle.belongs_to_parent()
-    }
-
     fn child_event_clears_pending_permission(
         &self,
         child_session_id: &str,
@@ -1228,7 +1216,6 @@ impl TuiRuntime {
                 self.state.scroll_transcript_down(1);
                 Ok(None)
             }
-            InputAction::MouseClick => Ok(None),
             InputAction::CycleReasoningEffort => {
                 if self.state.is_read_only_child_view() {
                     self.push_child_view_read_only_notice();
@@ -1567,16 +1554,6 @@ impl TuiRuntime {
 
     pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
         drawer.draw(&mut self.state)
-    }
-
-    pub fn run<D: RuntimeDrawer>(
-        &mut self,
-        terminal: &mut OwnedTerminal,
-        drawer: &mut D,
-    ) -> io::Result<()> {
-        self.try_drain_session_events();
-        self.update_terminal_title(terminal)?;
-        self.draw(drawer)
     }
 
     fn has_active_or_pending_session_turn(&self) -> bool {
@@ -1952,7 +1929,7 @@ impl TuiRuntime {
 
         self.state.set_tool_output_expanded(mode.expanded());
         let prefs = self.tui_preferences();
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(_error) = prefs.save_to_dir(&self.preferences_dir) {
             self.state
                 .show_toast("Tool output mode changed", ToastKind::Info);
             return Ok(Some(SubmittedCommand::LocalOnly));
@@ -1974,7 +1951,7 @@ impl TuiRuntime {
         };
         self.state.set_transcript_scrollbar_visible(visible);
         let prefs = self.tui_preferences();
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(_error) = prefs.save_to_dir(&self.preferences_dir) {
             self.state
                 .show_toast("Transcript scrollbar", ToastKind::Info);
             return SubmittedCommand::LocalOnly;
@@ -2914,10 +2891,6 @@ fn reasoning_dialog_selected_index(
         .unwrap_or(0)
 }
 
-fn short_session_id(session_id: &str) -> &str {
-    session_id.get(..12).unwrap_or(session_id)
-}
-
 fn child_view_allows_prompt(prompt: &str) -> bool {
     let prompt = prompt.trim();
     if prompt.eq_ignore_ascii_case("exit") || prompt.eq_ignore_ascii_case("quit") {
@@ -2958,15 +2931,9 @@ impl LocalToolOutputMode {
     fn expanded(self) -> bool {
         matches!(self, Self::Expanded)
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Expanded => "expanded",
-            Self::Truncated => "truncated",
-        }
-    }
 }
 
+#[cfg(test)]
 fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogItem> {
     let mut items = Vec::new();
 
@@ -3071,6 +3038,7 @@ fn context_detail_available(
     super::state::context_detail_target_exists(context, target)
 }
 
+#[cfg(test)]
 fn context_detail_dialog(
     context: &super::state::ContextPaneState,
     target: &ContextDetailTarget,
@@ -3164,6 +3132,7 @@ fn context_detail_dialog(
     ))
 }
 
+#[cfg(test)]
 fn context_node_depth(tree: &crate::context_tree::ContextTreeState, node_id: &str) -> usize {
     let mut depth = 0usize;
     let mut current = tree
@@ -3182,6 +3151,7 @@ fn context_node_depth(tree: &crate::context_tree::ContextTreeState, node_id: &st
     depth
 }
 
+#[cfg(test)]
 fn context_block_status_labels(
     view: &crate::context_view::ContextViewProjection,
     block: &crate::context_view::ContextBlock,
@@ -3206,6 +3176,7 @@ fn context_block_status_labels(
     labels
 }
 
+#[cfg(test)]
 fn block_source_label(block: &crate::context_view::ContextBlock) -> &'static str {
     match block.source {
         crate::context_view::ContextBlockSource::TranscriptSpan { .. } => "Source",
@@ -3213,6 +3184,7 @@ fn block_source_label(block: &crate::context_view::ContextBlock) -> &'static str
     }
 }
 
+#[cfg(test)]
 fn context_block_detail_lines(
     block: &crate::context_view::ContextBlock,
     view: &crate::context_view::ContextViewProjection,
@@ -3238,6 +3210,7 @@ fn context_block_detail_lines(
     lines
 }
 
+#[cfg(test)]
 fn truncate_dialog_text(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= 120 {
@@ -6646,11 +6619,6 @@ mod tests {
             1,
         );
 
-        let command = runtime
-            .handle_input_action(InputAction::MouseClick)
-            .expect("mouse click succeeds");
-
-        assert_eq!(command, None);
         assert!(runtime.state().is_read_only_child_view());
     }
 

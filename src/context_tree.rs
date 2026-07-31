@@ -225,6 +225,7 @@ impl ContextTreeState {
         self.nodes.values()
     }
 
+    #[cfg(test)]
     pub(crate) fn node_count(&self) -> usize {
         self.nodes.len()
     }

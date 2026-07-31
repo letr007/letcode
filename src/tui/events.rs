@@ -4,11 +4,16 @@
 //! existing TUI event names while migration proceeds.
 
 pub use crate::session::{
-    AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
-    ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
-    NoticeEvent, NoticeKind, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
-    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RetryLifecycleEvent,
+    AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeKind, PermissionDecision,
+    PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
     RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent,
-    TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
-    ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
+    ToolStartedEvent, UserMessageEvent,
+};
+
+// 仅测试模块引用的历史别名。
+#[cfg(test)]
+pub use crate::session::{
+    ContextTreeUpdatedEvent, ContextViewUpdatedEvent, NoticeEvent, ProcessIssueEvent,
+    RetryLifecycleEvent, ToolCancelledEvent,
 };

@@ -68,7 +68,7 @@ pub(super) fn restore_history_projection(
     let mut history: Vec<HistoryProjectionEntry> = Vec::new();
     let mut active_turn_id = None;
     let mut active_segment_id = None;
-    for (index, record) in records.iter().enumerate() {
+    for (_index, record) in records.iter().enumerate() {
         match &record.event {
             TranscriptEvent::TurnStarted(event) => {
                 // Recorders historically append the user frame before the start

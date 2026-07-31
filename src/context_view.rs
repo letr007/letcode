@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -6,7 +6,6 @@ use std::fmt;
 
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::runtime_context::SourceSpan;
-use crate::tool_names;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -138,6 +137,7 @@ impl Default for ContextViewState {
 }
 
 impl ContextViewState {
+    #[cfg(test)]
     pub(crate) fn replay(
         blocks: &BTreeMap<ContextBlockId, ContextBlock>,
         operations: &[ContextViewOperation],
@@ -374,19 +374,13 @@ impl ContextViewProjection {
             )
     }
 
-    pub(crate) fn is_addressable(&self, block_id: &ContextBlockId) -> bool {
-        !self.is_compacted(block_id)
-            && !matches!(
-                self.status_for(block_id),
-                ContextViewStatus::RemovedFromView | ContextViewStatus::Resolved
-            )
-    }
     pub(crate) fn open_summary_artifact(&self, artifact_id: &str) -> Option<&SummaryArtifact> {
         self.summary_artifacts
             .iter()
             .find(|artifact| artifact.artifact_id == artifact_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn list_summary_artifacts_for_node(&self, node_id: &str) -> Vec<&SummaryArtifact> {
         self.summary_artifacts
             .iter()
@@ -479,18 +473,10 @@ impl ContextViewProjection {
 
     /// Compacted blocks remain runtime provenance frames on restore even though
     /// they are no longer prompt-visible.
-    pub(crate) fn provider_compacted_block_ids(&self) -> Vec<String> {
-        sorted_context_blocks(self)
-            .into_iter()
-            .filter(|(block_id, _)| self.is_compacted(block_id))
-            .map(|(block_id, _)| block_id.as_str().to_string())
-            .collect()
-    }
-
     pub(crate) fn provider_pinned_block_ids(&self) -> Vec<String> {
         sorted_context_blocks(self)
             .into_iter()
-            .filter(|(block_id, block)| {
+            .filter(|(block_id, _block)| {
                 !self.is_compacted(block_id) && self.is_pinned_visible(block_id)
             })
             .map(|(block_id, _)| block_id.as_str().to_string())
@@ -499,7 +485,7 @@ impl ContextViewProjection {
 
     pub(crate) fn provider_open_detail_block_id(&self) -> Option<String> {
         let block_id = self.view_state.open_detail_block_id()?;
-        let block = self.blocks.get(block_id)?;
+        let _block = self.blocks.get(block_id)?;
         if self.is_compacted(block_id)
             || self.status_for(block_id) == ContextViewStatus::RemovedFromView
             || self.is_resolved(block_id)
@@ -529,6 +515,7 @@ fn sorted_context_blocks(
     blocks
 }
 
+#[allow(dead_code)] // Kept as the direct transcript projection API for internal callers and focused tests.
 pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<ContextViewProjection> {
     crate::transcript::transcript_projection::validate_context_projection_events(records)?;
     project_context_view_unvalidated(records)

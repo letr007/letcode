@@ -1,7 +1,6 @@
-use ratatui::{
-    style::{Modifier, Style},
-    text::Line,
-};
+use ratatui::style::{Modifier, Style};
+#[cfg(test)]
+use ratatui::text::Line;
 
 use crate::{
     agent::{TodoItem, TodoStatus},
@@ -10,15 +9,21 @@ use crate::{
         surface,
         theme::Theme,
         timeline::TodoView,
-        transcript_ratatui,
         transcript_render::{Break, Document, Line as RenderLine, SourceRange, Span},
     },
 };
 
 /// Legacy visual API. Its output is always the renderer bridge of the semantic
 /// document, so it cannot introduce or discard provenance before projection.
-pub fn render_todo_card_lines(todo: &TodoView, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    transcript_ratatui::document_to_ratatui(&render_todo_card_document(todo, theme, width))
+#[cfg(test)]
+pub(crate) fn render_todo_card_lines(
+    todo: &TodoView,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    crate::tui::transcript_ratatui::document_to_ratatui(&render_todo_card_document(
+        todo, theme, width,
+    ))
 }
 
 pub fn render_todo_card_document(todo: &TodoView, theme: Theme, width: usize) -> Document<Style> {

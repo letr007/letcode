@@ -229,7 +229,7 @@ pub(super) fn prompt_segment_to_chat_message(
                     })
                     .collect(),
             ),
-            function_call: None,
+            ..Default::default()
         }),
         (
             PromptSegmentRole::Tool,
@@ -400,11 +400,7 @@ fn prelude_to_chat_message(message: PromptMessage) -> ChatCompletionRequestMessa
 fn chat_assistant_text(text: String) -> ChatCompletionRequestMessage {
     ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
         content: Some(ChatCompletionRequestAssistantMessageContent::Text(text)),
-        refusal: None,
-        name: None,
-        audio: None,
-        tool_calls: None,
-        function_call: None,
+        ..Default::default()
     })
 }
 
