@@ -32,7 +32,7 @@ use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
     ContextDetailTarget, DialogItem, DialogKind, DialogState, McpDiscoveryState,
-    PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
+    PendingQuestionState, QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::theme::ThemeName;
@@ -2068,8 +2068,8 @@ impl TuiRuntime {
                 Some("Allow read/preview, ask for risky tools".into()),
             ),
             DialogItem::new(
-                "solo",
-                "Solo",
+                "yolo",
+                "YOLO",
                 Some("Allow write and command tools without asking".into()),
             ),
         ];
@@ -2081,7 +2081,7 @@ impl TuiRuntime {
         );
         dialog.selected = match self.state.permission_mode_label.as_str() {
             "safe" => 0,
-            "solo" => 2,
+            "yolo" => 2,
             _ => 1,
         };
         self.state.open_dialog(dialog);
@@ -2413,7 +2413,7 @@ impl TuiRuntime {
                 self.state.close_dialog();
                 let mode = match selected.id.as_str() {
                     "safe" => PermissionMode::Safe,
-                    "solo" => PermissionMode::Solo,
+                    "yolo" => PermissionMode::Yolo,
                     _ => PermissionMode::Default,
                 };
                 let label = mode.to_string();
@@ -2662,6 +2662,14 @@ impl TuiRuntime {
         }
     }
 
+    fn handle_transcript_click(&mut self, col: u16, row: u16) {
+        if let Some(TranscriptClickTarget::ToolCard(call_id)) =
+            self.state.transcript_click_target(col, row)
+        {
+            self.state.toggle_tool_output(&call_id);
+        }
+    }
+
     fn handle_selection_start(&mut self, col: u16, row: u16) {
         // 落在 transcript 内容区外不开始选择；点击空白/spacer 也返回 None
         if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
@@ -2670,11 +2678,13 @@ impl TuiRuntime {
                 end: anchor,
             });
             self.state.selection_in_progress = true;
+            self.state.selection_dragged = false;
             self.state.selection_last_mouse = Some((col, row));
         } else {
             // 在 transcript 外点击：清除现有选择，避免残留高亮
             self.state.text_selection = None;
             self.state.selection_in_progress = false;
+            self.state.selection_dragged = false;
             self.state.selection_last_mouse = None;
         }
     }
@@ -2683,6 +2693,7 @@ impl TuiRuntime {
         if !self.state.selection_in_progress {
             return;
         }
+        self.state.selection_dragged = true;
         self.state.selection_last_mouse = Some((col, row));
         if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
             if let Some(selection) = &mut self.state.text_selection {
@@ -2692,14 +2703,21 @@ impl TuiRuntime {
     }
 
     fn handle_selection_end(&mut self, col: u16, row: u16) {
-        self.handle_selection_drag(col, row);
+        let dragged = self.state.selection_dragged;
+        if dragged {
+            self.handle_selection_drag(col, row);
+        }
         self.state.selection_in_progress = false;
+        self.state.selection_dragged = false;
         self.state.selection_last_mouse = None;
         // 抛弃零宽选择（单击未拖动），避免接管 Ctrl+C 复制语义且无视觉反馈
         if let Some(selection) = &self.state.text_selection {
             if selection.start == selection.end {
                 self.state.text_selection = None;
             }
+        }
+        if !dragged {
+            self.handle_transcript_click(col, row);
         }
     }
 
@@ -3346,11 +3364,15 @@ pub async fn run_tui(
 
 struct TerminalDrawer<'a> {
     terminal: &'a mut OwnedTerminal,
+    applied_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
 }
 
 impl<'a> TerminalDrawer<'a> {
     fn new(terminal: &'a mut OwnedTerminal) -> Self {
-        Self { terminal }
+        Self {
+            terminal,
+            applied_hyperlink_cells: Vec::new(),
+        }
     }
 
     fn set_title(&mut self, title: &str) -> io::Result<()> {
@@ -3368,7 +3390,14 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
         // frame does not set a cursor position, so a briefly-visible caret during
         // buffer writes looks like it is jumping across the UI.
         let _ = terminal.hide_cursor();
-        terminal.draw(|frame| render::render(frame, state))?;
+        let completed = terminal.draw(|frame| render::render(frame, state))?;
+        let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
+            completed.buffer,
+            &self.applied_hyperlink_cells,
+            &state.frame_hyperlink_cells,
+        );
+        super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
+        self.applied_hyperlink_cells = overlay.applied;
         let _ = terminal.hide_cursor();
         Ok(())
     }
@@ -7875,7 +7904,7 @@ mod tests {
         assert_eq!(dialog.selected, 1);
         assert_eq!(dialog.items.len(), 3);
         assert_eq!(dialog.items[0].label, "Safe");
-        assert_eq!(dialog.items[2].label, "Solo");
+        assert_eq!(dialog.items[2].label, "YOLO");
     }
 
     #[test]
@@ -7900,8 +7929,8 @@ mod tests {
                     Some("Allow read/preview, ask for risky tools".into()),
                 ),
                 DialogItem::new(
-                    "solo",
-                    "Solo",
+                    "yolo",
+                    "YOLO",
                     Some("Allow write and command tools without asking".into()),
                 ),
             ],
@@ -7918,10 +7947,10 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::SetPermissionMode(PermissionMode::Solo))
+            Some(RuntimeCommand::SetPermissionMode(PermissionMode::Yolo))
         );
         assert!(runtime.state().dialog().is_none());
-        assert_eq!(runtime.state().permission_mode_label, "solo");
+        assert_eq!(runtime.state().permission_mode_label, "yolo");
     }
 
     #[test]

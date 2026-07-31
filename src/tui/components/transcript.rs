@@ -90,6 +90,16 @@ impl TranscriptRenderCache {
         self.entries = entries;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_row_metadata_for_test(
+        &mut self,
+        row_starts: Vec<usize>,
+        row_counts: Vec<usize>,
+    ) {
+        self.row_starts = row_starts;
+        self.row_counts = row_counts;
+    }
+
     /// 获取行起始位置的引用（用于坐标映射）
     pub fn row_starts(&self) -> &[usize] {
         &self.row_starts
@@ -150,6 +160,12 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     let paragraph = Paragraph::new(Text::from(visible_lines)).style(theme.app_style());
 
     frame.render_widget(paragraph, content_area);
+    let visible_lines = visible_document_lines(state, visible_rows, scroll);
+    state.frame_hyperlink_cells = transcript_ratatui::collect_hyperlink_cells(
+        frame.buffer_mut(),
+        content_area,
+        &visible_lines,
+    );
 
     if let Some(scrollbar_area) = scrollbar_area
         && total_rows > visible_rows as usize
@@ -205,7 +221,7 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
                 theme,
                 width,
                 state.status_spinner_frame,
-                state.tool_output_expanded,
+                tool_output_expanded_for_item(state, item),
             ),
         ));
     }
@@ -360,6 +376,25 @@ fn visible_cached_transcript_lines(
     visible
 }
 
+fn visible_document_lines(
+    state: &TuiState,
+    visible_rows: u16,
+    top_scroll: u16,
+) -> Vec<Option<&RenderLine<Style>>> {
+    let mut rows = vec![None; surface::TRANSCRIPT_TOP_SPACER];
+    for (index, entry) in state.transcript_render_cache.entries.iter().enumerate() {
+        if index > 0
+            && timeline_item_needs_separator_before(&state.active_timeline().items()[index])
+        {
+            rows.push(None);
+        }
+        rows.extend(entry.document.lines.iter().map(Some));
+    }
+    let start = (top_scroll as usize).min(rows.len());
+    let end = start.saturating_add(visible_rows as usize).min(rows.len());
+    rows.drain(start..end).collect()
+}
+
 fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
     let timeline = state.active_timeline();
     state.transcript_render_cache.row_metadata_revision == Some(timeline.mutation_revision())
@@ -368,6 +403,17 @@ fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
 
 fn timeline_item_needs_separator_before(item: &TimelineItem) -> bool {
     !matches!(item, TimelineItem::Todo(_))
+}
+
+fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool {
+    match item {
+        TimelineItem::Tool(tool) => state
+            .tool_output_overrides
+            .get(&tool.call_id)
+            .copied()
+            .unwrap_or(state.tool_output_expanded),
+        _ => state.tool_output_expanded,
+    }
 }
 
 fn cached_item_line_count(state: &mut TuiState, index: usize, theme: Theme, width: usize) -> usize {
@@ -419,7 +465,7 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         theme,
         width,
         state.status_spinner_frame,
-        state.tool_output_expanded,
+        tool_output_expanded_for_item(state, &item),
     );
     let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;

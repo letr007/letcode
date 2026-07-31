@@ -47,7 +47,7 @@ sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
 [permissions]
-mode = "default"
+mode = "default" # safe/default/yolo；读取时兼容旧的 solo
 
 # 可选的本地执行策略。经过审查的读取工具可以声明支持并行；
 # 其他工具保持单例执行，除非其处理器明确选择并行。

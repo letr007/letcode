@@ -35,6 +35,12 @@ pub enum CopyJoin {
     Space,
 }
 
+/// A local action associated with a rendered semantic span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Interaction {
+    OpenUrl(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Span<S> {
     pub text: String,
@@ -43,6 +49,8 @@ pub struct Span<S> {
     pub source: Option<SourceRange>,
     /// Separator inserted before this leaf when copying across distinct sources.
     pub copy_join: CopyJoin,
+    /// Semantic local action retained through layout transformations.
+    pub interaction: Option<Interaction>,
 }
 
 impl<S> Span<S> {
@@ -52,6 +60,7 @@ impl<S> Span<S> {
             style,
             source: None,
             copy_join: CopyJoin::Concat,
+            interaction: None,
         }
     }
 
@@ -66,11 +75,22 @@ impl<S> Span<S> {
         source: SourceRange,
         copy_join: CopyJoin,
     ) -> Self {
+        Self::source_with_interaction(text, style, source, copy_join, None)
+    }
+
+    pub fn source_with_interaction(
+        text: impl Into<String>,
+        style: S,
+        source: SourceRange,
+        copy_join: CopyJoin,
+        interaction: Option<Interaction>,
+    ) -> Self {
         Self {
             text: text.into(),
             style,
             source: Some(source),
             copy_join,
+            interaction,
         }
     }
 }
@@ -88,6 +108,7 @@ pub struct SemanticSpan<S> {
     pub style: S,
     pub copy: bool,
     pub copy_join: CopyJoin,
+    pub interaction: Option<Interaction>,
 }
 
 impl<S> SemanticSpan<S> {
@@ -97,6 +118,7 @@ impl<S> SemanticSpan<S> {
             style,
             copy: false,
             copy_join: CopyJoin::Concat,
+            interaction: None,
         }
     }
 
@@ -105,11 +127,21 @@ impl<S> SemanticSpan<S> {
     }
 
     pub fn source_with_join(text: impl Into<String>, style: S, copy_join: CopyJoin) -> Self {
+        Self::source_with_interaction(text, style, copy_join, None)
+    }
+
+    pub fn source_with_interaction(
+        text: impl Into<String>,
+        style: S,
+        copy_join: CopyJoin,
+        interaction: Option<Interaction>,
+    ) -> Self {
         Self {
             text: text.into(),
             style,
             copy: true,
             copy_join,
+            interaction,
         }
     }
 }
@@ -188,11 +220,12 @@ impl<S> Document<S> {
                 if span.copy && !span.text.is_empty() {
                     let end = span.text.chars().count();
                     let block = self.add_source(span.text.clone());
-                    Span::source_with_join(
+                    Span::source_with_interaction(
                         span.text,
                         span.style,
                         SourceRange::new(block, 0, end),
                         span.copy_join,
+                        span.interaction,
                     )
                 } else {
                     Span::decoration(span.text, span.style)
@@ -318,6 +351,24 @@ pub trait Component<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_interaction_is_preserved_by_semantic_lines() {
+        let mut document = Document::<()>::default();
+        document.push_semantic_line(SemanticLine {
+            spans: vec![SemanticSpan::source_with_interaction(
+                "docs",
+                (),
+                CopyJoin::Concat,
+                Some(Interaction::OpenUrl("https://example.test".into())),
+            )],
+            boundary: Break::End,
+        });
+        assert_eq!(
+            document.lines[0].spans[0].interaction,
+            Some(Interaction::OpenUrl("https://example.test".into()))
+        );
+    }
 
     #[test]
     fn document_rejects_out_of_bounds_source_range() {

@@ -6,7 +6,8 @@ use super::events::{
 use super::measure;
 use super::slash;
 use super::theme::{Theme, ThemeName};
-use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TodoView};
+use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TimelineItem, TodoView};
+use super::transcript_render::Interaction;
 use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
@@ -64,6 +65,11 @@ use std::collections::{HashMap, HashSet};
 pub struct TextSelection {
     pub start: SelectionAnchor,
     pub end: SelectionAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptClickTarget {
+    ToolCard(String),
 }
 
 impl TextSelection {
@@ -853,8 +859,10 @@ pub struct TuiState {
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
     pub tool_output_expanded: bool,
+    pub tool_output_overrides: HashMap<String, bool>,
     pub theme_name: ThemeName,
     pub transcript_render_cache: TranscriptRenderCache,
+    pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub toast: Option<ToastState>,
@@ -864,6 +872,8 @@ pub struct TuiState {
     pub text_selection: Option<TextSelection>,
     /// 是否正在进行鼠标拖拽选择
     pub selection_in_progress: bool,
+    /// The current press has emitted a drag event and must not trigger a click action.
+    pub selection_dragged: bool,
     /// 最后渲染的 transcript 文本区域（content_area，不含 scrollbar 列，用于鼠标坐标映射）
     pub last_transcript_area: ratatui::layout::Rect,
     /// 最后渲染时已解析为 top-relative 的滚动顶部偏移（0 = 全文第一行可见）
@@ -918,8 +928,10 @@ impl Default for TuiState {
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
             tool_output_expanded: false,
+            tool_output_overrides: HashMap::new(),
             theme_name: ThemeName::default(),
             transcript_render_cache: TranscriptRenderCache::default(),
+            frame_hyperlink_cells: Vec::new(),
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
             toast: None,
@@ -927,6 +939,7 @@ impl Default for TuiState {
             ignore_late_tool_events: false,
             text_selection: None,
             selection_in_progress: false,
+            selection_dragged: false,
             last_transcript_area: ratatui::layout::Rect::default(),
             last_transcript_scroll_top: 0,
             selection_last_mouse: None,
@@ -999,6 +1012,18 @@ impl TuiState {
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }
+    }
+
+    pub fn toggle_tool_output(&mut self, call_id: &str) {
+        let expanded = !self
+            .tool_output_overrides
+            .get(call_id)
+            .copied()
+            .unwrap_or(self.tool_output_expanded);
+        self.tool_output_overrides
+            .insert(call_id.to_string(), expanded);
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
     }
 
     pub fn set_transcript_scrollbar_visible(&mut self, visible: bool) {
@@ -2245,6 +2270,54 @@ impl TuiState {
     /// 使用渲染时存的 `last_transcript_area`（content_area，不含 scrollbar 列）
     /// 与 `last_transcript_scroll_top`（已解析为 top-relative 偏移）。这两者都来自
     /// 渲染阶段，保证点击坐标和高亮坐标系完全一致。
+    pub fn transcript_click_target(
+        &self,
+        terminal_col: u16,
+        terminal_row: u16,
+    ) -> Option<TranscriptClickTarget> {
+        let area = self.last_transcript_area;
+        if terminal_col < area.left()
+            || terminal_col >= area.right()
+            || terminal_row < area.top()
+            || terminal_row >= area.bottom()
+            || area.width == 0
+            || area.height == 0
+        {
+            return None;
+        }
+
+        let absolute_row =
+            (terminal_row - area.y) as usize + self.last_transcript_scroll_top as usize;
+        let cache = &self.transcript_render_cache;
+        let item_index = match cache.row_starts().binary_search(&absolute_row) {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        let entry = cache.entries().get(item_index)?;
+        let rendered_line_offset =
+            absolute_row.saturating_sub(*cache.row_starts().get(item_index)?);
+        let line = entry.document.lines.get(rendered_line_offset)?;
+        let local_col = terminal_col - area.x;
+        let mut visual_col = 0u16;
+        for span in &line.spans {
+            let span_width = crate::tui::measure::display_width(&span.text) as u16;
+            if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
+                if matches!(span.interaction, Some(Interaction::OpenUrl(_))) {
+                    return None;
+                }
+                break;
+            }
+            visual_col = visual_col.saturating_add(span_width);
+        }
+
+        match self.active_timeline().items().get(item_index) {
+            Some(TimelineItem::Tool(tool)) => {
+                Some(TranscriptClickTarget::ToolCard(tool.call_id.clone()))
+            }
+            _ => None,
+        }
+    }
+
     pub fn map_mouse_to_anchor(
         &self,
         terminal_col: u16,
@@ -3611,6 +3684,58 @@ mod tests {
                 if tool.call_id == "call-pending"
                     && tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
         ));
+    }
+
+    #[test]
+    fn markdown_link_click_does_not_toggle_its_tool_card() {
+        let mut state = TuiState::default();
+        state.last_transcript_area = ratatui::layout::Rect::new(0, 0, 8, 1);
+        let mut document = crate::tui::transcript_render::Document::default();
+        let block = document.add_source("docs");
+        document.push_line(
+            crate::tui::transcript_render::Line {
+                spans: vec![
+                    crate::tui::transcript_render::Span::source_with_interaction(
+                        "docs",
+                        ratatui::style::Style::default(),
+                        crate::tui::transcript_render::SourceRange::new(block, 0, 4),
+                        crate::tui::transcript_render::CopyJoin::Concat,
+                        Some(crate::tui::transcript_render::Interaction::OpenUrl(
+                            "https://example.test".into(),
+                        )),
+                    ),
+                ],
+            },
+            crate::tui::transcript_render::Break::End,
+        );
+        state.transcript_render_cache.set_entries_for_test(vec![
+            crate::tui::components::transcript::TranscriptRenderCacheEntry {
+                revision: None,
+                document,
+            },
+        ]);
+        state
+            .transcript_render_cache
+            .set_row_metadata_for_test(vec![0], vec![1]);
+        state
+            .timeline
+            .push_tool_started(crate::tui::events::ToolStartedEvent::new(
+                "call-1",
+                "shell__exec",
+                "run",
+            ));
+
+        assert_eq!(state.transcript_click_target(0, 0), None);
+    }
+
+    #[test]
+    fn per_tool_output_override_uses_global_preference_as_its_default() {
+        let mut state = TuiState::default();
+        state.tool_output_expanded = true;
+        state.toggle_tool_output("call-1");
+        assert_eq!(state.tool_output_overrides.get("call-1"), Some(&false));
+        state.toggle_tool_output("call-1");
+        assert_eq!(state.tool_output_overrides.get("call-1"), Some(&true));
     }
 
     #[test]

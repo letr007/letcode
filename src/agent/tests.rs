@@ -5799,8 +5799,8 @@ async fn apply_patch_permission_modes_authorize_external_and_mixed_batches() {
         (PermissionMode::Default, "mixed"),
         (PermissionMode::Safe, "external"),
         (PermissionMode::Safe, "mixed"),
-        (PermissionMode::Solo, "external"),
-        (PermissionMode::Solo, "mixed"),
+        (PermissionMode::Yolo, "external"),
+        (PermissionMode::Yolo, "mixed"),
     ] {
         let external = fixture
             .external
@@ -5852,7 +5852,7 @@ async fn apply_patch_permission_modes_authorize_external_and_mixed_batches() {
             .await
             .expect("approved patch executes");
 
-        assert_eq!(approvals, usize::from(mode != PermissionMode::Solo));
+        assert_eq!(approvals, usize::from(mode != PermissionMode::Yolo));
         assert_eq!(writable_event_phases(&events), vec![true, true]);
         assert_eq!(record.status, ToolExecutionStatus::Executed);
         assert_eq!(record.rejection, None);
@@ -6378,7 +6378,7 @@ async fn writable_unresolvable_rebind_is_a_post_started_security_failure() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn writable_tools_cover_allow_once_and_solo_external_execution_events() {
+async fn writable_tools_cover_allow_once_and_yolo_external_execution_events() {
     let fixture = UnixWritableFixture::new("mode-events");
     for (tool, mode) in [
         ("fs__write", PermissionMode::Default),
@@ -6435,13 +6435,13 @@ async fn writable_tools_cover_allow_once_and_solo_external_execution_events() {
     }
 
     for tool in ["fs__write", "fs__append"] {
-        let path = fixture.external.join(format!("solo-{tool}"));
+        let path = fixture.external.join(format!("yolo-{tool}"));
         if tool == "fs__append" {
             std::fs::write(&path, "seed").expect("seed append target");
         }
-        let call = writable_call(&format!("solo-{tool}"), tool, &path, "solo");
+        let call = writable_call(&format!("yolo-{tool}"), tool, &path, "yolo");
         let mut agent = test_agent();
-        agent.set_permission_mode(PermissionMode::Solo);
+        agent.set_permission_mode(PermissionMode::Yolo);
         let mut approvals = 0;
         let mut events = Vec::new();
         let record = agent
@@ -6457,18 +6457,18 @@ async fn writable_tools_cover_allow_once_and_solo_external_execution_events() {
                 },
             )
             .await
-            .expect("solo execution");
+            .expect("yolo execution");
         assert_eq!(approvals, 0, "{tool}");
         assert_eq!(writable_event_phases(&events), vec![true, true], "{tool}");
         assert!(record.output.ok, "{tool}: {:?}", record.output.error);
         assert_eq!(
-            std::fs::read_to_string(&path).expect("solo target"),
+            std::fs::read_to_string(&path).expect("yolo target"),
             if tool == "fs__append" {
-                "seedsolo"
+                "seedyolo"
             } else {
-                "solo"
+                "yolo"
             },
-            "{tool} solo effect"
+            "{tool} yolo effect"
         );
     }
 }
@@ -6610,9 +6610,9 @@ async fn writable_tools_cover_post_started_rebind_failures() {
 }
 
 #[tokio::test]
-async fn solo_external_workspace_read_executes_without_approval() {
+async fn yolo_external_workspace_read_executes_without_approval() {
     let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Solo);
+    agent.set_permission_mode(PermissionMode::Yolo);
     let outside_path = std::env::temp_dir().join(format!(
         "letcode-outside-agent-read-{}.txt",
         SystemTime::now()
@@ -6635,7 +6635,7 @@ async fn solo_external_workspace_read_executes_without_approval() {
             std::future::ready(Ok(PermissionApproval::AllowOnce))
         })
         .await
-        .expect("outside read should execute in solo mode");
+        .expect("outside read should execute in yolo mode");
 
     assert!(record.output.ok, "{:?}", record.output.error);
     assert!(permission_requests.is_empty());
@@ -6774,9 +6774,9 @@ async fn matching_grant_does_not_override_base_policy_denial() {
 }
 
 #[tokio::test]
-async fn solo_external_workspace_write_executes_without_approval() {
+async fn yolo_external_workspace_write_executes_without_approval() {
     let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Solo);
+    agent.set_permission_mode(PermissionMode::Yolo);
     let outside_path = std::env::temp_dir().join(format!(
         "letcode-outside-agent-denied-write-{}.txt",
         SystemTime::now()
@@ -6806,7 +6806,7 @@ async fn solo_external_workspace_write_executes_without_approval() {
             },
         )
         .await
-        .expect("outside write should execute in solo mode");
+        .expect("outside write should execute in yolo mode");
 
     assert!(permission_requests.is_empty());
     assert_eq!(record.status, ToolExecutionStatus::Executed);
@@ -7199,11 +7199,11 @@ async fn writable_leaf_preparation_failure_skips_approval_and_started_event() {
 }
 
 #[tokio::test]
-async fn solo_mode_executes_commands_that_default_mode_denies_by_policy() {
+async fn yolo_mode_executes_commands_that_default_mode_denies_by_policy() {
     let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Solo);
+    agent.set_permission_mode(PermissionMode::Yolo);
     let call = HistoryToolCall {
-        call_id: "call-solo-deny-risk".into(),
+        call_id: "call-yolo-deny-risk".into(),
         name: "shell__exec".into(),
         arguments_json: json!({"command": "curl --version"}).to_string(),
     };
@@ -7215,7 +7215,7 @@ async fn solo_mode_executes_commands_that_default_mode_denies_by_policy() {
             std::future::ready(Ok(PermissionApproval::Deny))
         })
         .await
-        .expect("solo mode should execute command without asking");
+        .expect("yolo mode should execute command without asking");
 
     assert!(!approval_requested);
     assert_eq!(record.status, ToolExecutionStatus::Executed);

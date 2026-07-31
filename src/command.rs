@@ -180,7 +180,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/permission",
         insert_text: "/permission ",
         description: "Show or switch permission mode",
-        usage: "/permission <safe|default|solo>",
+        usage: "/permission <safe|default|yolo>",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -189,7 +189,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/perm",
         insert_text: "/perm ",
         description: "Alias for /permission",
-        usage: "/perm <safe|default|solo>",
+        usage: "/perm <safe|default|yolo>",
         visible_in_slash: false,
         visible_in_help: true,
         visible_in_summary: false,
@@ -484,14 +484,14 @@ fn parse_permission(parts: &[&str]) -> Result<CommandIntent, CommandParseError> 
         ["/permission", mode] | ["/perm", mode] => match parse_permission_mode(mode) {
             Some(mode) => Ok(CommandIntent::PermissionSet(mode)),
             None => Err(CommandParseError::new(format!(
-                "Unknown permission mode: {}. Use safe, default, or solo.",
+                "Unknown permission mode: {}. Use safe, default, or yolo.",
                 mode
             ))),
         },
         ["/permission", ..] => Err(CommandParseError::new(
-            "Usage: /permission <safe|default|solo>",
+            "Usage: /permission <safe|default|yolo>",
         )),
-        ["/perm", ..] => Err(CommandParseError::new("Usage: /perm <safe|default|solo>")),
+        ["/perm", ..] => Err(CommandParseError::new("Usage: /perm <safe|default|yolo>")),
         _ => unreachable!(),
     }
 }
@@ -633,7 +633,7 @@ fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "safe" => Some(PermissionMode::Safe),
         "default" => Some(PermissionMode::Default),
-        "solo" => Some(PermissionMode::Solo),
+        "yolo" | "solo" => Some(PermissionMode::Yolo),
         _ => None,
     }
 }
@@ -830,6 +830,14 @@ mod tests {
         assert_eq!(
             parse_command("  /permission   default  "),
             Ok(CommandIntent::PermissionSet(PermissionMode::Default))
+        );
+        assert_eq!(
+            parse_command("/permission yolo"),
+            Ok(CommandIntent::PermissionSet(PermissionMode::Yolo))
+        );
+        assert_eq!(
+            parse_command("/permission solo"),
+            Ok(CommandIntent::PermissionSet(PermissionMode::Yolo))
         );
         assert_eq!(
             parse_command("  @explorer   inspect src/lib.rs  "),

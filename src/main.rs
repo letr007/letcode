@@ -155,9 +155,9 @@ async fn main() -> Result<()> {
     }
     let skill_registry = Arc::new(SkillRegistry::load(&config.config_dir, &workspace_dir)?);
     agent.register_skill_registry(skill_registry.clone())?;
-    if matches!(config.permissions.mode, PermissionMode::Solo) {
+    if matches!(config.permissions.mode, PermissionMode::Yolo) {
         eprintln!(
-            "warning: permissions.mode is set to 'solo'; write and command tools will run without confirmation"
+            "warning: permissions.mode is set to 'yolo'; write and command tools will run without confirmation"
         );
     }
     let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(
@@ -267,7 +267,7 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
             ReplCommand::Help => print_repl_help(),
             ReplCommand::PermissionShow => {
                 println!(
-                    "permission mode: {}\navailable modes: safe, default, solo",
+                    "permission mode: {}\navailable modes: safe, default, yolo",
                     agent.permission_mode()
                 );
             }
@@ -279,9 +279,9 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 set_permission_mode(agent, recorder, PermissionMode::Default)?;
                 println!("permission mode set to default");
             }
-            ReplCommand::PermissionSet(PermissionMode::Solo) => {
+            ReplCommand::PermissionSet(PermissionMode::Yolo) => {
                 print!(
-                    "solo mode allows write and command tools without asking. Enable solo mode? [y/N] "
+                    "YOLO mode allows write and command tools without asking. Enable YOLO mode? [y/N] "
                 );
                 io::stdout().flush()?;
 
@@ -290,10 +290,10 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 let confirm = confirm.trim().to_ascii_lowercase();
 
                 if matches!(confirm.as_str(), "y" | "yes") {
-                    set_permission_mode(agent, recorder, PermissionMode::Solo)?;
-                    println!("permission mode set to solo");
+                    set_permission_mode(agent, recorder, PermissionMode::Yolo)?;
+                    println!("permission mode set to yolo");
                 } else {
-                    println!("solo mode not enabled");
+                    println!("YOLO mode not enabled");
                 }
             }
             ReplCommand::ModelShow => {
@@ -1869,7 +1869,7 @@ mod tests {
         assert_eq!(
             parse_repl_command("/permission bogus"),
             ReplCommand::Invalid(
-                "Unknown permission mode: bogus. Use safe, default, or solo.".into()
+                "Unknown permission mode: bogus. Use safe, default, or yolo.".into()
             )
         );
         assert_eq!(

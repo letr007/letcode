@@ -11,7 +11,8 @@ pub enum PermissionMode {
     Safe,
     #[default]
     Default,
-    Solo,
+    #[serde(alias = "solo")]
+    Yolo,
 }
 
 impl PermissionMode {
@@ -19,7 +20,7 @@ impl PermissionMode {
         match self {
             Self::Safe => "safe",
             Self::Default => "default",
-            Self::Solo => "solo",
+            Self::Yolo => "yolo",
         }
     }
 }
@@ -424,7 +425,7 @@ impl PermissionPolicy {
                     CommandRisk::Deny => PermissionDecision::Deny,
                 },
             },
-            PermissionMode::Solo => PermissionDecision::Allow,
+            PermissionMode::Yolo => PermissionDecision::Allow,
         }
     }
 }
@@ -902,9 +903,21 @@ mod tests {
     }
 
     #[test]
-    fn solo_mode_allows_commands_that_other_modes_deny() {
+    fn permission_mode_serializes_yolo_and_deserializes_legacy_solo() {
+        assert_eq!(
+            serde_json::to_string(&PermissionMode::Yolo).unwrap(),
+            "\"yolo\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"solo\"").unwrap(),
+            PermissionMode::Yolo
+        );
+    }
+
+    #[test]
+    fn yolo_mode_allows_commands_that_other_modes_deny() {
         let mut policy = PermissionPolicy::default();
-        policy.set_mode(PermissionMode::Solo);
+        policy.set_mode(PermissionMode::Yolo);
 
         assert_eq!(
             policy.check("shell__exec", &json!({"command": "rm -rf ."})),

@@ -47,7 +47,7 @@ sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
 [permissions]
-mode = "default"
+mode = "default" # safe/default/yolo; legacy solo remains accepted when reading
 
 # Optional local execution policy. Reviewed read tools may declare parallel support;
 # all other tools stay exclusive unless their handler explicitly opts in.

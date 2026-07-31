@@ -241,7 +241,13 @@ impl MarkdownRenderer {
                 if let Some(dest_url) = self.inline.links.pop()
                     && !dest_url.is_empty()
                 {
-                    self.push_styled(&format!(" <{dest_url}>"), link_dest_style(self.theme));
+                    self.push_styled_with_interaction(
+                        &format!(" <{dest_url}>"),
+                        link_dest_style(self.theme),
+                        Some(crate::tui::transcript_render::Interaction::OpenUrl(
+                            dest_url,
+                        )),
+                    );
                 }
             }
             TagEnd::Table => {
@@ -283,14 +289,28 @@ impl MarkdownRenderer {
 
     /// Parser leaf construction point: never derive provenance from rendered output.
     fn push_styled(&mut self, text: &str, style: Style) {
+        let interaction = self.inline.links.last().cloned().and_then(|url| {
+            (!url.is_empty()).then_some(crate::tui::transcript_render::Interaction::OpenUrl(url))
+        });
+        self.push_styled_with_interaction(text, style, interaction);
+    }
+
+    fn push_styled_with_interaction(
+        &mut self,
+        text: &str,
+        style: Style,
+        interaction: Option<crate::tui::transcript_render::Interaction>,
+    ) {
         if text.is_empty() {
             return;
         }
         let block = self.document.add_source(text);
-        self.spans.push(RenderSpan::source(
+        self.spans.push(RenderSpan::source_with_interaction(
             text,
             style,
             SourceRange::new(block, 0, text.chars().count()),
+            CopyJoin::Concat,
+            interaction,
         ));
     }
 
@@ -604,9 +624,11 @@ fn append_render_grapheme(
     text: &str,
     style: Style,
     source: Option<SourceRange>,
+    interaction: Option<crate::tui::transcript_render::Interaction>,
 ) {
     if let Some(last) = target.last_mut()
         && last.style == style
+        && last.interaction == interaction
         && match (last.source, source) {
             (None, None) => true,
             (Some(previous), Some(next)) => {
@@ -620,7 +642,13 @@ fn append_render_grapheme(
             last.end = source.end;
         }
     } else if let Some(source) = source {
-        target.push(RenderSpan::source(text, style, source));
+        target.push(RenderSpan::source_with_interaction(
+            text,
+            style,
+            source,
+            CopyJoin::Concat,
+            interaction,
+        ));
     } else {
         target.push(RenderSpan::decoration(text, style));
     }
@@ -690,7 +718,13 @@ fn wrap_render_spans_with_prefixes(
             if width > limit && current.is_empty() {
                 continue;
             }
-            append_render_grapheme(&mut current, grapheme, span.style, source);
+            append_render_grapheme(
+                &mut current,
+                grapheme,
+                span.style,
+                source,
+                span.interaction.clone(),
+            );
             used = used.saturating_add(width);
             at_start = false;
         }
@@ -802,6 +836,7 @@ fn truncate_render_spans(spans: &[RenderSpan<Style>], width: usize) -> Vec<Rende
                 span.style,
                 span.source
                     .map(|range| SourceRange::new(range.block_index, offset, offset + count)),
+                span.interaction.clone(),
             );
             offset += count;
             used += grapheme_width;
@@ -1102,6 +1137,36 @@ mod tests {
 
     fn rendered(markdown: &str, width: usize) -> Vec<Line<'static>> {
         render_markdown(markdown, Theme::dark(), MarkdownRenderOptions::new(width))
+    }
+
+    #[test]
+    fn markdown_links_retain_open_url_interaction_through_wrapping() {
+        let document = render_markdown_document(
+            "[a long link label](https://example.test/path)",
+            Theme::dark(),
+            MarkdownRenderOptions::new(4),
+        );
+        assert!(document.validate());
+        let links = document
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.interaction.as_ref())
+            .collect::<Vec<_>>();
+        assert!(links.iter().all(|interaction| matches!(
+            interaction,
+            crate::tui::transcript_render::Interaction::OpenUrl(url)
+                if url == "https://example.test/path"
+        )));
+        assert!(links.len() > 1, "{document:?}");
+        assert!(
+            document
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.text.contains("link") || span.text.contains("example"))
+                .all(|span| span.interaction.is_some())
+        );
     }
 
     #[test]

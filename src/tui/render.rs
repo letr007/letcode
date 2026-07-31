@@ -31,6 +31,7 @@ const WELCOME_ART_RIGHT: &[&str] = &[
 /// Rendering may refresh viewport bookkeeping, but it never invokes tools, resolves permissions,
 /// persists transcripts, or mutates runtime/business state.
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
+    state.frame_hyperlink_cells.clear();
     let theme = state.theme();
     let area = frame.area();
 
@@ -1931,8 +1932,8 @@ mod tests {
                     Some("Allow read/preview, ask for risky tools".into()),
                 ),
                 crate::tui::state::DialogItem::new(
-                    "solo",
-                    "Solo",
+                    "yolo",
+                    "YOLO",
                     Some("Allow write and command tools without asking".into()),
                 ),
             ],
