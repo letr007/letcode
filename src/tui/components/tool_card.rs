@@ -24,6 +24,7 @@ const DIFF_CARD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 3
 const DIFF_CARD_GUTTER: ratatui::style::Color = ratatui::style::Color::Rgb(112, 118, 134);
 const DIFF_CARD_GUTTER_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
 const DIFF_CARD_TEXT: ratatui::style::Color = ratatui::style::Color::Rgb(222, 226, 236);
+const COMPACT_SHELL_BODY_LINES: usize = 20;
 const DIFF_CARD_META: ratatui::style::Color = ratatui::style::Color::Rgb(143, 151, 170);
 const DIFF_CARD_ADD_SIGN: ratatui::style::Color = ratatui::style::Color::Rgb(107, 211, 145);
 const DIFF_CARD_DELETE_SIGN: ratatui::style::Color = ratatui::style::Color::Rgb(239, 126, 139);
@@ -1227,7 +1228,7 @@ fn render_shell_output_section(
         theme,
         width,
     ));
-    lines.extend(render_limited_text_lines(
+    lines.extend(render_tail_limited_text_lines(
         text,
         text_style,
         theme,
@@ -1460,6 +1461,47 @@ fn render_limited_text_lines(
             ));
             break;
         }
+        let line = if raw.is_empty() { " " } else { raw };
+        let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
+        lines.push(render_source_card_line_with_boundary(
+            &segments,
+            Style::default().bg(DIFF_CARD_BG),
+            theme,
+            width,
+            Break::HardBreak,
+        ));
+    }
+    lines
+}
+
+fn render_tail_limited_text_lines(
+    text: &str,
+    text_style: Style,
+    theme: Theme,
+    width: usize,
+    expanded_output: bool,
+) -> Vec<SemanticLine<Style>> {
+    let body = text.lines().collect::<Vec<_>>();
+    let is_clipped = !expanded_output && body.len() > COMPACT_SHELL_BODY_LINES;
+    let body = if is_clipped {
+        &body[body.len() - COMPACT_SHELL_BODY_LINES..]
+    } else {
+        &body[..]
+    };
+
+    let mut lines = Vec::new();
+    if is_clipped {
+        lines.push(render_card_line(
+            &[(
+                "… click to expand for details".to_string(),
+                root_muted_style(theme).bg(DIFF_CARD_BG),
+            )],
+            Style::default().bg(DIFF_CARD_BG),
+            theme,
+            width,
+        ));
+    }
+    for raw in body {
         let line = if raw.is_empty() { " " } else { raw };
         let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
         lines.push(render_source_card_line_with_boundary(
@@ -3461,50 +3503,85 @@ mod tests {
     }
 
     #[test]
-    fn shell_output_truncates_in_compact_mode_and_expands_in_full_mode() {
+    fn shell_output_compact_mode_shows_latest_lines_and_expanded_mode_shows_all_lines() {
         let theme = Theme::dark();
-        let stdout = (0..130)
-            .map(|index| format!("line-{index}"))
+        let stdout = (0..25)
+            .map(|index| format!("stdout-item-{index:02}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let tool = ToolView {
-            call_id: "call-shell-expand".into(),
-            name: "shell__exec".into(),
-            summary: "exit 0 · stdout 130 lines".into(),
-            arguments: Some(serde_json::json!({"command":"cargo test"}).to_string()),
-            output: Some(
-                serde_json::json!({
-                    "ok": true,
-                    "tool": "shell__exec",
-                    "data": {
-                        "status": 0,
-                        "success": true,
-                        "stdout": stdout,
-                        "stdout_truncated": false,
-                        "stderr": "",
-                        "stderr_truncated": false
-                    }
-                })
-                .to_string(),
-            ),
-            status: ToolExecutionStatus::Succeeded,
-        };
-
-        let compact = render_tool_card_lines_with_frame(&tool, theme, 80, 0, false)
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let expanded = render_tool_card_lines_with_frame(&tool, theme, 80, 0, true)
-            .iter()
-            .map(|line| line.to_string())
+        let stderr = (0..25)
+            .map(|index| format!("stderr-item-{index:02}"))
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(compact.contains("… output clipped in TUI"), "{compact}");
-        assert!(!compact.contains("line-129"), "{compact}");
-        assert!(expanded.contains("line-129"), "{expanded}");
-        assert!(!expanded.contains("… output clipped in TUI"), "{expanded}");
+        for status in [ToolExecutionStatus::Running, ToolExecutionStatus::Succeeded] {
+            let tool = ToolView {
+                call_id: "call-shell-expand".into(),
+                name: "shell__exec".into(),
+                summary: "exit 0 · stdout 25 lines · stderr 25 lines".into(),
+                arguments: Some(serde_json::json!({"command":"cargo test"}).to_string()),
+                output: Some(
+                    serde_json::json!({
+                        "ok": true,
+                        "tool": "shell__exec",
+                        "data": {
+                            "status": 0,
+                            "success": true,
+                            "stdout": stdout,
+                            "stdout_truncated": false,
+                            "stderr": stderr,
+                            "stderr_truncated": false
+                        }
+                    })
+                    .to_string(),
+                ),
+                status,
+            };
+
+            let compact_lines = render_tool_card_lines_with_frame(&tool, theme, 80, 0, false);
+            let compact = compact_lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expanded = render_tool_card_lines_with_frame(&tool, theme, 80, 0, true)
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                compact.contains("… click to expand for details"),
+                "{compact}"
+            );
+            assert!(!compact.contains("stdout-item-00"), "{compact}");
+            assert!(!compact.contains("stderr-item-00"), "{compact}");
+            assert!(compact.contains("stdout-item-24"), "{compact}");
+            assert!(compact.contains("stderr-item-24"), "{compact}");
+            assert_eq!(
+                compact
+                    .lines()
+                    .filter(|line| line.contains("stdout-item-"))
+                    .count(),
+                COMPACT_SHELL_BODY_LINES,
+                "{compact}"
+            );
+            assert_eq!(
+                compact
+                    .lines()
+                    .filter(|line| line.contains("stderr-item-"))
+                    .count(),
+                COMPACT_SHELL_BODY_LINES,
+                "{compact}"
+            );
+            assert!(expanded.contains("stdout-item-00"), "{expanded}");
+            assert!(expanded.contains("stderr-item-00"), "{expanded}");
+            assert!(expanded.contains("stdout-item-24"), "{expanded}");
+            assert!(expanded.contains("stderr-item-24"), "{expanded}");
+            assert!(
+                !expanded.contains("… click to expand for details"),
+                "{expanded}"
+            );
+        }
     }
 
     #[test]
