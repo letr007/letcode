@@ -180,8 +180,8 @@ async fn create_response_stream<C: Config>(
     }
 }
 
-/// Ignores the one validated provider side-band event and otherwise preserves
-/// the payload for strict SDK deserialization.
+/// Filters the validated provider side-band event and normalizes response payloads
+/// for strict SDK deserialization.
 pub(super) fn project_response_stream_event(
     raw: &Value,
 ) -> std::result::Result<Option<ResponseStreamEvent>, serde_json::Error> {
@@ -212,6 +212,14 @@ fn project_response_stream_event_value(
     let mut projected = raw.clone();
     if let Some(response) = projected.get_mut("response").and_then(Value::as_object_mut) {
         response.remove("reasoning");
+        if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+            usage
+                .entry("input_tokens_details".to_owned())
+                .or_insert_with(|| serde_json::json!({ "cached_tokens": 0 }));
+            usage
+                .entry("output_tokens_details".to_owned())
+                .or_insert_with(|| serde_json::json!({ "reasoning_tokens": 0 }));
+        }
     }
     Ok(Some(projected))
 }
@@ -2517,6 +2525,160 @@ mod tests {
             projected["response"]["metadata"],
             json!({ "request": "preserve" })
         );
+    }
+
+    fn response_completed_event_with_usage(usage: Value) -> Value {
+        json!({
+            "type": "response.completed",
+            "response": { "usage": usage },
+        })
+    }
+
+    fn assert_completed_usage_deserializes(event: &Value) {
+        let response = json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1,
+            "model": "test-model",
+            "output": [],
+            "status": "completed",
+            "usage": event["response"]["usage"],
+        });
+        let event = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": response,
+        });
+        assert!(
+            project_response_stream_event(&event).is_ok(),
+            "completed usage should deserialize: {event}"
+        );
+    }
+
+    #[test]
+    fn projection_adds_missing_output_token_details_to_completed_response() {
+        let event = response_completed_event_with_usage(json!({
+            "input_tokens": 5,
+            "input_tokens_details": { "cached_tokens": 2 },
+            "output_tokens": 3,
+            "total_tokens": 8,
+        }));
+
+        let projected = project_response_stream_event_value(&event)
+            .expect("completed projection")
+            .expect("completed event is not ignored");
+        let usage = &projected["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 8);
+        assert_eq!(
+            usage["output_tokens_details"],
+            json!({ "reasoning_tokens": 0 })
+        );
+        assert_completed_usage_deserializes(&projected);
+    }
+
+    #[test]
+    fn projection_adds_missing_input_token_details_to_completed_response() {
+        let event = response_completed_event_with_usage(json!({
+            "input_tokens": 5,
+            "output_tokens": 3,
+            "output_tokens_details": { "reasoning_tokens": 1 },
+            "total_tokens": 8,
+        }));
+
+        let projected = project_response_stream_event_value(&event)
+            .expect("completed projection")
+            .expect("completed event is not ignored");
+        let usage = &projected["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 8);
+        assert_eq!(usage["input_tokens_details"], json!({ "cached_tokens": 0 }));
+        assert_completed_usage_deserializes(&projected);
+    }
+
+    #[test]
+    fn projection_adds_both_missing_token_details_to_completed_response() {
+        let event = response_completed_event_with_usage(json!({
+            "input_tokens": 5,
+            "output_tokens": 3,
+            "total_tokens": 8,
+        }));
+
+        let projected = project_response_stream_event_value(&event)
+            .expect("completed projection")
+            .expect("completed event is not ignored");
+        let usage = &projected["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 8);
+        assert_eq!(usage["input_tokens_details"], json!({ "cached_tokens": 0 }));
+        assert_eq!(
+            usage["output_tokens_details"],
+            json!({ "reasoning_tokens": 0 })
+        );
+        assert_completed_usage_deserializes(&projected);
+    }
+
+    #[test]
+    fn projection_preserves_complete_response_usage() {
+        let event = response_completed_event_with_usage(json!({
+            "input_tokens": 5,
+            "input_tokens_details": { "cached_tokens": 2 },
+            "output_tokens": 3,
+            "output_tokens_details": { "reasoning_tokens": 1 },
+            "total_tokens": 8,
+        }));
+
+        let projected = project_response_stream_event_value(&event)
+            .expect("completed projection")
+            .expect("completed event is not ignored");
+        assert_eq!(projected, event);
+        assert_completed_usage_deserializes(&projected);
+    }
+
+    #[test]
+    fn projection_preserves_function_call_when_output_token_details_are_missing() {
+        let raw = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1,
+                "model": "test-model",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_test",
+                    "call_id": "call_test",
+                    "name": "test_function",
+                    "arguments": "{\"value\":1}",
+                    "status": "completed",
+                }],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 5,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens": 3,
+                    "total_tokens": 8,
+                },
+            },
+        });
+
+        let Some(ResponseStreamEvent::ResponseCompleted(event)) =
+            project_response_stream_event(&raw).expect("completed event should project")
+        else {
+            panic!("expected completed event")
+        };
+        let [async_openai::types::responses::OutputItem::FunctionCall(call)] =
+            event.response.output.as_slice()
+        else {
+            panic!("expected function call output")
+        };
+        assert_eq!(call.call_id, "call_test");
+        assert_eq!(call.name, "test_function");
+        assert_eq!(call.arguments, "{\"value\":1}");
     }
 
     struct Group16Tool;
