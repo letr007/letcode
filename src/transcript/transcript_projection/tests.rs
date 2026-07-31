@@ -366,6 +366,123 @@ fn replay_context_tree_reconstructs_valid_tree() {
 }
 
 #[test]
+fn context_tree_active_branch_projection_excludes_abandoned_sibling_nodes() {
+    let records = [
+        record_at(
+            1,
+            TranscriptEvent::SessionStarted {
+                model: "gpt-5".into(),
+            },
+        ),
+        metadata_record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "active".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        metadata_record_at(
+            3,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "abandoned".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        branch_record_at(
+            4,
+            "active",
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("active branch"),
+            },
+        ),
+        metadata_record_at(
+            5,
+            TranscriptEvent::ContextCheckout {
+                branch_id: "active".into(),
+                leaf_sequence: 4,
+            },
+        ),
+        metadata_record_at(
+            6,
+            TranscriptEvent::ContextNodeCreated {
+                node_id: "active-node".into(),
+                parent_node_id: Some("root".into()),
+                label: None,
+                purpose: None,
+                block_ref: None,
+                source_ref: None,
+            },
+        ),
+        metadata_record_at(
+            7,
+            TranscriptEvent::ContextNodeLifecycle {
+                node_id: "root".into(),
+                status: ContextNodeStatus::Inactive,
+            },
+        ),
+        metadata_record_at(
+            8,
+            TranscriptEvent::ContextNodeLifecycle {
+                node_id: "active-node".into(),
+                status: ContextNodeStatus::Active,
+            },
+        ),
+        metadata_record_at(
+            9,
+            TranscriptEvent::ContextCheckout {
+                branch_id: "abandoned".into(),
+                leaf_sequence: 1,
+            },
+        ),
+        branch_record_at(
+            10,
+            "abandoned",
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("abandoned branch"),
+            },
+        ),
+        metadata_record_at(
+            11,
+            TranscriptEvent::ContextNodeCreated {
+                node_id: "active-node".into(),
+                parent_node_id: Some("root".into()),
+                label: Some("same id in abandoned scope".into()),
+                purpose: None,
+                block_ref: None,
+                source_ref: None,
+            },
+        ),
+        metadata_record_at(
+            12,
+            TranscriptEvent::ContextCheckout {
+                branch_id: "active".into(),
+                leaf_sequence: 4,
+            },
+        ),
+    ];
+
+    assert!(
+        replay_context_tree(&records)
+            .expect_err("global replay mixes checkout scopes")
+            .to_string()
+            .contains("duplicate context node_id 'active-node'")
+    );
+
+    let tree = project_context_tree_for_active_branch(&records, None)
+        .expect("project active branch context tree");
+    let active_node = tree
+        .node(&ContextNodeId::new("active-node").expect("active node id"))
+        .expect("active branch node");
+
+    assert_eq!(tree.node_count(), 2);
+    assert_eq!(active_node.label, None);
+}
+
+#[test]
 fn replay_context_tree_rejects_unknown_parent() {
     let error = replay_context_tree(&[metadata_record_at(
         1,

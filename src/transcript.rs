@@ -1271,7 +1271,11 @@ impl TranscriptRecorder {
     }
 
     fn current_context_tree_state(&self) -> Result<crate::context_tree::ContextTreeState> {
-        transcript_projection::project_context_tree(&read_records(self.path())?)
+        let records = read_records(self.path())?;
+        transcript_projection::project_context_tree_for_active_branch(
+            &records,
+            self.current_context_branch_id(),
+        )
     }
 
     fn current_active_context_node_id(&self) -> Result<String> {

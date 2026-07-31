@@ -146,6 +146,20 @@ pub(crate) fn project_context_view(
     context_view::project_context_view(records)
 }
 
+pub(crate) fn project_context_tree_for_active_branch(
+    records: &[TranscriptRecord],
+    current_branch_id: Option<&str>,
+) -> anyhow::Result<crate::context_tree::ContextTreeState> {
+    let resolved = resolve_branch_context(
+        records.to_vec(),
+        SessionContextCursor {
+            branch_id: current_branch_id.map(str::to_owned),
+            leaf_sequence: None,
+        },
+    )?;
+    replay_context_tree(&runtime_projection_records(records, &resolved))
+}
+
 #[derive(Debug)]
 struct ResolvedBranchContext {
     branch_id: String,
