@@ -1096,6 +1096,10 @@ fn render_shell_output_lines(
         return Vec::new();
     }
 
+    let show_expand_hint = !expanded_output
+        && [stdout, stderr]
+            .into_iter()
+            .any(|output| output.lines().count() > COMPACT_SHELL_BODY_LINES);
     let mut lines = render_shell_card_header_lines(tool, theme, width);
     if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
         mark_last_source_boundary(&mut lines, Break::BlockBreak);
@@ -1129,6 +1133,23 @@ fn render_shell_output_lines(
             theme,
             width,
             expanded_output,
+        ));
+    }
+    if show_expand_hint {
+        lines.push(render_card_line(
+            &[(
+                "… click to expand for details".to_string(),
+                root_muted_style(theme).bg(DIFF_CARD_BG),
+            )],
+            Style::default().bg(DIFF_CARD_BG),
+            theme,
+            width,
+        ));
+        lines.push(render_card_line(
+            &[],
+            Style::default().bg(DIFF_CARD_BG),
+            theme,
+            width,
         ));
     }
     lines
@@ -1490,17 +1511,6 @@ fn render_tail_limited_text_lines(
     };
 
     let mut lines = Vec::new();
-    if is_clipped {
-        lines.push(render_card_line(
-            &[(
-                "… click to expand for details".to_string(),
-                root_muted_style(theme).bg(DIFF_CARD_BG),
-            )],
-            Style::default().bg(DIFF_CARD_BG),
-            theme,
-            width,
-        ));
-    }
     for raw in body {
         let line = if raw.is_empty() { " " } else { raw };
         let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
@@ -3557,6 +3567,15 @@ mod tests {
             assert!(!compact.contains("stderr-item-00"), "{compact}");
             assert!(compact.contains("stdout-item-24"), "{compact}");
             assert!(compact.contains("stderr-item-24"), "{compact}");
+            let stdout_tail = compact.find("stdout-item-24").expect("stdout tail");
+            let stderr_tail = compact.find("stderr-item-24").expect("stderr tail");
+            let notices = compact
+                .match_indices("… click to expand for details")
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(notices.len(), 1, "{compact}");
+            assert!(stdout_tail < notices[0], "{compact}");
+            assert!(stderr_tail < notices[0], "{compact}");
             assert_eq!(
                 compact
                     .lines()
