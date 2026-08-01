@@ -5,6 +5,7 @@ use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
+use crate::subagent::StructuredSubagentResult;
 use crate::tui::{
     measure::{display_width, wrap_text_to_width},
     presentation::{
@@ -847,22 +848,40 @@ fn render_subagent_lines(
     }
 
     let data = tool_output_data(tool);
+    let structured = data
+        .as_ref()
+        .and_then(|data| data.get("structured_result"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<StructuredSubagentResult>(value).ok())
+        .filter(|result| !result.malformed);
     let status = data
         .as_ref()
         .and_then(|data| data.get("status").and_then(serde_json::Value::as_str))
+        .or_else(|| structured.as_ref().map(|result| result.status.as_str()))
         .unwrap_or_else(|| subagent_status_label(tool.status));
-    let child = data
+    let child_id = data
         .as_ref()
         .and_then(|data| data.get("child_session_id"))
         .and_then(serde_json::Value::as_str)
-        .map(|id| format!("/child {}", truncate_display_width(id, 16)))
-        .unwrap_or_else(|| "/child".into());
+        .or_else(|| {
+            structured
+                .as_ref()
+                .map(|result| result.child_session_id.as_str())
+        })
+        .map(|id| truncate_display_width(id, 16))
+        .unwrap_or_else(|| "child".into());
     let summary = data
         .as_ref()
         .and_then(|data| data.get("summary"))
         .and_then(serde_json::Value::as_str)
         .map(one_line_snippet)
         .filter(|summary| !summary.is_empty())
+        .or_else(|| {
+            structured
+                .as_ref()
+                .map(|result| one_line_snippet(&result.summary))
+                .filter(|summary| !summary.is_empty())
+        })
         .or_else(|| subagent_task(tool))
         .unwrap_or_else(|| one_line_snippet(&tool.summary));
     let agent_name = data
@@ -917,8 +936,9 @@ fn render_subagent_lines(
     let status_style = root_status_style(status_color, theme);
     let text_style = root_text_style(theme);
     let muted = root_muted_style(theme);
-
-    vec![render_card_line_with_guide(
+    let mut lines = Vec::new();
+    let has_structured_details = structured.is_some();
+    lines.push(render_card_line_with_guide(
         &[
             SemanticSpan::decoration(format!("{status_label}{state_suffix}"), status_style),
             SemanticSpan::decoration(" ", text_style),
@@ -929,14 +949,166 @@ fn render_subagent_lines(
             SemanticSpan::decoration(" ", text_style),
             SemanticSpan::source(summary, text_style),
             SemanticSpan::decoration(" · ", muted),
-            SemanticSpan::decoration(child, muted),
+            SemanticSpan::decoration(format!("/child {child_id}"), muted),
         ],
         Style::default().bg(theme.root_bg),
         TOOL_CARD_GUIDE,
         theme,
         width,
-        Break::End,
-    )]
+        if has_structured_details {
+            Break::HardBreak
+        } else {
+            Break::End
+        },
+    ));
+
+    let Some(structured) = structured else {
+        return lines;
+    };
+
+    let run_id = data
+        .as_ref()
+        .and_then(|data| data.get("run_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(structured.run_id.as_str());
+    let activity = subagent_activity_summary(&structured);
+    lines.push(render_subagent_metadata_line(
+        run_id,
+        &child_id,
+        &activity,
+        muted,
+        text_style,
+        theme,
+        width,
+        Break::HardBreak,
+    ));
+
+    let detail_values = structured_subagent_detail_values(&structured);
+    let detail_count = detail_values.len();
+    for (index, (label, value)) in detail_values.into_iter().enumerate() {
+        let is_last = index + 1 == detail_count;
+        lines.push(render_subagent_detail_line(
+            label,
+            value,
+            muted,
+            text_style,
+            theme,
+            width,
+            if is_last {
+                Break::End
+            } else {
+                Break::HardBreak
+            },
+        ));
+    }
+
+    if lines.len() > 1
+        && lines
+            .last()
+            .is_some_and(|line| line.boundary == Break::HardBreak)
+    {
+        if let Some(last) = lines.last_mut() {
+            last.boundary = Break::End;
+        }
+    }
+    lines
+}
+
+fn render_subagent_metadata_line(
+    run_id: &str,
+    child_id: &str,
+    activity: &str,
+    muted: Style,
+    text_style: Style,
+    theme: Theme,
+    width: usize,
+    boundary: Break,
+) -> SemanticLine<Style> {
+    let mut segments = vec![
+        SemanticSpan::decoration("run ", muted),
+        SemanticSpan::source(truncate_display_width(run_id, 16), text_style),
+        SemanticSpan::decoration(" · /child ", muted),
+        SemanticSpan::source(child_id.to_string(), text_style),
+    ];
+    if !activity.is_empty() {
+        segments.push(SemanticSpan::decoration(" · ", muted));
+        segments.push(SemanticSpan::source(activity.to_string(), muted));
+    }
+    render_card_line_with_guide(
+        &segments,
+        Style::default().bg(theme.root_bg),
+        TOOL_CARD_GUIDE,
+        theme,
+        width,
+        boundary,
+    )
+}
+
+fn render_subagent_detail_line(
+    label: &str,
+    value: String,
+    muted: Style,
+    text_style: Style,
+    theme: Theme,
+    width: usize,
+    boundary: Break,
+) -> SemanticLine<Style> {
+    render_card_line_with_guide(
+        &[
+            SemanticSpan::decoration(format!("{label}: "), muted),
+            SemanticSpan::source(value, text_style),
+        ],
+        Style::default().bg(theme.root_bg),
+        TOOL_CARD_GUIDE,
+        theme,
+        width,
+        boundary,
+    )
+}
+
+fn subagent_activity_summary(result: &StructuredSubagentResult) -> String {
+    [
+        ("read", result.files_read.len()),
+        ("changed", result.files_changed.len()),
+        ("commands", result.commands_run.len()),
+        ("checks", result.validation.len()),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(label, count)| format!("{label} {count}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+fn structured_subagent_detail_values(
+    result: &StructuredSubagentResult,
+) -> Vec<(&'static str, String)> {
+    [
+        ("blocker", &result.blockers),
+        ("next", &result.next_steps),
+        ("finding", &result.findings),
+        ("changed", &result.files_changed),
+        ("validation", &result.validation),
+    ]
+    .into_iter()
+    .filter_map(|(label, values)| subagent_list_summary(values).map(|value| (label, value)))
+    .collect()
+}
+
+fn subagent_list_summary(values: &[String]) -> Option<String> {
+    let mut visible = values
+        .iter()
+        .map(|value| one_line_snippet(value))
+        .filter(|value| !value.is_empty())
+        .take(2)
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        return None;
+    }
+    if values.len() > visible.len() {
+        visible.push(format!("+{} more", values.len() - visible.len()));
+    }
+    Some(visible.join(" · "))
 }
 
 fn subagent_task(tool: &ToolView) -> Option<String> {
@@ -3020,6 +3192,152 @@ mod tests {
             !rendered[0].contains("hidden child detail"),
             "{}",
             rendered[0]
+        );
+    }
+
+    #[test]
+    fn subagent_card_renders_structured_details_and_metadata() {
+        let tool = ToolView {
+            call_id: "run-structured".into(),
+            name: "agent__explore".into(),
+            summary: "explorer completed".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "run_id": "run-structured",
+                        "child_session_id": "child-structured",
+                        "agent_name": "explorer",
+                        "status": "completed",
+                        "summary": "completed with useful detail",
+                        "structured_result": {
+                            "status": "completed",
+                            "summary": "completed with useful detail",
+                            "malformed": false,
+                            "findings": ["found issue in src/a.rs", "verified follow-up"],
+                            "files_read": ["src/a.rs", "src/b.rs"],
+                            "files_changed": ["src/fix.rs"],
+                            "commands_run": ["cargo test"],
+                            "validation": ["cargo test passed"],
+                            "blockers": [],
+                            "next_steps": ["review the patch"],
+                            "run_id": "run-structured",
+                            "child_session_id": "child-structured"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let document = render_tool_card_document(&tool, Theme::dark(), 160, 0, false);
+        let rendered = crate::tui::transcript_ratatui::document_to_ratatui(&document)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let text = rendered.join("\n");
+
+        assert!(rendered.len() > 1, "{rendered:?}");
+        assert!(text.contains("run run-structured"), "{text}");
+        assert!(text.contains("/child child-structured"), "{text}");
+        assert!(
+            text.contains("read 2 · changed 1 · commands 1 · checks 1"),
+            "{text}"
+        );
+        assert!(text.contains("next: review the patch"), "{text}");
+        assert!(
+            text.contains("finding: found issue in src/a.rs · verified follow-up"),
+            "{text}"
+        );
+        assert!(text.contains("changed: src/fix.rs"), "{text}");
+        assert!(text.contains("validation: cargo test passed"), "{text}");
+        assert!(!text.contains("structured_result"), "{text}");
+        assert!(document.validate());
+    }
+
+    #[test]
+    fn subagent_card_falls_back_for_missing_or_invalid_structured_results() {
+        for structured_result in [
+            serde_json::json!("not an object"),
+            serde_json::json!({"status": "completed", "summary": "partial"}),
+        ] {
+            let tool = ToolView {
+                call_id: "run-fallback".into(),
+                name: "agent__explore".into(),
+                summary: "explorer completed".into(),
+                arguments: None,
+                output: Some(
+                    serde_json::json!({
+                        "data": {
+                            "agent_name": "explorer",
+                            "status": "completed",
+                            "summary": "fallback summary",
+                            "child_session_id": "child-fallback",
+                            "structured_result": structured_result
+                        }
+                    })
+                    .to_string(),
+                ),
+                status: ToolExecutionStatus::Succeeded,
+            };
+
+            let rendered = render_tool_card_lines(&tool, Theme::dark(), 120)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert!(
+                rendered[0].contains("completed explorer fallback summary"),
+                "{rendered:?}"
+            );
+            assert!(!rendered[0].contains("run run-fallback"), "{rendered:?}");
+        }
+    }
+
+    #[test]
+    fn subagent_card_keeps_structured_details_width_safe_and_truncated() {
+        let tool = ToolView {
+            call_id: "run-narrow".into(),
+            name: "agent__fixer".into(),
+            summary: "fixer completed".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "run_id": "run-narrow-with-a-long-identifier",
+                        "child_session_id": "child-narrow-with-a-long-identifier",
+                        "agent_name": "fixer",
+                        "status": "completed",
+                        "summary": "a very long summary that must be clipped",
+                        "structured_result": {
+                            "status": "completed",
+                            "summary": "a very long summary that must be clipped",
+                            "malformed": false,
+                            "findings": ["a very long finding that must be clipped"],
+                            "files_read": ["src/one.rs", "src/two.rs"],
+                            "files_changed": ["src/changed.rs"],
+                            "commands_run": ["cargo test --all-targets"],
+                            "validation": ["cargo test passed"],
+                            "blockers": [],
+                            "next_steps": ["a very long next step that must be clipped"],
+                            "run_id": "run-narrow-with-a-long-identifier",
+                            "child_session_id": "child-narrow-with-a-long-identifier"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 32);
+        assert!(rendered.iter().any(|line| line.to_string().contains('…')));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= 32),
+            "{rendered:?}"
         );
     }
 
