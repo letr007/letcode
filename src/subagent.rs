@@ -1003,6 +1003,72 @@ fn extract_json_candidate(raw: &str) -> Option<&str> {
     (end > start).then_some(trimmed[start..=end].trim())
 }
 
+pub fn looks_like_structured_subagent_output(raw: &str) -> bool {
+    let compact = raw.trim_start();
+    (compact.starts_with('{') || compact.starts_with("```"))
+        && compact.contains("\"status\"")
+        && compact.contains("\"summary\"")
+}
+
+pub fn try_parse_structured_subagent_result(raw: &str) -> Option<StructuredSubagentResult> {
+    let candidate = extract_json_candidate(raw)?;
+    let value = serde_json::from_str::<Value>(candidate).ok()?;
+    let object = structured_result_object(&value)?;
+    let status = string_field(&Value::Object(object.clone()), "status")?;
+    let summary = string_field(&Value::Object(object.clone()), "summary").or_else(|| {
+        object
+            .get("summary")
+            .and_then(|summary| summary.get("conclusion"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string)
+    })?;
+    const LIST_FIELDS: [&str; 7] = [
+        "blockers",
+        "findings",
+        "next_steps",
+        "validation",
+        "files_read",
+        "files_changed",
+        "commands_run",
+    ];
+    if !LIST_FIELDS.iter().any(|field| object.contains_key(*field)) {
+        return None;
+    }
+
+    let object = Value::Object(object.clone());
+    Some(StructuredSubagentResult {
+        status,
+        summary,
+        malformed: false,
+        findings: list_field(&object, "findings"),
+        files_read: list_field(&object, "files_read"),
+        files_changed: list_field(&object, "files_changed"),
+        commands_run: list_field(&object, "commands_run"),
+        validation: validation_field(&object),
+        blockers: list_field(&object, "blockers"),
+        next_steps: list_field(&object, "next_steps"),
+        run_id: String::new(),
+        child_session_id: String::new(),
+        raw_excerpt: None,
+    })
+}
+
+fn structured_result_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
+    [
+        value.as_object(),
+        value.get("data").and_then(Value::as_object),
+        value.get("result").and_then(Value::as_object),
+        value.get("structured_result").and_then(Value::as_object),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|object| {
+        object.get("status").and_then(Value::as_str).is_some() && object.contains_key("summary")
+    })
+}
+
 fn string_field(value: &Value, key: &str) -> Option<String> {
     match value.get(key) {
         Some(Value::String(text)) => Some(text.trim().to_string()).filter(|text| !text.is_empty()),
@@ -1026,6 +1092,7 @@ fn list_field(value: &Value, key: &str) -> Vec<String> {
                     .get("path")
                     .or_else(|| map.get("file"))
                     .or_else(|| map.get("command"))
+                    .or_else(|| map.get("evidence"))
                     .or_else(|| map.get("summary"))
                     .and_then(Value::as_str)
                     .map(str::trim)

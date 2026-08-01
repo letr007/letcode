@@ -6,6 +6,9 @@ use ratatui::{
     widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
+use crate::subagent::{
+    looks_like_structured_subagent_output, try_parse_structured_subagent_result,
+};
 use crate::tui::{
     markdown::{MarkdownRenderOptions, render_markdown_document},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
@@ -24,7 +27,7 @@ use crate::tui::{
 use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
-use super::{composer::one_line_snippet, todo_card, tool_card};
+use super::{composer::one_line_snippet, structured_subagent, todo_card, tool_card};
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptRenderCache {
@@ -978,11 +981,26 @@ fn push_user_card_content_line_into(
 fn build_assistant_message_lines(
     out: &mut TimelineDocument,
     text: &str,
-    _streaming: bool,
+    streaming: bool,
     theme: Theme,
     width: usize,
 ) {
     if text.is_empty() {
+        out.push_decoration(
+            Line::from(Span::styled("  …", root_muted_style(theme))),
+            Break::End,
+        );
+        return;
+    }
+
+    if let Some(result) = try_parse_structured_subagent_result(text) {
+        out.document.append(
+            structured_subagent::render_structured_subagent_result_document(&result, theme, width),
+        );
+        return;
+    }
+
+    if streaming && looks_like_structured_subagent_output(text) {
         out.push_decoration(
             Line::from(Span::styled("  …", root_muted_style(theme))),
             Break::End,
@@ -2303,6 +2321,95 @@ mod tests {
         assert!(lines.contains("let x = 1;"), "{lines}");
         assert!(!lines.contains("**item**"), "{lines}");
         assert!(!lines.contains("```"), "{lines}");
+    }
+
+    #[test]
+    fn structured_subagent_json_renders_as_compact_card_at_narrow_width() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            json!({
+                "status": "completed",
+                "summary": "Updated transcript rendering",
+                "findings": ["Structured results no longer expose raw JSON"],
+                "files_read": ["src/tui/components/transcript.rs"],
+                "files_changed": ["src/tui/components/transcript.rs"],
+                "commands_run": ["cargo test transcript"],
+                "validation": ["focused tests passed"],
+                "blockers": [],
+                "next_steps": ["review the card"],
+            })
+            .to_string(),
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+
+        let lines = transcript_lines(&state, Theme::dark(), 24)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("Subagent"), "{rendered}");
+        assert!(rendered.contains("completed"), "{rendered}");
+        assert!(rendered.contains("Updated transcript"), "{rendered}");
+        assert!(rendered.contains("read"), "{rendered}");
+        assert!(rendered.contains("Findings"), "{rendered}");
+        assert!(!rendered.contains("\"status\""), "{rendered}");
+        assert!(!rendered.contains('{'), "{rendered}");
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 24),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn structured_subagent_json_accepts_object_summary_and_findings() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            json!({
+                "status": "completed",
+                "summary": {"conclusion": "Reviewed the child result"},
+                "findings": [{"evidence": "The child returned structured evidence"}],
+                "files_read": [],
+            })
+            .to_string(),
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+
+        let lines = transcript_lines(&state, Theme::dark(), 32)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("Subagent"), "{rendered}");
+        assert!(rendered.contains("completed"), "{rendered}");
+        assert!(rendered.contains("Reviewed the child"), "{rendered}");
+        assert!(rendered.contains("Findings"), "{rendered}");
+        assert!(!rendered.contains("\"conclusion\""), "{rendered}");
+        assert!(!rendered.contains('{'), "{rendered}");
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 32),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn non_structured_assistant_json_uses_markdown_fallback() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            r#"{"message":"ordinary JSON"}"#,
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("message"), "{rendered}");
+        assert!(rendered.contains("ordinary JSON"), "{rendered}");
+        assert!(!rendered.contains("Subagent"), "{rendered}");
     }
 
     #[test]
