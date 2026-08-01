@@ -3403,7 +3403,7 @@ mod tests {
         manual_compaction_session_token_usage, next_idle_session_command,
         record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
         select_active_session_operation, select_manual_compaction_operation,
-        send_subagent_interrupted,
+        send_subagent_interrupted, wait_for_subagent_cancel_settle,
     };
     use crate::session::{
         PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
@@ -9260,6 +9260,32 @@ mod tests {
         )
     }
 
+    fn responses_sse_tool_call_body(name: &str, arguments: serde_json::Value) -> String {
+        let response = serde_json::json!({
+            "type": "response.completed", "sequence_number": 1,
+            "response": {
+                "id": "r-tool-call", "object": "response", "created_at": 1,
+                "status": "completed", "background": false, "error": null,
+                "incomplete_details": null, "instructions": null, "max_output_tokens": null,
+                "model": "m1", "output": [{
+                    "type": "function_call", "id": "fc-test", "call_id": "call-test",
+                    "name": name, "arguments": arguments.to_string(), "status": "completed"
+                }],
+                "parallel_tool_calls": true, "previous_response_id": null, "reasoning": {},
+                "store": true, "temperature": 1, "text": {"format": {"type": "text"}},
+                "tool_choice": "auto", "tools": [], "top_p": 1, "truncation": "disabled",
+                "usage": {
+                    "input_tokens": 1, "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 2
+                },
+                "user": null, "metadata": {}
+            }
+        });
+        let response = serde_json::to_string(&response).expect("SSE response serializes");
+        format!("data: {response}\n\ndata: [DONE]\n\n")
+    }
+
     fn responses_sse_body(text: &str) -> String {
         let response = serde_json::json!({
             "type": "response.completed", "sequence_number": 1,
@@ -9317,6 +9343,14 @@ mod tests {
     }
 
     fn integration_agent(base_url: String, m1_input_limit_tokens: u64) -> Agent<OpenAIConfig> {
+        integration_agent_with_tools(base_url, m1_input_limit_tokens, false)
+    }
+
+    fn integration_agent_with_tools(
+        base_url: String,
+        m1_input_limit_tokens: u64,
+        supports_tools: bool,
+    ) -> Agent<OpenAIConfig> {
         let client = Client::with_config(
             OpenAIConfig::new()
                 .with_api_base(base_url)
@@ -9327,7 +9361,7 @@ mod tests {
             context_window: Some(input_limit_tokens.saturating_add(1_000)),
             effective_input_limit_tokens: Some(input_limit_tokens),
             max_output_tokens: Some(128),
-            supports_tools: false,
+            supports_tools,
             supports_reasoning: false,
             ..Default::default()
         };
@@ -9508,23 +9542,25 @@ mod tests {
                             )
                             .await
                             {
-                                ActiveSessionOperation::Interrupted => {
-                                    break (
-                                        Some(derive_interrupt_request(
-                                            &transcript,
+                                outcome @ (ActiveSessionOperation::Interrupted
+                                | ActiveSessionOperation::Shutdown) => {
+                                    let interrupt =
+                                        derive_interrupt_request(&transcript, &subagent_runtime);
+                                    let is_shutdown =
+                                        matches!(outcome, ActiveSessionOperation::Shutdown);
+                                    let settle_shutdown = if subagent_runtime.is_running() {
+                                        subagent_runtime.cancel_active();
+                                        wait_for_subagent_cancel_settle(
+                                            &mut control_rx,
+                                            &mut deferred_commands,
+                                            run.as_mut(),
                                             &subagent_runtime,
-                                        )),
-                                        false,
-                                    );
-                                }
-                                ActiveSessionOperation::Shutdown => {
-                                    break (
-                                        Some(derive_interrupt_request(
-                                            &transcript,
-                                            &subagent_runtime,
-                                        )),
-                                        true,
-                                    );
+                                        )
+                                        .await
+                                    } else {
+                                        false
+                                    };
+                                    break (Some(interrupt), is_shutdown || settle_shutdown);
                                 }
                                 ActiveSessionOperation::Completed(_) => break (None, false),
                                 ActiveSessionOperation::Command(Some(command)) => {
@@ -10568,6 +10604,59 @@ mod tests {
             }
             _ => true,
         }));
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn session_prompt_tool_call_interrupt_settles_active_child() {
+        let mut server = spawn_controlled_sse_server(vec![
+            ControlledSseResponse::Immediate(responses_sse_tool_call_body(
+                "agent__explore",
+                serde_json::json!({ "task": "inspect the blocked child" }),
+            )),
+            ControlledSseResponse::Blocked(responses_sse_body("child must not complete")),
+        ])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("tool-call-child-interrupt", Vec::new());
+        let agent = integration_agent_with_tools(server.base_url.clone(), 32_000, true);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir.clone());
+
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "parent-tool-call",
+                crate::user_content::UserMessageContent::new(
+                    "delegate the investigation",
+                    Vec::new(),
+                ),
+            )))
+            .expect("session executor accepts prompt");
+        server.expect_request(0).await;
+        server.expect_request(1).await;
+
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("session executor accepts interrupt");
+        let events = session_transport_events_until_terminal(&mut harness).await;
+
+        assert!(matches!(
+            events.last(),
+            Some(SessionTransportEvent::Interrupted) | Some(SessionTransportEvent::Done)
+        ));
+        assert_eq!(terminal_count(&events), 1, "unexpected events: {events:?}");
+        assert!(crate::transcript::child_sessions_dir(&sessions_dir).exists());
+        assert!(records(&transcript).iter().any(|record| matches!(
+            &record.event,
+            TranscriptEvent::SubagentResult { agent_name, status, .. }
+                if agent_name == "explorer" && status == "cancelled"
+        )));
+        assert!(
+            records(&transcript)
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+        );
+
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 

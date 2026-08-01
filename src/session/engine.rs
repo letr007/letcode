@@ -16,6 +16,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_openai::config::Config;
@@ -38,6 +39,17 @@ use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecorder, read_records,
     remove_empty_session_file, sync_recorder_branch, transcript_projection,
 };
+
+/// Maximum time to keep polling the parent run after signalling subagent
+/// cancellation so the subagent's completion teardown (cancelled terminal
+/// record, guard release) can run to completion. Bounded so a stuck subagent
+/// cannot block the engine forever.
+const SUBAGENT_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Poll interval while waiting for subagent cancellation to settle. Keeps the
+/// parent run polled (so the in-flight subagent future can settle) without
+/// busy-spinning.
+const SUBAGENT_CANCEL_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Error returned when the session engine no longer accepts frontend input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,6 +628,68 @@ where
                 Some(SessionEngineControl::Shutdown) | None => return ManualCompactionOperation::Shutdown,
             },
             result = operation.as_mut() => return ManualCompactionOperation::Completed(result),
+        }
+    }
+}
+
+/// Polls the parent run until every running subagent has settled (its
+/// completion teardown ran) or the bounded settle window expires.
+///
+/// Callers must signal `cancel_active()` before calling this. During the settle
+/// window the parent run remains live and polled: this lets the inline
+/// subagent future complete `complete_started_run`, record its cancelled
+/// terminal state, and release its active slot. Commands received during this
+/// wait are retained for the outer loop rather than being consumed or lost.
+///
+/// Returns whether shutdown was requested while waiting.
+pub(crate) async fn wait_for_subagent_cancel_settle<T, F>(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+    mut run: Pin<&mut F>,
+    subagent_runtime: &SubagentPool,
+) -> bool
+where
+    F: Future<Output = T> + ?Sized,
+{
+    let timeout = tokio::time::sleep(SUBAGENT_CANCEL_SETTLE_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut cancel_tick = tokio::time::interval(SUBAGENT_CANCEL_SETTLE_POLL_INTERVAL);
+    let mut shutdown = false;
+
+    loop {
+        if !subagent_runtime.is_running() {
+            return shutdown;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut timeout => {
+                // Bounded fallback: the caller will drop the parent run, which
+                // force-cancels any child that could not settle cooperatively.
+                return shutdown;
+            }
+            control = control_rx.recv() => match control {
+                Some(SessionEngineControl::Interrupt) => {
+                    // Keep waiting; the first interrupt already initiated cancellation.
+                }
+                Some(SessionEngineControl::Shutdown) | None => {
+                    shutdown = true;
+                }
+                Some(SessionEngineControl::Command(command)) => {
+                    deferred_commands.push_back(command);
+                }
+            },
+            _ = cancel_tick.tick() => {
+                // Re-signal in case the parent turn briefly recovered and
+                // attempted to start another subagent during cancellation.
+                subagent_runtime.cancel_active();
+            }
+            _ = run.as_mut() => {
+                // The parent turn completed before the pool observed guard
+                // release. Its future is settled, so no further child work can
+                // be driven by this run.
+                return shutdown;
+            }
         }
     }
 }
@@ -1686,19 +1760,33 @@ async fn run_engine_loop<C>(
                         )
                         .await
                         {
-                            ActiveSessionOperation::Interrupted => {
-                                interrupted = Some(derive_interrupt_request(
+                            outcome @ (ActiveSessionOperation::Interrupted
+                            | ActiveSessionOperation::Shutdown) => {
+                                let is_shutdown =
+                                    matches!(outcome, ActiveSessionOperation::Shutdown);
+                                // Capture the interrupt request while the subagent is
+                                // still active so the visible child session can be
+                                // reported. Then signal cancellation and poll the run
+                                // until the in-flight subagent's completion teardown
+                                // (cancelled terminal record, guard release) settles.
+                                let interrupt = derive_interrupt_request(
                                     &transcript,
                                     &subagent_runtime,
-                                ));
-                                break;
-                            }
-                            ActiveSessionOperation::Shutdown => {
-                                shutdown = true;
-                                interrupted = Some(derive_interrupt_request(
-                                    &transcript,
-                                    &subagent_runtime,
-                                ));
+                                );
+                                interrupted = Some(interrupt);
+                                if subagent_runtime.is_running() {
+                                    subagent_runtime.cancel_active();
+                                    let settle_shutdown = wait_for_subagent_cancel_settle(
+                                        &mut control_rx,
+                                        &mut deferred_commands,
+                                        run.as_mut(),
+                                        &subagent_runtime,
+                                    )
+                                    .await;
+                                    shutdown = is_shutdown || settle_shutdown;
+                                } else {
+                                    shutdown = is_shutdown;
+                                }
                                 break;
                             }
                             ActiveSessionOperation::Completed(_) => break,
