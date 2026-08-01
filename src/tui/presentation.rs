@@ -69,13 +69,7 @@ fn tool_presentation_impl(
     }
 
     if is_workflow_control_tool(tool_name) {
-        return match status {
-            ToolPresentationStatus::Pending | ToolPresentationStatus::Running => {
-                ToolPresentation::CompactCard
-            }
-            ToolPresentationStatus::Succeeded => ToolPresentation::Hidden,
-            ToolPresentationStatus::Failed => ToolPresentation::CompactCard,
-        };
+        return ToolPresentation::CompactCard;
     }
 
     let class = crate::permission::classify_tool(tool_name);
@@ -170,27 +164,21 @@ mod tests {
     }
 
     #[test]
-    fn workflow_control_tools_follow_pending_running_finished_visibility() {
+    fn workflow_control_tools_remain_visible() {
         let policy = PresentationPolicy;
 
-        for (status, expected) in [
-            (
-                ToolPresentationStatus::Pending,
-                ToolPresentation::CompactCard,
-            ),
-            (
-                ToolPresentationStatus::Running,
-                ToolPresentation::CompactCard,
-            ),
-            (ToolPresentationStatus::Succeeded, ToolPresentation::Hidden),
-            (
-                ToolPresentationStatus::Failed,
-                ToolPresentation::CompactCard,
-            ),
+        for status in [
+            ToolPresentationStatus::Pending,
+            ToolPresentationStatus::Running,
+            ToolPresentationStatus::Succeeded,
+            ToolPresentationStatus::Failed,
         ] {
             for tool_name in ["workflow__todos", "workflow__auto_continue"] {
                 let text_context = ToolTextPresentationContext::new(tool_name, status);
-                assert_eq!(policy.tool_presentation_text(&text_context), expected);
+                assert_eq!(
+                    policy.tool_presentation_text(&text_context),
+                    ToolPresentation::CompactCard
+                );
             }
         }
     }

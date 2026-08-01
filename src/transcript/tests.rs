@@ -2023,10 +2023,7 @@ fn todo_and_auto_continue_events_round_trip_and_restore_latest_state() {
         }])
         .expect("record first todo snapshot");
     recorder
-        .record_auto_continue_changed(AutoContinueState {
-            enabled: true,
-            max_continuations: 2,
-        })
+        .record_auto_continue_changed(AutoContinueState { enabled: true })
         .expect("record auto-continue");
     recorder
         .record_auto_continuation_scheduled(1, 1)
@@ -2056,7 +2053,6 @@ fn todo_and_auto_continue_events_round_trip_and_restore_latest_state() {
 
     let auto_continue = restore_latest_auto_continue_state(&records).expect("latest auto-continue");
     assert!(auto_continue.enabled);
-    assert_eq!(auto_continue.max_continuations, 2);
     assert!(
         restore_conversation_messages(&records)
             .expect("restore messages")
@@ -2094,10 +2090,7 @@ fn restore_latest_workflow_state_resets_on_new_turn_and_error() {
             timestamp_ms: 1,
             context_branch_id: None,
             event: TranscriptEvent::AutoContinueChanged {
-                state: AutoContinueState {
-                    enabled: true,
-                    max_continuations: 2,
-                },
+                state: AutoContinueState { enabled: true },
             },
         },
         TranscriptRecord {

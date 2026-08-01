@@ -7,8 +7,6 @@ use super::{ToolHandler, ToolRegistry};
 
 const MAX_WORKFLOW_TODOS: usize = 100;
 const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 1_000;
-const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 16;
-
 struct WorkflowTodosTool;
 
 struct WorkflowAutoContinueTool;
@@ -78,7 +76,7 @@ impl ToolHandler for WorkflowAutoContinueTool {
     }
 
     fn description(&self) -> &'static str {
-        "Enable or disable bounded internal auto-continuation for unfinished todos."
+        "Enable or disable autonomous continuation. Use workflow__todos to track work when useful, but todo statuses do not control continuation. Once enabled, normal model completion continues until the agent disables this extension; explicit interruption, shutdown, and interactive permission or question requests remain stopping boundaries."
     }
 
     fn parameters(&self) -> Value {
@@ -89,14 +87,8 @@ impl ToolHandler for WorkflowAutoContinueTool {
                     "type": "boolean",
                     "description": "Whether bounded auto-continuation is enabled"
                 },
-                "max_continuations": {
-                    "type": ["integer", "null"],
-                    "minimum": 0,
-                    "maximum": MAX_WORKFLOW_AUTO_CONTINUATIONS,
-                    "description": "Optional per-turn continuation limit. Use null to keep the default."
-                }
             },
-            "required": ["enabled", "max_continuations"],
+            "required": ["enabled"],
             "additionalProperties": false
         })
     }
@@ -176,21 +168,5 @@ fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
         bail!("workflow__auto_continue requires boolean field 'enabled'");
     }
 
-    let Some(max_continuations) = args.get("max_continuations") else {
-        bail!("workflow__auto_continue requires field 'max_continuations' as integer or null");
-    };
-
-    if max_continuations.is_null() {
-        return Ok(());
-    }
-
-    let Some(max_continuations) = max_continuations.as_u64() else {
-        bail!("workflow__auto_continue field 'max_continuations' must be integer or null");
-    };
-    if max_continuations > MAX_WORKFLOW_AUTO_CONTINUATIONS {
-        bail!(
-            "workflow__auto_continue max_continuations must be <= {MAX_WORKFLOW_AUTO_CONTINUATIONS}, got {max_continuations}"
-        );
-    }
     Ok(())
 }

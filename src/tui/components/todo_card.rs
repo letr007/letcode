@@ -194,10 +194,7 @@ mod tests {
                     status: TodoStatus::Blocked,
                 },
             ],
-            auto_continue: AutoContinueState {
-                enabled: true,
-                max_continuations: 3,
-            },
+            auto_continue: AutoContinueState { enabled: true },
         };
 
         let lines = render_todo_card_lines(&todo, Theme::dark(), 56);
@@ -310,10 +307,7 @@ mod tests {
                     status: TodoStatus::Completed,
                 },
             ],
-            auto_continue: AutoContinueState {
-                enabled: true,
-                max_continuations: 2,
-            },
+            auto_continue: AutoContinueState { enabled: true },
         };
 
         for width in [18usize, 24, 36] {

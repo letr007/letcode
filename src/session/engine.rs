@@ -278,6 +278,7 @@ impl SessionEngine {
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let title_event_tx = event_tx.clone();
         let ingress = SessionEngineIngress { control_tx };
         let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
         let discovery_config = config.mcp_config.clone();
@@ -297,6 +298,7 @@ impl SessionEngine {
             mcp_tools_rx,
             control_rx,
             event_tx.clone(),
+            title_event_tx,
             subagent_runtime,
         ));
         Ok((
@@ -485,6 +487,7 @@ pub(crate) enum ActiveSessionOperation<T> {
     Interrupted,
     Shutdown,
     Completed(T),
+    RunnerEvent(SessionTransportEvent),
     Command(Option<SessionEngineCommand>),
 }
 
@@ -552,7 +555,20 @@ pub(crate) async fn next_idle_session_command(
 pub(crate) async fn select_active_session_operation<T, F>(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
+    operation: Pin<&mut F>,
+) -> ActiveSessionOperation<T>
+where
+    F: Future<Output = T> + ?Sized,
+{
+    select_active_session_operation_with_events(control_rx, deferred_commands, operation, None)
+        .await
+}
+
+pub(crate) async fn select_active_session_operation_with_events<T, F>(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
     mut operation: Pin<&mut F>,
+    mut runner_event_rx: Option<&mut mpsc::UnboundedReceiver<SessionTransportEvent>>,
 ) -> ActiveSessionOperation<T>
 where
     F: Future<Output = T> + ?Sized,
@@ -589,7 +605,36 @@ where
                     return ActiveSessionOperation::Shutdown;
                 }
             },
+            event = async {
+                match runner_event_rx.as_deref_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
+                Some(event) => return ActiveSessionOperation::RunnerEvent(event),
+                None => runner_event_rx = None,
+            },
             result = operation.as_mut() => return ActiveSessionOperation::Completed(result),
+        }
+    }
+}
+
+/// Forwards all runner events that are already queued when its future settles,
+/// except its private completion marker. The engine emits the sole public Done
+/// after this drain.
+pub(crate) fn forward_queued_runner_events(
+    runner_event_rx: &mut mpsc::UnboundedReceiver<SessionTransportEvent>,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+) {
+    loop {
+        match runner_event_rx.try_recv() {
+            Ok(SessionTransportEvent::Done) => {}
+            Ok(event) => {
+                let _ = session_transport_tx.send(event);
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
         }
     }
 }
@@ -1202,14 +1247,12 @@ async fn run_engine_loop<C>(
     mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
     mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
+    title_event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     subagent_runtime: SubagentPool,
 ) where
     C: Config + Clone + Send + Sync + 'static,
 {
     let transcript = transcript;
-    let runner: AgentRunner<C> =
-        AgentRunner::with_transcript(session_transport_tx.clone(), transcript.clone())
-            .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
     let mut agent = agent;
     let mut mcp_tools_rx = Some(mcp_tools_rx);
     let mut mcp_config = mcp_config;
@@ -1466,11 +1509,14 @@ async fn run_engine_loop<C>(
                                         }
                                         record_interrupt_transcript(&transcript, &interrupt);
                                         if child_started {
-                                            if let Err(error) = delegate.await {
-                                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                                                    ErrorEvent::new(format!("{error:#}")),
-                                                ));
-                                            }
+                                            let settle_shutdown = wait_for_subagent_cancel_settle(
+                                                &mut control_rx,
+                                                &mut deferred_commands,
+                                                delegate.as_mut(),
+                                                &subagent_runtime,
+                                            )
+                                            .await;
+                                            shutdown |= settle_shutdown;
                                         }
                                         break;
                                     }
@@ -1540,6 +1586,9 @@ async fn run_engine_loop<C>(
                                         let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
                                             "history navigation is unavailable while a turn is active",
                                         )));
+                                    }
+                                    ActiveSessionOperation::RunnerEvent(_) => {
+                                        unreachable!("event-aware selection is not used for delegates")
                                     }
                                     ActiveSessionOperation::Command(Some(_)) => {}
                                     ActiveSessionOperation::Command(None) => break,
@@ -1746,6 +1795,10 @@ async fn run_engine_loop<C>(
                     continue;
                 }
 
+                let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
+                let runner = AgentRunner::with_transcript(runner_event_tx, transcript.clone())
+                    .with_session_title_event_sender(title_event_tx.clone())
+                    .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
                 let (interrupted, shutdown) = {
                     let run = runner.run_prompt(&mut agent, prompt);
                     tokio::pin!(run);
@@ -1753,10 +1806,11 @@ async fn run_engine_loop<C>(
                     let mut shutdown = false;
 
                     loop {
-                        match select_active_session_operation(
+                        match select_active_session_operation_with_events(
                             &mut control_rx,
                             &mut deferred_commands,
                             run.as_mut(),
+                            Some(&mut runner_event_rx),
                         )
                         .await
                         {
@@ -1789,7 +1843,21 @@ async fn run_engine_loop<C>(
                                 }
                                 break;
                             }
-                            ActiveSessionOperation::Completed(_) => break,
+                            ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done) => {
+                                // Runner completion is internal until its future has
+                                // settled. This keeps external Done authoritative.
+                            }
+                            ActiveSessionOperation::RunnerEvent(event) => {
+                                let _ = session_transport_tx.send(event);
+                            }
+                            ActiveSessionOperation::Completed(_) => {
+                                forward_queued_runner_events(
+                                    &mut runner_event_rx,
+                                    &session_transport_tx,
+                                );
+                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                break;
+                            }
                             ActiveSessionOperation::Command(command) => match command {
                                 Some(SessionEngineCommand::Prompt(prompt)) => {
                                     deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));

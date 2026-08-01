@@ -5609,12 +5609,12 @@ fn auto_continue_defaults_to_disabled() {
 }
 
 #[tokio::test]
-async fn workflow_auto_continue_tool_enables_bounded_state() {
+async fn workflow_auto_continue_tool_enables_llm_controlled_state() {
     let mut agent = test_agent();
     let call = HistoryToolCall {
         call_id: "call-auto".into(),
         name: "workflow__auto_continue".into(),
-        arguments_json: r#"{"enabled":true,"max_continuations":2}"#.into(),
+        arguments_json: r#"{"enabled":true}"#.into(),
     };
 
     let record = agent
@@ -5625,8 +5625,47 @@ async fn workflow_auto_continue_tool_enables_bounded_state() {
         .expect("control tool should succeed");
 
     assert!(record.output.ok);
-    assert_eq!(agent.auto_continue().enabled, true);
-    assert_eq!(agent.auto_continue().max_continuations, 2);
+    assert!(agent.auto_continue().enabled);
+}
+
+#[tokio::test]
+async fn auto_continue_runs_past_agent_limits_until_llm_disables_it() {
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+        responses_tool_batch_sse(vec![json!({
+            "type": "function_call", "id": "fc-enable", "call_id": "call-enable",
+            "name": "workflow__auto_continue", "arguments": "{\"enabled\":true}",
+            "status": "completed"
+        })]),
+        responses_final_sse("first"),
+        responses_tool_batch_sse(vec![json!({
+            "type": "function_call", "id": "fc-disable", "call_id": "call-disable",
+            "name": "workflow__auto_continue", "arguments": "{\"enabled\":false}",
+            "status": "completed"
+        })]),
+        responses_final_sse("final"),
+    ])
+    .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 1, 1);
+
+    let result = agent
+        .run_stream_async(
+            "continue until disabled",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("auto-continue should outlive ordinary agent limits");
+
+    assert_eq!(result, "firstfinal");
+    assert_eq!(request_count.load(Ordering::SeqCst), 4);
+    assert!(!agent.auto_continue().enabled);
+    server.await.expect("server task should finish");
 }
 
 #[tokio::test]
@@ -5716,12 +5755,9 @@ async fn workflow_todos_event_failure_does_not_mutate_state() {
 #[tokio::test]
 async fn workflow_auto_continue_event_failure_does_not_mutate_state() {
     let mut agent = test_agent();
-    let previous = AutoContinueState {
-        enabled: false,
-        max_continuations: 3,
-    };
+    let previous = AutoContinueState { enabled: false };
     agent.turn.workflow.auto_continue = previous.clone();
-    let args = json!({"enabled": true, "max_continuations": 5});
+    let args = json!({"enabled": true});
 
     let result = agent
         .apply_control_tool_state("workflow__auto_continue", &args, &mut |_| {
@@ -7242,19 +7278,11 @@ async fn yolo_mode_executes_commands_that_default_mode_denies_by_policy() {
 }
 
 #[tokio::test]
-async fn unfinished_todos_trigger_bounded_internal_continuation() {
+async fn auto_continue_continues_without_todo_progress() {
     let mut agent = test_agent();
     agent.prepare_turn_prelude("implement a feature");
     let turn_id = agent.current_turn_id();
-    agent.turn.workflow.auto_continue = AutoContinueState {
-        enabled: true,
-        max_continuations: 2,
-    };
-    agent.turn.workflow.todos = vec![TodoItem {
-        id: "t1".into(),
-        content: "keep going".into(),
-        status: TodoStatus::InProgress,
-    }];
+    agent.turn.workflow.auto_continue = AutoContinueState { enabled: true };
     let mut continuation_count = 0;
     let mut events = Vec::new();
 
@@ -7285,23 +7313,20 @@ async fn unfinished_todos_trigger_bounded_internal_continuation() {
             },
             AgentEvent::AutoContinuationScheduled {
                 continuation_count: 1,
-                remaining_unfinished: 1,
+                remaining_unfinished: 0,
             }
         ]
     ));
 }
 
 #[tokio::test]
-async fn auto_continue_stops_when_todos_do_not_progress() {
+async fn auto_continue_stops_only_when_llm_disables_it() {
     let mut agent = test_agent();
-    agent.turn.workflow.auto_continue = AutoContinueState {
-        enabled: true,
-        max_continuations: 3,
-    };
+    agent.turn.workflow.auto_continue.enabled = true;
     agent.turn.workflow.todos = vec![TodoItem {
-        id: "t1".into(),
-        content: "still pending".into(),
-        status: TodoStatus::Pending,
+        id: "blocked".into(),
+        content: "LLM records this as blocked but remains in control".into(),
+        status: TodoStatus::Blocked,
     }];
     let mut continuation_count = 0;
 
@@ -7312,29 +7337,10 @@ async fn auto_continue_stops_when_todos_do_not_progress() {
                 &mut continuation_count
             )
             .await
-            .expect("first continuation should proceed")
+            .expect("blocked todo must not stop auto-continue")
     );
 
-    let error = agent
-        .continue_after_no_tool_reply(&mut |_| std::future::ready(Ok(())), &mut continuation_count)
-        .await
-        .expect_err("unchanged todo snapshot should stop");
-
-    assert!(error.to_string().contains("no todo progress"));
-    assert_eq!(continuation_count, 1);
-}
-
-#[tokio::test]
-async fn completed_or_blocked_todos_stop_auto_continuation() {
-    let mut agent = test_agent();
-    agent.turn.workflow.auto_continue.enabled = true;
-    let mut continuation_count = 0;
-
-    agent.turn.workflow.todos = vec![TodoItem {
-        id: "done".into(),
-        content: "done".into(),
-        status: TodoStatus::Completed,
-    }];
+    agent.turn.workflow.auto_continue.enabled = false;
     assert!(
         !agent
             .continue_after_no_tool_reply(
@@ -7342,46 +7348,8 @@ async fn completed_or_blocked_todos_stop_auto_continuation() {
                 &mut continuation_count
             )
             .await
-            .expect("completed todos should stop")
+            .expect("LLM disable must stop auto-continue")
     );
-
-    agent.turn.workflow.todos = vec![TodoItem {
-        id: "blocked".into(),
-        content: "blocked".into(),
-        status: TodoStatus::Blocked,
-    }];
-    assert!(
-        !agent
-            .continue_after_no_tool_reply(
-                &mut |_| std::future::ready(Ok(())),
-                &mut continuation_count
-            )
-            .await
-            .expect("blocked todos should stop")
-    );
-}
-
-#[tokio::test]
-async fn continuation_bound_is_runtime_enforced() {
-    let mut agent = test_agent();
-    agent.turn.workflow.auto_continue = AutoContinueState {
-        enabled: true,
-        max_continuations: 1,
-    };
-    agent.turn.workflow.todos = vec![TodoItem {
-        id: "t1".into(),
-        content: "still pending".into(),
-        status: TodoStatus::Pending,
-    }];
-    let mut continuation_count = 1;
-
-    let error = agent
-        .continue_after_no_tool_reply(&mut |_| std::future::ready(Ok(())), &mut continuation_count)
-        .await
-        .expect_err("limit should fail fast");
-
-    assert!(error.to_string().contains("auto-continue limit reached"));
-    assert_eq!(continuation_count, 1);
 }
 
 #[test]
@@ -8341,6 +8309,24 @@ fn child_validation_classification_ignores_not_run_and_counts_object_failures() 
 
     assert_eq!(ran, 2);
     assert_eq!(failed, 1);
+}
+
+#[test]
+fn auto_continue_bypasses_agent_iteration_and_tool_call_limits() {
+    let mut agent = test_agent();
+    agent.turn.auto_continue_active = true;
+
+    assert!(agent.ensure_tool_call_budget(4, 1).is_ok());
+}
+
+#[test]
+fn auto_continue_runtime_flag_resets_for_the_next_turn() {
+    let mut agent = test_agent();
+    agent.turn.auto_continue_active = true;
+
+    agent.prepare_turn_prelude("next task");
+
+    assert!(!agent.turn.auto_continue_active);
 }
 
 #[test]

@@ -324,15 +324,21 @@ fn render_tool_trace_line(
         return SemanticLine::default();
     }
 
-    let glyph = if matches!(
+    let active = matches!(
         tool.status,
         ToolExecutionStatus::Pending | ToolExecutionStatus::Running
-    ) {
+    );
+    let hide_terminal_auto_continue_glyph = tool.name == "workflow__auto_continue" && !active;
+    let glyph = if active {
         PROCESS_FRAMES[frame % PROCESS_FRAMES.len()]
     } else {
         "→"
     };
-    let prefix = format!("  {glyph} ");
+    let prefix = if hide_terminal_auto_continue_glyph {
+        "  ".to_owned()
+    } else {
+        format!("  {glyph} ")
+    };
     let arrow_style = tool_trace_arrow_style(tool.status, theme);
     let text_style = tool_trace_text_style(tool.status, theme);
     let status_suffix = if tool.name == crate::tool_names::TOOL_QUESTION {
@@ -347,10 +353,10 @@ fn render_tool_trace_line(
         }
     };
     let text_budget = width.saturating_sub(display_width(&prefix));
-    let mut spans = vec![
-        SemanticSpan::decoration("  ", theme.app_style()),
-        SemanticSpan::decoration(format!("{glyph} "), arrow_style),
-    ];
+    let mut spans = vec![SemanticSpan::decoration("  ", theme.app_style())];
+    if !hide_terminal_auto_continue_glyph {
+        spans.push(SemanticSpan::decoration(format!("{glyph} "), arrow_style));
+    }
     spans.extend(tool_trace_segments(tool, text_style));
     if !status_suffix.is_empty() {
         spans.push(SemanticSpan::decoration(status_suffix, text_style));
@@ -2361,7 +2367,13 @@ fn tool_trace_label(tool: &ToolView) -> String {
         ),
         "edit__apply_patch" => "Apply patch".into(),
         "workflow__todos" => "Update todos".into(),
-        "workflow__auto_continue" => "Update auto-continue".into(),
+        "workflow__auto_continue" => match args
+            .and_then(|value| value.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(enabled) => format!("⚙ auto-continue {enabled}"),
+            None => "⚙ auto-continue".into(),
+        },
         "code__ast_search" => {
             let path = value_str(args, "path").unwrap_or(".");
             format!("AST search in {path}")
@@ -2388,7 +2400,7 @@ fn pending_tool_trace_label(name: &str) -> String {
         "skill" => "Skill".into(),
         "edit__apply_patch" => "Apply patch".into(),
         "workflow__todos" => "Update todos".into(),
-        "workflow__auto_continue" => "Update auto-continue".into(),
+        "workflow__auto_continue" => "⚙ auto-continue".into(),
         "fs__read" => "Read".into(),
         "fs__list" => "List".into(),
         "fs__write" => "Write".into(),
@@ -3467,19 +3479,28 @@ mod tests {
     }
 
     #[test]
-    fn workflow_control_tools_hide_quiet_success_trace_lines() {
+    fn workflow_auto_continue_success_renders_enabled_state() {
         let tool = ToolView {
             call_id: "call-workflow".into(),
-            name: "workflow__todos".into(),
-            summary: "workflow__todos completed".into(),
-            arguments: Some(serde_json::json!({"items": []}).to_string()),
+            name: "workflow__auto_continue".into(),
+            summary: "workflow__auto_continue completed".into(),
+            arguments: Some(serde_json::json!({"enabled": true}).to_string()),
             output: Some("{}".into()),
             status: ToolExecutionStatus::Succeeded,
         };
 
-        let lines = render_tool_card_lines(&tool, Theme::dark(), 60);
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
 
-        assert!(lines.is_empty());
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("⚙ auto-continue true"),
+            "{}",
+            rendered[0]
+        );
+        assert!(!rendered[0].contains('→'), "{}", rendered[0]);
     }
 
     #[test]
@@ -3509,7 +3530,7 @@ mod tests {
             call_id: "call-workflow-running".into(),
             name: "workflow__auto_continue".into(),
             summary: "workflow__auto_continue".into(),
-            arguments: Some(serde_json::json!({"enabled":true,"max_continuations":2}).to_string()),
+            arguments: Some(serde_json::json!({"enabled":true}).to_string()),
             output: None,
             status: ToolExecutionStatus::Running,
         };
@@ -3521,10 +3542,11 @@ mod tests {
 
         assert_eq!(rendered.len(), 1, "{rendered:?}");
         assert!(
-            rendered[0].contains("Update auto-continue …"),
+            rendered[0].contains("⚙ auto-continue true …"),
             "{}",
             rendered[0]
         );
+        assert!(rendered[0].contains(PROCESS_FRAMES[0]), "{}", rendered[0]);
     }
 
     #[test]

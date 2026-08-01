@@ -27,22 +27,7 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AutoContinueState {
     pub enabled: bool,
-    pub max_continuations: usize,
-}
-
-impl AutoContinueState {
-    const DEFAULT_MAX_CONTINUATIONS: usize = 3;
-    pub(super) const ABSOLUTE_MAX_CONTINUATIONS: usize = 16;
-}
-
-impl Default for AutoContinueState {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_continuations: Self::DEFAULT_MAX_CONTINUATIONS,
-        }
-    }
 }

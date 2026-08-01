@@ -101,7 +101,7 @@ impl TimelineItem {
                 blocks.push(DisplayBlock::KeyValue {
                     label: "auto".into(),
                     value: if todo.auto_continue.enabled {
-                        format!("on · max {}", todo.auto_continue.max_continuations)
+                        "on".into()
                     } else {
                         "off".into()
                     },
@@ -1763,7 +1763,6 @@ mod tests {
         }]));
         timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(AutoContinueState {
             enabled: true,
-            max_continuations: 2,
         }));
         timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
             id: "t1".into(),
@@ -1772,7 +1771,6 @@ mod tests {
         }]));
         timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(AutoContinueState {
             enabled: true,
-            max_continuations: 2,
         }));
 
         assert_eq!(timeline.items().len(), 2);
@@ -1852,7 +1850,6 @@ mod tests {
         timeline.push_user_message(UserMessageEvent::queued("follow up"));
         timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(AutoContinueState {
             enabled: true,
-            max_continuations: 3,
         }));
 
         let todo = timeline
@@ -1879,10 +1876,7 @@ mod tests {
                 timestamp_ms: 0,
                 context_branch_id: None,
                 event: TranscriptEvent::AutoContinueChanged {
-                    state: AutoContinueState {
-                        enabled: true,
-                        max_continuations: 3,
-                    },
+                    state: AutoContinueState { enabled: true },
                 },
             },
             TranscriptRecord {
@@ -1919,7 +1913,6 @@ mod tests {
             TimelineItem::Todo(todo) => {
                 assert_eq!(todo.items[0].status, TodoStatus::Completed);
                 assert!(todo.auto_continue.enabled);
-                assert_eq!(todo.auto_continue.max_continuations, 3);
             }
             other => panic!("expected restored todo item, got {other:?}"),
         }

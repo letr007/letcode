@@ -459,7 +459,11 @@ where
     let result = async {
         let mut iteration_count = 0;
         'agent_iteration: loop {
-            ensure_iteration_budget(agent.max_iterations, iteration_count)?;
+            ensure_iteration_budget(
+                agent.max_iterations,
+                iteration_count,
+                agent.turn.auto_continue_active,
+            )?;
             let iteration = iteration_count;
             iteration_count += 1;
         debug!(
@@ -1190,7 +1194,11 @@ where
     let result = async {
         let mut iteration_count = 0;
         'agent_iteration: loop {
-            ensure_iteration_budget(agent.max_iterations, iteration_count)?;
+            ensure_iteration_budget(
+                agent.max_iterations,
+                iteration_count,
+                agent.turn.auto_continue_active,
+            )?;
             let iteration = iteration_count;
             iteration_count += 1;
         debug!(
@@ -2392,7 +2400,14 @@ where
     Ok(())
 }
 
-fn ensure_iteration_budget(limit: Option<usize>, iteration_count: usize) -> Result<()> {
+fn ensure_iteration_budget(
+    limit: Option<usize>,
+    iteration_count: usize,
+    auto_continue_enabled: bool,
+) -> Result<()> {
+    if auto_continue_enabled {
+        return Ok(());
+    }
     if let Some(limit) = limit
         && iteration_count >= limit
     {

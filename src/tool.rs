@@ -3167,13 +3167,14 @@ mod tests {
             .find(|spec| spec.name == "workflow__auto_continue")
             .expect("workflow auto-continue tool is registered");
 
-        assert_eq!(
-            auto_continue.parameters["properties"]["max_continuations"]["type"],
-            serde_json::json!(["integer", "null"])
+        assert!(
+            auto_continue.parameters["properties"]
+                .get("max_continuations")
+                .is_none()
         );
         assert_eq!(
             auto_continue.parameters["required"],
-            serde_json::json!(["enabled", "max_continuations"])
+            serde_json::json!(["enabled"])
         );
     }
 
@@ -3440,20 +3441,9 @@ mod tests {
         );
 
         let auto_output = tools
-            .call(
-                "workflow__auto_continue",
-                json!({"enabled": true, "max_continuations": 17}),
-            )
+            .call("workflow__auto_continue", json!({"enabled": true}))
             .await;
-        assert!(!auto_output.ok);
-        assert!(
-            auto_output
-                .error
-                .as_ref()
-                .expect("auto-continue error")
-                .message
-                .contains("<= 16")
-        );
+        assert!(auto_output.ok, "{auto_output:?}");
     }
 
     #[tokio::test]
@@ -3552,10 +3542,7 @@ mod tests {
     async fn workflow_auto_continue_rejects_invalid_types() {
         let tools = ToolRegistry::default_tools();
         let output = tools
-            .call(
-                "workflow__auto_continue",
-                json!({"enabled": "yes", "max_continuations": null}),
-            )
+            .call("workflow__auto_continue", json!({"enabled": "yes"}))
             .await;
         assert!(!output.ok);
         assert!(
@@ -3565,22 +3552,6 @@ mod tests {
                 .expect("auto-continue error")
                 .message
                 .contains("requires boolean field 'enabled'")
-        );
-
-        let output = tools
-            .call(
-                "workflow__auto_continue",
-                json!({"enabled": true, "max_continuations": "many"}),
-            )
-            .await;
-        assert!(!output.ok);
-        assert!(
-            output
-                .error
-                .as_ref()
-                .expect("auto-continue error")
-                .message
-                .contains("must be integer or null")
         );
     }
 

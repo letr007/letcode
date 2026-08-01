@@ -1740,10 +1740,7 @@ mod tests {
     fn todo_timeline_items_render_full_card_sections() {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::AutoContinueChanged(
-            AutoContinueChangedEvent::new(AutoContinueState {
-                enabled: true,
-                max_continuations: 2,
-            }),
+            AutoContinueChangedEvent::new(AutoContinueState { enabled: true }),
         ));
         state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
             TodoItem {

@@ -2204,6 +2204,9 @@ impl<C: Config> Agent<C> {
 
     fn ensure_tool_call_budget(&self, current_count: usize, requested_count: usize) -> Result<()> {
         let total_count = current_count + requested_count;
+        if self.turn.auto_continue_active {
+            return Ok(());
+        }
         if let Some(limit) = self.max_tool_calls
             && total_count > limit
         {
@@ -2751,22 +2754,17 @@ impl<C: Config> Agent<C> {
             }
             "workflow__auto_continue" => {
                 let payload: WorkflowAutoContinuePayload = serde_json::from_value(args.clone())?;
-                let mut next_state = self.turn.workflow.auto_continue.clone();
-                next_state.enabled = payload.enabled;
-                if let Some(max_continuations) = payload.max_continuations {
-                    if max_continuations > AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS {
-                        return Err(anyhow!(
-                            "max_continuations {max_continuations} exceeds maximum {}",
-                            AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS
-                        ));
-                    }
-                    next_state.max_continuations = max_continuations;
-                }
+                let next_state = AutoContinueState {
+                    enabled: payload.enabled,
+                };
                 on_event(AgentEvent::AutoContinueChanged {
                     state: next_state.clone(),
                 })
                 .await?;
                 self.turn.workflow.auto_continue = next_state;
+                if payload.enabled {
+                    self.turn.auto_continue_active = true;
+                }
             }
             _ => {}
         }
@@ -2774,43 +2772,11 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-    fn finalize_turn_decision(&self, continuation_count: usize) -> FinalizeDecision {
-        let Some(remaining_unfinished) = self.remaining_unfinished_todos() else {
-            return FinalizeDecision::Finish;
-        };
-
-        if !self.turn.workflow.auto_continue.enabled {
-            return FinalizeDecision::Finish;
-        }
-
-        if continuation_count >= self.turn.workflow.auto_continue.max_continuations {
-            return FinalizeDecision::StopWithError {
-                message: format!(
-                    "stopped: auto-continue limit reached (max {}, {} unfinished todo item{})",
-                    self.turn.workflow.auto_continue.max_continuations,
-                    remaining_unfinished,
-                    if remaining_unfinished == 1 { "" } else { "s" }
-                ),
-            };
-        }
-
-        if self
-            .turn
-            .last_continuation_todos
-            .as_ref()
-            .is_some_and(|previous| previous == &self.turn.workflow.todos)
-        {
-            return FinalizeDecision::StopWithError {
-                message: format!(
-                    "stopped: auto-continue made no todo progress ({} unfinished todo item{})",
-                    remaining_unfinished,
-                    if remaining_unfinished == 1 { "" } else { "s" }
-                ),
-            };
-        }
-
-        FinalizeDecision::Continue {
-            remaining_unfinished,
+    fn finalize_turn_decision(&self) -> FinalizeDecision {
+        if self.turn.workflow.auto_continue.enabled {
+            FinalizeDecision::Continue
+        } else {
+            FinalizeDecision::Finish
         }
     }
 
@@ -2823,16 +2789,12 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
     {
-        match self.finalize_turn_decision(*continuation_count) {
+        match self.finalize_turn_decision() {
             FinalizeDecision::Finish => Ok(false),
-            FinalizeDecision::StopWithError { message } => Err(anyhow!(message)),
-            FinalizeDecision::Continue {
-                remaining_unfinished,
-            } => {
+            FinalizeDecision::Continue => {
                 *continuation_count += 1;
                 self.turn.counters.continuations = *continuation_count;
-                self.turn.last_continuation_todos = Some(self.turn.workflow.todos.clone());
-                let text = "Continue the current task internally. Do not repeat finished work. Focus on unfinished todo items and stop when they are complete or blocked.".to_string();
+                let text = "Continue the current task internally. Do not repeat finished work. Use the todo list as working context when present; decide yourself when to disable auto-continue.".to_string();
                 self.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
                 on_event(AgentEvent::InternalContinuation {
                     text,
@@ -2841,7 +2803,7 @@ impl<C: Config> Agent<C> {
                 .await?;
                 on_event(AgentEvent::AutoContinuationScheduled {
                     continuation_count: *continuation_count,
-                    remaining_unfinished,
+                    remaining_unfinished: self.remaining_unfinished_todos().unwrap_or(0),
                 })
                 .await?;
                 Ok(true)
@@ -2944,6 +2906,7 @@ impl<C: Config> Agent<C> {
     }
 
     fn finish_current_turn(&mut self) -> Result<()> {
+        self.turn.auto_continue_active = false;
         self.turn.pressure_compaction.reset_for_turn_end();
         self.turn.current_turn_start_index = None;
         self.runtime_snapshot.current_turn_id = None;
@@ -3839,7 +3802,10 @@ struct TurnRuntimeState {
     policy: WorkflowTurnState,
     workflow: WorkflowState,
     counters: TurnCounters,
-    last_continuation_todos: Option<Vec<TodoItem>>,
+    // Once enabled, auto-continue owns the rest of this turn so the LLM can
+    // explicitly disable it and still receive one final response. This is
+    // separate from the persisted setting, which records the LLM's last choice.
+    auto_continue_active: bool,
     frozen_evidence: Option<FrozenTurnEvidence>,
     pressure_compaction: PressureCompactionState,
 }
@@ -3858,7 +3824,7 @@ impl TurnRuntimeState {
             policy,
             workflow: WorkflowState::default(),
             counters: TurnCounters::default(),
-            last_continuation_todos: None,
+            auto_continue_active: false,
             frozen_evidence: None,
             pressure_compaction: PressureCompactionState::default(),
         }
@@ -3949,8 +3915,7 @@ struct PendingSubagentJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FinalizeDecision {
     Finish,
-    Continue { remaining_unfinished: usize },
-    StopWithError { message: String },
+    Continue,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3961,8 +3926,6 @@ struct WorkflowTodosPayload {
 #[derive(Debug, Clone, Deserialize)]
 struct WorkflowAutoContinuePayload {
     enabled: bool,
-    #[serde(default)]
-    max_continuations: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

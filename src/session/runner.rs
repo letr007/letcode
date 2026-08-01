@@ -384,6 +384,7 @@ impl SessionTransportEvent {
 pub(crate) struct AgentRunner<C: Config> {
     event_tx: Option<SessionTransportEventSender>,
     permission_event_tx: Option<SessionTransportEventSender>,
+    session_title_event_tx: Option<SessionTransportEventSender>,
     transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
     event_mode: SessionTransportEventMode,
     child_session_id: Option<String>,
@@ -518,6 +519,7 @@ impl<C: Config> AgentRunner<C> {
         Self {
             event_tx: Some(event_tx),
             permission_event_tx: None,
+            session_title_event_tx: None,
             transcript: None,
             event_mode: SessionTransportEventMode::Emit,
             child_session_id: None,
@@ -535,6 +537,7 @@ impl<C: Config> AgentRunner<C> {
         Self {
             event_tx: Some(event_tx),
             permission_event_tx: None,
+            session_title_event_tx: None,
             transcript: Some(transcript),
             event_mode: SessionTransportEventMode::Emit,
             child_session_id: None,
@@ -543,6 +546,14 @@ impl<C: Config> AgentRunner<C> {
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
+    }
+
+    pub fn with_session_title_event_sender(
+        mut self,
+        event_tx: SessionTransportEventSender,
+    ) -> Self {
+        self.session_title_event_tx = Some(event_tx);
+        self
     }
 
     pub fn with_subagent_runtime(self, runtime: SubagentPool, sessions_dir: PathBuf) -> Self
@@ -567,6 +578,7 @@ impl<C: Config> AgentRunner<C> {
         Self {
             event_tx: None,
             permission_event_tx: None,
+            session_title_event_tx: None,
             transcript: Some(transcript),
             event_mode: SessionTransportEventMode::SilentDenyPermissions,
             child_session_id: None,
@@ -585,6 +597,7 @@ impl<C: Config> AgentRunner<C> {
         Self {
             event_tx: Some(event_tx),
             permission_event_tx: None,
+            session_title_event_tx: None,
             transcript: Some(transcript),
             event_mode: SessionTransportEventMode::SilentDenyPermissions,
             child_session_id: Some(child_session_id.into()),
@@ -605,6 +618,7 @@ impl<C: Config> AgentRunner<C> {
         Self {
             event_tx: Some(event_tx.clone()),
             permission_event_tx: Some(event_tx),
+            session_title_event_tx: None,
             transcript: Some(transcript),
             event_mode: SessionTransportEventMode::Emit,
             child_session_id: Some(child_session_id.into()),
@@ -709,7 +723,10 @@ impl<C: Config> AgentRunner<C> {
         }
         if let Some((session_id, mut title_agent)) = pending_title {
             let transcript = self.transcript.clone();
-            let event_tx = self.event_tx.clone();
+            let event_tx = self
+                .session_title_event_tx
+                .clone()
+                .or_else(|| self.event_tx.clone());
             let prompt = prompt_text.clone();
             tokio::spawn(async move {
                 match title_agent.generate_session_title(&prompt).await {
@@ -1311,6 +1328,18 @@ impl<C: Config> AgentRunner<C> {
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn emit_session_title_updated(&self, session_id: String, title: String) -> Result<()> {
+        send_optional_event(
+            &self
+                .session_title_event_tx
+                .as_ref()
+                .or(self.event_tx.as_ref())
+                .cloned(),
+            SessionTransportEvent::SessionTitleUpdated { session_id, title },
+        )
     }
 
     #[cfg(test)]
@@ -1963,13 +1992,8 @@ fn summarize_auto_continue(data: &Value) -> String {
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let max = data
-        .get("max_continuations")
-        .and_then(Value::as_u64)
-        .map(|value| format!(" · max {value}"))
-        .unwrap_or_default();
     if enabled {
-        format!("enabled auto-continue{max}")
+        "enabled auto-continue".into()
     } else {
         "disabled auto-continue".into()
     }
@@ -2306,11 +2330,11 @@ mod tests {
 
         let auto_continue = ToolResult::ok(
             "workflow__auto_continue",
-            serde_json::json!({"enabled": true, "max_continuations": 2}),
+            serde_json::json!({"enabled": true}),
         );
         assert_eq!(
             output_summary(&auto_continue).as_deref(),
-            Some("enabled auto-continue · max 2")
+            Some("enabled auto-continue")
         );
     }
 
@@ -2538,6 +2562,25 @@ mod tests {
     }
 
     #[test]
+    fn session_title_update_uses_dedicated_session_event_sender() {
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let (title_tx, mut title_rx) = mpsc::unbounded_channel();
+        let runner =
+            AgentRunner::<OpenAIConfig>::new(turn_tx).with_session_title_event_sender(title_tx);
+
+        runner
+            .emit_session_title_updated("session-1".into(), "Session title".into())
+            .expect("title update should emit");
+
+        assert!(matches!(
+            title_rx.try_recv(),
+            Ok(SessionTransportEvent::SessionTitleUpdated { session_id, title })
+                if session_id == "session-1" && title == "Session title"
+        ));
+        assert!(turn_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn runner_can_record_model_and_permission_provenance_events() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-runner-provenance-test-{}",
@@ -2605,10 +2648,7 @@ mod tests {
         ));
 
         let auto_event = SessionTransportEvent::AutoContinueChanged(AutoContinueChangedEvent::new(
-            AutoContinueState {
-                enabled: true,
-                max_continuations: 2,
-            },
+            AutoContinueState { enabled: true },
         ));
         assert!(matches!(
             auto_event.session_event(),

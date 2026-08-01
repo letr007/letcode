@@ -4180,10 +4180,7 @@ mod tests {
         let mut state = TuiState::default();
 
         state.apply_event(SessionEvent::AutoContinueChanged(
-            AutoContinueChangedEvent::new(AutoContinueState {
-                enabled: true,
-                max_continuations: 2,
-            }),
+            AutoContinueChangedEvent::new(AutoContinueState { enabled: true }),
         ));
         assert!(state.latest_todo.is_none());
         assert_eq!(state.timeline.items().len(), 0);
@@ -4198,7 +4195,6 @@ mod tests {
 
         let todo = state.latest_todo.as_ref().expect("todo state exists");
         assert!(todo.auto_continue.enabled);
-        assert_eq!(todo.auto_continue.max_continuations, 2);
         assert_eq!(todo.items.len(), 1);
         assert!(matches!(
             state.timeline.items().last(),

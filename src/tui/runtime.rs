@@ -5844,10 +5844,7 @@ mod tests {
                 content: "keep working".into(),
                 status: TodoStatus::InProgress,
             }],
-            auto_continue: AutoContinueState {
-                enabled: true,
-                max_continuations: 2,
-            },
+            auto_continue: AutoContinueState { enabled: true },
         });
         runtime.state_mut().set_input("follow up");
 
@@ -5883,10 +5880,7 @@ mod tests {
     fn delayed_mcp_diagnostic_after_done_preserves_completed_turn_todo_and_auto_continue() {
         let mut runtime = runtime();
         let message = "MCP server 'docs' is offline: connection refused";
-        let auto_continue = AutoContinueState {
-            enabled: true,
-            max_continuations: 2,
-        };
+        let auto_continue = AutoContinueState { enabled: true };
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().latest_auto_continue = auto_continue.clone();
         runtime.state_mut().latest_todo = Some(crate::tui::timeline::TodoView {
@@ -9083,10 +9077,7 @@ mod tests {
                 timestamp_ms: 0,
                 context_branch_id: None,
                 event: TranscriptEvent::AutoContinueChanged {
-                    state: AutoContinueState {
-                        enabled: true,
-                        max_continuations: 2,
-                    },
+                    state: AutoContinueState { enabled: true },
                 },
             },
             TranscriptRecord {
@@ -9492,9 +9483,6 @@ mod tests {
         poll_gate: Option<SessionExecutorPollGate>,
     ) -> Agent<OpenAIConfig> {
         let subagent_runtime = SubagentPool::new();
-        let runner =
-            AgentRunner::with_transcript(session_transport_tx.clone(), Arc::clone(&transcript))
-                .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
         let mut deferred_commands = VecDeque::new();
 
         if let Some(SessionExecutorPollGate { ready, release }) = poll_gate {
@@ -9531,14 +9519,19 @@ mod tests {
                         session_transport_tx.send(SessionTransportEvent::QueuedPromptAccepted {
                             prompt: prompt.clone(),
                         });
+                    let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
+                    let runner =
+                        AgentRunner::with_transcript(runner_event_tx, Arc::clone(&transcript))
+                            .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
                     let (interrupted, shutdown) = {
                         let run = runner.run_prompt(&mut agent, prompt);
                         tokio::pin!(run);
                         loop {
-                            match select_active_session_operation(
+                            match crate::session::engine::select_active_session_operation_with_events(
                                 &mut control_rx,
                                 &mut deferred_commands,
                                 run.as_mut(),
+                                Some(&mut runner_event_rx),
                             )
                             .await
                             {
@@ -9562,7 +9555,31 @@ mod tests {
                                     };
                                     break (Some(interrupt), is_shutdown || settle_shutdown);
                                 }
-                                ActiveSessionOperation::Completed(_) => break (None, false),
+                                ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done) => {
+                                    // Runner completion is internal until its future
+                                    // settles and the executor emits authoritative Done.
+                                }
+                                ActiveSessionOperation::RunnerEvent(event) => {
+                                    let _ = session_transport_tx.send(event);
+                                }
+                                ActiveSessionOperation::Completed(_) => {
+                                    crate::session::engine::forward_queued_runner_events(
+                                        &mut runner_event_rx,
+                                        &session_transport_tx,
+                                    );
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                    break (None, false);
+                                }
+                                ActiveSessionOperation::Command(Some(
+                                    SessionEngineCommand::Prompt(prompt),
+                                )) => {
+                                    deferred_commands
+                                        .push_front(SessionEngineCommand::Prompt(prompt));
+                                    let _ = session_transport_tx.send(
+                                        SessionTransportEvent::AssistantDone { message_id: None },
+                                    );
+                                    break (None, false);
+                                }
                                 ActiveSessionOperation::Command(Some(command)) => {
                                     deferred_commands.push_front(command);
                                     break (None, false);
@@ -9663,6 +9680,9 @@ mod tests {
                                     }
                                     break;
                                 }
+                                ActiveSessionOperation::RunnerEvent(_) => {
+                                    unreachable!("event-aware selection is not used for delegates")
+                                }
                                 ActiveSessionOperation::Command(Some(command)) => {
                                     deferred_commands.push_front(command);
                                     break;
@@ -9719,6 +9739,36 @@ mod tests {
             );
             events.push(event);
             if terminal {
+                return events;
+            }
+        }
+    }
+
+    async fn assert_no_session_transport_event(
+        harness: &mut SessionExecutorHarness,
+        window: std::time::Duration,
+    ) {
+        match timeout(window, harness.event_rx.recv()).await {
+            Err(_) | Ok(None) => {}
+            Ok(Some(event)) => panic!("unexpected late session transport event: {event:?}"),
+        }
+    }
+
+    async fn session_transport_events_until_handoff(
+        harness: &mut SessionExecutorHarness,
+    ) -> Vec<SessionTransportEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, harness.event_rx.recv())
+                .await
+                .expect("timed out waiting for session handoff event")
+                .expect("session transport event channel closed before handoff");
+            let handoff = matches!(
+                event,
+                SessionTransportEvent::AssistantDone { message_id: None }
+            );
+            events.push(event);
+            if handoff {
                 return events;
             }
         }
@@ -10546,6 +10596,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_prompt_handoff_drops_late_runner_events() {
+        let mut server = spawn_controlled_sse_server(vec![
+            ControlledSseResponse::Blocked(responses_sse_body("late first response")),
+            ControlledSseResponse::Immediate(responses_sse_body("second response")),
+        ])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("queued-prompt-handoff", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "first-prompt",
+                crate::user_content::UserMessageContent::new("first", Vec::new()),
+            )))
+            .expect("session executor accepts first prompt");
+        server.expect_request(0).await;
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "second-prompt",
+                crate::user_content::UserMessageContent::new("second", Vec::new()),
+            )))
+            .expect("session executor accepts queued prompt");
+
+        let handoff_events = session_transport_events_until_handoff(&mut harness).await;
+        assert!(matches!(
+            handoff_events.last(),
+            Some(SessionTransportEvent::AssistantDone { .. })
+        ));
+        assert!(!handoff_events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::Done | SessionTransportEvent::Interrupted
+        )));
+
+        server.release.notify_one();
+        server.expect_request(1).await;
+        let second_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            second_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
+        assert_eq!(
+            second_events
+                .iter()
+                .filter(|event| matches!(event, SessionTransportEvent::Done))
+                .count(),
+            1,
+            "unexpected events: {second_events:?}"
+        );
+        assert!(!second_events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::AssistantDelta(delta) if delta.delta.contains("late first response")
+        )));
+        assert_no_session_transport_event(&mut harness, std::time::Duration::from_millis(100))
+            .await;
+
+        let _ = finish_session_executor_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
     async fn session_prompt_ingress_disconnect_interrupts_active_turn() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
             responses_sse_body("prompt interrupted by disconnect"),
@@ -10586,6 +10698,8 @@ mod tests {
             Some(SessionTransportEvent::Interrupted)
         ));
         assert_eq!(terminal_count(&events), 1);
+        assert_no_session_transport_event(&mut harness, std::time::Duration::from_millis(100))
+            .await;
         assert!(records(&transcript).iter().any(|record| matches!(
             &record.event,
             TranscriptEvent::ToolCallCancelled { call_id, name }
@@ -10633,17 +10747,32 @@ mod tests {
             .expect("session executor accepts prompt");
         server.expect_request(0).await;
         server.expect_request(1).await;
-
         harness
             .send_interrupt(test_interrupt())
             .expect("session executor accepts interrupt");
         let events = session_transport_events_until_terminal(&mut harness).await;
 
-        assert!(matches!(
-            events.last(),
-            Some(SessionTransportEvent::Interrupted) | Some(SessionTransportEvent::Done)
-        ));
+        assert!(
+            matches!(events.last(), Some(SessionTransportEvent::Interrupted)),
+            "unexpected events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionTransportEvent::Interrupted))
+                .count(),
+            1,
+            "unexpected events: {events:?}"
+        );
         assert_eq!(terminal_count(&events), 1, "unexpected events: {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionTransportEvent::Done)),
+            "an explicit parent interrupt must not expose Done: {events:?}"
+        );
+        assert_no_session_transport_event(&mut harness, std::time::Duration::from_millis(100))
+            .await;
         assert!(crate::transcript::child_sessions_dir(&sessions_dir).exists());
         assert!(records(&transcript).iter().any(|record| matches!(
             &record.event,
@@ -10831,6 +10960,101 @@ mod tests {
             _ => true,
         }));
         server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn active_operation_forwards_runner_events_but_suppresses_done() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        runner_tx
+            .send(SessionTransportEvent::Done)
+            .expect("runner event sender remains open");
+        assert!(matches!(
+            crate::session::engine::select_active_session_operation_with_events(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+                Some(&mut runner_rx),
+            )
+            .await,
+            ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done)
+        ));
+
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        runner_tx
+            .send(SessionTransportEvent::AssistantDone { message_id: None })
+            .expect("runner event sender remains open");
+        assert!(matches!(
+            crate::session::engine::select_active_session_operation_with_events(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+                Some(&mut runner_rx),
+            )
+            .await,
+            ActiveSessionOperation::Interrupted
+        ));
+        assert!(matches!(
+            runner_rx.try_recv(),
+            Ok(SessionTransportEvent::AssistantDone { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_operation_forwards_queued_events_before_done() {
+        let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        let operation = async {
+            runner_tx
+                .send(SessionTransportEvent::AssistantDone { message_id: None })
+                .expect("runner event receiver remains open");
+            runner_tx
+                .send(SessionTransportEvent::Error(ErrorEvent::new(
+                    "request failed",
+                )))
+                .expect("runner event receiver remains open");
+            runner_tx
+                .send(SessionTransportEvent::Done)
+                .expect("runner event receiver remains open");
+        };
+        tokio::pin!(operation);
+
+        assert!(matches!(
+            crate::session::engine::select_active_session_operation_with_events(
+                &mut control_rx,
+                &mut deferred_commands,
+                operation.as_mut(),
+                Some(&mut runner_rx),
+            )
+            .await,
+            ActiveSessionOperation::Completed(())
+        ));
+        crate::session::engine::forward_queued_runner_events(&mut runner_rx, &session_tx);
+        session_tx
+            .send(SessionTransportEvent::Done)
+            .expect("session event receiver remains open");
+
+        assert!(matches!(
+            session_rx.recv().await,
+            Some(SessionTransportEvent::AssistantDone { .. })
+        ));
+        assert!(matches!(
+            session_rx.recv().await,
+            Some(SessionTransportEvent::Error(_))
+        ));
+        assert!(matches!(
+            session_rx.recv().await,
+            Some(SessionTransportEvent::Done)
+        ));
+        assert!(session_rx.try_recv().is_err());
     }
 
     #[tokio::test]
