@@ -266,6 +266,17 @@ pub(crate) enum SessionTransportEvent {
         records: Vec<TranscriptRecord>,
         runtime_context: RuntimeActiveContext,
     },
+    /// Parent transcript view navigation, symmetrical to [`Self::ChildSessionViewed`].
+    /// Unlike [`Self::SessionResumed`] this is not a session restore: frontends must
+    /// preserve in-flight runtime state (queued prompts, active turn, permissions).
+    ParentSessionViewed {
+        session_id: String,
+        branch_id: String,
+        records: Vec<TranscriptRecord>,
+        model_id: Option<String>,
+        token_usage: Option<TokenUsageEvent>,
+        runtime_context: RuntimeActiveContext,
+    },
     SessionStarted {
         session_id: String,
         records: Vec<TranscriptRecord>,
@@ -379,7 +390,7 @@ impl SessionTransportEvent {
                 branch_id: branch_id.clone(),
             }),
             Self::SessionHistoryLoaded { .. } => None,
-            Self::ChildSessionViewed { .. } => None,
+            Self::ChildSessionViewed { .. } | Self::ParentSessionViewed { .. } => None,
             Self::Error(event) => Some(SessionEvent::Error(event.clone())),
             Self::Done => Some(SessionEvent::Done),
         }

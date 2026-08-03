@@ -552,12 +552,10 @@ impl SessionCoordinator {
         match dir.and_then(|dir| project_parent_session_view(transcript, dir)) {
             Ok(projected) => {
                 let snapshot = projected.snapshot;
-                let _ = event_tx.send(SessionTransportEvent::SessionResumed {
+                let _ = event_tx.send(SessionTransportEvent::ParentSessionViewed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
-                    messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
                     records: snapshot.records,
-                    evidence_count: projected.evidence_count,
                     model_id: snapshot.latest_model,
                     token_usage: None,
                     runtime_context: projected.runtime_context,
@@ -953,16 +951,16 @@ protocol = "responses"
     }
 
     #[test]
-    fn emit_view_parent_sends_session_resumed() {
+    fn emit_view_parent_sends_parent_session_viewed() {
         let transcript = temp_transcript();
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         SessionCoordinator::emit_view_parent(&transcript, &tx, None);
-        match rx.try_recv().expect("session resumed") {
-            SessionTransportEvent::SessionResumed { session_id, .. } => {
+        match rx.try_recv().expect("parent view") {
+            SessionTransportEvent::ParentSessionViewed { session_id, .. } => {
                 assert!(!session_id.is_empty());
             }
-            other => panic!("expected SessionResumed, got {other:?}"),
+            other => panic!("expected ParentSessionViewed, got {other:?}"),
         }
         assert!(rx.try_recv().is_err());
     }

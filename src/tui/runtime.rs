@@ -1007,6 +1007,57 @@ impl TuiRuntime {
                 }
                 self.state.show_toast("Session resumed", ToastKind::Info);
             }
+            SessionTransportEvent::ParentSessionViewed {
+                session_id,
+                branch_id,
+                records,
+                model_id,
+                token_usage,
+                runtime_context,
+            } => {
+                // Pure view navigation, symmetrical to ChildSessionViewed: the parent
+                // timeline is reprojected from transcript records, but the session is
+                // still live, so queued submissions and in-flight runtime state are
+                // preserved (unlike SessionResumed, which resets them). The timeline
+                // projection clears the question dialog, so keep it aside first and
+                // restore it when the in-flight handle is still live.
+                let pending_question = self.state.pending_question.take();
+                if let Err(error) = self
+                    .state
+                    .try_replace_session_timeline_from_records_with_runtime_context(
+                        records,
+                        runtime_context.clone(),
+                    )
+                {
+                    self.state.pending_question = pending_question;
+                    self.state.show_toast(
+                        format!("Context projection failed: {error}"),
+                        ToastKind::Error,
+                    );
+                    return;
+                }
+                self.state.session_id = Some(session_id.clone());
+                self.session_title = session_title_from_records(records);
+                // Transcript records do not contain queued submissions; republish
+                // their previews so they remain visible and dispatchable.
+                for prompt in &self.queued_prompts {
+                    self.state.push_queued_user_message_preview(prompt.clone());
+                }
+                if self.pending_question_handle.is_some()
+                    && let Some(question) = pending_question
+                {
+                    self.state.pending_question = Some(question);
+                    self.state.phase = super::state::AppPhase::WaitingForPermission;
+                }
+                if let Some(model_id) = model_id {
+                    self.apply_restored_model(model_id.clone());
+                    self.state.set_provider_label_from_model_route(model_id);
+                }
+                self.state.set_current_context_branch(branch_id.clone());
+                if let Some(token_usage) = token_usage {
+                    self.state.set_token_usage(token_usage.clone().into());
+                }
+            }
             SessionTransportEvent::ContextBranchChanged { branch_id } => {
                 self.state.set_current_context_branch(branch_id.clone());
             }
@@ -5998,6 +6049,263 @@ mod tests {
         assert!(matches!(
             runtime.state().timeline.items().last(),
             Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
+        ));
+    }
+
+    #[test]
+    fn queued_prompt_survives_parent_view_navigation() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up with attachment");
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-queued".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert_eq!(runtime.queued_prompts[0].content.attachments.len(), 1);
+
+        // Parent view navigation reprojects the parent timeline from transcript
+        // records; it must not reset the queued submission or its preview.
+        runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+            session_id: "session-1".into(),
+            branch_id: "root".into(),
+            records: Vec::new(),
+            model_id: Some("gpt-5.5".into()),
+            token_usage: None,
+            runtime_context: event_context("session-1", 0),
+        });
+
+        assert_eq!(
+            runtime.queued_prompts.len(),
+            1,
+            "queued prompt must survive parent view navigation"
+        );
+        assert_eq!(
+            runtime.queued_prompts[0].content.attachments[0].id,
+            "img-queued"
+        );
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(runtime.session_turn_active);
+        assert!(runtime.state().timeline.items().iter().any(|item| {
+            matches!(
+                item,
+                TimelineItem::User(message)
+                    if message.queued
+                        && message.attachments.first().is_some_and(|attachment| {
+                            attachment.id == "img-queued"
+                        })
+            )
+        }));
+
+        // The queued prompt remains dispatchable once the running turn finishes.
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        let Some(RuntimeCommand::SubmitPrompt(submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command after parent view navigation");
+        };
+        assert_eq!(submission.content.attachments[0].id, "img-queued");
+    }
+
+    #[test]
+    fn parent_view_navigation_preserves_inflight_handoff_and_ack_activates_republished_preview() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        // Dispatch the queued prompt; the handoff is in flight (no ack yet).
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        let Some(RuntimeCommand::SubmitPrompt(submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command");
+        };
+        assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
+
+        // Parent view navigation must preserve the in-flight handoff and
+        // republish the preview for the still-unacked submission.
+        runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+            session_id: "session-1".into(),
+            branch_id: "root".into(),
+            records: Vec::new(),
+            model_id: Some("gpt-5.5".into()),
+            token_usage: None,
+            runtime_context: event_context("session-1", 0),
+        });
+
+        assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert!(runtime.state().timeline.items().iter().any(|item| {
+            matches!(
+                item,
+                TimelineItem::User(message) if message.text == "follow up" && message.queued
+            )
+        }));
+
+        // The late ack activates the republished preview instead of duplicating
+        // the message, and the handoff resolves.
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(submission),
+        ));
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(runtime.queued_prompts.is_empty());
+        assert_eq!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up"))
+                .count(),
+            1,
+            "republished preview must be activated, not duplicated"
+        );
+    }
+
+    #[test]
+    fn parent_view_navigation_preserves_pending_permission_projection() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "Run command"),
+            handle: RunnerPermissionRequest::new(reply_tx),
+        });
+        assert!(runtime.state().pending_permission.is_some());
+        assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+
+        // Parent view navigation reprojects the parent timeline; the pending
+        // permission request must remain visible and resolvable.
+        runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+            session_id: "session-1".into(),
+            branch_id: "root".into(),
+            records: Vec::new(),
+            model_id: Some("gpt-5.5".into()),
+            token_usage: None,
+            runtime_context: event_context("session-1", 0),
+        });
+
+        assert!(
+            runtime.state().pending_permission.is_some(),
+            "pending permission must survive parent view navigation"
+        );
+        assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+        assert!(runtime.permission_lifecycle.is_pending());
+    }
+
+    #[test]
+    fn parent_view_navigation_preserves_pending_question_projection() {
+        for child_origin in [false, true] {
+            let mut runtime = runtime();
+            runtime.session_turn_active = true;
+            runtime.state_mut().phase = AppPhase::Running;
+            let (tx, mut rx) = oneshot::channel();
+            if child_origin {
+                runtime.apply_session_transport_event(
+                    SessionTransportEvent::ChildQuestionRequested {
+                        child_session_id: "child-1".into(),
+                        request: sample_question_request(false),
+                        handle: RunnerQuestionRequest::new(tx),
+                    },
+                );
+            } else {
+                runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
+                    request: sample_question_request(false),
+                    handle: RunnerQuestionRequest::new(tx),
+                });
+            }
+            assert!(runtime.state().pending_question.is_some());
+            assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+
+            // Parent view navigation reprojects the parent timeline; the
+            // unanswered question dialog must remain visible and answerable.
+            runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+                session_id: "session-1".into(),
+                branch_id: "root".into(),
+                records: Vec::new(),
+                model_id: Some("gpt-5.5".into()),
+                token_usage: None,
+                runtime_context: event_context("session-1", 0),
+            });
+
+            assert!(
+                runtime.state().pending_question.is_some(),
+                "pending question must survive parent view navigation (child_origin={child_origin})"
+            );
+            assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+
+            // The preserved dialog remains answerable through its live handle.
+            runtime
+                .handle_input_action(InputAction::QuestionPickOption(1))
+                .expect("pick succeeds");
+            assert!(runtime.state().pending_question.is_none());
+            assert_eq!(
+                rx.try_recv(),
+                Ok(Ok(crate::tool::QuestionResponse {
+                    answers: vec![vec!["Fast".into()]],
+                })),
+                "answer must reach the engine after parent view navigation (child_origin={child_origin})"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_view_navigation_projection_failure_restores_pending_question() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        let (tx, _rx) = oneshot::channel();
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+        assert!(runtime.state().pending_question.is_some());
+
+        // Records whose session id conflicts with the projected runtime context
+        // make the timeline projection fail; the pending question must be
+        // restored untouched and the error surfaced.
+        let conflicting_records = vec![TranscriptRecord {
+            session_id: "other-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::SessionStarted {
+                model: "gpt-test".into(),
+            },
+        }];
+        runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+            session_id: "session-1".into(),
+            branch_id: "root".into(),
+            records: conflicting_records,
+            model_id: Some("gpt-5.5".into()),
+            token_usage: None,
+            runtime_context: event_context("session-1", 0),
+        });
+
+        assert!(
+            runtime.state().pending_question.is_some(),
+            "pending question must be restored when the projection fails"
+        );
+        assert!(runtime.pending_question_handle.is_some());
+        assert!(matches!(
+            runtime.state().toast(),
+            Some(toast) if toast.message.contains("Context projection failed") && toast.kind == ToastKind::Error
         ));
     }
 
