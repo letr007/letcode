@@ -121,7 +121,7 @@ pub(super) fn prompt_segment_to_response_inputs(segment: &PromptSegment) -> Vec<
         }
         (
             PromptSegmentRole::Assistant,
-            PromptSegmentContent::AssistantToolCalls { text, calls },
+            PromptSegmentContent::AssistantToolCalls { text, calls, .. },
         ) => {
             let mut input = text
                 .clone()
@@ -206,7 +206,7 @@ pub(super) fn prompt_segment_to_chat_message(
         }
         (
             PromptSegmentRole::Assistant,
-            PromptSegmentContent::AssistantToolCalls { text, calls },
+            PromptSegmentContent::AssistantToolCalls { text, calls, .. },
         ) => ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content: text
                 .clone()
@@ -282,6 +282,24 @@ pub(super) fn tool_to_response_tool(tool: &ToolSpec) -> Tool {
         strict: Some(tool.strict),
         defer_loading: None,
     })
+}
+
+pub(super) fn apply_chat_reasoning_content(
+    request: &mut serde_json::Value,
+    prompt_plan: &PromptPlan,
+) {
+    let messages = request["messages"]
+        .as_array_mut()
+        .expect("chat completion request has messages");
+    for (message, segment) in messages.iter_mut().zip(&prompt_plan.segments) {
+        if let PromptSegmentContent::AssistantToolCalls {
+            reasoning_content: Some(reasoning_content),
+            ..
+        } = &segment.content
+        {
+            message["reasoning_content"] = serde_json::Value::String(reasoning_content.clone());
+        }
+    }
 }
 
 pub(super) fn build_completions_request(

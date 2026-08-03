@@ -1004,9 +1004,14 @@ impl TranscriptRecorder {
     pub fn record_assistant_tool_call_batch(
         &mut self,
         text: Option<String>,
+        reasoning_content: Option<String>,
         calls: Vec<HistoryToolCall>,
     ) -> Result<()> {
-        self.append(TranscriptEvent::AssistantToolCallBatch { text, calls })
+        self.append(TranscriptEvent::AssistantToolCallBatch {
+            text,
+            reasoning_content,
+            calls,
+        })
     }
 
     pub fn record_tool_call_finished(
@@ -2542,18 +2547,22 @@ fn append_history_item_from_transcript_record(record: &TranscriptRecord) -> Opti
         TranscriptEvent::InternalContinuation { text, .. } => {
             Some(HistoryItem::internal_continuation(text.clone()))
         }
-        TranscriptEvent::AssistantToolCallBatch { text, calls } => {
-            Some(HistoryItem::AssistantToolCalls {
-                text: text.clone(),
-                calls: calls.clone(),
-            })
-        }
+        TranscriptEvent::AssistantToolCallBatch {
+            text,
+            reasoning_content,
+            calls,
+        } => Some(HistoryItem::AssistantToolCalls {
+            text: text.clone(),
+            reasoning_content: reasoning_content.clone(),
+            calls: calls.clone(),
+        }),
         TranscriptEvent::ToolCallStarted {
             call_id,
             name,
             args,
         } => Some(HistoryItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: call_id.clone(),
                 name: name.clone(),

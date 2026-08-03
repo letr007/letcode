@@ -2395,7 +2395,11 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
             sequence: 3,
             timestamp_ms: 2,
             context_branch_id: None,
-            event: TranscriptEvent::AssistantToolCallBatch { text: None, calls },
+            event: TranscriptEvent::AssistantToolCallBatch {
+                text: None,
+                reasoning_content: None,
+                calls,
+            },
         },
         TranscriptRecord {
             session_id: "live".into(),
@@ -2918,6 +2922,7 @@ mod compaction_legacy_schema_tests {
         recorder.record_user_message("request").expect("user");
         recorder
             .record_assistant_tool_call_batch(
+                None,
                 None,
                 vec![HistoryToolCall {
                     call_id: "call-1".into(),

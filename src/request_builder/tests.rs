@@ -21,6 +21,7 @@ fn apply_patch_single_tool_spec_budget_accounts_for_batch_prevalidation_contract
 fn history_aliases_share_protocol_item_type_and_json_shape() {
     let legacy = HistoryItem::AssistantToolCalls {
         text: Some("working".into()),
+        reasoning_content: Some("inspect file before calling the tool".into()),
         calls: vec![HistoryToolCall {
             call_id: "call-1".into(),
             name: "fs__read".into(),
@@ -37,8 +38,20 @@ fn history_aliases_share_protocol_item_type_and_json_shape() {
     );
     assert_eq!(
         serde_json::to_string(&canonical).expect("canonical item serializes"),
-        r#"{"kind":"assistant_tool_calls","text":"working","calls":[{"call_id":"call-1","name":"fs__read","arguments_json":"{\"path\":\"src/main.rs\"}"}]}"#
+        r#"{"kind":"assistant_tool_calls","text":"working","reasoning_content":"inspect file before calling the tool","calls":[{"call_id":"call-1","name":"fs__read","arguments_json":"{\"path\":\"src/main.rs\"}"}]}"#
     );
+
+    let old: HistoryItem = serde_json::from_str(
+        r#"{"kind":"assistant_tool_calls","text":"working","calls":[{"call_id":"call-1","name":"fs__read","arguments_json":"{}"}]}"#,
+    )
+    .expect("old history item deserializes");
+    assert!(matches!(
+        old,
+        HistoryItem::AssistantToolCalls {
+            reasoning_content: None,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1880,6 +1893,7 @@ fn complete_tool_call_output_pairs_are_kept_when_building_chat_request() {
     let history = vec![
         HistoryItem::AssistantToolCalls {
             text: None,
+            reasoning_content: Some("inspect the requested file".into()),
             calls: vec![HistoryToolCall {
                 call_id: "call-read".into(),
                 name: "fs__read".into(),
@@ -1907,21 +1921,19 @@ fn complete_tool_call_output_pairs_are_kept_when_building_chat_request() {
     })
     .expect("request builds");
 
-    let BuiltRequest::Completions(request) = result.request else {
-        panic!("expected chat completions request");
+    let request_json = match result.request {
+        BuiltRequest::CompletionsCompatible(request) => request,
+        _ => panic!("expected compatible chat completions request"),
     };
-    assert!(
-        request
-            .messages
-            .iter()
-            .any(|message| matches!(message, ChatCompletionRequestMessage::Assistant(_)))
-    );
-    assert!(
-        request
-            .messages
-            .iter()
-            .any(|message| matches!(message, ChatCompletionRequestMessage::Tool(_)))
-    );
+    let messages = request_json["messages"]
+        .as_array()
+        .expect("request has messages");
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant tool call message");
+    assert_eq!(assistant["reasoning_content"], "inspect the requested file");
+    assert!(messages.iter().any(|message| message["role"] == "tool"));
 }
 
 #[test]
@@ -3147,6 +3159,7 @@ fn both_providers_render_mixed_skill_source_and_fallback_once_in_legal_order() {
         1,
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "retired-skill".into(),
                 name: "skill".into(),
@@ -3169,6 +3182,7 @@ fn both_providers_render_mixed_skill_source_and_fallback_once_in_legal_order() {
         3,
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "active-skill".into(),
                 name: "skill".into(),
@@ -3350,6 +3364,7 @@ fn planner_is_pure_deterministic_and_preserves_protected_tool_groups() {
         0,
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-1".into(),
                 name: "read".into(),
@@ -3471,6 +3486,7 @@ fn canonical_tool_result_snapshot(bytes: usize) -> RuntimeSnapshot {
         0,
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "phase1b-call".into(),
                 name: tool.into(),
@@ -3675,6 +3691,7 @@ fn phase5b5_protected_boundary_characterizes_dense_group_expansion_without_mutat
         3,
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "call".into(),
                 name: "tool".into(),

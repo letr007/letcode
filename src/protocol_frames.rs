@@ -40,6 +40,8 @@ pub enum ProtocolItem {
     },
     AssistantToolCalls {
         text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         calls: Vec<ProtocolToolCall>,
     },
     ToolOutput {
@@ -132,10 +134,15 @@ impl ProtocolFrame {
             ProtocolFrameItem::AssistantText { text } => {
                 format!("assistant:{}:{}", self.history_index, text)
             }
-            ProtocolFrameItem::AssistantToolCalls { text, calls } => format!(
-                "assistant_tool_calls:{}:{}:{}",
+            ProtocolFrameItem::AssistantToolCalls {
+                text,
+                reasoning_content,
+                calls,
+            } => format!(
+                "assistant_tool_calls:{}:{}:{}:{}",
                 self.history_index,
                 text.clone().unwrap_or_default(),
+                reasoning_content.clone().unwrap_or_default(),
                 calls
                     .iter()
                     .map(|call| format!("{}:{}:{}", call.call_id, call.name, call.arguments_json))
@@ -249,7 +256,7 @@ pub(crate) fn analyze_history_items(
 
     for frame in &frames {
         match &frame.item {
-            ProtocolFrameItem::AssistantToolCalls { text: _, calls } => {
+            ProtocolFrameItem::AssistantToolCalls { text: _, calls, .. } => {
                 if let Some(group) = pending_group.take() {
                     tool_call_groups.push(group.finish_incomplete());
                 }
@@ -441,6 +448,7 @@ mod tests {
             HistoryItem::user("question"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("call-1"), tool_call("call-2")],
             },
             HistoryItem::ToolOutput {
@@ -473,6 +481,7 @@ mod tests {
             HistoryItem::user("question"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("call-1"), tool_call("call-2")],
             },
             HistoryItem::ToolOutput {
@@ -515,6 +524,7 @@ mod tests {
             HistoryItem::user("question"),
             HistoryItem::AssistantToolCalls {
                 text: Some("working".into()),
+                reasoning_content: None,
                 calls: vec![tool_call("call-1")],
             },
         ];
@@ -536,6 +546,7 @@ mod tests {
             HistoryItem::user("question"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("call-1")],
             },
         ];
@@ -552,6 +563,7 @@ mod tests {
                 "duplicate call id",
                 vec![HistoryItem::AssistantToolCalls {
                     text: None,
+                    reasoning_content: None,
                     calls: vec![tool_call("call-1"), tool_call("call-1")],
                 }],
                 "duplicate assistant tool call_id 'call-1' at history index 0",
@@ -561,6 +573,7 @@ mod tests {
                 vec![
                     HistoryItem::AssistantToolCalls {
                         text: None,
+                        reasoning_content: None,
                         calls: vec![tool_call("call-1"), tool_call("call-2")],
                     },
                     HistoryItem::ToolOutput {
@@ -579,6 +592,7 @@ mod tests {
                 vec![
                     HistoryItem::AssistantToolCalls {
                         text: None,
+                        reasoning_content: None,
                         calls: vec![tool_call("call-1")],
                     },
                     HistoryItem::ToolOutput {
@@ -603,6 +617,7 @@ mod tests {
             let history = vec![
                 HistoryItem::AssistantToolCalls {
                     text: None,
+                    reasoning_content: None,
                     calls: vec![tool_call("call-1"), tool_call("call-2")],
                 },
                 content_before_outputs,
@@ -619,6 +634,7 @@ mod tests {
             let history = vec![
                 HistoryItem::AssistantToolCalls {
                     text: None,
+                    reasoning_content: None,
                     calls: vec![tool_call("call-1"), tool_call("call-2")],
                 },
                 HistoryItem::ToolOutput {
@@ -650,6 +666,7 @@ mod tests {
             HistoryItem::user("question"),
             HistoryItem::AssistantToolCalls {
                 text: Some("working".into()),
+                reasoning_content: None,
                 calls: vec![tool_call("call-1")],
             },
             HistoryItem::ToolOutput {

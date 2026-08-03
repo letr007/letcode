@@ -1096,6 +1096,7 @@ where
         }
         on_event(AgentEvent::AssistantToolCallBatch {
             text: (!turn_text.is_empty()).then(|| turn_text.clone()),
+            reasoning_content: None,
             calls: tool_calls.clone(),
         })
         .await?;
@@ -1727,6 +1728,7 @@ where
                     }
                 }
             }
+            let reasoning_content = native_reasoning.text().map(ToString::to_string);
             if let Some(event) = native_reasoning.finish() {
                 stream_had_side_effect = true;
                 on_event(event).await?;
@@ -1924,12 +1926,17 @@ where
                 Some(&finish_reasons_label),
             );
             drop(iteration_span);
-            agent.append_assistant_tool_calls(&turn_text, &tool_calls)?;
+            agent.append_assistant_tool_calls_with_reasoning_content(
+                &turn_text,
+                reasoning_content.as_deref(),
+                &tool_calls,
+            )?;
             if let Some(usage) = provider_usage {
                 agent.install_provider_usage_anchor(usage);
             }
             on_event(AgentEvent::AssistantToolCallBatch {
                 text: (!turn_text.is_empty()).then(|| turn_text.clone()),
+                reasoning_content: reasoning_content.clone(),
                 calls: tool_calls.clone(),
             })
             .await?;
@@ -2202,6 +2209,10 @@ impl NativeReasoningAccumulator {
             item_id: self.item_id.clone(),
             delta,
         })
+    }
+
+    fn text(&self) -> Option<&str> {
+        (!self.text.is_empty()).then_some(self.text.as_str())
     }
 
     fn finish(self) -> Option<AgentEvent> {

@@ -68,8 +68,16 @@ pub fn persist_agent_event(
             recorder.record_assistant_message(content.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
-        AgentEvent::AssistantToolCallBatch { text, calls } => {
-            recorder.record_assistant_tool_call_batch(text.clone(), calls.clone())?;
+        AgentEvent::AssistantToolCallBatch {
+            text,
+            reasoning_content,
+            calls,
+        } => {
+            recorder.record_assistant_tool_call_batch(
+                text.clone(),
+                reasoning_content.clone(),
+                calls.clone(),
+            )?;
             JournalEffect::persisted(ContextProjection::None)
         }
         AgentEvent::InternalContinuation { text, source } => {
@@ -245,6 +253,61 @@ mod tests {
             provider_response_id: Some("opaque-response-id".into()),
             error_class: None,
         })
+    }
+
+    #[test]
+    fn assistant_tool_call_reasoning_content_persists_and_restores() {
+        let mut recorder = recorder("assistant-tool-reasoning");
+        let event = AgentEvent::AssistantToolCallBatch {
+            text: None,
+            reasoning_content: Some("inspect the requested file".into()),
+            calls: vec![crate::request_builder::HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+            }],
+        };
+
+        let effect = persist_agent_event(&mut recorder, &event).expect("persist tool call batch");
+        assert!(effect.persisted);
+        persist_agent_event(
+            &mut recorder,
+            &AgentEvent::ToolCallFinished {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                ok: true,
+                output: ToolResult::ok("fs__read", json!({"path":"src/main.rs"})),
+            },
+        )
+        .expect("persist tool output");
+        let records = read_records(recorder.path()).expect("read records");
+        assert!(matches!(
+            &records[0].event,
+            TranscriptEvent::AssistantToolCallBatch {
+                reasoning_content: Some(reasoning_content),
+                ..
+            } if reasoning_content == "inspect the requested file"
+        ));
+        let old: TranscriptEvent =
+            serde_json::from_str(r#"{"kind":"assistant_tool_call_batch","text":null,"calls":[]}"#)
+                .expect("old tool-call batch deserializes");
+        assert!(matches!(
+            old,
+            TranscriptEvent::AssistantToolCallBatch {
+                reasoning_content: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            restore_session_history(&records).expect("restore history").as_slice(),
+            [
+                crate::request_builder::HistoryItem::AssistantToolCalls {
+                    reasoning_content: Some(reasoning_content),
+                    ..
+                },
+                crate::request_builder::HistoryItem::ToolOutput { .. }
+            ] if reasoning_content == "inspect the requested file"
+        ));
     }
 
     #[test]

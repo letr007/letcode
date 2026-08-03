@@ -258,6 +258,7 @@ fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
         HistoryItem::user("seed"),
         HistoryItem::AssistantToolCalls {
             text: Some("calling tools".into()),
+            reasoning_content: None,
             calls: vec![
                 crate::protocol_frames::ProtocolToolCall {
                     call_id: "call-1".into(),
@@ -441,6 +442,7 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
     for item in [
         HistoryItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![crate::protocol_frames::ProtocolToolCall {
                 call_id: "call-1".into(),
                 name: "lookup".into(),
@@ -828,11 +830,11 @@ fn complete_http_request_len(request: &[u8]) -> Option<usize> {
     Some(header_end + 4 + content_length)
 }
 
-async fn read_complete_http_request(socket: &mut tokio::net::TcpStream) {
+async fn read_complete_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     loop {
         if complete_http_request_len(&request).is_some_and(|length| request.len() >= length) {
-            return;
+            return request;
         }
         let read = socket
             .read_buf(&mut request)
@@ -858,7 +860,7 @@ async fn spawn_chat_completion_server(
             // the next scripted response at that point lets a connection close race the
             // client's upload, which made response sequencing intermittent under a busy
             // serial suite.  Consume the complete request before advancing the script.
-            read_complete_http_request(&mut socket).await;
+            let _ = read_complete_http_request(&mut socket).await;
             server_count.fetch_add(1, Ordering::SeqCst);
             socket
                 .write_all(response.as_bytes())
@@ -901,19 +903,35 @@ fn responses_tool_batch_sse(calls: Vec<serde_json::Value>) -> &'static str {
 }
 
 fn chat_tool_batch_sse(name: &str, call_id: &str, arguments: String) -> &'static str {
+    let reasoning_content = "inspect ";
+    let reasoning = "then call";
+    let thinking = " the tool";
     let response = json!({
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": [{
-                    "index": 0,
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments}
-                }]
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning_content": reasoning_content},
+                "finish_reason": null
             },
-            "finish_reason": "tool_calls"
-        }]
+            {
+                "index": 0,
+                "delta": {"reasoning": reasoning},
+                "finish_reason": null
+            },
+            {
+                "index": 0,
+                "delta": {
+                    "thinking": thinking,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ]
     });
     let response = serde_json::to_string(&response).expect("response serializes");
     sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
@@ -1017,6 +1035,116 @@ async fn responses_installs_provider_anchor_after_assistant_frame() {
     };
     assert_eq!(agent.provider_usage_anchor_for_test(), Some(expected));
     assert_eq!(agent.projected_token_usage(), Some(expected));
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn chat_tool_calls_round_trip_reasoning_content_in_follow_up_request() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("server has address")
+    );
+    let server = tokio::spawn(async move {
+        let (mut first_socket, _) = listener
+            .accept()
+            .await
+            .expect("server accepts first request");
+        let _ = read_complete_http_request(&mut first_socket).await;
+        first_socket
+            .write_all(
+                chat_tool_batch_sse("workflow__todos", "call-1", r#"{"items":[]}"#.into())
+                    .as_bytes(),
+            )
+            .await
+            .expect("server writes first response");
+        first_socket
+            .shutdown()
+            .await
+            .expect("server closes first response");
+
+        let (mut second_socket, _) = listener
+            .accept()
+            .await
+            .expect("server accepts second request");
+        let second_request = read_complete_http_request(&mut second_socket).await;
+        let body_start = second_request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request has headers")
+            + 4;
+        let body: serde_json::Value =
+            serde_json::from_slice(&second_request[body_start..]).expect("request body is JSON");
+        let assistant = body["messages"]
+            .as_array()
+            .expect("request has messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("follow-up request has assistant tool-call message");
+        assert_eq!(assistant["reasoning_content"], "inspect then call the tool");
+        second_socket
+            .write_all(chat_final_sse("done").as_bytes())
+            .await
+            .expect("server writes second response");
+        second_socket
+            .shutdown()
+            .await
+            .expect("server closes second response");
+    });
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 2, 1);
+
+    let result = agent
+        .run_oai_comp_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("chat stream completes");
+
+    assert_eq!(result, "done");
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn chat_tool_calls_preserve_native_reasoning_content() {
+    let (base_url, _, server) = spawn_chat_completion_server(vec![
+        chat_tool_batch_sse("workflow__todos", "call-1", r#"{"items":[]}"#.into()),
+        chat_final_sse("done"),
+    ])
+    .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 2, 1);
+
+    agent
+        .run_oai_comp_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("chat tool call stream completes");
+
+    assert!(matches!(
+        agent.history_for_test().get(1),
+        Some(HistoryItem::AssistantToolCalls {
+            reasoning_content: Some(reasoning_content),
+            ..
+        }) if reasoning_content == "inspect then call the tool"
+    ));
     server.await.expect("server task should finish");
 }
 
@@ -1415,6 +1543,7 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
     agent
         .append_history_item(HistoryItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "pending".into(),
                 name: "fs__read".into(),
@@ -2010,6 +2139,7 @@ fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
             context_branch_id: None,
             event: TranscriptEvent::AssistantToolCallBatch {
                 text: None,
+                reasoning_content: None,
                 calls: vec![HistoryToolCall {
                     call_id: "finished".into(),
                     name: "test__replay_guard".into(),
@@ -3320,6 +3450,7 @@ fn protocol_frames_remain_authoritative_for_history_cache() {
     agent
         .append_history_item(HistoryItem::AssistantToolCalls {
             text: Some("working".into()),
+            reasoning_content: None,
             calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
         })
         .expect("tool call append succeeds");
@@ -3831,6 +3962,7 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
             HistoryItem::user("active request"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![HistoryToolCall {
                     call_id: "call-pending".into(),
                     name: "fs__read".into(),
@@ -3956,6 +4088,7 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
         HistoryItem::user("active request"),
         HistoryItem::AssistantToolCalls {
             text: None,
+            reasoning_content: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-pending".into(),
                 name: "fs__read".into(),

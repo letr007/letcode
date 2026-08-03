@@ -533,6 +533,7 @@ pub enum AgentEvent {
     },
     AssistantToolCallBatch {
         text: Option<String>,
+        reasoning_content: Option<String>,
         calls: Vec<HistoryToolCall>,
     },
     InternalContinuation {

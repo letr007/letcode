@@ -121,6 +121,7 @@ pub(crate) enum PromptSegmentContent {
     },
     AssistantToolCalls {
         text: Option<String>,
+        reasoning_content: Option<String>,
         calls: Vec<HistoryToolCall>,
     },
     ToolOutput {
@@ -1238,7 +1239,7 @@ fn history_item_text(item: &HistoryItem) -> String {
         HistoryItem::UserMessage { content } => content.prompt_plan_text(),
         HistoryItem::InternalContinuation { text } => text.clone(),
         HistoryItem::AssistantText { text } => text.clone(),
-        HistoryItem::AssistantToolCalls { text, calls } => {
+        HistoryItem::AssistantToolCalls { text, calls, .. } => {
             let calls_text = calls
                 .iter()
                 .map(|call| format!("{} {} {}", call.call_id, call.name, call.arguments_json))
@@ -1313,12 +1314,15 @@ fn history_item_content(item: &HistoryItem) -> PromptSegmentContent {
         HistoryItem::UserMessage { content } => PromptSegmentContent::UserContent {
             content: content.clone(),
         },
-        HistoryItem::AssistantToolCalls { text, calls } => {
-            PromptSegmentContent::AssistantToolCalls {
-                text: text.clone(),
-                calls: calls.clone(),
-            }
-        }
+        HistoryItem::AssistantToolCalls {
+            text,
+            reasoning_content,
+            calls,
+        } => PromptSegmentContent::AssistantToolCalls {
+            text: text.clone(),
+            reasoning_content: reasoning_content.clone(),
+            calls: calls.clone(),
+        },
         HistoryItem::ToolOutput {
             call_id,
             output_json,
@@ -1544,6 +1548,7 @@ mod tests {
             },
             HistoryItem::AssistantToolCalls {
                 text: Some("running tool".into()),
+                reasoning_content: None,
                 calls: vec![HistoryToolCall {
                     call_id: "call-1".into(),
                     name: "read".into(),
@@ -1717,6 +1722,7 @@ mod tests {
                 },
                 HistoryItem::AssistantToolCalls {
                     text: None,
+                    reasoning_content: None,
                     calls: vec![HistoryToolCall {
                         call_id: "call-1".into(),
                         name: "skill".into(),

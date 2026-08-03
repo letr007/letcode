@@ -2126,6 +2126,7 @@ mod tests {
                         transcript.record_model_changed("gpt-test", "child-resume-model")?;
                         transcript.record_assistant_tool_call_batch(
                             None,
+                            None,
                             vec![crate::request_builder::HistoryToolCall {
                                 call_id: "call-1".into(),
                                 name: "fs__read".into(),

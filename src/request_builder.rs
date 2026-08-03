@@ -856,11 +856,21 @@ pub(crate) fn build_request_from_selected_prompt(
                 &input.prompt_plan,
                 input.tools,
             );
+            let needs_reasoning_content = input.prompt_plan.segments.iter().any(|segment| {
+                matches!(
+                    segment.content,
+                    prompt_plan::PromptSegmentContent::AssistantToolCalls {
+                        reasoning_content: Some(_),
+                        ..
+                    }
+                )
+            });
             if input
                 .model
                 .reasoning_effort
                 .as_ref()
                 .is_some_and(ModelReasoningEffort::requires_compatible_request)
+                || needs_reasoning_content
             {
                 let mut request = serde_json::to_value(request)
                     .expect("CreateChatCompletionRequest should always serialize to JSON");
@@ -872,6 +882,10 @@ pub(crate) fn build_request_from_selected_prompt(
                 {
                     request["reasoning_effort"] = Value::String(effort.as_str().into());
                 }
+                provider_serialization::apply_chat_reasoning_content(
+                    &mut request,
+                    &input.prompt_plan,
+                );
                 BuiltRequest::CompletionsCompatible(request)
             } else {
                 BuiltRequest::Completions(request)

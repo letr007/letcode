@@ -118,6 +118,7 @@ mod tests {
             HistoryItem::user("current"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {
@@ -162,6 +163,7 @@ mod tests {
             HistoryItem::user("current"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {
@@ -198,6 +200,7 @@ mod tests {
             HistoryItem::user("old"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("pending", "lookup")],
             },
             HistoryItem::assistant("recent tail"),
@@ -216,6 +219,7 @@ mod tests {
             HistoryItem::user("old"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("x", "lookup")],
             },
             HistoryItem::ToolOutput {
@@ -253,6 +257,7 @@ mod tests {
             HistoryItem::user("current"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {
@@ -274,6 +279,7 @@ mod tests {
             HistoryItem::user("current"),
             HistoryItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {

@@ -614,7 +614,7 @@ fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, St
             format!("assistant:{text}"),
             text.clone(),
         )),
-        HistoryItem::AssistantToolCalls { text, calls } => {
+        HistoryItem::AssistantToolCalls { text, calls, .. } => {
             let stable_key = calls
                 .iter()
                 .map(|call| format!("{}:{}:{}", call.call_id, call.name, call.arguments_json))

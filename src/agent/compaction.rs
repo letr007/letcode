@@ -753,7 +753,7 @@ pub(super) fn describe_history_item(item: &HistoryItem) -> String {
         HistoryItem::UserMessage { content } => format!("用户: {}", content.display_text()),
         HistoryItem::InternalContinuation { text } => format!("继续执行指令: {text}"),
         HistoryItem::AssistantText { text } => format!("助手: {text}"),
-        HistoryItem::AssistantToolCalls { text, calls } => format!(
+        HistoryItem::AssistantToolCalls { text, calls, .. } => format!(
             "助手工具调用{}: {}",
             text.as_deref()
                 .map(|value| format!("（附言: {value}）"))

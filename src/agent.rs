@@ -2446,12 +2446,20 @@ impl<C: Config> Agent<C> {
         turn_text: &str,
         tool_calls: &[HistoryToolCall],
     ) -> Result<()> {
+        self.append_assistant_tool_calls_with_reasoning_content(turn_text, None, tool_calls)
+    }
+
+    fn append_assistant_tool_calls_with_reasoning_content(
+        &mut self,
+        turn_text: &str,
+        reasoning_content: Option<&str>,
+        tool_calls: &[HistoryToolCall],
+    ) -> Result<()> {
         self.append_history_item(HistoryItem::AssistantToolCalls {
-            text: if turn_text.is_empty() {
-                None
-            } else {
-                Some(turn_text.to_string())
-            },
+            text: (!turn_text.is_empty()).then(|| turn_text.to_string()),
+            reasoning_content: reasoning_content
+                .filter(|reasoning_content| !reasoning_content.is_empty())
+                .map(ToString::to_string),
             calls: tool_calls.to_vec(),
         })
         .map_err(|error| anyhow!("assistant tool calls should remain protocol-compatible: {error}"))
@@ -3697,12 +3705,15 @@ pub(crate) fn protocol_frame_item_from_history_item(
         HistoryItem::AssistantText { text } => {
             crate::protocol_frames::ProtocolFrameItem::AssistantText { text: text.clone() }
         }
-        HistoryItem::AssistantToolCalls { text, calls } => {
-            crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls {
-                text: text.clone(),
-                calls: calls.clone(),
-            }
-        }
+        HistoryItem::AssistantToolCalls {
+            text,
+            reasoning_content,
+            calls,
+        } => crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls {
+            text: text.clone(),
+            reasoning_content: reasoning_content.clone(),
+            calls: calls.clone(),
+        },
         HistoryItem::ToolOutput {
             call_id,
             output_json,
@@ -3738,7 +3749,7 @@ fn runtime_frame_from_protocol_frame(
             format!("assistant:{}", frame.history_index),
             Some(text.clone()),
         ),
-        crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls { text, calls } => (
+        crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls { text, calls, .. } => (
             RuntimeFrameKind::ToolCall,
             format!(
                 "assistant-tool-calls:{}:{}",

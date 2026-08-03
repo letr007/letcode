@@ -1318,6 +1318,7 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
             Some(SourceSpan::new(24, 24).expect("fixture span")),
             ProtocolFrameItem::AssistantToolCalls {
                 text: None,
+                reasoning_content: None,
                 calls: vec![HistoryToolCall {
                     call_id: "current-call".into(),
                     name: "shell__exec".into(),

@@ -1430,7 +1430,11 @@ fn cancelled_durable_multi_call_batch_restores_every_terminal_output() {
     let records = vec![
         record_at(
             1,
-            TranscriptEvent::AssistantToolCallBatch { text: None, calls },
+            TranscriptEvent::AssistantToolCallBatch {
+                text: None,
+                reasoning_content: None,
+                calls,
+            },
         ),
         record_at(
             2,
@@ -2712,6 +2716,7 @@ fn modern_active_turn_compaction_retires_current_user_with_prefix() {
             5,
             TranscriptEvent::AssistantToolCallBatch {
                 text: None,
+                reasoning_content: None,
                 calls: vec![HistoryToolCall {
                     call_id: "c1".into(),
                     name: "fs__read".into(),
