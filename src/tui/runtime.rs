@@ -2136,12 +2136,8 @@ impl TuiRuntime {
         self.available_models
             .iter()
             .map(|model| {
-                DialogItem::new(
-                    model.id.clone(),
-                    model.label.clone(),
-                    Some(model.id.clone()),
-                )
-                .with_section(model.provider.clone())
+                DialogItem::new(model.id.clone(), model.label.clone(), None)
+                    .with_section(model.provider.clone())
             })
             .collect()
     }
@@ -8403,8 +8399,12 @@ mod tests {
 
         let dialog = runtime.state().dialog().expect("model picker open");
         assert_eq!(dialog.items[0].id, "primary/shared");
+        assert_eq!(dialog.items[0].label, "Primary Shared");
+        assert_eq!(dialog.items[0].detail, None);
         assert_eq!(dialog.items[0].section.as_deref(), Some("primary"));
         assert_eq!(dialog.items[1].id, "expert/shared");
+        assert_eq!(dialog.items[1].label, "Expert Shared");
+        assert_eq!(dialog.items[1].detail, None);
         assert_eq!(dialog.items[1].section.as_deref(), Some("expert"));
     }
 

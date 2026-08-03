@@ -107,11 +107,7 @@ async fn main() -> Result<()> {
                 let route = config::ModelRoute::new(provider_name, model_id);
                 AvailableModel::with_context_window_and_reasoning(
                     route.display_name(),
-                    format!(
-                        "{} ({})",
-                        provider.model_label(model_id),
-                        route.display_name()
-                    ),
+                    provider.model_label(model_id),
                     model.context_window,
                     model.reasoning_effort.clone(),
                     model.request_metadata().selectable_reasoning_efforts(),
@@ -211,11 +207,7 @@ async fn main() -> Result<()> {
             }
         }
         EntryMode::Tui => {
-            let model_label = format!(
-                "{} ({})",
-                active_provider.model_label(&active_route.model),
-                active_route.display_name()
-            );
+            let model_label = active_provider.model_label(&active_route.model);
             let (engine, projection) = session::SessionEngine::start(
                 agent,
                 recorder,
