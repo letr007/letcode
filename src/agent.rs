@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{Instrument, debug, error, info, trace, warn};
 
-use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
+use crate::config::{ApiProtocol, CompactionConfig, ModelRoute, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 #[cfg(test)]
 use crate::permission::ToolScope;
@@ -55,6 +55,7 @@ use crate::tool_format::format_tool_call;
 use crate::tool_names;
 use crate::transcript::{ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
+use async_openai::config::OpenAIConfig;
 
 #[path = "agent/catalog.rs"]
 mod catalog;
@@ -315,6 +316,77 @@ impl LogicalRequestObservationTracker {
     }
 }
 
+pub trait SubagentChildFactory<C: Config>: Send + Sync {
+    fn create_child(
+        &self,
+        parent: &Agent<C>,
+        template: &AgentTemplate,
+        max_tool_calls_override: Option<usize>,
+    ) -> Option<Agent<C>>;
+}
+
+pub trait PrimaryRouteFactory<C: Config>: Send + Sync {
+    fn prepare_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute<C>>;
+}
+
+pub struct PreparedPrimaryRoute<C: Config> {
+    client: Client<C>,
+    route: ModelRoute,
+    default_protocol: ApiProtocol,
+    model_protocols: HashMap<String, ApiProtocol>,
+    model_catalog: HashMap<String, ModelRequestMetadata>,
+    retry_config: RetryConfig,
+}
+
+pub(crate) struct PreparedPrimaryRouteInstall<C: Config> {
+    route: PreparedPrimaryRoute<C>,
+}
+
+impl<C: Config> PreparedPrimaryRoute<C> {
+    pub fn new(
+        client: Client<C>,
+        route: ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+    ) -> Self {
+        Self {
+            client,
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+        }
+    }
+
+    pub(crate) fn into_install(self) -> PreparedPrimaryRouteInstall<C> {
+        PreparedPrimaryRouteInstall { route: self }
+    }
+}
+
+impl<C: Config> PreparedPrimaryRouteInstall<C> {
+    pub(crate) fn apply(self, agent: &mut Agent<C>) {
+        let PreparedPrimaryRoute {
+            client,
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+        } = self.route;
+        agent.apply_route(
+            client,
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+        );
+    }
+}
+
 pub trait SubagentDelegate<C: Config>: Send + Sync {
     fn run_named<'a>(
         &'a self,
@@ -422,6 +494,7 @@ pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot
 pub struct Agent<C: Config> {
     pub client: Client<C>,
     model: String,
+    primary_route: Option<ModelRoute>,
     subagent_model_overrides: HashMap<String, String>,
     default_protocol: ApiProtocol,
     model_protocols: HashMap<String, ApiProtocol>,
@@ -434,6 +507,8 @@ pub struct Agent<C: Config> {
     skill_registry: Option<Arc<SkillRegistry>>,
     skill_cards: Vec<SkillCard>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
+    subagent_child_factory: Option<Arc<dyn SubagentChildFactory<C>>>,
+    primary_route_factory: Option<Arc<dyn PrimaryRouteFactory<C>>>,
     question_handler: Option<QuestionCallback>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     compaction_config: CompactionConfig,
@@ -468,20 +543,84 @@ impl AgentFactory {
         template: &AgentTemplate,
         max_tool_calls_override: Option<usize>,
     ) -> Agent<C> {
+        if let Some(factory) = &parent.subagent_child_factory
+            && let Some(child) = factory.create_child(parent, template, max_tool_calls_override)
+        {
+            return child;
+        }
+
         let model = parent
             .subagent_model_override(&template.name)
             .unwrap_or(parent.model())
             .to_string();
+        let mut child = Self::create_child_with_parts(
+            parent,
+            template,
+            parent.client.clone(),
+            model,
+            parent.default_protocol,
+            parent.model_protocols.clone(),
+            parent.model_catalog.clone(),
+            parent.retry_config.clone(),
+            max_tool_calls_override,
+        );
+        if parent.subagent_model_override(&template.name).is_none()
+            && let Some(route) = parent.primary_route().cloned()
+        {
+            child.set_primary_route(route);
+        }
+        child
+    }
+
+    pub fn create_routed_child_with_max_tool_calls(
+        parent: &Agent<OpenAIConfig>,
+        template: &AgentTemplate,
+        client: Client<OpenAIConfig>,
+        route: ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+        max_tool_calls_override: Option<usize>,
+    ) -> Agent<OpenAIConfig> {
+        let mut child = Self::create_child_with_parts(
+            parent,
+            template,
+            client,
+            route.model.clone(),
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+            max_tool_calls_override,
+        );
+        child.set_primary_route(route);
+        child
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_child_with_parts<C: Config + Clone>(
+        parent: &Agent<C>,
+        template: &AgentTemplate,
+        client: Client<C>,
+        model: String,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+        max_tool_calls_override: Option<usize>,
+    ) -> Agent<C> {
         let mut prelude = parent.prelude.clone();
         prelude.push(PromptMessage::developer(template.system_prompt.clone()));
 
         Agent {
-            client: parent.client.clone(),
+            client,
             model: model.clone(),
+            primary_route: None,
             subagent_model_overrides: parent.subagent_model_overrides.clone(),
-            default_protocol: parent.default_protocol,
-            model_protocols: parent.model_protocols.clone(),
-            model_catalog: parent.model_catalog.clone(),
+            default_protocol,
+            model_protocols,
+            model_catalog,
             prelude,
             protocol_frames: Vec::new(),
             history: Vec::new(),
@@ -493,10 +632,12 @@ impl AgentFactory {
             skill_registry: parent.skill_registry.clone(),
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,
+            subagent_child_factory: parent.subagent_child_factory.clone(),
+            primary_route_factory: parent.primary_route_factory.clone(),
             question_handler: None,
             permission_session: Arc::clone(&parent.permission_session),
             compaction_config: parent.compaction_config.clone(),
-            retry_config: parent.retry_config.clone(),
+            retry_config,
             tool_timeout_secs: parent.tool_timeout_secs,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -740,6 +881,7 @@ impl<C: Config> Agent<C> {
         Self {
             client,
             model: model.clone(),
+            primary_route: None,
             subagent_model_overrides: HashMap::new(),
             default_protocol: ApiProtocol::Responses,
             model_protocols: HashMap::new(),
@@ -752,6 +894,8 @@ impl<C: Config> Agent<C> {
             skill_registry: None,
             skill_cards: Vec::new(),
             subagent_delegate: None,
+            subagent_child_factory: None,
+            primary_route_factory: None,
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
@@ -986,6 +1130,19 @@ impl<C: Config> Agent<C> {
         &self.model
     }
 
+    pub fn primary_route(&self) -> Option<&ModelRoute> {
+        self.primary_route.as_ref()
+    }
+
+    pub fn route_display_name(&self) -> String {
+        self.primary_route()
+            .map_or_else(|| self.model().to_string(), ModelRoute::display_name)
+    }
+
+    pub fn set_primary_route(&mut self, route: ModelRoute) {
+        self.primary_route = Some(route);
+    }
+
     pub fn reasoning_effort(&self) -> Option<ModelReasoningEffort> {
         self.active_model_metadata().reasoning_effort
     }
@@ -1043,18 +1200,48 @@ impl<C: Config> Agent<C> {
         self.max_iterations
     }
 
-    pub fn subagent_model_override(&self, agent_name: &str) -> Option<&str> {
-        self.subagent_model_overrides
-            .get(agent_name)
-            .map(String::as_str)
-    }
-
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.model = model.into();
         self.runtime_snapshot.latest_model = Some(self.model.clone());
         self.clear_provider_usage_anchor();
     }
 
+    #[allow(dead_code)]
+    pub fn apply_route(
+        &mut self,
+        client: Client<C>,
+        route: ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+    ) {
+        self.client = client;
+        self.default_protocol = default_protocol;
+        self.model_protocols = model_protocols;
+        self.model_catalog = model_catalog;
+        self.retry_config = retry_config;
+        self.primary_route = Some(route.clone());
+        self.set_model(route.model);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn default_protocol_for_test(&self) -> ApiProtocol {
+        self.default_protocol
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_config_for_test(&self) -> &RetryConfig {
+        &self.retry_config
+    }
+
+    pub fn subagent_model_override(&self, agent_name: &str) -> Option<&str> {
+        self.subagent_model_overrides
+            .get(agent_name)
+            .map(String::as_str)
+    }
+
+    #[allow(dead_code)]
     pub fn set_subagent_model_override(
         &mut self,
         agent_name: impl Into<String>,
@@ -1333,6 +1520,37 @@ impl<C: Config> Agent<C> {
 
     pub fn set_subagent_delegate(&mut self, delegate: Arc<dyn SubagentDelegate<C>>) {
         self.subagent_delegate = Some(delegate);
+    }
+
+    pub fn set_subagent_child_factory(&mut self, factory: Arc<dyn SubagentChildFactory<C>>) {
+        self.subagent_child_factory = Some(factory);
+    }
+
+    pub fn set_primary_route_factory(&mut self, factory: Arc<dyn PrimaryRouteFactory<C>>) {
+        self.primary_route_factory = Some(factory);
+    }
+
+    pub fn prepare_primary_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute<C>> {
+        let factory = self
+            .primary_route_factory
+            .clone()
+            .ok_or_else(|| anyhow!("primary route switching is not configured"))?;
+        factory.prepare_route(route)
+    }
+
+    pub(crate) fn apply_prepared_primary_route(&mut self, route: PreparedPrimaryRouteInstall<C>) {
+        route.apply(self);
+    }
+
+    pub(crate) fn apply_prepared_route(&mut self, route: PreparedPrimaryRoute<C>) {
+        self.apply_prepared_primary_route(route.into_install());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn switch_primary_route(&mut self, route: ModelRoute) -> Result<()> {
+        let prepared = self.prepare_primary_route(route)?;
+        self.apply_prepared_route(prepared);
+        Ok(())
     }
 
     pub fn set_context_scope_state(
@@ -1935,6 +2153,7 @@ impl<C: Config> Agent<C> {
         Agent {
             client: self.client.clone(),
             model: self.model.clone(),
+            primary_route: None,
             subagent_model_overrides: HashMap::new(),
             default_protocol: self.default_protocol,
             model_protocols: self.model_protocols.clone(),
@@ -1947,6 +2166,8 @@ impl<C: Config> Agent<C> {
             skill_registry: None,
             skill_cards: Vec::new(),
             subagent_delegate: None,
+            subagent_child_factory: None,
+            primary_route_factory: None,
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),

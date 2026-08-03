@@ -65,10 +65,9 @@ pub use lifecycle::{
     prepare_new_session_package, resolve_session_prefix,
 };
 pub use ports::SessionCommandHandler;
-pub(crate) use restore::session_resumed_event;
 pub use restore::{
-    install_prepared_resume_for_agent, prepare_resume_package,
-    project_runtime_restore_snapshot_with_children, restored_session_token_usage,
+    install_prepared_routed_resume_for_agent, prepare_resume_package,
+    project_runtime_restore_snapshot_with_children,
 };
 #[cfg(test)]
 pub(crate) use runner::PermissionResponse;
@@ -76,4 +75,5 @@ pub(crate) use runner::{
     AgentRunner, RunnerPermissionRequest, RunnerQuestionRequest, SessionTransportEvent,
     subagent_event_sender,
 };
-pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
+pub(crate) use settings::persist_and_apply_model_route_with;
+pub use settings::{apply_permission_mode, apply_reasoning_effort};

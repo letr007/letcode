@@ -102,6 +102,7 @@ pub enum CommandIntent {
     PermissionSet(PermissionMode),
     ModelShow,
     ModelSet(String),
+    AgentsShow,
     FastToggle,
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
@@ -199,6 +200,15 @@ const COMMANDS: &[CommandMetadata] = &[
         insert_text: "/model ",
         description: "Show or switch the active model",
         usage: "/model <id>",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/agents",
+        insert_text: "/agents",
+        description: "Configure expert models",
+        usage: "/agents",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -377,6 +387,7 @@ pub fn help_summary() -> String {
         "/exit",
         "/quit",
         "/model",
+        "/agents",
         "/fast",
         "/reasoning",
         "/permission",
@@ -443,6 +454,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/exit" | "/quit" => expect_no_extra_args(&parts, name.as_str(), CommandIntent::Exit),
         "/permission" | "/perm" => parse_permission(&parts),
         "/model" => parse_model(&parts),
+        "/agents" => expect_no_extra_args(&parts, "/agents", CommandIntent::AgentsShow),
         "/fast" => expect_no_extra_args(&parts, "/fast", CommandIntent::FastToggle),
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/tool-output" => parse_tool_output(&parts),
@@ -700,6 +712,7 @@ mod tests {
             "/permission",
             "/perm",
             "/model",
+            "/agents",
             "/fast",
             "/reasoning",
             "/think",
@@ -745,6 +758,7 @@ mod tests {
             parse_command("/model gpt-5.5"),
             Ok(CommandIntent::ModelSet("gpt-5.5".into()))
         );
+        assert_eq!(parse_command("/agents"), Ok(CommandIntent::AgentsShow));
         assert_eq!(parse_command("/fast"), Ok(CommandIntent::FastToggle));
         assert_eq!(
             parse_command("/think x-high"),

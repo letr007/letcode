@@ -34,6 +34,10 @@ pub enum SessionCommand {
     ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    SetExpertModel {
+        agent_name: String,
+        model_id: String,
+    },
     ToggleFastMode,
     SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
@@ -87,6 +91,7 @@ impl SessionCommand {
             | CommandIntent::Exit
             | CommandIntent::PermissionShow
             | CommandIntent::ModelShow
+            | CommandIntent::AgentsShow
             | CommandIntent::ReasoningShow
             | CommandIntent::ToolOutputSet(_)
             | CommandIntent::TranscriptScrollbarSet(_)

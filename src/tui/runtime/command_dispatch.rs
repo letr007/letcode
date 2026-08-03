@@ -39,6 +39,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         )

@@ -210,13 +210,14 @@ impl DialogItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogKind {
     ModelPicker,
+    AgentPicker,
+    ExpertModelPicker(String),
     PermissionPicker,
     ReasoningPicker,
     ThemePicker,
     SessionPicker,
     HistoryTree,
     ContextPicker,
-    #[allow(dead_code)] // Context detail is constructed by runtime dialog routing.
     #[allow(dead_code)] // Context detail is constructed by runtime dialog routing.
     ContextDetail,
     McpPicker,
@@ -310,6 +311,8 @@ pub struct DialogState {
     pub mcp_server_name: Option<String>,
     pub mcp_primary_query: Option<String>,
     pub mcp_primary_selected_server: Option<String>,
+    pub expert_primary_query: Option<String>,
+    pub expert_primary_selected_agent: Option<String>,
     pub detail_focused: bool,
     pub detail_scroll: u16,
     pub detail_scroll_max: u16,
@@ -695,6 +698,8 @@ impl DialogState {
             mcp_server_name: None,
             mcp_primary_query: None,
             mcp_primary_selected_server: None,
+            expert_primary_query: None,
+            expert_primary_selected_agent: None,
             detail_focused: false,
             detail_scroll: 0,
             detail_scroll_max: u16::MAX,
@@ -1567,6 +1572,12 @@ impl TuiState {
 
     pub fn set_provider_label(&mut self, label: impl Into<String>) {
         self.provider_label = label.into();
+    }
+
+    pub fn set_provider_label_from_model_route(&mut self, model_id: &str) {
+        if let Some((provider, _)) = model_id.split_once('/') {
+            self.set_provider_label(provider);
+        }
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {

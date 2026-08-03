@@ -4196,11 +4196,20 @@ fn render_compaction_prompt_applies_total_history_cap() {
 #[test]
 fn setting_reasoning_effort_does_not_make_fast_mode_sticky_in_the_catalog() {
     let fast_mode_dir = agents_test_dir();
-    let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-    assert!(matches!(
-        fast_mode.toggle("gpt-5.5").expect("enable fast mode"),
-        crate::fast_mode::FastModeToggle::Enabled
-    ));
+    let fast_mode_path = fast_mode_dir.join("letcode.toml");
+    std::fs::write(
+        &fast_mode_path,
+        r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+    )
+    .expect("write Fast Mode config");
+    let fast_mode = crate::fast_mode::FastMode::load(fast_mode_path, true);
 
     let mut agent = test_agent();
     agent.set_model("gpt-5.5");
@@ -4232,11 +4241,20 @@ fn setting_reasoning_effort_does_not_make_fast_mode_sticky_in_the_catalog() {
 #[tokio::test]
 async fn request_preparation_auto_disables_fast_mode_and_emits_projection() {
     let fast_mode_dir = agents_test_dir();
-    let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-    assert!(matches!(
-        fast_mode.toggle("gpt-5.5").expect("enable fast mode"),
-        crate::fast_mode::FastModeToggle::Enabled
-    ));
+    let fast_mode_path = fast_mode_dir.join("letcode.toml");
+    std::fs::write(
+        &fast_mode_path,
+        r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+    )
+    .expect("write Fast Mode config");
+    let fast_mode = crate::fast_mode::FastMode::load(fast_mode_path, true);
 
     let mut agent = test_agent();
     agent.set_fast_mode(Arc::clone(&fast_mode));
@@ -4270,12 +4288,7 @@ async fn request_preparation_auto_disables_fast_mode_and_emits_projection() {
                 .get("service_tier")
                 .is_none()
     ));
-    assert!(
-        !crate::fast_mode::FastMode::load(&fast_mode_dir)
-            .expect("reload fast mode")
-            .enabled(),
-        "auto-disable must persist"
-    );
+    assert!(!fast_mode.enabled(), "auto-disable must persist");
 }
 
 #[tokio::test]

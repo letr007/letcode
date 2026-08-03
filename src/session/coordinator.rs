@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::session::child_view::{
@@ -18,9 +17,12 @@ use crate::session::child_view::{
 };
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
-use crate::session::restore::restored_messages_from_protocol_frames;
+use crate::session::restore::{
+    apply_prepared_restored_route, prepare_restored_model_route,
+    restored_messages_from_protocol_frames,
+};
 use crate::session::runner::SessionTransportEvent;
-use crate::session::settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
+use crate::session::settings::{apply_permission_mode, apply_reasoning_effort};
 use crate::transcript::TranscriptRecorder;
 
 #[derive(Debug)]
@@ -70,9 +72,9 @@ impl SessionCoordinator {
     ///
     /// `sessions_dir` is required for child/parent view commands; when `None`,
     /// those commands resolve the directory from the live transcript path.
-    pub(crate) fn dispatch_idle_command<C: Config>(
+    pub(crate) fn dispatch_idle_command(
         command: SessionCommand,
-        agent: &mut Agent<C>,
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
@@ -137,26 +139,8 @@ impl SessionCoordinator {
                 }
                 Ok(IdleDispatch::Handled)
             }
-            SessionCommand::SetModel(model) => {
-                match apply_model(agent, transcript, model) {
-                    Err(error) => {
-                        if error.fast_mode_auto_disabled() {
-                            Self::emit_fast_mode_auto_disabled(event_tx);
-                        }
-                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
-                            format!("failed to set model: {error}"),
-                        )));
-                    }
-                    Ok(fast_mode_auto_disabled) => {
-                        if fast_mode_auto_disabled {
-                            Self::emit_fast_mode_auto_disabled(event_tx);
-                        }
-                        let _ = event_tx.send(SessionTransportEvent::ModelChanged {
-                            model_id: agent.model().to_string(),
-                        });
-                    }
-                }
-                Ok(IdleDispatch::Handled)
+            SessionCommand::SetModel(_) | SessionCommand::SetExpertModel { .. } => {
+                Ok(IdleDispatch::NotIdle)
             }
             SessionCommand::ToggleFastMode => {
                 let Some(fast_mode) = agent.fast_mode() else {
@@ -225,8 +209,8 @@ impl SessionCoordinator {
         }
     }
 
-    fn navigate_undo<C: Config>(
-        agent: &mut Agent<C>,
+    fn navigate_undo(
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     ) {
@@ -310,8 +294,8 @@ impl SessionCoordinator {
         }
     }
 
-    fn navigate_redo<C: Config>(
-        agent: &mut Agent<C>,
+    fn navigate_redo(
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     ) {
@@ -369,8 +353,8 @@ impl SessionCoordinator {
             .map_err(Into::into)
     }
 
-    fn navigate_history<C: Config>(
-        agent: &mut Agent<C>,
+    fn navigate_history(
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         target_sequence: u64,
@@ -465,18 +449,16 @@ impl SessionCoordinator {
                 snapshot.protocol_frames.clone(),
                 snapshot.snapshot.clone(),
             )?;
-            let model = snapshot
-                .latest_model
-                .as_deref()
-                .unwrap_or(agent.model())
-                .to_string();
-            let fast_mode_auto_disabled =
-                agent
-                    .auto_disable_fast_mode_for_model(&model)
-                    .map_err(|error| NavigationError {
-                        error,
-                        fast_mode_auto_disabled: false,
-                    })?;
+            let route = prepare_restored_model_route(agent, snapshot.latest_model.as_deref())?;
+            let fast_mode_model = route
+                .as_ref()
+                .map_or_else(|| agent.model(), |route| route.target_model());
+            let fast_mode_auto_disabled = agent
+                .auto_disable_fast_mode_for_model(fast_mode_model)
+                .map_err(|error| NavigationError {
+                error,
+                fast_mode_auto_disabled: false,
+            })?;
             #[cfg(test)]
             if FAIL_HISTORY_NAVIGATION_COMMIT.with(|fail| fail.replace(false)) {
                 return Err(NavigationError {
@@ -502,7 +484,7 @@ impl SessionCoordinator {
                 runtime_context,
                 protocol_frames,
                 runtime_snapshot,
-                model,
+                route,
                 fast_mode_auto_disabled,
             ))
         })();
@@ -512,11 +494,11 @@ impl SessionCoordinator {
                 runtime_context,
                 protocol_frames,
                 runtime_snapshot,
-                model,
+                route,
                 fast_mode_auto_disabled,
             )) => {
+                apply_prepared_restored_route(agent, route);
                 agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
-                agent.set_model(model);
                 agent.restore_turn_sequence(snapshot.max_turn_id);
                 if fast_mode_auto_disabled {
                     Self::emit_fast_mode_auto_disabled(event_tx);
@@ -527,7 +509,7 @@ impl SessionCoordinator {
                     messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
                     records: snapshot.records,
                     evidence_count: 0,
-                    model_id: snapshot.latest_model,
+                    model_id: Some(agent.route_display_name()),
                     token_usage: None,
                     runtime_context,
                 });
@@ -653,7 +635,6 @@ impl SessionCoordinator {
                 | SessionCommand::Redo
                 | SessionCommand::NavigateHistory { .. }
                 | SessionCommand::SetPermissionMode(_)
-                | SessionCommand::SetModel(_)
                 | SessionCommand::ToggleFastMode
                 | SessionCommand::SetReasoningEffort(_)
                 | SessionCommand::ViewParent
@@ -670,7 +651,6 @@ impl SessionCoordinator {
             | SessionCommand::Redo
             | SessionCommand::NavigateHistory { .. }
             | SessionCommand::SetPermissionMode(_)
-            | SessionCommand::SetModel(_)
             | SessionCommand::ToggleFastMode
             | SessionCommand::SetReasoningEffort(_)
             | SessionCommand::ViewParent
@@ -678,6 +658,8 @@ impl SessionCoordinator {
             SessionCommand::SubmitPrompt(_)
             | SessionCommand::DelegateSubagent { .. }
             | SessionCommand::Compact
+            | SessionCommand::SetModel(_)
+            | SessionCommand::SetExpertModel { .. }
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
             | SessionCommand::ToggleMcpServer(_)
@@ -744,6 +726,10 @@ mod tests {
             SessionCommand::ViewParent,
             SessionCommand::SetPermissionMode(PermissionMode::Safe),
             SessionCommand::SetModel("m".into()),
+            SessionCommand::SetExpertModel {
+                agent_name: "explorer".into(),
+                model_id: "provider/m".into(),
+            },
             SessionCommand::ToggleFastMode,
             SessionCommand::SetReasoningEffort(ModelReasoningEffort::Low),
             SessionCommand::ResumeSession("abc".into()),
@@ -771,6 +757,12 @@ mod tests {
         ));
         assert!(!SessionCoordinator::is_idle_command(
             &SessionCommand::Compact
+        ));
+        assert!(!SessionCoordinator::is_idle_command(
+            &SessionCommand::SetExpertModel {
+                agent_name: "explorer".into(),
+                model_id: "provider/model".into(),
+            }
         ));
 
         let transcript = temp_transcript();
@@ -815,19 +807,37 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_toggle_emits_state_notice_and_model_switch_auto_disables() {
+    fn fast_mode_toggle_emits_state_notice() {
         let transcript = temp_transcript();
         let mut agent = test_agent();
-        let fast_mode_dir = std::env::temp_dir().join(format!(
-            "letcode-session-coordinator-fast-mode-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        agent.set_fast_mode(
-            crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode"),
-        );
+        let fast_mode_path = std::env::temp_dir()
+            .join(format!(
+                "letcode-session-coordinator-fast-mode-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("time ok")
+                    .as_nanos()
+            ))
+            .join("letcode.toml");
+        std::fs::create_dir_all(
+            fast_mode_path
+                .parent()
+                .expect("Fast Mode config has a parent directory"),
+        )
+        .expect("create Fast Mode config directory");
+        std::fs::write(
+            &fast_mode_path,
+            r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+        )
+        .expect("write Fast Mode config");
+        agent.set_fast_mode(crate::fast_mode::FastMode::load(&fast_mode_path, false));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         assert_eq!(
@@ -852,34 +862,6 @@ mod tests {
             }
             other => panic!("expected fast mode notice, got {other:?}"),
         }
-
-        assert_eq!(
-            SessionCoordinator::dispatch_idle_command(
-                SessionCommand::SetModel("claude-4".into()),
-                &mut agent,
-                &transcript,
-                &tx,
-                None,
-            )
-            .expect("model dispatch"),
-            IdleDispatch::Handled
-        );
-        assert!(!agent.fast_mode_enabled());
-        assert!(matches!(
-            rx.try_recv().expect("auto-disabled state"),
-            SessionTransportEvent::FastModeChanged { enabled: false }
-        ));
-        match rx.try_recv().expect("auto-disabled notice") {
-            SessionTransportEvent::Notice(notice) => assert_eq!(
-                notice.message,
-                "Fast mode auto-disabled: current model is unavailable"
-            ),
-            other => panic!("expected auto-disabled notice, got {other:?}"),
-        }
-        assert!(matches!(
-            rx.try_recv().expect("model state"),
-            SessionTransportEvent::ModelChanged { model_id } if model_id == "claude-4"
-        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -888,14 +870,14 @@ mod tests {
         let transcript = temp_transcript();
         let mut agent = test_agent();
         let fast_mode_path = std::env::temp_dir().join(format!(
-            "letcode-session-coordinator-fast-mode-file-{}",
+            "letcode-session-coordinator-fast-mode-file-{}.toml",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time ok")
                 .as_nanos()
         ));
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_path).expect("load fast mode");
-        std::fs::write(&fast_mode_path, "not a directory").expect("create blocking file");
+        std::fs::write(&fast_mode_path, "not a config file").expect("create blocking file");
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_path, false);
         agent.set_fast_mode(fast_mode);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -917,59 +899,6 @@ mod tests {
             }
             other => panic!("expected fast mode error, got {other:?}"),
         }
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn model_recording_failure_projects_persisted_fast_mode_disable() {
-        let transcript = temp_transcript();
-        let cloned = Arc::clone(&transcript);
-        let join = std::thread::spawn(move || {
-            let _guard = cloned.lock().expect("lock transcript");
-            panic!("poison transcript mutex for test");
-        });
-        let _ = join.join();
-        let mut agent = test_agent();
-        let fast_mode_dir = std::env::temp_dir().join(format!(
-            "letcode-session-coordinator-model-recording-fast-mode-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-        fast_mode.toggle(agent.model()).expect("enable fast mode");
-        agent.set_fast_mode(fast_mode);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        SessionCoordinator::dispatch_idle_command(
-            SessionCommand::SetModel("claude-4".into()),
-            &mut agent,
-            &transcript,
-            &tx,
-            None,
-        )
-        .expect("dispatch");
-
-        assert_eq!(agent.model(), "gpt-5.5");
-        assert!(!agent.fast_mode_enabled());
-        assert!(
-            !crate::fast_mode::FastMode::load(&fast_mode_dir)
-                .expect("reload fast mode")
-                .enabled()
-        );
-        assert!(matches!(
-            rx.try_recv().expect("fast mode state"),
-            SessionTransportEvent::FastModeChanged { enabled: false }
-        ));
-        assert!(matches!(
-            rx.try_recv().expect("fast mode notice"),
-            SessionTransportEvent::Notice(_)
-        ));
-        assert!(matches!(
-            rx.try_recv().expect("model error"),
-            SessionTransportEvent::Error(error) if error.message.contains("failed to set model")
-        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -1060,17 +989,29 @@ mod tests {
                 .expect("time ok")
                 .as_nanos()
         ));
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-        fast_mode.toggle(agent.model()).expect("enable fast mode");
+        let fast_mode_config_path = fast_mode_dir.join("letcode.toml");
+        std::fs::create_dir_all(&fast_mode_dir).expect("create Fast Mode config directory");
+        std::fs::write(
+            &fast_mode_config_path,
+            r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+        )
+        .expect("write Fast Mode config");
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_config_path, true);
         agent.set_fast_mode(fast_mode);
-        (transcript, agent, fast_mode_dir)
+        (transcript, agent, fast_mode_config_path)
     }
 
     #[test]
     fn navigation_fast_mode_persistence_failure_prevents_transaction() {
-        let (transcript, mut agent, fast_mode_dir) = history_navigation_with_unsupported_model();
-        std::fs::remove_dir_all(&fast_mode_dir).expect("remove fast mode directory");
-        std::fs::write(&fast_mode_dir, "blocking file").expect("block persistence");
+        let (transcript, mut agent, fast_mode_path) = history_navigation_with_unsupported_model();
+        std::fs::write(&fast_mode_path, "not a config file").expect("block persistence");
         let before = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read initial records")
@@ -1104,7 +1045,7 @@ mod tests {
 
     #[test]
     fn navigation_commit_failure_projects_persisted_fast_mode_disable() {
-        let (transcript, mut agent, fast_mode_dir) = history_navigation_with_unsupported_model();
+        let (transcript, mut agent, _fast_mode_dir) = history_navigation_with_unsupported_model();
         let before = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read initial records")
@@ -1125,11 +1066,6 @@ mod tests {
 
         assert_eq!(agent.model(), "gpt-5.5");
         assert!(!agent.fast_mode_enabled());
-        assert!(
-            !crate::fast_mode::FastMode::load(&fast_mode_dir)
-                .expect("reload fast mode")
-                .enabled()
-        );
         let after = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read final records")
@@ -1148,6 +1084,90 @@ mod tests {
             SessionTransportEvent::Error(error) if error.message.contains("injected history navigation commit failure")
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn navigation_applies_provider_qualified_model_routes() {
+        struct RecordingRouteFactory {
+            accepted_routes: Vec<crate::config::ModelRoute>,
+            applied_route: Arc<Mutex<Option<crate::config::ModelRoute>>>,
+        }
+
+        impl crate::agent::PrimaryRouteFactory<OpenAIConfig> for RecordingRouteFactory {
+            fn prepare_route(
+                &self,
+                route: crate::config::ModelRoute,
+            ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+                if !self.accepted_routes.contains(&route) {
+                    anyhow::bail!("route is not configured: {}", route.display_name());
+                }
+                *self.applied_route.lock().expect("capture route") = Some(route.clone());
+                let client = Client::with_config(
+                    OpenAIConfig::new()
+                        .with_api_base("http://127.0.0.1:9/v1")
+                        .with_api_key("test-key"),
+                );
+                Ok(crate::agent::PreparedPrimaryRoute::new(
+                    client,
+                    route,
+                    crate::config::ApiProtocol::Responses,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    crate::config::RetryConfig::default(),
+                ))
+            }
+        }
+
+        let transcript = temp_transcript();
+        {
+            let mut recorder = transcript.lock().expect("recorder");
+            recorder
+                .record_session_started("primary/shared")
+                .expect("started");
+            recorder.record_user_message("first").expect("first user");
+            recorder
+                .record_model_changed("primary/shared", "expert/shared")
+                .expect("model changed");
+            recorder.record_user_message("second").expect("second user");
+        }
+        let applied_route = Arc::new(Mutex::new(None));
+        let mut agent = test_agent();
+        agent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+        agent.set_primary_route_factory(Arc::new(RecordingRouteFactory {
+            accepted_routes: vec![crate::config::ModelRoute::new("expert", "shared")],
+            applied_route: Arc::clone(&applied_route),
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            SessionCoordinator::dispatch_idle_command(
+                SessionCommand::NavigateHistory {
+                    target_entry_id: "entry-4".into(),
+                },
+                &mut agent,
+                &transcript,
+                &tx,
+                None,
+            )
+            .expect("dispatch"),
+            IdleDispatch::Handled
+        );
+
+        assert_eq!(
+            agent.primary_route(),
+            Some(&crate::config::ModelRoute::new("expert", "shared"))
+        );
+        assert_eq!(
+            *applied_route.lock().expect("capture route"),
+            Some(crate::config::ModelRoute::new("expert", "shared"))
+        );
+        assert!(matches!(
+            rx.try_recv().expect("navigation result"),
+            SessionTransportEvent::SessionResumed {
+                model_id: Some(model_id),
+                ..
+            } if model_id == "expert/shared"
+        ));
     }
 
     #[test]

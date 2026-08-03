@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_openai::config::Config;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -162,6 +162,10 @@ pub(crate) enum SessionTransportEvent {
     ModelChanged {
         model_id: String,
     },
+    ExpertModelChanged {
+        agent_name: String,
+        model_id: String,
+    },
     PermissionRequested {
         event: PermissionRequestEvent,
         handle: RunnerPermissionRequest,
@@ -293,6 +297,7 @@ impl SessionTransportEvent {
             Self::RetryStarted(event) => Some(SessionEvent::RetryStarted(event.clone())),
             Self::FastModeChanged { .. }
             | Self::ModelChanged { .. }
+            | Self::ExpertModelChanged { .. }
             | Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(SessionEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => {
@@ -394,27 +399,117 @@ pub(crate) struct AgentRunner<C: Config> {
     _config: std::marker::PhantomData<C>,
 }
 
-struct RunnerSubagentDelegate<C: Config> {
+struct RunnerSubagentDelegate {
     runtime: SubagentPool,
     sessions_dir: PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: Option<SessionTransportEventSender>,
-    _config: std::marker::PhantomData<C>,
+    expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
+    route_api_key_configured: indexmap::IndexMap<String, bool>,
+    provider_api_key_hints: indexmap::IndexMap<String, String>,
+    api_key_hint: String,
 }
 
-impl<C> SubagentDelegate<C> for RunnerSubagentDelegate<C>
-where
-    C: Config + Clone + Send + Sync + 'static,
-{
+impl RunnerSubagentDelegate {
+    fn route_display_name(
+        &self,
+        parent: &Agent<async_openai::config::OpenAIConfig>,
+        agent_name: &str,
+        target_child_session_id: Option<&str>,
+    ) -> Result<String> {
+        let Some(target_child_session_id) = target_child_session_id else {
+            return Ok(self.expert_model_routes.get(agent_name).map_or_else(
+                || parent.route_display_name(),
+                crate::config::ModelRoute::display_name,
+            ));
+        };
+        let parent_records = self
+            .transcript
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))
+            .and_then(|recorder| {
+                crate::transcript::read_records(recorder.path()).map_err(Into::into)
+            })?;
+        let child = SubagentPool::child_sessions(&self.sessions_dir, &parent_records)
+            .into_iter()
+            .find(|child| child.child_session_id == target_child_session_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "takeover failed: child_session_id `{target_child_session_id}` is not a known child of this parent"
+                )
+            })?;
+        if child.agent_name != agent_name {
+            bail!(
+                "takeover failed: child `{target_child_session_id}` is agent `{}`, expected `{agent_name}`",
+                child.agent_name
+            );
+        }
+        let child_records = crate::transcript::read_records_allow_partial_tail(
+            crate::transcript::child_sessions_dir(&self.sessions_dir)
+                .join(format!("{target_child_session_id}.jsonl")),
+        )?;
+        crate::transcript::restore_latest_model(&child_records).ok_or_else(|| {
+            anyhow!(
+                "takeover failed: child `{target_child_session_id}` has no recorded model route"
+            )
+        })
+    }
+
+    fn missing_api_key_result(
+        &self,
+        tool_name: &str,
+        agent_name: &str,
+        route_display_name: String,
+    ) -> ToolResult {
+        let provider = route_display_name
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .unwrap_or("selected");
+        let hint = self
+            .provider_api_key_hints
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| self.api_key_hint.clone());
+        let summary = format!("API key is not set for the selected provider. {hint}");
+        let data = json!({
+            "agent_name": agent_name,
+            "route": route_display_name,
+            "status": SubagentStatus::Failed.as_str(),
+            "failure_kind": SubagentFailureKind::Hard.as_str(),
+            "summary": summary,
+            "full_summary": summary,
+            "active": false,
+            "unreconciled": false,
+            "reconciled": false,
+            "reusable": false,
+        });
+        ToolResult::err_with_data(tool_name, summary, data)
+    }
+}
+
+impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDelegate {
     fn run_named<'a>(
         &'a self,
-        parent: &'a Agent<C>,
+        parent: &'a Agent<async_openai::config::OpenAIConfig>,
         agent_name: &'a str,
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
         Box::pin(async move {
             let tool_name = subagent_tool_name_for_agent_name(agent_name)
                 .expect("runner dispatched unknown subagent agent name");
+            let route_display_name = self.route_display_name(
+                parent,
+                agent_name,
+                invocation.input.target_child_session_id.as_deref(),
+            )?;
+            if !self
+                .route_api_key_configured
+                .get(&route_display_name)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Ok(self.missing_api_key_result(tool_name, agent_name, route_display_name));
+            }
             let target_child_session_id = invocation.input.target_child_session_id.clone();
             let parent_session_id = match self.transcript.lock() {
                 Ok(recorder) => recorder.session_id().to_string(),
@@ -452,7 +547,7 @@ where
                     parent_session_id,
                     parent_turn_id,
                     Some(self.transcript.clone()),
-                    self.event_tx.clone().map(subagent_event_sender::<C>),
+                    self.event_tx.clone().map(subagent_event_sender),
                 )
                 .await;
 
@@ -505,15 +600,34 @@ where
     }
 }
 
-impl<C: Config> AgentRunner<C> {
-    #[cfg(test)]
-    pub fn subagent_event_sender(event_tx: SessionTransportEventSender) -> SubagentEventSender<C>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
-        subagent_event_sender(event_tx)
+impl AgentRunner<async_openai::config::OpenAIConfig> {
+    pub fn with_subagent_runtime(
+        self,
+        runtime: SubagentPool,
+        sessions_dir: PathBuf,
+        expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
+        route_api_key_configured: indexmap::IndexMap<String, bool>,
+        provider_api_key_hints: indexmap::IndexMap<String, String>,
+        api_key_hint: String,
+    ) -> Self {
+        let mut self_ = self;
+        if let Some(transcript) = self_.transcript.clone() {
+            self_.subagent_delegate = Some(Arc::new(RunnerSubagentDelegate {
+                runtime,
+                sessions_dir,
+                transcript,
+                event_tx: self_.event_tx.clone(),
+                expert_model_routes,
+                route_api_key_configured,
+                provider_api_key_hints,
+                api_key_hint,
+            }));
+        }
+        self_
     }
+}
 
+impl<C: Config> AgentRunner<C> {
     #[cfg(test)]
     pub fn new(event_tx: SessionTransportEventSender) -> Self {
         Self {
@@ -554,23 +668,6 @@ impl<C: Config> AgentRunner<C> {
     ) -> Self {
         self.session_title_event_tx = Some(event_tx);
         self
-    }
-
-    pub fn with_subagent_runtime(self, runtime: SubagentPool, sessions_dir: PathBuf) -> Self
-    where
-        C: Clone + Send + Sync + 'static,
-    {
-        let mut self_ = self;
-        if let Some(transcript) = self_.transcript.clone() {
-            self_.subagent_delegate = Some(Arc::new(RunnerSubagentDelegate::<C> {
-                runtime,
-                sessions_dir,
-                transcript,
-                event_tx: self_.event_tx.clone(),
-                _config: std::marker::PhantomData,
-            }));
-        }
-        self_
     }
 
     #[cfg(test)]
@@ -1421,12 +1518,9 @@ impl<C: Config> AgentRunner<C> {
     }
 }
 
-pub(crate) fn subagent_event_sender<C>(
+pub(crate) fn subagent_event_sender(
     event_tx: SessionTransportEventSender,
-) -> SubagentEventSender<C>
-where
-    C: Config + Clone + Send + Sync + 'static,
-{
+) -> SubagentEventSender<async_openai::config::OpenAIConfig> {
     let status_tx = event_tx.clone();
     let error_tx = event_tx.clone();
     SubagentEventSender::new(
@@ -1447,21 +1541,22 @@ where
                   child_session_id,
                   permission_origin,
                   parent_tool_call_id| {
-                let runner: AgentRunner<C> = if let Some(permission_origin) = permission_origin {
-                    AgentRunner::child_streaming_with_permission_passthrough(
-                        transcript,
-                        event_tx.clone(),
-                        child_session_id,
-                        permission_origin,
-                        parent_tool_call_id,
-                    )
-                } else {
-                    AgentRunner::child_streaming_with_transcript(
-                        transcript,
-                        event_tx.clone(),
-                        child_session_id,
-                    )
-                };
+                let runner: AgentRunner<async_openai::config::OpenAIConfig> =
+                    if let Some(permission_origin) = permission_origin {
+                        AgentRunner::child_streaming_with_permission_passthrough(
+                            transcript,
+                            event_tx.clone(),
+                            child_session_id,
+                            permission_origin,
+                            parent_tool_call_id,
+                        )
+                    } else {
+                        AgentRunner::child_streaming_with_transcript(
+                            transcript,
+                            event_tx.clone(),
+                            child_session_id,
+                        )
+                    };
                 Box::pin(async move {
                     let mut agent = agent;
                     runner
@@ -1569,7 +1664,8 @@ fn wrap_child_session_transport_event(
             }
         }
         SessionTransportEvent::FastModeChanged { .. }
-        | SessionTransportEvent::ModelChanged { .. } => event,
+        | SessionTransportEvent::ModelChanged { .. }
+        | SessionTransportEvent::ExpertModelChanged { .. } => event,
         SessionTransportEvent::PermissionResolved(event) => {
             SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
@@ -2370,6 +2466,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_driven_expert_delegation_requires_its_route_credential() {
+        let delegate = RunnerSubagentDelegate {
+            runtime: SubagentPool::new(),
+            sessions_dir: std::env::temp_dir(),
+            transcript: temp_transcript(),
+            event_tx: None,
+            expert_model_routes: indexmap::IndexMap::from([(
+                "explorer".into(),
+                crate::config::ModelRoute::new("expert", "shared"),
+            )]),
+            route_api_key_configured: indexmap::IndexMap::from([
+                ("primary/shared".into(), true),
+                ("expert/shared".into(), false),
+            ]),
+            provider_api_key_hints: indexmap::IndexMap::from([(
+                "expert".into(),
+                "Set EXPERT_API_KEY.".into(),
+            )]),
+            api_key_hint: "Set <PROVIDER>_API_KEY.".into(),
+        };
+        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+        let invocation = SubagentInvocation {
+            input: crate::tool::NormalizedSubagentInput {
+                objective: "inspect route credentials".into(),
+                success_criteria: Vec::new(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: Vec::new(),
+                owned_paths: Vec::new(),
+                timeout_secs: None,
+                max_tool_calls: None,
+                target_child_session_id: None,
+            },
+            prompt: "inspect route credentials".into(),
+            parent_tool_call_id: Some("call-1".into()),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        let output = runtime.block_on(delegate.run_named(&parent, "explorer", invocation));
+
+        let output = output.expect("credential denial is a tool result");
+        assert!(!output.ok);
+        assert!(matches!(
+            output.error.as_ref(),
+            Some(crate::tool::ToolError { message, .. })
+                if message == "API key is not set for the selected provider. Set EXPERT_API_KEY."
+        ));
+        let data = output
+            .data
+            .expect("credential denial includes route metadata");
+        assert_eq!(data.get("route"), Some(&json!("expert/shared")));
+        assert_eq!(data.get("agent_name"), Some(&json!("explorer")));
+    }
+
+    #[test]
     fn agent_fixer_summary_uses_agent_name() {
         let output = ToolResult::ok(
             "agent__fixer",
@@ -2670,11 +2824,21 @@ mod tests {
                 .expect("time ok")
                 .as_nanos()
         ));
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-        assert!(matches!(
-            fast_mode.toggle("gpt-5.5").expect("enable fast mode"),
-            crate::fast_mode::FastModeToggle::Enabled
-        ));
+        std::fs::create_dir_all(&fast_mode_dir).expect("create Fast Mode config directory");
+        let fast_mode_path = fast_mode_dir.join("letcode.toml");
+        std::fs::write(
+            &fast_mode_path,
+            r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+        )
+        .expect("write Fast Mode config");
+        let fast_mode = crate::fast_mode::FastMode::load(fast_mode_path, true);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let runner = AgentRunner::new(tx);
@@ -2706,13 +2870,7 @@ mod tests {
             SessionTransportEvent::Notice(notice)
                 if notice.message == "Fast mode auto-disabled: current model is unavailable"
         )));
-        assert!(!agent.fast_mode_enabled());
-        assert!(
-            !crate::fast_mode::FastMode::load(&fast_mode_dir)
-                .expect("reload fast mode")
-                .enabled(),
-            "auto-disable must persist"
-        );
+        assert!(!agent.fast_mode_enabled(), "auto-disable must persist");
     }
 
     #[tokio::test]

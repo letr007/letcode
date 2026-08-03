@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use async_openai::config::Config;
 
 use crate::agent::Agent;
+use crate::config::ModelRoute;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::transcript::TranscriptRecorder;
@@ -23,6 +24,13 @@ pub struct ModelApplyError {
 }
 
 impl ModelApplyError {
+    pub(crate) fn new(error: anyhow::Error, fast_mode_auto_disabled: bool) -> Self {
+        Self {
+            error,
+            fast_mode_auto_disabled,
+        }
+    }
+
     pub fn fast_mode_auto_disabled(&self) -> bool {
         self.fast_mode_auto_disabled
     }
@@ -57,38 +65,76 @@ pub fn apply_permission_mode<C: Config>(
     Ok(())
 }
 
-/// Apply a model id and record provenance when it changes.
-///
-/// Callers that gate against a provider catalog should validate before this.
-pub fn apply_model<C: Config>(
-    agent: &mut Agent<C>,
+pub(crate) fn apply_model_route_with(
+    agent: &mut Agent<async_openai::config::OpenAIConfig>,
     transcript: &Arc<Mutex<TranscriptRecorder>>,
-    model: impl Into<String>,
+    route: ModelRoute,
+    prepared_route: crate::agent::PreparedPrimaryRoute<async_openai::config::OpenAIConfig>,
 ) -> std::result::Result<bool, ModelApplyError> {
-    let model = model.into();
-    let previous = agent.model().to_string();
-    let fast_mode_auto_disabled =
-        agent
-            .auto_disable_fast_mode_for_model(&model)
-            .map_err(|error| ModelApplyError {
-                error,
-                fast_mode_auto_disabled: false,
-            })?;
-    if previous != model {
+    let previous_route = agent.route_display_name();
+    let new_route = route.display_name();
+    let route_changed = previous_route != new_route;
+    let fast_mode_auto_disabled = agent
+        .auto_disable_fast_mode_for_model(&route.model)
+        .map_err(|error| ModelApplyError::new(error, false))?;
+
+    if route_changed {
         transcript
             .lock()
-            .map_err(|_| ModelApplyError {
-                error: anyhow!("transcript recorder poisoned"),
-                fast_mode_auto_disabled,
+            .map_err(|_| {
+                ModelApplyError::new(
+                    anyhow!("transcript recorder poisoned"),
+                    fast_mode_auto_disabled,
+                )
             })?
-            .record_model_changed(previous, model.clone())
-            .map_err(|error| ModelApplyError {
-                error,
-                fast_mode_auto_disabled,
-            })?;
+            .record_model_changed(previous_route, new_route)
+            .map_err(|error| ModelApplyError::new(error, fast_mode_auto_disabled))?;
     }
-    agent.set_model(model);
+
+    agent.apply_prepared_route(prepared_route);
     Ok(fast_mode_auto_disabled)
+}
+
+/// Persist a primary-route selection before installing it. If the live route
+/// cannot be applied afterwards, restore the previous persisted selection.
+pub(crate) fn persist_and_apply_model_route_with(
+    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    transcript: &Arc<Mutex<TranscriptRecorder>>,
+    route: ModelRoute,
+    prepared_route: crate::agent::PreparedPrimaryRoute<async_openai::config::OpenAIConfig>,
+    mut persist: impl FnMut(&ModelRoute) -> Result<()>,
+) -> std::result::Result<bool, ModelApplyError> {
+    let previous_route = agent.primary_route().cloned().ok_or_else(|| {
+        ModelApplyError::new(anyhow!("current primary route is unavailable"), false)
+    })?;
+    let route_changed = previous_route != route;
+
+    persist(&route).map_err(|error| {
+        ModelApplyError::new(
+            anyhow!(
+                "failed to persist model route '{}': {error}",
+                route.display_name()
+            ),
+            false,
+        )
+    })?;
+
+    match apply_model_route_with(agent, transcript, route, prepared_route) {
+        Ok(fast_mode_auto_disabled) => Ok(fast_mode_auto_disabled),
+        Err(error) if !route_changed => Err(error),
+        Err(error) => {
+            if let Err(rollback_error) = persist(&previous_route) {
+                return Err(ModelApplyError::new(
+                    anyhow!(
+                        "failed to apply model route after persisting it: {error}; failed to restore persisted route '{}': {rollback_error}",
+                        previous_route.display_name()
+                    ),
+                    error.fast_mode_auto_disabled(),
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Apply reasoning effort. No transcript provenance event today.
@@ -123,12 +169,46 @@ mod tests {
         let config = OpenAIConfig::new()
             .with_api_base("http://127.0.0.1:9/v1")
             .with_api_key("test-key");
-        let client = Client::with_config(config);
-        Agent::new(client, "gpt-5.5", 1, 1)
+        Agent::new(Client::with_config(config), "gpt-5.5", 1, 1)
+    }
+
+    fn configured_agent(fast_mode_path: &std::path::Path) -> Agent<OpenAIConfig> {
+        std::fs::write(
+            fast_mode_path,
+            r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+        )
+        .expect("write Fast Mode config");
+        let mut agent = test_agent();
+        agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
+        let fast_mode = crate::fast_mode::FastMode::load(fast_mode_path, true);
+        agent.set_fast_mode(fast_mode);
+        agent
+    }
+
+    fn prepared_route(route: ModelRoute) -> crate::agent::PreparedPrimaryRoute<OpenAIConfig> {
+        crate::agent::PreparedPrimaryRoute::new(
+            Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base("http://127.0.0.1:9/v1")
+                    .with_api_key("expert-key"),
+            ),
+            route,
+            crate::config::ApiProtocol::Responses,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            crate::config::RetryConfig::default(),
+        )
     }
 
     #[test]
-    fn model_recording_failure_leaves_model_and_fast_mode_unchanged() {
+    fn model_route_apply_failure_restores_the_persisted_route() {
         let (_base_dir, transcript, _session_id) = temp_transcript();
         let cloned = Arc::clone(&transcript);
         let join = std::thread::spawn(move || {
@@ -137,51 +217,95 @@ mod tests {
         });
         let _ = join.join();
         let mut agent = test_agent();
-        let fast_mode_dir = std::env::temp_dir().join(format!(
-            "letcode-session-settings-fast-mode-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-        fast_mode.toggle(agent.model()).expect("enable fast mode");
-        agent.set_fast_mode(fast_mode);
+        let previous_route = ModelRoute::new("primary", "gpt-5.5");
+        let selected_route = ModelRoute::new("expert", "claude-4");
+        agent.set_primary_route(previous_route.clone());
+        let mut persisted_routes = Vec::new();
 
-        let error = apply_model(&mut agent, &transcript, "claude-4")
-            .expect_err("poisoned transcript must fail");
-        assert!(error.fast_mode_auto_disabled());
+        let error = persist_and_apply_model_route_with(
+            &mut agent,
+            &transcript,
+            selected_route.clone(),
+            prepared_route(selected_route.clone()),
+            |route| {
+                persisted_routes.push(route.clone());
+                Ok(())
+            },
+        )
+        .expect_err("poisoned transcript must prevent route application");
+
+        assert!(!error.fast_mode_auto_disabled());
+        assert_eq!(persisted_routes, [selected_route, previous_route]);
         assert_eq!(agent.model(), "gpt-5.5");
-        assert!(!agent.fast_mode_enabled());
-        assert!(
-            !crate::fast_mode::FastMode::load(&fast_mode_dir)
-                .expect("reload fast mode")
-                .enabled()
+        assert_eq!(
+            agent.primary_route(),
+            Some(&ModelRoute::new("primary", "gpt-5.5"))
         );
     }
 
     #[test]
-    fn fast_mode_persistence_failure_prevents_model_provenance() {
-        let (base_dir, transcript, session_id) = temp_transcript();
+    fn model_route_persistence_failure_leaves_live_agent_unchanged() {
+        let (_base_dir, transcript, _session_id) = temp_transcript();
+        let cloned = Arc::clone(&transcript);
+        let join = std::thread::spawn(move || {
+            let _guard = cloned.lock().expect("lock transcript");
+            panic!("poison transcript mutex for test");
+        });
+        let _ = join.join();
         let mut agent = test_agent();
-        let fast_mode_dir = std::env::temp_dir().join(format!(
-            "letcode-session-settings-fast-mode-write-failure-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
-        fast_mode.toggle(agent.model()).expect("enable fast mode");
-        std::fs::remove_dir_all(&fast_mode_dir).expect("remove fast mode directory");
-        std::fs::write(&fast_mode_dir, "blocking file").expect("block persistence");
-        agent.set_fast_mode(fast_mode);
+        agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
 
-        let error = apply_model(&mut agent, &transcript, "claude-4")
-            .expect_err("fast mode persistence must fail");
+        let prepared_route = crate::agent::PreparedPrimaryRoute::new(
+            Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base("http://127.0.0.1:9/v1")
+                    .with_api_key("expert-key"),
+            ),
+            ModelRoute::new("expert", "claude-4"),
+            crate::config::ApiProtocol::Responses,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            crate::config::RetryConfig::default(),
+        );
+        let error = apply_model_route_with(
+            &mut agent,
+            &transcript,
+            ModelRoute::new("expert", "claude-4"),
+            prepared_route,
+        )
+        .expect_err("poisoned transcript must fail before applying the route");
+
         assert!(!error.fast_mode_auto_disabled());
         assert_eq!(agent.model(), "gpt-5.5");
-        assert!(agent.fast_mode_enabled());
+        assert_eq!(
+            agent.primary_route(),
+            Some(&ModelRoute::new("primary", "gpt-5.5"))
+        );
+    }
+
+    #[test]
+    fn model_route_fast_mode_failure_prevents_transcript_provenance_and_route_apply() {
+        let (base_dir, transcript, session_id) = temp_transcript();
+        let fast_mode_path = base_dir.join("letcode.toml");
+        std::fs::write(&fast_mode_path, "not a config file").expect("block Fast Mode persistence");
+        let mut agent = test_agent();
+        agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
+        agent.set_fast_mode(crate::fast_mode::FastMode::load(&fast_mode_path, true));
+
+        let error = apply_model_route_with(
+            &mut agent,
+            &transcript,
+            ModelRoute::new("expert", "claude-4"),
+            prepared_route(ModelRoute::new("expert", "claude-4")),
+        )
+        .expect_err("fast mode persistence must fail before transcript provenance");
+
+        assert!(!error.fast_mode_auto_disabled());
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert_eq!(
+            agent.primary_route(),
+            Some(&ModelRoute::new("primary", "gpt-5.5"))
+        );
         assert!(
             crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
                 .expect("read records")
@@ -190,24 +314,53 @@ mod tests {
     }
 
     #[test]
-    fn apply_settings_records_provenance_only_on_change() {
+    fn model_route_transcript_failure_follows_fast_mode_reconciliation_without_route_apply() {
+        let (base_dir, transcript, session_id) = temp_transcript();
+        let fast_mode_path = base_dir.join("letcode.toml");
+        let mut agent = configured_agent(&fast_mode_path);
+        let cloned = Arc::clone(&transcript);
+        let join = std::thread::spawn(move || {
+            let _guard = cloned.lock().expect("lock transcript");
+            panic!("poison transcript mutex for test");
+        });
+        let _ = join.join();
+
+        let error = apply_model_route_with(
+            &mut agent,
+            &transcript,
+            ModelRoute::new("expert", "claude-4"),
+            prepared_route(ModelRoute::new("expert", "claude-4")),
+        )
+        .expect_err("transcript failure must prevent route application");
+
+        assert!(error.fast_mode_auto_disabled());
+        assert!(!agent.fast_mode_enabled());
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert_eq!(
+            agent.primary_route(),
+            Some(&ModelRoute::new("primary", "gpt-5.5"))
+        );
+        assert!(
+            crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
+                .expect("read records")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn apply_permission_mode_records_provenance_only_on_change() {
         let (base_dir, transcript, session_id) = temp_transcript();
         let mut agent = test_agent();
 
         apply_permission_mode(&mut agent, &transcript, PermissionMode::Safe).expect("permission");
         apply_permission_mode(&mut agent, &transcript, PermissionMode::Safe).expect("idempotent");
-        apply_model(&mut agent, &transcript, "gpt-5.5-mini").expect("model");
-        apply_model(&mut agent, &transcript, "gpt-5.5-mini").expect("idempotent model");
 
         assert_eq!(agent.permission_mode(), PermissionMode::Safe);
-        assert_eq!(agent.model(), "gpt-5.5-mini");
 
         let records = crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
             .expect("read records");
-        assert_eq!(records.len(), 2);
-        let first = serde_json::to_value(&records[0]).expect("serialize");
-        assert_eq!(first.get("kind"), Some(&json!("permission_mode_changed")));
-        let second = serde_json::to_value(&records[1]).expect("serialize");
-        assert_eq!(second.get("kind"), Some(&json!("model_changed")));
+        assert_eq!(records.len(), 1);
+        let record = serde_json::to_value(&records[0]).expect("serialize");
+        assert_eq!(record.get("kind"), Some(&json!("permission_mode_changed")));
     }
 }

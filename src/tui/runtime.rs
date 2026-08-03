@@ -193,6 +193,7 @@ struct AssistantDeltaBuffer {
 pub struct AvailableModel {
     pub id: String,
     pub label: String,
+    pub provider: String,
     pub context_window_tokens: Option<u64>,
     pub reasoning_effort: Option<ModelReasoningEffort>,
     pub reasoning_efforts: Vec<ModelReasoningEffort>,
@@ -201,8 +202,10 @@ pub struct AvailableModel {
 impl AvailableModel {
     #[cfg(test)]
     pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
+            provider: model_provider(&id),
+            id,
             label: label.into(),
             context_window_tokens: None,
             reasoning_effort: None,
@@ -216,8 +219,10 @@ impl AvailableModel {
         label: impl Into<String>,
         context_window_tokens: Option<u64>,
     ) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
+            provider: model_provider(&id),
+            id,
             label: label.into(),
             context_window_tokens,
             reasoning_effort: None,
@@ -232,14 +237,29 @@ impl AvailableModel {
         reasoning_effort: Option<ModelReasoningEffort>,
         reasoning_efforts: Vec<ModelReasoningEffort>,
     ) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
+            provider: model_provider(&id),
+            id,
             label: label.into(),
             context_window_tokens,
             reasoning_effort,
             reasoning_efforts,
         }
     }
+}
+
+fn model_provider(model_id: &str) -> String {
+    model_id
+        .split_once('/')
+        .map(|(provider, _)| provider.to_string())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableExpert {
+    pub agent_name: String,
+    pub route_id: String,
 }
 
 /// Compatibility alias: session commands are owned by the backend boundary.
@@ -316,6 +336,7 @@ pub struct TuiRuntime {
     history_selection: Option<usize>,
     history_draft: Option<ComposerDraft>,
     available_models: Vec<AvailableModel>,
+    available_experts: Vec<AvailableExpert>,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
     assistant_delta_buffer: Option<AssistantDeltaBuffer>,
@@ -329,6 +350,7 @@ impl TuiRuntime {
         state: TuiState,
         session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
         available_models: Vec<AvailableModel>,
+        available_experts: Vec<AvailableExpert>,
         sessions_dir: PathBuf,
         preferences_dir: PathBuf,
     ) -> Self {
@@ -348,6 +370,7 @@ impl TuiRuntime {
             history_selection: None,
             history_draft: None,
             available_models,
+            available_experts,
             sessions_dir,
             preferences_dir,
             assistant_delta_buffer: None,
@@ -849,7 +872,21 @@ impl TuiRuntime {
             }
             SessionTransportEvent::ModelChanged { model_id } => {
                 self.apply_restored_model(model_id.clone());
+                self.state.set_provider_label_from_model_route(model_id);
                 self.show_toast("Model updated", ToastKind::Success);
+            }
+            SessionTransportEvent::ExpertModelChanged {
+                agent_name,
+                model_id,
+            } => {
+                if let Some(expert) = self
+                    .available_experts
+                    .iter_mut()
+                    .find(|expert| expert.agent_name == *agent_name)
+                {
+                    expert.route_id = model_id.clone();
+                }
+                self.show_toast(format!("{agent_name} model updated"), ToastKind::Success);
             }
             SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
@@ -962,6 +999,7 @@ impl TuiRuntime {
                 self.state.timeline.remove_queued_user_message_previews();
                 if let Some(model_id) = model_id {
                     self.apply_restored_model(model_id.clone());
+                    self.state.set_provider_label_from_model_route(model_id);
                 }
                 self.state.set_current_context_branch(branch_id.clone());
                 if let Some(token_usage) = token_usage {
@@ -1417,6 +1455,20 @@ impl TuiRuntime {
                     self.show_mcp_dialog_with_state(query, selected_server);
                     return Ok(None);
                 }
+                if let Some((query, selected_agent)) = self
+                    .state
+                    .dialog()
+                    .filter(|dialog| matches!(dialog.kind, DialogKind::ExpertModelPicker(_)))
+                    .map(|dialog| {
+                        (
+                            dialog.expert_primary_query.clone().unwrap_or_default(),
+                            dialog.expert_primary_selected_agent.clone(),
+                        )
+                    })
+                {
+                    self.show_agents_dialog_with_state(query, selected_agent);
+                    return Ok(None);
+                }
                 let detail_focused = self.state.dialog().is_some_and(|dialog| {
                     dialog.kind == DialogKind::ContextPicker && dialog.detail_focused
                 });
@@ -1804,6 +1856,7 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::ModelShow => self.show_model_dialog(),
+            CommandIntent::AgentsShow => self.show_agents_dialog(),
             CommandIntent::ReasoningShow => self.show_reasoning_dialog(),
             CommandIntent::PermissionShow => self.show_permission_dialog(),
             CommandIntent::ToolOutputSet(mode) => self.handle_tool_output_command(mode),
@@ -1842,6 +1895,15 @@ impl TuiRuntime {
         match command {
             SessionCommand::SubmitPrompt(_) => Ok(None),
             SessionCommand::SetModel(model_id) => self.handle_model_selection(model_id),
+            SessionCommand::SetExpertModel {
+                agent_name,
+                model_id,
+            } => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::SetExpertModel {
+                    agent_name,
+                    model_id,
+                },
+            ))),
             SessionCommand::ToggleFastMode => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleFastMode,
             ))),
@@ -2070,9 +2132,8 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn show_model_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
-        let items = self
-            .available_models
+    fn model_dialog_items(&self) -> Vec<DialogItem> {
+        self.available_models
             .iter()
             .map(|model| {
                 DialogItem::new(
@@ -2080,8 +2141,13 @@ impl TuiRuntime {
                     model.label.clone(),
                     Some(model.id.clone()),
                 )
+                .with_section(model.provider.clone())
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn show_model_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let items = self.model_dialog_items();
         let mut dialog = DialogState::new(DialogKind::ModelPicker, "Select model", None, items);
         if let Some(index) = self
             .available_models
@@ -2092,6 +2158,70 @@ impl TuiRuntime {
         }
         self.state.open_dialog(dialog);
         Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn show_agents_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        self.show_agents_dialog_with_state(String::new(), None);
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn show_agents_dialog_with_state(&mut self, query: String, selected_agent: Option<String>) {
+        let items = self
+            .available_experts
+            .iter()
+            .map(|expert| {
+                DialogItem::new(
+                    expert.agent_name.clone(),
+                    expert.agent_name.clone(),
+                    Some(expert.route_id.clone()),
+                )
+                .with_section("Experts")
+            })
+            .collect();
+        let mut dialog = DialogState::new(DialogKind::AgentPicker, "Expert models", None, items);
+        dialog.query = query;
+        if let Some(agent_name) = selected_agent
+            && let Some(index) = dialog.items.iter().position(|item| item.id == agent_name)
+        {
+            dialog.selected = index;
+        }
+        self.state.open_dialog(dialog);
+    }
+
+    fn show_expert_model_dialog(&mut self, agent_name: String) {
+        let (primary_query, primary_selected_agent) = self
+            .state
+            .dialog()
+            .filter(|dialog| dialog.kind == DialogKind::AgentPicker)
+            .map(|dialog| {
+                (
+                    dialog.query.clone(),
+                    dialog.selected_item().map(|item| item.id.clone()),
+                )
+            })
+            .unwrap_or_default();
+        let current_route = self
+            .available_experts
+            .iter()
+            .find(|expert| expert.agent_name == agent_name)
+            .map(|expert| expert.route_id.clone())
+            .unwrap_or_else(|| self.state.model_id.clone());
+        let mut dialog = DialogState::new(
+            DialogKind::ExpertModelPicker(agent_name),
+            "Select expert model",
+            None,
+            self.model_dialog_items(),
+        );
+        dialog.expert_primary_query = Some(primary_query);
+        dialog.expert_primary_selected_agent = primary_selected_agent;
+        if let Some(index) = dialog
+            .items
+            .iter()
+            .position(|item| item.id == current_route)
+        {
+            dialog.selected = index;
+        }
+        self.state.open_dialog(dialog);
     }
 
     fn apply_restored_model(&mut self, model_id: String) {
@@ -2368,28 +2498,18 @@ impl TuiRuntime {
         match kind {
             DialogKind::ModelPicker => {
                 self.state.close_dialog();
-                self.state
-                    .set_model(selected.id.clone(), selected.label.clone());
-                let context_window_tokens = self
-                    .available_models
-                    .iter()
-                    .find(|model| model.id == selected.id)
-                    .and_then(|model| model.context_window_tokens);
-                self.state.set_model_context_window(context_window_tokens);
-                let reasoning_effort = self
-                    .available_models
-                    .iter()
-                    .find(|model| model.id == selected.id)
-                    .and_then(|model| model.reasoning_effort.clone());
-                self.state
-                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(
-                        reasoning_effort,
-                    )));
-                self.show_toast(
-                    format!("Model updated · {}", selected.label),
-                    ToastKind::Success,
-                );
                 Ok(Some(RuntimeCommand::SetModel(selected.id)))
+            }
+            DialogKind::AgentPicker => {
+                self.show_expert_model_dialog(selected.id);
+                Ok(None)
+            }
+            DialogKind::ExpertModelPicker(agent_name) => {
+                self.state.close_dialog();
+                Ok(Some(RuntimeCommand::SetExpertModel {
+                    agent_name,
+                    model_id: selected.id,
+                }))
             }
             DialogKind::PermissionPicker => {
                 self.state.close_dialog();
@@ -3228,6 +3348,7 @@ pub async fn run_tui(
     preferences_dir: PathBuf,
     provider_label: String,
     available_models: Vec<AvailableModel>,
+    available_experts: Vec<AvailableExpert>,
     startup_toast: Option<StartupToast>,
     skill_cards: Vec<SkillCard>,
 ) -> Result<()> {
@@ -3269,6 +3390,7 @@ pub async fn run_tui(
             state,
             session_transport_rx,
             available_models,
+            available_experts,
             sessions_dir,
             preferences_dir,
         );
@@ -3405,9 +3527,9 @@ mod tests {
         select_active_session_operation, select_manual_compaction_operation,
         send_subagent_interrupted, wait_for_subagent_cancel_settle,
     };
+    use crate::session::restore::restored_session_token_usage;
     use crate::session::{
         PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
-        restored_session_token_usage,
     };
     use crate::subagent::SubagentPool;
     use crate::transcript::sync_recorder_branch;
@@ -3579,6 +3701,7 @@ mod tests {
                     ModelReasoningEffort::Xhigh,
                 ],
             )],
+            Vec::new(),
             std::env::temp_dir(),
             base,
         )
@@ -4524,8 +4647,14 @@ mod tests {
         state.session_id = Some(initial_session_id);
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut runtime =
-            TuiRuntime::new(state, rx, Vec::new(), sessions_dir, std::env::temp_dir());
+        let mut runtime = TuiRuntime::new(
+            state,
+            rx,
+            Vec::new(),
+            Vec::new(),
+            sessions_dir,
+            std::env::temp_dir(),
+        );
 
         let path = runtime.sessions_dir.join(format!("{session_id}.jsonl"));
         let records = read_records(&path).expect("records");
@@ -5478,6 +5607,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -5498,6 +5628,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -5531,6 +5662,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -7168,6 +7300,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             sessions_dir.clone(),
             std::env::temp_dir(),
         );
@@ -7790,6 +7923,7 @@ mod tests {
                     ModelReasoningEffort::Max,
                 ],
             )],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -7860,6 +7994,7 @@ mod tests {
                 None,
                 Vec::new(),
             )],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -7902,6 +8037,7 @@ mod tests {
             TuiState::new("gpt-5.5", "GPT-5.5", "default"),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -7942,6 +8078,44 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_acceptance_emits_command_without_mutating_state() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("primary/shared", "Primary Shared", "default"),
+            rx,
+            vec![
+                AvailableModel::new("primary/shared", "Primary Shared"),
+                AvailableModel::new("expert/shared", "Expert Shared"),
+            ],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().set_provider_label("primary");
+        runtime.show_model_dialog().expect("open model picker");
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("model picker")
+            .selected = 1;
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::DialogAccept)
+                .expect("selection succeeds"),
+            Some(RuntimeCommand::SetModel("expert/shared".into()))
+        );
+        assert_eq!(runtime.state().model_id, "primary/shared");
+        assert_eq!(runtime.state().provider_label, "primary");
+
+        runtime.apply_session_transport_event(SessionTransportEvent::ModelChanged {
+            model_id: "expert/shared".into(),
+        });
+        assert_eq!(runtime.state().model_id, "expert/shared");
+        assert_eq!(runtime.state().provider_label, "expert");
+    }
+
+    #[test]
     fn slash_model_emits_command_then_applies_backend_confirmed_model() {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
@@ -7951,6 +8125,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -7976,6 +8151,45 @@ mod tests {
     }
 
     #[test]
+    fn provider_qualified_model_events_update_the_composer_provider_label() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("primary/shared", "Primary Shared", "default"),
+            rx,
+            vec![
+                AvailableModel::new("primary/shared", "Primary Shared"),
+                AvailableModel::new("expert/shared", "Expert Shared"),
+            ],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().set_provider_label("primary");
+
+        runtime.apply_session_transport_event(SessionTransportEvent::ModelChanged {
+            model_id: "expert/shared".into(),
+        });
+
+        assert_eq!(runtime.state().model_id, "expert/shared");
+        assert_eq!(runtime.state().model_label, "Expert Shared");
+        assert_eq!(runtime.state().provider_label, "expert");
+
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
+            session_id: "session-1".into(),
+            branch_id: "root".into(),
+            messages: Vec::new(),
+            records: Vec::new(),
+            evidence_count: 0,
+            model_id: Some("primary/shared".into()),
+            token_usage: None,
+            runtime_context: event_context("session-1", 0),
+        });
+
+        assert_eq!(runtime.state().model_id, "primary/shared");
+        assert_eq!(runtime.state().provider_label, "primary");
+    }
+
+    #[test]
     fn slash_model_without_args_opens_dialog() {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
@@ -7985,6 +8199,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -8000,6 +8215,197 @@ mod tests {
         assert_eq!(dialog.selected, 0);
         assert_eq!(dialog.items.len(), 2);
         assert_eq!(dialog.items[1].label, "GPT-5.5 Mini");
+    }
+
+    #[test]
+    fn slash_agents_opens_expert_picker_and_emits_selection_command() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("primary/default", "Primary", "default"),
+            rx,
+            vec![
+                AvailableModel::new("primary/shared", "Primary Shared"),
+                AvailableModel::new("expert/shared", "Expert Shared"),
+            ],
+            vec![AvailableExpert {
+                agent_name: "explorer".into(),
+                route_id: "expert/shared".into(),
+            }],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().set_input("/agents");
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("agents command succeeds"),
+            None
+        );
+        let dialog = runtime.state().dialog().expect("expert picker open");
+        assert_eq!(dialog.kind, DialogKind::AgentPicker);
+        assert_eq!(dialog.items[0].section.as_deref(), Some("Experts"));
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::DialogAccept)
+                .expect("expert accepts"),
+            None
+        );
+        let dialog = runtime.state().dialog().expect("model picker open");
+        assert_eq!(
+            dialog.kind,
+            DialogKind::ExpertModelPicker("explorer".into())
+        );
+        assert_eq!(dialog.selected, 1);
+        assert_eq!(dialog.items[0].section.as_deref(), Some("primary"));
+        assert_eq!(dialog.items[1].section.as_deref(), Some("expert"));
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::DialogAccept)
+                .expect("model accepts"),
+            Some(RuntimeCommand::SetExpertModel {
+                agent_name: "explorer".into(),
+                model_id: "expert/shared".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn expert_picker_uses_the_resolved_expert_route() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("expert/shared", "Expert Shared", "default"),
+            rx,
+            vec![
+                AvailableModel::new("primary/shared", "Primary Shared"),
+                AvailableModel::new("expert/shared", "Expert Shared"),
+            ],
+            vec![AvailableExpert {
+                agent_name: "explorer".into(),
+                route_id: "expert/shared".into(),
+            }],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runtime.show_agents_dialog().expect("opens expert picker");
+        let dialog = runtime.state().dialog().expect("expert picker open");
+        assert_eq!(dialog.items[0].detail.as_deref(), Some("expert/shared"));
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("opens expert model picker");
+        let dialog = runtime.state().dialog().expect("expert model picker open");
+        assert_eq!(
+            dialog.selected_item().map(|item| item.id.as_str()),
+            Some("expert/shared")
+        );
+    }
+
+    #[test]
+    fn expert_model_picker_cancel_returns_to_expert_picker_with_query_and_selection() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("primary/shared", "Primary Shared")],
+            vec![
+                AvailableExpert {
+                    agent_name: "explorer".into(),
+                    route_id: "primary/shared".into(),
+                },
+                AvailableExpert {
+                    agent_name: "fixer".into(),
+                    route_id: "primary/shared".into(),
+                },
+            ],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.show_agents_dialog().expect("opens expert picker");
+        {
+            let dialog = runtime.state_mut().dialog_mut().expect("expert picker");
+            dialog.query = "fix".into();
+            dialog.selected = 1;
+        }
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("opens expert model picker");
+        assert!(matches!(
+            runtime.state().dialog().map(|dialog| &dialog.kind),
+            Some(DialogKind::ExpertModelPicker(agent_name)) if agent_name == "fixer"
+        ));
+
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("returns to expert picker");
+        let dialog = runtime.state().dialog().expect("expert picker restored");
+        assert_eq!(dialog.kind, DialogKind::AgentPicker);
+        assert_eq!(dialog.query, "fix");
+        assert_eq!(
+            dialog.selected_item().map(|item| item.id.as_str()),
+            Some("fixer")
+        );
+    }
+
+    #[test]
+    fn expert_model_changed_updates_only_the_selected_expert_route() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            Vec::new(),
+            vec![
+                AvailableExpert {
+                    agent_name: "explorer".into(),
+                    route_id: "primary/shared".into(),
+                },
+                AvailableExpert {
+                    agent_name: "fixer".into(),
+                    route_id: "expert/shared".into(),
+                },
+            ],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runtime.apply_session_transport_event(SessionTransportEvent::ExpertModelChanged {
+            agent_name: "explorer".into(),
+            model_id: "expert/shared".into(),
+        });
+
+        assert_eq!(runtime.available_experts[0].route_id, "expert/shared");
+        assert_eq!(runtime.available_experts[1].route_id, "expert/shared");
+    }
+
+    #[test]
+    fn model_picker_groups_provider_qualified_routes() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("primary/shared", "Primary Shared", "default"),
+            rx,
+            vec![
+                AvailableModel::new("primary/shared", "Primary Shared"),
+                AvailableModel::new("expert/shared", "Expert Shared"),
+            ],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().set_input("/model");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("model command succeeds");
+
+        let dialog = runtime.state().dialog().expect("model picker open");
+        assert_eq!(dialog.items[0].id, "primary/shared");
+        assert_eq!(dialog.items[0].section.as_deref(), Some("primary"));
+        assert_eq!(dialog.items[1].id, "expert/shared");
+        assert_eq!(dialog.items[1].section.as_deref(), Some("expert"));
     }
 
     #[test]
@@ -8062,6 +8468,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             sessions_dir,
             std::env::temp_dir(),
         );
@@ -8431,6 +8838,7 @@ mod tests {
                 AvailableModel::with_context_window("gpt-5.5", "GPT-5.5", Some(128_000)),
                 AvailableModel::with_context_window("gpt-5.5-mini", "GPT-5.5 Mini", Some(64_000)),
             ],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -8707,6 +9115,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -8734,8 +9143,8 @@ mod tests {
             Some(RuntimeCommand::SetModel("gpt-5.5-mini".into()))
         );
         assert!(runtime.state().dialog().is_none());
-        assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
-        assert_eq!(runtime.state().model_label, "GPT-5.5 Mini");
+        assert_eq!(runtime.state().model_id, "gpt-5.5");
+        assert_eq!(runtime.state().model_label, "GPT-5.5");
     }
 
     #[test]
@@ -9018,6 +9427,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -9046,6 +9456,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -9500,6 +9911,15 @@ mod tests {
             };
 
             match command {
+                SessionEngineCommand::SetExpertModel {
+                    agent_name,
+                    model_id,
+                } => {
+                    let _ = session_transport_tx.send(SessionTransportEvent::ExpertModelChanged {
+                        agent_name,
+                        model_id,
+                    });
+                }
                 SessionEngineCommand::Compact => {
                     let shutdown = run_manual_compaction(
                         &mut agent,
@@ -9520,9 +9940,20 @@ mod tests {
                             prompt: prompt.clone(),
                         });
                     let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
-                    let runner =
-                        AgentRunner::with_transcript(runner_event_tx, Arc::clone(&transcript))
-                            .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
+                    let route_api_key_configured =
+                        indexmap::IndexMap::from([(agent.route_display_name(), true)]);
+                    let runner = AgentRunner::<OpenAIConfig>::with_transcript(
+                        runner_event_tx,
+                        Arc::clone(&transcript),
+                    )
+                    .with_subagent_runtime(
+                        subagent_runtime.clone(),
+                        sessions_dir.clone(),
+                        indexmap::IndexMap::new(),
+                        route_api_key_configured,
+                        indexmap::IndexMap::new(),
+                        String::new(),
+                    );
                     let (interrupted, shutdown) = {
                         let run = runner.run_prompt(&mut agent, prompt);
                         tokio::pin!(run);
@@ -9627,7 +10058,7 @@ mod tests {
                             parent_session_id,
                             "runner-harness".into(),
                             Some(Arc::clone(&transcript)),
-                            Some(crate::session::subagent_event_sender::<OpenAIConfig>(
+                            Some(crate::session::subagent_event_sender(
                                 session_transport_tx.clone(),
                             )),
                         );
@@ -9636,59 +10067,49 @@ mod tests {
                         let mut child_started = false;
                         let mut interrupted_child_session_id = None;
                         let mut shutdown = false;
-                        loop {
-                            match select_active_session_operation(
-                                &mut control_rx,
-                                &mut deferred_commands,
-                                delegate.as_mut(),
-                            )
-                            .await
-                            {
-                                outcome @ (ActiveSessionOperation::Interrupted
-                                | ActiveSessionOperation::Shutdown) => {
-                                    shutdown = matches!(outcome, ActiveSessionOperation::Shutdown);
-                                    let interrupt =
-                                        derive_interrupt_request(&transcript, &subagent_runtime);
-                                    child_started = subagent_runtime.is_running();
-                                    interrupted = true;
-                                    interrupted_child_session_id =
-                                        interrupt.visible_child_session_id.clone();
-                                    if child_started {
-                                        subagent_runtime.cancel_active();
-                                    }
-                                    record_interrupt_transcript(&transcript, &interrupt);
-                                    if child_started {
-                                        let _ = delegate.await;
-                                    }
-                                    break;
+                        match select_active_session_operation(
+                            &mut control_rx,
+                            &mut deferred_commands,
+                            delegate.as_mut(),
+                        )
+                        .await
+                        {
+                            outcome @ (ActiveSessionOperation::Interrupted
+                            | ActiveSessionOperation::Shutdown) => {
+                                shutdown = matches!(outcome, ActiveSessionOperation::Shutdown);
+                                let interrupt =
+                                    derive_interrupt_request(&transcript, &subagent_runtime);
+                                child_started = subagent_runtime.is_running();
+                                interrupted = true;
+                                interrupted_child_session_id =
+                                    interrupt.visible_child_session_id.clone();
+                                if child_started {
+                                    subagent_runtime.cancel_active();
                                 }
-                                ActiveSessionOperation::Completed(result) => {
-                                    match result {
-                                        Ok(_) => {
-                                            let _ = session_transport_tx
-                                                .send(SessionTransportEvent::Done);
-                                        }
-                                        Err(error) => {
-                                            let _ = session_transport_tx.send(
-                                                SessionTransportEvent::Error(ErrorEvent::new(
-                                                    format!("{error:#}"),
-                                                )),
-                                            );
-                                            let _ = session_transport_tx
-                                                .send(SessionTransportEvent::Done);
-                                        }
-                                    }
-                                    break;
+                                record_interrupt_transcript(&transcript, &interrupt);
+                                if child_started {
+                                    let _ = delegate.await;
                                 }
-                                ActiveSessionOperation::RunnerEvent(_) => {
-                                    unreachable!("event-aware selection is not used for delegates")
-                                }
-                                ActiveSessionOperation::Command(Some(command)) => {
-                                    deferred_commands.push_front(command);
-                                    break;
-                                }
-                                ActiveSessionOperation::Command(None) => break,
                             }
+                            ActiveSessionOperation::Completed(result) => match result {
+                                Ok(_) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                }
+                                Err(error) => {
+                                    let _ =
+                                        session_transport_tx.send(SessionTransportEvent::Error(
+                                            ErrorEvent::new(format!("{error:#}")),
+                                        ));
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                }
+                            },
+                            ActiveSessionOperation::RunnerEvent(_) => {
+                                unreachable!("event-aware selection is not used for delegates")
+                            }
+                            ActiveSessionOperation::Command(Some(command)) => {
+                                deferred_commands.push_front(command);
+                            }
+                            ActiveSessionOperation::Command(None) => {}
                         }
                         (
                             interrupted,
@@ -9710,9 +10131,6 @@ mod tests {
                         deferred_commands.clear();
                         break;
                     }
-                }
-                SessionEngineCommand::SetModel(model) => {
-                    agent.set_model(model);
                 }
                 #[cfg(test)]
                 SessionEngineCommand::InspectHistory(reply) => {
@@ -10566,9 +10984,6 @@ mod tests {
         harness
             .send_interrupt(test_interrupt())
             .expect("session executor accepts stale cancellation");
-        harness
-            .send_command(SessionEngineCommand::SetModel("m2".into()))
-            .expect("session executor accepts model command");
         let _ = inspect_session_history(&harness).await;
         harness
             .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
@@ -11151,7 +11566,11 @@ mod tests {
     #[tokio::test]
     async fn idle_shutdown_prevents_deferred_command_dispatch() {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetModel("m2".into())]);
+        let mut deferred_commands =
+            VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred",
+                crate::user_content::UserMessageContent::from("deferred"),
+            ))]);
         control_tx
             .send(SessionEngineControl::Shutdown)
             .expect("queue shutdown");
@@ -11167,7 +11586,11 @@ mod tests {
     #[tokio::test]
     async fn idle_disconnect_prevents_deferred_command_dispatch() {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetModel("m2".into())]);
+        let mut deferred_commands =
+            VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred",
+                crate::user_content::UserMessageContent::from("deferred"),
+            ))]);
         drop(control_tx);
 
         assert!(
@@ -11603,6 +12026,7 @@ mod tests {
             TuiState::default(),
             event_rx,
             vec![AvailableModel::new("m1", "M1")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11644,6 +12068,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11679,6 +12104,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11728,6 +12154,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11760,6 +12187,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11790,6 +12218,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11814,6 +12243,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11887,6 +12317,7 @@ mod tests {
             TuiState::default(),
             event_rx,
             vec![AvailableModel::new("m1", "M1")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11911,6 +12342,7 @@ mod tests {
             TuiState::default(),
             event_rx,
             vec![AvailableModel::new("m1", "M1")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
@@ -11934,6 +12366,7 @@ mod tests {
             TuiState::default(),
             session_transport_rx,
             vec![AvailableModel::new("m1", "M1")],
+            Vec::new(),
             std::env::temp_dir(),
             std::env::temp_dir(),
         );

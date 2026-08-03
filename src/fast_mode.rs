@@ -1,66 +1,28 @@
-use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
-const FAST_MODE_STATE_FILE: &str = "fast-mode.json";
-const FAST_MODE_STATE_VERSION: u8 = 1;
-static FAST_MODE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FastModeState {
-    pub version: u8,
-    pub enabled: bool,
-}
-
-impl Default for FastModeState {
-    fn default() -> Self {
-        Self {
-            version: FAST_MODE_STATE_VERSION,
-            enabled: false,
-        }
-    }
-}
-
-impl FastModeState {
-    fn validate(self) -> Result<Self> {
-        if self.version != FAST_MODE_STATE_VERSION {
-            bail!(
-                "invalid Fast Mode state: version must be {FAST_MODE_STATE_VERSION}, got {}",
-                self.version
-            );
-        }
-        Ok(self)
-    }
-}
 
 #[derive(Debug)]
 pub struct FastMode {
-    config_dir: PathBuf,
-    state: Mutex<FastModeState>,
+    config_path: PathBuf,
+    state: Mutex<bool>,
 }
 
 impl FastMode {
-    pub fn load(config_dir: impl Into<PathBuf>) -> Result<Arc<Self>> {
-        let config_dir = config_dir.into();
-        let state = load_state(&state_path(&config_dir))?;
-        Ok(Arc::new(Self {
-            config_dir,
-            state: Mutex::new(state),
-        }))
+    pub fn load(config_path: impl Into<PathBuf>, enabled: bool) -> Arc<Self> {
+        Arc::new(Self {
+            config_path: config_path.into(),
+            state: Mutex::new(enabled),
+        })
     }
 
     pub fn enabled(&self) -> bool {
-        self.state.lock().expect("Fast Mode state poisoned").enabled
+        *self.state.lock().expect("Fast Mode state poisoned")
     }
 
     pub fn toggle(&self, model_id: &str) -> Result<FastModeToggle> {
         let mut state = self.state.lock().expect("Fast Mode state poisoned");
-        let enabled = !state.enabled;
+        let enabled = !*state;
         if enabled && !is_fast_capable_model(model_id) {
             return Ok(FastModeToggle::Unavailable);
         }
@@ -74,20 +36,23 @@ impl FastMode {
 
     pub fn auto_disable_for_model(&self, model_id: &str) -> Result<bool> {
         let mut state = self.state.lock().expect("Fast Mode state poisoned");
-        if state.enabled && !is_fast_capable_model(model_id) {
+        if *state && !is_fast_capable_model(model_id) {
             self.set_enabled_locked(&mut state, false)?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn set_enabled_locked(&self, current: &mut FastModeState, enabled: bool) -> Result<()> {
-        let state = FastModeState {
-            version: FAST_MODE_STATE_VERSION,
-            enabled,
-        };
-        write_state(&state_path(&self.config_dir), state)?;
-        *current = state;
+    fn set_enabled_locked(&self, current: &mut bool, enabled: bool) -> Result<()> {
+        crate::config::persist_fast_mode_enabled(&self.config_path, enabled).with_context(
+            || {
+                format!(
+                    "failed to persist Fast Mode state in {}",
+                    self.config_path.display()
+                )
+            },
+        )?;
+        *current = enabled;
         Ok(())
     }
 }
@@ -104,115 +69,58 @@ pub fn is_fast_capable_model(model_id: &str) -> bool {
     id.starts_with("gpt-") && !id.starts_with("gpt-image")
 }
 
-fn state_path(config_dir: &Path) -> PathBuf {
-    config_dir.join(FAST_MODE_STATE_FILE)
-}
-
-fn load_state(path: &Path) -> Result<FastModeState> {
-    match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str::<FastModeState>(&contents)
-            .context(
-                "invalid Fast Mode state: exactly {\"version\":1,\"enabled\":boolean} is required",
-            )?
-            .validate(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FastModeState::default()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to read Fast Mode state {}", path.display()))
-        }
-    }
-}
-
-fn write_state(path: &Path, state: FastModeState) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create Fast Mode config directory {}",
-            parent.display()
-        )
-    })?;
-    let contents = format!("{}\n", serde_json::to_string(&state)?);
-    let temp_path = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .ok_or_else(|| anyhow!("Fast Mode state path has no file name: {}", path.display()))?
-            .to_string_lossy(),
-        std::process::id(),
-        FAST_MODE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-    ));
-    let result = (|| -> Result<()> {
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary Fast Mode state {}",
-                    temp_path.display()
-                )
-            })?;
-        temp.write_all(contents.as_bytes()).with_context(|| {
-            format!(
-                "failed to write temporary Fast Mode state {}",
-                temp_path.display()
-            )
-        })?;
-        temp.sync_all().with_context(|| {
-            format!(
-                "failed to sync temporary Fast Mode state {}",
-                temp_path.display()
-            )
-        })?;
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to atomically replace Fast Mode state {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+    fn temp_config(name: &str, fast_mode: Option<bool>) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
             "letcode-fast-mode-{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .expect("time ok")
                 .as_nanos()
-        ))
+        ));
+        fs::create_dir_all(&directory).expect("create config directory");
+        let path = directory.join("letcode.toml");
+        let fast_mode = fast_mode
+            .map(|enabled| format!("fast_mode = {enabled}\n"))
+            .unwrap_or_default();
+        fs::write(
+            &path,
+            format!(
+                "{fast_mode}active_provider = \"primary\"\n\
+                 [providers.primary]\n\
+                 base_url = \"https://primary.invalid/v1\"\n\
+                 api_key = \"primary-key\"\n\
+                 protocol = \"responses\"\n\
+                 [providers.primary.models.gpt-5]\n"
+            ),
+        )
+        .expect("write config");
+        path
     }
 
     #[test]
-    fn missing_state_defaults_disabled_and_toggle_persists() {
-        let dir = temp_dir("persist");
-        let mode = FastMode::load(&dir).expect("load missing state");
+    fn omitted_fast_mode_defaults_disabled_and_toggle_persists_in_main_config() {
+        let path = temp_config("persist", None);
+        let mode = FastMode::load(&path, false);
         assert!(!mode.enabled());
         assert_eq!(
             mode.toggle("gpt-5.5").expect("enable fast mode"),
             FastModeToggle::Enabled
         );
-        assert!(FastMode::load(&dir).expect("reload state").enabled());
-    }
-
-    #[test]
-    fn malformed_state_fails_instead_of_defaulting() {
-        let dir = temp_dir("malformed");
-        fs::create_dir_all(&dir).expect("create state dir");
-        fs::write(
-            state_path(&dir),
-            "{\"version\":1,\"enabled\":true,\"extra\":false}",
-        )
-        .expect("write malformed state");
-        assert!(FastMode::load(&dir).is_err());
+        assert!(
+            crate::config::AppConfig::load_from_path(&path)
+                .expect("reload config state")
+                .fast_mode_enabled
+        );
+        assert!(
+            !path.with_file_name("fast-mode.json").exists(),
+            "Fast Mode must not create a separate state file"
+        );
     }
 
     #[test]
@@ -224,36 +132,29 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_model_auto_disables_persisted_state() {
-        let dir = temp_dir("auto-disable");
-        let mode = FastMode::load(&dir).expect("load state");
-        mode.toggle("gpt-5.5").expect("enable");
+    fn unsupported_model_auto_disables_main_config_state() {
+        let path = temp_config("auto-disable", Some(true));
+        let mode = FastMode::load(&path, true);
         assert!(mode.auto_disable_for_model("claude-4").expect("disable"));
-        assert!(!FastMode::load(&dir).expect("reload state").enabled());
+        assert!(
+            !crate::config::AppConfig::load_from_path(&path)
+                .expect("reload state")
+                .fast_mode_enabled
+        );
     }
 
     #[test]
-    fn concurrent_transitions_keep_disk_and_memory_in_sync() {
-        use std::thread;
+    fn legacy_state_file_is_ignored_when_main_config_omits_fast_mode() {
+        let path = temp_config("legacy-state", None);
+        fs::write(
+            path.with_file_name("fast-mode.json"),
+            r#"{"version":1,"enabled":true}"#,
+        )
+        .expect("write legacy state");
 
-        let dir = temp_dir("concurrent-transitions");
-        let mode = FastMode::load(&dir).expect("load state");
-        let mut workers = Vec::new();
-        for _ in 0..16 {
-            let mode = Arc::clone(&mode);
-            workers.push(thread::spawn(move || {
-                for _ in 0..32 {
-                    mode.toggle("gpt-5.5").expect("toggle fast mode");
-                    mode.auto_disable_for_model("claude-4")
-                        .expect("auto-disable fast mode");
-                }
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker completes");
-        }
+        let config = crate::config::AppConfig::load_from_path(&path).expect("load config");
+        let mode = FastMode::load(&path, config.fast_mode_enabled);
 
-        let persisted = FastMode::load(&dir).expect("reload state");
-        assert_eq!(mode.enabled(), persisted.enabled());
+        assert!(!mode.enabled());
     }
 }

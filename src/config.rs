@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
+use async_openai::Client;
+use async_openai::config::OpenAIConfig;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -6,7 +8,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use toml_edit::{DocumentMut, Item, value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -55,15 +57,71 @@ const MAX_RETRY_ATTEMPTS: usize = 10;
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
 const MAX_RETRY_ELAPSED_MS: u64 = 300_000;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
-static MCP_CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Persist one configured MCP server's enabled state without rewriting unrelated
+/// Persist the selected primary route without rewriting unrelated configuration
+/// content.
+pub fn persist_primary_model_route(config_path: &Path, route: &ModelRoute) -> Result<()> {
+    persist_config_document(config_path, "primary model route", true, |document| {
+        let provider = document
+            .get_mut("providers")
+            .and_then(Item::as_table_mut)
+            .and_then(|providers| providers.get_mut(&route.provider))
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider '{}' is not a configured table under [providers]",
+                    route.provider
+                )
+            })?;
+        provider.insert("default_model", value(route.model.clone()));
+        document["active_provider"] = value(route.provider.clone());
+        Ok(())
+    })
+}
+
+/// Persist Fast Mode in the main configuration without rewriting unrelated
+/// content.
+pub fn persist_fast_mode_enabled(config_path: &Path, enabled: bool) -> Result<()> {
+    persist_config_document(config_path, "Fast Mode state", true, |document| {
+        document["fast_mode"] = value(enabled);
+        Ok(())
+    })
+}
+
+/// Persist one expert's provider-qualified route without rewriting unrelated
 /// configuration content.
-pub fn persist_mcp_server_enabled(
+pub fn persist_expert_model_route(
     config_path: &Path,
-    server_name: &str,
-    enabled: bool,
-) -> Result<McpServerConfig> {
+    agent_name: &str,
+    route: &ModelRoute,
+) -> Result<()> {
+    if !crate::delegation::supported_agent_names().any(|name| name == agent_name) {
+        bail!("unknown expert '{agent_name}'");
+    }
+
+    persist_config_document(config_path, "expert model route", true, |document| {
+        let agents = document["agents"].or_insert(Item::Table(Table::new()));
+        let agents = agents
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("config [agents] entry is not a table"))?;
+        let agent = agents
+            .entry(agent_name)
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("agents.{agent_name} is not a configured table"))?;
+        agent.insert("provider", value(route.provider.clone()));
+        agent.insert("model", value(route.model.clone()));
+        Ok(())
+    })
+}
+
+fn persist_config_document(
+    config_path: &Path,
+    update_name: &str,
+    require_full_config: bool,
+    edit: impl FnOnce(&mut DocumentMut) -> Result<()>,
+) -> Result<()> {
     // Resolve before editing so a config symlink remains a symlink while its
     // existing target is atomically replaced.
     let config_target = fs::canonicalize(config_path)
@@ -83,36 +141,74 @@ pub fn persist_mcp_server_enabled(
     let mut document = config_text
         .parse::<DocumentMut>()
         .with_context(|| format!("failed to parse config file {}", config_target.display()))?;
-    let mcp = document
-        .get_mut("mcp")
-        .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| anyhow!("config does not define an [mcp] table"))?;
-    let server = mcp
-        .get_mut(server_name)
-        .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| anyhow!("MCP server '{server_name}' is not a configured table"))?;
-    server.insert("enabled", value(enabled));
+    edit(&mut document)?;
 
     let updated_config = document.to_string();
-    let raw_document = toml::from_str::<toml::Value>(&updated_config)
-        .context("failed to parse updated MCP server configuration")?;
-    let raw_server = raw_document
-        .get("mcp")
-        .and_then(toml::Value::as_table)
-        .and_then(|mcp| mcp.get(server_name))
-        .cloned()
-        .ok_or_else(|| anyhow!("updated MCP server '{server_name}' is missing"))?
-        .try_into::<RawMcpServerConfig>()
-        .with_context(|| format!("failed to parse MCP server '{server_name}'"))?;
-    let (_, persisted_server) = build_mcp_server_config(server_name, raw_server)?;
-
+    validate_updated_config_document(
+        &config_target,
+        &updated_config,
+        update_name,
+        require_full_config,
+    )?;
     atomic_write_config(
         &config_target,
         &config_text,
         &original_metadata,
         updated_config.as_bytes(),
-    )?;
-    Ok(persisted_server)
+    )
+}
+
+fn validate_updated_config_document(
+    config_path: &Path,
+    config_text: &str,
+    update_name: &str,
+    require_full_config: bool,
+) -> Result<()> {
+    let raw: RawAppConfig = toml::from_str(config_text)
+        .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
+
+    if raw.providers.is_empty() && !require_full_config {
+        return Ok(());
+    }
+
+    AppConfig::load_from_str_at_path(config_path, config_text)
+        .with_context(|| format!("failed to validate updated {update_name} configuration"))?;
+    Ok(())
+}
+
+/// Persist one configured MCP server's enabled state without rewriting unrelated
+/// configuration content.
+pub fn persist_mcp_server_enabled(
+    config_path: &Path,
+    server_name: &str,
+    enabled: bool,
+) -> Result<McpServerConfig> {
+    let mut persisted_server = None;
+    persist_config_document(config_path, "MCP server state", false, |document| {
+        let mcp = document
+            .get_mut("mcp")
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| anyhow!("config does not define an [mcp] table"))?;
+        let server = mcp
+            .get_mut(server_name)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| anyhow!("MCP server '{server_name}' is not a configured table"))?;
+        server.insert("enabled", value(enabled));
+
+        let raw_document = toml::from_str::<toml::Value>(&document.to_string())
+            .context("failed to parse updated MCP server configuration")?;
+        let raw_server = raw_document
+            .get("mcp")
+            .and_then(toml::Value::as_table)
+            .and_then(|mcp| mcp.get(server_name))
+            .cloned()
+            .ok_or_else(|| anyhow!("updated MCP server '{server_name}' is missing"))?
+            .try_into::<RawMcpServerConfig>()
+            .with_context(|| format!("failed to parse MCP server '{server_name}'"))?;
+        persisted_server = Some(build_mcp_server_config(server_name, raw_server)?.1);
+        Ok(())
+    })?;
+    Ok(persisted_server.expect("MCP server persistence validates and stores the server"))
 }
 
 fn atomic_write_config(
@@ -129,7 +225,7 @@ fn atomic_write_config(
         ".{}.{}.{}.tmp",
         file_name.to_string_lossy(),
         std::process::id(),
-        MCP_CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let write_result = (|| -> Result<()> {
         let mut temp = create_config_temp_file(&temp_path, original_metadata)?;
@@ -201,7 +297,7 @@ fn revalidate_config_source(
         || !config_metadata_matches(original_metadata, &current_metadata)
     {
         bail!(
-            "config file {} changed while updating MCP server state; refusing to overwrite it",
+            "config file {} changed while updating configuration; refusing to overwrite it",
             config_path.display()
         );
     }
@@ -312,6 +408,7 @@ fn lock_file(_file: &fs::File) -> Result<()> {
 pub struct AppConfig {
     pub config_path: PathBuf,
     pub config_dir: PathBuf,
+    pub fast_mode_enabled: bool,
     pub active_provider: String,
     pub global: GlobalConfig,
     pub agents: AgentsConfig,
@@ -333,7 +430,12 @@ impl AppConfig {
         }
         let config_text = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read config file {}", config_path.display()))?;
-        let raw: RawAppConfig = toml::from_str(&config_text)
+        Self::load_from_str_at_path(&config_path, &config_text)
+    }
+
+    fn load_from_str_at_path(config_path: &Path, config_text: &str) -> Result<Self> {
+        let config_path = config_path.to_path_buf();
+        let raw: RawAppConfig = toml::from_str(config_text)
             .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
         let config_dir = config_path
             .parent()
@@ -421,6 +523,7 @@ impl AppConfig {
         Ok(Self {
             config_path,
             config_dir,
+            fast_mode_enabled: raw.fast_mode.unwrap_or(false),
             active_provider,
             global,
             agents,
@@ -439,13 +542,79 @@ impl AppConfig {
         (&self.active_provider, provider)
     }
 
-    pub fn active_provider_api_key_env_var(&self) -> String {
-        provider_env_var(&self.active_provider, "API_KEY")
+    pub fn active_route(&self) -> ModelRoute {
+        let (_, provider) = self.active_provider();
+        ModelRoute::new(self.active_provider.clone(), provider.default_model.clone())
     }
 
-    pub fn active_provider_model_label(&self, model_id: &str) -> String {
-        let (_, provider) = self.active_provider();
-        provider.model_label(model_id)
+    #[allow(dead_code)]
+    pub fn provider_for_route(&self, route: &ModelRoute) -> Result<&ProviderConfig> {
+        self.providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "provider '{}' is not defined under [providers]",
+                route.provider
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_route(&self, route: &ModelRoute) -> Result<&ProviderConfig> {
+        let provider = self.provider_for_route(route)?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "model '{}' is not defined under [providers.{}.models]",
+                route.model,
+                route.provider
+            );
+        }
+        Ok(provider)
+    }
+
+    pub fn model_route_for(&self, agent_name: &str) -> Option<&ModelRoute> {
+        self.agents.route_for(agent_name)
+    }
+
+    #[allow(dead_code)]
+    pub fn expert_route_for(&self, agent_name: &str) -> Option<ModelRoute> {
+        if !crate::delegation::supported_agent_names().any(|name| name == agent_name) {
+            return None;
+        }
+        self.model_route_for(agent_name)
+            .map(|route| {
+                if self.agents.follows_active_provider(agent_name) {
+                    ModelRoute::new(self.active_provider.clone(), route.model.clone())
+                } else {
+                    route.clone()
+                }
+            })
+            .or_else(|| Some(self.active_route()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelRoute {
+    pub provider: String,
+    pub model: String,
+}
+
+impl ModelRoute {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
+
+    pub fn build_client(&self, provider: &ProviderConfig) -> Client<OpenAIConfig> {
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(provider.base_url.clone())
+                .with_api_key(provider.api_key.clone()),
+        )
     }
 }
 
@@ -460,22 +629,40 @@ pub struct AgentsConfig {
 }
 
 impl AgentsConfig {
-    pub fn model_for(&self, agent_name: &str) -> Option<&str> {
+    pub fn route_for(&self, agent_name: &str) -> Option<&ModelRoute> {
+        self.config_for(agent_name)
+            .and_then(|config| config.route.as_ref())
+    }
+
+    #[allow(dead_code)]
+    pub fn follows_active_provider(&self, agent_name: &str) -> bool {
+        self.config_for(agent_name)
+            .is_some_and(|config| config.follows_active_provider)
+    }
+
+    fn config_for(&self, agent_name: &str) -> Option<&AgentConfig> {
         match agent_name {
-            "explorer" => self.explorer.model.as_deref(),
-            "fixer" => self.fixer.model.as_deref(),
-            "oracle" => self.oracle.model.as_deref(),
-            "designer" => self.designer.model.as_deref(),
-            "librarian" => self.librarian.model.as_deref(),
-            "general" => self.general.model.as_deref(),
+            "explorer" => Some(&self.explorer),
+            "fixer" => Some(&self.fixer),
+            "oracle" => Some(&self.oracle),
+            "designer" => Some(&self.designer),
+            "librarian" => Some(&self.librarian),
+            "general" => Some(&self.general),
             _ => None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn model_for(&self, agent_name: &str) -> Option<&str> {
+        self.route_for(agent_name).map(|route| route.model.as_str())
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
-    pub model: Option<String>,
+    pub route: Option<ModelRoute>,
+    #[allow(dead_code)]
+    pub follows_active_provider: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -638,6 +825,8 @@ impl ModelConfig {
 #[serde(deny_unknown_fields)]
 struct RawAppConfig {
     #[serde(default)]
+    fast_mode: Option<bool>,
+    #[serde(default)]
     active_provider: Option<String>,
     #[serde(default)]
     global: Option<RawGlobalConfig>,
@@ -698,6 +887,7 @@ struct RawAgentsConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAgentConfig {
+    provider: Option<String>,
     model: Option<String>,
 }
 
@@ -1109,17 +1299,13 @@ fn build_agents_config(
     active_provider: &str,
     providers: &IndexMap<String, ProviderConfig>,
 ) -> Result<AgentsConfig> {
-    let provider = providers
-        .get(active_provider)
-        .expect("active provider should be validated at load time");
-
     Ok(AgentsConfig {
-        explorer: build_agent_config(raw.explorer, "explorer", active_provider, provider)?,
-        fixer: build_agent_config(raw.fixer, "fixer", active_provider, provider)?,
-        oracle: build_agent_config(raw.oracle, "oracle", active_provider, provider)?,
-        designer: build_agent_config(raw.designer, "designer", active_provider, provider)?,
-        librarian: build_agent_config(raw.librarian, "librarian", active_provider, provider)?,
-        general: build_agent_config(raw.general, "general", active_provider, provider)?,
+        explorer: build_agent_config(raw.explorer, "explorer", active_provider, providers)?,
+        fixer: build_agent_config(raw.fixer, "fixer", active_provider, providers)?,
+        oracle: build_agent_config(raw.oracle, "oracle", active_provider, providers)?,
+        designer: build_agent_config(raw.designer, "designer", active_provider, providers)?,
+        librarian: build_agent_config(raw.librarian, "librarian", active_provider, providers)?,
+        general: build_agent_config(raw.general, "general", active_provider, providers)?,
     })
 }
 
@@ -1127,28 +1313,49 @@ fn build_agent_config(
     raw: Option<RawAgentConfig>,
     agent_name: &str,
     active_provider: &str,
-    provider: &ProviderConfig,
+    providers: &IndexMap<String, ProviderConfig>,
 ) -> Result<AgentConfig> {
     let Some(raw) = raw else {
         return Ok(AgentConfig::default());
     };
 
+    let provider_name = raw
+        .provider
+        .map(|value| required_non_empty(&format!("agents.{agent_name}.provider"), value))
+        .transpose()?;
     let model = raw
         .model
         .map(|value| required_non_empty(&format!("agents.{agent_name}.model"), value))
         .transpose()?;
 
-    if let Some(model_id) = &model {
-        if !provider.has_model(model_id) {
+    let follows_active_provider = provider_name.is_none() && model.is_some();
+    let route = match (provider_name, model) {
+        (None, None) => None,
+        (Some(provider), Some(model)) => Some(ModelRoute::new(provider, model)),
+        (None, Some(model)) => Some(ModelRoute::new(active_provider, model)),
+        (Some(_), None) => bail!("agents.{agent_name}.provider requires agents.{agent_name}.model"),
+    };
+
+    if let Some(route) = &route {
+        let provider = providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "agents.{agent_name}.provider '{}' is not defined under [providers]",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
             bail!(
                 "agents.{agent_name}.model '{}' is not defined under [providers.{}.models]",
-                model_id,
-                active_provider
+                route.model,
+                route.provider
             );
         }
     }
 
-    Ok(AgentConfig { model })
+    Ok(AgentConfig {
+        route,
+        follows_active_provider,
+    })
 }
 
 fn env_override(provider_name: &str, suffix: &str) -> Option<String> {
@@ -1171,6 +1378,10 @@ fn provider_env_var(provider_name: &str, suffix: &str) -> String {
         })
         .collect::<String>();
     format!("{}_{}", normalized, suffix)
+}
+
+pub fn provider_api_key_env_var(provider_name: &str) -> String {
+    provider_env_var(provider_name, "API_KEY")
 }
 
 fn resolve_relative_path(base_dir: &Path, path: &str) -> PathBuf {
@@ -1934,6 +2145,205 @@ mod tests {
     }
 
     #[test]
+    fn parses_provider_qualified_expert_routes_and_preserves_duplicate_model_ids() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "primary"
+
+            [agents.explorer]
+            model = "shared"
+
+            [agents.fixer]
+            provider = "expert"
+            model = "shared"
+
+            [agents.general]
+            provider = "expert"
+            model = "shared"
+
+            [providers.primary]
+            base_url = "https://primary.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "shared"
+
+            [providers.primary.models.shared]
+            name = "Primary Shared"
+
+            [providers.expert]
+            base_url = "https://expert.invalid/v1"
+            api_key = "expert-key"
+            protocol = "completions"
+            default_model = "shared"
+
+            [providers.expert.models.shared]
+            name = "Expert Shared"
+            supports_reasoning = false
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(
+            config.model_route_for("explorer"),
+            Some(&ModelRoute::new("primary", "shared"))
+        );
+        assert_eq!(
+            config.model_route_for("fixer"),
+            Some(&ModelRoute::new("expert", "shared"))
+        );
+        assert_eq!(
+            config.model_route_for("general"),
+            Some(&ModelRoute::new("expert", "shared"))
+        );
+        assert_eq!(config.agents.model_for("explorer"), Some("shared"));
+        assert_eq!(config.agents.model_for("fixer"), Some("shared"));
+        assert_eq!(config.active_route(), ModelRoute::new("primary", "shared"));
+        assert_eq!(
+            config
+                .resolve_route(config.model_route_for("fixer").expect("fixer route"))
+                .expect("route resolves")
+                .protocol,
+            ApiProtocol::Completions
+        );
+        assert_eq!(
+            config
+                .resolve_route(config.model_route_for("general").expect("general route"))
+                .expect("route resolves")
+                .protocol,
+            ApiProtocol::Completions
+        );
+    }
+
+    #[test]
+    fn legacy_expert_routes_follow_primary_provider_switches_while_explicit_routes_stay_fixed() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "primary"
+
+            [agents.explorer]
+            model = "shared"
+
+            [agents.fixer]
+            provider = "expert"
+            model = "shared"
+
+            [providers.primary]
+            base_url = "https://primary.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "shared"
+            [providers.primary.models.shared]
+
+            [providers.secondary]
+            base_url = "https://secondary.invalid/v1"
+            api_key = "secondary-key"
+            protocol = "responses"
+            default_model = "shared"
+            [providers.secondary.models.shared]
+
+            [providers.expert]
+            base_url = "https://expert.invalid/v1"
+            api_key = "expert-key"
+            protocol = "responses"
+            default_model = "shared"
+            [providers.expert.models.shared]
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert!(config.agents.follows_active_provider("explorer"));
+        assert!(!config.agents.follows_active_provider("fixer"));
+        assert_eq!(
+            config.expert_route_for("explorer"),
+            Some(ModelRoute::new("primary", "shared"))
+        );
+        assert_eq!(
+            config.expert_route_for("fixer"),
+            Some(ModelRoute::new("expert", "shared"))
+        );
+
+        persist_primary_model_route(&path, &ModelRoute::new("secondary", "shared"))
+            .expect("persist primary provider switch");
+        let restarted = AppConfig::load_from_path(&path).expect("restart config should load");
+        assert_eq!(restarted.active_provider, "secondary");
+        assert_eq!(
+            restarted.expert_route_for("explorer"),
+            Some(ModelRoute::new("secondary", "shared"))
+        );
+        assert_eq!(
+            restarted.expert_route_for("fixer"),
+            Some(ModelRoute::new("expert", "shared"))
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unknown_provider_qualified_expert_routes() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [agents.explorer]
+            provider = "expert"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models.model]
+            "#,
+        );
+        let error = AppConfig::load_from_path(&path).expect_err("incomplete route must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.explorer.provider requires agents.explorer.model")
+        );
+
+        let path = write_temp_config(
+            r#"
+            [agents.explorer]
+            provider = "missing"
+            model = "model"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models.model]
+            "#,
+        );
+        let error = AppConfig::load_from_path(&path).expect_err("unknown provider must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.explorer.provider 'missing' is not defined")
+        );
+
+        let path = write_temp_config(
+            r#"
+            [agents.explorer]
+            provider = "expert"
+            model = "missing"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models.model]
+
+            [providers.expert]
+            base_url = "https://expert.invalid/v1"
+            api_key = "expert-key"
+            protocol = "responses"
+
+            [providers.expert.models.model]
+            "#,
+        );
+        let error = AppConfig::load_from_path(&path).expect_err("unknown model must fail");
+        assert!(error.to_string().contains(
+            "agents.explorer.model 'missing' is not defined under [providers.expert.models]"
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_subagent_name() {
         let _guard = lock_env();
         let path = write_temp_config(
@@ -2086,6 +2496,110 @@ mod tests {
         };
         assert_eq!(local.command, ["npx", "-y", "@upstash/context7-mcp"]);
         assert_eq!(local.environment["CONTEXT7_API_KEY"], "secret");
+    }
+
+    #[test]
+    fn persists_mcp_enabled_state_without_provider_configuration() {
+        let path = write_temp_config(
+            "[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\"]\nenabled = true\n",
+        );
+
+        persist_mcp_server_enabled(&path, "alpha", false).expect("persist MCP setting");
+
+        let written = fs::read_to_string(&path).expect("read updated config");
+        assert!(written.contains("enabled = false"));
+    }
+
+    #[test]
+    fn persists_fast_mode_in_the_main_config_without_rewriting_unrelated_config() {
+        let path = write_temp_config(
+            r#"# preserve this comment
+active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models.model]
+"#,
+        );
+
+        persist_fast_mode_enabled(&path, true).expect("persist Fast Mode");
+
+        let written = fs::read_to_string(&path).expect("read updated config");
+        assert!(written.contains("# preserve this comment"));
+        assert!(written.contains("fast_mode = true"));
+        assert!(
+            AppConfig::load_from_path(&path)
+                .expect("reload Fast Mode config")
+                .fast_mode_enabled
+        );
+    }
+
+    #[test]
+    fn parses_fast_mode_from_the_main_config() {
+        let path = write_temp_config(
+            r#"# preserve this comment
+fast_mode = true
+active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models.model]
+"#,
+        );
+
+        assert!(
+            AppConfig::load_from_path(&path)
+                .expect("load Fast Mode config")
+                .fast_mode_enabled
+        );
+    }
+
+    #[test]
+    fn persists_primary_and_expert_model_routes_without_rewriting_unrelated_config() {
+        let path = write_temp_config(
+            r#"# keep this comment
+active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+default_model = "old"
+[providers.primary.models.old]
+[providers.primary.models.shared]
+
+[providers.expert]
+base_url = "https://expert.invalid/v1"
+api_key = "expert-key"
+protocol = "responses"
+[providers.expert.models.shared]
+
+[agents.explorer]
+model = "shared"
+
+# preserve this trailing comment
+"#,
+        );
+
+        persist_primary_model_route(&path, &ModelRoute::new("expert", "shared"))
+            .expect("persist primary route");
+        persist_expert_model_route(&path, "explorer", &ModelRoute::new("primary", "shared"))
+            .expect("persist expert route");
+
+        let written = fs::read_to_string(&path).expect("read updated config");
+        assert!(written.contains("# keep this comment"));
+        assert!(written.contains("# preserve this trailing comment"));
+        let config = AppConfig::load_from_path(&path).expect("reload updated config");
+        assert_eq!(config.active_provider().0, "expert");
+        assert_eq!(config.active_provider().1.default_model, "shared");
+        assert_eq!(
+            config.model_route_for("explorer"),
+            Some(&ModelRoute::new("primary", "shared"))
+        );
     }
 
     #[test]

@@ -309,8 +309,8 @@ mod tests {
             .expect("tool output command is available");
 
         let rendered = draw_panel(&state, 72, 5);
-        assert!(rendered.contains("/permission"), "{rendered}");
-        assert!(rendered.contains("/reasoning"), "{rendered}");
+        assert!(rendered.contains("/agents"), "{rendered}");
+        assert!(rendered.contains("/fast"), "{rendered}");
         assert!(rendered.contains("› /tool-output"), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");
         assert!(rendered.contains("↑"), "{rendered}");

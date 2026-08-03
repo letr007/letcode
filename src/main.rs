@@ -27,13 +27,12 @@ mod transcript;
 mod tui;
 mod user_content;
 
-use agent::{Agent, AgentEvent};
+use agent::{Agent, AgentEvent, PreparedPrimaryRoute, PrimaryRouteFactory as _};
 use agent_event_journal::persist_agent_event;
 use anyhow::{Result, anyhow, bail};
-use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
-use config::AppConfig;
+use config::{AppConfig, ProviderConfig};
 use delegation::supported_agent_names;
 use fast_mode::FastMode;
 use indexmap::IndexMap;
@@ -60,6 +59,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use subagent::ExpertRouteFactory;
 use tool::{QuestionRequest, QuestionResponse};
 use tool_format::format_tool_call;
 use tracing::warn;
@@ -72,7 +72,7 @@ use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, restore_job_board,
     transcript_has_session_title, transcript_has_user_message,
 };
-use tui::runtime::AvailableModel;
+use tui::runtime::{AvailableExpert, AvailableModel};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -82,40 +82,55 @@ async fn main() -> Result<()> {
     let _tracing_guards = init_tracing(&config.global.log_file);
 
     let (active_provider_name, active_provider) = config.active_provider();
+    let active_route = config.active_route();
+    let active_provider_label = active_provider_name.to_string();
     let api_key_hint = format!(
-        "Set providers.{active_provider_name}.api_key in {} or set {}.",
+        "Set api_key for the selected provider in {}.",
         config.config_path.display(),
-        config.active_provider_api_key_env_var()
     );
-
-    let api_base = active_provider.base_url.clone();
-    let api_key = active_provider.api_key.clone();
-    let api_key_configured = !api_key.trim().is_empty();
-    let available_models = active_provider
-        .models
-        .iter()
-        .map(|(model_id, model)| {
-            AvailableModel::with_context_window_and_reasoning(
-                model_id.clone(),
-                active_provider.model_label(model_id),
-                model.context_window,
-                model.reasoning_effort.clone(),
-                model.request_metadata().selectable_reasoning_efforts(),
+    let provider_api_key_hints = config
+        .providers
+        .keys()
+        .map(|provider_name| {
+            (
+                provider_name.clone(),
+                provider_api_key_hint(&config, provider_name),
             )
         })
+        .collect::<IndexMap<_, _>>();
+
+    let available_models = config
+        .providers
+        .iter()
+        .flat_map(|(provider_name, provider)| {
+            provider.models.iter().map(move |(model_id, model)| {
+                let route = config::ModelRoute::new(provider_name, model_id);
+                AvailableModel::with_context_window_and_reasoning(
+                    route.display_name(),
+                    format!(
+                        "{} ({})",
+                        provider.model_label(model_id),
+                        route.display_name()
+                    ),
+                    model.context_window,
+                    model.reasoning_effort.clone(),
+                    model.request_metadata().selectable_reasoning_efforts(),
+                )
+            })
+        })
         .collect::<Vec<_>>();
-    let oai_config = OpenAIConfig::new()
-        .with_api_base(api_base)
-        .with_api_key(api_key);
     memory::set_memory_sessions_dir(config.global.sessions_dir.clone());
-    let client = Client::with_config(oai_config);
+    let client = active_route.build_client(active_provider);
     let mut agent = Agent::new(
         client,
-        active_provider.default_model.clone(),
+        active_route.model.clone(),
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
-    agent.set_fast_mode(FastMode::load(&config.config_dir)?);
+    agent.set_fast_mode(FastMode::load(
+        &config.config_path,
+        config.fast_mode_enabled,
+    ));
     agent.auto_disable_fast_mode_for_model(agent.model())?;
     let workspace_dir = env::current_dir()?;
     agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
@@ -126,6 +141,7 @@ async fn main() -> Result<()> {
         .map(|(model_id, model)| (model_id.clone(), model.request_metadata()))
         .collect::<HashMap<_, _>>();
     agent.set_model_catalog(model_catalog);
+    agent.set_primary_route(active_route.clone());
     let model_protocols = active_provider
         .models
         .iter()
@@ -148,11 +164,11 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| config.global.retry.clone()),
     );
     agent.set_permission_mode(config.permissions.mode);
-    for agent_name in supported_agent_names() {
-        if let Some(model) = config.agents.model_for(agent_name) {
-            agent.set_subagent_model_override(agent_name, model.to_string());
-        }
-    }
+    let primary_route_factory = Arc::new(PrimaryRouteFactory::new(&config));
+    let prepared_active_route = primary_route_factory.prepare_route(active_route.clone())?;
+    agent.apply_prepared_route(prepared_active_route);
+    agent.set_primary_route_factory(primary_route_factory);
+    install_expert_route_factory(&mut agent, &config)?;
     let skill_registry = Arc::new(SkillRegistry::load(&config.config_dir, &workspace_dir)?);
     agent.register_skill_registry(skill_registry.clone())?;
     if matches!(config.permissions.mode, PermissionMode::Yolo) {
@@ -173,7 +189,7 @@ async fn main() -> Result<()> {
 
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
-        recorder.record_session_started(agent.model().to_string())?;
+        recorder.record_session_started(active_route.display_name())?;
         sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
     }
 
@@ -183,10 +199,9 @@ async fn main() -> Result<()> {
                 run_one_shot(
                     &mut agent,
                     &recorder,
+                    &config,
                     &config.mcp,
-                    &active_provider_name,
                     &api_key_hint,
-                    api_key_configured,
                     prompt,
                     json,
                 )
@@ -196,14 +211,56 @@ async fn main() -> Result<()> {
             }
         }
         EntryMode::Tui => {
-            let model_label = config.active_provider_model_label(agent.model());
+            let model_label = format!(
+                "{} ({})",
+                active_provider.model_label(&active_route.model),
+                active_route.display_name()
+            );
             let (engine, projection) = session::SessionEngine::start(
                 agent,
                 recorder,
                 model_label,
                 session::SessionEngineConfig {
                     sessions_dir: config.global.sessions_dir.clone(),
-                    api_key_configured,
+                    model_routes: config
+                        .providers
+                        .iter()
+                        .flat_map(|(provider_name, provider)| {
+                            provider.models.keys().map(move |model| {
+                                let route = config::ModelRoute::new(provider_name, model);
+                                (route.display_name(), route)
+                            })
+                        })
+                        .collect(),
+                    route_api_key_configured: config
+                        .providers
+                        .iter()
+                        .flat_map(|(provider_name, provider)| {
+                            provider.models.keys().map(move |model| {
+                                let route = config::ModelRoute::new(provider_name, model);
+                                (route.display_name(), !provider.api_key.trim().is_empty())
+                            })
+                        })
+                        .collect(),
+                    expert_model_routes: supported_agent_names()
+                        .filter_map(|agent_name| {
+                            config
+                                .model_route_for(agent_name)
+                                .cloned()
+                                .map(|route| (agent_name.to_string(), route))
+                        })
+                        .collect(),
+                    legacy_expert_models: supported_agent_names()
+                        .filter(|agent_name| config.agents.follows_active_provider(agent_name))
+                        .filter_map(|agent_name| {
+                            config
+                                .model_route_for(agent_name)
+                                .map(|route| (agent_name.to_string(), route.model.clone()))
+                        })
+                        .collect(),
+                    providers: config.providers.clone(),
+                    global_retry: config.global.retry.clone(),
+                    provider_api_key_hints,
                     api_key_hint,
                     mcp_config_path: config.config_path.clone(),
                     mcp_config: config.mcp.clone(),
@@ -214,8 +271,17 @@ async fn main() -> Result<()> {
                 projection,
                 config.global.sessions_dir.clone(),
                 config.config_dir.clone(),
-                active_provider_name.to_string(),
+                active_provider_label,
                 available_models,
+                supported_agent_names()
+                    .map(|agent_name| AvailableExpert {
+                        agent_name: agent_name.to_string(),
+                        route_id: config
+                            .expert_route_for(agent_name)
+                            .expect("supported expert has a resolved route")
+                            .display_name(),
+                    })
+                    .collect(),
                 langfuse_startup_toast(&_tracing_guards.langfuse_status),
                 skill_registry.cards(),
             )
@@ -233,8 +299,6 @@ async fn main() -> Result<()> {
         &recorder,
         &config,
         &config.global.sessions_dir,
-        active_provider_name,
-        api_key_configured,
         &api_key_hint,
     )
     .await?;
@@ -244,13 +308,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_repl<C: async_openai::config::Config + Clone>(
-    agent: &mut Agent<C>,
+async fn run_repl(
+    agent: &mut Agent<OpenAIConfig>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     config: &AppConfig,
     sessions_dir: &Path,
-    active_provider_name: &str,
-    api_key_configured: bool,
     api_key_hint: &str,
 ) -> Result<()> {
     loop {
@@ -297,15 +359,26 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 }
             }
             ReplCommand::ModelShow => {
-                let (_, active_provider) = config.active_provider();
+                let current_route = agent
+                    .primary_route()
+                    .cloned()
+                    .unwrap_or_else(|| config.active_route());
+                let current_provider = config.provider_for_route(&current_route)?;
                 println!(
                     "current model: {} ({})",
-                    config.active_provider_model_label(agent.model()),
-                    agent.model()
+                    current_provider.model_label(&current_route.model),
+                    current_route.display_name()
                 );
                 println!("available models:");
-                for (model_id, _) in &active_provider.models {
-                    println!("  {} ({})", active_provider.model_label(model_id), model_id);
+                for (provider_name, provider) in &config.providers {
+                    for model_id in provider.models.keys() {
+                        let route = config::ModelRoute::new(provider_name, model_id);
+                        println!(
+                            "  {} ({})",
+                            provider.model_label(model_id),
+                            route.display_name()
+                        );
+                    }
                 }
             }
             ReplCommand::ToggleFastMode => {
@@ -322,30 +395,37 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 }
             }
             ReplCommand::ModelSet(model_id) => {
-                let (_, active_provider) = config.active_provider();
-                if !active_provider.has_model(&model_id) {
+                let route = parse_model_route(config, &model_id);
+                let Ok(provider) = config.resolve_route(&route) else {
                     println!("unknown model: {model_id}");
                     println!("available models:");
-                    for (available_model_id, _) in &active_provider.models {
-                        println!(
-                            "  {} ({})",
-                            active_provider.model_label(available_model_id),
-                            available_model_id
-                        );
+                    for (provider_name, provider) in &config.providers {
+                        for available_model_id in provider.models.keys() {
+                            let available_route =
+                                config::ModelRoute::new(provider_name, available_model_id);
+                            println!(
+                                "  {} ({})",
+                                provider.model_label(available_model_id),
+                                available_route.display_name()
+                            );
+                        }
                     }
                     continue;
-                }
-
-                let fast_mode_auto_disabled =
-                    session::apply_model(agent, recorder, model_id.clone())?;
+                };
+                let label = provider.model_label(&route.model);
+                let route_display_name = route.display_name();
+                let prepared_route = agent.prepare_primary_route(route.clone())?;
+                let fast_mode_auto_disabled = session::persist_and_apply_model_route_with(
+                    agent,
+                    recorder,
+                    route.clone(),
+                    prepared_route,
+                    |route| config::persist_primary_model_route(&config.config_path, route),
+                )?;
                 if fast_mode_auto_disabled {
                     println!("fast mode auto-disabled: current model is unavailable");
                 }
-                println!(
-                    "model set to {} ({})",
-                    active_provider.model_label(&model_id),
-                    model_id
-                );
+                println!("model set to {} ({})", label, route_display_name);
             }
             ReplCommand::Sessions => print_sessions(sessions_dir)?,
             ReplCommand::ResumeShow => {
@@ -373,11 +453,8 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 );
             }
             ReplCommand::Compact => {
-                if !api_key_configured {
-                    println!(
-                        "API key is not configured for active provider '{}'. {}",
-                        active_provider_name, api_key_hint
-                    );
+                if let Err(error) = ensure_active_route_api_key(agent, config, api_key_hint) {
+                    println!("{error}");
                     continue;
                 }
                 compact_agent_context(agent, recorder).await?;
@@ -410,11 +487,8 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 println!("{message}");
             }
             ReplCommand::Prompt(input) => {
-                if !api_key_configured {
-                    println!(
-                        "API key is not configured for active provider '{}'. {}",
-                        active_provider_name, api_key_hint
-                    );
+                if let Err(error) = ensure_active_route_api_key(agent, config, api_key_hint) {
+                    println!("{error}");
                     continue;
                 }
 
@@ -432,22 +506,16 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
     Ok(())
 }
 
-async fn run_one_shot<C: async_openai::config::Config + Clone>(
-    agent: &mut Agent<C>,
+async fn run_one_shot(
+    agent: &mut Agent<OpenAIConfig>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
+    config: &AppConfig,
     mcp_config: &IndexMap<String, config::McpServerConfig>,
-    active_provider_name: &str,
     api_key_hint: &str,
-    api_key_configured: bool,
     prompt: String,
     json_output: bool,
 ) -> Result<()> {
-    if !api_key_configured {
-        let err = anyhow!(
-            "API key is not configured for active provider '{}'. {}",
-            active_provider_name,
-            api_key_hint
-        );
+    if let Err(err) = ensure_active_route_api_key(agent, config, api_key_hint) {
         record_one_shot_error(recorder, &err)?;
         print_one_shot_error(recorder, agent.model(), json_output, 0, &err)?;
         return Err(err);
@@ -794,8 +862,8 @@ fn set_permission_mode<C: async_openai::config::Config>(
     session::apply_permission_mode(agent, recorder, mode)
 }
 
-fn start_new_session<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
+fn start_new_session(
+    agent: &mut Agent<OpenAIConfig>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: &Path,
 ) -> Result<()> {
@@ -962,6 +1030,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::Exit => ReplCommand::Exit,
         CommandIntent::PermissionShow => ReplCommand::PermissionShow,
         CommandIntent::ModelShow => ReplCommand::ModelShow,
+        CommandIntent::AgentsShow => ReplCommand::Unsupported(
+            "CLI does not support /agents yet; use the TUI to select expert models.".into(),
+        ),
         CommandIntent::ReasoningShow => ReplCommand::ReasoningShow,
         CommandIntent::ResumeShow => ReplCommand::ResumeShow,
         CommandIntent::ToolOutputSet(ToolOutputMode::Toggle)
@@ -1016,6 +1087,9 @@ fn repl_command_from_session_command(command: session::SessionCommand) -> ReplCo
         }
         SessionCommand::SetPermissionMode(mode) => ReplCommand::PermissionSet(mode),
         SessionCommand::SetModel(model_id) => ReplCommand::ModelSet(model_id),
+        SessionCommand::SetExpertModel { .. } => ReplCommand::Unsupported(
+            "CLI does not support expert model selection yet; use the TUI.".into(),
+        ),
         SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,
         SessionCommand::SetReasoningEffort(effort) => ReplCommand::ReasoningSet(effort),
         SessionCommand::Compact => ReplCommand::Compact,
@@ -1070,6 +1144,68 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String
     }
 }
 
+struct PrimaryRouteFactory {
+    providers: IndexMap<String, ProviderConfig>,
+    global_retry: config::RetryConfig,
+}
+
+impl PrimaryRouteFactory {
+    fn new(config: &AppConfig) -> Self {
+        Self {
+            providers: config.providers.clone(),
+            global_retry: config.global.retry.clone(),
+        }
+    }
+}
+
+impl agent::PrimaryRouteFactory<OpenAIConfig> for PrimaryRouteFactory {
+    fn prepare_route(
+        &self,
+        route: config::ModelRoute,
+    ) -> Result<PreparedPrimaryRoute<OpenAIConfig>> {
+        let provider = self.providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "provider '{}' is not defined under [providers]",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "model '{}' is not defined under [providers.{}.models]",
+                route.model,
+                route.provider
+            );
+        }
+        let model = provider
+            .models
+            .get(&route.model)
+            .expect("route model was validated above");
+        Ok(PreparedPrimaryRoute::new(
+            route.clone().build_client(provider),
+            route.clone(),
+            provider.protocol,
+            HashMap::from([(route.model.clone(), model.protocol)]),
+            HashMap::from([(route.model.clone(), model.request_metadata())]),
+            provider
+                .retry
+                .clone()
+                .unwrap_or_else(|| self.global_retry.clone()),
+        ))
+    }
+}
+
+fn install_expert_route_factory(agent: &mut Agent<OpenAIConfig>, config: &AppConfig) -> Result<()> {
+    let routes = supported_agent_names().filter_map(|agent_name| {
+        config
+            .model_route_for(agent_name)
+            .cloned()
+            .map(|route| (agent_name.to_string(), route))
+    });
+    let factory = ExpertRouteFactory::new(routes, &config.providers, &config.global.retry)?;
+    agent.set_subagent_child_factory(Arc::new(factory));
+    Ok(())
+}
+
 fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
     recorder: &TranscriptRecorder,
@@ -1100,6 +1236,49 @@ fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
             .snapshot,
         )
     }));
+}
+
+fn provider_api_key_env_var(provider_name: &str) -> String {
+    config::provider_api_key_env_var(provider_name)
+}
+
+fn provider_api_key_hint(config: &AppConfig, provider_name: &str) -> String {
+    format!(
+        "Set providers.{provider_name}.api_key in {} or set {}.",
+        config.config_path.display(),
+        provider_api_key_env_var(provider_name)
+    )
+}
+
+fn parse_model_route(config: &AppConfig, input: &str) -> config::ModelRoute {
+    let active_route = config.active_route();
+    if config.active_provider().1.has_model(input) {
+        return config::ModelRoute::new(active_route.provider, input);
+    }
+    match input.split_once('/') {
+        Some((provider, model)) => config::ModelRoute::new(provider, model),
+        None => config::ModelRoute::new(active_route.provider, input),
+    }
+}
+
+fn ensure_active_route_api_key(
+    agent: &Agent<OpenAIConfig>,
+    config: &AppConfig,
+    _api_key_hint: &str,
+) -> Result<()> {
+    let route = agent
+        .primary_route()
+        .cloned()
+        .unwrap_or_else(|| config.active_route());
+    let provider = config.provider_for_route(&route)?;
+    if provider.api_key.trim().is_empty() {
+        bail!(
+            "API key is not configured for provider '{}'. {}",
+            route.provider,
+            provider_api_key_hint(config, &route.provider),
+        );
+    }
+    Ok(())
 }
 
 fn print_repl_help() {
@@ -1197,8 +1376,8 @@ fn pending_session_title<C: async_openai::config::Config + Clone>(
     Ok(Some((session_id, agent.session_title_agent())))
 }
 
-fn resume_session<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
+fn resume_session(
+    agent: &mut Agent<OpenAIConfig>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: &Path,
     session_prefix: &str,
@@ -1233,8 +1412,8 @@ fn resume_session<C: async_openai::config::Config>(
     let latest_model = prepared.snapshot.latest_model.clone();
 
     let fast_mode_auto_disabled =
-        match session::install_prepared_resume_for_agent(agent, recorder, prepared) {
-            Ok(auto_disabled) => auto_disabled,
+        match session::install_prepared_routed_resume_for_agent(agent, recorder, prepared) {
+            Ok((auto_disabled, _token_usage)) => auto_disabled,
             Err(error) => {
                 if error.fast_mode_auto_disabled {
                     println!("Fast mode auto-disabled: current model is unavailable");
@@ -1407,6 +1586,8 @@ mod tests {
     use crate::agent::{
         CompactionBlocker, CompactionNoProgress, CompactionTrigger, ContextCompactionEvent,
     };
+    use crate::config::ProviderConfig;
+    use async_openai::Client;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1435,6 +1616,186 @@ mod tests {
 
     fn compacted_event() -> AgentEvent {
         AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded("summary", 0))
+    }
+
+    #[test]
+    fn provider_api_key_env_var_normalizes_provider_names() {
+        assert_eq!(provider_api_key_env_var("expert"), "EXPERT_API_KEY");
+        assert_eq!(
+            provider_api_key_env_var("my-provider"),
+            "MY_PROVIDER_API_KEY"
+        );
+    }
+
+    #[test]
+    fn parse_model_route_accepts_provider_qualified_and_legacy_model_ids() {
+        let path = test_config_path(
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://primary.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+
+            [providers.primary.models.shared]
+            [providers.primary.models."vendor/model"]
+
+            [providers.expert]
+            base_url = "https://expert.invalid/v1"
+            api_key = "expert-key"
+            protocol = "responses"
+
+            [providers.expert.models.shared]
+            "#,
+        );
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+
+        assert_eq!(
+            parse_model_route(&config, "expert/shared"),
+            config::ModelRoute::new("expert", "shared")
+        );
+        assert_eq!(
+            parse_model_route(&config, "shared"),
+            config::ModelRoute::new("primary", "shared")
+        );
+        assert_eq!(
+            parse_model_route(&config, "vendor/model"),
+            config::ModelRoute::new("primary", "vendor/model"),
+            "configured active-provider model ids take precedence over provider-qualified parsing"
+        );
+    }
+
+    fn test_config_path(contents: &str) -> std::path::PathBuf {
+        let path = test_dir().join("letcode.toml");
+        fs::write(&path, contents).expect("write test config");
+        path
+    }
+
+    #[test]
+    fn active_provider_model_switch_reconfigures_complete_route() {
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: config::ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: Some(config::RetryConfig {
+                enabled: false,
+                max_attempts: 1,
+                max_elapsed_ms: 1_000,
+                max_recovery_attempts: 1,
+                initial_delay_ms: 10,
+                max_delay_ms: 10,
+                backoff_multiplier: 1.0,
+                jitter_ms: 0,
+            }),
+            models: IndexMap::from([(
+                "shared".into(),
+                config::ModelConfig {
+                    display_name: None,
+                    protocol: config::ApiProtocol::Completions,
+                    context_window: Some(8_192),
+                    effective_input_limit_tokens: Some(4_096),
+                    max_output_tokens: Some(512),
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(test_dir()).expect("create transcript"),
+        ));
+        let mut agent = test_agent();
+        agent.set_primary_route(config::ModelRoute::new("primary", "shared"));
+
+        let factory = Arc::new(PrimaryRouteFactory {
+            providers: IndexMap::from([("expert".into(), provider)]),
+            global_retry: config::RetryConfig::default(),
+        });
+        let route = config::ModelRoute::new("expert", "shared");
+        let prepared_route = factory
+            .prepare_route(route.clone())
+            .expect("route should prepare");
+        agent.set_primary_route_factory(factory);
+        session::settings::apply_model_route_with(&mut agent, &recorder, route, prepared_route)
+            .expect("route switch");
+
+        assert_eq!(agent.model(), "shared");
+        assert_eq!(
+            agent.default_protocol_for_test(),
+            config::ApiProtocol::Completions
+        );
+        assert_eq!(agent.active_model_metadata().context_window, Some(8_192));
+        assert!(!agent.active_model_metadata().supports_tools);
+        assert!(!agent.retry_config_for_test().enabled);
+        let records = transcript::read_records(
+            recorder
+                .lock()
+                .expect("transcript recorder")
+                .path()
+                .to_path_buf(),
+        )
+        .expect("read transcript");
+        let model_change = serde_json::to_value(
+            records
+                .last()
+                .expect("provider route switch records provenance"),
+        )
+        .expect("serialize model change");
+        assert_eq!(
+            model_change.get("previous_model"),
+            Some(&json!("primary/shared"))
+        );
+        assert_eq!(model_change.get("new_model"), Some(&json!("expert/shared")));
+    }
+
+    #[test]
+    fn primary_route_factory_rejects_unknown_provider_or_model() {
+        let mut agent = test_agent();
+        let factory = PrimaryRouteFactory {
+            providers: IndexMap::new(),
+            global_retry: config::RetryConfig::default(),
+        };
+        agent.set_primary_route_factory(Arc::new(factory));
+
+        let error = agent
+            .switch_primary_route(config::ModelRoute::new("missing", "shared"))
+            .expect_err("unknown provider must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("provider 'missing' is not defined under [providers]")
+        );
+
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "test-key".into(),
+            protocol: config::ApiProtocol::Responses,
+            default_model: "available".into(),
+            retry: None,
+            models: IndexMap::new(),
+        };
+        let mut agent = test_agent();
+        agent.set_primary_route_factory(Arc::new(PrimaryRouteFactory {
+            providers: IndexMap::from([("known".into(), provider)]),
+            global_retry: config::RetryConfig::default(),
+        }));
+        let error = agent
+            .switch_primary_route(config::ModelRoute::new("known", "missing"))
+            .expect_err("unknown model must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("model 'missing' is not defined under [providers.known.models]")
+        );
     }
 
     #[test]
@@ -1847,6 +2208,12 @@ mod tests {
         );
         assert_eq!(parse_repl_command("/new"), ReplCommand::NewSession);
         assert_eq!(parse_repl_command("/compact"), ReplCommand::Compact);
+        assert_eq!(
+            parse_repl_command("/agents"),
+            ReplCommand::Unsupported(
+                "CLI does not support /agents yet; use the TUI to select expert models.".into()
+            )
+        );
     }
 
     #[test]

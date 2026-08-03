@@ -476,6 +476,7 @@ where
     let mut summary_agent = Agent {
         client: agent.client.clone(),
         model: agent.model.clone(),
+        primary_route: None,
         subagent_model_overrides: HashMap::new(),
         default_protocol: agent.default_protocol,
         model_protocols: agent.model_protocols.clone(),
@@ -488,6 +489,8 @@ where
         skill_registry: None,
         skill_cards: Vec::new(),
         subagent_delegate: None,
+        subagent_child_factory: None,
+        primary_route_factory: None,
         question_handler: None,
         permission_session: std::sync::Arc::new(std::sync::Mutex::new(
             PermissionSessionState::default(),

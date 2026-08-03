@@ -1,8 +1,10 @@
 use anyhow::{Result, anyhow};
-use async_openai::config::Config;
+use async_openai::Client;
+use async_openai::config::{Config, OpenAIConfig};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -11,7 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
-use crate::agent::{Agent, AgentFactory, AgentTemplate, SubagentInvocation};
+use crate::agent::{
+    Agent, AgentFactory, AgentTemplate, PrimaryRouteFactory, SubagentChildFactory,
+    SubagentInvocation,
+};
+use crate::config::{ApiProtocol, ModelRoute, ProviderConfig, RetryConfig};
+use crate::request_builder::ModelRequestMetadata;
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::transcript_projection;
@@ -206,6 +213,21 @@ pub struct SubagentPool {
     next_ordinal: Arc<Mutex<u32>>,
 }
 
+#[derive(Clone)]
+pub struct ExpertRouteFactory {
+    routes: HashMap<String, ExpertRoute>,
+}
+
+#[derive(Clone)]
+struct ExpertRoute {
+    route: ModelRoute,
+    client: Client<OpenAIConfig>,
+    default_protocol: ApiProtocol,
+    model_protocols: HashMap<String, ApiProtocol>,
+    model_catalog: HashMap<String, ModelRequestMetadata>,
+    retry_config: RetryConfig,
+}
+
 #[derive(Debug)]
 struct ActiveSlot {
     cancel: Option<oneshot::Sender<()>>,
@@ -258,6 +280,110 @@ impl Drop for ActiveRunGuard {
 impl Default for SubagentPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ExpertRouteFactory {
+    fn prepare_route(
+        &self,
+        route: ModelRoute,
+    ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+        let expert_route = self
+            .routes
+            .values()
+            .find(|expert_route| expert_route.route == route)
+            .ok_or_else(|| {
+                anyhow!(
+                    "child route provider '{}' model '{}' is not configured",
+                    route.provider,
+                    route.model
+                )
+            })?;
+        Ok(crate::agent::PreparedPrimaryRoute::new(
+            expert_route.client.clone(),
+            route,
+            expert_route.default_protocol,
+            expert_route.model_protocols.clone(),
+            expert_route.model_catalog.clone(),
+            expert_route.retry_config.clone(),
+        ))
+    }
+
+    pub fn new(
+        routes: impl IntoIterator<Item = (String, ModelRoute)>,
+        providers: &indexmap::IndexMap<String, ProviderConfig>,
+        global_retry: &RetryConfig,
+    ) -> Result<Self> {
+        let routes = routes
+            .into_iter()
+            .map(|(agent_name, route)| {
+                let provider = providers.get(&route.provider).ok_or_else(|| {
+                    anyhow!(
+                        "expert route for '{agent_name}' references unknown provider '{}'",
+                        route.provider
+                    )
+                })?;
+                let model = provider.models.get(&route.model).ok_or_else(|| {
+                    anyhow!(
+                        "expert route for '{agent_name}' references unknown model '{}' under provider '{}'",
+                        route.model,
+                        route.provider
+                    )
+                })?;
+                let client = route.build_client(provider);
+                let model_catalog = HashMap::from([(route.model.clone(), model.request_metadata())]);
+                let model_protocols = HashMap::from([(route.model.clone(), model.protocol)]);
+                let retry_config = provider
+                    .retry
+                    .clone()
+                    .unwrap_or_else(|| global_retry.clone());
+                Ok((
+                    agent_name,
+                    ExpertRoute {
+                        route,
+                        client,
+                        default_protocol: provider.protocol,
+                        model_protocols,
+                        model_catalog,
+                        retry_config,
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        Ok(Self { routes })
+    }
+}
+
+impl PrimaryRouteFactory<OpenAIConfig> for ExpertRouteFactory {
+    fn prepare_route(
+        &self,
+        route: ModelRoute,
+    ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+        self.prepare_route(route)
+    }
+}
+
+impl SubagentChildFactory<OpenAIConfig> for ExpertRouteFactory {
+    fn create_child(
+        &self,
+        parent: &Agent<OpenAIConfig>,
+        template: &AgentTemplate,
+        max_tool_calls_override: Option<usize>,
+    ) -> Option<Agent<OpenAIConfig>> {
+        let Some(route) = self.routes.get(&template.name) else {
+            return None;
+        };
+        Some(AgentFactory::create_routed_child_with_max_tool_calls(
+            parent,
+            template,
+            route.client.clone(),
+            route.route.clone(),
+            route.default_protocol,
+            route.model_protocols.clone(),
+            route.model_catalog.clone(),
+            route.retry_config.clone(),
+            max_tool_calls_override,
+        ))
     }
 }
 
@@ -533,6 +659,10 @@ impl SubagentPool {
                 let mut child_recorder = TranscriptRecorder::open(&child_dir, target_id.clone())?;
                 child_agent.set_context_scope_state(child_recorder.context_scope_state());
                 let child_records = read_records_allow_partial_tail(child_recorder.path())?;
+                let recorded_route = crate::transcript::restore_latest_model(&child_records)
+                    .ok_or_else(|| {
+                        anyhow!("takeover failed: child `{target_id}` has no recorded model route")
+                    })?;
                 let snapshot = transcript_projection::project_runtime_restore_snapshot(
                     target_id.clone(),
                     child_records,
@@ -543,12 +673,15 @@ impl SubagentPool {
                     &[],
                 )?;
                 child_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
-                child_agent
-                    .restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
-                child_agent.restore_turn_sequence(snapshot.max_turn_id);
-                if let Some(model) = snapshot.latest_model {
-                    child_agent.set_model(model);
-                }
+                let (protocol_frames, runtime_snapshot) = child_agent
+                    .validate_runtime_snapshot_restore(
+                        snapshot.protocol_frames,
+                        snapshot.snapshot,
+                    )?;
+                let restored_route = crate::session::restore::prepare_restored_model_route(
+                    &child_agent,
+                    Some(&recorded_route),
+                )?;
 
                 child_recorder.record_subagent_lifecycle(
                     run_id.clone(),
@@ -569,6 +702,13 @@ impl SubagentPool {
                     pool_ordinal,
                 )?;
 
+                crate::session::restore::apply_prepared_restored_route(
+                    &mut child_agent,
+                    restored_route,
+                );
+                child_agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
+                child_agent.restore_turn_sequence(snapshot.max_turn_id);
+
                 Ok((
                     run_id,
                     target_id.clone(),
@@ -579,7 +719,7 @@ impl SubagentPool {
                 let pool_ordinal = self.allocate_ordinal_from_children(&existing_children);
                 let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
                 child_agent.set_context_scope_state(child_recorder.context_scope_state());
-                child_recorder.record_session_started(child_agent.model().to_string())?;
+                child_recorder.record_session_started(child_agent.route_display_name())?;
                 let child_session_id = child_recorder.session_id().to_string();
                 child_recorder.record_subagent_lifecycle(
                     run_id.clone(),
@@ -1385,6 +1525,300 @@ mod tests {
         assert_eq!(fixer.model(), "gpt-fixer");
     }
 
+    async fn spawn_endpoint(
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&request_count);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4_096];
+                let read = socket.read(&mut chunk).await.expect("request should read");
+                assert_ne!(read, 0, "client closed before completing the request");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end])
+                    .expect("request headers should be UTF-8");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .expect("request content length");
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            socket
+                .write_all(body.as_bytes())
+                .await
+                .expect("response should write");
+            socket.shutdown().await.expect("response should close");
+        });
+        (format!("http://{address}/v1"), request_count, server)
+    }
+
+    #[tokio::test]
+    async fn expert_route_factory_uses_the_configured_endpoint_for_future_child_runs() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (primary_url, primary_requests, primary_server) = spawn_endpoint(response).await;
+        let (expert_url, expert_requests, expert_server) = spawn_endpoint(response).await;
+        let primary_client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(primary_url)
+                .with_api_key("primary-key"),
+        );
+        let parent = Agent::new(primary_client, "shared", 2, 4);
+        let provider = ProviderConfig {
+            base_url: expert_url,
+            api_key: "expert-key".into(),
+            protocol: ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: Some(RetryConfig {
+                enabled: false,
+                max_attempts: 1,
+                max_elapsed_ms: 1_000,
+                max_recovery_attempts: 1,
+                initial_delay_ms: 10,
+                max_delay_ms: 10,
+                backoff_multiplier: 1.0,
+                jitter_ms: 0,
+            }),
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: ApiProtocol::Completions,
+                    context_window: None,
+                    effective_input_limit_tokens: None,
+                    max_output_tokens: None,
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = ExpertRouteFactory::new(
+            [("explorer".into(), ModelRoute::new("expert", "shared"))],
+            &indexmap::IndexMap::from([("expert".into(), provider)]),
+            &RetryConfig::default(),
+        )
+        .expect("factory should build");
+        let mut parent = parent;
+        parent.set_subagent_child_factory(Arc::new(factory));
+        let mut child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
+
+        child
+            .run_stream_async(
+                "inspect",
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(crate::permission::PermissionApproval::Deny)),
+            )
+            .await
+            .expect("child request should succeed");
+
+        assert_eq!(expert_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 0);
+        expert_server.await.expect("expert server completes");
+        drop(primary_server);
+    }
+
+    #[test]
+    fn expert_route_factory_rejects_an_unconfigured_model_for_a_known_provider() {
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: None,
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: ApiProtocol::Completions,
+                    context_window: None,
+                    effective_input_limit_tokens: None,
+                    max_output_tokens: None,
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = ExpertRouteFactory::new(
+            [("explorer".into(), ModelRoute::new("expert", "shared"))],
+            &indexmap::IndexMap::from([("expert".into(), provider)]),
+            &RetryConfig::default(),
+        )
+        .expect("factory should build");
+
+        let result =
+            PrimaryRouteFactory::prepare_route(&factory, ModelRoute::new("expert", "unconfigured"));
+
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.to_string()
+                    == "child route provider 'expert' model 'unconfigured' is not configured"
+        ));
+    }
+
+    #[test]
+    fn routed_child_retains_route_factory_for_takeover_restoration() {
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: None,
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: ApiProtocol::Completions,
+                    context_window: None,
+                    effective_input_limit_tokens: None,
+                    max_output_tokens: None,
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = Arc::new(
+            ExpertRouteFactory::new(
+                [("explorer".into(), ModelRoute::new("expert", "shared"))],
+                &indexmap::IndexMap::from([("expert".into(), provider)]),
+                &RetryConfig::default(),
+            )
+            .expect("factory should build"),
+        );
+        let mut parent = test_agent();
+        parent.set_subagent_child_factory(factory.clone());
+        parent.set_primary_route_factory(factory);
+
+        let mut child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
+        crate::session::restore::apply_restored_model_route(&mut child, Some("expert/shared"))
+            .expect("routed child should prepare its qualified takeover route");
+
+        assert_eq!(
+            child.primary_route(),
+            Some(&ModelRoute::new("expert", "shared"))
+        );
+        assert_eq!(child.model(), "shared");
+    }
+
+    #[test]
+    fn expert_route_factory_creates_children_with_the_routed_provider_settings() {
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: Some(RetryConfig {
+                enabled: false,
+                max_attempts: 1,
+                max_elapsed_ms: 1_000,
+                max_recovery_attempts: 1,
+                initial_delay_ms: 10,
+                max_delay_ms: 10,
+                backoff_multiplier: 1.0,
+                jitter_ms: 0,
+            }),
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: ApiProtocol::Completions,
+                    context_window: Some(8_192),
+                    effective_input_limit_tokens: Some(4_096),
+                    max_output_tokens: Some(512),
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let providers = indexmap::IndexMap::from([("expert".into(), provider)]);
+        let factory = ExpertRouteFactory::new(
+            [("explorer".into(), ModelRoute::new("expert", "shared"))],
+            &providers,
+            &RetryConfig::default(),
+        )
+        .expect("factory should build");
+        let mut parent = test_agent();
+        parent.set_subagent_child_factory(Arc::new(factory));
+
+        let child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
+
+        assert_eq!(
+            child.primary_route(),
+            Some(&ModelRoute::new("expert", "shared"))
+        );
+        assert_eq!(child.model(), "shared");
+        assert_eq!(child.default_protocol_for_test(), ApiProtocol::Completions);
+        assert_eq!(child.active_model_metadata().context_window, Some(8_192));
+        assert!(!child.active_model_metadata().supports_tools);
+        assert!(!child.retry_config_for_test().enabled);
+    }
+
     #[test]
     fn generate_run_id_is_unique_within_process() {
         let first = generate_run_id();
@@ -1764,6 +2198,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn takeover_restores_provider_qualified_child_route_identity() {
+        let runtime = SubagentPool::new();
+        let sessions_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(temp_sessions_dir()).expect("create parent recorder"),
+        ));
+        let parent_session_id = parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .session_id()
+            .to_string();
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: None,
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: ApiProtocol::Completions,
+                    context_window: None,
+                    effective_input_limit_tokens: None,
+                    max_output_tokens: None,
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = Arc::new(
+            ExpertRouteFactory::new(
+                [("explorer".into(), ModelRoute::new("expert", "shared"))],
+                &indexmap::IndexMap::from([("expert".into(), provider)]),
+                &RetryConfig::default(),
+            )
+            .expect("factory should build"),
+        );
+        let mut parent = test_agent();
+        parent.set_primary_route(ModelRoute::new("primary", "shared"));
+        parent.set_subagent_child_factory(factory.clone());
+        parent.set_primary_route_factory(factory.clone());
+        let first = runtime
+            .run_with_executor(
+                &parent,
+                AgentTemplate::explorer(),
+                "inspect routed state".into(),
+                test_governance(),
+                sessions_dir.clone(),
+                parent_session_id.clone(),
+                "turn-1".into(),
+                Some(Arc::clone(&parent_recorder)),
+                no_event_sender(),
+                None,
+                |_agent,
+                 _task,
+                 transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
+                    async move {
+                        transcript
+                            .lock()
+                            .expect("lock child transcript")
+                            .record_model_changed("gpt-test", "expert/shared")?;
+                        Ok("completed summary".into())
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .expect("initial run succeeds");
+
+        let mut current_expert_parent = test_agent();
+        current_expert_parent.set_primary_route(ModelRoute::new("primary", "shared"));
+        current_expert_parent.set_primary_route_factory(factory);
+        let mut takeover_governance = test_governance();
+        takeover_governance.input.target_child_session_id = Some(first.child_session_id.clone());
+        let resumed_child_session_id = first.child_session_id.clone();
+        let resumed = runtime
+            .run_with_executor(
+                &current_expert_parent,
+                AgentTemplate::explorer(),
+                "continue routed inspection".into(),
+                takeover_governance,
+                sessions_dir,
+                parent_session_id,
+                "turn-2".into(),
+                Some(parent_recorder),
+                no_event_sender(),
+                Some(resumed_child_session_id.clone()),
+                move |agent,
+                      _task,
+                      _transcript,
+                      _session_transport_tx,
+                      child_session_id,
+                      _agent_name| {
+                    async move {
+                        assert_eq!(child_session_id, resumed_child_session_id);
+                        assert_eq!(
+                            agent.primary_route(),
+                            Some(&ModelRoute::new("expert", "shared"))
+                        );
+                        assert_eq!(agent.model(), "shared");
+                        Ok("resumed summary".into())
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .expect("takeover succeeds");
+
+        assert_eq!(resumed.child_session_id, first.child_session_id);
+    }
+
+    #[tokio::test]
     async fn max_concurrency_guard_rejects_second_run() {
         let runtime = SubagentPool::new();
         let agent = test_agent();
@@ -2068,10 +2626,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_transcript_session_started_records_actual_child_model() {
+    async fn child_transcript_session_started_records_routed_child_model() {
         let runtime = SubagentPool::new();
+        let provider = ProviderConfig {
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: None,
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: ApiProtocol::Completions,
+                    context_window: None,
+                    effective_input_limit_tokens: None,
+                    max_output_tokens: None,
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = ExpertRouteFactory::new(
+            [("explorer".into(), ModelRoute::new("expert", "shared"))],
+            &indexmap::IndexMap::from([("expert".into(), provider)]),
+            &RetryConfig::default(),
+        )
+        .expect("factory should build");
         let mut agent = test_agent();
-        agent.set_subagent_model_override("explorer", "gpt-explorer");
+        agent.set_subagent_child_factory(Arc::new(factory));
         let sessions_dir = temp_sessions_dir();
 
         let summary = runtime
@@ -2105,7 +2696,7 @@ mod tests {
 
         match &child_records[0].event {
             crate::transcript::TranscriptEvent::SessionStarted { model } => {
-                assert_eq!(model, "gpt-explorer");
+                assert_eq!(model, "expert/shared");
             }
             other => panic!("unexpected child event: {other:?}"),
         }
@@ -2185,7 +2776,7 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
-                Some(crate::session::subagent_event_sender::<OpenAIConfig>(tx)),
+                Some(crate::session::subagent_event_sender(tx)),
                 None,
                 |_agent,
                  _task,
@@ -2223,9 +2814,7 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
-                Some(crate::session::subagent_event_sender::<OpenAIConfig>(
-                    _tx.clone(),
-                )),
+                Some(crate::session::subagent_event_sender(_tx.clone())),
                 None,
                 |_agent,
                  _task,
@@ -2273,7 +2862,7 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
-                Some(crate::session::subagent_event_sender::<OpenAIConfig>(tx)),
+                Some(crate::session::subagent_event_sender(tx)),
                 None,
                 |_agent,
                  _task,

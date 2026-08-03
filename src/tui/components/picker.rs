@@ -132,6 +132,8 @@ fn picker_has_search(dialog: &DialogState) -> bool {
     matches!(
         dialog.kind,
         DialogKind::ModelPicker
+            | DialogKind::AgentPicker
+            | DialogKind::ExpertModelPicker(_)
             | DialogKind::SessionPicker
             | DialogKind::HistoryTree
             | DialogKind::ContextPicker
@@ -200,17 +202,6 @@ fn render_picker_body(
     dialog: &DialogState,
 ) {
     let mut y = area.y;
-    if dialog.kind == DialogKind::ModelPicker {
-        render_section_heading(
-            frame,
-            Rect::new(area.x, y, area.width, 1),
-            theme,
-            "Recent",
-            theme.accent,
-        );
-        y = y.saturating_add(1);
-    }
-
     let rows = area.bottom().saturating_sub(y) as usize;
     if rows == 0 {
         return;
@@ -244,6 +235,12 @@ fn render_picker_body(
                         selected,
                         item.id == state.model_id,
                     ),
+                    DialogKind::AgentPicker => {
+                        render_session_row(frame, row, theme, item, selected, None)
+                    }
+                    DialogKind::ExpertModelPicker(_) => {
+                        render_model_row(frame, row, theme, item, selected, false)
+                    }
                     DialogKind::SessionPicker
                     | DialogKind::HistoryTree
                     | DialogKind::ContextPicker
@@ -309,7 +306,9 @@ fn render_picker_body(
             DialogKind::PermissionPicker => "No permission modes found",
             DialogKind::ThemePicker => "No themes found",
             DialogKind::ReasoningPicker => "No reasoning efforts found",
-            _ => "No models found",
+            DialogKind::AgentPicker => "No experts found",
+            DialogKind::ExpertModelPicker(_) | DialogKind::ModelPicker => "No models found",
+            _ => "No items found",
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(empty_label, muted_style(theme))))
@@ -533,18 +532,29 @@ fn picker_entries<'a>(dialog: &'a DialogState) -> Vec<PickerEntry<'a>> {
     for (index, item) in dialog.visible_items() {
         if matches!(
             dialog.kind,
-            DialogKind::SessionPicker | DialogKind::HistoryTree | DialogKind::ContextPicker
+            DialogKind::ModelPicker
+                | DialogKind::AgentPicker
+                | DialogKind::ExpertModelPicker(_)
+                | DialogKind::SessionPicker
+                | DialogKind::HistoryTree
+                | DialogKind::ContextPicker
         ) {
-            let section =
-                item.section
-                    .as_deref()
-                    .unwrap_or(if dialog.kind == DialogKind::HistoryTree {
-                        "Branches"
-                    } else if dialog.kind == DialogKind::ContextPicker {
-                        "Context"
-                    } else {
-                        "Sessions"
-                    });
+            let section = item.section.as_deref().unwrap_or_else(|| {
+                if dialog.kind == DialogKind::HistoryTree {
+                    "Branches"
+                } else if dialog.kind == DialogKind::ContextPicker {
+                    "Context"
+                } else if dialog.kind == DialogKind::AgentPicker {
+                    "Experts"
+                } else if matches!(
+                    dialog.kind,
+                    DialogKind::ModelPicker | DialogKind::ExpertModelPicker(_)
+                ) {
+                    "Models"
+                } else {
+                    "Sessions"
+                }
+            });
             if previous_section != Some(section) {
                 entries.push(PickerEntry::Heading(section));
                 previous_section = Some(section);

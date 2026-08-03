@@ -25,19 +25,20 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome, SubagentInvocation};
 use crate::agent_event_journal::persist_agent_event;
+use crate::config::ModelRoute;
 use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::{
     AgentRunner, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
-    SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent,
-    restored_session_token_usage, session_resumed_event, session_started_event,
+    SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent, session_started_event,
     unfinished_current_active_turn_tool_calls,
 };
 use crate::subagent::SubagentPool;
 use crate::tool::{ToolHandler, normalize_subagent_input};
 use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecorder, read_records,
-    remove_empty_session_file, sync_recorder_branch, transcript_projection,
+    read_records_allow_partial_tail, remove_empty_session_file, sync_recorder_branch,
+    transcript_projection,
 };
 
 /// Maximum time to keep polling the parent run after signalling subagent
@@ -88,6 +89,10 @@ pub(crate) enum SessionEngineCommand {
     ViewParent,
     SetPermissionMode(crate::permission::PermissionMode),
     SetModel(String),
+    SetExpertModel {
+        agent_name: String,
+        model_id: String,
+    },
     ToggleFastMode,
     SetReasoningEffort(crate::request_builder::ModelReasoningEffort),
     ResumeSession(String),
@@ -121,6 +126,13 @@ impl SessionEngineCommand {
             SessionCommand::ViewParent => Self::ViewParent,
             SessionCommand::SetPermissionMode(mode) => Self::SetPermissionMode(mode),
             SessionCommand::SetModel(model) => Self::SetModel(model),
+            SessionCommand::SetExpertModel {
+                agent_name,
+                model_id,
+            } => Self::SetExpertModel {
+                agent_name,
+                model_id,
+            },
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
@@ -212,7 +224,21 @@ pub struct SessionEngine {
 #[derive(Debug, Clone)]
 pub struct SessionEngineConfig {
     pub sessions_dir: PathBuf,
-    pub api_key_configured: bool,
+    /// Routes keyed by their provider-qualified display name (`provider/model`).
+    pub model_routes: indexmap::IndexMap<String, ModelRoute>,
+    /// Whether each route has a non-empty credential configured.
+    pub route_api_key_configured: indexmap::IndexMap<String, bool>,
+    /// Expert routes keyed by role name; roles without an entry use the active primary route.
+    pub expert_model_routes: indexmap::IndexMap<String, ModelRoute>,
+    /// Legacy model-only expert assignments keyed by role name. Their provider
+    /// follows successful primary-route changes while their model id is retained.
+    pub legacy_expert_models: indexmap::IndexMap<String, String>,
+    /// Provider catalog used to reconstruct expert route factories after configuration updates.
+    pub providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
+    pub global_retry: crate::config::RetryConfig,
+    /// Provider-specific API-key remediation keyed by provider name.
+    pub provider_api_key_hints: indexmap::IndexMap<String, String>,
+    /// Fallback remediation if a provider-specific hint is unavailable.
     pub api_key_hint: String,
     pub mcp_config_path: PathBuf,
     pub mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
@@ -252,18 +278,16 @@ impl SessionEngine {
     }
 
     /// Start the backend control loop and transfer all execution resources into it.
-    pub fn start<C>(
-        agent: Agent<C>,
+    pub fn start(
+        agent: Agent<async_openai::config::OpenAIConfig>,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         model_label: String,
         config: SessionEngineConfig,
-    ) -> Result<(Self, SessionEngineProjection)>
-    where
-        C: Config + Clone + Send + Sync + 'static,
-    {
+    ) -> Result<(Self, SessionEngineProjection)> {
         // `main` synchronizes the initial scope before startup; subsequent session
         // switches are synchronized by this engine's control loop.
-        let model_id = agent.model().to_string();
+        let model_id = agent.route_display_name();
+        let api_key_configured = route_has_api_key(&config.route_api_key_configured, &model_id);
         let permission_mode_label = agent.permission_mode().to_string();
         let fast_mode_enabled = agent.fast_mode_enabled();
         let (session_id, session_title) = initial_session_metadata(&transcript)?;
@@ -274,7 +298,7 @@ impl SessionEngine {
             model_label,
             permission_mode_label,
             fast_mode_enabled,
-            api_key_configured: config.api_key_configured,
+            api_key_configured,
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -291,7 +315,13 @@ impl SessionEngine {
             agent,
             Arc::clone(&transcript),
             config.sessions_dir,
-            config.api_key_configured,
+            config.model_routes,
+            config.route_api_key_configured,
+            config.expert_model_routes,
+            config.legacy_expert_models,
+            config.providers,
+            config.global_retry,
+            config.provider_api_key_hints,
             config.api_key_hint,
             config.mcp_config_path,
             config.mcp_config,
@@ -455,9 +485,6 @@ fn session_engine_command_as_idle_session_command(
         SessionEngineCommand::SetPermissionMode(mode) => {
             Some(crate::session::SessionCommand::SetPermissionMode(*mode))
         }
-        SessionEngineCommand::SetModel(model) => {
-            Some(crate::session::SessionCommand::SetModel(model.clone()))
-        }
         SessionEngineCommand::ToggleFastMode => {
             Some(crate::session::SessionCommand::ToggleFastMode)
         }
@@ -475,6 +502,8 @@ fn session_engine_command_as_idle_session_command(
         SessionEngineCommand::Prompt(_)
         | SessionEngineCommand::DelegateSubagent { .. }
         | SessionEngineCommand::Compact
+        | SessionEngineCommand::SetModel(_)
+        | SessionEngineCommand::SetExpertModel { .. }
         | SessionEngineCommand::ResumeSession(_)
         | SessionEngineCommand::NewSession
         | SessionEngineCommand::ToggleMcpServer(_) => None,
@@ -739,20 +768,122 @@ where
     }
 }
 
+fn route_has_api_key(
+    route_api_key_configured: &indexmap::IndexMap<String, bool>,
+    route_display_name: &str,
+) -> bool {
+    route_api_key_configured
+        .get(route_display_name)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn route_api_key_hint(
+    route_display_name: &str,
+    provider_api_key_hints: &indexmap::IndexMap<String, String>,
+    fallback_hint: &str,
+) -> String {
+    let provider = route_display_name
+        .split_once('/')
+        .map(|(provider, _)| provider)
+        .unwrap_or("selected");
+    provider_api_key_hints
+        .get(provider)
+        .cloned()
+        .unwrap_or_else(|| fallback_hint.to_string())
+}
+
+fn active_route_has_api_key(
+    agent: &Agent<async_openai::config::OpenAIConfig>,
+    route_api_key_configured: &indexmap::IndexMap<String, bool>,
+) -> bool {
+    route_has_api_key(route_api_key_configured, &agent.route_display_name())
+}
+
+fn expert_routes_after_primary_switch(
+    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    legacy_expert_models: &indexmap::IndexMap<String, String>,
+    primary_route: &ModelRoute,
+) -> indexmap::IndexMap<String, ModelRoute> {
+    let mut routes = expert_model_routes.clone();
+    for (agent_name, model) in legacy_expert_models {
+        routes.insert(
+            agent_name.clone(),
+            ModelRoute::new(primary_route.provider.clone(), model.clone()),
+        );
+    }
+    routes
+}
+
+fn delegated_route_display_name(
+    agent: &Agent<async_openai::config::OpenAIConfig>,
+    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    agent_name: &str,
+) -> String {
+    expert_model_routes
+        .get(agent_name)
+        .map_or_else(|| agent.route_display_name(), ModelRoute::display_name)
+}
+
+fn delegated_route_for_takeover(
+    agent: &Agent<async_openai::config::OpenAIConfig>,
+    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    sessions_dir: &std::path::Path,
+    parent_transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    agent_name: &str,
+    target_child_session_id: Option<&str>,
+) -> Result<String> {
+    let Some(target_child_session_id) = target_child_session_id else {
+        return Ok(delegated_route_display_name(
+            agent,
+            expert_model_routes,
+            agent_name,
+        ));
+    };
+    let parent_records = parent_transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))
+        .and_then(|recorder| read_records(recorder.path()).map_err(Into::into))?;
+    let child = crate::subagent::SubagentPool::child_sessions(sessions_dir, &parent_records)
+        .into_iter()
+        .find(|child| child.child_session_id == target_child_session_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "takeover failed: child_session_id `{target_child_session_id}` is not a known child of this parent"
+            )
+        })?;
+    if child.agent_name != agent_name {
+        anyhow::bail!(
+            "takeover failed: child `{target_child_session_id}` is agent `{}`, expected `{agent_name}`",
+            child.agent_name
+        );
+    }
+    let child_records = read_records_allow_partial_tail(
+        crate::transcript::child_sessions_dir(sessions_dir)
+            .join(format!("{target_child_session_id}.jsonl")),
+    )?;
+    crate::transcript::restore_latest_model(&child_records).ok_or_else(|| {
+        anyhow::anyhow!(
+            "takeover failed: child `{target_child_session_id}` has no recorded model route"
+        )
+    })
+}
+
 fn missing_api_key_error(api_key_hint: &str) -> ErrorEvent {
     ErrorEvent::new(format!(
-        "API key is not set for the active provider. {}",
+        "API key is not set for the selected provider. {}",
         api_key_hint
     ))
 }
 
 fn send_missing_api_key_error(
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    route_display_name: &str,
+    provider_api_key_hints: &indexmap::IndexMap<String, String>,
     api_key_hint: &str,
 ) {
-    let _ = session_transport_tx.send(SessionTransportEvent::Error(missing_api_key_error(
-        api_key_hint,
-    )));
+    let hint = route_api_key_hint(route_display_name, provider_api_key_hints, api_key_hint);
+    let _ = session_transport_tx.send(SessionTransportEvent::Error(missing_api_key_error(&hint)));
     let _ = session_transport_tx.send(SessionTransportEvent::Done);
 }
 
@@ -1236,11 +1367,18 @@ async fn refresh_visible_child_session_view(
     });
 }
 
-async fn run_engine_loop<C>(
-    agent: Agent<C>,
+#[allow(clippy::too_many_arguments)]
+async fn run_engine_loop(
+    agent: Agent<async_openai::config::OpenAIConfig>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
-    api_key_configured: bool,
+    model_routes: indexmap::IndexMap<String, ModelRoute>,
+    route_api_key_configured: indexmap::IndexMap<String, bool>,
+    expert_model_routes: indexmap::IndexMap<String, ModelRoute>,
+    legacy_expert_models: indexmap::IndexMap<String, String>,
+    providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
+    global_retry: crate::config::RetryConfig,
+    provider_api_key_hints: indexmap::IndexMap<String, String>,
     api_key_hint: String,
     mcp_config_path: PathBuf,
     mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
@@ -1249,13 +1387,18 @@ async fn run_engine_loop<C>(
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     title_event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     subagent_runtime: SubagentPool,
-) where
-    C: Config + Clone + Send + Sync + 'static,
-{
+) {
     let transcript = transcript;
     let mut agent = agent;
     let mut mcp_tools_rx = Some(mcp_tools_rx);
     let mut mcp_config = mcp_config;
+    let model_routes = model_routes;
+    let route_api_key_configured = route_api_key_configured;
+    let mut expert_model_routes = expert_model_routes;
+    let mut legacy_expert_models = legacy_expert_models;
+    let providers = providers;
+    let global_retry = global_retry;
+    let provider_api_key_hints = provider_api_key_hints;
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
     let mut deferred_commands = VecDeque::new();
@@ -1271,6 +1414,147 @@ async fn run_engine_loop<C>(
                 let Some(command) = command else {
                     break;
                 };
+
+                if let SessionEngineCommand::SetExpertModel {
+                    agent_name,
+                    model_id,
+                } = &command
+                {
+                    if !crate::delegation::supported_agent_names().any(|name| name == agent_name) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!("unknown expert: {agent_name}")),
+                        ));
+                        continue;
+                    }
+                    let Some(route) = model_routes.get(model_id).cloned() else {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!("unknown model: {model_id}")),
+                        ));
+                        continue;
+                    };
+                    let mut updated_expert_model_routes = expert_model_routes.clone();
+                    updated_expert_model_routes.insert(agent_name.clone(), route.clone());
+                    if let Err(error) = crate::subagent::ExpertRouteFactory::new(
+                        updated_expert_model_routes
+                            .iter()
+                            .map(|(name, route)| (name.clone(), route.clone())),
+                        &providers,
+                        &global_retry,
+                    ) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!("failed to activate expert model: {error}")),
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = crate::config::persist_expert_model_route(
+                        &mcp_config_path,
+                        agent_name,
+                        &route,
+                    ) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!("failed to set expert model: {error}")),
+                        ));
+                        continue;
+                    }
+                    let factory = crate::subagent::ExpertRouteFactory::new(
+                        updated_expert_model_routes
+                            .iter()
+                            .map(|(name, route)| (name.clone(), route.clone())),
+                        &providers,
+                        &global_retry,
+                    )
+                    .expect("validated expert route factory must remain constructible");
+                    agent.set_subagent_child_factory(Arc::new(factory));
+                    expert_model_routes = updated_expert_model_routes;
+                    legacy_expert_models.shift_remove(agent_name);
+                    let _ = session_transport_tx.send(SessionTransportEvent::ExpertModelChanged {
+                        agent_name: agent_name.clone(),
+                        model_id: model_id.clone(),
+                    });
+                    continue;
+                }
+
+                if let SessionEngineCommand::SetModel(model) = &command {
+                    let Some(route) = model_routes.get(model).cloned() else {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!("unknown model: {model}")),
+                        ));
+                        continue;
+                    };
+                    let model_id = route.display_name();
+                    let prepared_route = match agent.prepare_primary_route(route.clone()) {
+                        Ok(prepared_route) => prepared_route,
+                        Err(error) => {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!("failed to set model: {error}")),
+                            ));
+                            continue;
+                        }
+                    };
+                    match crate::session::persist_and_apply_model_route_with(
+                        &mut agent,
+                        &transcript,
+                        route.clone(),
+                        prepared_route,
+                        |route| crate::config::persist_primary_model_route(&mcp_config_path, route),
+                    ) {
+                        Ok(fast_mode_auto_disabled) => {
+                            if fast_mode_auto_disabled {
+                                let _ = session_transport_tx.send(
+                                    SessionTransportEvent::FastModeChanged { enabled: false },
+                                );
+                                let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                    NoticeEvent::info(
+                                        "Fast mode auto-disabled: current model is unavailable",
+                                    ),
+                                ));
+                            }
+                            let updated_expert_model_routes = expert_routes_after_primary_switch(
+                                &expert_model_routes,
+                                &legacy_expert_models,
+                                &route,
+                            );
+                            let factory = crate::subagent::ExpertRouteFactory::new(
+                                updated_expert_model_routes
+                                    .iter()
+                                    .map(|(name, route)| (name.clone(), route.clone())),
+                                &providers,
+                                &global_retry,
+                            )
+                            .expect("configured expert routes remain constructible after a primary switch");
+                            agent.set_subagent_child_factory(Arc::new(factory));
+                            expert_model_routes = updated_expert_model_routes;
+                            let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
+                                model_id: model_id.clone(),
+                            });
+                            if !route_has_api_key(&route_api_key_configured, &model_id) {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    missing_api_key_error(&route_api_key_hint(
+                                        &model_id,
+                                        &provider_api_key_hints,
+                                        &api_key_hint,
+                                    )),
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            if error.fast_mode_auto_disabled() {
+                                let _ = session_transport_tx.send(
+                                    SessionTransportEvent::FastModeChanged { enabled: false },
+                                );
+                                let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                    NoticeEvent::info(
+                                        "Fast mode auto-disabled: current model is unavailable",
+                                    ),
+                                ));
+                            }
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!("failed to set model: {error}")),
+                            ));
+                        }
+                    }
+                    continue;
+                }
 
                 if let Some(session_command) = session_engine_command_as_idle_session_command(&command) {
                     if let SessionEngineCommand::ViewChild { .. } = &command {
@@ -1411,6 +1695,7 @@ async fn run_engine_loop<C>(
                     | SessionEngineCommand::NavigateHistory { .. }
                     | SessionEngineCommand::SetPermissionMode(_)
                     | SessionEngineCommand::SetModel(_)
+                    | SessionEngineCommand::SetExpertModel { .. }
                     | SessionEngineCommand::ToggleFastMode
                     | SessionEngineCommand::SetReasoningEffort(_)
                     | SessionEngineCommand::ViewChild { .. }
@@ -1419,11 +1704,6 @@ async fn run_engine_loop<C>(
                         continue;
                     }
                     SessionEngineCommand::DelegateSubagent { agent_name, task } => {
-                        if !api_key_configured {
-                            send_missing_api_key_error(&session_transport_tx, &api_key_hint);
-                            continue;
-                        }
-
                         let parent_session_id = match transcript.lock() {
                             Ok(recorder) => recorder.session_id().to_string(),
                             Err(_) => {
@@ -1452,6 +1732,31 @@ async fn run_engine_loop<C>(
                                 continue;
                             }
                         };
+                        let route_display_name = match delegated_route_for_takeover(
+                            &agent,
+                            &expert_model_routes,
+                            &sessions_dir,
+                            &transcript,
+                            &agent_name,
+                            invocation.input.target_child_session_id.as_deref(),
+                        ) {
+                            Ok(route_display_name) => route_display_name,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(error.to_string()),
+                                ));
+                                continue;
+                            }
+                        };
+                        if !route_has_api_key(&route_api_key_configured, &route_display_name) {
+                            send_missing_api_key_error(
+                                &session_transport_tx,
+                                &route_display_name,
+                                &provider_api_key_hints,
+                                &api_key_hint,
+                            );
+                            continue;
+                        }
 
                         let (
                             interrupted,
@@ -1473,9 +1778,7 @@ async fn run_engine_loop<C>(
                                         .as_millis()
                                 ),
                                 Some(transcript.clone()),
-                                Some(crate::session::subagent_event_sender::<C>(
-                                    session_transport_tx.clone(),
-                                )),
+                                Some(crate::session::subagent_event_sender(session_transport_tx.clone())),
                             );
 
                             tokio::pin!(delegate);
@@ -1622,9 +1925,14 @@ async fn run_engine_loop<C>(
                         continue;
                     }
                     SessionEngineCommand::Compact => {
-                        if !api_key_configured {
-                            send_missing_api_key_error(&session_transport_tx, &api_key_hint);
-                            let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                        if !active_route_has_api_key(&agent, &route_api_key_configured) {
+                            let route_display_name = agent.route_display_name();
+                            send_missing_api_key_error(
+                                &session_transport_tx,
+                                &route_display_name,
+                                &provider_api_key_hints,
+                                &api_key_hint,
+                            );
                             continue;
                         }
                         if subagent_runtime.is_running() {
@@ -1698,32 +2006,20 @@ async fn run_engine_loop<C>(
                                 continue;
                             }
                         };
-                        let target_model = prepared
-                            .snapshot
-                            .latest_model
-                            .as_deref()
-                            .unwrap_or(agent.model());
-                        let token_usage = match restored_session_token_usage(
-                            &agent,
-                            target_model,
-                            &prepared.snapshot.snapshot,
-                        ) {
-                            Ok(usage) => Some(usage),
-                            Err(error) => {
-                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                                    "failed to restore session token usage: {error}"
-                                ))));
-                                continue;
-                            }
-                        };
-                        let resumed_event =
-                            session_resumed_event(&prepared, runtime_context, token_usage);
-                        let fast_mode_auto_disabled = match crate::session::install_prepared_resume_for_agent(
+                        let resumed_event_session_id = prepared.session_id.clone();
+                        let resumed_event_branch_id = prepared.snapshot.branch_id.clone();
+                        let resumed_event_messages =
+                            crate::session::restore::restored_messages_from_protocol_frames(
+                                &prepared.snapshot.protocol_frames,
+                            );
+                        let resumed_event_records = prepared.snapshot.records.clone();
+                        let resumed_event_evidence_count = prepared.snapshot.snapshot.evidence.len();
+                        let (fast_mode_auto_disabled, token_usage) = match crate::session::install_prepared_routed_resume_for_agent(
                             &mut agent,
                             &transcript,
                             prepared,
                         ) {
-                            Ok(auto_disabled) => auto_disabled,
+                            Ok(result) => result,
                             Err(error) => {
                                 if error.fast_mode_auto_disabled {
                                     let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
@@ -1743,7 +2039,16 @@ async fn run_engine_loop<C>(
                                 "Fast mode auto-disabled: current model is unavailable",
                             )));
                         }
-                        let _ = session_transport_tx.send(resumed_event);
+                        let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
+                            session_id: resumed_event_session_id,
+                            branch_id: resumed_event_branch_id,
+                            messages: resumed_event_messages,
+                            records: resumed_event_records,
+                            evidence_count: resumed_event_evidence_count,
+                            model_id: Some(agent.route_display_name()),
+                            token_usage: Some(token_usage),
+                            runtime_context,
+                        });
                         continue;
                     }
                     SessionEngineCommand::NewSession => {
@@ -1754,9 +2059,10 @@ async fn run_engine_loop<C>(
                             continue;
                         }
 
+                        let model = agent.route_display_name();
                         let prepared = match crate::session::prepare_new_session_package(
                             &sessions_dir,
-                            agent.model().to_string(),
+                            model,
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -1790,15 +2096,31 @@ async fn run_engine_loop<C>(
                     prompt: prompt.clone(),
                 });
 
-                if !api_key_configured {
-                    send_missing_api_key_error(&session_transport_tx, &api_key_hint);
+                if !active_route_has_api_key(&agent, &route_api_key_configured) {
+                    let route_display_name = agent.route_display_name();
+                    send_missing_api_key_error(
+                        &session_transport_tx,
+                        &route_display_name,
+                        &provider_api_key_hints,
+                        &api_key_hint,
+                    );
                     continue;
                 }
 
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
-                let runner = AgentRunner::with_transcript(runner_event_tx, transcript.clone())
+                let runner = AgentRunner::<async_openai::config::OpenAIConfig>::with_transcript(
+                    runner_event_tx,
+                    transcript.clone(),
+                )
                     .with_session_title_event_sender(title_event_tx.clone())
-                    .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
+                    .with_subagent_runtime(
+                        subagent_runtime.clone(),
+                        sessions_dir.clone(),
+                        expert_model_routes.clone(),
+                        route_api_key_configured.clone(),
+                        provider_api_key_hints.clone(),
+                        api_key_hint.clone(),
+                    );
                 let (interrupted, shutdown) = {
                     let run = runner.run_prompt(&mut agent, prompt);
                     tokio::pin!(run);
@@ -2193,6 +2515,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_ingress_maps_expert_model_selection() {
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        ingress
+            .submit(SessionCommand::SetExpertModel {
+                agent_name: "explorer".into(),
+                model_id: "expert/shared".into(),
+            })
+            .expect("engine accepts expert model command");
+
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Command(SessionEngineCommand::SetExpertModel {
+                agent_name,
+                model_id,
+            })) if agent_name == "explorer" && model_id == "expert/shared"
+        ));
+    }
+
+    #[tokio::test]
     async fn interrupt_and_shutdown_are_frontend_neutral_intents() {
         let (mut engine, ingress, _egress) = SessionEngine::new();
         ingress
@@ -2225,6 +2566,224 @@ mod tests {
         drop(egress);
 
         assert!(event_tx.send(SessionTransportEvent::Done).is_err());
+    }
+
+    #[test]
+    fn active_route_credential_lookup_uses_the_provider_qualified_route() {
+        let route_api_key_configured = indexmap::IndexMap::from([
+            ("primary/shared".into(), true),
+            ("expert/shared".into(), false),
+        ]);
+        let mut agent = Agent::new(
+            async_openai::Client::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_base("http://127.0.0.1:9/v1")
+                    .with_api_key("test-key"),
+            ),
+            "shared",
+            1,
+            1,
+        );
+        agent.set_primary_route(ModelRoute::new("expert", "shared"));
+
+        assert!(!active_route_has_api_key(&agent, &route_api_key_configured));
+
+        agent.set_primary_route(ModelRoute::new("primary", "shared"));
+        assert!(active_route_has_api_key(&agent, &route_api_key_configured));
+    }
+
+    #[test]
+    fn direct_expert_execution_uses_the_selected_expert_provider_credential() {
+        let route_api_key_configured = indexmap::IndexMap::from([
+            ("primary/shared".into(), true),
+            ("expert/shared".into(), false),
+        ]);
+        let mut agent = Agent::new(
+            async_openai::Client::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_base("http://127.0.0.1:9/v1")
+                    .with_api_key("primary-key"),
+            ),
+            "shared",
+            1,
+            1,
+        );
+        agent.set_primary_route(ModelRoute::new("expert", "shared"));
+
+        assert!(
+            !active_route_has_api_key(&agent, &route_api_key_configured),
+            "direct expert delegation must not inherit the primary provider credential"
+        );
+        assert_eq!(
+            delegated_route_display_name(
+                &agent,
+                &indexmap::IndexMap::from([(
+                    "explorer".into(),
+                    ModelRoute::new("expert", "shared"),
+                )]),
+                "explorer",
+            ),
+            "expert/shared"
+        );
+        assert_eq!(
+            route_api_key_hint(
+                &agent.route_display_name(),
+                &indexmap::IndexMap::from([("expert".into(), "Set EXPERT_API_KEY.".into())]),
+                "Set <PROVIDER>_API_KEY.",
+            ),
+            "Set EXPERT_API_KEY."
+        );
+    }
+
+    #[test]
+    fn delegated_credential_lookup_uses_the_selected_expert_route_or_primary_fallback() {
+        let mut agent = Agent::new(
+            async_openai::Client::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_base("http://127.0.0.1:9/v1")
+                    .with_api_key("primary-key"),
+            ),
+            "shared",
+            1,
+            1,
+        );
+        agent.set_primary_route(ModelRoute::new("primary", "shared"));
+        let routes =
+            indexmap::IndexMap::from([("explorer".into(), ModelRoute::new("expert", "shared"))]);
+        let credentials = indexmap::IndexMap::from([
+            ("primary/shared".into(), true),
+            ("expert/shared".into(), false),
+        ]);
+
+        let explorer_route = delegated_route_display_name(&agent, &routes, "explorer");
+        assert_eq!(explorer_route, "expert/shared");
+        assert!(!route_has_api_key(&credentials, &explorer_route));
+        assert_eq!(
+            route_api_key_hint(
+                &explorer_route,
+                &indexmap::IndexMap::from([("expert".into(), "Set EXPERT_API_KEY.".into())]),
+                "Set <PROVIDER>_API_KEY.",
+            ),
+            "Set EXPERT_API_KEY."
+        );
+
+        let general_route = delegated_route_display_name(&agent, &routes, "general");
+        assert_eq!(general_route, "primary/shared");
+        assert!(route_has_api_key(&credentials, &general_route));
+    }
+
+    #[test]
+    fn legacy_expert_routes_follow_primary_switches_but_explicit_routes_stay_fixed() {
+        let routes = indexmap::IndexMap::from([
+            ("explorer".into(), ModelRoute::new("primary", "legacy")),
+            ("fixer".into(), ModelRoute::new("expert", "fixed")),
+        ]);
+        let legacy_models = indexmap::IndexMap::from([("explorer".into(), "legacy".into())]);
+
+        assert_eq!(
+            expert_routes_after_primary_switch(
+                &routes,
+                &legacy_models,
+                &ModelRoute::new("secondary", "primary-model"),
+            ),
+            indexmap::IndexMap::from([
+                ("explorer".into(), ModelRoute::new("secondary", "legacy")),
+                ("fixer".into(), ModelRoute::new("expert", "fixed")),
+            ])
+        );
+    }
+
+    #[test]
+    fn takeover_credential_lookup_uses_the_historical_child_route() {
+        let sessions_dir = temp_sessions_dir();
+        let parent = parent_transcript(&sessions_dir);
+        let child_session_id = add_child(&parent, &sessions_dir, "run-1", 1);
+        let child_path = crate::transcript::child_sessions_dir(&sessions_dir)
+            .join(format!("{child_session_id}.jsonl"));
+        let mut child = TranscriptRecorder::open(
+            crate::transcript::child_sessions_dir(&sessions_dir),
+            child_session_id.clone(),
+        )
+        .expect("open child transcript");
+        child
+            .record_session_started("expert/shared")
+            .expect("record child route");
+        drop(child);
+        assert!(child_path.exists());
+
+        let agent = Agent::new(
+            async_openai::Client::with_config(async_openai::config::OpenAIConfig::new()),
+            "shared",
+            1,
+            1,
+        );
+        let route = delegated_route_for_takeover(
+            &agent,
+            &indexmap::IndexMap::from([("explorer".into(), ModelRoute::new("primary", "shared"))]),
+            &sessions_dir,
+            &parent,
+            "explorer",
+            Some(&child_session_id),
+        )
+        .expect("historical child route resolves");
+        let credentials = indexmap::IndexMap::from([
+            ("primary/shared".into(), true),
+            ("expert/shared".into(), false),
+        ]);
+
+        assert_eq!(route, "expert/shared");
+        assert!(
+            !route_has_api_key(&credentials, &route),
+            "takeover must validate its historical child provider, not the current expert route"
+        );
+    }
+
+    #[test]
+    fn missing_api_key_error_emits_error_then_exactly_one_done() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_missing_api_key_error(
+            &tx,
+            "expert/shared",
+            &indexmap::IndexMap::from([("expert".into(), "Set EXPERT_API_KEY.".into())]),
+            "fallback",
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionTransportEvent::Error(error))
+                if error.message == "API key is not set for the selected provider. Set EXPERT_API_KEY."
+        ));
+        assert!(matches!(rx.try_recv(), Ok(SessionTransportEvent::Done)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn route_credential_lookup_and_hint_use_the_selected_provider() {
+        let route_api_key_configured = indexmap::IndexMap::from([
+            ("primary/shared".into(), true),
+            ("expert/shared".into(), false),
+        ]);
+
+        assert!(route_has_api_key(
+            &route_api_key_configured,
+            "primary/shared"
+        ));
+        assert!(!route_has_api_key(
+            &route_api_key_configured,
+            "expert/shared"
+        ));
+        assert!(!route_has_api_key(
+            &route_api_key_configured,
+            "unknown/shared"
+        ));
+        assert_eq!(
+            route_api_key_hint(
+                "expert/shared",
+                &indexmap::IndexMap::from([("expert".into(), "Set EXPERT_API_KEY.".into())]),
+                "Set <PROVIDER>_API_KEY.",
+            ),
+            "Set EXPERT_API_KEY."
+        );
     }
 
     #[test]

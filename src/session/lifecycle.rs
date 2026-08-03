@@ -174,7 +174,8 @@ pub fn install_new_session_for_agent<C: Config>(
     live: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: impl AsRef<Path>,
 ) -> Result<String> {
-    let prepared = prepare_new_session_package(sessions_dir, agent.model().to_string())?;
+    let model = agent.route_display_name();
+    let prepared = prepare_new_session_package(sessions_dir, model)?;
     let session_id = prepared.session_id.clone();
     install_prepared_new_session_for_agent(agent, live, prepared)?;
     Ok(session_id)
