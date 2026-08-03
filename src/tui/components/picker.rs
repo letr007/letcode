@@ -783,6 +783,14 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
+    fn centered_picker_area_uses_the_shared_picker_dimensions() {
+        assert_eq!(
+            centered_picker_area(Rect::new(0, 0, 100, 30)),
+            Rect::new(12, 3, 75, 24)
+        );
+    }
+
+    #[test]
     fn mcp_tools_picker_renders_server_status_and_search() {
         let theme = Theme::dark();
         let area = Rect::new(0, 0, 100, 30);

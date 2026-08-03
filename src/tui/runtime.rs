@@ -2166,12 +2166,9 @@ impl TuiRuntime {
             .available_experts
             .iter()
             .map(|expert| {
-                DialogItem::new(
-                    expert.agent_name.clone(),
-                    expert.agent_name.clone(),
-                    Some(expert.route_id.clone()),
-                )
-                .with_section("Experts")
+                DialogItem::new(expert.agent_name.clone(), expert.agent_name.clone(), None)
+                    .with_section("Experts")
+                    .with_right_detail(expert.route_id.clone())
             })
             .collect();
         let mut dialog = DialogState::new(DialogKind::AgentPicker, "Expert models", None, items);
@@ -8241,6 +8238,11 @@ mod tests {
         let dialog = runtime.state().dialog().expect("expert picker open");
         assert_eq!(dialog.kind, DialogKind::AgentPicker);
         assert_eq!(dialog.items[0].section.as_deref(), Some("Experts"));
+        assert_eq!(dialog.items[0].detail, None);
+        assert_eq!(
+            dialog.items[0].right_detail.as_deref(),
+            Some("expert/shared")
+        );
 
         assert_eq!(
             runtime
@@ -8288,7 +8290,10 @@ mod tests {
 
         runtime.show_agents_dialog().expect("opens expert picker");
         let dialog = runtime.state().dialog().expect("expert picker open");
-        assert_eq!(dialog.items[0].detail.as_deref(), Some("expert/shared"));
+        assert_eq!(
+            dialog.items[0].right_detail.as_deref(),
+            Some("expert/shared")
+        );
 
         runtime
             .handle_input_action(InputAction::DialogAccept)

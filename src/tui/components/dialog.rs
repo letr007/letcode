@@ -23,6 +23,8 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
     if matches!(
         dialog.kind,
         DialogKind::ModelPicker
+            | DialogKind::AgentPicker
+            | DialogKind::ExpertModelPicker(_)
             | DialogKind::SessionPicker
             | DialogKind::HistoryTree
             | DialogKind::ContextPicker
@@ -208,6 +210,49 @@ fn accent_style(theme: Theme) -> Style {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn agent_pickers_render_with_shared_picker_layout() {
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 100, 30);
+        let cases = [
+            (
+                DialogKind::AgentPicker,
+                vec![
+                    DialogItem::new("explorer", "explorer", None)
+                        .with_section("Experts")
+                        .with_right_detail("CPA/gpt-5.6-luna"),
+                ],
+                "CPA/gpt-5.6-luna",
+            ),
+            (
+                DialogKind::ExpertModelPicker("explorer".into()),
+                vec![DialogItem::new("CPA/gpt-5.6-luna", "GPT-5.6 Luna", None).with_section("CPA")],
+                "CPA",
+            ),
+        ];
+
+        for (kind, items, expected_label) in cases {
+            let mut state = TuiState::default();
+            state.open_dialog(DialogState::new(kind, "Select expert model", None, items));
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+
+            terminal
+                .draw(|frame| render_dialog(frame, &mut state, area, theme))
+                .expect("draw");
+
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Search"));
+            assert!(rendered.contains(expected_label));
+        }
+    }
 
     #[test]
     fn generic_dialogs_render_as_borderless_elevated_panels() {
