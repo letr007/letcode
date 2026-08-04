@@ -2605,6 +2605,60 @@ mod tests {
         let _ = std::fs::remove_file(outside_path);
     }
 
+    #[tokio::test]
+    async fn search_rg_can_query_outside_workspace_fetch_artifact() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let outside_path =
+            std::env::temp_dir().join(format!("letcode-fetch-search-{unique}.txt"));
+        std::fs::write(&outside_path, "needle-one\ndecoy\nneedle-two\n")
+            .expect("write fixture");
+
+        let args = json!({
+            "pattern": "needle",
+            "path": outside_path.to_string_lossy(),
+            "include": null,
+            "case_sensitive": false,
+            "max_results": 10,
+        });
+
+        let access = external_workspace_access_for_tool("search__rg", &args)
+            .expect("outside path should require approval");
+        assert_eq!(access.paths.len(), 1);
+
+        let registry = ToolRegistry::default_tools();
+        let denied = registry.call("search__rg", args.clone()).await;
+        assert!(!denied.ok);
+        assert!(
+            denied
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("outside workspace")),
+            "{:?}",
+            denied.error
+        );
+
+        let allowed = registry
+            .call_with_context(
+                "search__rg",
+                args,
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(allowed.ok, "{:?}", allowed.error);
+        let matches = allowed
+            .data
+            .as_ref()
+            .and_then(|data| data.get("matches"))
+            .and_then(serde_json::Value::as_array)
+            .expect("matches array");
+        assert_eq!(matches.len(), 2);
+
+        let _ = std::fs::remove_file(outside_path);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn external_workspace_mkdir_via_symlink_requires_explicit_grant() {

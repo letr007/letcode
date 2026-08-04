@@ -14,6 +14,12 @@ use crate::tool_names;
 
 const MAX_URL_CHARS: usize = 8_192;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Bodies larger than this are folded to a local artifact instead of being
+/// returned inline. The result carries a short preview plus `local_path` so the
+/// model can retrieve or search the full body with search__rg / fs__read.
+const FOLD_THRESHOLD_BYTES: usize = 64 * 1024;
+/// Number of characters kept inline when a body is folded.
+const FOLD_PREVIEW_CHARS: usize = 8 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,7 +38,7 @@ impl ToolHandler for WebFetchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch text content from a public HTTP or HTTPS URL. Redirects, response size, timeouts, and private-network access are restricted."
+        "Fetch text content from a public HTTP or HTTPS URL. Redirects, response size, timeouts, and private-network access are restricted. Response bodies over 64 KiB are folded: the result returns a short preview plus a `local_path` to a local copy; search or read that file with search__rg / fs__read to retrieve the full content on demand instead of returning it inline."
     }
 
     fn parameters(&self) -> Value {
@@ -147,18 +153,30 @@ async fn fetch_public_url_inner(raw_url: &str) -> Result<Value> {
         let (body, stream_truncated) = read_limited_body(&mut response).await?;
         let content_bytes = body.len();
         let (content, output_truncated) = content_for_output(&body);
-        let truncated = content_length_exceeds_limit || stream_truncated || output_truncated;
+        let folded = content_bytes > FOLD_THRESHOLD_BYTES;
+        let truncated =
+            content_length_exceeds_limit || stream_truncated || output_truncated || folded;
 
-        return Ok(json!({
+        let mut output = json!({
             "requested_url": requested_url,
             "final_url": current.to_string(),
             "status": status.as_u16(),
             "content_type": content_type,
-            "content": content,
             "content_bytes": content_bytes,
             "truncated": truncated,
             "redirects": redirects,
-        }));
+        });
+        if folded {
+            // Keep the full body addressable without bloating the context:
+            // return a preview plus a local artifact the model can search.
+            let local_path = write_fetch_artifact(&body).await?;
+            output["content"] = json!(fold_preview(&content, FOLD_PREVIEW_CHARS));
+            output["folded"] = json!(true);
+            output["local_path"] = json!(local_path);
+        } else {
+            output["content"] = json!(content);
+        }
+        return Ok(output);
     }
 }
 
@@ -332,6 +350,39 @@ fn content_for_output(body: &[u8]) -> (String, bool) {
     (output, false)
 }
 
+fn fold_preview(content: &str, max_chars: usize) -> String {
+    content.chars().take(max_chars).collect()
+}
+
+/// Deterministic artifact name derived from the body content. Identical bodies
+/// reuse the same file, so repeated fetches do not accumulate duplicates.
+///
+/// FNV-1a is used instead of std's DefaultHasher because the latter's internal
+/// algorithm is not stable across rustc releases, which would silently break
+/// cross-version deduplication.
+fn artifact_file_name(body: &[u8]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &byte in body {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}.txt")
+}
+
+async fn write_fetch_artifact(body: &[u8]) -> Result<String> {
+    let dir = std::env::temp_dir().join("letcode-fetch");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed to create web__fetch artifact dir {}", dir.display()))?;
+    let path = dir.join(artifact_file_name(body));
+    tokio::fs::write(&path, body)
+        .await
+        .with_context(|| format!("failed to write web__fetch artifact {}", path.display()))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 async fn read_limited_body(response: &mut reqwest::Response) -> Result<(Vec<u8>, bool)> {
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -432,6 +483,37 @@ mod tests {
         let (content, truncated) = content_for_output(&control_bytes);
         assert!(truncated);
         assert!(serde_json::to_string(&content).unwrap().len() <= MAX_RESPONSE_BYTES + 2);
+    }
+
+    #[test]
+    fn preview_truncates_to_max_chars() {
+        let content = "a".repeat(FOLD_PREVIEW_CHARS + 100);
+        assert_eq!(fold_preview(&content, FOLD_PREVIEW_CHARS).chars().count(), FOLD_PREVIEW_CHARS);
+
+        let short = "short body".to_string();
+        assert_eq!(fold_preview(&short, FOLD_PREVIEW_CHARS), short);
+    }
+
+    #[test]
+    fn artifact_name_is_content_deterministic() {
+        let first = vec![b'a'; FOLD_THRESHOLD_BYTES];
+        let duplicate = vec![b'a'; FOLD_THRESHOLD_BYTES];
+        let other = vec![b'b'; FOLD_THRESHOLD_BYTES];
+        assert_eq!(artifact_file_name(&first), artifact_file_name(&duplicate));
+        assert_ne!(artifact_file_name(&first), artifact_file_name(&other));
+    }
+
+    #[tokio::test]
+    async fn fold_writes_searchable_local_artifact() {
+        let body = vec![b'x'; FOLD_THRESHOLD_BYTES + 4 * 1024];
+        let path = write_fetch_artifact(&body).await.expect("artifact written");
+        assert!(
+            path.starts_with(std::env::temp_dir().to_string_lossy().as_ref()),
+            "artifact should live under the system temp dir: {path}"
+        );
+        let written = tokio::fs::read_to_string(&path).await.expect("read artifact back");
+        assert_eq!(written.len(), body.len());
+        std::fs::remove_file(&path).expect("clean up artifact");
     }
 
     #[tokio::test]

@@ -81,13 +81,11 @@ async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
         .unwrap_or(100)
         .clamp(1, 1000);
 
-    let mut command_args = vec![
-        "--line-number".to_string(),
-        "--column".to_string(),
-        "--no-heading".to_string(),
-        "--color".to_string(),
-        "never".to_string(),
-    ];
+    // `--json` emits one structured NDJSON object per event, so matches are
+    // read from `data.line_number` / `data.submatches[].start` below. Text
+    // output (`path:line:column:text`) would split on ':' and break for paths
+    // that contain a colon, e.g. `C:\...` drive prefixes on Windows.
+    let mut command_args = vec!["--json".to_string()];
 
     if !case_sensitive {
         command_args.push("--ignore-case".to_string());
@@ -125,15 +123,45 @@ async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
             break;
         }
 
-        let mut parts = line.splitn(4, ':');
-        let Some(path) = parts.next() else { continue };
-        let Some(line_number) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let Some(column) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+        if event.get("type").and_then(Value::as_str) != Some("match") {
+            continue;
+        }
+        let data = event.get("data");
+        let Some(path) = data
+            .and_then(|data| data.get("path"))
+            .and_then(|path| path.get("text"))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
-        let Some(text) = parts.next() else { continue };
+        let Some(line_number) = data.and_then(|data| data.get("line_number")).and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let Some(first_submatch) = data
+            .and_then(|data| data.get("submatches"))
+            .and_then(Value::as_array)
+            .and_then(|submatches| submatches.first())
+        else {
+            continue;
+        };
+        // rg reports byte offsets (0-based); expose a 1-based column like the
+        // previous `--column` output did.
+        let column = first_submatch
+            .get("start")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let text = data
+            .and_then(|data| data.get("lines"))
+            .and_then(|lines| lines.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches('\n')
+            .to_string();
 
         matches.push(json!({
             "path": path,
