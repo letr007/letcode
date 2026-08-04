@@ -25,7 +25,6 @@ use crate::transcript::{
 pub struct ParentViewProjection {
     pub snapshot: RuntimeRestoreSnapshot,
     pub runtime_context: RuntimeActiveContext,
-    pub evidence_count: usize,
 }
 
 /// Child-session view projection (frontend maps this to ChildSessionViewed).
@@ -131,11 +130,9 @@ pub fn project_parent_session_view(
         sessions_dir,
     )?;
     let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
-    let evidence_count = snapshot.snapshot.evidence.len();
     Ok(ParentViewProjection {
         snapshot,
         runtime_context,
-        evidence_count,
     })
 }
 
