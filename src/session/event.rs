@@ -87,7 +87,7 @@ pub enum SessionEvent {
 pub struct RetryLifecycleEvent {
     pub attempt: usize,
     pub max_attempts: usize,
-    pub delay_ms: u64,
+    pub delay_secs: u64,
     pub error: String,
 }
 

@@ -1657,12 +1657,10 @@ fn test_retry_config() -> RetryConfig {
     RetryConfig {
         enabled: true,
         max_attempts: 3,
-        max_elapsed_ms: 100,
         max_recovery_attempts: 3,
-        initial_delay_ms: 1,
-        max_delay_ms: 5,
+        initial_delay_secs: 1,
         backoff_multiplier: 2.0,
-        jitter_ms: 0,
+        jitter_secs: 0,
     }
 }
 
@@ -4743,7 +4741,7 @@ async fn responses_stream_retries_transient_response_failed_before_side_effects(
     assert!(matches!(lifecycle.as_slice(), [
         AgentEvent::LlmRetryScheduled(retry),
         AgentEvent::LlmRetryStarted(started)
-    ] if retry.attempt == 2 && retry.delay_ms == 1 && retry == started));
+    ] if retry.attempt == 2 && retry.delay_secs == 1 && retry == started));
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     server.await.expect("server task should finish");
 }
@@ -5042,7 +5040,7 @@ async fn compatible_chat_stream_propagates_http_retry_after_delay() {
     );
     let mut agent = Agent::new(client, "m1", 4, 4);
     let mut retry = test_retry_config();
-    retry.initial_delay_ms = 1;
+    retry.initial_delay_secs = 1;
     agent.set_retry_config(retry);
     let mut scheduled = Vec::new();
 
@@ -5063,7 +5061,7 @@ async fn compatible_chat_stream_propagates_http_retry_after_delay() {
 
     assert_eq!(result, "ok");
     assert_eq!(scheduled.len(), 1);
-    assert_eq!(scheduled[0].delay_ms, 1);
+    assert_eq!(scheduled[0].delay_secs, 1);
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     server.await.expect("server task should finish");
 }

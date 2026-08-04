@@ -438,7 +438,7 @@ impl LlmRequestTelemetryPhase {
 pub struct LlmRetryLifecycle {
     pub attempt: usize,
     pub max_attempts: usize,
-    pub delay_ms: u64,
+    pub delay_secs: u64,
     pub error: String,
 }
 

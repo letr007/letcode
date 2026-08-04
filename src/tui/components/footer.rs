@@ -615,25 +615,7 @@ fn phase_indicator_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 }
 
 fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
-    let mut spans = phase_indicator_spans(state, theme);
-    if let Some(retry) = &state.retry {
-        spans.push(Span::styled(" retry ", footer_dim_style(theme)));
-        spans.push(Span::styled(
-            format!("{}/{}", retry.attempt, retry.max_attempts),
-            footer_value_style(theme),
-        ));
-        spans.push(Span::styled(
-            format!(" {}ms", retry.delay_ms),
-            footer_muted_style(theme),
-        ));
-        if !retry.error.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}", retry.error),
-                footer_muted_style(theme),
-            ));
-        }
-    }
-    spans
+    phase_indicator_spans(state, theme)
 }
 
 #[cfg(test)]
@@ -650,21 +632,27 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     #[test]
-    fn footer_shows_scheduled_retry_details() {
+    fn footer_omits_scheduled_retry_details() {
         let mut state = TuiState::default();
         state.phase = AppPhase::Running;
         state.retry = Some(RetryLifecycleEvent {
             attempt: 2,
             max_attempts: 3,
-            delay_ms: 250,
+            delay_secs: 1,
             error: "temporary upstream failure".into(),
         });
 
-        let status = footer_status_spans(&state, crate::tui::Theme::dark())
+        let status_with_retry = footer_status_spans(&state, crate::tui::Theme::dark())
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(status.contains("retry 2/3 250ms temporary upstream failure"));
+        state.retry = None;
+        let status_without_retry = footer_status_spans(&state, crate::tui::Theme::dark())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert_eq!(status_with_retry, status_without_retry);
     }
 
     #[test]

@@ -1674,12 +1674,10 @@ mod tests {
             retry: Some(config::RetryConfig {
                 enabled: false,
                 max_attempts: 1,
-                max_elapsed_ms: 1_000,
                 max_recovery_attempts: 1,
-                initial_delay_ms: 10,
-                max_delay_ms: 10,
+                initial_delay_secs: 1,
                 backoff_multiplier: 1.0,
-                jitter_ms: 0,
+                jitter_secs: 0,
             }),
             models: IndexMap::from([(
                 "shared".into(),

@@ -2538,8 +2538,8 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
             *projection.phase = AppPhase::Running;
             *projection.toast = Some(ToastState::new(
                 format!(
-                    "Retrying {}/{} in {}ms",
-                    retry.attempt, retry.max_attempts, retry.delay_ms
+                    "Temporary issue. Trying again in {}s (attempt {} of {})",
+                    retry.delay_secs, retry.attempt, retry.max_attempts
                 ),
                 ToastKind::Info,
                 ToastState::DEFAULT_TICKS,
@@ -3276,13 +3276,17 @@ mod tests {
         let retry = RetryLifecycleEvent {
             attempt: 2,
             max_attempts: 3,
-            delay_ms: 250,
+            delay_secs: 1,
             error: "temporary upstream failure".into(),
         };
 
         state.apply_event(SessionEvent::RetryScheduled(retry.clone()));
         assert_eq!(state.retry, Some(retry.clone()));
         assert_eq!(state.phase, AppPhase::Running);
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Temporary issue. Trying again in 1s (attempt 2 of 3)")
+        );
 
         state.apply_event(SessionEvent::RetryStarted(retry));
         assert_eq!(state.retry, None);
@@ -3290,7 +3294,7 @@ mod tests {
         state.apply_event(SessionEvent::RetryScheduled(RetryLifecycleEvent {
             attempt: 3,
             max_attempts: 3,
-            delay_ms: 500,
+            delay_secs: 2,
             error: "temporary upstream failure".into(),
         }));
         state.apply_event(SessionEvent::Error(ErrorEvent::new("request failed")));
@@ -3302,7 +3306,7 @@ mod tests {
         let retry = RetryLifecycleEvent {
             attempt: 2,
             max_attempts: 3,
-            delay_ms: 250,
+            delay_secs: 1,
             error: "temporary upstream failure".into(),
         };
         let mut state = TuiState::default();

@@ -61,18 +61,6 @@ pub(crate) fn can_retry_attempt(config: &RetryConfig, attempt: usize) -> bool {
     config.enabled && attempt < config.max_attempts
 }
 
-pub(crate) fn retry_delay_within_elapsed_budget(
-    max_elapsed_ms: u64,
-    retry_started_at: std::time::Instant,
-    delay: Duration,
-) -> Option<Duration> {
-    retry_started_at
-        .elapsed()
-        .checked_add(delay)
-        .filter(|elapsed| *elapsed <= Duration::from_millis(max_elapsed_ms))
-        .map(|_| delay)
-}
-
 pub(crate) fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
     if let Some(status) = error.status() {
         return is_retryable_http_status(status);
@@ -249,11 +237,10 @@ fn error_chain_has_transient_message(error: &(dyn Error + 'static)) -> bool {
 }
 
 pub(crate) fn retry_delay(config: &RetryConfig, attempt: usize) -> Duration {
-    let base_ms = retry_backoff_delay_ms(config, attempt);
-    let delay_ms = base_ms
-        .saturating_add(retry_jitter_ms(config.jitter_ms))
-        .min(config.max_delay_ms);
-    Duration::from_millis(delay_ms)
+    Duration::from_secs(
+        retry_backoff_delay_secs(config, attempt)
+            .saturating_add(retry_jitter_secs(config.jitter_secs)),
+    )
 }
 
 pub(crate) fn retry_delay_from_headers(
@@ -261,42 +248,36 @@ pub(crate) fn retry_delay_from_headers(
     attempt: usize,
     headers: &HeaderMap,
 ) -> Duration {
-    let Some(retry_after_ms) = retry_after_delay_ms(headers) else {
-        return retry_delay(config, attempt);
-    };
-    Duration::from_millis(retry_after_ms.min(config.max_delay_ms))
+    retry_after_delay(headers).unwrap_or_else(|| retry_delay(config, attempt))
 }
 
-pub(crate) fn retry_after_delay_ms(headers: &HeaderMap) -> Option<u64> {
+pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
-        return (seconds > 0).then(|| seconds.saturating_mul(1_000));
+        return (seconds > 0).then(|| Duration::from_secs(seconds));
     }
 
     let retry_at = httpdate::parse_http_date(value).ok()?;
-    retry_at
-        .duration_since(SystemTime::now())
-        .ok()?
-        .as_millis()
-        .try_into()
-        .ok()
+    retry_at.duration_since(SystemTime::now()).ok()
 }
 
-pub(crate) fn retry_backoff_delay_ms(config: &RetryConfig, attempt: usize) -> u64 {
-    let exponent = attempt.saturating_sub(1) as i32;
+pub(crate) fn retry_backoff_delay_secs(config: &RetryConfig, attempt: usize) -> u64 {
+    let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
     let delay =
-        (config.initial_delay_ms as f64) * (config.backoff_multiplier as f64).powi(exponent);
-    let delay = delay.min(config.max_delay_ms as f64);
+        (config.initial_delay_secs as f64) * (config.backoff_multiplier as f64).powi(exponent);
+    if !delay.is_finite() || delay >= u64::MAX as f64 {
+        return u64::MAX;
+    }
     delay.round() as u64
 }
 
-fn retry_jitter_ms(max_jitter_ms: u64) -> u64 {
-    if max_jitter_ms == 0 {
+fn retry_jitter_secs(max_jitter_secs: u64) -> u64 {
+    if max_jitter_secs == 0 {
         return 0;
     }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::from(duration.subsec_nanos()) % (max_jitter_ms + 1))
+        .map(|duration| u64::from(duration.subsec_nanos()) % max_jitter_secs.saturating_add(1))
         .unwrap_or(0)
 }
 
@@ -308,12 +289,10 @@ mod tests {
         RetryConfig {
             enabled: true,
             max_attempts: 3,
-            max_elapsed_ms: 10_000,
             max_recovery_attempts: 3,
-            initial_delay_ms: 100,
-            max_delay_ms: 250,
+            initial_delay_secs: 1,
             backoff_multiplier: 2.0,
-            jitter_ms: 0,
+            jitter_secs: 0,
         }
     }
 
@@ -341,46 +320,45 @@ mod tests {
     }
 
     #[test]
-    fn backoff_delay_is_capped() {
+    fn retry_delay_uses_uncapped_exponential_backoff() {
         let config = test_retry_config();
 
-        assert_eq!(retry_backoff_delay_ms(&config, 1), 100);
-        assert_eq!(retry_backoff_delay_ms(&config, 2), 200);
-        assert_eq!(retry_backoff_delay_ms(&config, 3), 250);
-        assert_eq!(retry_delay(&config, 3), Duration::from_millis(250));
+        assert_eq!(retry_delay(&config, 1), Duration::from_secs(1));
+        assert_eq!(retry_delay(&config, 2), Duration::from_secs(2));
+        assert_eq!(retry_delay(&config, 3), Duration::from_secs(4));
+        assert_eq!(retry_delay(&config, 4), Duration::from_secs(8));
 
         let jittered = RetryConfig {
-            jitter_ms: 100,
+            jitter_secs: 1,
             ..config
         };
-        assert_eq!(retry_delay(&jittered, 3), Duration::from_millis(250));
+        let delay = retry_delay(&jittered, 3);
+        assert!(delay == Duration::from_secs(4) || delay == Duration::from_secs(5));
     }
 
     #[test]
-    fn retry_after_header_overrides_backoff_but_is_capped() {
+    fn retry_after_header_overrides_local_backoff_without_a_cap() {
         let config = RetryConfig {
             enabled: true,
             max_attempts: 3,
-            max_elapsed_ms: 10_000,
             max_recovery_attempts: 3,
-            initial_delay_ms: 250,
-            max_delay_ms: 1_500,
+            initial_delay_secs: 1,
             backoff_multiplier: 2.0,
-            jitter_ms: 0,
+            jitter_secs: 0,
         };
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "1".parse().unwrap());
 
-        assert_eq!(retry_after_delay_ms(&headers), Some(1_000));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(1)));
         assert_eq!(
-            retry_delay_from_headers(&config, 1, &headers),
-            Duration::from_millis(1_000)
+            retry_delay_from_headers(&config, 2, &headers),
+            Duration::from_secs(1)
         );
 
         headers.insert(RETRY_AFTER, "30".parse().unwrap());
         assert_eq!(
             retry_delay_from_headers(&config, 1, &headers),
-            Duration::from_millis(1_500)
+            Duration::from_secs(30)
         );
     }
 
@@ -389,25 +367,23 @@ mod tests {
         let config = RetryConfig {
             enabled: true,
             max_attempts: 3,
-            max_elapsed_ms: 10_000,
             max_recovery_attempts: 3,
-            initial_delay_ms: 250,
-            max_delay_ms: 2_000,
+            initial_delay_secs: 1,
             backoff_multiplier: 2.0,
-            jitter_ms: 0,
+            jitter_secs: 0,
         };
         let mut headers = HeaderMap::new();
 
         headers.insert(RETRY_AFTER, "not-a-date".parse().unwrap());
         assert_eq!(
             retry_delay_from_headers(&config, 1, &headers),
-            Duration::from_millis(250)
+            Duration::from_secs(1)
         );
 
         headers.insert(RETRY_AFTER, "0".parse().unwrap());
         assert_eq!(
             retry_delay_from_headers(&config, 1, &headers),
-            Duration::from_millis(250)
+            Duration::from_secs(1)
         );
 
         headers.insert(
@@ -418,25 +394,13 @@ mod tests {
         );
         assert_eq!(
             retry_delay_from_headers(&config, 1, &headers),
-            Duration::from_millis(250)
+            Duration::from_secs(1)
         );
 
         headers.insert(RETRY_AFTER, "30".parse().unwrap());
         assert_eq!(
             retry_delay_from_headers(&config, 1, &headers),
-            Duration::from_millis(2_000)
-        );
-    }
-
-    #[test]
-    fn elapsed_budget_rejects_a_retry_that_would_exceed_it() {
-        let started_at = std::time::Instant::now();
-        assert!(
-            retry_delay_within_elapsed_budget(10_000, started_at, Duration::from_millis(1))
-                .is_some()
-        );
-        assert!(
-            retry_delay_within_elapsed_budget(0, started_at, Duration::from_millis(1)).is_none()
+            Duration::from_secs(30)
         );
     }
 
@@ -445,12 +409,10 @@ mod tests {
         let config = RetryConfig {
             enabled: true,
             max_attempts: 3,
-            max_elapsed_ms: 10_000,
             max_recovery_attempts: 3,
-            initial_delay_ms: 250,
-            max_delay_ms: 2_000,
+            initial_delay_secs: 5,
             backoff_multiplier: 2.0,
-            jitter_ms: 0,
+            jitter_secs: 0,
         };
         let retry_at = SystemTime::now() + Duration::from_secs(1);
         let mut headers = HeaderMap::new();
@@ -460,8 +422,8 @@ mod tests {
         );
 
         let delay = retry_delay_from_headers(&config, 1, &headers);
-        assert!(delay <= Duration::from_millis(2_000));
-        assert!(delay > Duration::from_millis(0));
+        assert!(delay <= Duration::from_secs(1));
+        assert!(delay > Duration::ZERO);
     }
 
     #[test]

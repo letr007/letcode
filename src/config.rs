@@ -53,9 +53,7 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
-const MAX_RETRY_ATTEMPTS: usize = 10;
-const MAX_RETRY_DELAY_MS: u64 = 60_000;
-const MAX_RETRY_ELAPSED_MS: u64 = 300_000;
+const MAX_RETRY_ATTEMPTS: usize = 50;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
 static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -695,25 +693,21 @@ impl Default for CompactionConfig {
 pub struct RetryConfig {
     pub enabled: bool,
     pub max_attempts: usize,
-    pub max_elapsed_ms: u64,
     pub max_recovery_attempts: usize,
-    pub initial_delay_ms: u64,
-    pub max_delay_ms: u64,
+    pub initial_delay_secs: u64,
     pub backoff_multiplier: f32,
-    pub jitter_ms: u64,
+    pub jitter_secs: u64,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_attempts: 3,
-            max_elapsed_ms: 30_000,
+            max_attempts: 50,
             max_recovery_attempts: 3,
-            initial_delay_ms: 250,
-            max_delay_ms: 2_000,
+            initial_delay_secs: 1,
             backoff_multiplier: 2.0,
-            jitter_ms: 100,
+            jitter_secs: 1,
         }
     }
 }
@@ -865,12 +859,10 @@ struct RawCompactionConfig {
 struct RawRetryConfig {
     enabled: Option<bool>,
     max_attempts: Option<usize>,
-    max_elapsed_ms: Option<u64>,
     max_recovery_attempts: Option<usize>,
-    initial_delay_ms: Option<u64>,
-    max_delay_ms: Option<u64>,
+    initial_delay_secs: Option<u64>,
     backoff_multiplier: Option<f32>,
-    jitter_ms: Option<u64>,
+    jitter_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1463,13 +1455,6 @@ fn build_retry_config_overlay(
     if max_attempts > MAX_RETRY_ATTEMPTS {
         bail!("{path}.max_attempts must be at most {MAX_RETRY_ATTEMPTS}");
     }
-    let max_elapsed_ms = positive_u64(
-        &format!("{path}.max_elapsed_ms"),
-        raw.max_elapsed_ms.unwrap_or(base.max_elapsed_ms),
-    )?;
-    if max_elapsed_ms > MAX_RETRY_ELAPSED_MS {
-        bail!("{path}.max_elapsed_ms must be at most {MAX_RETRY_ELAPSED_MS}");
-    }
     let max_recovery_attempts = positive_usize(
         &format!("{path}.max_recovery_attempts"),
         raw.max_recovery_attempts
@@ -1478,24 +1463,11 @@ fn build_retry_config_overlay(
     if max_recovery_attempts > MAX_RECOVERY_ATTEMPTS {
         bail!("{path}.max_recovery_attempts must be at most {MAX_RECOVERY_ATTEMPTS}");
     }
-    let initial_delay_ms = positive_u64(
-        &format!("{path}.initial_delay_ms"),
-        raw.initial_delay_ms.unwrap_or(base.initial_delay_ms),
+    let initial_delay_secs = positive_u64(
+        &format!("{path}.initial_delay_secs"),
+        raw.initial_delay_secs.unwrap_or(base.initial_delay_secs),
     )?;
-    let max_delay_ms = positive_u64(
-        &format!("{path}.max_delay_ms"),
-        raw.max_delay_ms.unwrap_or(base.max_delay_ms),
-    )?;
-    if max_delay_ms > MAX_RETRY_DELAY_MS {
-        bail!("{path}.max_delay_ms must be at most {MAX_RETRY_DELAY_MS}");
-    }
-    if max_delay_ms < initial_delay_ms {
-        bail!("{path}.max_delay_ms must be greater than or equal to initial_delay_ms");
-    }
-    let jitter_ms = raw.jitter_ms.unwrap_or(base.jitter_ms);
-    if jitter_ms > max_delay_ms {
-        bail!("{path}.jitter_ms must be less than or equal to max_delay_ms");
-    }
+    let jitter_secs = raw.jitter_secs.unwrap_or(base.jitter_secs);
     let backoff_multiplier = raw.backoff_multiplier.unwrap_or(base.backoff_multiplier);
     validate_f32_range(
         &format!("{path}.backoff_multiplier"),
@@ -1507,18 +1479,16 @@ fn build_retry_config_overlay(
     Ok(RetryConfig {
         enabled: raw.enabled.unwrap_or(base.enabled),
         max_attempts,
-        max_elapsed_ms,
         max_recovery_attempts,
-        initial_delay_ms,
-        max_delay_ms,
+        initial_delay_secs,
         backoff_multiplier,
-        jitter_ms,
+        jitter_secs,
     })
 }
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\nmax_elapsed_ms = 30000\nmax_recovery_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# max_elapsed_ms = 30000\n# max_recovery_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = false\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = false\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -1645,7 +1615,7 @@ mod tests {
         assert!(message.contains("[global.compaction]"));
         assert!(message.contains("active model input budget"));
         assert!(message.contains("[global.retry]"));
-        assert!(message.contains("max_attempts = 3"));
+        assert!(message.contains("max_attempts = 50"));
         assert!(message.contains("# Optional runtime limits:"));
         assert!(message.contains("tool_timeout_secs = 60"));
     }
@@ -1682,10 +1652,9 @@ mod tests {
             [global.retry]
             enabled = false
             max_attempts = 4
-            initial_delay_ms = 100
-            max_delay_ms = 800
+            initial_delay_secs = 2
             backoff_multiplier = 1.5
-            jitter_ms = 0
+            jitter_secs = 0
 
             [providers.openai]
             api_key = "config-key"
@@ -1701,12 +1670,10 @@ mod tests {
             RetryConfig {
                 enabled: false,
                 max_attempts: 4,
-                max_elapsed_ms: 30_000,
                 max_recovery_attempts: 3,
-                initial_delay_ms: 100,
-                max_delay_ms: 800,
+                initial_delay_secs: 2,
                 backoff_multiplier: 1.5,
-                jitter_ms: 0,
+                jitter_secs: 0,
             }
         );
     }
@@ -1719,10 +1686,9 @@ mod tests {
             [global.retry]
             enabled = false
             max_attempts = 2
-            initial_delay_ms = 100
-            max_delay_ms = 10000
+            initial_delay_secs = 2
             backoff_multiplier = 3.0
-            jitter_ms = 20
+            jitter_secs = 1
 
             [providers.openai]
             api_key = "config-key"
@@ -1743,70 +1709,21 @@ mod tests {
             Some(RetryConfig {
                 enabled: false,
                 max_attempts: 5,
-                max_elapsed_ms: 30_000,
                 max_recovery_attempts: 3,
-                initial_delay_ms: 100,
-                max_delay_ms: 10000,
+                initial_delay_secs: 2,
                 backoff_multiplier: 3.0,
-                jitter_ms: 20,
+                jitter_secs: 1,
             })
         );
     }
 
     #[test]
-    fn rejects_invalid_global_retry_config() {
+    fn rejects_retry_attempts_above_maximum() {
         let _guard = lock_env();
         let path = write_temp_config(
             r#"
             [global.retry]
-            initial_delay_ms = 1000
-            max_delay_ms = 500
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(error.to_string().contains(
-            "global.retry.max_delay_ms must be greater than or equal to initial_delay_ms"
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_provider_retry_config_with_provider_path() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.retry]
-            initial_delay_ms = 1000
-            max_delay_ms = 500
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(error.to_string().contains(
-            "providers.openai.retry.max_delay_ms must be greater than or equal to initial_delay_ms"
-        ));
-    }
-
-    #[test]
-    fn rejects_retry_jitter_larger_than_max_delay() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [global.retry]
-            max_delay_ms = 500
-            jitter_ms = 501
+            max_attempts = 51
 
             [providers.openai]
             api_key = "config-key"
@@ -1820,51 +1737,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("global.retry.jitter_ms must be less than or equal to max_delay_ms")
-        );
-    }
-
-    #[test]
-    fn rejects_retry_limits_above_safety_bounds() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [global.retry]
-            max_attempts = 11
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("global.retry.max_attempts must be at most 10")
-        );
-
-        let path = write_temp_config(
-            r#"
-            [global.retry]
-            max_delay_ms = 60001
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("global.retry.max_delay_ms must be at most 60000")
+                .contains("global.retry.max_attempts must be at most 50")
         );
     }
 

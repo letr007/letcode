@@ -1,8 +1,6 @@
 use super::*;
 use crate::langfuse_trace;
-use crate::retry::{
-    is_retryable_provider_error_fields, retry_delay_from_headers, retry_delay_within_elapsed_budget,
-};
+use crate::retry::{is_retryable_provider_error_fields, retry_delay_from_headers};
 use crate::user_content::UserMessageContent;
 use tracing::Instrument;
 
@@ -65,7 +63,7 @@ where
     let retry = LlmRetryLifecycle {
         attempt: attempt.saturating_add(1),
         max_attempts,
-        delay_ms: delay.as_millis().try_into().unwrap_or(u64::MAX),
+        delay_secs: delay.as_secs(),
         error: error.to_string(),
     };
     on_event(AgentEvent::LlmRetryScheduled(retry.clone())).await?;
@@ -76,8 +74,6 @@ async fn wait_for_retry<E, Efut>(
     attempt: usize,
     max_attempts: usize,
     delay: std::time::Duration,
-    max_elapsed_ms: u64,
-    retry_started_at: std::time::Instant,
     error: impl std::fmt::Display,
     on_event: &mut E,
 ) -> Result<()>
@@ -85,8 +81,6 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let delay = retry_delay_within_elapsed_budget(max_elapsed_ms, retry_started_at, delay)
-        .ok_or_else(|| anyhow!("retry elapsed-time budget exhausted"))?;
     let retry = emit_retry_scheduled(attempt, max_attempts, delay, error, on_event).await?;
     tokio::time::sleep(delay).await;
     on_event(AgentEvent::LlmRetryStarted(retry)).await
@@ -516,7 +510,6 @@ where
             }
         };
 
-        let retry_started_at = std::time::Instant::now();
         let mut attempt = 1;
         let (response, mut turn_text, completed_reasoning_ids, prepared_telemetry) = 'retry_response_stream: loop {
             let mut prepared_telemetry = llm_request_telemetry(
@@ -557,7 +550,7 @@ where
                     warn!(
                         attempt,
                         max_attempts = agent.retry_config.max_attempts,
-                        delay_ms = delay.as_millis(),
+                        delay_secs = delay.as_secs(),
                         error = %error,
                         "retrying streamed response creation"
                     );
@@ -572,8 +565,6 @@ where
                         attempt,
                         agent.retry_config.max_attempts,
                         delay,
-                        agent.retry_config.max_elapsed_ms,
-                        retry_started_at,
                         &error,
                         &mut on_event,
                     )
@@ -620,7 +611,7 @@ where
                         warn!(
                             attempt,
                             max_attempts = agent.retry_config.max_attempts,
-                            delay_ms = delay.as_millis(),
+                            delay_secs = delay.as_secs(),
                             error = %error,
                             "retrying streamed response read before side effects"
                         );
@@ -629,8 +620,6 @@ where
                             attempt,
                             agent.retry_config.max_attempts,
                             delay,
-                            agent.retry_config.max_elapsed_ms,
-                            retry_started_at,
                             &error,
                             &mut on_event,
                         )
@@ -792,8 +781,6 @@ where
                                 attempt,
                                 agent.retry_config.max_attempts,
                                 delay,
-                                agent.retry_config.max_elapsed_ms,
-                                retry_started_at,
                                 &error,
                                 &mut on_event,
                             )
@@ -852,8 +839,6 @@ where
                                 attempt,
                                 agent.retry_config.max_attempts,
                                 delay,
-                                agent.retry_config.max_elapsed_ms,
-                                retry_started_at,
                                 &error,
                                 &mut on_event,
                             )
@@ -906,8 +891,6 @@ where
                                 attempt,
                                 agent.retry_config.max_attempts,
                                 delay,
-                                agent.retry_config.max_elapsed_ms,
-                                retry_started_at,
                                 &error,
                                 &mut on_event,
                             )
@@ -935,7 +918,7 @@ where
                     warn!(
                         attempt,
                         max_attempts = agent.retry_config.max_attempts,
-                        delay_ms = delay.as_millis(),
+                        delay_secs = delay.as_secs(),
                         "retrying streamed response after early end before side effects"
                     );
                     emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
@@ -943,8 +926,6 @@ where
                         attempt,
                         agent.retry_config.max_attempts,
                         delay,
-                        agent.retry_config.max_elapsed_ms,
-                        retry_started_at,
                         "stream ended before response.completed",
                         &mut on_event,
                     )
@@ -1251,7 +1232,6 @@ where
             }
         };
 
-        let retry_started_at = std::time::Instant::now();
         let mut attempt = 1;
         'retry_chat_stream: loop {
             let mut prepared_telemetry = llm_request_telemetry(
@@ -1306,8 +1286,6 @@ where
                         attempt,
                         agent.retry_config.max_attempts,
                         delay,
-                        agent.retry_config.max_elapsed_ms,
-                        retry_started_at,
                         &error,
                         &mut on_event,
                     )
@@ -1358,7 +1336,7 @@ where
                         warn!(
                             attempt,
                             max_attempts = agent.retry_config.max_attempts,
-                            delay_ms = delay.as_millis(),
+                            delay_secs = delay.as_secs(),
                             error = %error,
                             "retrying chat completions stream read before side effects"
                         );
@@ -1371,8 +1349,6 @@ where
                             attempt,
                             agent.retry_config.max_attempts,
                             delay,
-                            agent.retry_config.max_elapsed_ms,
-                            retry_started_at,
                             &error,
                             &mut on_event,
                         )
@@ -1427,7 +1403,7 @@ where
                                 phase = "event_parse",
                                 attempt,
                                 max_attempts = agent.retry_config.max_attempts,
-                                delay_ms = delay.as_millis(),
+                                delay_secs = delay.as_secs(),
                                 error = %error,
                                 "retrying chat completions stream after transient event parse failure before side effects"
                             );
@@ -1436,8 +1412,6 @@ where
                                 attempt,
                                 agent.retry_config.max_attempts,
                                 delay,
-                                agent.retry_config.max_elapsed_ms,
-                                retry_started_at,
                                 &error,
                                 &mut on_event,
                             )
@@ -1579,7 +1553,7 @@ where
                             phase = "finish_event_parse",
                             attempt,
                             max_attempts = agent.retry_config.max_attempts,
-                            delay_ms = delay.as_millis(),
+                            delay_secs = delay.as_secs(),
                             error = %error,
                             "retrying chat completions stream after transient final event parse failure before side effects"
                         );
@@ -1588,8 +1562,6 @@ where
                             attempt,
                             agent.retry_config.max_attempts,
                             delay,
-                            agent.retry_config.max_elapsed_ms,
-                            retry_started_at,
                             &error,
                             &mut on_event,
                         )
@@ -1743,7 +1715,7 @@ where
                 warn!(
                     attempt,
                     max_attempts = agent.retry_config.max_attempts,
-                    delay_ms = delay.as_millis(),
+                    delay_secs = delay.as_secs(),
                     "retrying chat completions stream after early end before side effects"
                 );
                 emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
@@ -1751,8 +1723,6 @@ where
                     attempt,
                     agent.retry_config.max_attempts,
                     delay,
-                    agent.retry_config.max_elapsed_ms,
-                    retry_started_at,
                     "stream ended before a completion finish reason",
                     &mut on_event,
                 )

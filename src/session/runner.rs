@@ -1917,7 +1917,7 @@ fn retry_lifecycle_event(retry: LlmRetryLifecycle) -> RetryLifecycleEvent {
     RetryLifecycleEvent {
         attempt: retry.attempt,
         max_attempts: retry.max_attempts,
-        delay_ms: retry.delay_ms,
+        delay_secs: retry.delay_secs,
         error: retry.error,
     }
 }
