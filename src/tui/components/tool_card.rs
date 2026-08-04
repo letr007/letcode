@@ -1612,36 +1612,215 @@ fn render_diff_block(
     lines.push(render_diff_card_header_line(&header, theme, width));
     lines.push(render_diff_card_spacer_line(theme, width));
 
-    let max_lines = max_body_lines();
-    let mut state = DiffLineNumbers::default();
-    for (idx, line) in diff
+    let mut body = diff
         .lines()
         .filter(|line| !is_diff_file_header_line(line))
-        .enumerate()
+        .take(max_body_lines().saturating_add(1))
+        .collect::<Vec<_>>();
+    if body.len() > max_body_lines() {
+        body.pop();
+        body.push("… output clipped in TUI");
+    }
+
+    if diff_uses_side_by_side_layout(width)
+        && body.iter().any(|line| {
+            (line.starts_with('+') || line.starts_with('-')) && !is_diff_file_header_line(line)
+        })
     {
-        if idx >= max_lines {
+        lines.extend(render_side_by_side_diff_body(&body, theme, width));
+    } else {
+        let mut state = DiffLineNumbers::default();
+        for line in body {
+            let (old_no, new_no) = state.next(line);
             lines.push(render_diff_card_body_line(
-                None,
-                None,
-                "… output clipped in TUI",
-                diff_meta_style(),
+                old_no,
+                new_no,
+                line,
+                diff_line_style(line),
                 theme,
                 width,
             ));
-            break;
         }
-        let (old_no, new_no) = state.next(line);
-        lines.push(render_diff_card_body_line(
-            old_no,
-            new_no,
-            line,
-            diff_line_style(line),
-            theme,
-            width,
-        ));
     }
     lines.push(render_diff_card_spacer_line(theme, width));
     lines
+}
+
+const DIFF_SIDE_BY_SIDE_SEPARATOR: &str = " │ ";
+const DIFF_SIDE_BY_SIDE_MIN_PANEL_WIDTH: usize = 20;
+
+fn diff_uses_side_by_side_layout(width: usize) -> bool {
+    let content_width = shell_card_content_width(width);
+    content_width
+        >= DIFF_SIDE_BY_SIDE_MIN_PANEL_WIDTH * 2 + display_width(DIFF_SIDE_BY_SIDE_SEPARATOR)
+}
+
+fn render_side_by_side_diff_body(
+    body: &[&str],
+    theme: Theme,
+    width: usize,
+) -> Vec<SemanticLine<Style>> {
+    let content_width = shell_card_content_width(width);
+    let panel_width = content_width.saturating_sub(display_width(DIFF_SIDE_BY_SIDE_SEPARATOR)) / 2;
+    let mut lines = Vec::new();
+    let mut state = DiffLineNumbers::default();
+    let mut index = 0;
+
+    while index < body.len() {
+        let line = body[index];
+        if line.starts_with('-') && !is_diff_file_header_line(line) {
+            let mut removed = Vec::new();
+            while index < body.len()
+                && body[index].starts_with('-')
+                && !is_diff_file_header_line(body[index])
+            {
+                let (old_no, _) = state.next(body[index]);
+                removed.push((old_no, body[index]));
+                index += 1;
+            }
+
+            let mut added = Vec::new();
+            while index < body.len()
+                && body[index].starts_with('+')
+                && !is_diff_file_header_line(body[index])
+            {
+                let (_, new_no) = state.next(body[index]);
+                added.push((new_no, body[index]));
+                index += 1;
+            }
+
+            for row in 0..removed.len().max(added.len()) {
+                lines.push(render_side_by_side_diff_line(
+                    removed.get(row).copied(),
+                    added.get(row).copied(),
+                    panel_width,
+                    theme,
+                    width,
+                ));
+            }
+            continue;
+        }
+
+        if line.starts_with('+') && !is_diff_file_header_line(line) {
+            let mut added = Vec::new();
+            while index < body.len()
+                && body[index].starts_with('+')
+                && !is_diff_file_header_line(body[index])
+            {
+                let (_, new_no) = state.next(body[index]);
+                added.push((new_no, body[index]));
+                index += 1;
+            }
+            for added in added {
+                lines.push(render_side_by_side_diff_line(
+                    None,
+                    Some(added),
+                    panel_width,
+                    theme,
+                    width,
+                ));
+            }
+            continue;
+        }
+
+        let (old_no, new_no) = state.next(line);
+        if line.starts_with(' ') {
+            lines.push(render_side_by_side_diff_line(
+                Some((old_no, line)),
+                Some((new_no, line)),
+                panel_width,
+                theme,
+                width,
+            ));
+        } else {
+            lines.push(render_diff_card_body_line(
+                old_no,
+                new_no,
+                line,
+                diff_line_style(line),
+                theme,
+                width,
+            ));
+        }
+        index += 1;
+    }
+
+    lines
+}
+
+fn render_side_by_side_diff_line(
+    removed: Option<(Option<usize>, &str)>,
+    added: Option<(Option<usize>, &str)>,
+    panel_width: usize,
+    theme: Theme,
+    width: usize,
+) -> SemanticLine<Style> {
+    let mut segments = render_diff_side(removed, panel_width);
+    segments.push(SemanticSpan::decoration(
+        DIFF_SIDE_BY_SIDE_SEPARATOR,
+        diff_meta_style(),
+    ));
+    segments.extend(render_diff_side(added, panel_width));
+    render_card_line_with_guide(
+        &segments,
+        diff_header_fill_style(),
+        TOOL_CARD_GUIDE,
+        theme,
+        width,
+        Break::HardBreak,
+    )
+}
+
+fn render_diff_side(
+    entry: Option<(Option<usize>, &str)>,
+    width: usize,
+) -> Vec<SemanticSpan<Style>> {
+    let Some((number, content)) = entry else {
+        return vec![SemanticSpan::decoration(
+            " ".repeat(width),
+            diff_header_fill_style(),
+        )];
+    };
+
+    let gutter_style = Style::default()
+        .fg(DIFF_CARD_GUTTER)
+        .bg(DIFF_CARD_GUTTER_BG);
+    let gutter_pad_style = Style::default().bg(DIFF_CARD_GUTTER_BG);
+    let content_style = diff_line_style(content);
+    let pad_style = Style::default().bg(content_style.bg.unwrap_or(DIFF_CARD_BG));
+    let (marker, body, marker_style) = diff_marker_and_body(content);
+    let clipped_notice = content == "… output clipped in TUI";
+    let marker_span = if clipped_notice {
+        SemanticSpan::decoration(marker, marker_style)
+    } else {
+        SemanticSpan::source(marker, marker_style)
+    };
+    let body_span = if clipped_notice {
+        SemanticSpan::decoration(body, content_style)
+    } else {
+        SemanticSpan::source(body, content_style)
+    };
+    let mut spans = clip_semantic_spans(
+        vec![
+            SemanticSpan::decoration(diff_line_number(number), gutter_style),
+            SemanticSpan::decoration(" ", gutter_pad_style),
+            marker_span,
+            SemanticSpan::decoration(" ", pad_style),
+            body_span,
+        ],
+        width,
+    );
+    let used = spans
+        .iter()
+        .map(|span| display_width(&span.text))
+        .sum::<usize>();
+    if used < width {
+        spans.push(SemanticSpan::decoration(
+            " ".repeat(width - used),
+            pad_style,
+        ));
+    }
+    spans
 }
 
 fn render_limited_text_lines(
@@ -4012,8 +4191,165 @@ mod tests {
         assert!(rendered.contains("← Patch src/main.rs"), "{rendered}");
         assert!(!rendered.contains("--- src/main.rs"), "{rendered}");
         assert!(!rendered.contains("+++ src/main.rs"), "{rendered}");
+        assert!(!rendered.contains("@@"), "{rendered}");
         assert!(rendered.contains("- old line"), "{rendered}");
         assert!(rendered.contains("+ new line"), "{rendered}");
+    }
+
+    #[test]
+    fn apply_patch_pairs_unequal_replacements_in_side_by_side_columns() {
+        let tool = ToolView {
+            call_id: "call-side-by-side-edit".into(),
+            name: "edit__apply_patch".into(),
+            summary: "patched".into(),
+            arguments: Some(
+                json!({
+                    "edits": [{
+                        "path": "src/main.rs",
+                        "find": "old first\nold second",
+                        "replace": "new first",
+                        "replace_all": false
+                    }]
+                })
+                .to_string(),
+            ),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let lines = render_tool_card_lines(&tool, Theme::dark(), 80);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let paired = lines
+            .iter()
+            .map(Line::to_string)
+            .find(|line| line.contains("old first"))
+            .expect("paired replacement row");
+        let unmatched = lines
+            .iter()
+            .map(Line::to_string)
+            .find(|line| line.contains("old second"))
+            .expect("unmatched deletion row");
+
+        assert!(paired.contains(DIFF_SIDE_BY_SIDE_SEPARATOR), "{rendered}");
+        assert!(paired.contains("new first"), "{rendered}");
+        assert!(
+            unmatched.contains(DIFF_SIDE_BY_SIDE_SEPARATOR),
+            "{rendered}"
+        );
+        assert!(!unmatched.contains("new first"), "{rendered}");
+    }
+
+    #[test]
+    fn side_by_side_diff_keeps_context_on_both_sides() {
+        let lines = render_diff_block(
+            "Patch src/main.rs".into(),
+            "@@ -1,3 +1,3 @@\n context before\n-old line\n+new line\n context after\n",
+            None,
+            Theme::dark(),
+            80,
+        )
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
+
+        let context_rows = lines
+            .iter()
+            .filter(|line| line.contains("context before") || line.contains("context after"))
+            .collect::<Vec<_>>();
+        assert_eq!(context_rows.len(), 2, "{rendered}");
+        assert!(
+            context_rows
+                .iter()
+                .all(|line| line.matches("context").count() == 2),
+            "{rendered}"
+        );
+        assert!(
+            context_rows
+                .iter()
+                .all(|line| line.contains(DIFF_SIDE_BY_SIDE_SEPARATOR)),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn write_and_append_render_additions_with_an_empty_left_side() {
+        for name in ["fs__write", "fs__append"] {
+            let tool = ToolView {
+                call_id: format!("call-{name}"),
+                name: name.into(),
+                summary: "write".into(),
+                arguments: Some(json!({"path": "file.rs", "content": "added line"}).to_string()),
+                output: None,
+                status: ToolExecutionStatus::Succeeded,
+            };
+            let line = render_tool_card_lines(&tool, Theme::dark(), 80)
+                .into_iter()
+                .map(|line| line.to_string())
+                .find(|line| line.contains("added line"))
+                .expect("added line");
+            let (left, right) = line
+                .split_once(DIFF_SIDE_BY_SIDE_SEPARATOR)
+                .expect("side-by-side separator");
+
+            assert!(
+                left.strip_prefix(TOOL_GUIDE_GLYPH)
+                    .unwrap_or(left)
+                    .trim()
+                    .is_empty(),
+                "{line}"
+            );
+            assert!(right.contains("+ added line"), "{line}");
+        }
+    }
+
+    #[test]
+    fn diff_uses_single_column_layout_at_narrow_width_without_overflow() {
+        let tool = ToolView {
+            call_id: "call-narrow-edit".into(),
+            name: "edit__apply_patch".into(),
+            summary: "patched".into(),
+            arguments: Some(
+                json!({
+                    "edits": [{
+                        "path": "src/main.rs",
+                        "find": "old line",
+                        "replace": "new line",
+                        "replace_all": false
+                    }]
+                })
+                .to_string(),
+            ),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let lines = render_tool_card_lines(&tool, Theme::dark(), 40);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !rendered.contains(DIFF_SIDE_BY_SIDE_SEPARATOR),
+            "{rendered}"
+        );
+        assert!(rendered.contains("- old line"), "{rendered}");
+        assert!(rendered.contains("+ new line"), "{rendered}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= 40),
+            "{rendered}"
+        );
     }
 
     #[test]
