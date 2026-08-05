@@ -137,7 +137,9 @@ async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
         else {
             continue;
         };
-        let Some(line_number) = data.and_then(|data| data.get("line_number")).and_then(Value::as_u64)
+        let Some(line_number) = data
+            .and_then(|data| data.get("line_number"))
+            .and_then(Value::as_u64)
         else {
             continue;
         };

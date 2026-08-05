@@ -488,7 +488,10 @@ mod tests {
     #[test]
     fn preview_truncates_to_max_chars() {
         let content = "a".repeat(FOLD_PREVIEW_CHARS + 100);
-        assert_eq!(fold_preview(&content, FOLD_PREVIEW_CHARS).chars().count(), FOLD_PREVIEW_CHARS);
+        assert_eq!(
+            fold_preview(&content, FOLD_PREVIEW_CHARS).chars().count(),
+            FOLD_PREVIEW_CHARS
+        );
 
         let short = "short body".to_string();
         assert_eq!(fold_preview(&short, FOLD_PREVIEW_CHARS), short);
@@ -511,7 +514,9 @@ mod tests {
             path.starts_with(std::env::temp_dir().to_string_lossy().as_ref()),
             "artifact should live under the system temp dir: {path}"
         );
-        let written = tokio::fs::read_to_string(&path).await.expect("read artifact back");
+        let written = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read artifact back");
         assert_eq!(written.len(), body.len());
         std::fs::remove_file(&path).expect("clean up artifact");
     }

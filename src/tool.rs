@@ -2611,10 +2611,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let outside_path =
-            std::env::temp_dir().join(format!("letcode-fetch-search-{unique}.txt"));
-        std::fs::write(&outside_path, "needle-one\ndecoy\nneedle-two\n")
-            .expect("write fixture");
+        let outside_path = std::env::temp_dir().join(format!("letcode-fetch-search-{unique}.txt"));
+        std::fs::write(&outside_path, "needle-one\ndecoy\nneedle-two\n").expect("write fixture");
 
         let args = json!({
             "pattern": "needle",
