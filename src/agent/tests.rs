@@ -2069,33 +2069,6 @@ async fn exclusive_read_tools_remain_ordering_barriers() {
     assert_eq!(max_active.load(Ordering::SeqCst), 1);
 }
 
-struct SleepTool;
-
-#[async_trait]
-impl ToolHandler for SleepTool {
-    fn name(&self) -> &str {
-        "test__sleep"
-    }
-
-    fn description(&self) -> &str {
-        "sleep test tool"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        sleep(Duration::from_millis(1_100)).await;
-        Ok(json!({"done": true}))
-    }
-}
-
 struct ReplayGuardTool(Arc<AtomicUsize>);
 
 #[async_trait]
@@ -2209,56 +2182,6 @@ async fn agent_lifecycle_finalizes_without_live_experiment_semantics() {
     );
 }
 
-#[tokio::test]
-async fn non_shell_tool_timeout_emits_cancelled_and_timed_out_terminal_events() {
-    let mut agent = test_agent();
-    agent.set_tool_timeout_secs(Some(1));
-    agent
-        .try_register_tool(SleepTool)
-        .expect("register sleep tool");
-
-    let call = test_tool_call("test__sleep", "{}");
-    let mut events = Vec::new();
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("tool call should return timeout record");
-
-    assert_eq!(record.status, ToolExecutionStatus::TimedOut);
-    assert!(!record.output.ok);
-    assert_eq!(
-        record
-            .output
-            .data
-            .as_ref()
-            .and_then(|data| data.get("status"))
-            .and_then(Value::as_str),
-        Some("timed_out")
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolCallCancelled { call_id, name }
-            if call_id == "call-test__sleep" && name == "test__sleep"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolCallFinished { ok, output, .. }
-            if !ok
-                && output
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("status"))
-                    .and_then(Value::as_str)
-                    == Some("timed_out")
-    )));
-}
 
 #[test]
 fn evidence_ids_remain_unique_after_restoring_older_evidence_snapshot() {

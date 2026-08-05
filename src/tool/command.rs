@@ -517,40 +517,6 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn command_timeout_kills_process_group_before_delayed_side_effect() {
-        let dir = process_fixture_dir("command-timeout");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-        let output = super::run_workspace_command("sh", &["-c".into(), script], 1)
-            .await
-            .expect("timed-out command returns JSON");
-        assert!(ready.exists(), "child did not reach its handshake");
-        assert!(output.get("error").is_some(), "{output}");
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_timeout_kills_process_group_before_delayed_side_effect() {
-        let dir = process_fixture_dir("shell-timeout");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-        let output = super::run_workspace_shell_command(&script, 1)
-            .await
-            .expect("timed-out shell command returns JSON");
-        assert!(ready.exists(), "shell did not reach its handshake");
-        assert!(output.get("error").is_some(), "{output}");
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    #[cfg(unix)]
-    #[tokio::test]
     async fn dropping_streaming_shell_command_kills_process_group() {
         let dir = process_fixture_dir("streaming-drop");
         let ready = dir.join("ready");

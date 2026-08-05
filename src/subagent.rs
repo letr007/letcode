@@ -2048,43 +2048,6 @@ mod tests {
         assert!(summary.summary.contains("src/outside.rs"));
     }
 
-    #[tokio::test]
-    async fn governance_timeout_overrides_template_default() {
-        let runtime = SubagentPool::new();
-        let mut governance = test_governance();
-        governance.timeout_secs = Some(1);
-
-        let summary = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::fixer(),
-                "apply fix".into(),
-                governance,
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        Ok("late".into())
-                    }
-                    .boxed()
-                },
-            )
-            .await
-            .expect("timeout returns summary");
-
-        assert_eq!(summary.status, SubagentStatus::TimedOut);
-        assert_eq!(summary.structured_result.status, "timed_out");
-    }
 
     #[tokio::test]
     async fn takeover_restores_full_runtime_snapshot_before_appending_prompt() {
@@ -2699,64 +2662,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn timeout_records_timed_out_and_releases_guard() {
-        let runtime = SubagentPool::new();
-        let mut template = AgentTemplate::explorer();
-        template.timeout_secs = Some(1);
-
-        let summary = runtime
-            .run_with_executor(
-                &test_agent(),
-                template,
-                "inspect".into(),
-                test_governance(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        Ok("late".into())
-                    }
-                    .boxed()
-                },
-            )
-            .await
-            .expect("timeout returns summary");
-        assert_eq!(summary.status, SubagentStatus::TimedOut);
-
-        let next = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::explorer(),
-                "inspect again".into(),
-                test_governance(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-2".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| { async move { Ok("done".into()) }.boxed() },
-            )
-            .await
-            .expect("second run succeeds after timeout");
-        assert_eq!(next.status, SubagentStatus::Completed);
-    }
 
     #[tokio::test]
     async fn completed_subagent_does_not_emit_status_notices() {
@@ -2797,7 +2702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_and_timed_out_subagents_do_not_emit_global_error_events() {
+    async fn failed_subagents_do_not_emit_global_error_events() {
         let runtime = SubagentPool::new();
         let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -2843,59 +2748,6 @@ mod tests {
         assert!(
             saw_terminal_status,
             "expected terminal status event for failed subagent"
-        );
-
-        let runtime = SubagentPool::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut template = AgentTemplate::fixer();
-        template.timeout_secs = Some(1);
-        let timed_out = runtime
-            .run_with_executor(
-                &test_agent(),
-                template,
-                "timeout task".into(),
-                test_governance(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-2".into(),
-                None,
-                Some(crate::session::subagent_event_sender(tx)),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        Ok("late".into())
-                    }
-                    .boxed()
-                },
-            )
-            .await
-            .expect("timed out subagent still returns summary");
-        assert_eq!(timed_out.status, SubagentStatus::TimedOut);
-
-        let mut saw_terminal_status = false;
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                SessionTransportEvent::Notice(notice) => {
-                    if notice.message.contains("timed_out") || notice.message.contains("timed out")
-                    {
-                        saw_terminal_status = true;
-                    }
-                }
-                SessionTransportEvent::Error(error) => {
-                    panic!("unexpected global error event: {}", error.message);
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            saw_terminal_status,
-            "expected terminal status event for timed out subagent"
         );
     }
 

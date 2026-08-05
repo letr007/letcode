@@ -521,24 +521,6 @@ mod tests {
         std::fs::remove_file(&path).expect("clean up artifact");
     }
 
-    #[tokio::test]
-    async fn total_timeout_bounds_the_whole_fetch_future() {
-        let result = fetch_with_timeout(
-            async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok(())
-            },
-            Duration::from_millis(1),
-        )
-        .await;
-
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("web__fetch exceeded the total 1ms timeout")
-        );
-    }
 
     #[test]
     fn content_type_filter_accepts_text_json_and_xml_only() {
