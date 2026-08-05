@@ -985,9 +985,7 @@ impl Timeline {
 
         self.push_item(TimelineItem::Permission(PermissionView {
             call_id: event.call_id,
-            tool_name: event
-                .tool_name
-                .unwrap_or_else(|| "unknown tool".into()),
+            tool_name: event.tool_name.unwrap_or_else(|| "unknown tool".into()),
             summary: event.summary.unwrap_or_else(|| {
                 "Permission resolved without an earlier prompt in timeline".into()
             }),

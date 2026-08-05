@@ -1652,10 +1652,7 @@ fn reviewer_subagent_result_records_system_evidence_without_panic() {
         } => {
             assert_eq!(parent_tool, "system__reviewer");
             assert!(tags.iter().any(|tag| tag == "reconciled"), "{tags:?}");
-            assert!(
-                tags.iter().any(|tag| tag == "system_expert"),
-                "{tags:?}"
-            );
+            assert!(tags.iter().any(|tag| tag == "system_expert"), "{tags:?}");
             assert!(
                 !tags.iter().any(|tag| tag == "unreconciled"),
                 "reviewer must not enter reconcile queue: {tags:?}"

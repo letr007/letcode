@@ -20,7 +20,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, ModelRoute, ProviderConfig, RetryConfig};
-use indexmap::IndexMap;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 #[cfg(test)]
 use crate::permission::ToolScope;
@@ -57,6 +56,7 @@ use crate::tool_names;
 use crate::transcript::{ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
 use async_openai::config::OpenAIConfig;
+use indexmap::IndexMap;
 
 #[path = "agent/auto_review.rs"]
 mod auto_review;
@@ -549,8 +549,7 @@ const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
 const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
 const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
 const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [工具输出已为压缩而截断]";
-const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
-    "… [较早历史已省略，以控制压缩提示词长度]";
+const COMPACTION_HISTORY_TRUNCATION_MARKER: &str = "… [较早历史已省略，以控制压缩提示词长度]";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
@@ -4386,9 +4385,7 @@ impl WorkflowTurnState {
                 );
             }
             ExecutionDirective::DoNotEdit => {
-                text.push_str(
-                    "\n本回合有明确的禁止编辑指令。不要修改文件，也不要运行非只读命令。",
-                );
+                text.push_str("\n本回合有明确的禁止编辑指令。不要修改文件，也不要运行非只读命令。");
             }
         }
 

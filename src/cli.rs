@@ -163,10 +163,7 @@ pub async fn run_repl(
                 }
             }
             ReplCommand::ModelShow => {
-                println!(
-                    "current model: {} ({})",
-                    view.model_label, view.model_id
-                );
+                println!("current model: {} ({})", view.model_label, view.model_id);
                 println!("available models:");
                 for (provider_name, provider) in &config.providers {
                     for model_id in provider.models.keys() {
@@ -637,8 +634,10 @@ fn present_transport_event(
         }
         SessionTransportEvent::CompactionCommitted { .. } => {
             if matches!(output_mode, OutputMode::Streaming)
-                && let Some(message) =
-                    cli_compaction_lifecycle_message(compaction_pending, CompactionSignal::Committed)
+                && let Some(message) = cli_compaction_lifecycle_message(
+                    compaction_pending,
+                    CompactionSignal::Committed,
+                )
             {
                 println!("{message}");
             }
@@ -739,7 +738,9 @@ fn present_transport_event(
                 }
             }
         }
-        SessionTransportEvent::ChildQuestionRequested { request, handle, .. } => {
+        SessionTransportEvent::ChildQuestionRequested {
+            request, handle, ..
+        } => {
             if interactive {
                 match ask_questions_in_terminal(&request) {
                     Ok(response) => handle.answer(response)?,
@@ -1073,10 +1074,7 @@ fn confirm_permission_event(event: &PermissionRequestEvent) -> Result<Permission
         .as_deref()
         .and_then(|rationale| rationale.split_whitespace().next())
         .unwrap_or("tool");
-    let detail = event
-        .arguments
-        .as_deref()
-        .unwrap_or(event.summary.as_str());
+    let detail = event.arguments.as_deref().unwrap_or(event.summary.as_str());
     println!(
         "permission required [{}]: {} {}",
         class, event.tool_name, detail

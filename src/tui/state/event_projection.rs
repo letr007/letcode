@@ -35,7 +35,10 @@ impl<'a> EventProjection<'a> {
     }
 }
 
-pub(super) fn apply_projected_session_event(mut projection: EventProjection<'_>, event: SessionEvent) {
+pub(super) fn apply_projected_session_event(
+    mut projection: EventProjection<'_>,
+    event: SessionEvent,
+) {
     let terminal_event = matches!(
         event,
         SessionEvent::Interrupted | SessionEvent::Error(_) | SessionEvent::Done
@@ -373,7 +376,9 @@ pub(super) fn compact_child_projection_text(text: &str) -> String {
 }
 
 #[cfg(test)]
-pub(super) fn project_child_timeline_state(records: &[TranscriptRecord]) -> Result<ChildTranscriptState> {
+pub(super) fn project_child_timeline_state(
+    records: &[TranscriptRecord],
+) -> Result<ChildTranscriptState> {
     Ok(ChildTranscriptState {
         session_id: records
             .first()
@@ -568,7 +573,10 @@ pub(super) fn parse_context_dialog_target(id: &str) -> Option<ContextDetailTarge
     }
 }
 
-pub(super) fn sync_context_picker_preview_for(dialog: &mut DialogState, context: &mut ContextPaneState) {
+pub(super) fn sync_context_picker_preview_for(
+    dialog: &mut DialogState,
+    context: &mut ContextPaneState,
+) {
     let mut first_available: Option<(usize, ContextDetailTarget)> = None;
     let mut selected_target: Option<(usize, ContextDetailTarget)> = None;
 
@@ -705,7 +713,10 @@ pub(super) fn context_node_depth(tree: &ContextTreeState, node_id: &str) -> usiz
     depth
 }
 
-pub(super) fn context_block_source_lines(block: &ContextBlock, view: &ContextViewProjection) -> Vec<String> {
+pub(super) fn context_block_source_lines(
+    block: &ContextBlock,
+    view: &ContextViewProjection,
+) -> Vec<String> {
     let mut lines = Vec::new();
     match &block.source {
         ContextBlockSource::TranscriptSpan {
@@ -747,4 +758,3 @@ pub(super) fn child_transcript_model(records: &[TranscriptRecord]) -> Option<Str
     }
     model
 }
-

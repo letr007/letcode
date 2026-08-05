@@ -349,10 +349,9 @@ mod tests {
     fn request_and_decision_cards_render_compact_labels() {
         let theme = Theme::dark();
         let request = parse_review_request(SAMPLE_REQUEST).expect("request");
-        let decision = parse_review_decision(
-            r#"{"decision":"deny","risk":"high","rationale":"too broad"}"#,
-        )
-        .expect("decision");
+        let decision =
+            parse_review_decision(r#"{"decision":"deny","risk":"high","rationale":"too broad"}"#)
+                .expect("decision");
 
         let request_doc = render_review_request_card_document(&request, theme, 72);
         let decision_doc = render_review_decision_card_document(&decision, theme, 72);

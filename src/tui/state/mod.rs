@@ -210,7 +210,11 @@ impl RetryNoticeState {
 
     fn sticky_toast(&self) -> ToastState {
         // ticks are ignored while retry is active; Tick refreshes this toast.
-        ToastState::new(self.toast_message(), ToastKind::Error, ToastState::DEFAULT_TICKS)
+        ToastState::new(
+            self.toast_message(),
+            ToastKind::Error,
+            ToastState::DEFAULT_TICKS,
+        )
     }
 }
 
@@ -2524,7 +2528,6 @@ fn column_to_char_offset(text: &str, target_col: u16) -> usize {
     }
     offset
 }
-
 
 mod event_projection;
 use event_projection::*;

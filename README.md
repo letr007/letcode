@@ -7,6 +7,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/letr007/letcode/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/letr007/letcode/ci.yml?branch=main&style=flat-square" alt="CI"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-0.1.0-informational?style=flat-square" alt="Changelog"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue?style=flat-square" alt="MIT License | Apache-2.0 License"></a>
 </p>
 
@@ -105,6 +107,10 @@ Optional Langfuse/OpenTelemetry tracing is off by default. Enable it with `LETCO
 ## Sessions
 
 Session transcripts are stored as append-only JSONL under `sessions_dir` and can be restored later. In the TUI, use `/tree` to browse history, `/undo` / `/redo` to move between completed user turns, and `/help` for all local commands. The line-based CLI supports `/tree` as a read-only listing; `/undo` and `/redo` require the TUI.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 

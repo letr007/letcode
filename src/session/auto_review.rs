@@ -102,13 +102,16 @@ impl StickyAutoReviewer {
     fn latest_user_goal(&self) -> Option<String> {
         let recorder = self.parent_transcript.lock().ok()?;
         let records = read_records_allow_partial_tail(recorder.path()).ok()?;
-        records.into_iter().rev().find_map(|record| match record.event {
-            TranscriptEvent::UserMessage { content, .. } => {
-                let text = content.text.trim();
-                (!text.is_empty()).then(|| text.to_string())
-            }
-            _ => None,
-        })
+        records
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.event {
+                TranscriptEvent::UserMessage { content, .. } => {
+                    let text = content.text.trim();
+                    (!text.is_empty()).then(|| text.to_string())
+                }
+                _ => None,
+            })
     }
 
     fn record_decision(
@@ -401,7 +404,11 @@ fn parse_reviewer_output(summary: &SubagentRunSummary, can_allow_always: bool) -
     let raw_candidates = [
         summary.structured_result.raw_excerpt.as_deref(),
         Some(summary.summary.as_str()),
-        summary.structured_result.findings.first().map(String::as_str),
+        summary
+            .structured_result
+            .findings
+            .first()
+            .map(String::as_str),
     ];
     for candidate in raw_candidates.into_iter().flatten() {
         if let Some(parsed) = try_parse_reviewer_json(candidate, can_allow_always) {
@@ -506,15 +513,9 @@ mod tests {
             r#"{"decision":"allow_always","risk":"low","rationale":"safe write"}"#,
         );
         let downgraded = parse_reviewer_output(&summary, false);
-        assert!(matches!(
-            downgraded.response,
-            PermissionResponse::AllowOnce
-        ));
+        assert!(matches!(downgraded.response, PermissionResponse::AllowOnce));
         let always = parse_reviewer_output(&summary, true);
-        assert!(matches!(
-            always.response,
-            PermissionResponse::AllowAlways
-        ));
+        assert!(matches!(always.response, PermissionResponse::AllowAlways));
     }
 
     #[test]

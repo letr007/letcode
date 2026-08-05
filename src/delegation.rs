@@ -123,8 +123,10 @@ mod tests {
             ]
         );
         assert!(is_system_expert("reviewer"));
-        assert!(!DELEGATION_EXPERTS
-            .iter()
-            .any(|expert| expert.agent_name == "reviewer"));
+        assert!(
+            !DELEGATION_EXPERTS
+                .iter()
+                .any(|expert| expert.agent_name == "reviewer")
+        );
     }
 }

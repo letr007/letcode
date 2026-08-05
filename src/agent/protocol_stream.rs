@@ -2070,9 +2070,8 @@ where
                 let Some(data) = event else {
                     continue;
                 };
-                let response: CompatibleChatCompletionStreamResponse =
-                    serde_json::from_str(&data)
-                        .context("failed to deserialize oneshot chat completion delta")?;
+                let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
+                    .context("failed to deserialize oneshot chat completion delta")?;
                 for choice in response.choices {
                     if let Some(delta) = choice.delta.and_then(|delta| delta.content) {
                         if !delta.is_empty() {
@@ -2153,7 +2152,9 @@ where
                     continue;
                 }
                 Err(error) => {
-                    return Err(anyhow!(error).context("failed to deserialize oneshot responses event"));
+                    return Err(
+                        anyhow!(error).context("failed to deserialize oneshot responses event")
+                    );
                 }
             };
             match event {

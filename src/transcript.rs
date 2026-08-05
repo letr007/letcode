@@ -798,9 +798,10 @@ impl TranscriptRecorder {
             summary: summary.into(),
         })?;
         if let Some(result) = structured_result {
-            let parent_tool = subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
-                anyhow!("subagent result recorded with unknown agent name: {agent_name}")
-            })?;
+            let parent_tool =
+                subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
+                    anyhow!("subagent result recorded with unknown agent name: {agent_name}")
+                })?;
             // System experts (e.g. auto-reviewer) are not user-delegated jobs — mark
             // reconciled immediately so they never pollute agent__reconcile context.
             let system_expert = parent_tool.starts_with("system__");
@@ -1089,15 +1090,7 @@ impl TranscriptRecorder {
         reason: Option<String>,
     ) -> Result<()> {
         self.record_permission_decision_full(
-            call_id,
-            tool,
-            args,
-            allowed,
-            reason,
-            None,
-            None,
-            None,
-            None,
+            call_id, tool, args, allowed, reason, None, None, None, None,
         )
     }
 

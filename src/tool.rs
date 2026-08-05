@@ -72,10 +72,7 @@ impl NormalizedSubagentInput {
             lines.push(format!("允许路径：{}", self.allowed_paths.join(", ")));
         }
         if !self.forbidden_paths.is_empty() {
-            lines.push(format!(
-                "禁止路径：{}",
-                self.forbidden_paths.join(", ")
-            ));
+            lines.push(format!("禁止路径：{}", self.forbidden_paths.join(", ")));
         }
         if !self.owned_paths.is_empty() {
             lines.push(format!("负责路径：{}", self.owned_paths.join(", ")));

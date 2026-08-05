@@ -124,15 +124,16 @@ impl TranscriptTimelineProjection {
                 risk,
                 reviewer_child_session_id: _,
             } => {
-                let restored_reason = match (reviewer.as_deref(), risk.as_deref(), reason.as_ref()) {
+                let restored_reason = match (reviewer.as_deref(), risk.as_deref(), reason.as_ref())
+                {
                     (Some("auto"), Some(risk), Some(reason)) => {
                         Some(format!("auto-review ({risk}): {reason}"))
                     }
                     (Some("auto"), _, Some(reason)) => Some(format!("auto-review: {reason}")),
                     _ => reason.clone(),
                 };
-                let origin_label = matches!(reviewer.as_deref(), Some("auto"))
-                    .then(|| "reviewer".to_string());
+                let origin_label =
+                    matches!(reviewer.as_deref(), Some("auto")).then(|| "reviewer".to_string());
                 self.timeline.push_restored_permission_decision(
                     call_id.clone().unwrap_or_else(|| tool.clone()),
                     tool.clone(),

@@ -1,6 +1,6 @@
 mod agent;
-mod cli;
 mod agent_event_journal;
+mod cli;
 mod code_analysis;
 mod command;
 mod config;
@@ -180,11 +180,7 @@ async fn main() -> Result<()> {
     }
 
     let model_label = active_provider.model_label(&active_route.model);
-    let engine_config = session_engine_config(
-        &config,
-        provider_api_key_hints,
-        api_key_hint,
-    );
+    let engine_config = session_engine_config(&config, provider_api_key_hints, api_key_hint);
     let initial_reasoning = agent.reasoning_effort();
     let (engine, projection) =
         session::SessionEngine::start(agent, recorder, model_label, engine_config)?;
@@ -590,10 +586,8 @@ mod tests {
     #[test]
     fn primary_route_factory_rejects_unknown_provider_or_model() {
         let mut agent = test_agent();
-        let factory = ConfiguredPrimaryRouteFactory::new(
-            IndexMap::new(),
-            config::RetryConfig::default(),
-        );
+        let factory =
+            ConfiguredPrimaryRouteFactory::new(IndexMap::new(), config::RetryConfig::default());
         agent.set_primary_route_factory(Arc::new(factory));
 
         let error = agent
@@ -1127,4 +1121,3 @@ fn open_log_file(log_path: &Path) -> io::Result<std::fs::File> {
     }
     OpenOptions::new().create(true).append(true).open(log_path)
 }
-

@@ -801,10 +801,8 @@ fn apply_config_reload(
         .ok_or_else(|| anyhow!("active agent route is unavailable during configuration reload"))?;
     let active_route = config.active_route();
     let provider = config.provider_for_route(&active_route)?;
-    let primary_factory = ConfiguredPrimaryRouteFactory::new(
-        config.providers.clone(),
-        config.global.retry.clone(),
-    );
+    let primary_factory =
+        ConfiguredPrimaryRouteFactory::new(config.providers.clone(), config.global.retry.clone());
     let prepared = primary_factory.prepare_route(active_route.clone())?;
 
     let next_model_routes = config
@@ -1701,16 +1699,17 @@ async fn run_engine_loop(
     let mut provider_api_key_hints = provider_api_key_hints;
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
-    let sticky_auto_reviewer = std::sync::Arc::new(crate::session::auto_review::StickyAutoReviewer::new(
-        subagent_runtime.clone(),
-        sessions_dir.clone(),
-        Arc::clone(&transcript),
-        Some(session_transport_tx.clone()),
-    ));
-    agent.set_auto_review_service(Some(
-        sticky_auto_reviewer.clone()
-            as std::sync::Arc<dyn crate::agent::AutoReviewService<async_openai::config::OpenAIConfig>>,
-    ));
+    let sticky_auto_reviewer =
+        std::sync::Arc::new(crate::session::auto_review::StickyAutoReviewer::new(
+            subagent_runtime.clone(),
+            sessions_dir.clone(),
+            Arc::clone(&transcript),
+            Some(session_transport_tx.clone()),
+        ));
+    agent.set_auto_review_service(Some(sticky_auto_reviewer.clone()
+        as std::sync::Arc<
+            dyn crate::agent::AutoReviewService<async_openai::config::OpenAIConfig>,
+        >));
     let mut deferred_commands = VecDeque::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
@@ -3525,8 +3524,7 @@ mod tests {
         agent.set_primary_route(route.clone());
         let config = AppConfig::load_from_path(&path).expect("config should load");
         let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
-        let mut route_api_key_configured =
-            indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut route_api_key_configured = indexmap::IndexMap::from([(route.display_name(), true)]);
         let mut expert_model_routes = indexmap::IndexMap::new();
         let mut legacy_expert_models = indexmap::IndexMap::new();
         let mut providers = config.providers.clone();
@@ -3569,10 +3567,7 @@ mod tests {
             &event_tx,
         )
         .expect("identical second reload should succeed");
-        assert!(
-            event_rx.try_recv().is_err(),
-            "noop reload must stay silent"
-        );
+        assert!(event_rx.try_recv().is_err(), "noop reload must stay silent");
 
         let _ = fs::remove_file(path);
     }
@@ -3765,8 +3760,7 @@ mod tests {
         assert!(agent.retry_config().enabled);
 
         let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
-        let mut route_api_key_configured =
-            indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut route_api_key_configured = indexmap::IndexMap::from([(route.display_name(), true)]);
         let mut expert_model_routes = indexmap::IndexMap::new();
         let mut legacy_expert_models = indexmap::IndexMap::new();
         let mut providers = config.providers.clone();

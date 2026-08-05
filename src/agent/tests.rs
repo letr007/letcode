@@ -7127,14 +7127,10 @@ async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
     };
     let mut human_approvals = 0usize;
     let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                human_approvals += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            human_approvals += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
+        })
         .await
         .expect("auto allow_once executes");
 
@@ -7162,11 +7158,9 @@ async fn auto_mode_deny_includes_reviewer_rationale() {
         arguments_json: json!({"path": "deny.txt", "content": "no"}).to_string(),
     };
     let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            std::future::ready(Ok(PermissionApproval::AllowOnce))
+        })
         .await
         .expect("auto deny is a tool record");
 
@@ -7175,13 +7169,11 @@ async fn auto_mode_deny_includes_reviewer_rationale() {
         record.rejection,
         Some(ToolExecutionRejection::PermissionDeniedByUser)
     );
-    assert!(
-        record
-            .output
-            .error
-            .as_ref()
-            .is_some_and(|error| error.message.contains("auto-review denied permission: mock-deny"))
-    );
+    assert!(record.output.error.as_ref().is_some_and(|error| {
+        error
+            .message
+            .contains("auto-review denied permission: mock-deny")
+    }));
 }
 
 #[cfg(unix)]
@@ -8206,7 +8198,10 @@ async fn execute_tool_call_emits_finished_event_for_user_denial_of_high_risk_com
         .await
         .expect("user denial should be reported as tool output");
 
-    assert!(approval_requested, "high-risk commands must Ask, not hard-deny");
+    assert!(
+        approval_requested,
+        "high-risk commands must Ask, not hard-deny"
+    );
     assert!(!record.output.ok);
     assert!(matches!(
         events.as_slice(),
@@ -8510,12 +8505,12 @@ fn pending_subagent_jobs_clear_after_live_reconciliation_evidence() {
 #[test]
 fn default_prelude_and_engineering_guidance_frame_non_trivial_work_as_orchestration() {
     assert!(DEFAULT_AGENT_PRELUDE.contains("先像工作流管理者一样行动"));
-    assert!(DEFAULT_AGENT_PRELUDE.contains(
-        "直接执行适用于琐碎、单文件、边界清晰的工作"
-    ));
+    assert!(DEFAULT_AGENT_PRELUDE.contains("直接执行适用于琐碎、单文件、边界清晰的工作"));
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("先判断是否需要专家通道"));
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer 用于广泛或未知代码搜索"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("优先使用会话历史或任务板中已完成或已调和的会话"));
+    assert!(
+        ENGINEERING_WORKFLOW_PRELUDE.contains("优先使用会话历史或任务板中已完成或已调和的会话")
+    );
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("绝不要把已取消或出错的会话当作权威结果复用"));
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("每个专家角色同时只允许一个活跃运行"));
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("委派不会在忙碌角色上排队"));
@@ -8531,11 +8526,11 @@ fn default_prelude_and_engineering_guidance_frame_non_trivial_work_as_orchestrat
             .iter()
             .any(|message| message.text.contains("先判断是否需要专家通道"))
     );
-    assert!(prelude.iter().any(|message| {
-        message
-            .text
-            .contains("explorer 用于广泛或未知代码搜索")
-    }));
+    assert!(
+        prelude
+            .iter()
+            .any(|message| { message.text.contains("explorer 用于广泛或未知代码搜索") })
+    );
 }
 
 #[tokio::test]

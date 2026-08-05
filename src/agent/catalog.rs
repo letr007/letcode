@@ -191,7 +191,9 @@ impl AgentTemplate {
             can_delegate: false,
             timeout_secs: Some(30),
             max_tool_calls: Some(2),
-            input_expectations: "需要工具权限请求：tool、args、class、summary、can_allow_always、用户目标摘要。".into(),
+            input_expectations:
+                "需要工具权限请求：tool、args、class、summary、can_allow_always、用户目标摘要。"
+                    .into(),
             expected_result_shape: concat!(
                 "JSON 对象：decision 为 allow_once|allow_always|deny；",
                 "risk 为 low|medium|high；rationale 为一句理由。"

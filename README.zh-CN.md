@@ -7,6 +7,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/letr007/letcode/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/letr007/letcode/ci.yml?branch=main&style=flat-square" alt="CI"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-0.1.0-informational?style=flat-square" alt="Changelog"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue?style=flat-square" alt="MIT License | Apache-2.0 License"></a>
 </p>
 
@@ -105,6 +107,10 @@ Provider API key 和 base URL 也可以来自按 provider 名称生成的环境�
 ## 会话
 
 会话 transcript 以 append-only JSONL 保存在 `sessions_dir` 下，之后可以恢复。在 TUI 中可用 `/tree` 浏览历史，用 `/undo` / `/redo` 在已完成用户回合间移动，完整本地命令见 `/help`。行命令式 CLI 支持只读的 `/tree`；`/undo` 与 `/redo` 需要 TUI。
+
+## 更新日志
+
+发布说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 开源协议
 
