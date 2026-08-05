@@ -2,9 +2,13 @@
 
 [中文](README.zh-CN.md) | English
 
-`letcode` is a terminal Agent written in Rust. It provides an `opencode`-style TUI based on Ratatui by default, while keeping a REPL CLI mode available.
+`letcode` is a terminal Agent written in Rust.
 
-## Build and test
+![letcode TUI](docs/letcode.png)
+
+It provides an `opencode`-style TUI based on Ratatui, and also keeps a REPL CLI mode.
+
+## Build and run
 
 ```sh
 cargo build
@@ -69,71 +73,22 @@ supports_tools = true
 parallel_tool_calls = false # allow one model response to request multiple tools
 supports_reasoning = true
 reasoning_effort = "medium" # model default
-# Optional: restrict the selectable levels for this model and their TUI cycling order.
+# Optional: restrict selectable levels and TUI cycle order.
 # Supported values: none, minimal, low, medium, high, xhigh, max
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto"
 text_verbosity = "medium"
 ```
 
-Provider API keys and base URLs can also come from environment variables. The variable names are generated from the provider name:
-
-```sh
-export OPENAI_API_KEY="..."
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-```
-
-If the provider is named `compat`, the corresponding variables are `COMPAT_API_KEY` and `COMPAT_BASE_URL`.
+Provider API keys and base URLs can also come from environment variables named from the provider, for example `OPENAI_API_KEY` / `OPENAI_BASE_URL`; for a provider named `compat`, use `COMPAT_API_KEY` / `COMPAT_BASE_URL`.
 
 Relative `sessions_dir` and `log_file` paths are resolved relative to the config file directory.
 
-`parallel_tool_calls` is an OpenAI request-level switch. When true, one model response may contain multiple tool calls. Local execution still follows each tool's declared policy: supported read tools may overlap, while writes, commands, workflow controls, questions, and MCP tools remain exclusive. It defaults to false. `[tools.parallelism]` may narrow a parallel-capable tool to `exclusive`, or explicitly keep it `parallel`; unsafe tools cannot be promoted to parallel.
+Optional Langfuse/OpenTelemetry tracing is off by default. Enable it with `LETCODE_LANGFUSE_ENABLED=true`, and set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optional `LANGFUSE_HOST` (or the same variables in a local `.env`). Missing credentials leave tracing disabled without stopping the agent.
 
-`reasoning_effort` sets a model's initial level. `reasoning_efforts` optionally restricts the levels users can select for that model through `/reasoning`, `/think`, Ctrl+T, and the TUI picker; its order controls the cycle order. When omitted, the backward-compatible set is `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. The `max` level is supported through OpenAI-compatible raw request serialization for providers that expose it. A configured default must appear in its model's `reasoning_efforts` list.
+## Sessions
 
-### Optional Langfuse tracing
-
-Langfuse/OpenTelemetry tracing is off by default and does not change agent behavior. When enabled, `letcode` exports only safe operational metadata for LLM turns, streamed model calls, tool calls, status, token counts, and latency. It does not export raw prompts, raw tool arguments, raw tool outputs, API keys, or `.env` contents.
-
-Enable it with environment variables, or place the same variables in a local `.env` file:
-
-```sh
-LETCODE_LANGFUSE_ENABLED=true
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_HOST=https://cloud.langfuse.com
-```
-
-If Langfuse credentials are missing or tracing cannot initialize, `letcode` continues running with Langfuse tracing disabled.
-
-## Session context and restore
-
-Session transcripts are stored as append-only JSONL records under `sessions_dir`. Restore rebuilds conversation history, context branches, the context tree, and the prompt context view from those records. Context view operations such as archive or remove-from-view append metadata only; they do not purge raw transcript events.
-
-The context tree is a strict tree of session/task context nodes. It records active and archived nodes for prompt assembly and TUI display, but it does not imply filesystem rollback. Hard constraints, current user requirements, unresolved errors including invariant violations, permission decisions, file write facts, validation/test results, and commit hashes remain protected context when they are part of the restored session.
-
-The context view is a derived prompt projection. It keeps stable hard context ahead of dynamic details, supports pinned blocks, summaries, and opened details, and hides archived or removed soft blocks from prompt-visible sections. Large shell outputs are folded into openable metadata by default; folded output is not a semantic summary.
-
-In the TUI, use `/context` to browse context nodes, blocks, summaries, and folded outputs. Legacy `context__checkpoint` / `context__return` records remain compatible with the newer context tree metadata.
-
-Use `/tree` in the TUI to browse durable session history, `/undo` to return to the previous completed user turn, and `/redo` to restore the next undone turn. Navigation creates a new append-only history path without deleting existing records. The line-based CLI supports `/tree` as a read-only listing; `/undo` and `/redo` require the TUI. The former `/branches` command is no longer available.
-
-## Project layout
-
-```text
-src/main.rs          entry point, config loading, TUI/CLI selection
-src/config.rs        TOML config parsing and validation
-src/agent.rs         model loop, tool execution, turn lifecycle
-src/context_tree.rs  session context tree replay and invariants
-src/context_view.rs  derived prompt context blocks, summaries, and folding
-src/tool.rs          built-in tool registry and tool result model
-src/permission.rs    permission modes, scopes, and request classification
-src/transcript.rs    JSONL transcript persistence and restore helpers
-src/request_builder.rs prompt assembly and context-view insertion
-src/subagent.rs      subagent-related code
-src/mcp.rs           MCP tool discovery
-src/tui/             Ratatui/Crossterm UI, runtime, state, events, rendering
-```
+Session transcripts are stored as append-only JSONL under `sessions_dir` and can be restored later. In the TUI, use `/tree` to browse history, `/undo` / `/redo` to move between completed user turns, and `/help` for all local commands. The line-based CLI supports `/tree` as a read-only listing; `/undo` and `/redo` require the TUI.
 
 ## License
 
