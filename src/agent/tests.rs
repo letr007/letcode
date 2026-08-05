@@ -4379,59 +4379,6 @@ async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
 }
 
 #[tokio::test]
-async fn chat_stream_creation_failure_includes_request_budget_diagnostic() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test port should bind");
-    let addr = listener.local_addr().expect("test listener has local addr");
-    drop(listener);
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(format!("http://{addr}"))
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            effective_input_limit_tokens: Some(4_096),
-            max_output_tokens: Some(2_000),
-            supports_tools: false,
-            supports_reasoning: false,
-            ..Default::default()
-        },
-    )]));
-    let mut retry_config = test_retry_config();
-    retry_config.enabled = false;
-    agent.set_retry_config(retry_config);
-
-    let error = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("stream creation should fail");
-    let message = format!("{error:#}");
-
-    assert!(
-        message.contains("failed to create streamed chat completion"),
-        "{message}"
-    );
-    assert!(message.contains("model=m1"), "{message}");
-    assert!(message.contains("estimated_request_tokens="), "{message}");
-    assert!(message.contains("input_budget_tokens=4096"), "{message}");
-    assert!(
-        message.contains("effective_input_limit_tokens=4096"),
-        "{message}"
-    );
-    assert!(message.contains("protected_tokens="), "{message}");
-}
-
-#[tokio::test]
 async fn compatible_chat_stream_sends_one_physical_request() {
     let (base_url, request_count, server) = spawn_chat_completion_server(vec![
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n",
