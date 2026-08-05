@@ -386,7 +386,17 @@ fn open_config_lock_file(lock_path: &Path) -> Result<fs::File> {
 
 #[cfg(unix)]
 fn lock_file(file: &fs::File) -> Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    lock_file_with_mode(file, libc::LOCK_EX)
+}
+
+#[cfg(unix)]
+fn lock_file_shared(file: &fs::File) -> Result<()> {
+    lock_file_with_mode(file, libc::LOCK_SH)
+}
+
+#[cfg(unix)]
+fn lock_file_with_mode(file: &fs::File, mode: i32) -> Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), mode) };
     if result != 0 {
         return Err(std::io::Error::last_os_error()).context("failed to lock config lock file");
     }
@@ -399,6 +409,18 @@ fn lock_file(_file: &fs::File) -> Result<()> {
     // revalidation detects changes before replacement but cannot serialize a
     // writer that races between revalidation and rename.
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_file_shared(_file: &fs::File) -> Result<()> {
+    Ok(())
+}
+
+fn acquire_config_read_lock(config_target: &Path) -> Result<ConfigLock> {
+    let lock_path = config_lock_path(config_target)?;
+    let file = open_config_lock_file(&lock_path)?;
+    lock_file_shared(&file)?;
+    Ok(ConfigLock { _file: file })
 }
 
 #[allow(dead_code)]
@@ -426,7 +448,13 @@ impl AppConfig {
         if !config_path.exists() {
             bail!(missing_config_message(&config_path));
         }
-        let config_text = fs::read_to_string(&config_path)
+        // Lock the canonical target rather than the directory entry. Writers
+        // replace the target atomically, so this keeps reads compatible with
+        // the existing writer lock across an atomic rename (and symlinks).
+        let config_target = fs::canonicalize(&config_path)
+            .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
+        let _lock = acquire_config_read_lock(&config_target)?;
+        let config_text = fs::read_to_string(&config_target)
             .with_context(|| format!("failed to read config file {}", config_path.display()))?;
         Self::load_from_str_at_path(&config_path, &config_text)
     }
@@ -750,7 +778,7 @@ pub struct McpRemoteServerConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
@@ -775,7 +803,7 @@ impl ProviderConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
     pub display_name: Option<String>,
     pub protocol: ApiProtocol,
@@ -3135,6 +3163,27 @@ api_key = "config-key"
             "#,
         ));
         AppConfig::load_from_path(&path).expect_err("config should be rejected")
+    }
+
+    #[test]
+    fn loads_new_content_after_atomic_replacement_under_shared_lock() {
+        let path = write_temp_config(
+            r#"
+            fast_mode = false
+
+            [providers.primary]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+
+            [providers.primary.models."gpt-test"]
+            "#,
+        );
+
+        persist_fast_mode_enabled(&path, true).expect("atomic config replacement should succeed");
+        let config = AppConfig::load_from_path(&path).expect("replaced config should load");
+
+        assert!(config.fast_mode_enabled);
     }
 
     fn write_temp_config(contents: &str) -> PathBuf {

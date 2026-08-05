@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{Instrument, debug, error, info, trace, warn};
 
-use crate::config::{ApiProtocol, CompactionConfig, ModelRoute, RetryConfig};
+use crate::config::{ApiProtocol, CompactionConfig, ModelRoute, ProviderConfig, RetryConfig};
+use indexmap::IndexMap;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 #[cfg(test)]
 use crate::permission::ToolScope;
@@ -327,6 +328,64 @@ pub trait SubagentChildFactory<C: Config>: Send + Sync {
 
 pub trait PrimaryRouteFactory<C: Config>: Send + Sync {
     fn prepare_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute<C>>;
+}
+
+/// Provider-catalog factory used at startup and after configuration reload.
+///
+/// Prepared routes expose the full provider model catalog so subsequent
+/// in-session switches do not need a reload to learn sibling model metadata.
+pub struct ConfiguredPrimaryRouteFactory {
+    providers: IndexMap<String, ProviderConfig>,
+    global_retry: RetryConfig,
+}
+
+impl ConfiguredPrimaryRouteFactory {
+    pub fn new(providers: IndexMap<String, ProviderConfig>, global_retry: RetryConfig) -> Self {
+        Self {
+            providers,
+            global_retry,
+        }
+    }
+}
+
+impl PrimaryRouteFactory<async_openai::config::OpenAIConfig> for ConfiguredPrimaryRouteFactory {
+    fn prepare_route(
+        &self,
+        route: ModelRoute,
+    ) -> Result<PreparedPrimaryRoute<async_openai::config::OpenAIConfig>> {
+        let provider = self.providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "provider '{}' is not defined under [providers]",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "model '{}' is not defined under [providers.{}.models]",
+                route.model,
+                route.provider
+            );
+        }
+        Ok(PreparedPrimaryRoute::new(
+            route.clone().build_client(provider),
+            route.clone(),
+            provider.protocol,
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+            provider
+                .retry
+                .clone()
+                .unwrap_or_else(|| self.global_retry.clone()),
+        ))
+    }
 }
 
 pub struct PreparedPrimaryRoute<C: Config> {
@@ -1040,8 +1099,16 @@ impl<C: Config> Agent<C> {
         self.compaction_config = config;
     }
 
+    pub(crate) fn compaction_config(&self) -> &CompactionConfig {
+        &self.compaction_config
+    }
+
     pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
         self.tool_timeout_secs = timeout_secs;
+    }
+
+    pub(crate) fn tool_timeout_secs(&self) -> Option<u64> {
+        self.tool_timeout_secs
     }
 
     pub fn set_tool_parallelism(
@@ -1051,8 +1118,30 @@ impl<C: Config> Agent<C> {
         self.tools.set_parallelism_overrides(parallelism)
     }
 
+    pub(crate) fn tool_parallelism_overrides(
+        &self,
+    ) -> &std::collections::BTreeMap<String, crate::tool::ToolParallelism> {
+        self.tools.parallelism_overrides()
+    }
+
     pub fn set_retry_config(&mut self, config: RetryConfig) {
         self.retry_config = config;
+    }
+
+    pub(crate) fn retry_config(&self) -> &RetryConfig {
+        &self.retry_config
+    }
+
+    pub(crate) fn model_catalog(&self) -> &HashMap<String, ModelRequestMetadata> {
+        &self.model_catalog
+    }
+
+    pub(crate) fn model_protocols(&self) -> &HashMap<String, ApiProtocol> {
+        &self.model_protocols
+    }
+
+    pub(crate) fn default_protocol(&self) -> ApiProtocol {
+        self.default_protocol
     }
 
     fn active_protocol(&self) -> ApiProtocol {

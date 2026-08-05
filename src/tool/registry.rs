@@ -130,6 +130,10 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub(crate) fn parallelism_overrides(&self) -> &BTreeMap<String, ToolParallelism> {
+        &self.parallelism_overrides
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }

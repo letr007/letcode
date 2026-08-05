@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use std::collections::{HashMap, VecDeque};
@@ -23,9 +24,12 @@ use async_openai::config::Config;
 use serde_json::json;
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome, SubagentInvocation};
+use crate::agent::{
+    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome, PrimaryRouteFactory,
+    SubagentInvocation,
+};
 use crate::agent_event_journal::persist_agent_event;
-use crate::config::ModelRoute;
+use crate::config::{AppConfig, ModelRoute, ProviderConfig, RetryConfig};
 use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::{
@@ -217,6 +221,7 @@ pub struct SessionEngine {
     event_rx: Option<mpsc::UnboundedReceiver<SessionTransportEvent>>,
     engine_task: Option<JoinHandle<()>>,
     mcp_discovery_task: Option<JoinHandle<()>>,
+    reload_watcher: Option<RecommendedWatcher>,
     transcript: Option<Arc<StdMutex<TranscriptRecorder>>>,
 }
 
@@ -270,6 +275,7 @@ impl SessionEngine {
                 event_rx: None,
                 engine_task: None,
                 mcp_discovery_task: None,
+                reload_watcher: None,
                 transcript: None,
             },
             ingress,
@@ -304,6 +310,9 @@ impl SessionEngine {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let title_event_tx = event_tx.clone();
         let ingress = SessionEngineIngress { control_tx };
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel();
+        let config_path = config.mcp_config_path.clone();
+        let reload_watcher = create_config_watcher(&config_path, reload_tx)?;
         let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
         let discovery_config = config.mcp_config.clone();
         let mcp_discovery_task = tokio::spawn(async move {
@@ -326,6 +335,7 @@ impl SessionEngine {
             config.mcp_config_path,
             config.mcp_config,
             mcp_tools_rx,
+            reload_rx,
             control_rx,
             event_tx.clone(),
             title_event_tx,
@@ -341,6 +351,7 @@ impl SessionEngine {
                 event_rx: Some(event_rx),
                 engine_task: Some(task),
                 mcp_discovery_task: Some(mcp_discovery_task),
+                reload_watcher: Some(reload_watcher),
                 transcript: Some(transcript),
             },
             projection,
@@ -378,6 +389,9 @@ impl SessionEngine {
     /// failure is returned after all owned resources have been reconciled.
     pub async fn join(mut self) -> Result<()> {
         let mut failure = None;
+        // Stop filesystem callbacks before waiting for the engine and discovery
+        // tasks so shutdown cannot enqueue work into a finished session.
+        self.reload_watcher.take();
 
         if let Some(task) = self.engine_task.take() {
             if let Err(error) = task.await {
@@ -768,6 +782,271 @@ where
     }
 }
 
+fn apply_config_reload(
+    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    config_path: &std::path::Path,
+    model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
+    route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
+    expert_model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
+    legacy_expert_models: &mut indexmap::IndexMap<String, String>,
+    providers: &mut indexmap::IndexMap<String, ProviderConfig>,
+    global_retry: &mut RetryConfig,
+    provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
+    event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+) -> Result<()> {
+    let config = AppConfig::load_from_path(config_path)?;
+    let previous_active_route = agent
+        .primary_route()
+        .cloned()
+        .ok_or_else(|| anyhow!("active agent route is unavailable during configuration reload"))?;
+    let active_route = config.active_route();
+    let provider = config.provider_for_route(&active_route)?;
+    let primary_factory = ConfiguredPrimaryRouteFactory::new(
+        config.providers.clone(),
+        config.global.retry.clone(),
+    );
+    let prepared = primary_factory.prepare_route(active_route.clone())?;
+
+    let next_model_routes = config
+        .providers
+        .iter()
+        .flat_map(|(provider_name, provider)| {
+            provider.models.keys().map(move |model| {
+                let route = ModelRoute::new(provider_name, model);
+                (route.display_name(), route)
+            })
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let next_route_api_key_configured = config
+        .providers
+        .iter()
+        .flat_map(|(provider_name, provider)| {
+            provider.models.keys().map(move |model| {
+                let route = ModelRoute::new(provider_name, model);
+                (route.display_name(), !provider.api_key.trim().is_empty())
+            })
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let next_expert_model_routes = crate::delegation::supported_agent_names()
+        .filter_map(|name| {
+            config
+                .model_route_for(name)
+                .cloned()
+                .map(|route| (name.to_string(), route))
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let next_legacy_expert_models = crate::delegation::supported_agent_names()
+        .filter(|name| config.agents.follows_active_provider(name))
+        .filter_map(|name| {
+            config
+                .model_route_for(name)
+                .map(|route| (name.to_string(), route.model.clone()))
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let next_provider_api_key_hints = config
+        .providers
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                format!(
+                    "Set providers.{name}.api_key in {} or set {}.",
+                    config.config_path.display(),
+                    crate::config::provider_api_key_env_var(name)
+                ),
+            )
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let expert_factory = crate::subagent::ExpertRouteFactory::new(
+        next_expert_model_routes
+            .iter()
+            .map(|(name, route)| (name.clone(), route.clone())),
+        &config.providers,
+        &config.global.retry,
+    )?;
+    let next_providers = config.providers.clone();
+    let next_global_retry = config.global.retry.clone();
+    let next_agent_retry = provider
+        .retry
+        .clone()
+        .unwrap_or_else(|| next_global_retry.clone());
+    let next_parallelism = config
+        .tools
+        .parallelism
+        .iter()
+        .map(|(name, mode)| (name.clone(), *mode))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let previous_expert_routes = crate::delegation::supported_agent_names()
+        .map(|name| {
+            (
+                name.to_string(),
+                effective_expert_route(
+                    expert_model_routes,
+                    legacy_expert_models,
+                    &previous_active_route,
+                    name,
+                ),
+            )
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let next_expert_routes = crate::delegation::supported_agent_names()
+        .map(|name| {
+            (
+                name.to_string(),
+                effective_expert_route(
+                    &next_expert_model_routes,
+                    &next_legacy_expert_models,
+                    &active_route,
+                    name,
+                ),
+            )
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+
+    let providers_runtime_unchanged = providers_runtime_eq(providers, &next_providers);
+    let maps_unchanged = *model_routes == next_model_routes
+        && *route_api_key_configured == next_route_api_key_configured
+        && *expert_model_routes == next_expert_model_routes
+        && *legacy_expert_models == next_legacy_expert_models
+        && *provider_api_key_hints == next_provider_api_key_hints
+        && *global_retry == next_global_retry;
+    let settings_unchanged = agent.compaction_config() == &config.global.compaction
+        && agent.tool_timeout_secs() == config.global.tool_timeout_secs
+        && agent.retry_config() == &next_agent_retry
+        && agent.tool_parallelism_overrides() == &next_parallelism;
+    let route_unchanged = previous_active_route == active_route;
+    let previous_provider = providers.get(&previous_active_route.provider);
+    let client_unchanged = route_unchanged
+        && previous_provider.is_some_and(|previous| {
+            previous.api_key == provider.api_key
+                && previous.base_url == provider.base_url
+                && previous.protocol == provider.protocol
+        });
+    let next_model_protocols = provider
+        .models
+        .iter()
+        .map(|(id, model)| (id.clone(), model.protocol))
+        .collect::<HashMap<_, _>>();
+    let next_model_catalog = provider
+        .models
+        .iter()
+        .map(|(id, model)| (id.clone(), model.request_metadata()))
+        .collect::<HashMap<_, _>>();
+    let catalog_unchanged = agent.default_protocol() == provider.protocol
+        && agent.model_protocols() == &next_model_protocols
+        && agent.model_catalog() == &next_model_catalog;
+    let expert_routes_unchanged = previous_expert_routes == next_expert_routes;
+
+    // Self-writes (model/fast-mode/MCP persist) and duplicate watcher events often
+    // land here with no reloadable runtime delta — stay silent and keep usage anchors.
+    if providers_runtime_unchanged
+        && maps_unchanged
+        && settings_unchanged
+        && client_unchanged
+        && catalog_unchanged
+        && expert_routes_unchanged
+    {
+        return Ok(());
+    }
+
+    // Fallible mutator first; remaining updates below are infallible.
+    agent.set_tool_parallelism(next_parallelism)?;
+    if agent.compaction_config() != &config.global.compaction {
+        agent.set_compaction_config(config.global.compaction.clone());
+    }
+    if agent.tool_timeout_secs() != config.global.tool_timeout_secs {
+        agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
+    }
+    if agent.retry_config() != &next_agent_retry {
+        agent.set_retry_config(next_agent_retry);
+    }
+    agent.set_primary_route_factory(Arc::new(primary_factory));
+    agent.set_subagent_child_factory(Arc::new(expert_factory));
+    if !client_unchanged {
+        // Rebuilding the client/route clears provider usage anchors intentionally.
+        prepared.into_install().apply(agent);
+    } else if !catalog_unchanged {
+        agent.set_default_protocol(provider.protocol);
+        agent.set_model_protocols(next_model_protocols);
+        agent.set_model_catalog(next_model_catalog);
+    }
+
+    if !route_unchanged {
+        let _ = event_tx.send(SessionTransportEvent::ModelChanged {
+            model_id: active_route.display_name(),
+        });
+    }
+    *model_routes = next_model_routes;
+    *route_api_key_configured = next_route_api_key_configured;
+    *expert_model_routes = next_expert_model_routes;
+    *legacy_expert_models = next_legacy_expert_models;
+    *provider_api_key_hints = next_provider_api_key_hints;
+    *providers = next_providers;
+    *global_retry = next_global_retry;
+    for (agent_name, route) in next_expert_routes {
+        if previous_expert_routes.get(&agent_name) != Some(&route) {
+            let _ = event_tx.send(SessionTransportEvent::ExpertModelChanged {
+                agent_name,
+                model_id: route.display_name(),
+            });
+        }
+    }
+    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+        "configuration reloaded (supported runtime fields only; MCP, permissions, Fast Mode, max_iterations/max_tool_calls unchanged)",
+    )));
+    Ok(())
+}
+
+/// Compare reloadable provider fields, ignoring `default_model` which is often
+/// rewritten by in-session model switches that already updated the live agent.
+fn providers_runtime_eq(
+    left: &indexmap::IndexMap<String, ProviderConfig>,
+    right: &indexmap::IndexMap<String, ProviderConfig>,
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().all(|(name, left_provider)| {
+        right.get(name).is_some_and(|right_provider| {
+            left_provider.base_url == right_provider.base_url
+                && left_provider.api_key == right_provider.api_key
+                && left_provider.protocol == right_provider.protocol
+                && left_provider.retry == right_provider.retry
+                && left_provider.models == right_provider.models
+        })
+    })
+}
+
+fn create_config_watcher(
+    config_path: &std::path::Path,
+    reload_tx: mpsc::UnboundedSender<()>,
+) -> Result<RecommendedWatcher> {
+    let target = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let watch_dir = target
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+        let Ok(event) = event else {
+            // Transient watcher errors should not force a reload storm.
+            return;
+        };
+        if matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) && event
+            .paths
+            .iter()
+            .any(|path| path.file_name() == target.file_name())
+        {
+            let _ = reload_tx.send(());
+        }
+    })?;
+    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
 fn route_has_api_key(
     route_api_key_configured: &indexmap::IndexMap<String, bool>,
     route_display_name: &str,
@@ -798,6 +1077,23 @@ fn active_route_has_api_key(
     route_api_key_configured: &indexmap::IndexMap<String, bool>,
 ) -> bool {
     route_has_api_key(route_api_key_configured, &agent.route_display_name())
+}
+
+fn effective_expert_route(
+    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    legacy_expert_models: &indexmap::IndexMap<String, String>,
+    primary_route: &ModelRoute,
+    agent_name: &str,
+) -> ModelRoute {
+    expert_model_routes
+        .get(agent_name)
+        .cloned()
+        .or_else(|| {
+            legacy_expert_models
+                .get(agent_name)
+                .map(|model| ModelRoute::new(primary_route.provider.clone(), model))
+        })
+        .unwrap_or_else(|| primary_route.clone())
 }
 
 fn expert_routes_after_primary_switch(
@@ -1383,6 +1679,7 @@ async fn run_engine_loop(
     mcp_config_path: PathBuf,
     mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
     mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
+    mut reload_rx: mpsc::UnboundedReceiver<()>,
     mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     title_event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
@@ -1392,13 +1689,13 @@ async fn run_engine_loop(
     let mut agent = agent;
     let mut mcp_tools_rx = Some(mcp_tools_rx);
     let mut mcp_config = mcp_config;
-    let model_routes = model_routes;
-    let route_api_key_configured = route_api_key_configured;
+    let mut model_routes = model_routes;
+    let mut route_api_key_configured = route_api_key_configured;
     let mut expert_model_routes = expert_model_routes;
     let mut legacy_expert_models = legacy_expert_models;
-    let providers = providers;
-    let global_retry = global_retry;
-    let provider_api_key_hints = provider_api_key_hints;
+    let mut providers = providers;
+    let mut global_retry = global_retry;
+    let mut provider_api_key_hints = provider_api_key_hints;
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
     let mut deferred_commands = VecDeque::new();
@@ -1410,6 +1707,28 @@ async fn run_engine_loop(
     loop {
         tokio::select! {
             biased;
+            reload = reload_rx.recv() => {
+                if reload.is_none() {
+                    break;
+                }
+                while reload_rx.try_recv().is_ok() {}
+                if let Err(error) = apply_config_reload(
+                    &mut agent,
+                    &mcp_config_path,
+                    &mut model_routes,
+                    &mut route_api_key_configured,
+                    &mut expert_model_routes,
+                    &mut legacy_expert_models,
+                    &mut providers,
+                    &mut global_retry,
+                    &mut provider_api_key_hints,
+                    &session_transport_tx,
+                ) {
+                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                        format!("failed to reload configuration: {error}"),
+                    )));
+                }
+            }
             command = next_idle_session_command(&mut control_rx, &mut deferred_commands) => {
                 let Some(command) = command else {
                     break;
@@ -1432,20 +1751,6 @@ async fn run_engine_loop(
                         ));
                         continue;
                     };
-                    let mut updated_expert_model_routes = expert_model_routes.clone();
-                    updated_expert_model_routes.insert(agent_name.clone(), route.clone());
-                    if let Err(error) = crate::subagent::ExpertRouteFactory::new(
-                        updated_expert_model_routes
-                            .iter()
-                            .map(|(name, route)| (name.clone(), route.clone())),
-                        &providers,
-                        &global_retry,
-                    ) {
-                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                            ErrorEvent::new(format!("failed to activate expert model: {error}")),
-                        ));
-                        continue;
-                    }
                     if let Err(error) = crate::config::persist_expert_model_route(
                         &mcp_config_path,
                         agent_name,
@@ -1456,21 +1761,22 @@ async fn run_engine_loop(
                         ));
                         continue;
                     }
-                    let factory = crate::subagent::ExpertRouteFactory::new(
-                        updated_expert_model_routes
-                            .iter()
-                            .map(|(name, route)| (name.clone(), route.clone())),
-                        &providers,
-                        &global_retry,
-                    )
-                    .expect("validated expert route factory must remain constructible");
-                    agent.set_subagent_child_factory(Arc::new(factory));
-                    expert_model_routes = updated_expert_model_routes;
-                    legacy_expert_models.shift_remove(agent_name);
-                    let _ = session_transport_tx.send(SessionTransportEvent::ExpertModelChanged {
-                        agent_name: agent_name.clone(),
-                        model_id: model_id.clone(),
-                    });
+                    if let Err(error) = apply_config_reload(
+                        &mut agent,
+                        &mcp_config_path,
+                        &mut model_routes,
+                        &mut route_api_key_configured,
+                        &mut expert_model_routes,
+                        &mut legacy_expert_models,
+                        &mut providers,
+                        &mut global_retry,
+                        &mut provider_api_key_hints,
+                        &session_transport_tx,
+                    ) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!("failed to reload configuration: {error}")),
+                        ));
+                    }
                     continue;
                 }
 
@@ -1893,7 +2199,12 @@ async fn run_engine_loop(
                                     ActiveSessionOperation::RunnerEvent(_) => {
                                         unreachable!("event-aware selection is not used for delegates")
                                     }
-                                    ActiveSessionOperation::Command(Some(_)) => {}
+                                    ActiveSessionOperation::Command(Some(command)) => {
+                                        deferred_commands.push_front(command);
+                                        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                            NoticeEvent::info("Turn still running · navigation only"),
+                                        ));
+                                    }
                                     ActiveSessionOperation::Command(None) => break,
                                 }
                             }
@@ -2224,7 +2535,8 @@ async fn run_engine_loop(
                                         "history navigation is unavailable while a turn is active",
                                     )));
                                 }
-                                Some(_) => {
+                                Some(command) => {
+                                    deferred_commands.push_front(command);
                                     let _ = session_transport_tx.send(SessionTransportEvent::Notice(
                                         NoticeEvent::info("Turn still running · navigation only"),
                                     ));
@@ -2318,8 +2630,10 @@ async fn run_engine_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::{Client, config::OpenAIConfig};
+    use std::fs;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_sessions_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2800,6 +3114,720 @@ mod tests {
 
         assert_ne!(projection.model_id, projection.model_label);
         assert_eq!(projection.model_label, "Provider Model Label");
+    }
+
+    #[test]
+    fn reload_failure_preserves_engine_owned_state() {
+        let old_path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-old-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        let bad_path = old_path.with_file_name("letcode-engine-reload-bad.toml");
+        let old_contents = r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://example.invalid/v1"
+            api_key = "old-key"
+            protocol = "responses"
+
+            [providers.primary.models.old]
+            "#;
+        let bad_contents = r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            api_key = "new-key"
+            protocol = "responses"
+
+            [providers.primary.models.new]
+            "#;
+        fs::write(&old_path, old_contents).expect("write old config");
+        fs::write(&bad_path, bad_contents).expect("write invalid reload config");
+        let old_config = AppConfig::load_from_path(&old_path).expect("old config should load");
+        let route = ModelRoute::new("primary", "old");
+        let mut agent = Agent::new(Client::with_config(OpenAIConfig::new()), "old", 1, 1);
+        agent.set_primary_route(route.clone());
+
+        let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
+        let mut route_api_key_configured = indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut expert_model_routes =
+            indexmap::IndexMap::from([(String::from("explorer"), route.clone())]);
+        let mut legacy_expert_models =
+            indexmap::IndexMap::from([(String::from("explorer"), String::from("old"))]);
+        let mut providers = old_config.providers.clone();
+        let mut global_retry = old_config.global.retry.clone();
+        let mut provider_api_key_hints =
+            indexmap::IndexMap::from([(String::from("primary"), String::from("old hint"))]);
+        let old_model_routes = model_routes.clone();
+        let old_route_api_key_configured = route_api_key_configured.clone();
+        let old_expert_model_routes = expert_model_routes.clone();
+        let old_legacy_expert_models = legacy_expert_models.clone();
+        let old_providers = providers.clone();
+        let old_global_retry = global_retry.clone();
+        let old_provider_api_key_hints = provider_api_key_hints.clone();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        assert!(
+            apply_config_reload(
+                &mut agent,
+                &bad_path,
+                &mut model_routes,
+                &mut route_api_key_configured,
+                &mut expert_model_routes,
+                &mut legacy_expert_models,
+                &mut providers,
+                &mut global_retry,
+                &mut provider_api_key_hints,
+                &event_tx,
+            )
+            .is_err()
+        );
+
+        assert_eq!(agent.primary_route(), Some(&route));
+        assert_eq!(model_routes, old_model_routes);
+        assert_eq!(route_api_key_configured, old_route_api_key_configured);
+        assert_eq!(expert_model_routes, old_expert_model_routes);
+        assert_eq!(legacy_expert_models, old_legacy_expert_models);
+        assert_eq!(
+            providers.keys().collect::<Vec<_>>(),
+            old_providers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            providers["primary"].api_key,
+            old_providers["primary"].api_key
+        );
+        assert_eq!(
+            providers["primary"].models.keys().collect::<Vec<_>>(),
+            old_providers["primary"].models.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(global_retry, old_global_retry);
+        assert_eq!(provider_api_key_hints, old_provider_api_key_hints);
+        assert!(event_rx.try_recv().is_err());
+
+        let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(bad_path);
+    }
+
+    #[test]
+    fn reload_factories_construct_and_prepare_configured_routes() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-factory-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+
+            [providers.primary.models.primary-model]
+
+            [providers.primary.models.expert-model]
+
+            [agents.explorer]
+            provider = "primary"
+            model = "expert-model"
+            "#,
+        )
+        .expect("write factory config");
+        let config = AppConfig::load_from_path(&path).expect("factory config should load");
+        let expert_route = ModelRoute::new("primary", "expert-model");
+        let expert_factory = crate::subagent::ExpertRouteFactory::new(
+            [(String::from("explorer"), expert_route.clone())],
+            &config.providers,
+            &config.global.retry,
+        )
+        .expect("expert factory should construct");
+        let _prepared_expert = <crate::subagent::ExpertRouteFactory as PrimaryRouteFactory<
+            OpenAIConfig,
+        >>::prepare_route(&expert_factory, expert_route)
+        .expect("expert factory should prepare configured route");
+
+        let primary_factory = ConfiguredPrimaryRouteFactory::new(
+            config.providers.clone(),
+            config.global.retry.clone(),
+        );
+        let _prepared_primary = primary_factory
+            .prepare_route(ModelRoute::new("primary", "primary-model"))
+            .expect("primary factory should prepare configured route");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_applies_configured_active_route_change() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-active-route-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+
+            [providers.secondary]
+            base_url = "https://secondary.example.invalid/v1"
+            api_key = "secondary-key"
+            protocol = "responses"
+            default_model = "secondary-model"
+
+            [providers.secondary.models.secondary-model]
+            "#,
+        )
+        .expect("write initial active route config");
+
+        let primary_route = ModelRoute::new("primary", "primary-model");
+        let secondary_route = ModelRoute::new("secondary", "secondary-model");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            primary_route.model.clone(),
+            1,
+            1,
+        );
+        agent.set_primary_route(primary_route.clone());
+        let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
+        let mut model_routes = indexmap::IndexMap::new();
+        let mut route_api_key_configured = indexmap::IndexMap::new();
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        fs::write(
+            &path,
+            r#"
+            active_provider = "secondary"
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+
+            [providers.secondary]
+            base_url = "https://secondary.example.invalid/v1"
+            api_key = "secondary-key"
+            protocol = "responses"
+            default_model = "secondary-model"
+
+            [providers.secondary.models.secondary-model]
+            "#,
+        )
+        .expect("write updated active route config");
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("active route config should reload");
+
+        assert_eq!(agent.primary_route(), Some(&secondary_route));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(SessionTransportEvent::ModelChanged { model_id })
+                if model_id == "secondary/secondary-model"
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_emits_effective_expert_route_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-expert-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        let config = |agent_entry: &str| {
+            format!(
+                r#"
+                active_provider = "primary"
+
+                [providers.primary]
+                base_url = "https://example.invalid/v1"
+                api_key = "config-key"
+                protocol = "responses"
+
+                [providers.primary.models.primary-model]
+                [providers.primary.models.expert-old]
+                [providers.primary.models.expert-new]
+                {agent_entry}
+                "#
+            )
+        };
+        fs::write(
+            &path,
+            config(
+                r#"
+                [agents.explorer]
+                provider = "primary"
+                model = "expert-old"
+                "#,
+            ),
+        )
+        .expect("write initial expert config");
+
+        let primary_route = ModelRoute::new("primary", "primary-model");
+        let old_route = ModelRoute::new("primary", "expert-old");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            "primary-model",
+            1,
+            1,
+        );
+        agent.set_primary_route(primary_route.clone());
+        let mut model_routes = indexmap::IndexMap::new();
+        let mut route_api_key_configured = indexmap::IndexMap::new();
+        let mut expert_model_routes =
+            indexmap::IndexMap::from([(String::from("explorer"), old_route)]);
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        fs::write(
+            &path,
+            config(
+                r#"
+                [agents.explorer]
+                provider = "primary"
+                model = "expert-new"
+                "#,
+            ),
+        )
+        .expect("write edited expert config");
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("edited expert config should reload");
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(SessionTransportEvent::ExpertModelChanged { agent_name, model_id })
+                if agent_name == "explorer" && model_id == "primary/expert-new"
+        ));
+        while event_rx.try_recv().is_ok() {}
+
+        fs::write(&path, config("")).expect("write removed expert config");
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("removed expert config should reload");
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(SessionTransportEvent::ExpertModelChanged { agent_name, model_id })
+                if agent_name == "explorer" && model_id == "primary/primary-model"
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_is_silent_when_runtime_fields_are_unchanged() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-noop-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        let contents = r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            "#;
+        fs::write(&path, contents).expect("write config");
+
+        let route = ModelRoute::new("primary", "primary-model");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            route.model.clone(),
+            1,
+            1,
+        );
+        agent.set_primary_route(route.clone());
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
+        let mut route_api_key_configured =
+            indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = config.providers.clone();
+        let mut global_retry = config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::from([(
+            String::from("primary"),
+            format!(
+                "Set providers.primary.api_key in {} or set {}.",
+                config.config_path.display(),
+                crate::config::provider_api_key_env_var("primary")
+            ),
+        )]);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("warming reload should succeed");
+        while event_rx.try_recv().is_ok() {}
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("identical second reload should succeed");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "noop reload must stay silent"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_preserves_usage_anchor_when_only_default_model_diverges() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-anchor-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+            default_model = "model-b"
+
+            [providers.primary.models.model-a]
+            [providers.primary.models.model-b]
+            "#,
+        )
+        .expect("write config");
+
+        let file_config = AppConfig::load_from_path(&path).expect("config should load");
+        let provider = file_config
+            .providers
+            .get("primary")
+            .expect("primary provider");
+        let route = ModelRoute::new("primary", "model-b");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            route.model.clone(),
+            1,
+            1,
+        );
+        agent.set_primary_route(route.clone());
+        agent.set_default_protocol(provider.protocol);
+        agent.set_model_protocols(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+        );
+        agent.set_model_catalog(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+        );
+        let usage = crate::agent::TokenUsageEstimate {
+            used_tokens: 42,
+            context_window_tokens: 1000,
+            input_tokens: 40,
+            output_tokens: 2,
+            cached_tokens: 0,
+        };
+        agent.install_provider_usage_anchor_for_test(usage.clone());
+
+        let mut stale_providers = file_config.providers.clone();
+        stale_providers
+            .get_mut("primary")
+            .expect("primary provider")
+            .default_model = "model-a".into();
+        let mut model_routes = file_config
+            .providers
+            .iter()
+            .flat_map(|(provider_name, provider)| {
+                provider.models.keys().map(move |model| {
+                    let route = ModelRoute::new(provider_name, model);
+                    (route.display_name(), route)
+                })
+            })
+            .collect::<indexmap::IndexMap<_, _>>();
+        let mut route_api_key_configured = model_routes
+            .keys()
+            .cloned()
+            .map(|name| (name, true))
+            .collect::<indexmap::IndexMap<_, _>>();
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut global_retry = file_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::from([(
+            String::from("primary"),
+            format!(
+                "Set providers.primary.api_key in {} or set {}.",
+                file_config.config_path.display(),
+                crate::config::provider_api_key_env_var("primary")
+            ),
+        )]);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut stale_providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("default_model-only divergence should be a silent noop");
+
+        assert_eq!(agent.provider_usage_anchor_for_test(), Some(usage));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "self-echo default_model sync must not emit reload notice"
+        );
+        assert_eq!(
+            stale_providers["primary"].default_model, "model-a",
+            "noop path must not rewrite engine maps"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_updates_retry_without_clearing_usage_anchor() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-retry-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [global.retry]
+            enabled = false
+            max_attempts = 1
+
+            [providers.primary]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            "#,
+        )
+        .expect("write retry config");
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let provider = config.providers.get("primary").expect("primary provider");
+        let route = ModelRoute::new("primary", "primary-model");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            route.model.clone(),
+            1,
+            1,
+        );
+        agent.set_primary_route(route.clone());
+        agent.set_default_protocol(provider.protocol);
+        agent.set_model_protocols(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+        );
+        agent.set_model_catalog(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+        );
+        let usage = crate::agent::TokenUsageEstimate {
+            used_tokens: 7,
+            context_window_tokens: 1000,
+            input_tokens: 7,
+            output_tokens: 0,
+            cached_tokens: 0,
+        };
+        agent.install_provider_usage_anchor_for_test(usage.clone());
+        assert!(agent.retry_config().enabled);
+
+        let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
+        let mut route_api_key_configured =
+            indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = config.providers.clone();
+        let mut global_retry = RetryConfig::default();
+        let mut provider_api_key_hints = indexmap::IndexMap::from([(
+            String::from("primary"),
+            format!(
+                "Set providers.primary.api_key in {} or set {}.",
+                config.config_path.display(),
+                crate::config::provider_api_key_env_var("primary")
+            ),
+        )]);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &event_tx,
+        )
+        .expect("retry-only reload should succeed");
+
+        assert!(!agent.retry_config().enabled);
+        assert_eq!(agent.provider_usage_anchor_for_test(), Some(usage));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(SessionTransportEvent::Notice(_))
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn config_watcher_filters_unrelated_files_and_notifies_target_events() {
+        let directory = std::env::temp_dir().join(format!(
+            "letcode-engine-watcher-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create watcher directory");
+        let config_path = directory.join("letcode.toml");
+        let unrelated_path = directory.join("unrelated.toml");
+        fs::write(&config_path, "active_provider = \"primary\"\n").expect("write target");
+        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
+        let watcher = create_config_watcher(&config_path, reload_tx).expect("watch config parent");
+        // macOS FSEvents can deliver the pre-watch create/write after the watcher
+        // starts; drain that noise before asserting filter behavior.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while reload_rx.try_recv().is_ok() {}
+
+        fs::write(&unrelated_path, "unrelated = true\n").expect("write unrelated file");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), reload_rx.recv())
+                .await
+                .is_err(),
+            "unrelated file changes must not request reload"
+        );
+
+        fs::write(&config_path, "active_provider = \"primary\"\n").expect("write target file");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reload_rx.recv())
+                .await
+                .expect("target event should arrive before timeout")
+                .expect("watcher channel should remain open"),
+            ()
+        );
+
+        drop(watcher);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[tokio::test]

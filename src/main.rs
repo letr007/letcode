@@ -27,12 +27,12 @@ mod transcript;
 mod tui;
 mod user_content;
 
-use agent::{Agent, AgentEvent, PreparedPrimaryRoute, PrimaryRouteFactory as _};
+use agent::{Agent, AgentEvent, ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
 use agent_event_journal::persist_agent_event;
 use anyhow::{Result, anyhow, bail};
 use async_openai::config::OpenAIConfig;
 use command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
-use config::{AppConfig, ProviderConfig};
+use config::AppConfig;
 use delegation::supported_agent_names;
 use fast_mode::FastMode;
 use indexmap::IndexMap;
@@ -160,7 +160,10 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| config.global.retry.clone()),
     );
     agent.set_permission_mode(config.permissions.mode);
-    let primary_route_factory = Arc::new(PrimaryRouteFactory::new(&config));
+    let primary_route_factory = Arc::new(ConfiguredPrimaryRouteFactory::new(
+        config.providers.clone(),
+        config.global.retry.clone(),
+    ));
     let prepared_active_route = primary_route_factory.prepare_route(active_route.clone())?;
     agent.apply_prepared_route(prepared_active_route);
     agent.set_primary_route_factory(primary_route_factory);
@@ -1136,56 +1139,6 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String
     }
 }
 
-struct PrimaryRouteFactory {
-    providers: IndexMap<String, ProviderConfig>,
-    global_retry: config::RetryConfig,
-}
-
-impl PrimaryRouteFactory {
-    fn new(config: &AppConfig) -> Self {
-        Self {
-            providers: config.providers.clone(),
-            global_retry: config.global.retry.clone(),
-        }
-    }
-}
-
-impl agent::PrimaryRouteFactory<OpenAIConfig> for PrimaryRouteFactory {
-    fn prepare_route(
-        &self,
-        route: config::ModelRoute,
-    ) -> Result<PreparedPrimaryRoute<OpenAIConfig>> {
-        let provider = self.providers.get(&route.provider).ok_or_else(|| {
-            anyhow!(
-                "provider '{}' is not defined under [providers]",
-                route.provider
-            )
-        })?;
-        if !provider.has_model(&route.model) {
-            bail!(
-                "model '{}' is not defined under [providers.{}.models]",
-                route.model,
-                route.provider
-            );
-        }
-        let model = provider
-            .models
-            .get(&route.model)
-            .expect("route model was validated above");
-        Ok(PreparedPrimaryRoute::new(
-            route.clone().build_client(provider),
-            route.clone(),
-            provider.protocol,
-            HashMap::from([(route.model.clone(), model.protocol)]),
-            HashMap::from([(route.model.clone(), model.request_metadata())]),
-            provider
-                .retry
-                .clone()
-                .unwrap_or_else(|| self.global_retry.clone()),
-        ))
-    }
-}
-
 fn install_expert_route_factory(agent: &mut Agent<OpenAIConfig>, config: &AppConfig) -> Result<()> {
     let routes = supported_agent_names().filter_map(|agent_name| {
         config
@@ -1706,10 +1659,10 @@ mod tests {
         let mut agent = test_agent();
         agent.set_primary_route(config::ModelRoute::new("primary", "shared"));
 
-        let factory = Arc::new(PrimaryRouteFactory {
-            providers: IndexMap::from([("expert".into(), provider)]),
-            global_retry: config::RetryConfig::default(),
-        });
+        let factory = Arc::new(ConfiguredPrimaryRouteFactory::new(
+            IndexMap::from([("expert".into(), provider)]),
+            config::RetryConfig::default(),
+        ));
         let route = config::ModelRoute::new("expert", "shared");
         let prepared_route = factory
             .prepare_route(route.clone())
@@ -1750,10 +1703,10 @@ mod tests {
     #[test]
     fn primary_route_factory_rejects_unknown_provider_or_model() {
         let mut agent = test_agent();
-        let factory = PrimaryRouteFactory {
-            providers: IndexMap::new(),
-            global_retry: config::RetryConfig::default(),
-        };
+        let factory = ConfiguredPrimaryRouteFactory::new(
+            IndexMap::new(),
+            config::RetryConfig::default(),
+        );
         agent.set_primary_route_factory(Arc::new(factory));
 
         let error = agent
@@ -1774,10 +1727,10 @@ mod tests {
             models: IndexMap::new(),
         };
         let mut agent = test_agent();
-        agent.set_primary_route_factory(Arc::new(PrimaryRouteFactory {
-            providers: IndexMap::from([("known".into(), provider)]),
-            global_retry: config::RetryConfig::default(),
-        }));
+        agent.set_primary_route_factory(Arc::new(ConfiguredPrimaryRouteFactory::new(
+            IndexMap::from([("known".into(), provider)]),
+            config::RetryConfig::default(),
+        )));
         let error = agent
             .switch_primary_route(config::ModelRoute::new("known", "missing"))
             .expect_err("unknown model must fail");
