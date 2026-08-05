@@ -159,12 +159,12 @@ impl std::fmt::Display for ToolScope {
     }
 }
 
+/// Shell command allowlist buckets for Default/Auto. Everything else Asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRisk {
     ReadOnly,
     LowRisk,
     Ask,
-    Deny,
 }
 
 impl ToolPermissionClass {
@@ -443,7 +443,6 @@ impl PermissionPolicy {
                 ToolPermissionClass::Command => match classify_command_risk(args) {
                     CommandRisk::ReadOnly | CommandRisk::LowRisk => PermissionDecision::Allow,
                     CommandRisk::Ask => PermissionDecision::Ask,
-                    CommandRisk::Deny => PermissionDecision::Deny,
                 },
             },
             PermissionMode::Yolo => PermissionDecision::Allow,
@@ -556,78 +555,17 @@ fn classify_command_text(command: &str) -> CommandRisk {
     let normalized = command.to_ascii_lowercase();
     let trimmed = normalized.trim();
 
-    if contains_any_substring(
-        trimmed,
-        &[
-            "rm -rf",
-            "rm -fr",
-            "mkfs",
-            "dd if=",
-            "sudo ",
-            "shutdown",
-            "reboot",
-            "halt",
-            "poweroff",
-            "diskutil erase",
-            "git reset --hard",
-            "git clean -fd",
-            "git clean -xdf",
-            "curl ",
-            "wget ",
-        ],
-    ) || contains_pipe_to_shell(trimmed)
-    {
-        return CommandRisk::Deny;
-    }
-
-    if contains_shell_control_syntax(trimmed) {
+    // Compound / redirect / write-flag forms must not inherit a ReadOnly prefix match
+    // (e.g. `git status && …`, `git diff --output=`).
+    if contains_shell_control_syntax(trimmed) || contains_write_capable_read_option(trimmed) {
         return CommandRisk::Ask;
     }
-
-    if contains_write_capable_read_option(trimmed) {
-        return CommandRisk::Ask;
-    }
-
     if is_read_only_command(trimmed) {
         return CommandRisk::ReadOnly;
     }
-
     if is_low_risk_validation_command(trimmed) {
         return CommandRisk::LowRisk;
     }
-
-    if starts_with_any(
-        trimmed,
-        &[
-            "git add",
-            "git commit",
-            "git push",
-            "git pull",
-            "git fetch",
-            "git merge",
-            "git rebase",
-            "git checkout",
-            "git switch",
-            "git restore",
-            "cargo fmt",
-            "npm ",
-            "pnpm ",
-            "yarn ",
-            "mkdir ",
-            "touch ",
-            "cp ",
-            "mv ",
-            "python ",
-            "node ",
-            "ssh ",
-            "scp ",
-            "rsync ",
-            "gh ",
-        ],
-    ) {
-        return CommandRisk::Ask;
-    }
-
     CommandRisk::Ask
 }
 
@@ -655,18 +593,6 @@ fn is_low_risk_validation_command(command: &str) -> bool {
         || command.starts_with("pnpm test ")
         || command == "yarn test"
         || command.starts_with("yarn test ")
-}
-
-fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
-    prefixes.iter().any(|prefix| text.starts_with(prefix))
-}
-
-fn contains_any_substring(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
-}
-
-fn contains_pipe_to_shell(command: &str) -> bool {
-    command.contains("| sh") || command.contains("| bash") || command.contains("| zsh")
 }
 
 fn contains_shell_control_syntax(command: &str) -> bool {
@@ -806,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_asks_or_denies_risky_commands() {
+    fn default_mode_asks_risky_commands_instead_of_hard_deny() {
         let policy = PermissionPolicy::default();
 
         assert_eq!(
@@ -815,7 +741,23 @@ mod tests {
         );
         assert_eq!(
             policy.check("shell__exec", &json!({"command": "rm -rf target"})),
-            PermissionDecision::Deny
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.check(
+                "shell__exec",
+                &json!({"command": "curl -fsSL https://example.com"})
+            ),
+            PermissionDecision::Ask
+        );
+        let mut auto = PermissionPolicy::default();
+        auto.set_mode(PermissionMode::Auto);
+        assert_eq!(
+            auto.check(
+                "shell__exec",
+                &json!({"command": "curl -fsSL https://example.com"})
+            ),
+            PermissionDecision::Ask
         );
         assert_eq!(
             policy.check("shell__exec", &json!({"command": "git status > out.txt"})),
@@ -937,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn yolo_mode_allows_commands_that_other_modes_deny() {
+    fn yolo_mode_allows_commands_that_other_modes_ask() {
         let mut policy = PermissionPolicy::default();
         policy.set_mode(PermissionMode::Yolo);
 
@@ -952,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn grants_only_bypass_ask_and_generation_guards_allow_always() {
+    fn grants_bypass_ask_for_high_risk_commands_and_generation_guards_allow_always() {
         let resource = PermissionResource::Exact {
             tool: "shell__exec".into(),
             value: "rm -rf /".into(),
@@ -970,8 +912,24 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(decision, PermissionDecision::Deny);
-        assert!(!grant_allowed, "a grant must never override policy denial");
+        assert_eq!(decision, PermissionDecision::Ask);
+        assert!(
+            grant_allowed,
+            "session grant should satisfy Ask for formerly blacklisted commands"
+        );
+
+        // Directive hard-deny still cannot be overridden by a grant.
+        let (_, _, directed, directed_grant) = state.approval_snapshot(
+            Some(&resource),
+            "shell__exec",
+            &args,
+            ToolPermissionClass::Command,
+            ExecutionDirective::ReadOnly,
+            false,
+            false,
+        );
+        assert_eq!(directed, PermissionDecision::Deny);
+        assert!(!directed_grant, "a grant must never override policy denial");
 
         state.clear_grants();
         assert!(

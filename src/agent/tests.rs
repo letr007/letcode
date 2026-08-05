@@ -6935,9 +6935,9 @@ async fn default_external_workspace_read_allow_always_grants_only_matching_resou
 }
 
 #[tokio::test]
-async fn matching_grant_does_not_override_base_policy_denial() {
+async fn matching_grant_allows_high_risk_command_without_reasking() {
     let mut agent = test_agent();
-    let command = "rm -rf letcode-test-target";
+    let command = "curl --version";
     agent
         .permission_session
         .lock()
@@ -6947,7 +6947,7 @@ async fn matching_grant_does_not_override_base_policy_denial() {
             value: command.into(),
         });
     let call = HistoryToolCall {
-        call_id: "call-granted-policy-denial".into(),
+        call_id: "call-granted-high-risk".into(),
         name: "shell__exec".into(),
         arguments_json: json!({"command": command}).to_string(),
     };
@@ -6956,14 +6956,14 @@ async fn matching_grant_does_not_override_base_policy_denial() {
     let record = agent
         .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
             approval_requested = true;
-            std::future::ready(Ok(PermissionApproval::AllowOnce))
+            std::future::ready(Ok(PermissionApproval::Deny))
         })
         .await
-        .expect("policy denial should produce a rejection record");
+        .expect("session grant should admit previously blacklisted commands");
 
     assert!(!approval_requested);
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
+    assert_eq!(record.status, ToolExecutionStatus::Executed);
+    assert_ne!(
         record.rejection,
         Some(ToolExecutionRejection::PermissionDeniedByPolicy)
     );
@@ -7556,11 +7556,11 @@ async fn writable_leaf_preparation_failure_skips_approval_and_started_event() {
 }
 
 #[tokio::test]
-async fn yolo_mode_executes_commands_that_default_mode_denies_by_policy() {
+async fn yolo_mode_executes_commands_that_default_mode_asks() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Yolo);
     let call = HistoryToolCall {
-        call_id: "call-yolo-deny-risk".into(),
+        call_id: "call-yolo-ask-risk".into(),
         name: "shell__exec".into(),
         arguments_json: json!({"command": "curl --version"}).to_string(),
     };
@@ -8176,7 +8176,7 @@ async fn execute_tool_call_blocks_non_read_only_commands_under_read_only_directi
 }
 
 #[tokio::test]
-async fn execute_tool_call_emits_finished_event_for_policy_denial() {
+async fn execute_tool_call_emits_finished_event_for_user_denial_of_high_risk_command() {
     let client = Client::with_config(
         OpenAIConfig::new()
             .with_api_base("https://api.openai.com/v1")
@@ -8189,6 +8189,7 @@ async fn execute_tool_call_emits_finished_event_for_policy_denial() {
         arguments_json: r#"{"command":"rm -rf target"}"#.into(),
     };
     let mut events = Vec::new();
+    let mut approval_requested = false;
 
     let record = agent
         .execute_tool_call(
@@ -8197,11 +8198,15 @@ async fn execute_tool_call_emits_finished_event_for_policy_denial() {
                 events.push(event);
                 std::future::ready(Ok(()))
             },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            &mut |_| {
+                approval_requested = true;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            },
         )
         .await
-        .expect("policy denial should be reported as tool output");
+        .expect("user denial should be reported as tool output");
 
+    assert!(approval_requested, "high-risk commands must Ask, not hard-deny");
     assert!(!record.output.ok);
     assert!(matches!(
         events.as_slice(),
@@ -8214,13 +8219,13 @@ async fn execute_tool_call_emits_finished_event_for_policy_denial() {
                 ..
             })
         ] if status == "rejected"
-                && rejection == "permission_denied_by_policy"
+                && rejection == "permission_denied_by_user"
                 && effect_kind == "diagnostic"
     ));
     assert_eq!(record.status, ToolExecutionStatus::Rejected);
     assert_eq!(
         record.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByPolicy)
+        Some(ToolExecutionRejection::PermissionDeniedByUser)
     );
     assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
 }
