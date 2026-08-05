@@ -5367,11 +5367,11 @@
         assert_eq!(format_terminal_title(None, None), "LetCode");
         assert_eq!(
             format_terminal_title(Some("Fix startup"), None),
-            "LetCode|Fix startup"
+            "LetCode | Fix startup"
         );
         assert_eq!(
             format_terminal_title(Some("Fix startup"), Some(1)),
-            "⠙ LetCode|Fix startup"
+            "⠙ LetCode | Fix startup"
         );
     }
 
@@ -5384,16 +5384,16 @@
         assert_eq!(
             titles,
             vec![
-                "⠋ LetCode|Work",
-                "⠙ LetCode|Work",
-                "⠹ LetCode|Work",
-                "⠸ LetCode|Work",
-                "⠼ LetCode|Work",
-                "⠴ LetCode|Work",
-                "⠦ LetCode|Work",
-                "⠧ LetCode|Work",
-                "⠇ LetCode|Work",
-                "⠏ LetCode|Work",
+                "⠋ LetCode | Work",
+                "⠙ LetCode | Work",
+                "⠹ LetCode | Work",
+                "⠸ LetCode | Work",
+                "⠼ LetCode | Work",
+                "⠴ LetCode | Work",
+                "⠦ LetCode | Work",
+                "⠧ LetCode | Work",
+                "⠇ LetCode | Work",
+                "⠏ LetCode | Work",
             ]
         );
     }
@@ -5408,16 +5408,16 @@
         ));
 
         for tick in 1..TERMINAL_TITLE_TICKS_PER_FRAME {
-            assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
+            assert_eq!(runtime.terminal_title(), "⠋ LetCode | Current session");
             runtime
                 .handle_input_action(InputAction::Tick)
                 .unwrap_or_else(|error| panic!("tick {tick} succeeds: {error}"));
         }
-        assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
+        assert_eq!(runtime.terminal_title(), "⠋ LetCode | Current session");
         runtime
             .handle_input_action(InputAction::Tick)
             .expect("third tick succeeds");
-        assert_eq!(runtime.terminal_title(), "⠙ LetCode|Current session");
+        assert_eq!(runtime.terminal_title(), "⠙ LetCode | Current session");
     }
 
     #[test]
@@ -5428,16 +5428,16 @@
         runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
             UserMessageEvent::new("work"),
         ));
-        assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
+        assert_eq!(runtime.terminal_title(), "⠋ LetCode | Current session");
 
         runtime.apply_session_transport_event(SessionTransportEvent::Done);
-        assert_eq!(runtime.terminal_title(), "LetCode|Current session");
+        assert_eq!(runtime.terminal_title(), "LetCode | Current session");
 
         runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
             UserMessageEvent::new("work again"),
         ));
         runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
-        assert_eq!(runtime.terminal_title(), "LetCode|Current session");
+        assert_eq!(runtime.terminal_title(), "LetCode | Current session");
     }
 
     #[test]

@@ -109,7 +109,7 @@ fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {
 
 fn format_terminal_title(session_title: Option<&str>, spinner_frame: Option<usize>) -> String {
     let title = match session_title.filter(|title| !title.trim().is_empty()) {
-        Some(title) => format!("{TERMINAL_TITLE_APP_NAME}|{title}"),
+        Some(title) => format!("{TERMINAL_TITLE_APP_NAME} | {title}"),
         None => TERMINAL_TITLE_APP_NAME.to_string(),
     };
     match spinner_frame {
