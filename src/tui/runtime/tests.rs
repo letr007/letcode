@@ -4746,9 +4746,10 @@ fn slash_permission_without_args_opens_dialog() {
     let dialog = runtime.state().dialog().expect("dialog should be open");
     assert_eq!(dialog.title, "Permission mode");
     assert_eq!(dialog.selected, 1);
-    assert_eq!(dialog.items.len(), 3);
+    assert_eq!(dialog.items.len(), 4);
     assert_eq!(dialog.items[0].label, "Safe");
-    assert_eq!(dialog.items[2].label, "YOLO");
+    assert_eq!(dialog.items[2].label, "Auto");
+    assert_eq!(dialog.items[3].label, "YOLO");
 }
 
 #[test]

@@ -2885,7 +2885,7 @@ async fn subagent_tool_execution_normalizes_bounded_input_before_delegation() {
     assert!(prompt.contains("允许路径：src/agent.rs"));
     assert!(prompt.contains("负责路径：src/tool.rs"));
     assert!(prompt.contains("执行边界：timeout_secs=30，max_tool_calls=5"));
-    assert!(prompt.contains("do not recursively delegate"));
+    assert!(prompt.contains("不要递归委派"));
 }
 
 #[tokio::test]
