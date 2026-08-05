@@ -100,7 +100,7 @@ jobs:
           notes_file="$(mktemp)"
           awk -v ver="$version" '
             $0 ~ "^## \\[" ver "\\]" {capture=1; next}
-            capture && $0 ~ /^## \[/ {exit}
+            capture && ($0 ~ /^## \[/ || $0 ~ /^\[[0-9]/) {exit}
             capture {print}
           ' CHANGELOG.md > "$notes_file"
           if [[ ! -s "$notes_file" ]]; then

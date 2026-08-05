@@ -7,20 +7,18 @@
 
 ## [0.1.0] - 2026-08-05
 
-首个公开版本。此前已用 letcode 自举开发，本标签冻结该可用基线。
+首个公开版本。
 
 ### 新增
 
-- 基于 Ratatui 的 TUI（opencode 风格）与行命令式 CLI/REPL，共用同一套会话引擎
-- 多 Provider 模型路由、推理力度控制，以及专家 Agent 的模型覆盖
-- 权限模式：`safe` / `default` / `auto` / `yolo`（读取配置时仍兼容旧值 `solo`）
-- `auto` 模式下的 sticky reviewer 专家；reviewer 子视图以请求/决策卡片展示审批
-- 工具面：shell、文件系统、搜索、web fetch、git、工作流、skill、子代理等
-- 支持处理器声明的并行工具调用；default/auto 的 Ask 矩阵支持会话级 AllowAlways
-- 追加写入的 JSONL 会话 transcript，支持恢复、历史树，以及 TUI 内 undo/redo
-- 上下文压缩、支持项的运行时配置热重载，以及可选的 Langfuse/OpenTelemetry 追踪
-- 可选 TUI 主题；工具、todo、权限与子代理结果的结构化卡片展示
-- Default/Auto 对高风险 shell 命令走审批（人工或 reviewer），不做命令级硬黑名单
-- Agent 提示词与面向操作者的引导文案使用中文
+- Rust 终端 Agent：Ratatui TUI 与行命令式 CLI/REPL，共用同一会话引擎
+- 多 Provider 配置（API Key / Base URL / 协议），模型展示名、工具调用、并行工具请求、推理等级与文本详细度
+- 专家 Agent 独立模型路由；`@` 委托探索、修复、设计、检索、综合等专家，并支持子会话浏览与回到父会话
+- 权限模式 `safe` / `default` / `auto` / `yolo`：读写与命令按模式自动放行、询问或全放行；`default` / `auto` 支持会话内「始终允许」；`auto` 由 sticky reviewer 专家完成审批，并在子视图以请求/决策卡片呈现
+- 内置工具：shell、文件系统读写、搜索、web fetch、git、代码 AST、工作流 todo / 自动续跑、记忆召回、skill 与 MCP 工具发现与调用
+- 工具并行策略可配置；shell 输出、diff、todo、权限与子代理结果以结构化卡片展示
+- 会话以追加写入的 JSONL transcript 持久化，支持恢复、历史树浏览，以及 TUI 内 undo / redo 与上下文压缩
+- 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
+- TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
 [0.1.0]: https://github.com/letr007/letcode/releases/tag/v0.1.0
