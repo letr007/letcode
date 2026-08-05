@@ -28,7 +28,7 @@ use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
 use super::{
-    composer::one_line_snippet, structured_subagent, todo_card, tool_card,
+    composer::one_line_snippet, reviewer_cards, structured_subagent, todo_card, tool_card,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -230,6 +230,7 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 width,
                 state.status_spinner_frame,
                 tool_output_expanded_for_item(state, item),
+                is_reviewer_child_view(state),
             ),
         ));
     }
@@ -476,6 +477,7 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         width,
         state.status_spinner_frame,
         tool_output_expanded_for_item(state, &item),
+        is_reviewer_child_view(state),
     );
     let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;
@@ -545,10 +547,19 @@ struct TimelineItemComponent<'a> {
     width: usize,
     frame: usize,
     expanded_output: bool,
+    reviewer_view: bool,
 }
 
 impl Component<Style> for TimelineItemComponent<'_> {
     fn render(&self, document: &mut Document<Style>) {
+        if self.reviewer_view
+            && let Some(specialized) =
+                try_render_reviewer_view_item(self.item, self.theme, self.width)
+        {
+            *document = specialized;
+            return;
+        }
+
         let mut out = TimelineDocument {
             document: std::mem::take(document),
         };
@@ -596,12 +607,41 @@ impl Component<Style> for TimelineItemComponent<'_> {
     }
 }
 
+fn is_reviewer_child_view(state: &TuiState) -> bool {
+    state
+        .child_view_metadata()
+        .is_some_and(|meta| meta.agent_name == "reviewer")
+}
+
+fn try_render_reviewer_view_item(
+    item: &TimelineItem,
+    theme: Theme,
+    width: usize,
+) -> Option<Document<Style>> {
+    match item {
+        TimelineItem::User(message) => {
+            let card = reviewer_cards::parse_review_request(message_text(message))?;
+            Some(reviewer_cards::render_review_request_card_document(
+                &card, theme, width,
+            ))
+        }
+        TimelineItem::Assistant(message) => {
+            let card = reviewer_cards::parse_review_decision(message_text(message))?;
+            Some(reviewer_cards::render_review_decision_card_document(
+                &card, theme, width,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn render_timeline_item_document(
     item: &TimelineItem,
     theme: Theme,
     width: usize,
     frame: usize,
     expanded_output: bool,
+    reviewer_view: bool,
 ) -> Document<Style> {
     let mut document = Document::default();
     TimelineItemComponent {
@@ -610,6 +650,7 @@ fn render_timeline_item_document(
         width,
         frame,
         expanded_output,
+        reviewer_view,
     }
     .render(&mut document);
     document.finish();
@@ -2084,6 +2125,74 @@ mod tests {
         assert_eq!(after_top, before_top);
         assert_eq!(after_first, before_first);
         assert!(!state.auto_scroll);
+    }
+
+    #[test]
+    fn reviewer_child_view_renders_request_and_decision_cards() {
+        let mut state = TuiState::default();
+        let records = vec![
+            TranscriptRecord {
+                session_id: "child-reviewer".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from(
+                        "Approve or deny this tool permission request.\n\
+                         \n\
+                         User goal:\nExecute commands to test auto-approval\n\
+                         \n\
+                         Tool: shell__exec\n\
+                         Class: command\n\
+                         Summary: shell__exec python3 fetch\n\
+                         Preview: (none)\n\
+                         can_allow_always: true\n\
+                         Arguments:\n{\"command\":\"python3\"}\n\
+                         \n\
+                         Reply with ONLY JSON:\n{}",
+                    ),
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-reviewer".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantMessage {
+                    content: r#"{"decision":"allow_once","risk":"low","rationale":"limited https fetch"}"#
+                        .into(),
+                },
+            },
+        ];
+        state.replace_child_timeline_from_records(
+            &records,
+            "parent",
+            "child-reviewer",
+            "reviewer",
+            0,
+            1,
+            1,
+        );
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("request"), "{rendered}");
+        assert!(rendered.contains("shell__exec"), "{rendered}");
+        assert!(rendered.contains("decide"), "{rendered}");
+        assert!(rendered.contains("allow once"), "{rendered}");
+        assert!(rendered.contains("limited https fetch"), "{rendered}");
+        assert!(
+            !rendered.contains("Approve or deny this tool permission request."),
+            "raw prompt body should be cardified: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"decision\""),
+            "raw JSON should be cardified: {rendered}"
+        );
     }
 
     #[test]
