@@ -1653,6 +1653,10 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot_provider = Some(provider);
     }
 
+    pub(crate) fn has_runtime_snapshot_provider(&self) -> bool {
+        self.runtime_snapshot_provider.is_some()
+    }
+
     pub(crate) fn clear_runtime_snapshot_provider(&mut self) {
         self.runtime_snapshot_provider = None;
     }
@@ -2913,23 +2917,21 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>> + Send,
         C: Clone,
     {
-        compaction::compact_session_stream_async(self, on_event, || Ok(()), |_| Ok(())).await
+        compaction::compact_session_stream_async(self, on_event, || Ok(())).await
     }
 
-    pub async fn compact_session_stream_async<E, Efut, S, D>(
+    pub async fn compact_session_stream_async<E, Efut, S>(
         &mut self,
         on_event: E,
         on_start: S,
-        on_delta: D,
     ) -> Result<ManualCompactionOutcome>
     where
         E: FnMut(AgentEvent) -> Efut + Send,
         Efut: Future<Output = Result<()>> + Send,
         S: FnMut() -> Result<()> + Send,
-        D: FnMut(&str) -> Result<()> + Send,
         C: Clone,
     {
-        compaction::compact_session_stream_async(self, on_event, on_start, on_delta).await
+        compaction::compact_session_stream_async(self, on_event, on_start).await
     }
 
     #[cfg(test)]

@@ -1381,25 +1381,29 @@ where
     C: Config + Clone,
 {
     let transcript = Arc::clone(transcript);
-    let snapshot_transcript = Arc::clone(&transcript);
-    agent.set_runtime_snapshot_provider(Arc::new(move || {
-        let transcript = snapshot_transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        let records = read_records(transcript.path())?;
-        Ok(
-            crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-                transcript.session_id().to_string(),
-                records,
-                crate::transcript::transcript_projection::SessionContextCursor {
-                    branch_id: transcript.current_context_branch_id().map(str::to_string),
-                    leaf_sequence: None,
-                },
-                &[],
-            )?
-            .snapshot,
-        )
-    }));
+    // main/runner already install an equivalent transcript→snapshot provider.
+    // Only fill it in when a direct Agent caller left the slot empty.
+    if !agent.has_runtime_snapshot_provider() {
+        let snapshot_transcript = Arc::clone(&transcript);
+        agent.set_runtime_snapshot_provider(Arc::new(move || {
+            let transcript = snapshot_transcript
+                .lock()
+                .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+            let records = read_records(transcript.path())?;
+            Ok(
+                crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                    transcript.session_id().to_string(),
+                    records,
+                    crate::transcript::transcript_projection::SessionContextCursor {
+                        branch_id: transcript.current_context_branch_id().map(str::to_string),
+                        leaf_sequence: None,
+                    },
+                    &[],
+                )?
+                .snapshot,
+            )
+        }));
+    }
     let event_transcript = Arc::clone(&transcript);
     let event_session_transport_tx = session_transport_tx.clone();
     // Persistence is the compaction transaction boundary. A cancellation that
@@ -1452,11 +1456,10 @@ where
         }
     };
     let mut on_start = || Ok(());
-    let mut on_delta = |_delta: &str| Ok(());
     // Drop the compaction future before reporting cancellation so a late
     // durable acknowledgement from a cancelled attempt cannot reach the UI.
     let compaction_result = {
-        let compact = agent.compact_session_stream_async(on_event, &mut on_start, &mut on_delta);
+        let compact = agent.compact_session_stream_async(on_event, &mut on_start);
         tokio::pin!(compact);
         select_manual_compaction_operation(control_rx, deferred_commands, compact.as_mut()).await
     };

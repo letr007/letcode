@@ -2,7 +2,6 @@ use super::*;
 use crate::protocol_frames::analyze_history_items;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use std::collections::BTreeSet;
 
 type EventCallback<'a> = dyn FnMut(AgentEvent) -> BoxFuture<'a, Result<()>> + Send + 'a;
 
@@ -35,18 +34,16 @@ struct PreparedLocalCompaction {
     runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
 }
 
-pub(super) async fn compact_session_stream_async<C, E, Efut, S, D>(
+pub(super) async fn compact_session_stream_async<C, E, Efut, S>(
     agent: &mut Agent<C>,
     mut on_event: E,
     mut on_start: S,
-    mut on_delta: D,
 ) -> Result<ManualCompactionOutcome>
 where
     C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
     S: FnMut() -> Result<()> + Send,
-    D: FnMut(&str) -> Result<()> + Send,
 {
     let trigger = CompactionTrigger::Manual;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
@@ -55,7 +52,7 @@ where
         return Err(error);
     }
     let mut on_event = |event| Box::pin(on_event(event)) as BoxFuture<'_, Result<()>>;
-    let result = attempt_compaction(agent, trigger, &mut on_event, Some(&mut on_delta)).await;
+    let result = attempt_compaction(agent, trigger, &mut on_event).await;
     if result.is_err() {
         let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
     }
@@ -97,15 +94,20 @@ async fn prepare_compaction<C>(
     agent: &mut Agent<C>,
     trigger: CompactionTrigger,
     on_event: &mut EventCallback<'_>,
-    on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
 ) -> Result<Result<PreparedCompaction, CompactionNoProgress>>
 where
     C: Config + Clone,
 {
     if agent.runtime_snapshot_provider.is_some() {
         agent.reload_runtime_snapshot_from_provider()?;
+        // Reload replaces history/snapshot from transcript but leaves live
+        // turn.workflow/counters untouched; realign before facts/cut.
+        sync_compaction_workflow_authority(agent);
     }
-    validate_compaction_runtime_state(agent)?;
+    // History structure is validated once below and reused by cut planning.
+    // Reload already analyzed with turn_start=None for install safety; this
+    // pass uses the live turn cursor so incomplete tool groups are respected.
+    agent.runtime_snapshot.validate_references()?;
 
     if agent.history.is_empty() {
         return Ok(Err(CompactionNoProgress {
@@ -113,6 +115,8 @@ where
             blockers: vec![CompactionBlocker::NoHistoricalItems],
         }));
     }
+    let history_transcript =
+        analyze_history_items(&agent.history, agent.turn.current_turn_start_index)?;
     let preserve_recent_tokens = match trigger {
         CompactionTrigger::Manual => 0,
         CompactionTrigger::RequestPressure => agent
@@ -125,10 +129,11 @@ where
                 ))
             }),
     };
-    let Some(cut) = super::history_compact::plan_turn_cut(
+    let Some(cut) = super::history_compact::plan_turn_cut_with_transcript(
         &agent.history,
         agent.turn.current_turn_start_index,
         preserve_recent_tokens,
+        &history_transcript,
     )?
     else {
         return Ok(Err(CompactionNoProgress {
@@ -146,7 +151,6 @@ where
             &cut.prefix,
             cut.split_active_turn,
             on_event,
-            on_delta,
         )
         .await?,
     )?;
@@ -321,7 +325,7 @@ where
     let result = async {
         // Build one durable compaction event. Tail pruning is part of the
         // append-only projection, never an unjournaled live mutation.
-        let prepared_result = match prepare_compaction(agent, trigger, on_event, None).await {
+        let prepared_result = match prepare_compaction(agent, trigger, on_event).await {
             Ok(result) => result,
             Err(error) => {
                 let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
@@ -390,13 +394,12 @@ async fn attempt_compaction<C>(
     agent: &mut Agent<C>,
     trigger: CompactionTrigger,
     on_event: &mut EventCallback<'_>,
-    on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
 ) -> Result<CompactionAttemptOutcome>
 where
     C: Config + Clone,
 {
     let result = async {
-        let prepared = match prepare_compaction(agent, trigger, on_event, on_delta).await? {
+        let prepared = match prepare_compaction(agent, trigger, on_event).await? {
             Ok(prepared) => prepared,
             Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
@@ -464,98 +467,50 @@ async fn generate_context_summary<C>(
     head_for_summary: &[HistoryItem],
     split_active_turn: bool,
     on_event: &mut EventCallback<'_>,
-    mut on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
 ) -> Result<String>
 where
     C: Config + Clone,
 {
-    // A summary is an implementation detail of a compaction transaction.  It
-    // must never start another pressure-compaction transaction of its own.
-    let mut summary_turn = TurnRuntimeState::default();
-    summary_turn.pressure_compaction.suppress();
-    let mut summary_agent = Agent {
-        client: agent.client.clone(),
-        model: agent.model.clone(),
-        primary_route: None,
-        subagent_model_overrides: HashMap::new(),
-        default_protocol: agent.default_protocol,
-        model_protocols: agent.model_protocols.clone(),
-        model_catalog: agent.model_catalog.clone(),
-        prelude: vec![PromptMessage::developer(CONTEXT_COMPACTION_PRELUDE)],
-        protocol_frames: Vec::new(),
-        history: Vec::new(),
-        runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&agent.model),
-        tools: ToolRegistry::new(),
-        skill_registry: None,
-        skill_cards: Vec::new(),
-        subagent_delegate: None,
-        subagent_child_factory: None,
-        primary_route_factory: None,
-        question_handler: None,
-        permission_session: std::sync::Arc::new(std::sync::Mutex::new(
-            PermissionSessionState::default(),
-        )),
-        compaction_config: CompactionConfig {
-            ..CompactionConfig::default()
-        },
-        retry_config: agent.retry_config.clone(),
-        tool_timeout_secs: agent.tool_timeout_secs,
-        turn: summary_turn,
-        next_turn_id: 0,
-        // One normal helper iteration plus semantic recovery retries.
-        max_iterations: agent.helper_max_iterations(),
-        max_tool_calls: Some(0),
-        context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
-        runtime_snapshot_provider: None,
-        logical_request_observations: super::LogicalRequestObservationTracker::default(),
-        active_epoch: None,
-        provider_usage_anchor: None,
-        pressure_compaction_suppressed: true,
-        fast_mode: None,
-    };
     let prompt = render_compaction_prompt_with_workflow_facts(
         previous_summary,
         head_for_summary,
         compaction_history_char_budget(agent.active_model_metadata()),
         split_active_turn,
-        &render_protected_workflow_facts(agent, head_for_summary)?,
+        &render_protected_workflow_facts(agent),
     );
-    // Keep the nested stream callback independent of the outer event future.
-    // Passing the outer callback through run_stream_async made its Send proof
-    // recursively depend on the task which owns this compaction attempt.
+    // Narrow oneshot stream: no nested Agent turn, no tools, reasoning forced off.
+    // Preview deltas ride the event channel only (session maps to CompactionPreviewDelta).
     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
     let emit_tx = delta_tx.clone();
     drop(delta_tx);
-    let summary = summary_agent
-        .run_stream_async(
-            &prompt,
-            move |delta| {
-                std::future::ready(
-                    emit_tx
-                        .send(delta.to_string())
-                        .map_err(|_| anyhow::anyhow!("context compaction delta receiver closed")),
-                )
-            },
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .boxed();
+    let prelude = [PromptMessage::developer(CONTEXT_COMPACTION_PRELUDE)];
+    let summary = super::protocol_stream::stream_oneshot_text_async(
+        &agent.client,
+        agent.model(),
+        agent.active_protocol(),
+        agent.active_model_metadata(),
+        &agent.retry_config,
+        &prelude,
+        &prompt,
+        move |delta| {
+            std::future::ready(
+                emit_tx
+                    .send(delta.to_string())
+                    .map_err(|_| anyhow::anyhow!("context compaction delta receiver closed")),
+            )
+        },
+    )
+    .boxed();
     tokio::pin!(summary);
     let summary = loop {
         tokio::select! {
             result = &mut summary => break result?,
             Some(delta) = delta_rx.recv() => {
-                if let Some(on_delta) = on_delta.as_deref_mut() {
-                    on_delta(&delta)?;
-                }
                 on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
             }
         }
     };
     while let Ok(delta) = delta_rx.try_recv() {
-        if let Some(on_delta) = on_delta.as_deref_mut() {
-            on_delta(&delta)?;
-        }
         on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
     }
     let trimmed = summary.trim();
@@ -565,10 +520,58 @@ where
     Ok(trimmed.to_string())
 }
 
-fn render_protected_workflow_facts<C: Config>(
-    agent: &Agent<C>,
-    prefix: &[HistoryItem],
-) -> Result<String> {
+fn sync_compaction_workflow_authority<C: Config>(agent: &mut Agent<C>) {
+    // Transcript-projected history is authoritative after reload; drop stale
+    // live turn counters and rebuild todos from the durable tool trail.
+    agent.turn.workflow.todos = latest_todos_from_history(&agent.history).unwrap_or_default();
+    agent.turn.counters.validation_effects = 0;
+    agent.turn.counters.failed_validation_effects = 0;
+    agent.turn.counters.child_validation_effects = 0;
+    agent.turn.counters.child_failed_validation_effects = 0;
+}
+
+fn latest_todos_from_history(history: &[HistoryItem]) -> Option<Vec<TodoItem>> {
+    let mut pending = std::collections::HashMap::<String, Vec<TodoItem>>::new();
+    let mut latest = None;
+    for item in history {
+        match item {
+            HistoryItem::AssistantToolCalls { calls, .. } => {
+                for call in calls {
+                    if call.name != "workflow__todos" {
+                        continue;
+                    }
+                    let Ok(payload) = serde_json::from_str::<Value>(&call.arguments_json) else {
+                        continue;
+                    };
+                    let Ok(items) = serde_json::from_value::<Vec<TodoItem>>(
+                        payload.get("items").cloned().unwrap_or(Value::Null),
+                    ) else {
+                        continue;
+                    };
+                    pending.insert(call.call_id.clone(), items);
+                }
+            }
+            HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+            } => {
+                let Some(items) = pending.remove(call_id) else {
+                    continue;
+                };
+                let Ok(output) = serde_json::from_str::<Value>(output_json) else {
+                    continue;
+                };
+                if output.get("ok").and_then(Value::as_bool) == Some(true) {
+                    latest = Some(items);
+                }
+            }
+            _ => {}
+        }
+    }
+    latest
+}
+
+fn render_protected_workflow_facts<C: Config>(agent: &Agent<C>) -> String {
     let mut facts = Vec::new();
     let unfinished_todos = agent
         .turn
@@ -578,21 +581,16 @@ fn render_protected_workflow_facts<C: Config>(
         .filter(|todo| todo.status.is_unfinished())
         .map(|todo| format!("- todo {}: {} ({:?})", todo.id, todo.content, todo.status))
         .collect::<Vec<_>>();
-    facts.push(if unfinished_todos.is_empty() {
-        "待办：无未完成待办。".to_string()
-    } else {
-        format!("待办：\n{}", unfinished_todos.join("\n"))
-    });
+    if !unfinished_todos.is_empty() {
+        facts.push(format!("待办：\n{}", unfinished_todos.join("\n")));
+    }
 
-    let validation = if agent.turn.counters.validation_effects == 0 {
-        "验证：尚未记录验证结果。".to_string()
-    } else {
-        format!(
+    if agent.turn.counters.validation_effects > 0 {
+        facts.push(format!(
             "验证：已记录 {} 项，其中失败 {} 项。",
             agent.turn.counters.validation_effects, agent.turn.counters.failed_validation_effects
-        )
-    };
-    facts.push(validation);
+        ));
+    }
 
     let decisions = agent
         .runtime_snapshot
@@ -609,57 +607,13 @@ fn render_protected_workflow_facts<C: Config>(
         })
         .map(|evidence| format!("- {}: {}", evidence.title, evidence.summary))
         .collect::<Vec<_>>();
-    facts.push(if decisions.is_empty() {
-        "已解决问题与专家协调：无可用持久事实。".to_string()
-    } else {
-        format!("已解决问题与专家协调：\n{}", decisions.join("\n"))
-    });
+    if !decisions.is_empty() {
+        facts.push(format!("已解决问题与专家协调：\n{}", decisions.join("\n")));
+    }
 
-    let successful_questions = prefix
-        .iter()
-        .flat_map(|item| match item {
-            HistoryItem::AssistantToolCalls { calls, .. } => calls
-                .iter()
-                .filter(|call| call.name == "question")
-                .map(|call| call.call_id.as_str())
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        })
-        .collect::<BTreeSet<_>>();
-    let answers = prefix
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolOutput {
-                call_id,
-                output_json,
-            } if successful_questions.contains(call_id.as_str()) => Some((call_id, output_json)),
-            _ => None,
-        })
-        .filter_map(|(call_id, output_json)| {
-            let output = serde_json::from_str::<Value>(output_json).ok()?;
-            (output.get("ok").and_then(Value::as_bool) == Some(true)).then(|| {
-                format!(
-                    "- resolved question {call_id}: {}",
-                    render_tool_output_for_compaction(output_json)
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    facts.push(if answers.is_empty() {
-        "已解决问题答案：无。".to_string()
-    } else {
-        format!("已解决问题答案：\n{}", answers.join("\n"))
-    });
-
-    Ok(facts.join("\n\n"))
-}
-
-fn validate_compaction_runtime_state<C: Config>(agent: &Agent<C>) -> Result<()> {
-    // History is the protocol authority. Only structural completeness is
-    // required before selection; no multi-copy payload equality checks.
-    analyze_history_items(&agent.history, agent.turn.current_turn_start_index)?;
-    agent.runtime_snapshot.validate_references()?;
-    Ok(())
+    // Question answers already appear in the bounded history serialization;
+    // do not duplicate them as a separate facts section.
+    facts.join("\n\n")
 }
 
 #[cfg(test)]
@@ -689,9 +643,15 @@ fn render_compaction_prompt_with_workflow_facts(
     let split_turn_instruction = split_active_turn.then_some(
         "本次是活动回合的前缀压缩：提供的历史（包括用户消息）都会退休并纳入摘要；仅 cut point 之后的原始尾部会被保留。",
     );
+    let facts_block = (!workflow_facts.trim().is_empty()).then(|| {
+        format!(
+            "\n\n受保护工作流事实（必须合并，不得被大工具输出挤出；缺失或无法解析的事实必须明确标为未知）：\n{}",
+            workflow_facts
+        )
+    });
     let common = format!(
-        "\n\n受保护工作流事实（必须合并，不得被大工具输出挤出；缺失或无法解析的事实必须明确标为未知）：\n{}{}",
-        workflow_facts,
+        "{}{}",
+        facts_block.unwrap_or_default(),
         split_turn_instruction
             .map(|instruction| format!("\n\n{instruction}"))
             .unwrap_or_default(),
@@ -1096,5 +1056,43 @@ mod transaction_tests {
 
         assert!(acknowledged.load(Ordering::SeqCst));
         assert_eq!(agent.history, expected);
+    }
+
+    #[test]
+    fn protected_workflow_facts_omit_empty_sections() {
+        let agent = test_agent();
+        assert!(render_protected_workflow_facts(&agent).is_empty());
+        let prompt = render_compaction_prompt_with_workflow_facts(
+            None,
+            &[HistoryItem::user("hi")],
+            1_000,
+            false,
+            "",
+        );
+        assert!(!prompt.contains("受保护工作流事实"));
+    }
+
+    #[test]
+    fn latest_todos_follow_successful_workflow_tool_trail() {
+        let history = vec![
+            HistoryItem::user("go"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                reasoning_content: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "t1".into(),
+                    name: "workflow__todos".into(),
+                    arguments_json: r#"{"items":[{"id":"a","content":"one","status":"pending"}]}"#
+                        .into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "t1".into(),
+                output_json: r#"{"ok":true,"tool":"workflow__todos","data":{"items":[{"id":"a","content":"one","status":"pending"}]}}"#.into(),
+            },
+        ];
+        let todos = latest_todos_from_history(&history).expect("todos restored");
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].id, "a");
     }
 }

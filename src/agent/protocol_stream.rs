@@ -1941,6 +1941,265 @@ where
     result
 }
 
+/// Stream a single text completion without opening a full agent turn.
+///
+/// Used by context compaction summaries: empty tools, reasoning forced off, and
+/// only content deltas are forwarded. Creation failures may retry; mid-stream
+/// failures after content is observed are not recovered into a new turn.
+pub(super) async fn stream_oneshot_text_async<C, F, Fut>(
+    client: &Client<C>,
+    model_id: &str,
+    protocol: ApiProtocol,
+    mut model: ModelRequestMetadata,
+    retry_config: &RetryConfig,
+    prelude: &[PromptMessage],
+    user_text: &str,
+    mut on_delta: F,
+) -> Result<String>
+where
+    C: Config,
+    F: FnMut(&str) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    model.supports_reasoning = false;
+    model.reasoning_effort = None;
+    model.supports_tools = false;
+
+    let mut snapshot = RuntimeSnapshot::new("compaction-summary");
+    let frames = crate::protocol_frames::history_items_to_frames(&[HistoryItem::user(user_text)]);
+    for (ordinal, frame) in frames.into_iter().enumerate() {
+        let stable_key = frame.stable_prompt_key();
+        let runtime_frame = RuntimeFrame::new(
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::Derived),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::User,
+                source: RuntimeSource::Derived,
+                ordinal: ordinal as u32,
+                stable_key: &stable_key,
+                source_span: None,
+            },
+        )
+        .with_protocol(frame.item);
+        snapshot
+            .compaction
+            .protected_frame_ids
+            .push(runtime_frame.id);
+        snapshot.push_frame(runtime_frame);
+    }
+
+    let build = build_request_with_policy(
+        RequestBuilderInput {
+            protocol,
+            model_id,
+            model: model.clone(),
+            prelude,
+            snapshot: &snapshot,
+            tools: &[],
+        },
+        None,
+        Some(ProtectedContextPolicy { reserve_tokens: 0 }),
+    )?;
+
+    match protocol {
+        ApiProtocol::Completions => {
+            stream_oneshot_completions(client, &build, retry_config, &mut on_delta).await
+        }
+        ApiProtocol::Responses => {
+            stream_oneshot_responses(client, &build, retry_config, &mut on_delta).await
+        }
+    }
+}
+
+async fn stream_oneshot_completions<C, F, Fut>(
+    client: &Client<C>,
+    build: &crate::request_builder::BuildResult,
+    retry_config: &RetryConfig,
+    on_delta: &mut F,
+) -> Result<String>
+where
+    C: Config,
+    F: FnMut(&str) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let completion_request = match &build.request {
+        BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request.clone()),
+        BuiltRequest::CompletionsCompatible(request) => {
+            CompletionStreamRequest::Compatible(request.clone())
+        }
+        BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
+            bail!("request builder returned non-completions request for oneshot summary")
+        }
+    };
+
+    let mut attempt = 1;
+    loop {
+        let response = match &completion_request {
+            CompletionStreamRequest::Typed(request) => {
+                send_compatible_chat_completion_stream(client, request).await
+            }
+            CompletionStreamRequest::Compatible(request) => {
+                send_compatible_chat_completion_stream(client, request).await
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
+                tokio::time::sleep(retry_delay(retry_config, attempt)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow!(error).context(request_creation_failure_context(
+                    "streamed chat completion",
+                    "oneshot",
+                    ModelRequestMetadata::default(),
+                    &build.budget,
+                )));
+            }
+        };
+
+        let mut byte_stream = response.bytes_stream();
+        let mut sse_buffer = String::new();
+        let mut text = String::new();
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = chunk.context("failed to read oneshot chat completion stream")?;
+            append_sse_chunk(&mut sse_buffer, &chunk);
+            for event in drain_sse_data_events(&mut sse_buffer) {
+                let Some(data) = event else {
+                    continue;
+                };
+                let response: CompatibleChatCompletionStreamResponse =
+                    serde_json::from_str(&data)
+                        .context("failed to deserialize oneshot chat completion delta")?;
+                for choice in response.choices {
+                    if let Some(delta) = choice.delta.and_then(|delta| delta.content) {
+                        if !delta.is_empty() {
+                            on_delta(&delta).await?;
+                            text.push_str(&delta);
+                        }
+                    }
+                }
+            }
+        }
+        for event in finish_sse_data_events(&mut sse_buffer) {
+            let Some(data) = event else {
+                continue;
+            };
+            let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
+                .context("failed to deserialize oneshot chat completion trailer")?;
+            for choice in response.choices {
+                if let Some(delta) = choice.delta.and_then(|delta| delta.content) {
+                    if !delta.is_empty() {
+                        on_delta(&delta).await?;
+                        text.push_str(&delta);
+                    }
+                }
+            }
+        }
+        return Ok(text);
+    }
+}
+
+async fn stream_oneshot_responses<C, F, Fut>(
+    client: &Client<C>,
+    build: &crate::request_builder::BuildResult,
+    retry_config: &RetryConfig,
+    on_delta: &mut F,
+) -> Result<String>
+where
+    C: Config,
+    F: FnMut(&str) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let response_request = match &build.request {
+        BuiltRequest::Responses(request) => ResponseStreamRequest::Typed(request.clone()),
+        BuiltRequest::ResponsesCompatible(request) => {
+            ResponseStreamRequest::Compatible(request.clone())
+        }
+        BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
+            bail!("request builder returned non-responses request for oneshot summary")
+        }
+    };
+
+    let mut attempt = 1;
+    loop {
+        let mut stream = match create_response_stream(client, &response_request).await {
+            Ok(stream) => stream,
+            Err(error) if should_retry_openai_stream_creation(retry_config, attempt, &error) => {
+                tokio::time::sleep(retry_delay(retry_config, attempt)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow!(error).context(request_creation_failure_context(
+                    "streamed response",
+                    "oneshot",
+                    ModelRequestMetadata::default(),
+                    &build.budget,
+                )));
+            }
+        };
+
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            let raw = event.context("failed to read oneshot responses stream")?;
+            let event = match project_response_stream_event(&raw) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(error) if is_ignorable_response_lifecycle_event(&raw) => {
+                    warn!(error = %error, "ignored oneshot response lifecycle stream event");
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow!(error).context("failed to deserialize oneshot responses event"));
+                }
+            };
+            match event {
+                ResponseStreamEvent::ResponseOutputTextDelta(event) => {
+                    if !event.delta.is_empty() {
+                        on_delta(&event.delta).await?;
+                        text.push_str(&event.delta);
+                    }
+                }
+                ResponseStreamEvent::ResponseFailed(event) => {
+                    bail!(
+                        "oneshot responses stream failed: {}",
+                        provider_response_terminal_error("failed", &event.response)
+                    );
+                }
+                ResponseStreamEvent::ResponseError(event) => {
+                    bail!(
+                        "oneshot responses stream error: {}",
+                        provider_error_event_terminal_error(&event)
+                    );
+                }
+                ResponseStreamEvent::ResponseIncomplete(event) => {
+                    bail!(
+                        "oneshot responses stream incomplete: {}",
+                        provider_response_terminal_error("incomplete", &event.response)
+                    );
+                }
+                ResponseStreamEvent::ResponseCompleted(event) => {
+                    // Test mocks and some providers only emit the completed payload.
+                    if text.is_empty() {
+                        if let Some(completed) = event.response.output_text() {
+                            if !completed.is_empty() {
+                                on_delta(&completed).await?;
+                                text.push_str(&completed);
+                            }
+                        }
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        return Ok(text);
+    }
+}
+
 pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
     client: &Client<C>,
     request: &impl Serialize,

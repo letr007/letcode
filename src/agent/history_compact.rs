@@ -1,5 +1,5 @@
 use crate::protocol_frames::{
-    ToolCallGroupStatus, analyze_history_items, canonical_compaction_boundary,
+    ProtocolTranscript, ToolCallGroupStatus, analyze_history_items, canonical_compaction_boundary,
 };
 use crate::request_builder::{HistoryItem, estimate_history_item_tokens};
 use anyhow::{Result, bail};
@@ -18,10 +18,22 @@ pub(crate) struct TurnCut {
 /// A long active turn is not protected wholesale: completed tool-call groups in
 /// its prefix may retire, but the retained tail always begins at a canonical
 /// complete-tool boundary.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_turn_cut(
     history: &[HistoryItem],
     turn_start: Option<usize>,
     preserve_recent_tokens: u64,
+) -> Result<Option<TurnCut>> {
+    let transcript = analyze_history_items(history, turn_start)?;
+    plan_turn_cut_with_transcript(history, turn_start, preserve_recent_tokens, &transcript)
+}
+
+/// Same as [`plan_turn_cut`], but reuses an already-computed transcript analysis.
+pub(crate) fn plan_turn_cut_with_transcript(
+    history: &[HistoryItem],
+    turn_start: Option<usize>,
+    preserve_recent_tokens: u64,
+    transcript: &ProtocolTranscript,
 ) -> Result<Option<TurnCut>> {
     if history.is_empty() {
         return Ok(None);
@@ -57,7 +69,6 @@ pub(crate) fn plan_turn_cut(
         return Ok(None);
     }
     let mut cut_end = canonical_compaction_boundary(history, requested_boundary)?;
-    let transcript = analyze_history_items(history, turn_start)?;
     if let Some(first_incomplete) = transcript
         .tool_call_groups
         .iter()
