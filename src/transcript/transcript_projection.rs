@@ -249,7 +249,6 @@ pub(crate) fn build_session_context_snapshot(
         &session_id,
         &records,
         &runtime_projection_records(&records, &resolved),
-        &resolved.branch_id,
     )?;
     let history = restore_session_history_projection(&resolved.records);
     let messages = history
@@ -287,7 +286,6 @@ pub(crate) fn project_runtime_restore_snapshot(
         &session_id,
         &records,
         &runtime_projection_records(&records, &resolved),
-        &resolved.branch_id,
     )?;
     let latest_model = restore_latest_model_projection(&resolved.records);
     // Keep allocation global to this session while all active state below stays
@@ -358,15 +356,14 @@ fn context_scope_revision(_records: &[TranscriptRecord], resolved: &ResolvedBran
 pub(crate) fn validate_context_projection_events(
     records: &[TranscriptRecord],
 ) -> anyhow::Result<()> {
-    let branch_id = resolve_branch_context(
+    resolve_branch_context(
         records.to_vec(),
         SessionContextCursor {
             branch_id: None,
             leaf_sequence: None,
         },
-    )?
-    .branch_id;
-    validate_projection_events("", records, records, &branch_id)
+    )?;
+    validate_projection_events("", records, records)
 }
 
 /// Validate replacement events in transcript order.  A later replacement may
@@ -376,11 +373,14 @@ fn validate_projection_events(
     session_id: &str,
     all_records: &[TranscriptRecord],
     visible: &[TranscriptRecord],
-    selected_branch_id: &str,
 ) -> anyhow::Result<()> {
     for record in visible {
         match &record.event {
             TranscriptEvent::ContextCompaction(event) => {
+                // A compaction is validated against the branch it was committed
+                // on. Root compactions carry `context_branch_id: None` even when
+                // a later restore selects another branch, so they re-validate
+                // against the root scope rather than the selected branch.
                 let scope = context_compaction_validation_scope(
                     all_records,
                     record.sequence.saturating_sub(1),
@@ -388,7 +388,7 @@ fn validate_projection_events(
                         branch_id: record
                             .context_branch_id
                             .clone()
-                            .or_else(|| Some(selected_branch_id.to_string())),
+                            .or_else(|| Some(ROOT_CONTEXT_BRANCH_ID.to_string())),
                         leaf_sequence: None,
                     },
                 )?;

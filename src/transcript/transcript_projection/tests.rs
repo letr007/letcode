@@ -2754,3 +2754,216 @@ fn modern_active_turn_compaction_retires_current_user_with_prefix() {
     ));
     assert!(matches!(&history[2], HistoryItem::ToolOutput { .. }));
 }
+
+#[test]
+fn branch_compaction_validates_against_selected_branch_scope() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("root"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AssistantMessage {
+                content: "root-reply".into(),
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "feature".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        branch_record_at(
+            4,
+            "feature",
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("branch request"),
+            },
+        ),
+        branch_record_at(
+            5,
+            "feature",
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded_at(
+                "branch summary",
+                Some("raw:4".into()),
+            )),
+        ),
+        branch_record_at(
+            6,
+            "feature",
+            TranscriptEvent::AssistantMessage {
+                content: "branch reply".into(),
+            },
+        ),
+    ];
+
+    let restored = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: Some("feature".into()),
+            leaf_sequence: None,
+        },
+        &[],
+    );
+    assert!(
+        restored.is_ok(),
+        "branch compaction must validate against its branch scope, got: {restored:?}"
+    );
+}
+
+#[test]
+fn navigation_restore_validates_root_compaction_on_root_scope() {
+    // Linear root journal with one modern compaction. Undo must validate the
+    // compaction against the root scope where it was committed, not against the
+    // new history branch created for the navigation (which postdates it).
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("a"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AssistantMessage {
+                content: "a-reply".into(),
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("b"),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::AssistantMessage {
+                content: "b-reply".into(),
+            },
+        ),
+        record_at(
+            5,
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded_at(
+                "summary",
+                Some("raw:3".into()),
+            )),
+        ),
+        record_at(
+            6,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("c"),
+            },
+        ),
+        record_at(
+            7,
+            TranscriptEvent::AssistantMessage {
+                content: "c-reply".into(),
+            },
+        ),
+        record_at(
+            8,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("d"),
+            },
+        ),
+        record_at(
+            9,
+            TranscriptEvent::AssistantMessage {
+                content: "d-reply".into(),
+            },
+        ),
+    ];
+
+    // Replicate navigate_undo: current = last visible entry, walk up the parent
+    // chain to the User turn root, target = that User entry's parent sequence.
+    let entries = project_session_history_tree(&records);
+    let snapshot = build_session_context_snapshot(
+        "s".into(),
+        records.clone(),
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )
+    .expect("root session context builds");
+    let visible: std::collections::BTreeSet<u64> =
+        snapshot.records.iter().map(|r| r.sequence).collect();
+    let current = entries
+        .iter()
+        .rev()
+        .find(|entry| visible.contains(&entry.sequence))
+        .map(|entry| entry.sequence)
+        .expect("current session history entry");
+    let mut turn_root = entries
+        .iter()
+        .find(|entry| entry.sequence == current)
+        .expect("current history entry exists");
+    while turn_root.kind != SessionHistoryEntryKind::User {
+        let parent_id = turn_root
+            .parent_id
+            .as_deref()
+            .expect("history parent is available");
+        turn_root = entries
+            .iter()
+            .find(|entry| entry.id == parent_id)
+            .expect("history parent exists");
+    }
+    let target = turn_root
+        .parent_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("entry-"))
+        .and_then(|sequence| sequence.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert_eq!(target, 7, "undo target precedes the most recent user turn");
+    assert!(
+        target > 5,
+        "target must include the compaction in the restore scope"
+    );
+
+    // Replicate navigate_history candidate records and restore validation.
+    let branch_sequence = 10;
+    let branch_id = format!("history-{branch_sequence}");
+    let mut candidate = records.clone();
+    let mut sequence = branch_sequence;
+    for event in [
+        TranscriptEvent::ContextBranchCreated {
+            branch_id: branch_id.clone(),
+            parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: target,
+            label: None,
+        },
+        TranscriptEvent::ContextCheckout {
+            branch_id: branch_id.clone(),
+            leaf_sequence: target,
+        },
+        TranscriptEvent::HistoryNavigation {
+            operation: crate::transcript::HistoryNavigationOperation::Undo,
+            target_sequence: target,
+            redo_stack: vec![current],
+            redo_target_sequence: None,
+        },
+    ] {
+        candidate.push(record_at(sequence, event));
+        sequence += 1;
+    }
+    let restored = project_runtime_restore_snapshot(
+        "s".into(),
+        candidate,
+        SessionContextCursor {
+            branch_id: Some(branch_id.clone()),
+            leaf_sequence: None,
+        },
+        &[],
+    );
+    assert!(
+        restored.is_ok(),
+        "undo navigation must validate the root compaction on root scope, got: {restored:?}"
+    );
+}
