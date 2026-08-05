@@ -1,34 +1,26 @@
-# Changelog
+# 更新日志
 
-All notable changes to this project are documented in this file.
+本文件记录项目的重要变更。
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 ## [0.1.0] - 2026-08-05
 
-First public release. letcode has been dogfooded on its own development for some time; this tag freezes that baseline.
+首个公开版本。此前已用 letcode 自举开发，本标签冻结该可用基线。
 
-### Added
+### 新增
 
-- Ratatui TUI (opencode-inspired) and line-based CLI/REPL frontends over a shared session engine
-- Multi-provider model routing, reasoning effort controls, and expert agent model overrides
-- Permission modes: `safe`, `default`, `auto`, `yolo` (legacy `solo` still accepted when reading config)
-- Sticky reviewer expert for `auto` mode, with compact request/decision cards in the reviewer child view
-- Tool surface for shell, filesystem, search, web fetch, git, workflows, skills, and subagents
-- Parallel tool calls where handlers opt in; session-local AllowAlways grants on the default/auto ask matrix
-- Append-only JSONL session transcripts with resume, history tree, and undo/redo in the TUI
-- Context compaction, hot-reload for supported runtime config, and optional Langfuse/OpenTelemetry tracing
-- Selectable TUI themes and structured cards for tools, todos, permissions, and subagent results
-
-### Changed
-
-- Default/Auto no longer hard-deny risky shell commands (`curl`, `rm -rf`, …); they Ask (human or reviewer) instead
-- Agent prompts and operator-facing guidance localized to Chinese
-
-### Fixed
-
-- Session resume append safety, child/parent view transitions, and compaction/context-branch validation
-- Retry, streaming, and interruption edge cases around subagents and queued prompts
+- 基于 Ratatui 的 TUI（opencode 风格）与行命令式 CLI/REPL，共用同一套会话引擎
+- 多 Provider 模型路由、推理力度控制，以及专家 Agent 的模型覆盖
+- 权限模式：`safe` / `default` / `auto` / `yolo`（读取配置时仍兼容旧值 `solo`）
+- `auto` 模式下的 sticky reviewer 专家；reviewer 子视图以请求/决策卡片展示审批
+- 工具面：shell、文件系统、搜索、web fetch、git、工作流、skill、子代理等
+- 支持处理器声明的并行工具调用；default/auto 的 Ask 矩阵支持会话级 AllowAlways
+- 追加写入的 JSONL 会话 transcript，支持恢复、历史树，以及 TUI 内 undo/redo
+- 上下文压缩、支持项的运行时配置热重载，以及可选的 Langfuse/OpenTelemetry 追踪
+- 可选 TUI 主题；工具、todo、权限与子代理结果的结构化卡片展示
+- Default/Auto 对高风险 shell 命令走审批（人工或 reviewer），不做命令级硬黑名单
+- Agent 提示词与面向操作者的引导文案使用中文
 
 [0.1.0]: https://github.com/letr007/letcode/releases/tag/v0.1.0
