@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Check Cargo.toml version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$tag" != "$crate" ]]; then
+            echo "Tag v${tag} does not match Cargo.toml version ${crate}"
+            exit 1
+          fi
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bin_dir="target/${{ matrix.target }}/release"
+          staging="dist/letcode-${version}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$bin_dir/letcode.exe" "$staging/"
+            asset="${staging}.zip"
+            7z a -tzip "$asset" "./${staging}/"*
+          else
+            cp "$bin_dir/letcode" "$staging/"
+            asset="${staging}.tar.gz"
+            tar -C dist -czf "$asset" "letcode-${version}-${{ matrix.target }}"
+          fi
+          echo "ASSET_PATH=${asset}" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=$(basename "$asset")" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Extract release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          notes_file="$(mktemp)"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" {capture=1; next}
+            capture && $0 ~ /^## \[/ {exit}
+            capture {print}
+          ' CHANGELOG.md > "$notes_file"
+          if [[ ! -s "$notes_file" ]]; then
+            echo "No CHANGELOG section for ${version}" >&2
+            exit 1
+          fi
+          {
+            echo "body<<EOF"
+            cat "$notes_file"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: letcode ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false

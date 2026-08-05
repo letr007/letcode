@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/letr007/letcode/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/letr007/letcode/ci.yml?branch=main&style=flat-square" alt="CI"></a>
+  <a href="https://github.com/letr007/letcode/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/letr007/letcode/test.yml?branch=main&style=flat-square" alt="Test"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-0.1.0-informational?style=flat-square" alt="Changelog"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue?style=flat-square" alt="MIT License | Apache-2.0 License"></a>
 </p>

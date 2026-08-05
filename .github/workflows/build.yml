@@ -1,0 +1,66 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          bin_dir="target/${{ matrix.target }}/release"
+          staging="dist/letcode-${version}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$bin_dir/letcode.exe" "$staging/"
+            asset="${staging}.zip"
+            7z a -tzip "$asset" "./${staging}/"*
+          else
+            cp "$bin_dir/letcode" "$staging/"
+            asset="${staging}.tar.gz"
+            tar -C dist -czf "$asset" "letcode-${version}-${{ matrix.target }}"
+          fi
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+          ls -lh "$asset"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: letcode-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error

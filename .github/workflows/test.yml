@@ -1,4 +1,4 @@
-name: CI
+name: Test
 
 on:
   push:
@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  test:
     name: fmt + test
     runs-on: ubuntu-latest
     timeout-minutes: 45
