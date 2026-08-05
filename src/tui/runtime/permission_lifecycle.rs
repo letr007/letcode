@@ -205,6 +205,9 @@ mod tests {
                 call_id: "call-2".into(),
                 decision: PermissionDecision::Approved,
                 reason: None,
+                tool_name: None,
+                summary: None,
+                origin_label: None,
             })
         ));
         assert!(!controller.clears_for_child_event(
@@ -213,6 +216,9 @@ mod tests {
                 call_id: "other-call".into(),
                 decision: PermissionDecision::Approved,
                 reason: None,
+                tool_name: None,
+                summary: None,
+                origin_label: None,
             })
         ));
         assert!(controller.clears_for_child_event(

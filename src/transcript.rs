@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::subagent_tool_name_for_agent_name;
+use crate::agent::subagent_evidence_parent_tool;
 use crate::agent::{
     AutoContinueState, ContextCompactionEvent, ConversationMessage, ConversationRole,
     LlmRequestTelemetry, LlmRequestTelemetryPhase, TodoItem, ToolExecutionSummaryEvent,
@@ -798,6 +798,12 @@ impl TranscriptRecorder {
             summary: summary.into(),
         })?;
         if let Some(result) = structured_result {
+            let parent_tool = subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
+                anyhow!("subagent result recorded with unknown agent name: {agent_name}")
+            })?;
+            // System experts (e.g. auto-reviewer) are not user-delegated jobs — mark
+            // reconciled immediately so they never pollute agent__reconcile context.
+            let system_expert = parent_tool.starts_with("system__");
             let detail = serde_json::to_string(&result).ok();
             let evidence = EvidenceDraft {
                 id: None,
@@ -809,13 +815,20 @@ impl TranscriptRecorder {
                     run_id,
                     child_session_id: child_session_id.clone(),
                     source_session_id: child_session_id,
-                    parent_tool: subagent_tool_name_for_agent_name(agent_name.as_str())
-                        .expect("subagent result recorded with unknown agent name")
-                        .to_string(),
+                    parent_tool,
                     parent_turn_id: Some(parent_run_id),
                     parent_session_id: Some(parent_session_id),
                 },
-                tags: vec![agent_name, "subagent_result".into(), "unreconciled".into()],
+                tags: if system_expert {
+                    vec![
+                        agent_name,
+                        "subagent_result".into(),
+                        "system_expert".into(),
+                        "reconciled".into(),
+                    ]
+                } else {
+                    vec![agent_name, "subagent_result".into(), "unreconciled".into()]
+                },
             };
             self.record_evidence(evidence)?;
         }
@@ -844,9 +857,13 @@ impl TranscriptRecorder {
                 run_id,
                 child_session_id: child_session_id.clone(),
                 source_session_id: child_session_id,
-                parent_tool: subagent_tool_name_for_agent_name(agent_name.as_str())
-                    .expect("subagent reconciliation recorded with unknown agent name")
-                    .to_string(),
+                parent_tool: subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(
+                    || {
+                        anyhow!(
+                            "subagent reconciliation recorded with unknown agent name: {agent_name}"
+                        )
+                    },
+                )?,
                 parent_turn_id: Some(parent_turn_id.into()),
                 parent_session_id: Some(self.session_id.clone()),
             },
@@ -1071,12 +1088,41 @@ impl TranscriptRecorder {
         allowed: bool,
         reason: Option<String>,
     ) -> Result<()> {
+        self.record_permission_decision_full(
+            call_id,
+            tool,
+            args,
+            allowed,
+            reason,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn record_permission_decision_full(
+        &mut self,
+        call_id: Option<String>,
+        tool: impl Into<String>,
+        args: Value,
+        allowed: bool,
+        reason: Option<String>,
+        reviewer: Option<String>,
+        approval: Option<String>,
+        risk: Option<String>,
+        reviewer_child_session_id: Option<String>,
+    ) -> Result<()> {
         self.append(TranscriptEvent::PermissionDecision {
             call_id,
             tool: tool.into(),
             args,
             allowed,
             reason,
+            reviewer,
+            approval,
+            risk,
+            reviewer_child_session_id,
         })
     }
 

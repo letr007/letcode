@@ -25,8 +25,8 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome, PrimaryRouteFactory,
-    SubagentInvocation,
+    Agent, AgentEvent, AutoReviewService, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome,
+    PrimaryRouteFactory, SubagentInvocation,
 };
 use crate::agent_event_journal::persist_agent_event;
 use crate::config::{AppConfig, ModelRoute, ProviderConfig, RetryConfig};
@@ -1701,6 +1701,16 @@ async fn run_engine_loop(
     let mut provider_api_key_hints = provider_api_key_hints;
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
+    let sticky_auto_reviewer = std::sync::Arc::new(crate::session::auto_review::StickyAutoReviewer::new(
+        subagent_runtime.clone(),
+        sessions_dir.clone(),
+        Arc::clone(&transcript),
+        Some(session_transport_tx.clone()),
+    ));
+    agent.set_auto_review_service(Some(
+        sticky_auto_reviewer.clone()
+            as std::sync::Arc<dyn crate::agent::AutoReviewService<async_openai::config::OpenAIConfig>>,
+    ));
     let mut deferred_commands = VecDeque::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
@@ -2353,6 +2363,7 @@ async fn run_engine_loop(
                                 "Fast mode auto-disabled: current model is unavailable",
                             )));
                         }
+                        sticky_auto_reviewer.clear_sticky_session();
                         let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
                             session_id: resumed_event_session_id,
                             branch_id: resumed_event_branch_id,
@@ -2401,6 +2412,7 @@ async fn run_engine_loop(
                             ))));
                             continue;
                         }
+                        sticky_auto_reviewer.clear_sticky_session();
                         let _ = session_transport_tx.send(started_event);
                         continue;
                     }
@@ -2421,6 +2433,7 @@ async fn run_engine_loop(
                     continue;
                 }
 
+                sticky_auto_reviewer.begin_prompt_turn();
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
                 let runner = AgentRunner::<async_openai::config::OpenAIConfig>::with_transcript(
                     runner_event_tx,

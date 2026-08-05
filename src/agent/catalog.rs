@@ -174,6 +174,32 @@ impl AgentTemplate {
         )
     }
 
+    pub fn reviewer() -> Self {
+        Self {
+            name: "reviewer".into(),
+            purpose: "权限自动审批".into(),
+            system_prompt: concat!(
+                "你是 reviewer 专家，唯一职责是审批主代理提出的工具权限请求。",
+                "根据用户意图、工具名、参数、风险与可逆性，决定 allow_once、allow_always 或 deny。",
+                "不确定时必须 deny。不要编辑文件，不要继续委派。",
+                "只输出一个 JSON 对象，字段为 decision、risk、rationale；不要输出其它文字。"
+            )
+            .into(),
+            tool_scope: ToolScope::ReadOnlyExplorer,
+            permission_mode: PermissionMode::Yolo,
+            can_write: false,
+            can_delegate: false,
+            timeout_secs: Some(30),
+            max_tool_calls: Some(2),
+            input_expectations: "需要工具权限请求：tool、args、class、summary、can_allow_always、用户目标摘要。".into(),
+            expected_result_shape: concat!(
+                "JSON 对象：decision 为 allow_once|allow_always|deny；",
+                "risk 为 low|medium|high；rationale 为一句理由。"
+            )
+            .into(),
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "explorer" => Some(Self::explorer()),
@@ -182,6 +208,7 @@ impl AgentTemplate {
             "designer" => Some(Self::designer()),
             "librarian" => Some(Self::librarian()),
             "general" => Some(Self::general()),
+            "reviewer" => Some(Self::reviewer()),
             _ => None,
         }
     }
@@ -194,6 +221,7 @@ impl AgentTemplate {
             Self::designer(),
             Self::librarian(),
             Self::general(),
+            Self::reviewer(),
         ]
     }
 
@@ -227,6 +255,15 @@ pub(crate) fn subagent_tool_name_for_agent_name(agent_name: &str) -> Option<&'st
     subagent_catalog_entry_by_agent_name(agent_name).map(|entry| entry.tool_name)
 }
 
+/// Parent-tool label for subagent evidence. Delegation experts map to `agent__*`;
+/// system experts (e.g. reviewer) use `system__{name}` because they have no tool.
+pub(crate) fn subagent_evidence_parent_tool(agent_name: &str) -> Option<String> {
+    if let Some(tool) = subagent_tool_name_for_agent_name(agent_name) {
+        return Some(tool.to_string());
+    }
+    AgentTemplate::from_name(agent_name).map(|template| format!("system__{}", template.name))
+}
+
 pub(crate) fn subagent_catalog_entry_by_tool_name(
     tool_name: &str,
 ) -> Option<&'static SubagentCatalogEntry> {
@@ -241,4 +278,22 @@ pub(crate) fn subagent_catalog_entry_by_agent_name(
     SUBAGENT_CATALOG
         .iter()
         .find(|entry| entry.agent_name == agent_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reviewer_evidence_parent_tool_uses_system_prefix() {
+        assert_eq!(
+            subagent_evidence_parent_tool("reviewer").as_deref(),
+            Some("system__reviewer")
+        );
+        assert_eq!(
+            subagent_evidence_parent_tool("explorer").as_deref(),
+            Some(tool_names::TOOL_AGENT_EXPLORE)
+        );
+        assert!(subagent_evidence_parent_tool("nosuch").is_none());
+    }
 }

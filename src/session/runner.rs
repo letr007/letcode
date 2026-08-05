@@ -1985,11 +1985,17 @@ fn permission_resolution_event(
             call_id,
             decision: crate::session::PermissionDecision::Approved,
             reason: Some("Allow once".into()),
+            tool_name: None,
+            summary: None,
+            origin_label: None,
         },
         PermissionResponse::AllowAlways => PermissionResolutionEvent {
             call_id,
             decision: crate::session::PermissionDecision::Approved,
             reason: Some("Allowed for this session".into()),
+            tool_name: None,
+            summary: None,
+            origin_label: None,
         },
         PermissionResponse::Deny => {
             PermissionResolutionEvent::denied(call_id, Some("Denied".into()))

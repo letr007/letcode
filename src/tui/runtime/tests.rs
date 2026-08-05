@@ -4803,6 +4803,11 @@
                     Some("Allow read/preview, ask for risky tools".into()),
                 ),
                 DialogItem::new(
+                    "auto",
+                    "Auto",
+                    Some("Same Ask set as Default; reviewer expert approves".into()),
+                ),
+                DialogItem::new(
                     "yolo",
                     "YOLO",
                     Some("Allow write and command tools without asking".into()),
@@ -4813,7 +4818,7 @@
             .state_mut()
             .dialog_mut()
             .expect("dialog exists")
-            .selected = 2;
+            .selected = 3;
 
         let command = runtime
             .handle_input_action(InputAction::DialogAccept)
@@ -6202,6 +6207,9 @@
                 call_id: "call-z".into(),
                 decision: PermissionDecision::Denied,
                 reason: Some("no".into()),
+                tool_name: Some("shell__exec".into()),
+                summary: Some("shell__exec cargo test".into()),
+                origin_label: Some("reviewer".into()),
             },
         ))
         .expect("send permission event");

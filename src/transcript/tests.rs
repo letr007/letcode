@@ -675,6 +675,10 @@ fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancell
                 args: json!({"command": "cargo test"}),
                 allowed: false,
                 reason: Some("Denied by user from TUI permission prompt".into()),
+                reviewer: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
             },
         },
         TranscriptRecord {
@@ -1601,6 +1605,65 @@ fn subagent_result_round_trips_structured_payload() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+#[test]
+fn reviewer_subagent_result_records_system_evidence_without_panic() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-reviewer-subagent-test-{}",
+        unix_timestamp_ms()
+    ));
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+    recorder
+        .record_subagent_result_structured(
+            "run-review",
+            "parent-session",
+            "auto-review-1",
+            "child-reviewer",
+            "reviewer",
+            "completed",
+            r#"{"decision":"allow_once","risk":"low","rationale":"ok"}"#,
+            Some(StructuredSubagentResult {
+                status: "completed".into(),
+                summary: r#"{"decision":"allow_once","risk":"low","rationale":"ok"}"#.into(),
+                malformed: false,
+                findings: vec![],
+                files_read: vec![],
+                files_changed: vec![],
+                commands_run: vec![],
+                validation: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                run_id: "run-review".into(),
+                child_session_id: "child-reviewer".into(),
+                raw_excerpt: None,
+            }),
+        )
+        .expect("reviewer result must not panic");
+
+    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+        .expect("read records");
+    match &records[1].event {
+        TranscriptEvent::Evidence {
+            source: EvidenceSource::Subagent { parent_tool, .. },
+            tags,
+            ..
+        } => {
+            assert_eq!(parent_tool, "system__reviewer");
+            assert!(tags.iter().any(|tag| tag == "reconciled"), "{tags:?}");
+            assert!(
+                tags.iter().any(|tag| tag == "system_expert"),
+                "{tags:?}"
+            );
+            assert!(
+                !tags.iter().any(|tag| tag == "unreconciled"),
+                "reviewer must not enter reconcile queue: {tags:?}"
+            );
+        }
+        other => panic!("expected reviewer evidence, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 #[test]
@@ -3109,6 +3172,59 @@ mod compaction_legacy_schema_tests {
         assert!(matches!(
             &restored[0],
             HistoryItem::ContextSummary { text } if text == "legacy summary"
+        ));
+    }
+
+    #[test]
+    fn permission_decision_auto_fields_round_trip_and_legacy_omission() {
+        let legacy = json!({
+            "session_id": "s",
+            "sequence": 1,
+            "timestamp_ms": 0,
+            "kind": "permission_decision",
+            "tool": "fs__write",
+            "args": {"path": "a.txt"},
+            "allowed": true
+        });
+        let legacy_record: TranscriptRecord =
+            serde_json::from_value(legacy).expect("legacy permission decision");
+        assert!(matches!(
+            legacy_record.event,
+            TranscriptEvent::PermissionDecision {
+                reviewer: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
+                ..
+            }
+        ));
+
+        let auto = TranscriptEvent::PermissionDecision {
+            call_id: Some("c1".into()),
+            tool: "fs__write".into(),
+            args: json!({"path": "a.txt"}),
+            allowed: true,
+            reason: Some("ok".into()),
+            reviewer: Some("auto".into()),
+            approval: Some("once".into()),
+            risk: Some("low".into()),
+            reviewer_child_session_id: Some("child-1".into()),
+        };
+        let encoded = serde_json::to_value(&auto).expect("encode");
+        let decoded: TranscriptEvent = serde_json::from_value(encoded).expect("decode");
+        assert!(matches!(
+            decoded,
+            TranscriptEvent::PermissionDecision {
+                reviewer: Some(ref reviewer),
+                approval: Some(ref approval),
+                risk: Some(ref risk),
+                reviewer_child_session_id: Some(ref child),
+                allowed: true,
+                ..
+            } if reviewer == "auto"
+                && approval == "once"
+                && risk == "low"
+                && child == "child-1"
         ));
     }
 }

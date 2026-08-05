@@ -286,13 +286,25 @@ pub fn render_permission_card_document(
     let mut segments = vec![
         SemanticSpan::decoration(status, status_style),
         SemanticSpan::decoration(" ", text_style),
-        SemanticSpan::decoration(
-            permission.tool_name.clone(),
-            text_style.add_modifier(Modifier::BOLD),
-        ),
-        SemanticSpan::decoration(" ", text_style),
-        SemanticSpan::source(summary, text_style),
     ];
+    if let Some(origin) = permission
+        .origin_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        segments.push(SemanticSpan::decoration(
+            origin.to_string(),
+            muted_style.add_modifier(Modifier::BOLD),
+        ));
+        segments.push(SemanticSpan::decoration(" · ", muted_style));
+    }
+    segments.push(SemanticSpan::decoration(
+        permission.tool_name.clone(),
+        text_style.add_modifier(Modifier::BOLD),
+    ));
+    segments.push(SemanticSpan::decoration(" ", text_style));
+    segments.push(SemanticSpan::source(summary, text_style));
     if let Some(reason) = reason {
         segments.push(SemanticSpan::decoration(" · ", muted_style));
         segments.push(SemanticSpan::source_with_join(
@@ -4565,6 +4577,27 @@ mod tests {
         assert!(!p.contains("perm-p"), "{p}");
         assert!(!p.contains("args"), "{p}");
         assert!(!p.contains("why"), "{p}");
+
+        let auto = PermissionView {
+            call_id: "perm-auto".into(),
+            tool_name: "fs__write".into(),
+            summary: "fs__write a.txt".into(),
+            arguments: Some(r#"{"path":"a.txt"}"#.into()),
+            rationale: None,
+            origin_label: Some("reviewer".into()),
+            can_allow_always: false,
+            grant_summary: None,
+            status: PermissionPromptStatus::Approved,
+            resolution_reason: Some("safe edit".into()),
+        };
+        let auto_line = render_permission_card_lines(&auto, theme, 80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(auto_line.contains("reviewer"), "{auto_line}");
+        assert!(auto_line.contains("fs__write"), "{auto_line}");
+        assert!(auto_line.contains("safe edit"), "{auto_line}");
     }
 
     #[test]

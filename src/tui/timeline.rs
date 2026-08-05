@@ -985,11 +985,15 @@ impl Timeline {
 
         self.push_item(TimelineItem::Permission(PermissionView {
             call_id: event.call_id,
-            tool_name: "unknown tool".into(),
-            summary: "Permission resolved without an earlier prompt in timeline".into(),
+            tool_name: event
+                .tool_name
+                .unwrap_or_else(|| "unknown tool".into()),
+            summary: event.summary.unwrap_or_else(|| {
+                "Permission resolved without an earlier prompt in timeline".into()
+            }),
             arguments: None,
             rationale: None,
-            origin_label: None,
+            origin_label: event.origin_label,
             can_allow_always: false,
             grant_summary: None,
             status: match event.decision {
@@ -1008,6 +1012,7 @@ impl Timeline {
         arguments: Option<String>,
         status: PermissionPromptStatus,
         resolution_reason: Option<String>,
+        origin_label: Option<String>,
     ) {
         self.push_item(TimelineItem::Permission(PermissionView {
             call_id,
@@ -1015,7 +1020,7 @@ impl Timeline {
             summary,
             arguments,
             rationale: None,
-            origin_label: None,
+            origin_label,
             can_allow_always: false,
             grant_summary: None,
             status,
@@ -1674,6 +1679,29 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_resolution_creates_reviewer_permission_card() {
+        let mut timeline = Timeline::new();
+        timeline.resolve_permission(PermissionResolutionEvent {
+            call_id: "call-auto".into(),
+            decision: PermissionDecision::Approved,
+            reason: Some("safe write".into()),
+            tool_name: Some("fs__write".into()),
+            summary: Some("fs__write a.txt".into()),
+            origin_label: Some("reviewer".into()),
+        });
+
+        match timeline.items().first() {
+            Some(TimelineItem::Permission(permission)) => {
+                assert_eq!(permission.tool_name, "fs__write");
+                assert_eq!(permission.origin_label.as_deref(), Some("reviewer"));
+                assert_eq!(permission.status, PermissionPromptStatus::Approved);
+                assert_eq!(permission.resolution_reason.as_deref(), Some("safe write"));
+            }
+            other => panic!("expected auto-review permission card, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn transcript_restore_preserves_tool_arguments_and_output_for_visible_cards() {
         let records = vec![
             TranscriptRecord {
@@ -1953,6 +1981,10 @@ mod tests {
                 args: json!({"command": "cargo test"}),
                 allowed: false,
                 reason: Some("Denied by user from TUI permission prompt".into()),
+                reviewer: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
             },
         }];
 

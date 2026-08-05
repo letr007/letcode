@@ -322,6 +322,16 @@ pub enum TranscriptEvent {
         allowed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// "user" | "auto"; omitted means user for legacy records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reviewer: Option<String>,
+        /// "once" | "always" | "deny"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reviewer_child_session_id: Option<String>,
     },
     PermissionModeChanged {
         previous_mode: String,

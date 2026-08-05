@@ -93,7 +93,7 @@ pub async fn run_repl(
             ReplCommand::Help => print_repl_help(),
             ReplCommand::PermissionShow => {
                 println!(
-                    "permission mode: {}\navailable modes: safe, default, yolo",
+                    "permission mode: {}\navailable modes: safe, default, auto, yolo",
                     view.permission_mode_label
                 );
             }
@@ -122,6 +122,19 @@ pub async fn run_repl(
                 .await?;
                 view.permission_mode_label = PermissionMode::Default.to_string();
                 println!("permission mode set to default");
+            }
+            ReplCommand::PermissionSet(PermissionMode::Auto) => {
+                submit_and_wait(
+                    &ingress,
+                    &mut events,
+                    &mut view,
+                    SessionCommand::SetPermissionMode(PermissionMode::Auto),
+                    CommandWait::BriefDrain,
+                    OutputMode::Streaming,
+                )
+                .await?;
+                view.permission_mode_label = PermissionMode::Auto.to_string();
+                println!("permission mode set to auto");
             }
             ReplCommand::PermissionSet(PermissionMode::Yolo) => {
                 print!(

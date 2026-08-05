@@ -61,7 +61,13 @@ sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
 [permissions]
-mode = "default" # safe/default/yolo；读取时兼容旧的 solo
+mode = "default" # safe/default/auto/yolo；读取时兼容旧的 solo
+# auto = Ask 集合与 default 相同，但由 sticky reviewer 专家回答审批
+
+# 可选：permission mode = "auto" 时的 reviewer 模型路由
+# [agents.reviewer]
+# provider = "openai"
+# model = "gpt-5.5"
 
 # 可选的本地执行策略。经过审查的读取工具可以声明支持并行；
 # 其他工具保持单例执行，除非其处理器明确选择并行。

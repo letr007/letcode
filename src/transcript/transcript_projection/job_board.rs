@@ -141,7 +141,11 @@ pub(crate) fn project_job_board(
                     entry.child_session_id = child_session_id.clone();
                 }
                 if entry.agent_name.is_empty() {
-                    entry.agent_name = parent_tool.trim_start_matches("agent__").to_string();
+                    entry.agent_name = parent_tool
+                        .strip_prefix("agent__")
+                        .or_else(|| parent_tool.strip_prefix("system__"))
+                        .unwrap_or(parent_tool)
+                        .to_string();
                 }
                 if tags.iter().any(|tag| tag == "subagent_result") {
                     entry.summary = summary.clone();

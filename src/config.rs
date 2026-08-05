@@ -652,6 +652,7 @@ pub struct AgentsConfig {
     pub designer: AgentConfig,
     pub librarian: AgentConfig,
     pub general: AgentConfig,
+    pub reviewer: AgentConfig,
 }
 
 impl AgentsConfig {
@@ -674,6 +675,7 @@ impl AgentsConfig {
             "designer" => Some(&self.designer),
             "librarian" => Some(&self.librarian),
             "general" => Some(&self.general),
+            "reviewer" => Some(&self.reviewer),
             _ => None,
         }
     }
@@ -902,6 +904,7 @@ struct RawAgentsConfig {
     designer: Option<RawAgentConfig>,
     librarian: Option<RawAgentConfig>,
     general: Option<RawAgentConfig>,
+    reviewer: Option<RawAgentConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1326,6 +1329,7 @@ fn build_agents_config(
         designer: build_agent_config(raw.designer, "designer", active_provider, providers)?,
         librarian: build_agent_config(raw.librarian, "librarian", active_provider, providers)?,
         general: build_agent_config(raw.general, "general", active_provider, providers)?,
+        reviewer: build_agent_config(raw.reviewer, "reviewer", active_provider, providers)?,
     })
 }
 
@@ -2249,7 +2253,7 @@ mod tests {
         let _guard = lock_env();
         let path = write_temp_config(
             r#"
-            [agents.reviewer]
+            [agents.nosuch]
             model = "gpt-5.5"
 
             [providers.openai]
@@ -2274,7 +2278,28 @@ mod tests {
                 && message.contains("designer")
                 && message.contains("librarian")
                 && message.contains("general")
+                && message.contains("reviewer")
         }));
+    }
+
+    #[test]
+    fn accepts_reviewer_agent_route() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [agents.reviewer]
+            model = "gpt-5.5"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("reviewer agent config");
+        assert_eq!(config.agents.model_for("reviewer"), Some("gpt-5.5"));
     }
 
     #[test]

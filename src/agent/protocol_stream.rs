@@ -404,7 +404,7 @@ pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     mut approve: A,
 ) -> Result<String>
 where
-    C: Config + Clone,
+    C: Config + Clone + Send + Sync + 'static,
     F: FnMut(&str) -> Dfut,
     E: FnMut(AgentEvent) -> Efut + Send,
     A: FnMut(PermissionRequest) -> Afut,
@@ -1127,7 +1127,7 @@ pub(super) async fn run_oai_comp_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     mut approve: A,
 ) -> Result<String>
 where
-    C: Config + Clone,
+    C: Config + Clone + Send + Sync + 'static,
     F: FnMut(&str) -> Dfut,
     E: FnMut(AgentEvent) -> Efut + Send,
     A: FnMut(PermissionRequest) -> Afut,

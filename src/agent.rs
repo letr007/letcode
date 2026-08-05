@@ -58,6 +58,8 @@ use crate::transcript::{ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
 use async_openai::config::OpenAIConfig;
 
+#[path = "agent/auto_review.rs"]
+mod auto_review;
 #[path = "agent/catalog.rs"]
 mod catalog;
 #[path = "agent/compaction.rs"]
@@ -75,10 +77,13 @@ mod tool_execution;
 #[path = "agent/workflow_state.rs"]
 mod workflow_state;
 
+pub(crate) use auto_review::{AutoReviewResolution, AutoReviewService};
+
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
 pub(crate) use catalog::{
     SUBAGENT_CATALOG, agent_name_for_subagent_tool, is_subagent_tool_name,
-    subagent_catalog_entry_by_tool_name, subagent_tool_name_for_agent_name,
+    subagent_catalog_entry_by_tool_name, subagent_evidence_parent_tool,
+    subagent_tool_name_for_agent_name,
 };
 #[allow(unused_imports)]
 pub(crate) use catalog::{SubagentCatalogEntry, subagent_catalog_entry_by_agent_name};
@@ -569,6 +574,7 @@ pub struct Agent<C: Config> {
     subagent_child_factory: Option<Arc<dyn SubagentChildFactory<C>>>,
     primary_route_factory: Option<Arc<dyn PrimaryRouteFactory<C>>>,
     question_handler: Option<QuestionCallback>,
+    auto_review_service: Option<Arc<dyn AutoReviewService<C>>>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
@@ -694,6 +700,7 @@ impl AgentFactory {
             subagent_child_factory: parent.subagent_child_factory.clone(),
             primary_route_factory: parent.primary_route_factory.clone(),
             question_handler: None,
+            auto_review_service: None,
             permission_session: Arc::clone(&parent.permission_session),
             compaction_config: parent.compaction_config.clone(),
             retry_config,
@@ -956,6 +963,7 @@ impl<C: Config> Agent<C> {
             subagent_child_factory: None,
             primary_route_factory: None,
             question_handler: None,
+            auto_review_service: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
@@ -1611,6 +1619,24 @@ impl<C: Config> Agent<C> {
         self.subagent_delegate = Some(delegate);
     }
 
+    pub fn set_auto_review_service(&mut self, service: Option<Arc<dyn AutoReviewService<C>>>) {
+        self.auto_review_service = service;
+    }
+
+    pub(crate) async fn resolve_auto_permission(
+        &self,
+        request: PermissionRequest,
+        user_goal: Option<String>,
+    ) -> Result<AutoReviewResolution>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        let Some(service) = self.auto_review_service.as_ref() else {
+            bail!("auto permission mode requires a reviewer service");
+        };
+        service.review(self, request, user_goal).await
+    }
+
     pub fn set_subagent_child_factory(&mut self, factory: Arc<dyn SubagentChildFactory<C>>) {
         self.subagent_child_factory = Some(factory);
     }
@@ -2262,6 +2288,7 @@ impl<C: Config> Agent<C> {
             subagent_child_factory: None,
             primary_route_factory: None,
             question_handler: None,
+            auto_review_service: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
             retry_config: self.retry_config.clone(),
@@ -2283,7 +2310,7 @@ impl<C: Config> Agent<C> {
 
     pub async fn generate_session_title(&mut self, user_input: &str) -> Result<String>
     where
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         let raw = self
             .run_stream(
@@ -2299,7 +2326,7 @@ impl<C: Config> Agent<C> {
     #[allow(dead_code)]
     pub async fn run(&mut self, user_input: &str) -> Result<String>
     where
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         self.run_stream(
             user_input,
@@ -2324,7 +2351,7 @@ impl<C: Config> Agent<C> {
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         self.run_stream_content_with_interactions_async(
             UserMessageContent::new(user_input.to_string(), Vec::new()),
@@ -2356,7 +2383,7 @@ impl<C: Config> Agent<C> {
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         self.run_stream_content_with_interactions_async(
             user_content,
@@ -2390,7 +2417,7 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         let mut question_handler_guard =
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
@@ -2445,6 +2472,7 @@ impl<C: Config> Agent<C> {
         approve: &mut A,
     ) -> Result<ToolExecutionRecord>
     where
+        C: Clone + Send + Sync + 'static,
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
@@ -2565,6 +2593,7 @@ impl<C: Config> Agent<C> {
         approve: &mut A,
     ) -> Result<()>
     where
+        C: Clone + Send + Sync + 'static,
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
@@ -2612,7 +2641,7 @@ impl<C: Config> Agent<C> {
             false,
             crate::permission::is_internal_tool(&call.name),
         );
-        let decision = if mode == PermissionMode::Default && grant_allowed {
+        let decision = if mode.uses_default_ask_matrix() && grant_allowed {
             PermissionDecision::Allow
         } else {
             decision
@@ -2631,6 +2660,7 @@ impl<C: Config> Agent<C> {
         approve: &mut A,
     ) -> Result<()>
     where
+        C: Clone + Send + Sync + 'static,
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
@@ -2871,7 +2901,7 @@ impl<C: Config> Agent<C> {
         F: FnMut(&str) -> Result<()>,
         E: FnMut(AgentEvent) -> Result<()> + Send,
         A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         self.run_stream_async(
             user_input,
@@ -2895,7 +2925,7 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Result<()> + Send,
         A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
         Q: FnMut(QuestionRequest) -> Result<QuestionResponse> + Send + 'static,
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         self.run_stream_content_with_interactions_async(
             UserMessageContent::new(user_input.to_string(), Vec::new()),
@@ -2949,7 +2979,7 @@ impl<C: Config> Agent<C> {
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         protocol_stream::run_oai_comp_stream_async(
             self,
@@ -3341,7 +3371,7 @@ impl<C: Config> Agent<C> {
                     PendingSubagentJob {
                         run_id: run_id.clone(),
                         child_session_id: child_session_id.clone(),
-                        agent_name: parent_tool.trim_start_matches("agent__").to_string(),
+                        agent_name: subagent_agent_name_from_parent_tool(parent_tool),
                         status,
                         summary: evidence.summary.clone(),
                     },
@@ -4233,6 +4263,14 @@ struct PendingSubagentJob {
     agent_name: String,
     status: String,
     summary: String,
+}
+
+fn subagent_agent_name_from_parent_tool(parent_tool: &str) -> String {
+    parent_tool
+        .strip_prefix("agent__")
+        .or_else(|| parent_tool.strip_prefix("system__"))
+        .unwrap_or(parent_tool)
+        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -52,8 +52,18 @@ pub const DELEGATION_EXPERTS: &[DelegationMetadata] = &[
     },
 ];
 
+/// System experts are configurable via `[agents.<name>]` but not user-delegable via `@`.
+pub const SYSTEM_EXPERTS: &[&str] = &["reviewer"];
+
 pub fn supported_agent_names() -> impl Iterator<Item = &'static str> {
-    DELEGATION_EXPERTS.iter().map(|expert| expert.agent_name)
+    DELEGATION_EXPERTS
+        .iter()
+        .map(|expert| expert.agent_name)
+        .chain(SYSTEM_EXPERTS.iter().copied())
+}
+
+pub fn is_system_expert(agent_name: &str) -> bool {
+    SYSTEM_EXPERTS.contains(&agent_name)
 }
 
 pub fn find_expert(agent_name: &str) -> Option<&'static DelegationMetadata> {
@@ -108,8 +118,13 @@ mod tests {
                 "oracle",
                 "designer",
                 "librarian",
-                "general"
+                "general",
+                "reviewer",
             ]
         );
+        assert!(is_system_expert("reviewer"));
+        assert!(!DELEGATION_EXPERTS
+            .iter()
+            .any(|expert| expert.agent_name == "reviewer"));
     }
 }

@@ -61,7 +61,13 @@ sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
 [permissions]
-mode = "default" # safe/default/yolo; legacy solo remains accepted when reading
+mode = "default" # safe/default/auto/yolo; legacy solo remains accepted when reading
+# auto = same Ask set as default, but a sticky reviewer expert answers approvals
+
+# Optional reviewer model route used by permission mode "auto"
+# [agents.reviewer]
+# provider = "openai"
+# model = "gpt-5.5"
 
 # Optional local execution policy. Reviewed read tools may declare parallel support;
 # all other tools stay exclusive unless their handler explicitly opts in.

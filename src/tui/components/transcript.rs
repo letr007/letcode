@@ -27,7 +27,9 @@ use crate::tui::{
 use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
-use super::{composer::one_line_snippet, structured_subagent, todo_card, tool_card};
+use super::{
+    composer::one_line_snippet, structured_subagent, todo_card, tool_card,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptRenderCache {

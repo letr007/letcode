@@ -7066,6 +7066,167 @@ async fn default_and_safe_allow_once_authorize_external_writes() {
     }
 }
 
+struct MockAutoReviewService {
+    approval: Mutex<PermissionApproval>,
+    calls: AtomicUsize,
+    child_session_id: String,
+}
+
+impl AutoReviewService<OpenAIConfig> for MockAutoReviewService {
+    fn review<'a>(
+        &'a self,
+        _parent: &'a Agent<OpenAIConfig>,
+        _request: PermissionRequest,
+        _user_goal: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<AutoReviewResolution>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let approval = *self.approval.lock().expect("approval lock");
+            let approval_label = match approval {
+                PermissionApproval::AllowOnce => "once",
+                PermissionApproval::AllowAlways => "always",
+                PermissionApproval::Deny => "deny",
+            };
+            Ok(AutoReviewResolution {
+                approval,
+                reason: format!("mock-{approval_label}"),
+                risk: Some("low".into()),
+                approval_label,
+                reviewer_child_session_id: self.child_session_id.clone(),
+            })
+        })
+    }
+
+    fn clear_sticky(&self) {}
+}
+
+#[tokio::test]
+async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::AllowOnce),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-1".into(),
+    });
+    agent.set_auto_review_service(Some(service.clone()));
+
+    let path = std::env::temp_dir().join(format!(
+        "letcode-auto-review-once-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    let call = HistoryToolCall {
+        call_id: "call-auto-once".into(),
+        name: "fs__write".into(),
+        arguments_json: json!({"path": path, "content": "ok"}).to_string(),
+    };
+    let mut human_approvals = 0usize;
+    let record = agent
+        .execute_tool_call(
+            &call,
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            },
+        )
+        .await
+        .expect("auto allow_once executes");
+
+    assert_eq!(human_approvals, 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(record.status, ToolExecutionStatus::Executed);
+    assert!(record.output.ok, "{:?}", record.output.error);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn auto_mode_deny_includes_reviewer_rationale() {
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::Deny),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-deny".into(),
+    });
+    agent.set_auto_review_service(Some(service));
+
+    let call = HistoryToolCall {
+        call_id: "call-auto-deny".into(),
+        name: "fs__write".into(),
+        arguments_json: json!({"path": "deny.txt", "content": "no"}).to_string(),
+    };
+    let record = agent
+        .execute_tool_call(
+            &call,
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("auto deny is a tool record");
+
+    assert_eq!(record.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        record.rejection,
+        Some(ToolExecutionRejection::PermissionDeniedByUser)
+    );
+    assert!(
+        record
+            .output
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("auto-review denied permission: mock-deny"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn auto_mode_allow_always_grant_skips_second_review() {
+    let fixture = UnixWritableFixture::new("auto-allow-always");
+    let path = fixture.external.join("written.txt");
+    let first_call = writable_call("auto-always-first", "fs__write", &path, "first");
+    let second_call = writable_call("auto-always-second", "fs__write", &path, "second");
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::AllowAlways),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-sticky".into(),
+    });
+    agent.set_auto_review_service(Some(service.clone()));
+
+    let first = agent
+        .execute_tool_call(
+            &first_call,
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("first auto allow_always");
+    assert!(first.output.ok, "{:?}", first.output.error);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+
+    let second = agent
+        .execute_tool_call(
+            &second_call,
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("grant reuse");
+    assert!(second.output.ok, "{:?}", second.output.error);
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        1,
+        "session grant must skip reviewer"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn default_allow_always_external_write_grant_is_cleared_at_top_level_session_boundary() {

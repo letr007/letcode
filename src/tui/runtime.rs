@@ -2163,6 +2163,11 @@ impl TuiRuntime {
                 Some("Allow read/preview, ask for risky tools".into()),
             ),
             DialogItem::new(
+                "auto",
+                "Auto",
+                Some("Same Ask set as Default; reviewer expert approves".into()),
+            ),
+            DialogItem::new(
                 "yolo",
                 "YOLO",
                 Some("Allow write and command tools without asking".into()),
@@ -2176,7 +2181,8 @@ impl TuiRuntime {
         );
         dialog.selected = match self.state.permission_mode_label.as_str() {
             "safe" => 0,
-            "yolo" => 2,
+            "auto" => 2,
+            "yolo" => 3,
             _ => 1,
         };
         self.state.open_dialog(dialog);
@@ -2559,6 +2565,7 @@ impl TuiRuntime {
                 self.state.close_dialog();
                 let mode = match selected.id.as_str() {
                     "safe" => PermissionMode::Safe,
+                    "auto" => PermissionMode::Auto,
                     "yolo" => PermissionMode::Yolo,
                     _ => PermissionMode::Default,
                 };

@@ -119,7 +119,20 @@ impl TranscriptTimelineProjection {
                 args,
                 allowed,
                 reason,
+                reviewer,
+                approval: _,
+                risk,
+                reviewer_child_session_id: _,
             } => {
+                let restored_reason = match (reviewer.as_deref(), risk.as_deref(), reason.as_ref()) {
+                    (Some("auto"), Some(risk), Some(reason)) => {
+                        Some(format!("auto-review ({risk}): {reason}"))
+                    }
+                    (Some("auto"), _, Some(reason)) => Some(format!("auto-review: {reason}")),
+                    _ => reason.clone(),
+                };
+                let origin_label = matches!(reviewer.as_deref(), Some("auto"))
+                    .then(|| "reviewer".to_string());
                 self.timeline.push_restored_permission_decision(
                     call_id.clone().unwrap_or_else(|| tool.clone()),
                     tool.clone(),
@@ -130,7 +143,8 @@ impl TranscriptTimelineProjection {
                     } else {
                         PermissionPromptStatus::Denied
                     },
-                    reason.clone(),
+                    restored_reason,
+                    origin_label,
                 );
             }
             TranscriptEvent::Error { message } => {
@@ -203,6 +217,10 @@ mod tests {
                 args: json!({"command": "cargo test"}),
                 allowed: false,
                 reason: Some("Denied by user from TUI permission prompt".into()),
+                reviewer: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
             },
         )]);
 
@@ -211,6 +229,35 @@ mod tests {
             Some(TimelineItem::Permission(permission))
                 if permission.status == PermissionPromptStatus::Denied
                     && permission.resolution_reason.as_deref() == Some("Denied by user from TUI permission prompt")
+        ));
+    }
+
+    #[test]
+    fn restored_auto_review_permissions_keep_reviewer_identity() {
+        let timeline = timeline_from_transcript_records(&[record(
+            1,
+            TranscriptEvent::PermissionDecision {
+                call_id: Some("call-auto".into()),
+                tool: "fs__write".into(),
+                args: json!({"path": "a.txt", "content": "x"}),
+                allowed: true,
+                reason: Some("safe edit".into()),
+                reviewer: Some("auto".into()),
+                approval: Some("once".into()),
+                risk: Some("low".into()),
+                reviewer_child_session_id: Some("child-reviewer".into()),
+            },
+        )]);
+
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::Permission(permission))
+                if permission.status == PermissionPromptStatus::Approved
+                    && permission.origin_label.as_deref() == Some("reviewer")
+                    && permission
+                        .resolution_reason
+                        .as_deref()
+                        == Some("auto-review (low): safe edit")
         ));
     }
 

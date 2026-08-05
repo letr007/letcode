@@ -26,6 +26,7 @@
 //!   CLI ──┘
 //! ```
 
+pub mod auto_review;
 pub mod child_view;
 pub mod command;
 pub mod context_scope;

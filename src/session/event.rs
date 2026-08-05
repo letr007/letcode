@@ -472,6 +472,12 @@ pub struct PermissionResolutionEvent {
     pub call_id: String,
     pub decision: PermissionDecision,
     pub reason: Option<String>,
+    /// Present when resolution was not preceded by a PermissionRequested UI prompt
+    /// (e.g. Auto-mode reviewer). Used to build a timeline card.
+    pub tool_name: Option<String>,
+    pub summary: Option<String>,
+    /// Fixed identity label for auto-review cards (`"reviewer"`).
+    pub origin_label: Option<String>,
 }
 
 impl PermissionResolutionEvent {
@@ -481,6 +487,9 @@ impl PermissionResolutionEvent {
             call_id: call_id.into(),
             decision: PermissionDecision::Approved,
             reason: None,
+            tool_name: None,
+            summary: None,
+            origin_label: None,
         }
     }
 
@@ -489,6 +498,9 @@ impl PermissionResolutionEvent {
             call_id: call_id.into(),
             decision: PermissionDecision::Denied,
             reason,
+            tool_name: None,
+            summary: None,
+            origin_label: None,
         }
     }
 }

@@ -1426,6 +1426,10 @@ mod tests {
                     args: json!({"command": "cargo test"}),
                     allowed: false,
                     reason: Some("Denied".into()),
+                    reviewer: None,
+                    approval: None,
+                    risk: None,
+                    reviewer_child_session_id: None,
                 },
             ),
             record_at(

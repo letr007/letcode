@@ -181,7 +181,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/permission",
         insert_text: "/permission ",
         description: "Show or switch permission mode",
-        usage: "/permission <safe|default|yolo>",
+        usage: "/permission <safe|default|auto|yolo>",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -190,7 +190,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/perm",
         insert_text: "/perm ",
         description: "Alias for /permission",
-        usage: "/perm <safe|default|yolo>",
+        usage: "/perm <safe|default|auto|yolo>",
         visible_in_slash: false,
         visible_in_help: true,
         visible_in_summary: false,
@@ -496,14 +496,16 @@ fn parse_permission(parts: &[&str]) -> Result<CommandIntent, CommandParseError> 
         ["/permission", mode] | ["/perm", mode] => match parse_permission_mode(mode) {
             Some(mode) => Ok(CommandIntent::PermissionSet(mode)),
             None => Err(CommandParseError::new(format!(
-                "Unknown permission mode: {}. Use safe, default, or yolo.",
+                "Unknown permission mode: {}. Use safe, default, auto, or yolo.",
                 mode
             ))),
         },
         ["/permission", ..] => Err(CommandParseError::new(
-            "Usage: /permission <safe|default|yolo>",
+            "Usage: /permission <safe|default|auto|yolo>",
         )),
-        ["/perm", ..] => Err(CommandParseError::new("Usage: /perm <safe|default|yolo>")),
+        ["/perm", ..] => Err(CommandParseError::new(
+            "Usage: /perm <safe|default|auto|yolo>",
+        )),
         _ => unreachable!(),
     }
 }
@@ -645,6 +647,7 @@ fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "safe" => Some(PermissionMode::Safe),
         "default" => Some(PermissionMode::Default),
+        "auto" => Some(PermissionMode::Auto),
         "yolo" | "solo" => Some(PermissionMode::Yolo),
         _ => None,
     }
@@ -848,6 +851,10 @@ mod tests {
         assert_eq!(
             parse_command("/permission yolo"),
             Ok(CommandIntent::PermissionSet(PermissionMode::Yolo))
+        );
+        assert_eq!(
+            parse_command("/permission auto"),
+            Ok(CommandIntent::PermissionSet(PermissionMode::Auto))
         );
         assert_eq!(
             parse_command("/permission solo"),

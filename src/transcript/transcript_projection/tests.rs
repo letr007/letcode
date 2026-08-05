@@ -2475,6 +2475,10 @@ fn checkpoint_permission_and_execution_facts_rebind_to_finished_output() {
             args: json!({}),
             allowed: true,
             reason: None,
+            reviewer: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         },
     );
     let write = record_at(
@@ -2523,6 +2527,10 @@ fn checkpoint_facts_with_missing_or_ambiguous_call_ids_fail() {
             args: json!({}),
             allowed: true,
             reason: None,
+            reviewer: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         },
     )];
     assert!(
@@ -2551,6 +2559,10 @@ fn checkpoint_facts_with_missing_or_ambiguous_call_ids_fail() {
             args: json!({}),
             allowed: true,
             reason: None,
+            reviewer: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         },
     )];
     assert!(

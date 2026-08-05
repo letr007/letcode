@@ -11,6 +11,8 @@ pub enum PermissionMode {
     Safe,
     #[default]
     Default,
+    /// Same Ask set as Default, but approvals are answered by the reviewer expert.
+    Auto,
     #[serde(alias = "solo")]
     Yolo,
 }
@@ -20,8 +22,14 @@ impl PermissionMode {
         match self {
             Self::Safe => "safe",
             Self::Default => "default",
+            Self::Auto => "auto",
             Self::Yolo => "yolo",
         }
+    }
+
+    /// Modes that share Default's Ask matrix and session-local AllowAlways grants.
+    pub fn uses_default_ask_matrix(self) -> bool {
+        matches!(self, Self::Default | Self::Auto)
     }
 }
 
@@ -335,7 +343,7 @@ impl PermissionSessionState {
             PermissionDecision::Deny
         } else if internal_tool {
             PermissionDecision::Allow
-        } else if self.mode() == PermissionMode::Default
+        } else if self.mode().uses_default_ask_matrix()
             && base_decision == PermissionDecision::Allow
             && external_workspace_access
         {
@@ -349,17 +357,26 @@ impl PermissionSessionState {
     }
     /// Inserts an approval grant only when it still belongs to the permission
     /// generation and mode that produced the request.
-    pub fn grant_if_current_default(
+    pub fn grant_if_current_session(
         &mut self,
         generation: u64,
         resource: PermissionResource,
     ) -> bool {
-        if self.mode() == PermissionMode::Default && self.generation == generation {
+        if self.mode().uses_default_ask_matrix() && self.generation == generation {
             self.grant(resource);
             true
         } else {
             false
         }
+    }
+
+    #[cfg(test)]
+    pub fn grant_if_current_default(
+        &mut self,
+        generation: u64,
+        resource: PermissionResource,
+    ) -> bool {
+        self.grant_if_current_session(generation, resource)
     }
     pub fn clear_grants(&mut self) {
         self.grants.clear();
@@ -411,10 +428,12 @@ impl PermissionPolicy {
 
         match self.mode {
             PermissionMode::Safe => PermissionDecision::Ask,
-            PermissionMode::Default if tool == tool_names::TOOL_WEB_FETCH => {
+            PermissionMode::Default | PermissionMode::Auto
+                if tool == tool_names::TOOL_WEB_FETCH =>
+            {
                 PermissionDecision::Ask
             }
-            PermissionMode::Default => match class {
+            PermissionMode::Default | PermissionMode::Auto => match class {
                 ToolPermissionClass::Read | ToolPermissionClass::Preview => {
                     PermissionDecision::Allow
                 }
@@ -959,6 +978,59 @@ mod tests {
             !state.grant_if_current_default(generation, resource),
             "an approval from a previous generation must not create a grant"
         );
+    }
+
+    #[test]
+    fn auto_mode_shares_default_ask_matrix_and_accepts_session_grants() {
+        let mut default_state = PermissionSessionState::default();
+        let mut auto_state = PermissionSessionState::default();
+        auto_state.set_mode(PermissionMode::Auto);
+
+        let write_args = json!({"path": "a.txt", "content": "x"});
+        assert_eq!(
+            default_state.decision(
+                "fs__write",
+                &write_args,
+                ToolPermissionClass::Write,
+                ExecutionDirective::None
+            ),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            auto_state.decision(
+                "fs__write",
+                &write_args,
+                ToolPermissionClass::Write,
+                ExecutionDirective::None
+            ),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            auto_state.decision(
+                "fs__read",
+                &json!({"path": "a.txt"}),
+                ToolPermissionClass::Read,
+                ExecutionDirective::None
+            ),
+            PermissionDecision::Allow
+        );
+
+        let resource = PermissionResource::ExactPath {
+            tool: "fs__write".into(),
+            path: PathBuf::from("a.txt"),
+        };
+        let (mode, generation, _, _) = auto_state.approval_snapshot(
+            Some(&resource),
+            "fs__write",
+            &write_args,
+            ToolPermissionClass::Write,
+            ExecutionDirective::None,
+            false,
+            false,
+        );
+        assert_eq!(mode, PermissionMode::Auto);
+        assert!(auto_state.grant_if_current_session(generation, resource.clone()));
+        assert!(auto_state.allows_grant(&resource));
     }
 
     #[test]

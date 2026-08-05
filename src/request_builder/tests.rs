@@ -2915,6 +2915,10 @@ fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_delet
                 args: json!({"command": "cargo test --quiet"}),
                 allowed: false,
                 reason: Some("Denied from restored permission prompt".into()),
+                reviewer: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
             },
         ),
         transcript_record(

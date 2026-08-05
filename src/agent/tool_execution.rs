@@ -16,7 +16,7 @@ pub(super) async fn execute_tool_call<C, E, A, Efut, Afut>(
     approve: &mut A,
 ) -> Result<ToolExecutionRecord>
 where
-    C: Config,
+    C: Config + Clone + Send + Sync + 'static,
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
@@ -102,7 +102,7 @@ where
                 false,
                 crate::permission::is_internal_tool(&call.name),
             );
-            let decision = if mode == PermissionMode::Default && grant_allowed {
+            let decision = if mode.uses_default_ask_matrix() && grant_allowed {
                 PermissionDecision::Allow
             } else {
                 decision
@@ -163,7 +163,7 @@ where
                     false,
                     crate::permission::is_internal_tool(&call.name),
                 );
-                let decision = if mode == PermissionMode::Default && grant_allowed {
+                let decision = if mode.uses_default_ask_matrix() && grant_allowed {
                     PermissionDecision::Allow
                 } else {
                     decision
@@ -640,7 +640,7 @@ where
             crate::permission::is_internal_tool(&call.name),
         )
     };
-    let decision = if mode == PermissionMode::Default && grant_allowed {
+    let decision = if mode.uses_default_ask_matrix() && grant_allowed {
         PermissionDecision::Allow
     } else {
         decision
@@ -695,7 +695,7 @@ async fn execute_with_arguments<C, E, A, Efut, Afut>(
     approve: &mut A,
 ) -> Result<ToolExecutionRecord>
 where
-    C: Config,
+    C: Config + Clone + Send + Sync + 'static,
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
@@ -845,17 +845,18 @@ where
             crate::permission::is_internal_tool(&call.name),
         )
     };
-    let permission_decision = if mode == PermissionMode::Default && grant_allowed {
+    let permission_decision = if mode.uses_default_ask_matrix() && grant_allowed {
         PermissionDecision::Allow
     } else {
         permission_decision
     };
     let mut approval = None;
+    let mut auto_deny_reason = None;
     let should_execute = match permission_decision {
         PermissionDecision::Allow => true,
         PermissionDecision::Ask => {
-            let can_allow_always = mode == PermissionMode::Default && resource.is_some();
-            let result = approve(PermissionRequest {
+            let can_allow_always = mode.uses_default_ask_matrix() && resource.is_some();
+            let request = PermissionRequest {
                 call_id: Some(call.call_id.clone()),
                 tool: call.name.clone(),
                 args: args.clone(),
@@ -867,8 +868,16 @@ where
                 can_allow_always,
                 grant_summary: can_allow_always
                     .then(|| resource.as_ref().expect("resource checked").summary()),
-            })
-            .await?;
+            };
+            let result = if mode == PermissionMode::Auto {
+                let resolution = agent.resolve_auto_permission(request, None).await?;
+                if !resolution.approval.allowed() {
+                    auto_deny_reason = Some(resolution.reason);
+                }
+                resolution.approval
+            } else {
+                approve(request).await?
+            };
             approval = Some(result);
             result.allowed()
         }
@@ -881,7 +890,7 @@ where
                 .permission_session
                 .lock()
                 .map_err(|_| anyhow::anyhow!("permission session poisoned"))?
-                .grant_if_current_default(permission_generation, resource);
+                .grant_if_current_session(permission_generation, resource);
         }
     }
 
@@ -1048,6 +1057,11 @@ where
     } else {
         let output = if matches!(permission_decision, PermissionDecision::Deny) {
             ToolResult::err(&call.name, "permission denied by current mode")
+        } else if let Some(reason) = auto_deny_reason {
+            ToolResult::err(
+                &call.name,
+                format!("auto-review denied permission: {reason}"),
+            )
         } else {
             ToolResult::err(&call.name, "user denied permission")
         };
