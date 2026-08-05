@@ -7,7 +7,7 @@ pub(super) struct EventProjection<'a> {
     pub(super) active_session: &'a mut bool,
     pub(super) latest_auto_continue: &'a mut AutoContinueState,
     pub(super) latest_todo: &'a mut Option<TodoView>,
-    pub(super) retry: &'a mut Option<crate::session::RetryLifecycleEvent>,
+    pub(super) retry: &'a mut Option<RetryNoticeState>,
     pub(super) phase: &'a mut AppPhase,
     pub(super) active_tool_call_id: &'a mut Option<String>,
     pub(super) pending_permission: &'a mut Option<PermissionView>,
@@ -44,7 +44,11 @@ pub(super) fn apply_projected_session_event(mut projection: EventProjection<'_>,
     match event {
         SessionEvent::Tick => {
             *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
-            if projection.toast.as_mut().is_some_and(ToastState::tick) {
+            if let Some(retry) = projection.retry.as_mut() {
+                // Sticky red countdown for the whole backoff window.
+                retry.tick_frame();
+                *projection.toast = Some(retry.sticky_toast());
+            } else if projection.toast.as_mut().is_some_and(ToastState::tick) {
                 *projection.toast = None;
             }
             return;
@@ -62,15 +66,9 @@ pub(super) fn apply_projected_session_event(mut projection: EventProjection<'_>,
         }
         SessionEvent::RetryScheduled(retry) => {
             *projection.phase = AppPhase::Running;
-            *projection.toast = Some(ToastState::new(
-                format!(
-                    "Temporary issue. Trying again in {}s (attempt {} of {})",
-                    retry.delay_secs, retry.attempt, retry.max_attempts
-                ),
-                ToastKind::Info,
-                ToastState::DEFAULT_TICKS,
-            ));
-            *projection.retry = Some(retry);
+            let notice = RetryNoticeState::from_lifecycle(retry);
+            *projection.toast = Some(notice.sticky_toast());
+            *projection.retry = Some(notice);
         }
         SessionEvent::RetryStarted(_) => {
             *projection.retry = None;
@@ -232,7 +230,7 @@ pub(super) fn apply_projected_session_event(mut projection: EventProjection<'_>,
             ));
         }
         SessionEvent::Error(error) => {
-            *projection.retry = None;
+            let had_retry = projection.retry.take().is_some();
             *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Error;
@@ -240,15 +238,22 @@ pub(super) fn apply_projected_session_event(mut projection: EventProjection<'_>,
             *projection.pending_permission = None;
             *projection.latest_auto_continue = AutoContinueState::default();
             *projection.latest_todo = None;
+            if had_retry {
+                // Drop the sticky retry toast so it cannot outlive the failed turn.
+                *projection.toast = None;
+            }
             projection.timeline.push_error(error);
         }
         SessionEvent::Done => {
-            *projection.retry = None;
+            let had_retry = projection.retry.take().is_some();
             *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
+            if had_retry {
+                *projection.toast = None;
+            }
         }
         SessionEvent::PermissionResolved(resolution) => {
             projection.timeline.resolve_permission(resolution);

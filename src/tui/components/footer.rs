@@ -635,12 +635,14 @@ mod tests {
     fn footer_omits_scheduled_retry_details() {
         let mut state = TuiState::default();
         state.phase = AppPhase::Running;
-        state.retry = Some(RetryLifecycleEvent {
-            attempt: 2,
-            max_attempts: 3,
-            delay_secs: 1,
-            error: "temporary upstream failure".into(),
-        });
+        state.retry = Some(crate::tui::RetryNoticeState::from_lifecycle(
+            RetryLifecycleEvent {
+                attempt: 2,
+                max_attempts: 3,
+                delay_secs: 1,
+                error: "temporary upstream failure".into(),
+            },
+        ));
 
         let status_with_retry = footer_status_spans(&state, crate::tui::Theme::dark())
             .into_iter()

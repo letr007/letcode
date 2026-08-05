@@ -166,6 +166,54 @@ impl ToastState {
     }
 }
 
+/// Sticky retry notice shown in the top-right toast while waiting to reissue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryNoticeState {
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay_secs: u64,
+    pub error: String,
+    pub secs_remaining: u64,
+    ticks_in_current_second: u8,
+}
+
+impl RetryNoticeState {
+    /// Matches `TUI_FRAME_POLL_INTERVAL` (~33ms): about one displayed second.
+    pub const TICKS_PER_SECOND: u8 = 30;
+
+    pub fn from_lifecycle(event: crate::session::RetryLifecycleEvent) -> Self {
+        Self {
+            attempt: event.attempt,
+            max_attempts: event.max_attempts,
+            delay_secs: event.delay_secs,
+            error: event.error,
+            secs_remaining: event.delay_secs,
+            ticks_in_current_second: 0,
+        }
+    }
+
+    pub fn toast_message(&self) -> String {
+        format!(
+            "Retrying in {}s · attempt {} of {}",
+            self.secs_remaining, self.attempt, self.max_attempts
+        )
+    }
+
+    fn tick_frame(&mut self) {
+        self.ticks_in_current_second = self.ticks_in_current_second.saturating_add(1);
+        if self.ticks_in_current_second < Self::TICKS_PER_SECOND {
+            return;
+        }
+        self.ticks_in_current_second = 0;
+        self.secs_remaining = self.secs_remaining.saturating_sub(1);
+    }
+
+    fn sticky_toast(&self) -> ToastState {
+        // ticks are ignored while retry is active; Tick refreshes this toast.
+        ToastState::new(self.toast_message(), ToastKind::Error, ToastState::DEFAULT_TICKS)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelTokenUsage {
     pub used_tokens: u64,
@@ -869,7 +917,7 @@ pub struct TuiState {
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
     pub latest_todo: Option<TodoView>,
-    pub retry: Option<crate::session::RetryLifecycleEvent>,
+    pub retry: Option<RetryNoticeState>,
     pub transcript_view: TranscriptViewState,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
@@ -2546,15 +2594,17 @@ mod tests {
         };
 
         state.apply_event(SessionEvent::RetryScheduled(retry.clone()));
-        assert_eq!(state.retry, Some(retry.clone()));
+        let notice = state.retry.as_ref().expect("retry notice");
+        assert_eq!(notice.attempt, 2);
+        assert_eq!(notice.secs_remaining, 1);
         assert_eq!(state.phase, AppPhase::Running);
-        assert_eq!(
-            state.toast().map(|toast| toast.message.as_str()),
-            Some("Temporary issue. Trying again in 1s (attempt 2 of 3)")
-        );
+        let toast = state.toast().expect("sticky retry toast");
+        assert_eq!(toast.message, "Retrying in 1s · attempt 2 of 3");
+        assert_eq!(toast.kind, ToastKind::Error);
 
         state.apply_event(SessionEvent::RetryStarted(retry));
         assert_eq!(state.retry, None);
+        assert!(state.toast().is_none());
 
         state.apply_event(SessionEvent::RetryScheduled(RetryLifecycleEvent {
             attempt: 3,
@@ -2567,13 +2617,44 @@ mod tests {
     }
 
     #[test]
+    fn retry_toast_counts_down_and_stays_visible_across_ticks() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::RetryScheduled(RetryLifecycleEvent {
+            attempt: 1,
+            max_attempts: 3,
+            delay_secs: 2,
+            error: "temporary upstream failure".into(),
+        }));
+
+        for _ in 0..RetryNoticeState::TICKS_PER_SECOND {
+            state.apply_event(SessionEvent::Tick);
+        }
+        let toast = state.toast().expect("countdown toast remains");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.message, "Retrying in 1s · attempt 1 of 3");
+        assert_eq!(
+            state.retry.as_ref().map(|retry| retry.secs_remaining),
+            Some(1)
+        );
+
+        for _ in 0..RetryNoticeState::TICKS_PER_SECOND {
+            state.apply_event(SessionEvent::Tick);
+        }
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Retrying in 0s · attempt 1 of 3")
+        );
+        assert!(state.retry.is_some());
+    }
+
+    #[test]
     fn retry_projection_clears_when_replacing_session_or_transcript_view() {
-        let retry = RetryLifecycleEvent {
+        let retry = RetryNoticeState::from_lifecycle(RetryLifecycleEvent {
             attempt: 2,
             max_attempts: 3,
             delay_secs: 1,
             error: "temporary upstream failure".into(),
-        };
+        });
         let mut state = TuiState::default();
 
         state.retry = Some(retry.clone());

@@ -48,7 +48,7 @@ pub use render::render;
 #[allow(unused_imports)]
 pub use runtime::{RuntimeCommand, RuntimeDrawer, StartupToast, TuiRuntime, run_tui};
 #[allow(unused_imports)]
-pub use state::{AppPhase, SelectionAnchor, TextSelection, TuiState};
+pub use state::{AppPhase, RetryNoticeState, SelectionAnchor, TextSelection, TuiState};
 #[allow(unused_imports)]
 pub use terminal::{OwnedTerminal, TerminalGuard, TuiTerminal};
 #[allow(unused_imports)]
