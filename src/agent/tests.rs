@@ -2958,11 +2958,11 @@ async fn subagent_tool_execution_normalizes_bounded_input_before_delegation() {
     let fixer_tasks = fixer_tasks.lock().expect("fixer tasks");
     assert_eq!(fixer_tasks.len(), 1);
     let prompt = &fixer_tasks[0];
-    assert!(prompt.contains("Objective: Implement contract"));
-    assert!(prompt.contains("Success criteria:"));
-    assert!(prompt.contains("Allowed paths: src/agent.rs"));
-    assert!(prompt.contains("Owned paths: src/tool.rs"));
-    assert!(prompt.contains("Execution bounds: timeout_secs=30, max_tool_calls=5"));
+    assert!(prompt.contains("目标：Implement contract"));
+    assert!(prompt.contains("成功标准："));
+    assert!(prompt.contains("允许路径：src/agent.rs"));
+    assert!(prompt.contains("负责路径：src/tool.rs"));
+    assert!(prompt.contains("执行边界：timeout_secs=30，max_tool_calls=5"));
     assert!(prompt.contains("do not recursively delegate"));
 }
 
@@ -2991,8 +2991,8 @@ async fn subagent_tool_execution_supports_legacy_task_only_input() {
     assert!(output.ok);
     let explorer_tasks = explorer_tasks.lock().expect("explorer tasks");
     assert_eq!(explorer_tasks.len(), 1);
-    assert!(explorer_tasks[0].contains("Objective: inspect src/subagent.rs"));
-    assert!(explorer_tasks[0].contains("Mode: read-only exploration only."));
+    assert!(explorer_tasks[0].contains("目标：inspect src/subagent.rs"));
+    assert!(explorer_tasks[0].contains("模式：仅只读探索。"));
 }
 
 #[tokio::test]
@@ -3018,7 +3018,7 @@ async fn readonly_expert_subagent_tool_execution_routes_through_generic_delegate
     assert!(fixer_tasks.lock().expect("fixer tasks").is_empty());
     let readonly_tasks = explorer_tasks.lock().expect("readonly tasks");
     assert_eq!(readonly_tasks.len(), 1);
-    assert!(readonly_tasks[0].contains("Objective: analyze failure mode"));
+    assert!(readonly_tasks[0].contains("目标：analyze failure mode"));
 }
 
 #[tokio::test]
@@ -3316,12 +3316,12 @@ async fn delegated_structured_subagent_results_surface_in_next_turn_prelude() {
 
     let prelude = agent.prepare_turn_prelude("Reconcile child work");
     assert!(prelude.iter().any(|message| {
-        message.text.contains("Pending child subagent results")
+        message.text.contains("来自更早回合的待处理子代理结果")
             && message.text.contains("run-structured-1")
             && message.text.contains("implemented bounded fix")
             && message.text.contains("child-structured-1")
             && message.text.contains("child_session_id=child-structured-1")
-            && message.text.contains("child transcript navigation")
+            && message.text.contains("仅用于子会话 transcript 导航")
     }));
 }
 
@@ -7516,19 +7516,19 @@ fn engineering_turn_prelude_adds_workflow_context_and_validation_reminder() {
         runtime_message.role,
         crate::request_builder::PromptRole::Developer
     );
-    assert!(runtime_message.text.contains("Runtime context"));
-    assert!(runtime_message.text.contains("Current date:"));
-    assert!(runtime_message.text.contains("Timezone:"));
-    assert!(!runtime_message.text.contains("Current time:"));
+    assert!(runtime_message.text.contains("运行时上下文"));
+    assert!(runtime_message.text.contains("当前日期："));
+    assert!(runtime_message.text.contains("时区："));
+    assert!(!runtime_message.text.contains("当前时间："));
     let workflow_message = &turn_prelude[turn_prelude.len() - 1];
     assert_eq!(
         workflow_message.role,
         crate::request_builder::PromptRole::Developer
     );
-    assert!(workflow_message.text.contains("engineering workflow task"));
-    assert!(workflow_message.text.contains("Delegate bounded work"));
-    assert!(workflow_message.text.contains("context hygiene"));
-    assert!(workflow_message.text.contains("targeted validation"));
+    assert!(workflow_message.text.contains("工程工作流任务"));
+    assert!(workflow_message.text.contains("委派有界工作"));
+    assert!(workflow_message.text.contains("上下文卫生"));
+    assert!(workflow_message.text.contains("针对性验证"));
 }
 
 #[test]
@@ -7558,7 +7558,7 @@ fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
     let prelude = agent.prepare_turn_prelude("Summarize the change.");
     let instructions = prelude
         .iter()
-        .filter(|message| message.text.starts_with("Instructions from "))
+        .filter(|message| message.text.starts_with("来自 "))
         .collect::<Vec<_>>();
     assert_eq!(instructions.len(), 3);
     assert!(
@@ -7567,7 +7567,7 @@ fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
             .all(|message| message.role == crate::request_builder::PromptRole::Developer)
     );
     assert!(instructions[0].text.contains(&format!(
-        "Instructions from {}",
+        "来自 {} 的指令：",
         workspace_root.join("AGENTS.md").display()
     )));
     assert!(instructions[0].text.ends_with("root instructions"));
@@ -7600,7 +7600,7 @@ fn config_agents_file_loads_before_workspace_instructions_without_duplicates() {
     let instructions = agent
         .prelude
         .iter()
-        .filter(|message| message.text.starts_with("Instructions from "))
+        .filter(|message| message.text.starts_with("来自 "))
         .collect::<Vec<_>>();
     assert_eq!(instructions.len(), 2);
     assert!(instructions[0].text.ends_with("global instructions"));
@@ -7647,10 +7647,10 @@ fn lightweight_turn_prelude_adds_only_runtime_context() {
         runtime_message.role,
         crate::request_builder::PromptRole::Developer
     );
-    assert!(runtime_message.text.contains("Runtime context"));
-    assert!(runtime_message.text.contains("Current date:"));
-    assert!(runtime_message.text.contains("Timezone:"));
-    assert!(!runtime_message.text.contains("Current time:"));
+    assert!(runtime_message.text.contains("运行时上下文"));
+    assert!(runtime_message.text.contains("当前日期："));
+    assert!(runtime_message.text.contains("时区："));
+    assert!(!runtime_message.text.contains("当前时间："));
 }
 
 #[test]
@@ -7810,20 +7810,20 @@ fn turn_prelude_injects_skill_cards_without_skill_body() {
     let turn_prelude = agent.prepare_turn_prelude("Summarize the available tools.");
     let skill_message = turn_prelude
         .iter()
-        .find(|message| message.text.contains("Available local skills:"))
+        .find(|message| message.text.contains("可用的本地 skills："))
         .expect("skill prelude message present");
 
     assert!(
         skill_message
             .text
-            .contains("Load relevant skills with the `skill` tool when needed.")
+            .contains("需要时用 `skill` 工具加载相关 skills。")
     );
     assert!(
         skill_message
             .text
             .contains("rust-audit — Inspect Rust code")
     );
-    assert!(skill_message.text.contains("source: .letcode/skills"));
+    assert!(skill_message.text.contains("来源：.letcode/skills"));
     assert!(
         !skill_message
             .text
@@ -7833,7 +7833,7 @@ fn turn_prelude_injects_skill_cards_without_skill_body() {
     assert!(
         skill_message
             .text
-            .contains("Skills do not change permissions or expand tool scope.")
+            .contains("Skills 不会改变权限或扩大工具范围。")
     );
 }
 
@@ -7870,7 +7870,7 @@ fn empty_skill_registry_does_not_register_skill_tool_or_prelude() {
     assert!(
         !turn_prelude
             .iter()
-            .any(|message| message.text.contains("Available local skills:"))
+            .any(|message| message.text.contains("可用的本地 skills："))
     );
 }
 
@@ -7879,10 +7879,10 @@ fn runtime_context_message_contains_date_and_timezone_only() {
     let message = runtime_context_message_from_parts("2026-06-18", "Asia/Shanghai");
 
     assert_eq!(message.role, crate::request_builder::PromptRole::Developer);
-    assert!(message.text.contains("Runtime context:"));
-    assert!(message.text.contains("Current date: 2026-06-18"));
-    assert!(message.text.contains("Timezone: Asia/Shanghai"));
-    assert!(!message.text.contains("Current time:"));
+    assert!(message.text.contains("运行时上下文："));
+    assert!(message.text.contains("当前日期：2026-06-18"));
+    assert!(message.text.contains("时区：Asia/Shanghai"));
+    assert!(!message.text.contains("当前时间："));
     assert!(!message.text.contains("09:43"));
 }
 
@@ -8152,7 +8152,7 @@ fn pending_validation_advisory_only_emits_for_write_without_validation() {
     assert_eq!(advisory.write_effects, 1);
     assert_eq!(advisory.validation_effects, 0);
     assert_eq!(advisory.failed_validation_effects, 0);
-    assert!(advisory.message.contains("without running validation"));
+    assert!(advisory.message.contains("但未运行验证"));
 
     agent.turn.counters.failed_validation_effects = 1;
     let advisory = agent
@@ -8161,7 +8161,7 @@ fn pending_validation_advisory_only_emits_for_write_without_validation() {
     assert_eq!(advisory.write_effects, 1);
     assert_eq!(advisory.validation_effects, 0);
     assert_eq!(advisory.failed_validation_effects, 1);
-    assert!(advisory.message.contains("validation ran but failed"));
+    assert!(advisory.message.contains("验证已运行但失败"));
 
     agent.turn.counters.validation_effects = 1;
     let advisory = agent
@@ -8169,7 +8169,7 @@ fn pending_validation_advisory_only_emits_for_write_without_validation() {
         .expect("failed validation should continue to emit advisory");
     assert_eq!(advisory.validation_effects, 1);
     assert_eq!(advisory.failed_validation_effects, 1);
-    assert!(advisory.message.contains("validation ran but failed"));
+    assert!(advisory.message.contains("验证已运行但失败"));
 }
 
 #[test]
@@ -8181,7 +8181,7 @@ fn pending_validation_advisory_includes_child_write_and_validation_failures() {
         .expect("child writes without validation should emit advisory");
     assert_eq!(advisory.write_effects, 2);
     assert_eq!(advisory.validation_effects, 0);
-    assert!(advisory.message.contains("delegated child work"));
+    assert!(advisory.message.contains("含委派的子工作"));
 
     agent.turn.counters.child_validation_effects = 1;
     agent.turn.counters.child_failed_validation_effects = 1;
@@ -8189,7 +8189,7 @@ fn pending_validation_advisory_includes_child_write_and_validation_failures() {
         .pending_validation_advisory()
         .expect("child validation failures should emit advisory");
     assert_eq!(advisory.failed_validation_effects, 1);
-    assert!(advisory.message.contains("validation failed"));
+    assert!(advisory.message.contains("至少有一项验证失败"));
 }
 
 #[test]
@@ -8241,12 +8241,12 @@ fn prepare_turn_prelude_includes_unreconciled_subagent_results() {
 
     let prelude = agent.prepare_turn_prelude("Implement next step");
     assert!(prelude.iter().any(|message| {
-        message.text.contains("Pending child subagent results")
+        message.text.contains("来自更早回合的待处理子代理结果")
             && message.text.contains("agent__reconcile")
             && message.text.contains("run-1")
             && message.text.contains("child completed")
             && message.text.contains("child_session_id=child-1")
-            && message.text.contains("child transcript navigation")
+            && message.text.contains("仅用于子会话 transcript 导航")
     }));
 }
 
@@ -8343,33 +8343,32 @@ fn pending_subagent_jobs_clear_after_live_reconciliation_evidence() {
 
 #[test]
 fn default_prelude_and_engineering_guidance_frame_non_trivial_work_as_orchestration() {
-    assert!(DEFAULT_AGENT_PRELUDE.contains("workflow manager first"));
-    assert!(
-        DEFAULT_AGENT_PRELUDE
-            .contains("Direct execution is for trivial, single-file, clearly bounded work")
-    );
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("specialist lane is needed"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer for broad or unknown code search"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("prefer completed or reconciled sessions"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Never reuse cancelled or errored sessions"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("one active run per specialist role"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Delegates do not queue on a busy role"));
+    assert!(DEFAULT_AGENT_PRELUDE.contains("先像工作流管理者一样行动"));
+    assert!(DEFAULT_AGENT_PRELUDE.contains(
+        "直接执行适用于琐碎、单文件、边界清晰的工作"
+    ));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("先判断是否需要专家通道"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer 用于广泛或未知代码搜索"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("优先使用会话历史或任务板中已完成或已调和的会话"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("绝不要把已取消或出错的会话当作权威结果复用"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("每个专家角色同时只允许一个活跃运行"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("委派不会在忙碌角色上排队"));
     let mut agent = test_agent();
     let prelude = agent.prepare_turn_prelude("Implement a non-trivial feature with validation");
     assert!(
         prelude
             .iter()
-            .any(|message| message.text.contains("workflow manager first"))
+            .any(|message| message.text.contains("先像工作流管理者一样行动"))
     );
     assert!(
         prelude
             .iter()
-            .any(|message| message.text.contains("specialist lane is needed"))
+            .any(|message| message.text.contains("先判断是否需要专家通道"))
     );
     assert!(prelude.iter().any(|message| {
         message
             .text
-            .contains("explorer for broad or unknown code search")
+            .contains("explorer 用于广泛或未知代码搜索")
     }));
 }
 

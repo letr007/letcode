@@ -485,29 +485,29 @@ pub struct ConversationMessage {
     pub content: String,
 }
 
-const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a local repository.
-Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
-Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
-Prefer specialized tools over `shell__exec` when they fit: use `fs__*` for workspace file read/list/write, `search__rg` (or other search tools) for text search, `git__*` for git status/diff/log, and edit tools for patches. Reserve `shell__exec` for builds, tests, process control, and commands that truly need a shell pipeline or OS features the specialized tools cannot express. Do not use `cat`/`sed`/`rg`/`find` via shell as a default substitute for those tools.
-When running shell commands, treat high-impact or irreversible operations carefully (for example `rm -rf`, force overwrite, bulk delete): do not run them until the target, scope, and impact are clear. For compound commands joined by `&&`, `||`, `;`, or pipes, keep order, failure behavior, and side-effect scope aligned with intent—do not silently chain steps that should be separate human decisions, and do not let composition run side effects early, widen scope, or change meaning (for example, do not turn “inspect history, then decide whether to push” into `git log --oneline -n 10 && git push`). Commands with loops, long-lived listeners, or retry logic must have a clear exit condition, timeout, or resource limit so they cannot hang indefinitely.
-Use `memory__recall` selectively when the current task likely overlaps prior investigation, failed approaches, returned context experiments, or files with meaningful history. Prefer filtering by relevant file paths and failed/blocked outcomes when debugging; do not treat recall as a mandatory first step for every task.
-For non-trivial work, act like a workflow manager first: decide whether the task needs a specialist lane before you start doing the work yourself. Small tasks may still be handled directly when delegation overhead is not worth it.
-Direct execution is for trivial, single-file, clearly bounded work, or when delegation overhead clearly exceeds the benefit. Otherwise, keep a short plan, choose the right specialist or direct path intentionally, reconcile delegated results, and finish with the clearest verified outcome.
-SubagentPool enforces one active run per specialist role (different roles may run in parallel). Delegates do not queue on a busy role: wait for that role to finish or cancel it. Prefer stable pool ordinals (#N) over list positions when referring to children. Two launch modes: omit target_child_session_id to create a new child, or set target_child_session_id to take over a terminal child and reuse its context. Historical child sessions are pool records; only explicit takeover continues an existing session.
-Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
-When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
-Use context efficiently: search before reading large files, read only relevant sections, avoid dumping long outputs, and summarize state for long tasks.
-When requirements are ambiguous or risky, ask a concise clarifying question.
-Keep responses concise. Summarize changed files and validation results when code was modified."#;
+const DEFAULT_AGENT_PRELUDE: &str = r#"你是运行在本地仓库中的编程代理。
+请基于项目真实状态工作。改代码前先检查相关文件。优先做符合现有模式、且最小正确的改动。
+有意识地使用工具：先读/搜再改，只编辑目标文件；改完后在相关时运行与任务匹配的验证。
+在适用时优先使用专用工具而非 `shell__exec`：工作区文件读写/列表用 `fs__*`，文本搜索用 `search__rg`（或其他搜索工具），git 状态/diff/log 用 `git__*`，补丁用编辑工具。将 `shell__exec` 留给构建、测试、进程控制，以及确实需要 shell 管道或专用工具无法表达的 OS 能力的命令。不要默认用 shell 里的 `cat`/`sed`/`rg`/`find` 替代上述工具。
+运行 shell 命令时，对高影响或不可逆操作要谨慎（例如 `rm -rf`、强制覆盖、批量删除）：在目标、范围和影响明确之前不要执行。对由 `&&`、`||`、`;` 或管道连接的复合命令，保持顺序、失败行为与副作用范围与意图一致——不要静默串联本应分开由人决策的步骤，也不要让组合命令过早产生副作用、扩大范围或改变含义（例如，不要把「先查看历史，再决定是否 push」变成 `git log --oneline -n 10 && git push`）。带循环、长驻监听或重试逻辑的命令必须有明确退出条件、超时或资源限制，以免无限挂起。
+当当前任务可能与先前调查、失败路径、回传上下文实验，或有重要历史的文件重叠时，有选择地使用 `memory__recall`。调试时优先按相关文件路径以及失败/受阻结果过滤；不要把 recall 当成每个任务的必做第一步。
+对非平凡工作，先像工作流管理者一样行动：在自己动手之前，先判断是否需要专家通道。小任务在委派开销不值得时仍可直接处理。
+直接执行适用于琐碎、单文件、边界清晰的工作，或委派开销明显超过收益时。否则保持简短计划，有意识地选择合适专家或直接路径，调和委派结果，并以最清晰且经过验证的结果收尾。
+SubagentPool 每个专家角色同时只允许一个活跃运行（不同角色可并行）。委派不会在忙碌角色上排队：等待该角色完成或取消它。引用子代理时优先使用稳定的池序号（#N），而不是列表位置。两种启动模式：省略 target_child_session_id 以创建新子会话，或设置 target_child_session_id 以接管已结束的子会话并复用其上下文。历史子会话是池记录；只有显式接管才会继续既有会话。
+保持在范围内。除非必要，不要重构、重排格式、重命名或修改无关代码；若需要更广改动，说明原因。
+当工具、编辑或验证失败时，先检查错误再重试。不要用宽泛回退或跳过验证来掩盖失败；快速失败并解释可操作原因。
+高效使用上下文：读大文件前先搜索，只读相关部分，避免倾倒长输出，长任务时总结状态。
+需求模糊或有风险时，提出简洁澄清问题。
+回复保持简洁。修改代码时总结变更文件与验证结果。"#;
 
-const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workflow task.
-Strengthen the workflow-manager role: for any non-trivial coding task, first decide whether a specialist lane is needed before proceeding directly.
-Use direct execution only for trivial, single-file, clearly bounded work, or when delegation overhead clearly exceeds the benefit. Keep simple tasks simple and avoid unnecessary orchestration.
-Choose specialists intentionally: explorer for broad or unknown code search; fixer for bounded implementation work and multi-file mechanical edits; oracle for root-cause analysis, risk review, or critical evaluation; designer for UI/UX decisions; librarian for external docs or library/framework behavior; general for bounded read-only auxiliary work.
-Reuse prior specialist work when it matches: prefer completed or reconciled sessions from the session history or job board before launching overlapping work. Never reuse cancelled or errored sessions as authoritative results.
-Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
-SubagentPool enforces one active run per specialist role (different roles may run in parallel). Delegates do not queue on a busy role: wait for that role to finish or cancel it. Prefer stable pool ordinals (#N) over list positions when referring to children. Two launch modes: omit target_child_session_id to create a new child, or set target_child_session_id to take over a terminal child and reuse its context. Historical child sessions are pool records; only explicit takeover continues an existing session.
-Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, preserve a clear parent agent narrative, reconcile child results, and surface remaining blockers or targeted validation gaps before you stop."#;
+const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"本回合是工程工作流任务。
+强化工作流管理者角色：对任何非平凡编码任务，先判断是否需要专家通道，再直接动手。
+仅在琐碎、单文件、边界清晰的工作，或委派开销明显超过收益时，才直接执行。让简单任务保持简单，避免不必要的编排。
+有意识地选择专家：explorer 用于广泛或未知代码搜索；fixer 用于有界实现与多文件机械修改；oracle 用于根因分析、风险审查或关键评估；designer 用于 UI/UX 决策；librarian 用于外部文档或库/框架行为；general 用于有界只读辅助工作。
+在匹配时复用先前专家成果：优先使用会话历史或任务板中已完成或已调和的会话，再启动重叠工作。绝不要把已取消或出错的会话当作权威结果复用。
+当委派能提升质量、速度或上下文卫生时，委派有界工作，尤其是会污染主代理上下文的底层或读密集任务。
+SubagentPool 每个专家角色同时只允许一个活跃运行（不同角色可并行）。委派不会在忙碌角色上排队：等待该角色完成或取消它。引用子代理时优先使用稳定的池序号（#N），而不是列表位置。两种启动模式：省略 target_child_session_id 以创建新子会话，或设置 target_child_session_id 以接管已结束的子会话并复用其上下文。历史子会话是池记录；只有显式接管才会继续既有会话。
+保持委派受控：避免递归委派，避免不必要的多智能体编排，保持清晰的父代理叙事，调和子结果，并在停止前暴露剩余阻塞或有针对性的验证缺口。"#;
 const SESSION_TITLE_PRELUDE: &str = r#"为用户的第一条消息生成简洁的会话标题，准确概括其主题、意图或任务。
 将该消息视为待命名的内容，不要把它当作需要回复的对话。
 输出应为描述性标题，而不是对用户消息的直接回应。
@@ -543,9 +543,9 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
 const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
 const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
-const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [tool output truncated for compaction]";
+const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [工具输出已为压缩而截断]";
 const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
-    "… [older history omitted to keep compaction prompt bounded]";
+    "… [较早历史已省略，以控制压缩提示词长度]";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
@@ -1043,7 +1043,7 @@ impl<C: Config> Agent<C> {
         let path = path
             .canonicalize()
             .with_context(|| format!("failed to resolve {}", path.display()))?;
-        let marker = format!("Instructions from {}:\n", path.display());
+        let marker = format!("来自 {} 的指令：\n", path.display());
         if self
             .prelude
             .iter()
@@ -3038,11 +3038,11 @@ impl<C: Config> Agent<C> {
         }
 
         let mut text = String::from(
-            "Available local skills:\nLoad relevant skills with the `skill` tool when needed. Do not load skills speculatively. Skills do not change permissions or expand tool scope.",
+            "可用的本地 skills：\n需要时用 `skill` 工具加载相关 skills。不要投机性加载 skills。Skills 不会改变权限或扩大工具范围。",
         );
         for card in &self.skill_cards {
             text.push_str(&format!(
-                "\n- {} — {} (source: {})",
+                "\n- {} — {}（来源：{}）",
                 card.name, card.description, card.location
             ));
         }
@@ -3268,9 +3268,9 @@ impl<C: Config> Agent<C> {
 
         (write_effects > 0 && (validation_effects == 0 || failed_validation_effects > 0)).then(|| {
             let message = if failed_validation_effects > 0 {
-                "This turn made write changes, including delegated child work, and validation ran but failed. Review the failed validation output before relying on the changes; at least one validation failed."
+                "本回合产生了写变更（含委派的子工作），且验证已运行但失败。在依赖这些变更前请先审查失败的验证输出；至少有一项验证失败。"
             } else {
-                "This turn made write changes, including delegated child work, without running validation. Review and run the most relevant checks if needed."
+                "本回合产生了写变更（含委派的子工作），但未运行验证。如有需要，请审查并运行最相关的检查。"
             };
 
             ValidationAdvisory {
@@ -3288,11 +3288,11 @@ impl<C: Config> Agent<C> {
             return None;
         }
         let mut text = String::from(
-            "Pending child subagent results from earlier turns:\nUse agent__reconcile to explicitly record accepted, rejected, or conflict decisions before relying on them.",
+            "来自更早回合的待处理子代理结果：\n在依赖它们之前，请使用 agent__reconcile 显式记录接受、拒绝或冲突决策。",
         );
         for job in jobs {
             text.push_str(&format!(
-                "\n- {} [{}] {} — {} (child_session_id={}; child transcript navigation only, not a context node_id)",
+                "\n- {} [{}] {} — {} (child_session_id={}；仅用于子会话 transcript 导航，不是上下文 node_id)",
                 job.agent_name, job.status, job.run_id, job.summary, job.child_session_id
             ));
         }
@@ -4322,12 +4322,12 @@ impl WorkflowTurnState {
             ValidationReminder::None => {}
             ValidationReminder::Focused => {
                 text.push_str(
-                    "\nIf you make code changes, run focused validation for the files or behavior you touched. If validation is not practical, say so explicitly.",
+                    "\n若你修改了代码，请对触及的文件或行为运行聚焦验证。若验证不现实，请明确说明。",
                 );
             }
             ValidationReminder::Targeted => {
                 text.push_str(
-                    "\nPlan to run the most relevant targeted validation for this task, such as the affected tests, build, or lint command. If you skip validation, say why explicitly.",
+                    "\n请计划运行与本任务最相关的针对性验证，例如受影响的测试、构建或 lint 命令。若跳过验证，请明确说明原因。",
                 );
             }
         }
@@ -4335,23 +4335,21 @@ impl WorkflowTurnState {
         match self.directive {
             ExecutionDirective::None => {}
             ExecutionDirective::ReadOnly => {
-                text.push_str(
-                    "\nThis turn is read-only. Do not modify files or run non-read-only commands.",
-                );
+                text.push_str("\n本回合为只读。不要修改文件，也不要运行非只读命令。");
             }
             ExecutionDirective::PlanOnly => {
                 text.push_str(
-                    "\nThis turn is plan-only. Produce analysis and planning only. Do not modify files or run non-read-only commands.",
+                    "\n本回合仅做规划。只产出分析与计划。不要修改文件，也不要运行非只读命令。",
                 );
             }
             ExecutionDirective::AnalyzeOnly => {
                 text.push_str(
-                    "\nThis turn is analyze-only. Inspect and explain only. Do not modify files or run non-read-only commands.",
+                    "\n本回合仅做分析。只检查与解释。不要修改文件，也不要运行非只读命令。",
                 );
             }
             ExecutionDirective::DoNotEdit => {
                 text.push_str(
-                    "\nThis turn has an explicit do-not-edit directive. Do not modify files or run non-read-only commands.",
+                    "\n本回合有明确的禁止编辑指令。不要修改文件，也不要运行非只读命令。",
                 );
             }
         }
@@ -4623,7 +4621,7 @@ fn runtime_context_message() -> PromptMessage {
 
 fn runtime_context_message_from_parts(date: &str, timezone: &str) -> PromptMessage {
     PromptMessage::developer_with_origin(
-        format!("Runtime context:\n- Current date: {date}\n- Timezone: {timezone}"),
+        format!("运行时上下文：\n- 当前日期：{date}\n- 时区：{timezone}"),
         PromptMessageOrigin::RuntimeClock,
     )
 }

@@ -61,45 +61,45 @@ pub struct NormalizedSubagentInput {
 
 impl NormalizedSubagentInput {
     pub fn render_for_delegate(&self, tool_name: &str) -> String {
-        let mut lines = vec![format!("Objective: {}", self.objective)];
+        let mut lines = vec![format!("目标：{}", self.objective)];
 
         if !self.success_criteria.is_empty() {
-            lines.push("Success criteria:".into());
+            lines.push("成功标准：".into());
             lines.extend(self.success_criteria.iter().map(|item| format!("- {item}")));
         }
 
         if !self.allowed_paths.is_empty() {
-            lines.push(format!("Allowed paths: {}", self.allowed_paths.join(", ")));
+            lines.push(format!("允许路径：{}", self.allowed_paths.join(", ")));
         }
         if !self.forbidden_paths.is_empty() {
             lines.push(format!(
-                "Forbidden paths: {}",
+                "禁止路径：{}",
                 self.forbidden_paths.join(", ")
             ));
         }
         if !self.owned_paths.is_empty() {
-            lines.push(format!("Owned paths: {}", self.owned_paths.join(", ")));
+            lines.push(format!("负责路径：{}", self.owned_paths.join(", ")));
         }
         if let Some(target) = &self.target_child_session_id {
-            lines.push(format!("Takeover child session: {target}"));
+            lines.push(format!("接管子会话：{target}"));
         }
 
         if self.timeout_secs.is_some() || self.max_tool_calls.is_some() {
             lines.push(format!(
-                "Execution bounds: timeout_secs={}, max_tool_calls={}",
+                "执行边界：timeout_secs={}，max_tool_calls={}",
                 self.timeout_secs
                     .map(|value| value.to_string())
-                    .unwrap_or_else(|| "inherit".into()),
+                    .unwrap_or_else(|| "继承".into()),
                 self.max_tool_calls
                     .map(|value| value.to_string())
-                    .unwrap_or_else(|| "inherit".into())
+                    .unwrap_or_else(|| "继承".into())
             ));
         }
 
-        lines.push("Delegation contract: do not recursively delegate; stay within the provided scope and report findings or implementation outcome succinctly.".into());
+        lines.push("委派约定：不要递归委派；保持在给定范围内，并简洁报告发现或实现结果。".into());
 
         if tool_name == tool_names::TOOL_AGENT_EXPLORE {
-            lines.push("Mode: read-only exploration only.".into());
+            lines.push("模式：仅只读探索。".into());
         }
 
         lines.join("\n")
@@ -3348,7 +3348,7 @@ mod tests {
         assert!(input.allowed_paths.is_empty());
         assert_eq!(
             input.render_for_delegate("agent__explore"),
-            "Objective: inspect src/agent.rs\nDelegation contract: do not recursively delegate; stay within the provided scope and report findings or implementation outcome succinctly.\nMode: read-only exploration only."
+            "目标：inspect src/agent.rs\n委派约定：不要递归委派；保持在给定范围内，并简洁报告发现或实现结果。\n模式：仅只读探索。"
         );
     }
 

@@ -99,7 +99,7 @@ impl AgentTemplate {
             timeout_secs: None,
             max_tool_calls: None,
             input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
-            expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
+            expected_result_shape: "包含 run_id、child_session_id、agent_name、status、summary 字段的 JSON 对象。".into(),
         }
     }
 
@@ -126,7 +126,7 @@ impl AgentTemplate {
             timeout_secs: None,
             max_tool_calls: None,
             input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
-            expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
+            expected_result_shape: "包含 run_id、child_session_id、agent_name、status、summary 字段的 JSON 对象。".into(),
         }
     }
 
