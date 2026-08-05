@@ -1,8 +1,18 @@
-# letcode
+<h1 align="center">
+  LetCode
+</h1>
 
-中文 | [English](README.md)
+<p align="center">
+  letcode 是一个由 Rust 编写的终端 Agent。
+</p>
 
-`letcode` 是一个由 Rust 编写的终端 Agent。
+<p align="center">
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue?style=flat-square" alt="MIT License | Apache-2.0 License"></a>
+</p>
+
+<p align="center">
+  中文 | <a href="README.md">English</a>
+</p>
 
 ![letcode TUI](docs/letcode.png)
 
