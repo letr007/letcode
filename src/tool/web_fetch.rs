@@ -521,7 +521,6 @@ mod tests {
         std::fs::remove_file(&path).expect("clean up artifact");
     }
 
-
     #[test]
     fn content_type_filter_accepts_text_json_and_xml_only() {
         for content_type in [

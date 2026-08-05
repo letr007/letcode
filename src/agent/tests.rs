@@ -2182,7 +2182,6 @@ async fn agent_lifecycle_finalizes_without_live_experiment_semantics() {
     );
 }
 
-
 #[test]
 fn evidence_ids_remain_unique_after_restoring_older_evidence_snapshot() {
     let mut agent = test_agent();

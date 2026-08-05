@@ -2048,7 +2048,6 @@ mod tests {
         assert!(summary.summary.contains("src/outside.rs"));
     }
 
-
     #[tokio::test]
     async fn takeover_restores_full_runtime_snapshot_before_appending_prompt() {
         let runtime = SubagentPool::new();
@@ -2661,7 +2660,6 @@ mod tests {
             other => panic!("unexpected child event: {other:?}"),
         }
     }
-
 
     #[tokio::test]
     async fn completed_subagent_does_not_emit_status_notices() {
