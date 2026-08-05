@@ -16,14 +16,14 @@
 //! additionally carries [`SessionTransportEvent`] for session-local interaction
 //! handles and raw restore projections that do not belong in `SessionEvent`.
 //!
+//! Turn execution is shared: every frontend goes through
+//! [`SessionEngine`] → [`AgentRunner`]. Frontends only submit [`SessionCommand`]
+//! and present [`SessionTransportEvent`]s.
+//!
 //! ```text
-//!   TUI / CLI / GUI
-//!        │ SessionCommand
-//!        ▼
-//!   session (engine boundary)
-//!        │ agent / tools / transcript / subagent pool
-//!        ▼
-//!   model providers + local workspace
+//!   TUI ──┐
+//!         ├──SessionCommand──► SessionEngine ──► AgentRunner ─► agent/tools/transcript
+//!   CLI ──┘
 //! ```
 
 pub mod child_view;
