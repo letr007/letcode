@@ -1,15 +1,15 @@
-# 更新日志
+# Changelog
 
 本文件记录项目的重要变更。
 
-格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
-版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
+版本号遵循 [Semantic Versioning](https://semver.org/)。
 
 ## [0.1.0] - 2026-08-05
 
 首个公开版本。
 
-### 新增
+### Added
 
 - Rust 终端 Agent：Ratatui TUI 与行命令式 CLI/REPL，共用同一会话引擎
 - 多 Provider 配置（API Key / Base URL / 协议），模型展示名、工具调用、并行工具请求、推理等级与文本详细度
