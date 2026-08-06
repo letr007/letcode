@@ -648,13 +648,7 @@ fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseE
 }
 
 fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "safe" => Some(PermissionMode::Safe),
-        "default" => Some(PermissionMode::Default),
-        "auto" => Some(PermissionMode::Auto),
-        "yolo" | "solo" => Some(PermissionMode::Yolo),
-        _ => None,
-    }
+    PermissionMode::parse(value)
 }
 
 pub fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {

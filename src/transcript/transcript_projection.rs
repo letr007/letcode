@@ -61,8 +61,8 @@ use branch::{
 mod history;
 
 pub(crate) use history::{
-    restore_latest_model_projection, restore_max_turn_id_projection,
-    restore_session_history_projection,
+    restore_latest_model_projection, restore_latest_permission_mode_projection,
+    restore_max_turn_id_projection, restore_session_history_projection,
 };
 
 use history::{
@@ -130,6 +130,7 @@ pub(crate) struct RuntimeRestoreSnapshot {
     pub protocol_frames: Vec<ProtocolFrame>,
     pub snapshot: RuntimeSnapshot,
     pub latest_model: Option<String>,
+    pub latest_permission_mode: Option<String>,
     pub max_turn_id: u64,
 }
 
@@ -290,6 +291,7 @@ pub(crate) fn project_runtime_restore_snapshot(
         &runtime_projection_records(&records, &resolved),
     )?;
     let latest_model = restore_latest_model_projection(&resolved.records);
+    let latest_permission_mode = restore_latest_permission_mode_projection(&resolved.records);
     // Keep allocation global to this session while all active state below stays
     // scoped to the resolved branch and leaf.
     let max_turn_id = restore_max_turn_id_projection(&records);
@@ -313,6 +315,7 @@ pub(crate) fn project_runtime_restore_snapshot(
         protocol_frames,
         snapshot,
         latest_model,
+        latest_permission_mode,
         max_turn_id,
     })
 }

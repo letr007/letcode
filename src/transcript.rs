@@ -2365,6 +2365,10 @@ pub fn restore_latest_model(records: &[TranscriptRecord]) -> Option<String> {
     transcript_projection::restore_latest_model_projection(records)
 }
 
+pub fn restore_latest_permission_mode(records: &[TranscriptRecord]) -> Option<String> {
+    transcript_projection::restore_latest_permission_mode_projection(records)
+}
+
 #[cfg(test)]
 pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
     restore_evidence_records(records)

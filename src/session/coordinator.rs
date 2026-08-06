@@ -18,7 +18,7 @@ use crate::session::child_view::{
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
 use crate::session::restore::{
-    apply_prepared_restored_route, prepare_restored_model_route,
+    apply_prepared_restored_route, apply_restored_permission_mode, prepare_restored_model_route,
     restored_messages_from_protocol_frames,
 };
 use crate::session::runner::SessionTransportEvent;
@@ -498,6 +498,7 @@ impl SessionCoordinator {
                 fast_mode_auto_disabled,
             )) => {
                 apply_prepared_restored_route(agent, route);
+                apply_restored_permission_mode(agent, snapshot.latest_permission_mode.as_deref());
                 agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
                 agent.restore_turn_sequence(snapshot.max_turn_id);
                 if fast_mode_auto_disabled {

@@ -1038,6 +1038,9 @@ impl TuiRuntime {
                     self.apply_restored_model(model_id.clone());
                     self.state.set_provider_label_from_model_route(model_id);
                 }
+                if let Some(mode) = crate::transcript::restore_latest_permission_mode(records) {
+                    self.state.set_permission_mode_label(mode);
+                }
                 self.state.set_current_context_branch(branch_id.clone());
                 if let Some(token_usage) = token_usage {
                     self.state.set_token_usage(token_usage.clone().into());

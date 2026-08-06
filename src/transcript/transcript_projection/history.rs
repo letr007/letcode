@@ -556,6 +556,18 @@ pub(crate) fn restore_latest_model_projection(records: &[TranscriptRecord]) -> O
     model
 }
 
+pub(crate) fn restore_latest_permission_mode_projection(
+    records: &[TranscriptRecord],
+) -> Option<String> {
+    let mut mode = None;
+    for record in records {
+        if let TranscriptEvent::PermissionModeChanged { new_mode, .. } = &record.event {
+            mode = Some(new_mode.clone());
+        }
+    }
+    mode
+}
+
 pub(crate) fn restore_max_turn_id_projection(records: &[TranscriptRecord]) -> u64 {
     records
         .iter()

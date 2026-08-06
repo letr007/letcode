@@ -11,6 +11,7 @@ use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::config::ModelRoute;
+use crate::permission::PermissionMode;
 use crate::session::context_scope::{apply_prepared_context_scope, prepare_context_scope};
 use crate::session::lifecycle::{cleanup_replaced_empty_session, replace_live_transcript};
 use crate::transcript::transcript_projection::{
@@ -134,6 +135,7 @@ pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
     if let Some(model) = prepared.snapshot.latest_model.as_deref() {
         agent.set_model(model);
     }
+    apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     apply_prepared_context_scope(agent, prepared_scope);
     Ok(())
@@ -224,6 +226,15 @@ pub(crate) fn apply_prepared_restored_route<C: Config>(
     }
 }
 
+pub(crate) fn apply_restored_permission_mode<C: Config>(
+    agent: &mut Agent<C>,
+    mode: Option<&str>,
+) {
+    if let Some(mode) = mode.and_then(PermissionMode::parse) {
+        agent.set_permission_mode(mode);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn apply_restored_model_route(
     agent: &mut Agent<async_openai::config::OpenAIConfig>,
@@ -291,6 +302,7 @@ pub fn install_prepared_routed_resume_for_agent(
     let old_path = replace_live_transcript(live, prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
     apply_prepared_restored_route(agent, route);
+    apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
     agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
     agent.restore_turn_sequence(prepared.snapshot.max_turn_id);
     apply_prepared_context_scope(agent, prepared_scope);

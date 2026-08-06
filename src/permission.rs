@@ -27,6 +27,16 @@ impl PermissionMode {
         }
     }
 
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "safe" => Some(Self::Safe),
+            "default" => Some(Self::Default),
+            "auto" => Some(Self::Auto),
+            "yolo" | "solo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
     /// Modes that share Default's Ask matrix and session-local AllowAlways grants.
     pub fn uses_default_ask_matrix(self) -> bool {
         matches!(self, Self::Default | Self::Auto)
