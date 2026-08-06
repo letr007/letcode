@@ -22,6 +22,9 @@ const MAX_SKILL_FILE_DEPTH: usize = 4;
 const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_RESOURCE_BYTES: u64 = MAX_SKILL_MD_BYTES;
 const MAX_SKILL_NAME_CHARS: usize = 64;
+const BUILTIN_SKILL_LOCATION: &str = "<built-in>";
+const CUSTOMIZE_LETCODE_SKILL_CONTENT: &str =
+    include_str!("../skills/customize-letcode/SKILL.md");
 
 /// Extract persisted successful skill material without consulting the registry.
 /// `None` means this was not a successful `skill` result.
@@ -256,7 +259,8 @@ impl SkillRegistry {
     }
 
     fn load_from_roots(roots: Vec<(PathBuf, String)>) -> Result<Self> {
-        let mut entries = Vec::new();
+        // Built-in first so a same-named disk skill can override it.
+        let mut entries = vec![builtin_customize_letcode_skill()];
         for (root, location) in roots {
             entries.extend(discover_skill_entries(&root, &location)?);
         }
@@ -900,6 +904,9 @@ fn push_skill_root(
 }
 
 fn sample_relative_files(base_dir: &Path, limit: usize) -> Result<Vec<String>> {
+    if !base_dir.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut files = Vec::new();
     collect_relative_files(base_dir, base_dir, &mut files, limit, 0)?;
     files.sort();
@@ -907,10 +914,29 @@ fn sample_relative_files(base_dir: &Path, limit: usize) -> Result<Vec<String>> {
 }
 
 fn list_relative_resource_files(base_dir: &Path) -> Result<Vec<String>> {
+    if !base_dir.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut files = Vec::new();
     collect_relative_resource_files(base_dir, base_dir, &mut files)?;
     files.sort();
     Ok(files)
+}
+
+fn builtin_customize_letcode_skill() -> SkillEntry {
+    let parsed = parse_skill_markdown(CUSTOMIZE_LETCODE_SKILL_CONTENT)
+        .expect("built-in customize-letcode skill must parse");
+    debug_assert_eq!(parsed.name, "customize-letcode");
+    let base_dir = PathBuf::from(format!("{BUILTIN_SKILL_LOCATION}/{}", parsed.name));
+    SkillEntry {
+        name: parsed.name,
+        description: parsed.description,
+        body: parsed.body,
+        content: CUSTOMIZE_LETCODE_SKILL_CONTENT.to_string(),
+        location: BUILTIN_SKILL_LOCATION.to_string(),
+        path: base_dir.join(SKILL_FILE_NAME),
+        base_dir,
+    }
 }
 
 fn collect_relative_files(
@@ -1596,17 +1622,62 @@ mod tests {
             load_test_registry(&temp.path().join("config"), temp.path()).expect("registry loads");
         let cards = registry.cards();
 
-        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().any(|card| card.name == "customize-letcode"));
         assert!(cards.iter().any(|card| card.name == "rust-audit"));
         assert!(cards.iter().any(|card| card.location == ".letcode/skills"));
+        assert_eq!(cards.len(), 3);
     }
 
     #[test]
-    fn registry_returns_empty_when_skills_directory_is_missing() {
+    fn registry_includes_builtin_customize_letcode_when_skills_directory_is_missing() {
         let temp = TempDir::new();
         let registry = load_test_registry(&temp.path().join("config"), temp.path())
             .expect("registry loads without skills dir");
-        assert!(registry.is_empty());
+        let cards = registry.cards();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].name, "customize-letcode");
+        assert_eq!(cards[0].location, BUILTIN_SKILL_LOCATION);
+    }
+
+    #[test]
+    fn disk_customize_letcode_overrides_builtin() {
+        let temp = TempDir::new();
+        write_skill(
+            temp.path(),
+            "config/skills",
+            "customize-letcode",
+            "---\nname: customize-letcode\ndescription: Disk override for letcode config help\n---\n# Override\n",
+        );
+
+        let registry =
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry loads");
+        let entry = registry.get("customize-letcode").expect("skill present");
+        assert_eq!(entry.description, "Disk override for letcode config help");
+        assert_eq!(entry.location, "letcode config skills");
+        assert!(entry.content.contains("# Override"));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_loads_builtin_customize_letcode_without_on_disk_dir() {
+        let temp = TempDir::new();
+        let registry = Arc::new(
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
+        );
+        let tool = SkillTool::new(registry);
+        let result = tool
+            .execute(json!({"name": "customize-letcode"}))
+            .await
+            .expect("builtin skill loads");
+
+        assert_eq!(result["name"], json!("customize-letcode"));
+        assert_eq!(result["location"], json!(BUILTIN_SKILL_LOCATION));
+        assert!(
+            result["content"]
+                .as_str()
+                .expect("content str")
+                .contains("# Customizing letcode")
+        );
+        assert_eq!(result["files"], json!([]));
     }
 
     #[test]

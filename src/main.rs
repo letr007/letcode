@@ -65,6 +65,9 @@ use tui::runtime::{AvailableExpert, AvailableModel};
 async fn main() -> Result<()> {
     let options = CliOptions::parse()?;
     dotenvy::dotenv().ok();
+    if let EntryMode::ValidateConfig { path } = options.entry_mode {
+        return run_config_validate(path);
+    }
     let config = AppConfig::load()?;
     let _tracing_guards = init_tracing(&config.global.log_file);
 
@@ -221,6 +224,9 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        EntryMode::ValidateConfig { .. } => {
+            unreachable!("config validate exits before AppConfig::load")
+        }
     }
 
     Ok(())
@@ -282,6 +288,7 @@ fn session_engine_config(
 enum EntryMode {
     Cli { prompt: Option<String>, json: bool },
     Tui,
+    ValidateConfig { path: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +319,23 @@ impl CliOptions {
                 "--tui" | "tui" => {
                     if prompt.is_none() {
                         entry_mode = EntryMode::Tui;
+                    }
+                }
+                "config" => {
+                    let Some(subcommand) = args.next() else {
+                        bail!("config requires a subcommand (validate)");
+                    };
+                    match subcommand.as_ref() {
+                        "validate" => {
+                            let path = args.next().map(|value| value.as_ref().to_string());
+                            if args.next().is_some() {
+                                bail!("config validate accepts at most one path argument");
+                            }
+                            return Ok(Self {
+                                entry_mode: EntryMode::ValidateConfig { path },
+                            });
+                        }
+                        other => bail!("unknown config subcommand: {other}"),
                     }
                 }
                 "--json" => {
@@ -354,6 +378,39 @@ impl CliOptions {
         }
 
         Ok(Self { entry_mode })
+    }
+}
+
+fn run_config_validate(path: Option<String>) -> Result<()> {
+    let path = match path {
+        Some(path) => std::path::PathBuf::from(path),
+        None => config::default_config_path()?,
+    };
+    let report = config::validate_config_file(&path);
+    if report.valid {
+        println!("valid: {}", report.path);
+        if let Some(provider) = &report.active_provider {
+            println!("active_provider: {provider}");
+        }
+        if let Some(route) = &report.active_route {
+            println!("active_route: {route}");
+        }
+        if let Some(mode) = &report.permission_mode {
+            println!("permission_mode: {mode}");
+        }
+        if !report.providers.is_empty() {
+            println!("providers: {}", report.providers.join(", "));
+        }
+        if !report.mcp_servers.is_empty() {
+            println!("mcp: {}", report.mcp_servers.join(", "));
+        }
+        Ok(())
+    } else {
+        eprintln!("invalid: {}", report.path);
+        if let Some(error) = &report.error {
+            eprintln!("{error}");
+        }
+        std::process::exit(1);
     }
 }
 
@@ -770,6 +827,30 @@ mod tests {
             CliOptions {
                 entry_mode: EntryMode::Tui
             }
+        );
+    }
+
+    #[test]
+    fn cli_options_support_config_validate() {
+        assert_eq!(
+            CliOptions::parse_from(["config", "validate"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::ValidateConfig { path: None }
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["config", "validate", "/tmp/letcode.toml"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::ValidateConfig {
+                    path: Some("/tmp/letcode.toml".into())
+                }
+            }
+        );
+        assert!(
+            CliOptions::parse_from(["config", "validate", "a", "b"])
+                .unwrap_err()
+                .to_string()
+                .contains("at most one path")
         );
     }
 

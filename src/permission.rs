@@ -513,6 +513,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_FS_LIST
         | tool_names::TOOL_FS_READ
         | tool_names::TOOL_MEMORY_RECALL
+        | tool_names::TOOL_CONFIG_VALIDATE
         | tool_names::TOOL_SEARCH_RG
         | tool_names::TOOL_WEB_FETCH
         | tool_names::TOOL_GIT_STATUS
@@ -681,7 +682,12 @@ mod tests {
 
     #[test]
     fn read_tools_are_classified_and_allowed_for_explorer_scope() {
-        for tool in ["skill__resource_list", "skill__resource_read", "web__fetch"] {
+        for tool in [
+            "skill__resource_list",
+            "skill__resource_read",
+            "web__fetch",
+            "config__validate",
+        ] {
             assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");
             assert!(ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
         }

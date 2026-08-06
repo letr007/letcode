@@ -1518,6 +1518,60 @@ fn build_retry_config_overlay(
     })
 }
 
+/// Load-check a config file with the same parser startup and hot-reload use.
+/// Never panics; invalid configs return `valid: false` with the error text.
+pub fn validate_config_file(path: impl AsRef<Path>) -> ConfigValidationReport {
+    let path = path.as_ref();
+    let path_display = path.display().to_string();
+    match AppConfig::load_from_path(path) {
+        Ok(config) => {
+            let active_route = config.active_route();
+            ConfigValidationReport {
+                valid: true,
+                path: path_display,
+                error: None,
+                active_provider: Some(config.active_provider.clone()),
+                active_route: Some(active_route.display_name()),
+                providers: config.providers.keys().cloned().collect(),
+                mcp_servers: config.mcp.keys().cloned().collect(),
+                permission_mode: Some(config.permissions.mode.as_str().to_string()),
+                fast_mode: Some(config.fast_mode_enabled),
+            }
+        }
+        Err(error) => ConfigValidationReport {
+            valid: false,
+            path: path_display,
+            error: Some(format!("{error:#}")),
+            active_provider: None,
+            active_route: None,
+            providers: Vec::new(),
+            mcp_servers: Vec::new(),
+            permission_mode: None,
+            fast_mode: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigValidationReport {
+    pub valid: bool,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_route: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
+}
+
 fn missing_config_message(path: &Path) -> String {
     format!(
         "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = false\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
@@ -1525,7 +1579,7 @@ fn missing_config_message(path: &Path) -> String {
     )
 }
 
-fn default_config_path() -> Result<PathBuf> {
+pub fn default_config_path() -> Result<PathBuf> {
     let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(DEFAULT_CONFIG_HOME_RELATIVE_PATH))
 }
@@ -1562,6 +1616,40 @@ mod tests {
         assert_eq!(config.global.tool_timeout_secs, Some(60));
         assert_eq!(config.global.compaction, CompactionConfig::default());
         assert_eq!(config.global.retry, RetryConfig::default());
+    }
+
+    #[test]
+    fn validate_config_file_reports_valid_and_invalid_without_panicking() {
+        let _guard = lock_env();
+        let good = write_temp_config(
+            r#"
+            active_provider = "openai"
+            [providers.openai]
+            api_key = "config-key"
+            [providers.openai.models."gpt-5.5"]
+            "#,
+        );
+        let report = validate_config_file(&good);
+        assert!(report.valid);
+        assert_eq!(report.active_provider.as_deref(), Some("openai"));
+        assert_eq!(report.active_route.as_deref(), Some("openai/gpt-5.5"));
+
+        let bad = write_temp_config(
+            r#"
+            active_provider = "missing"
+            [providers.openai]
+            api_key = "config-key"
+            [providers.openai.models."gpt-5.5"]
+            "#,
+        );
+        let report = validate_config_file(&bad);
+        assert!(!report.valid);
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("active_provider"))
+        );
     }
 
     #[test]

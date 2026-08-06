@@ -29,6 +29,7 @@ pub enum ToolParallelism {
 
 mod code_analysis;
 mod command;
+mod config_validate;
 mod git;
 mod memory;
 mod question;
@@ -663,6 +664,7 @@ impl ToolRegistry {
         question::register(&mut registry);
         workflow::register(&mut registry);
         memory::register(&mut registry);
+        config_validate::register(&mut registry);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
         registry.register(AgentReconcileTool);

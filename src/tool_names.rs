@@ -20,6 +20,7 @@ pub const TOOL_SHELL_EXEC: &str = "shell__exec";
 pub const TOOL_WORKFLOW_TODOS: &str = "workflow__todos";
 pub const TOOL_WORKFLOW_AUTO_CONTINUE: &str = "workflow__auto_continue";
 pub const TOOL_MEMORY_RECALL: &str = "memory__recall";
+pub const TOOL_CONFIG_VALIDATE: &str = "config__validate";
 
 pub const TOOL_AGENT_EXPLORE: &str = "agent__explore";
 pub const TOOL_AGENT_FIXER: &str = "agent__fixer";
