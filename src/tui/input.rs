@@ -1010,5 +1010,4 @@ mod tests {
             InputAction::NoOp
         );
     }
-
 }

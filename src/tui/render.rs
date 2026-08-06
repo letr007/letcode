@@ -1673,5 +1673,4 @@ mod tests {
         assert!(rendered.contains("Allow read/preview"), "{rendered}");
         assert!(rendered.contains("esc"), "{rendered}");
     }
-
 }

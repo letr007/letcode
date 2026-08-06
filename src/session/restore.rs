@@ -226,10 +226,7 @@ pub(crate) fn apply_prepared_restored_route<C: Config>(
     }
 }
 
-pub(crate) fn apply_restored_permission_mode<C: Config>(
-    agent: &mut Agent<C>,
-    mode: Option<&str>,
-) {
+pub(crate) fn apply_restored_permission_mode<C: Config>(agent: &mut Agent<C>, mode: Option<&str>) {
     if let Some(mode) = mode.and_then(PermissionMode::parse) {
         agent.set_permission_mode(mode);
     }

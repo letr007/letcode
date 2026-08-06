@@ -340,5 +340,4 @@ mod tests {
         assert_eq!(card.risk.as_deref(), Some("low"));
         assert!(card.rationale.contains("safe https"));
     }
-
 }

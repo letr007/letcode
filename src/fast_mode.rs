@@ -134,5 +134,4 @@ mod tests {
                 .fast_mode_enabled
         );
     }
-
 }

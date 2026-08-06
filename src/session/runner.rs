@@ -2376,5 +2376,4 @@ mod tests {
             TranscriptRecorder::create(&base_dir).expect("transcript created"),
         ))
     }
-
 }

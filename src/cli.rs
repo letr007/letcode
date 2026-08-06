@@ -1266,5 +1266,4 @@ mod tests {
             PermissionApproval::Deny
         );
     }
-
 }

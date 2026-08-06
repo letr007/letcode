@@ -2861,7 +2861,6 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod session_title_tests {
     use super::*;
-
 }
 
 #[cfg(test)]

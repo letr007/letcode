@@ -346,5 +346,4 @@ protocol = "responses"
                 .is_empty()
         );
     }
-
 }

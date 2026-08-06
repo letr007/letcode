@@ -100,5 +100,4 @@ mod tests {
         assert!(commands.contains(&"/children"));
         assert!(commands.contains(&"/parent"));
     }
-
 }

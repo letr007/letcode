@@ -1018,5 +1018,4 @@ mod tests {
                 .contains("duplicate evidence id: ev-custom-1")
         );
     }
-
 }

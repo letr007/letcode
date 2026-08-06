@@ -1766,12 +1766,26 @@ mod tests {
         assert!(summary.summary.contains("too many tool calls"));
     }
 
+    fn temp_scope_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-subagent-scope-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "").expect("create scope root");
+        path
+    }
+
     #[tokio::test]
     async fn fixer_out_of_scope_changes_are_visible_and_fail_the_run() {
         let runtime = SubagentPool::new();
+        let owned = temp_scope_root("owned");
+        let owned_label = owned.to_string_lossy().into_owned();
         let mut governance = test_governance();
-        governance.input.allowed_paths = vec!["src/owned.rs".into()];
-        governance.input.owned_paths = vec!["src/owned.rs".into()];
+        governance.input.allowed_paths = vec![owned_label.clone()];
+        governance.input.owned_paths = vec![owned_label];
 
         let summary = runtime
             .run_with_executor(
@@ -1809,13 +1823,15 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("src/outside.rs"))
         );
+        let _ = std::fs::remove_file(owned);
     }
 
     #[tokio::test]
     async fn observed_child_write_effects_enforce_scope_even_when_files_changed_missing() {
         let runtime = SubagentPool::new();
+        let owned = temp_scope_root("allowed");
         let mut governance = test_governance();
-        governance.input.allowed_paths = vec!["src/owned.rs".into()];
+        governance.input.allowed_paths = vec![owned.to_string_lossy().into_owned()];
 
         let summary = runtime
             .run_with_executor(
@@ -1859,6 +1875,7 @@ mod tests {
 
         assert_eq!(summary.status, SubagentStatus::Failed);
         assert!(summary.summary.contains("src/outside.rs"));
+        let _ = std::fs::remove_file(owned);
     }
 
     #[tokio::test]

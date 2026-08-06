@@ -150,5 +150,4 @@ mod tests {
             ToolPresentation::CompactCard
         );
     }
-
 }

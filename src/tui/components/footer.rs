@@ -534,9 +534,7 @@ fn scanner_cells(frame: usize, theme: Theme) -> Vec<(char, Color)> {
         (0, false, position - reverse_end)
     };
 
-    let head_color = phase_style(AppPhase::Idle, theme)
-        .fg
-        .unwrap_or(theme.user);
+    let head_color = phase_style(AppPhase::Idle, theme).fg.unwrap_or(theme.user);
     let background = theme.root_bg;
     let gradient = [
         blend_toward_background(head_color, background, 0.00),
@@ -704,7 +702,6 @@ mod tests {
 
         assert!(rendered.contains("~50%"), "{rendered}");
     }
-
 }
 
 fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {

@@ -588,5 +588,4 @@ mod tests {
 
         assert!(validate_memory_recall_query(&json!({"limit": 99})).is_err());
     }
-
 }

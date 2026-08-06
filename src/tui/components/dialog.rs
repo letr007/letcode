@@ -210,5 +210,4 @@ fn accent_style(theme: Theme) -> Style {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
-
 }

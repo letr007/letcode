@@ -296,5 +296,4 @@ pub fn cleanup_replaced_empty_session(old_path: PathBuf, new_path: &Path) -> Res
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-
 }

@@ -254,5 +254,4 @@ mod tests {
         assert!(error.to_string().contains("does not declare parallel"));
         assert!(!registry.contains("example__dynamic"));
     }
-
 }

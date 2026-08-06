@@ -420,5 +420,4 @@ mod tests {
             assert_eq!(extract_selected_text(&state), expected);
         }
     }
-
 }

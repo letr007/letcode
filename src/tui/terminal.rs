@@ -145,5 +145,4 @@ fn sanitize_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 }

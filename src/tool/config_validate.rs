@@ -75,5 +75,4 @@ mod tests {
         fs::write(&path, body).expect("write config");
         path
     }
-
 }

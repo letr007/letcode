@@ -1061,4 +1061,3 @@ fn canonical_first_exposure_representation_is_pressure_invariant_and_impossible_
     );
     assert_eq!(snapshot, before);
 }
-

@@ -2096,5 +2096,4 @@ mod compaction_legacy_schema_tests {
                 if text == "legacy summary" && reply == "reply"
         ));
     }
-
 }

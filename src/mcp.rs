@@ -1037,5 +1037,4 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for process {pid} to exit"));
     }
-
 }

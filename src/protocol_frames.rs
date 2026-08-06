@@ -522,5 +522,4 @@ mod tests {
             .expect_err("dangling assistant tool calls must fail");
         assert!(error.to_string().contains("dangling assistant tool calls"));
     }
-
 }
