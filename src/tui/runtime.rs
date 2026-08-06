@@ -3577,13 +3577,11 @@ impl<'a> TerminalDrawer<'a> {
 
 impl RuntimeDrawer for TerminalDrawer<'_> {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
-        // Keep the hardware cursor hidden for the whole frame flush. Ratatui only
-        // re-hides after flush when no frame cursor is set; if anything leaves the
-        // cursor visible, full-screen redraws make it appear to jump around.
+        // Keep the hardware cursor hidden during buffer flush so it does not sweep
+        // the screen. After paint (and hyperlink OSC writes, which move the VT
+        // cursor), pin it to the composer caret and hide again: CJK IMEs anchor
+        // their candidate window to the real cursor cell even while hidden.
         let terminal = self.terminal.terminal_mut();
-        // Hide before and after paint: ratatui only re-hides after flush when the
-        // frame does not set a cursor position, so a briefly-visible caret during
-        // buffer writes looks like it is jumping across the UI.
         let _ = terminal.hide_cursor();
         let completed = terminal.draw(|frame| render::render(frame, state))?;
         let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
@@ -3593,6 +3591,9 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
         );
         super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
         self.applied_hyperlink_cells = overlay.applied;
+        if let Some((x, y)) = state.ime_cursor_anchor {
+            let _ = terminal.set_cursor_position(ratatui::layout::Position { x, y });
+        }
         let _ = terminal.hide_cursor();
         Ok(())
     }

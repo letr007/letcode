@@ -32,6 +32,7 @@ const WELCOME_ART_RIGHT: &[&str] = &[
 /// persists transcripts, or mutates runtime/business state.
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.frame_hyperlink_cells.clear();
+    state.ime_cursor_anchor = None;
     let theme = state.theme();
     let area = frame.area();
 
@@ -773,7 +774,7 @@ fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
     frame.render_widget(paragraph, message_area);
 }
 
-fn render_dashboard(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+fn render_dashboard(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     let footer_area = Rect::new(
         area.x,
         area.y + area.height.saturating_sub(1),
@@ -1798,10 +1799,43 @@ mod tests {
             .draw(|frame| render(frame, &mut state))
             .expect("render succeeds");
 
+        assert_eq!(state.ime_cursor_anchor, None);
         assert_eq!(
             terminal.get_cursor_position().expect("cursor position"),
             Position::ORIGIN
         );
+    }
+
+    #[test]
+    fn editable_composer_records_ime_cursor_anchor() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal is created");
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.active_session = true;
+        state.set_input("hi");
+
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("render succeeds");
+
+        let anchor = state
+            .ime_cursor_anchor
+            .expect("editable composer should expose an IME anchor");
+        // Pin after paint the same way TerminalDrawer does for CJK IME popups.
+        terminal
+            .set_cursor_position(Position {
+                x: anchor.0,
+                y: anchor.1,
+            })
+            .expect("set cursor");
+        assert_eq!(
+            terminal.get_cursor_position().expect("cursor position"),
+            Position {
+                x: anchor.0,
+                y: anchor.1
+            }
+        );
+        assert!(anchor.0 > 0 || anchor.1 > 0, "anchor should leave ORIGIN");
     }
 
     #[test]

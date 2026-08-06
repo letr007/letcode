@@ -934,6 +934,9 @@ pub struct TuiState {
     pub theme_name: ThemeName,
     pub transcript_render_cache: TranscriptRenderCache,
     pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
+    /// Composer caret cell for OS IME candidate anchoring after paint.
+    /// Cleared each frame; set only while drawing an editable composer caret.
+    pub ime_cursor_anchor: Option<(u16, u16)>,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub toast: Option<ToastState>,
@@ -1005,6 +1008,7 @@ impl Default for TuiState {
             theme_name: ThemeName::default(),
             transcript_render_cache: TranscriptRenderCache::default(),
             frame_hyperlink_cells: Vec::new(),
+            ime_cursor_anchor: None,
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
             toast: None,

@@ -152,7 +152,7 @@ fn composer_scroll_row(metrics: ComposerMetrics, visible_rows: u16) -> usize {
         .saturating_sub(visible_rows.saturating_sub(1))
 }
 
-pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+pub fn render_composer(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
     }
@@ -183,7 +183,7 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, them
     render_composer_panel(frame, state, area, theme);
 }
 
-fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+fn render_composer_tiny(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
     } else {
@@ -209,7 +209,7 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
     }
 }
 
-fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+fn render_composer_panel(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     // Accent bar at the left edge.
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
@@ -641,10 +641,16 @@ fn tiny_composer_cursor_area(state: &TuiState, area: Rect) -> Option<Rect> {
     Some(Rect::new(desired_x.min(max_x), area.y, 1, 1))
 }
 
-fn render_tiny_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+fn render_tiny_composer_cursor(
+    frame: &mut Frame<'_>,
+    state: &mut TuiState,
+    area: Rect,
+    theme: Theme,
+) {
     if let Some(cursor_area) = tiny_composer_cursor_area(state, area) {
         render_composer_cursor_block(
             frame,
+            state,
             cursor_area,
             theme,
             composer_cursor_style(state, theme),
@@ -654,7 +660,7 @@ fn render_tiny_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, area: Re
 
 fn render_panel_composer_cursor(
     frame: &mut Frame<'_>,
-    state: &TuiState,
+    state: &mut TuiState,
     metrics: ComposerMetrics,
     scroll_row: usize,
     textarea_area: Rect,
@@ -663,6 +669,7 @@ fn render_panel_composer_cursor(
     if let Some(cursor_area) = panel_composer_cursor_area(metrics, scroll_row, textarea_area) {
         render_composer_cursor_block(
             frame,
+            state,
             cursor_area,
             theme,
             composer_cursor_style(state, theme),
@@ -672,6 +679,7 @@ fn render_panel_composer_cursor(
 
 fn render_composer_cursor_block(
     frame: &mut Frame<'_>,
+    state: &mut TuiState,
     cursor_area: Rect,
     theme: Theme,
     pulse: ComposerCursorPulse,
@@ -680,28 +688,14 @@ fn render_composer_cursor_block(
     if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
         cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
     }
+    // Soft caret is visual only; the real VT cursor anchors CJK IME popups.
+    state.ime_cursor_anchor = Some((cursor_area.x, cursor_area.y));
 }
 
-/// Soft pulse only while the user is idle/editing. During agent work the status
-/// spinner frame advances on every stream/tool event; reusing it for the input
-/// caret makes the caret appear to flicker or jump even though its cell is fixed.
+/// Soft pulse driven by the shared tick clock. Spinner only advances on Tick now,
+/// so Running can breathe at the same rate as Idle without event-storm flicker.
 fn composer_cursor_style(state: &TuiState, theme: Theme) -> ComposerCursorPulse {
-    use crate::tui::state::AppPhase;
-
-    match state.phase {
-        AppPhase::Idle | AppPhase::Editing => {
-            composer_cursor_pulse(theme, state.status_spinner_frame)
-        }
-        _ => composer_cursor_static(theme),
-    }
-}
-
-fn composer_cursor_static(theme: Theme) -> ComposerCursorPulse {
-    let cursor_bg = composer_cursor_target_color(theme);
-    ComposerCursorPulse {
-        bg: mix_color_f32(theme.element_bg, cursor_bg, 0.92),
-        fg: mix_color_f32(theme.text, theme.element_bg, 0.75),
-    }
+    composer_cursor_pulse(theme, state.status_spinner_frame)
 }
 
 fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursorPulse {
@@ -1136,7 +1130,7 @@ mod tests {
         }
     }
 
-    fn draw_to_string(state: &TuiState, width: u16, height: u16) -> String {
+    fn draw_to_string(state: &mut TuiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -1156,7 +1150,7 @@ mod tests {
             .collect()
     }
 
-    fn draw_rows(state: &TuiState, width: u16, height: u16) -> Vec<String> {
+    fn draw_rows(state: &mut TuiState, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -1177,7 +1171,7 @@ mod tests {
             .collect()
     }
 
-    fn leading_bar_color(state: &TuiState, width: u16, height: u16) -> Option<Color> {
+    fn leading_bar_color(state: &mut TuiState, width: u16, height: u16) -> Option<Color> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -1192,7 +1186,7 @@ mod tests {
     }
 
     fn composer_cell_style(
-        state: &TuiState,
+        state: &mut TuiState,
         width: u16,
         height: u16,
         x: u16,
@@ -1276,7 +1270,7 @@ mod tests {
         let mut state = TuiState::default();
         state.set_input("first\nsecond");
 
-        let rows = draw_rows(&state, 80, 8);
+        let rows = draw_rows(&mut state, 80, 8);
 
         assert!(rows[1].contains("first"), "{rows:?}");
         assert!(rows[2].contains("second"), "{rows:?}");
@@ -1333,7 +1327,7 @@ mod tests {
         state.input_cursor = state.input_buffer.len();
         state.add_composer_attachment(test_attachment("img-2", "diagram.png"));
 
-        let rows = draw_rows(&state, 80, 10);
+        let rows = draw_rows(&mut state, 80, 10);
 
         assert!(
             rows.iter()
@@ -1464,7 +1458,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, 2, 1);
-                render_composer(frame, &state, area, Theme::dark());
+                render_composer(frame, &mut state, area, Theme::dark());
             })
             .expect("draw");
     }
@@ -1477,7 +1471,7 @@ mod tests {
         request.arguments = Some("cargo test --workspace".into());
         state.apply_event(SessionEvent::PermissionRequested(request));
 
-        let rendered = draw_to_string(&state, 80, 8);
+        let rendered = draw_to_string(&mut state, 80, 8);
 
         assert!(
             rendered.contains("Approve tool") || rendered.contains("Run command"),
@@ -1504,7 +1498,7 @@ mod tests {
         request.rationale = Some("project tests require approval".into());
         state.apply_event(SessionEvent::PermissionRequested(request));
 
-        let rendered = draw_to_string(&state, 100, 10);
+        let rendered = draw_to_string(&mut state, 100, 10);
 
         assert!(rendered.contains("Patterns"), "{rendered}");
         assert!(rendered.contains("Values"), "{rendered}");
@@ -1524,7 +1518,7 @@ mod tests {
         request.can_allow_always = true;
         state.apply_event(SessionEvent::PermissionRequested(request));
 
-        let rendered = draw_to_string(&state, 100, 10);
+        let rendered = draw_to_string(&mut state, 100, 10);
 
         assert!(rendered.contains("Allow once"), "{rendered}");
         assert!(rendered.contains("Allow always"), "{rendered}");
@@ -1542,7 +1536,7 @@ mod tests {
         request.origin_label = Some("fixer".into());
         state.apply_event(SessionEvent::PermissionRequested(request));
 
-        let rendered = draw_to_string(&state, 80, 8);
+        let rendered = draw_to_string(&mut state, 80, 8);
 
         assert!(rendered.contains("fixer"), "{rendered}");
         assert!(rendered.contains("cargo test --workspace"), "{rendered}");
@@ -1553,7 +1547,7 @@ mod tests {
         let mut state = TuiState::default();
         state.set_input("/per");
 
-        let rendered = draw_to_string(&state, 100, 12);
+        let rendered = draw_to_string(&mut state, 100, 12);
         assert!(
             !rendered.contains("Show current permission mode"),
             "{rendered}"
@@ -1569,7 +1563,7 @@ mod tests {
         state.set_reasoning_effort_label(Some("medium".into()));
         state.set_fast_mode_enabled(true);
 
-        let rendered = draw_to_string(&state, 100, 8);
+        let rendered = draw_to_string(&mut state, 100, 8);
 
         assert!(rendered.contains("prompt"), "{rendered}");
         assert!(rendered.contains("GPT-5.5"), "{rendered}");
@@ -1583,9 +1577,9 @@ mod tests {
     fn child_navigation_prefix_mutes_composer_leading_bar() {
         let mut state = TuiState::default();
 
-        let normal = leading_bar_color(&state, 80, 8).expect("normal color");
+        let normal = leading_bar_color(&mut state, 80, 8).expect("normal color");
         state.child_navigation_prefix = true;
-        let prefixed = leading_bar_color(&state, 80, 8).expect("prefixed color");
+        let prefixed = leading_bar_color(&mut state, 80, 8).expect("prefixed color");
 
         assert_eq!(normal, Theme::dark().user);
         assert_eq!(prefixed, Theme::dark().notice);
@@ -1620,7 +1614,7 @@ mod tests {
         state.input_cursor = 2;
         state.status_spinner_frame = (CURSOR_CYCLE_DURATION_MS / CURSOR_FRAME_INTERVAL_MS) * 3 / 5;
 
-        let (symbol, fg, bg) = composer_cell_style(&state, 80, 8, 5, 1).expect("cursor cell");
+        let (symbol, fg, bg) = composer_cell_style(&mut state, 80, 8, 5, 1).expect("cursor cell");
 
         assert_eq!(symbol, "l");
         assert_ne!(bg, Theme::dark().element_bg);
@@ -1628,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_cursor_stays_static_while_agent_is_running() {
+    fn composer_cursor_pulses_while_agent_is_running() {
         let theme = Theme::dark();
         let mut state = TuiState::default();
         state.phase = crate::tui::state::AppPhase::Running;
@@ -1636,7 +1630,7 @@ mod tests {
         let a = composer_cursor_style(&state, theme);
         state.status_spinner_frame = 1_000;
         let b = composer_cursor_style(&state, theme);
-        assert_eq!(a, b, "running phase must not pulse with spinner frames");
+        assert_ne!(a, b, "running phase should pulse with tick frames");
     }
 
     fn color_distance(a: Color, b: Color) -> u32 {
@@ -1670,7 +1664,7 @@ mod tests {
             1,
         );
 
-        let rendered = draw_to_string(&state, 100, 8);
+        let rendered = draw_to_string(&mut state, 100, 8);
 
         assert!(rendered.contains("fixer"), "{rendered}");
         assert!(rendered.contains("2/3"), "{rendered}");
@@ -1711,7 +1705,7 @@ mod tests {
             1,
         );
 
-        let rows = draw_rows(&state, 100, 4);
+        let rows = draw_rows(&mut state, 100, 4);
 
         assert!(!rows[0].contains("explorer"), "{rows:?}");
         assert!(rows[1].contains("explorer"), "{rows:?}");
@@ -1739,7 +1733,7 @@ mod tests {
         );
         state.set_input("/tool-output".to_string());
 
-        let rendered = draw_to_string(&state, 100, 8);
+        let rendered = draw_to_string(&mut state, 100, 8);
 
         assert!(rendered.contains("/tool-output"), "{rendered}");
         assert!(!rendered.contains("Read-only child view"), "{rendered}");
@@ -1753,7 +1747,7 @@ mod tests {
             PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
         state.apply_event(SessionEvent::PermissionRequested(request));
 
-        let rendered = draw_to_string(&state, 100, 12);
+        let rendered = draw_to_string(&mut state, 100, 12);
         assert!(
             !rendered.contains("Show current permission mode"),
             "{rendered}"
