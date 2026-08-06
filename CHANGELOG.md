@@ -12,7 +12,7 @@
 - 子代理目录授权：`allowed_paths` 只读、`owned_paths` 读写、`forbidden_paths` 优先；越界硬拒绝，scope 内结构化工具预授权，避免 auto 模式下逐文件重复审批
 - 子代理 PermissionSession 隔离：只继承权限模式，不继承 AllowAlways grants；父子/兄弟互不影响；Shell 仍按完整命令 AllowAlways
 - auto 模式下普通子代理继承 reviewer 服务；reviewer 子代理不继承，防止递归审批；并发 auto-review 串行化，避免 reviewer busy
-- TUI 主题：内置 Tokyo Night，并从 `themes/*.toml` 加载可编辑主题，选择时热重载
+- TUI 主题：内置部分主题，并从 `themes/*.toml` 加载可编辑主题，选择时热重载
 - 内置 `customize-letcode` skill，以及 `config__validate` / `letcode config validate`
 - 退出横幅打印 `letcode resume <id>`；新增同名 CLI，可直接恢复指定会话
 - 已选 skill 在时间线中持续可见
