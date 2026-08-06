@@ -1899,49 +1899,60 @@ fn render_tail_limited_text_lines(
     lines
 }
 
+/// Split shell/tool output into styled segments for TUI cells.
+///
+/// Contract: segment text never contains control characters. SGR becomes style;
+/// other CSI/OSC/C0 and truncated escapes are dropped so VT state cannot escape
+/// into the ratatui write path.
 fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, Style)> {
+    // Progress bars overwrite with CR; only the suffix after the last CR is visible.
+    let text = text.rsplit('\r').next().unwrap_or(text);
+
     let mut segments = Vec::new();
     let mut current_style = base_style;
     let mut current_text = String::new();
     let mut chars = text.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' || chars.peek() != Some(&'[') {
-            current_text.push(ch);
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    match consume_csi_sequence(&mut chars) {
+                        CsiOutcome::Sgr(sequence) => {
+                            if !current_text.is_empty() {
+                                segments.push((std::mem::take(&mut current_text), current_style));
+                            }
+                            current_style = apply_sgr_sequence(&sequence, base_style, current_style);
+                        }
+                        CsiOutcome::Other | CsiOutcome::Incomplete => {}
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    let _ = consume_osc_sequence(&mut chars);
+                }
+                Some(_) => {
+                    // Two-byte / short ESC form: drop introducer and the next byte.
+                    chars.next();
+                }
+                None => {
+                    // Truncated ESC at end of stream — never emit it into a cell.
+                }
+            }
             continue;
         }
 
-        chars.next();
-        let mut sequence = String::new();
-        let mut terminated = false;
-        for next in chars.by_ref() {
-            if next == 'm' {
-                terminated = true;
-                break;
-            }
-            if next.is_ascii_digit() || next == ';' {
-                sequence.push(next);
-            } else {
-                current_text.push('\u{1b}');
-                current_text.push('[');
-                current_text.push_str(&sequence);
-                current_text.push(next);
-                terminated = true;
-                break;
-            }
+        if ch == '\t' {
+            current_text.push(' ');
+            continue;
         }
 
-        if !terminated {
-            current_text.push('\u{1b}');
-            current_text.push('[');
-            current_text.push_str(&sequence);
-            break;
+        if ch.is_control() {
+            continue;
         }
 
-        if !current_text.is_empty() {
-            segments.push((std::mem::take(&mut current_text), current_style));
-        }
-        current_style = apply_sgr_sequence(&sequence, base_style, current_style);
+        current_text.push(ch);
     }
 
     if !current_text.is_empty() {
@@ -1952,6 +1963,67 @@ fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, Style)> {
         segments.push((String::new(), base_style));
     }
     segments
+}
+
+enum CsiOutcome {
+    Sgr(String),
+    Other,
+    Incomplete,
+}
+
+/// Consume CSI parameter/intermediate bytes through the final byte (`@`..=`~`).
+fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> CsiOutcome {
+    let mut sequence = String::new();
+    let mut saw_final = false;
+    let mut final_byte = '\0';
+
+    for next in chars.by_ref() {
+        match next {
+            '\u{20}'..='\u{3f}' => sequence.push(next),
+            '\u{40}'..='\u{7e}' => {
+                final_byte = next;
+                saw_final = true;
+                break;
+            }
+            _ => {
+                // Malformed CSI: drop what we consumed; do not emit ESC.
+                return CsiOutcome::Other;
+            }
+        }
+    }
+
+    if !saw_final {
+        return CsiOutcome::Incomplete;
+    }
+
+    if final_byte == 'm' {
+        // SGR params are digits/semicolons; strip private/intermediate junk.
+        let params: String = sequence
+            .chars()
+            .filter(|ch| ch.is_ascii_digit() || *ch == ';')
+            .collect();
+        CsiOutcome::Sgr(params)
+    } else {
+        CsiOutcome::Other
+    }
+}
+
+/// Consume OSC through BEL or ST (`ESC \`). Incomplete OSC is dropped.
+fn consume_osc_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while let Some(next) = chars.next() {
+        if next == '\u{07}' {
+            return true;
+        }
+        if next == '\u{1b}' {
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+                return true;
+            }
+            // Nested/truncated ESC inside OSC — stop without leaking.
+            return false;
+        }
+    }
+    false
 }
 
 fn apply_sgr_sequence(sequence: &str, base_style: Style, mut style: Style) -> Style {
@@ -4046,6 +4118,72 @@ mod tests {
         assert_eq!(segments[0].1.fg, base.fg);
         assert_eq!(segments[1].1.fg, Some(Color::Rgb(205, 49, 49)));
         assert_eq!(segments[2].1.fg, base.fg);
+    }
+
+    fn segment_texts(segments: &[(String, Style)]) -> Vec<&str> {
+        segments.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    fn assert_segments_have_no_controls(segments: &[(String, Style)]) {
+        for (text, _) in segments {
+            assert!(
+                !text.chars().any(|ch| ch.is_control()),
+                "control leaked into segment text: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_output_drops_non_sgr_csi_from_visible_text() {
+        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let cases = [
+            ("keep\u{1b}[2Kdone", "keepdone"),
+            ("up\u{1b}[1Aline", "upline"),
+            ("clear\u{1b}[2Jscreen", "clearscreen"),
+            ("hide\u{1b}[?25lcursor", "hidecursor"),
+        ];
+        for (input, expected) in cases {
+            let segments = ansi_sgr_segments(input, base);
+            assert_segments_have_no_controls(&segments);
+            assert_eq!(segment_texts(&segments).join(""), expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn shell_output_strips_osc8_hyperlink_wrappers() {
+        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let segments = ansi_sgr_segments(
+            "\u{1b}]8;;http://example.test\u{07}link\u{1b}]8;;\u{07}",
+            base,
+        );
+        assert_segments_have_no_controls(&segments);
+        assert_eq!(segment_texts(&segments), vec!["link"]);
+    }
+
+    #[test]
+    fn shell_output_keeps_suffix_after_last_carriage_return() {
+        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let segments = ansi_sgr_segments("progress\rold\rnew", base);
+        assert_segments_have_no_controls(&segments);
+        assert_eq!(segment_texts(&segments), vec!["new"]);
+
+        let colored = ansi_sgr_segments("\u{1b}[32mold\r\u{1b}[32mnew\u{1b}[0m", base);
+        assert_segments_have_no_controls(&colored);
+        assert_eq!(segment_texts(&colored), vec!["new"]);
+        assert_eq!(colored[0].1.fg, Some(Color::Rgb(13, 188, 121)));
+    }
+
+    #[test]
+    fn shell_output_drops_truncated_escape_without_leaking_esc() {
+        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let truncated = ansi_sgr_segments("plain\u{1b}[3", base);
+        assert_segments_have_no_controls(&truncated);
+        assert_eq!(segment_texts(&truncated), vec!["plain"]);
+
+        let completed = ansi_sgr_segments("plain\u{1b}[31mred", base);
+        assert_segments_have_no_controls(&completed);
+        assert_eq!(segment_texts(&completed), vec!["plain", "red"]);
+        assert_eq!(completed[1].1.fg, Some(Color::Rgb(205, 49, 49)));
     }
 
     #[test]
