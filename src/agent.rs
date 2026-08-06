@@ -2911,7 +2911,6 @@ impl<C: Config> Agent<C> {
         .await
     }
 
-
     #[cfg(test)]
     pub async fn compact_session_async<E, Efut>(
         &mut self,

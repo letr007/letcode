@@ -16,9 +16,9 @@ use crate::session::event::{NoticeEvent, NoticeKind, PermissionResolutionEvent};
 use crate::session::runner::{
     PermissionResponse, SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
 };
-use crate::subagent::{SubagentPool, SubagentRunGovernance, SubagentRunSummary};
 #[cfg(test)]
 use crate::subagent::SubagentStatus;
+use crate::subagent::{SubagentPool, SubagentRunGovernance, SubagentRunSummary};
 use crate::subagent_events::run_child_prompt;
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{TranscriptEvent, TranscriptRecorder, read_records_allow_partial_tail};

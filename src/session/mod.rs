@@ -61,11 +61,11 @@ pub use event::{
 pub(crate) use interrupt::unfinished_current_active_turn_tool_calls;
 pub(crate) use lifecycle::session_started_event;
 
+#[cfg(test)]
+pub use lifecycle::install_new_session_for_agent;
 pub use lifecycle::{
     install_prepared_new_session_for_agent, prepare_new_session_package, resolve_session_prefix,
 };
-#[cfg(test)]
-pub use lifecycle::install_new_session_for_agent;
 pub use ports::SessionCommandHandler;
 pub use restore::{
     install_prepared_routed_resume_for_agent, prepare_resume_package,

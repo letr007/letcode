@@ -25,8 +25,8 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome,
-    PrimaryRouteFactory, SubagentInvocation,
+    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome, PrimaryRouteFactory,
+    SubagentInvocation,
 };
 use crate::agent_event_journal::persist_agent_event;
 use crate::config::{AppConfig, ModelRoute, ProviderConfig, RetryConfig};
