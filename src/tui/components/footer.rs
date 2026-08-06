@@ -12,8 +12,8 @@ use crate::tui::{
     theme::Theme,
 };
 
-pub fn footer_scanner_cells(frame: usize) -> Vec<(char, Color)> {
-    scanner_cells(frame)
+pub fn footer_scanner_cells(frame: usize, theme: Theme) -> Vec<(char, Color)> {
+    scanner_cells(frame, theme)
 }
 
 pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -512,7 +512,7 @@ fn dimmed_compaction_color(theme: Theme) -> Color {
     }
 }
 
-fn scanner_cells(frame: usize) -> Vec<(char, Color)> {
+fn scanner_cells(frame: usize, theme: Theme) -> Vec<(char, Color)> {
     const WIDTH: usize = 8;
     const HOLD_END: usize = 9;
     const HOLD_START: usize = 30;
@@ -534,6 +534,20 @@ fn scanner_cells(frame: usize) -> Vec<(char, Color)> {
         (0, false, position - reverse_end)
     };
 
+    let head_color = phase_style(AppPhase::Idle, theme)
+        .fg
+        .unwrap_or(theme.user);
+    let background = theme.root_bg;
+    let gradient = [
+        blend_toward_background(head_color, background, 0.00),
+        blend_toward_background(head_color, background, 0.20),
+        blend_toward_background(head_color, background, 0.40),
+        blend_toward_background(head_color, background, 0.55),
+        blend_toward_background(head_color, background, 0.70),
+        blend_toward_background(head_color, background, 0.82),
+    ];
+    let trail_color = blend_toward_background(head_color, background, 0.88);
+
     (0..WIDTH)
         .map(|index| {
             let distance = if forward {
@@ -547,20 +561,25 @@ fn scanner_cells(frame: usize) -> Vec<(char, Color)> {
             let active = distance < TRAIL;
             let glyph = if active { '■' } else { '⬝' };
             let color = if active {
-                match distance {
-                    0 => Color::Rgb(80, 180, 220),
-                    1 => Color::Rgb(85, 188, 230),
-                    2 => Color::Rgb(58, 123, 149),
-                    3 => Color::Rgb(44, 86, 103),
-                    4 => Color::Rgb(35, 63, 73),
-                    _ => Color::Rgb(29, 47, 54),
-                }
+                gradient[distance.min(gradient.len() - 1)]
             } else {
-                Color::Rgb(30, 50, 58)
+                trail_color
             };
             (glyph, color)
         })
         .collect()
+}
+
+fn blend_toward_background(color: Color, background: Color, amount: f64) -> Color {
+    match (color, background) {
+        (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => {
+            let mix = |value: u8, bg_value: u8| {
+                (value as f64 * (1.0 - amount) + bg_value as f64 * amount).round() as u8
+            };
+            Color::Rgb(mix(red, bg_red), mix(green, bg_green), mix(blue, bg_blue))
+        }
+        _ => color,
+    }
 }
 
 fn footer_value_style(theme: Theme) -> Style {
@@ -899,7 +918,7 @@ mod tests {
 }
 
 fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
-    footer_scanner_cells(frame)
+    footer_scanner_cells(frame, theme)
         .into_iter()
         .map(|(glyph, color)| {
             Span::styled(
