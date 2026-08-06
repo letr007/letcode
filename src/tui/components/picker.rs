@@ -270,7 +270,7 @@ fn render_picker_body(
                         theme,
                         item,
                         selected,
-                        item.id == state.theme_name.as_str(),
+                        item.id == state.theme_id,
                     ),
                     DialogKind::ReasoningPicker => render_reasoning_row(
                         frame,

@@ -3,16 +3,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::command::ThemeName;
+
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+fn default_theme_id() -> String {
+    ThemeName::default().as_str().to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiPreferences {
     #[serde(default)]
     pub tool_output_expanded: bool,
     #[serde(default = "default_transcript_scrollbar_visible")]
     pub transcript_scrollbar_visible: bool,
-    #[serde(default)]
-    pub theme: crate::tui::theme::ThemeName,
+    #[serde(default = "default_theme_id")]
+    pub theme: String,
 }
 
 impl Default for TuiPreferences {
@@ -20,7 +26,7 @@ impl Default for TuiPreferences {
         Self {
             tool_output_expanded: false,
             transcript_scrollbar_visible: default_transcript_scrollbar_visible(),
-            theme: crate::tui::theme::ThemeName::default(),
+            theme: default_theme_id(),
         }
     }
 }
@@ -68,7 +74,7 @@ mod tests {
         let prefs = TuiPreferences {
             tool_output_expanded: true,
             transcript_scrollbar_visible: false,
-            theme: crate::tui::theme::ThemeName::Forest,
+            theme: "forest".into(),
         };
         prefs.save_to_dir(&base).expect("save preferences");
 
@@ -101,6 +107,18 @@ mod tests {
 
         assert!(loaded.tool_output_expanded);
         assert!(loaded.transcript_scrollbar_visible);
-        assert_eq!(loaded.theme, crate::tui::theme::ThemeName::Dark);
+        assert_eq!(loaded.theme, ThemeName::Dark.as_str());
+    }
+
+    #[test]
+    fn custom_theme_id_round_trips() {
+        let prefs = TuiPreferences {
+            tool_output_expanded: false,
+            transcript_scrollbar_visible: true,
+            theme: "sunset".into(),
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize");
+        let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(loaded.theme, "sunset");
     }
 }

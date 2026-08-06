@@ -41,10 +41,6 @@ pub enum TranscriptScrollbarMode {
 #[serde(rename_all = "lowercase")]
 pub enum ThemeName {
     Dark,
-    Ocean,
-    Forest,
-    Rose,
-    TokyoNight,
     Rainbow,
 }
 
@@ -52,10 +48,6 @@ impl ThemeName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Dark => "dark",
-            Self::Ocean => "ocean",
-            Self::Forest => "forest",
-            Self::Rose => "rose",
-            Self::TokyoNight => "tokyonight",
             Self::Rainbow => "rainbow",
         }
     }
@@ -63,24 +55,13 @@ impl ThemeName {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "dark" | "default" => Some(Self::Dark),
-            "ocean" => Some(Self::Ocean),
-            "forest" => Some(Self::Forest),
-            "rose" => Some(Self::Rose),
-            "tokyonight" | "tokyo-night" | "tokyo_night" => Some(Self::TokyoNight),
             "rainbow" => Some(Self::Rainbow),
             _ => None,
         }
     }
 
     pub const fn available() -> &'static [Self] {
-        &[
-            Self::Dark,
-            Self::Ocean,
-            Self::Forest,
-            Self::Rose,
-            Self::TokyoNight,
-            Self::Rainbow,
-        ]
+        &[Self::Dark, Self::Rainbow]
     }
 }
 
@@ -90,10 +71,10 @@ impl Default for ThemeName {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeCommand {
     Show,
-    Set(ThemeName),
+    Set(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,7 +247,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/theme",
         insert_text: "/theme ",
         description: "Show or switch the TUI theme",
-        usage: "/theme [dark|ocean|forest|rose|tokyonight|rainbow]",
+        usage: "/theme [dark|rainbow|<themes/*.toml>]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -578,16 +559,39 @@ fn parse_transcript_scrollbar(parts: &[&str]) -> Result<CommandIntent, CommandPa
 fn parse_theme(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     match parts {
         ["/theme"] => Ok(CommandIntent::Theme(ThemeCommand::Show)),
-        ["/theme", value] => match ThemeName::parse(value) {
+        ["/theme", value] => match normalize_theme_command_id(value) {
             Some(theme) => Ok(CommandIntent::Theme(ThemeCommand::Set(theme))),
             None => Err(CommandParseError::new(
-                "Unknown theme. Use dark, ocean, forest, rose, tokyonight, or rainbow.",
+                "Unknown theme. Use dark, rainbow, or a themes/*.toml id (ocean, forest, rose, tokyonight, …).",
             )),
         },
         ["/theme", ..] => Err(CommandParseError::new(
-            "Usage: /theme <dark|ocean|forest|rose|tokyonight|rainbow>",
+            "Usage: /theme <dark|rainbow|<themes/*.toml>>",
         )),
         _ => unreachable!(),
+    }
+}
+
+fn normalize_theme_command_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(builtin) = ThemeName::parse(trimmed) {
+        return Some(builtin.as_str().to_string());
+    }
+    let id = trimmed.to_ascii_lowercase();
+    let id = match id.as_str() {
+        "tokyo-night" | "tokyo_night" => "tokyonight".to_string(),
+        _ => id,
+    };
+    if id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Some(id)
+    } else {
+        None
     }
 }
 
@@ -787,7 +791,7 @@ mod tests {
         );
         assert_eq!(
             parse_command("/theme rainbow"),
-            Ok(CommandIntent::Theme(ThemeCommand::Set(ThemeName::Rainbow)))
+            Ok(CommandIntent::Theme(ThemeCommand::Set("rainbow".into())))
         );
         assert_eq!(
             parse_command("/theme"),
@@ -935,16 +939,20 @@ mod tests {
             ))
         );
         assert_eq!(
-            parse_command("/theme neon"),
+            parse_command("/theme bad!id"),
             Err(CommandParseError::new(
-                "Unknown theme. Use dark, ocean, forest, rose, tokyonight, or rainbow."
+                "Unknown theme. Use dark, rainbow, or a themes/*.toml id (ocean, forest, rose, tokyonight, …)."
             ))
         );
         assert_eq!(
             parse_command("/theme tokyonight"),
             Ok(CommandIntent::Theme(ThemeCommand::Set(
-                ThemeName::TokyoNight
+                "tokyonight".into()
             )))
+        );
+        assert_eq!(
+            parse_command("/theme sunset"),
+            Ok(CommandIntent::Theme(ThemeCommand::Set("sunset".into())))
         );
         assert_eq!(
             parse_command("@fixer"),

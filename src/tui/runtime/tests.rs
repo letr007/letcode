@@ -3793,7 +3793,7 @@ fn scrollbar_command_persists_preference() {
 #[test]
 fn theme_command_without_name_opens_picker_on_current_theme() {
     let mut runtime = runtime();
-    runtime.state_mut().set_theme_name(ThemeName::Forest);
+    runtime.apply_theme_selection("forest");
     runtime.state_mut().set_input("/theme");
 
     let command = runtime
@@ -3804,38 +3804,41 @@ fn theme_command_without_name_opens_picker_on_current_theme() {
     let dialog = runtime.state().dialog().expect("theme dialog");
     assert_eq!(dialog.kind, DialogKind::ThemePicker);
     assert_eq!(dialog.title, "Select theme");
+    // dark, rainbow, then sorted file themes: forest, ocean, rose, tokyonight
     assert_eq!(dialog.selected, 2);
     assert_eq!(dialog.items.len(), 6);
-    assert_eq!(dialog.items[4].id, "tokyonight");
-    assert_eq!(dialog.items[5].id, "rainbow");
+    assert_eq!(dialog.items[0].id, "dark");
+    assert_eq!(dialog.items[1].id, "rainbow");
+    assert_eq!(dialog.items[2].id, "forest");
+    assert_eq!(dialog.items[5].id, "tokyonight");
 }
 
 #[test]
 fn theme_picker_previews_selection_and_cancel_restores_original() {
     let mut runtime = runtime();
     let preferences_dir = runtime.preferences_dir.clone();
-    runtime.apply_theme_selection(ThemeName::Forest);
+    runtime.apply_theme_selection("forest");
     runtime.show_theme_dialog();
 
     runtime
         .handle_input_action(InputAction::DialogNext)
         .expect("theme preview advances");
 
-    assert_eq!(runtime.state().theme_name, ThemeName::Rose);
+    assert_eq!(runtime.state().theme_id, "ocean");
     assert_eq!(
         TuiPreferences::load_from_dir(&preferences_dir).theme,
-        ThemeName::Forest
+        "forest"
     );
 
     runtime
         .handle_input_action(InputAction::DialogCancel)
         .expect("theme preview cancels");
 
-    assert_eq!(runtime.state().theme_name, ThemeName::Forest);
+    assert_eq!(runtime.state().theme_id, "forest");
     assert!(!runtime.state().dialog_is_open());
     assert_eq!(
         TuiPreferences::load_from_dir(&preferences_dir).theme,
-        ThemeName::Forest
+        "forest"
     );
 }
 
@@ -3843,16 +3846,16 @@ fn theme_picker_previews_selection_and_cancel_restores_original() {
 fn theme_picker_accepts_and_persists_selected_theme() {
     let mut runtime = runtime();
     let preferences_dir = runtime.preferences_dir.clone();
-    runtime.apply_theme_selection(ThemeName::Forest);
+    runtime.apply_theme_selection("forest");
     runtime.show_theme_dialog();
     runtime
         .handle_input_action(InputAction::DialogNext)
         .expect("theme preview advances");
 
-    assert_eq!(runtime.state().theme_name, ThemeName::Rose);
+    assert_eq!(runtime.state().theme_id, "ocean");
     assert_eq!(
         TuiPreferences::load_from_dir(&preferences_dir).theme,
-        ThemeName::Forest
+        "forest"
     );
 
     let command = runtime
@@ -3860,11 +3863,11 @@ fn theme_picker_accepts_and_persists_selected_theme() {
         .expect("theme selection succeeds");
 
     assert_eq!(command, None);
-    assert_eq!(runtime.state().theme_name, ThemeName::Rose);
+    assert_eq!(runtime.state().theme_id, "ocean");
     assert!(!runtime.state().dialog_is_open());
     assert_eq!(
         TuiPreferences::load_from_dir(&preferences_dir).theme,
-        ThemeName::Rose
+        "ocean"
     );
 }
 
@@ -3887,7 +3890,7 @@ fn theme_command_works_in_child_view() {
         .expect("theme command succeeds in child view");
 
     assert_eq!(command, None);
-    assert_eq!(runtime.state().theme_name, ThemeName::Ocean);
+    assert_eq!(runtime.state().theme_id, "ocean");
 }
 
 #[test]
@@ -3902,10 +3905,122 @@ fn theme_command_switches_persists_and_works_while_running() {
         .expect("theme command succeeds while running");
 
     assert_eq!(command, None);
-    assert_eq!(runtime.state().theme_name, ThemeName::Forest);
+    assert_eq!(runtime.state().theme_id, "forest");
     assert_eq!(
         TuiPreferences::load_from_dir(&preferences_dir).theme,
-        ThemeName::Forest
+        "forest"
+    );
+}
+
+#[test]
+fn theme_picker_lists_custom_theme_and_reloads_file_on_select() {
+    use ratatui::style::Color;
+    use std::fs;
+
+    use crate::tui::theme_file::themes_dir;
+
+    let mut runtime = runtime();
+    let preferences_dir = runtime.preferences_dir.clone();
+    let themes = themes_dir(&preferences_dir);
+    fs::create_dir_all(&themes).expect("create themes dir");
+    let theme_path = themes.join("sunset.toml");
+    fs::write(
+        &theme_path,
+        r##"
+label = "Sunset"
+description = "Warm custom palette"
+accent = "#ff6600"
+"##,
+    )
+    .expect("write custom theme");
+
+    runtime.state_mut().set_input("/theme");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("theme picker opens");
+    let dialog = runtime.state().dialog().expect("theme dialog");
+    // dark, rainbow, forest, ocean, rose, sunset, tokyonight
+    assert_eq!(dialog.items.len(), 7);
+    assert_eq!(dialog.items[5].id, "sunset");
+    assert_eq!(dialog.items[5].label, "Sunset");
+
+    // Move from dark(0) to sunset(5).
+    for _ in 0..5 {
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("advance to custom theme");
+    }
+    assert_eq!(runtime.state().theme_id, "sunset");
+    assert_eq!(
+        runtime.state().theme().accent,
+        Color::Rgb(255, 102, 0)
+    );
+
+    fs::write(
+        &theme_path,
+        r##"
+label = "Sunset"
+accent = "#00aaff"
+"##,
+    )
+    .expect("rewrite custom theme");
+
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("leave custom");
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("reselect custom");
+    assert_eq!(runtime.state().theme_id, "sunset");
+    assert_eq!(
+        runtime.state().theme().accent,
+        Color::Rgb(0, 170, 255)
+    );
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("accept custom theme");
+    assert_eq!(
+        TuiPreferences::load_from_dir(&preferences_dir).theme,
+        "sunset"
+    );
+}
+
+#[test]
+fn theme_picker_reloads_bundled_theme_edits_without_clobber() {
+    use ratatui::style::Color;
+    use std::fs;
+
+    use crate::tui::theme_file::theme_file_path;
+
+    let mut runtime = runtime();
+    let preferences_dir = runtime.preferences_dir.clone();
+    runtime.apply_theme_selection("tokyonight");
+    assert_eq!(runtime.state().theme().user, Color::Rgb(0xbb, 0x9a, 0xf7));
+
+    let path = theme_file_path(&preferences_dir, "tokyonight");
+    fs::write(
+        &path,
+        r##"
+label = "TokyoNight"
+user = "#ff00aa"
+"##,
+    )
+    .expect("edit bundled theme");
+
+    runtime.show_theme_dialog();
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("leave tokyonight");
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("reselect tokyonight");
+    assert_eq!(runtime.state().theme_id, "tokyonight");
+    assert_eq!(runtime.state().theme().user, Color::Rgb(0xff, 0x00, 0xaa));
+    assert!(
+        fs::read_to_string(&path)
+            .expect("file intact")
+            .contains("user = \"#ff00aa\"")
     );
 }
 

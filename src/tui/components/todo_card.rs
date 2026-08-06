@@ -60,7 +60,12 @@ fn push_todo_decoration(document: &mut Document<Style>, text: &str, theme: Theme
         Span::decoration("  ", fill_style(theme)),
     ];
     if !text.is_empty() {
-        spans.push(Span::decoration(text, text_style(theme)));
+        let style = if text.starts_with('#') {
+            title_style(theme)
+        } else {
+            text_style(theme)
+        };
+        spans.push(Span::decoration(text, style));
     }
     let used = spans.iter().map(|span| display_width(&span.text)).sum();
     if width > used {
@@ -126,7 +131,14 @@ fn push_todo_item(document: &mut Document<Style>, item: &TodoItem, width: usize,
 }
 
 fn guide_style(theme: Theme) -> Style {
-    Style::default().fg(theme.accent).bg(theme.root_bg)
+    Style::default().fg(theme.card_guide()).bg(theme.root_bg)
+}
+
+fn title_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.approval)
+        .bg(theme.element_bg)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn status_marker(status: &TodoStatus) -> &'static str {

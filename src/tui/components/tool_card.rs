@@ -18,18 +18,7 @@ use crate::tui::{
 };
 
 const TOOL_GUIDE_GLYPH: &str = surface::ACCENT_BAR_GLYPH;
-const TOOL_CARD_GUIDE: ratatui::style::Color = ratatui::style::Color::Rgb(76, 80, 96);
-const DIFF_CARD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
-const DIFF_CARD_GUTTER: ratatui::style::Color = ratatui::style::Color::Rgb(112, 118, 134);
-const DIFF_CARD_GUTTER_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
-const DIFF_CARD_TEXT: ratatui::style::Color = ratatui::style::Color::Rgb(222, 226, 236);
 const COMPACT_SHELL_BODY_LINES: usize = 20;
-const DIFF_CARD_META: ratatui::style::Color = ratatui::style::Color::Rgb(143, 151, 170);
-const DIFF_CARD_ADD_SIGN: ratatui::style::Color = ratatui::style::Color::Rgb(107, 211, 145);
-const DIFF_CARD_DELETE_SIGN: ratatui::style::Color = ratatui::style::Color::Rgb(239, 126, 139);
-const DIFF_CARD_ADD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(22, 45, 32);
-const DIFF_CARD_DELETE_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 32, 42);
-const DIFF_CARD_HUNK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(31, 40, 60);
 const DIFF_CARD_HEADER_ARROW: &str = "←";
 const PROCESS_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -947,7 +936,7 @@ fn render_subagent_lines(
         ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
         ToolExecutionStatus::Cancelled => theme.error,
-        ToolExecutionStatus::Succeeded => theme.notice,
+        ToolExecutionStatus::Succeeded => theme.assistant,
         ToolExecutionStatus::Failed => theme.error,
     };
 
@@ -970,7 +959,7 @@ fn render_subagent_lines(
             SemanticSpan::decoration(format!("/child {child_id}"), muted),
         ],
         Style::default().bg(theme.root_bg),
-        TOOL_CARD_GUIDE,
+        theme.card_guide(),
         theme,
         width,
         if has_structured_details {
@@ -1055,7 +1044,7 @@ fn render_subagent_metadata_line(
     render_card_line_with_guide(
         &segments,
         Style::default().bg(theme.root_bg),
-        TOOL_CARD_GUIDE,
+        theme.card_guide(),
         theme,
         width,
         boundary,
@@ -1077,7 +1066,7 @@ fn render_subagent_detail_line(
             SemanticSpan::source(value, text_style),
         ],
         Style::default().bg(theme.root_bg),
-        TOOL_CARD_GUIDE,
+        theme.card_guide(),
         theme,
         width,
         boundary,
@@ -1316,7 +1305,7 @@ fn render_shell_output_lines(
         if lines.len() > 4 {
             lines.push(render_card_line(
                 &[],
-                Style::default().bg(DIFF_CARD_BG),
+                Style::default().bg(theme.card_bg()),
                 theme,
                 width,
             ));
@@ -1334,15 +1323,15 @@ fn render_shell_output_lines(
         lines.push(render_card_line(
             &[(
                 "… click to expand for details".to_string(),
-                root_muted_style(theme).bg(DIFF_CARD_BG),
+                root_muted_style(theme).bg(theme.card_bg()),
             )],
-            Style::default().bg(DIFF_CARD_BG),
+            Style::default().bg(theme.card_bg()),
             theme,
             width,
         ));
         lines.push(render_card_line(
             &[],
-            Style::default().bg(DIFF_CARD_BG),
+            Style::default().bg(theme.card_bg()),
             theme,
             width,
         ));
@@ -1371,19 +1360,19 @@ fn render_shell_card_header_lines(
 
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
     lines.push(render_card_line(
-        &[(format!("# {title}"), shell_card_title_style())],
-        Style::default().bg(DIFF_CARD_BG),
+        &[(format!("# {title}"), shell_card_title_style(theme))],
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
@@ -1397,11 +1386,11 @@ fn render_shell_card_header_lines(
             let prompt = if index == 0 { "$ " } else { "  " };
             lines.push(render_card_line_with_guide(
                 &[
-                    SemanticSpan::decoration(prompt, shell_card_command_style()),
-                    SemanticSpan::source(wrapped, shell_card_command_style()),
+                    SemanticSpan::decoration(prompt, shell_card_command_style(theme)),
+                    SemanticSpan::source(wrapped, shell_card_command_style(theme)),
                 ],
-                Style::default().bg(DIFF_CARD_BG),
-                TOOL_CARD_GUIDE,
+                Style::default().bg(theme.card_bg()),
+                theme.card_guide(),
                 theme,
                 width,
                 Break::SoftWrap,
@@ -1409,7 +1398,7 @@ fn render_shell_card_header_lines(
         }
         lines.push(render_card_line(
             &[],
-            Style::default().bg(DIFF_CARD_BG),
+            Style::default().bg(theme.card_bg()),
             theme,
             width,
         ));
@@ -1431,16 +1420,16 @@ fn render_shell_output_section(
         &[(
             title.to_string(),
             root_muted_style(theme)
-                .bg(DIFF_CARD_BG)
+                .bg(theme.card_bg())
                 .add_modifier(Modifier::BOLD),
         )],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
@@ -1453,7 +1442,7 @@ fn render_shell_output_section(
     ));
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
@@ -1563,7 +1552,7 @@ fn render_output_section(
     let mut lines = Vec::new();
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
@@ -1571,16 +1560,16 @@ fn render_output_section(
         &[(
             format!("{title}"),
             root_muted_style(theme)
-                .bg(DIFF_CARD_BG)
+                .bg(theme.card_bg())
                 .add_modifier(Modifier::BOLD),
         )],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
@@ -1593,7 +1582,7 @@ fn render_output_section(
     ));
     lines.push(render_card_line(
         &[],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(theme.card_bg()),
         theme,
         width,
     ));
@@ -1648,7 +1637,7 @@ fn render_diff_block(
                 old_no,
                 new_no,
                 line,
-                diff_line_style(line),
+                diff_line_style(line, theme),
                 theme,
                 width,
             ));
@@ -1749,7 +1738,7 @@ fn render_side_by_side_diff_body(
                 old_no,
                 new_no,
                 line,
-                diff_line_style(line),
+                diff_line_style(line, theme),
                 theme,
                 width,
             ));
@@ -1767,16 +1756,16 @@ fn render_side_by_side_diff_line(
     theme: Theme,
     width: usize,
 ) -> SemanticLine<Style> {
-    let mut segments = render_diff_side(removed, panel_width);
+    let mut segments = render_diff_side(removed, panel_width, theme);
     segments.push(SemanticSpan::decoration(
         DIFF_SIDE_BY_SIDE_SEPARATOR,
-        diff_meta_style(),
+        diff_meta_style(theme),
     ));
-    segments.extend(render_diff_side(added, panel_width));
+    segments.extend(render_diff_side(added, panel_width, theme));
     render_card_line_with_guide(
         &segments,
-        diff_header_fill_style(),
-        TOOL_CARD_GUIDE,
+        diff_header_fill_style(theme),
+        theme.card_guide(),
         theme,
         width,
         Break::HardBreak,
@@ -1786,21 +1775,22 @@ fn render_side_by_side_diff_line(
 fn render_diff_side(
     entry: Option<(Option<usize>, &str)>,
     width: usize,
+    theme: Theme,
 ) -> Vec<SemanticSpan<Style>> {
     let Some((number, content)) = entry else {
         return vec![SemanticSpan::decoration(
             " ".repeat(width),
-            diff_header_fill_style(),
+            diff_header_fill_style(theme),
         )];
     };
 
     let gutter_style = Style::default()
-        .fg(DIFF_CARD_GUTTER)
-        .bg(DIFF_CARD_GUTTER_BG);
-    let gutter_pad_style = Style::default().bg(DIFF_CARD_GUTTER_BG);
-    let content_style = diff_line_style(content);
-    let pad_style = Style::default().bg(content_style.bg.unwrap_or(DIFF_CARD_BG));
-    let (marker, body, marker_style) = diff_marker_and_body(content);
+        .fg(theme.muted_text)
+        .bg(theme.card_bg());
+    let gutter_pad_style = Style::default().bg(theme.card_bg());
+    let content_style = diff_line_style(content, theme);
+    let pad_style = Style::default().bg(content_style.bg.unwrap_or(theme.card_bg()));
+    let (marker, body, marker_style) = diff_marker_and_body(content, theme);
     let clipped_notice = content == "… output clipped in TUI";
     let marker_span = if clipped_notice {
         SemanticSpan::decoration(marker, marker_style)
@@ -1848,19 +1838,19 @@ fn render_limited_text_lines(
             lines.push(render_card_line(
                 &[(
                     "… output clipped in TUI".to_string(),
-                    root_muted_style(theme).bg(DIFF_CARD_BG),
+                    root_muted_style(theme).bg(theme.card_bg()),
                 )],
-                Style::default().bg(DIFF_CARD_BG),
+                Style::default().bg(theme.card_bg()),
                 theme,
                 width,
             ));
             break;
         }
         let line = if raw.is_empty() { " " } else { raw };
-        let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
+        let segments = ansi_sgr_segments(line, text_style.bg(theme.card_bg()));
         lines.push(render_source_card_line_with_boundary(
             &segments,
-            Style::default().bg(DIFF_CARD_BG),
+            Style::default().bg(theme.card_bg()),
             theme,
             width,
             Break::HardBreak,
@@ -1887,10 +1877,10 @@ fn render_tail_limited_text_lines(
     let mut lines = Vec::new();
     for raw in body {
         let line = if raw.is_empty() { " " } else { raw };
-        let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
+        let segments = ansi_sgr_segments(line, text_style.bg(theme.card_bg()));
         lines.push(render_source_card_line_with_boundary(
             &segments,
-            Style::default().bg(DIFF_CARD_BG),
+            Style::default().bg(theme.card_bg()),
             theme,
             width,
             Break::HardBreak,
@@ -2237,21 +2227,21 @@ fn output_title<'a>(label: &'a str, truncated: Option<&serde_json::Value>) -> &'
     }
 }
 
-fn diff_line_style(line: &str) -> Style {
+fn diff_line_style(line: &str, theme: Theme) -> Style {
     if line.starts_with("diff --git") || line.starts_with("index ") {
-        diff_meta_style().add_modifier(Modifier::BOLD)
+        diff_meta_style(theme).add_modifier(Modifier::BOLD)
     } else if line.starts_with("+++") || line.starts_with("---") {
-        diff_meta_style()
+        diff_meta_style(theme)
     } else if line.starts_with('+') {
-        Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_ADD_BG)
+        Style::default().fg(theme.text).bg(theme.diff_add_bg)
     } else if line.starts_with('-') {
-        Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_DELETE_BG)
+        Style::default().fg(theme.text).bg(theme.diff_delete_bg)
     } else if line.starts_with("@@") {
         Style::default()
-            .fg(ratatui::style::Color::Rgb(161, 198, 255))
-            .bg(DIFF_CARD_HUNK_BG)
+            .fg(theme.user)
+            .bg(theme.diff_hunk_bg)
     } else {
-        Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_BG)
+        Style::default().fg(theme.text).bg(theme.card_bg())
     }
 }
 
@@ -2259,22 +2249,22 @@ fn is_diff_file_header_line(line: &str) -> bool {
     line.starts_with("---") || line.starts_with("+++")
 }
 
-fn diff_meta_style() -> Style {
-    Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
+fn diff_meta_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.card_bg())
 }
 
 fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> SemanticLine<Style> {
     let text = format!(" {DIFF_CARD_HEADER_ARROW} {title}");
     render_card_line(
-        &[(text, diff_header_style())],
-        diff_header_fill_style(),
+        &[(text, diff_header_style(theme))],
+        diff_header_fill_style(theme),
         theme,
         width,
     )
 }
 
 fn render_diff_card_spacer_line(theme: Theme, width: usize) -> SemanticLine<Style> {
-    render_card_line(&[], diff_header_fill_style(), theme, width)
+    render_card_line(&[], diff_header_fill_style(theme), theme, width)
 }
 
 fn render_diff_card_body_line(
@@ -2286,13 +2276,13 @@ fn render_diff_card_body_line(
     width: usize,
 ) -> SemanticLine<Style> {
     let gutter_style = Style::default()
-        .fg(DIFF_CARD_GUTTER)
-        .bg(DIFF_CARD_GUTTER_BG);
+        .fg(theme.muted_text)
+        .bg(theme.card_bg());
     let number = diff_line_number(new_no.or(old_no));
-    let bg = content_style.bg.unwrap_or(DIFF_CARD_BG);
+    let bg = content_style.bg.unwrap_or(theme.card_bg());
     let pad_style = Style::default().bg(bg);
-    let gutter_pad_style = Style::default().bg(DIFF_CARD_GUTTER_BG);
-    let (marker, body, marker_style) = diff_marker_and_body(content);
+    let gutter_pad_style = Style::default().bg(theme.card_bg());
+    let (marker, body, marker_style) = diff_marker_and_body(content, theme);
     let clipped_notice = content == "… output clipped in TUI";
     let marker_span = if clipped_notice {
         SemanticSpan::decoration(marker, marker_style)
@@ -2315,35 +2305,35 @@ fn render_diff_card_body_line(
     render_card_line_with_guide(
         &segments,
         content_style,
-        TOOL_CARD_GUIDE,
+        theme.card_guide(),
         theme,
         width,
         Break::HardBreak,
     )
 }
 
-fn diff_marker_and_body(content: &str) -> (String, String, Style) {
+fn diff_marker_and_body(content: &str, theme: Theme) -> (String, String, Style) {
     match content.chars().next() {
         Some('+') if !content.starts_with("+++") => (
             "+".to_string(),
             content.chars().skip(1).collect(),
             Style::default()
-                .fg(DIFF_CARD_ADD_SIGN)
-                .bg(DIFF_CARD_GUTTER_BG),
+                .fg(theme.success)
+                .bg(theme.card_bg()),
         ),
         Some('-') if !content.starts_with("---") => (
             "-".to_string(),
             content.chars().skip(1).collect(),
             Style::default()
-                .fg(DIFF_CARD_DELETE_SIGN)
-                .bg(DIFF_CARD_GUTTER_BG),
+                .fg(theme.error)
+                .bg(theme.card_bg()),
         ),
         _ => (
             " ".to_string(),
             content.to_string(),
             Style::default()
-                .fg(DIFF_CARD_GUTTER)
-                .bg(DIFF_CARD_GUTTER_BG),
+                .fg(theme.muted_text)
+                .bg(theme.card_bg()),
         ),
     }
 }
@@ -2361,7 +2351,7 @@ pub(crate) fn render_card_line(
     render_card_line_with_guide(
         &semantic_segments,
         fill_style,
-        TOOL_CARD_GUIDE,
+        theme.card_guide(),
         theme,
         width,
         Break::SoftWrap,
@@ -2382,7 +2372,7 @@ fn render_source_card_line_with_boundary(
     render_card_line_with_guide(
         &semantic_segments,
         fill_style,
-        TOOL_CARD_GUIDE,
+        theme.card_guide(),
         theme,
         width,
         boundary,
@@ -2411,8 +2401,6 @@ fn render_card_line_with_guide(
         };
     }
 
-    // Leading pad must match the card fill. Hardcoding DIFF_CARD_BG here made
-    // elevated surfaces (e.g. "# User response") paint two body backgrounds.
     let leading_pad_style = fill_style;
 
     let mut spans = vec![
@@ -2434,22 +2422,23 @@ fn render_card_line_with_guide(
     SemanticLine { spans, boundary }
 }
 
-fn diff_header_style() -> Style {
-    Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
+fn diff_header_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.card_bg())
 }
 
-fn diff_header_fill_style() -> Style {
-    Style::default().bg(DIFF_CARD_BG)
+fn diff_header_fill_style(theme: Theme) -> Style {
+    Style::default().bg(theme.card_bg())
 }
 
-fn shell_card_title_style() -> Style {
+fn shell_card_title_style(theme: Theme) -> Style {
     Style::default()
-        .fg(ratatui::style::Color::Rgb(160, 170, 210))
-        .bg(DIFF_CARD_BG)
+        .fg(theme.accent)
+        .bg(theme.card_bg())
+        .add_modifier(Modifier::BOLD)
 }
 
-fn shell_card_command_style() -> Style {
-    Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_BG)
+fn shell_card_command_style(theme: Theme) -> Style {
+    Style::default().fg(theme.text).bg(theme.card_bg())
 }
 
 fn diff_line_number(number: Option<usize>) -> String {
@@ -2769,7 +2758,7 @@ fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui:
         ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
         ToolExecutionStatus::Cancelled => theme.error,
-        ToolExecutionStatus::Succeeded => theme.notice,
+        ToolExecutionStatus::Succeeded => theme.assistant,
         ToolExecutionStatus::Failed => theme.error,
     };
 
@@ -2784,7 +2773,7 @@ fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::
         ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
         ToolExecutionStatus::Cancelled => theme.error,
-        ToolExecutionStatus::Succeeded => theme.notice,
+        ToolExecutionStatus::Succeeded => theme.muted_text,
         ToolExecutionStatus::Failed => theme.error,
     };
 
@@ -2877,7 +2866,7 @@ mod tests {
             assert!(
                 line.spans[0].style
                     == Style::default()
-                        .fg(TOOL_CARD_GUIDE)
+                        .fg(Theme::dark().card_guide())
                         .bg(Theme::dark().root_bg)
                     && line.spans[1].content == "  "
                     && line.spans[1].style.bg == Some(surface)
@@ -3049,7 +3038,7 @@ mod tests {
             ),
             json!({"answers": [["Fast"]]}),
         );
-        let theme = Theme::ocean();
+        let theme = Theme::dark();
         let width = 80;
         let question_lines = render_tool_card_lines(&tool, theme, width);
         assert!(question_lines.iter().all(|line| {
@@ -3057,7 +3046,7 @@ mod tests {
                 return false;
             };
             guide.content == TOOL_GUIDE_GLYPH
-                && guide.style == Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg)
+                && guide.style == Style::default().fg(theme.card_guide()).bg(theme.root_bg)
                 && surface.first().is_some_and(|span| {
                     span.content == "  " && span.style.bg == Some(theme.element_bg)
                 })
@@ -4023,7 +4012,7 @@ mod tests {
         for line in lines.iter().skip(1) {
             let guide = line.spans.first().expect("body line has guide");
             assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
-            assert_eq!(guide.style.fg, Some(TOOL_CARD_GUIDE));
+            assert_eq!(guide.style.fg, Some(theme.card_guide()));
             assert_eq!(guide.style.bg, Some(theme.root_bg));
             assert_eq!(display_width(&line.to_string()), 80, "{line:?}");
         }
@@ -4104,7 +4093,7 @@ mod tests {
 
     #[test]
     fn shell_output_interprets_ansi_sgr_colors() {
-        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let base = root_text_style(Theme::dark()).bg(Theme::dark().card_bg());
         let segments = ansi_sgr_segments("plain \u{1b}[31mred\u{1b}[0m normal", base);
 
         assert_eq!(
@@ -4134,7 +4123,7 @@ mod tests {
 
     #[test]
     fn shell_output_drops_non_sgr_csi_from_visible_text() {
-        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let base = root_text_style(Theme::dark()).bg(Theme::dark().card_bg());
         let cases = [
             ("keep\u{1b}[2Kdone", "keepdone"),
             ("up\u{1b}[1Aline", "upline"),
@@ -4150,7 +4139,7 @@ mod tests {
 
     #[test]
     fn shell_output_strips_osc8_hyperlink_wrappers() {
-        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let base = root_text_style(Theme::dark()).bg(Theme::dark().card_bg());
         let segments = ansi_sgr_segments(
             "\u{1b}]8;;http://example.test\u{07}link\u{1b}]8;;\u{07}",
             base,
@@ -4161,7 +4150,7 @@ mod tests {
 
     #[test]
     fn shell_output_keeps_suffix_after_last_carriage_return() {
-        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let base = root_text_style(Theme::dark()).bg(Theme::dark().card_bg());
         let segments = ansi_sgr_segments("progress\rold\rnew", base);
         assert_segments_have_no_controls(&segments);
         assert_eq!(segment_texts(&segments), vec!["new"]);
@@ -4174,7 +4163,7 @@ mod tests {
 
     #[test]
     fn shell_output_drops_truncated_escape_without_leaking_esc() {
-        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let base = root_text_style(Theme::dark()).bg(Theme::dark().card_bg());
         let truncated = ansi_sgr_segments("plain\u{1b}[3", base);
         assert_segments_have_no_controls(&truncated);
         assert_eq!(segment_texts(&truncated), vec!["plain"]);

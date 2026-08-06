@@ -21,6 +21,9 @@ pub struct Theme {
     pub error: Color,
     pub approval: Color,
     pub notice: Color,
+    pub diff_add_bg: Color,
+    pub diff_delete_bg: Color,
+    pub diff_hunk_bg: Color,
 }
 
 impl Theme {
@@ -42,103 +45,22 @@ impl Theme {
             error: Color::Rgb(220, 80, 80),
             approval: Color::Rgb(220, 180, 60),
             notice: Color::Rgb(100, 100, 100),
+            diff_add_bg: Color::Rgb(22, 45, 32),
+            diff_delete_bg: Color::Rgb(54, 32, 42),
+            diff_hunk_bg: Color::Rgb(31, 40, 60),
         }
     }
 
-    pub const fn ocean() -> Self {
-        Self {
-            root_bg: Color::Rgb(10, 22, 32),
-            surface_bg: Color::Rgb(14, 31, 44),
-            element_bg: Color::Rgb(19, 41, 57),
-            elevated_bg: Color::Rgb(26, 52, 70),
-            border: Color::Rgb(48, 83, 105),
-            text: Color::Rgb(218, 234, 240),
-            muted_text: Color::Rgb(137, 169, 181),
-            dim_text: Color::Rgb(82, 114, 128),
-            accent: Color::Rgb(62, 190, 211),
-            assistant: Color::Rgb(101, 207, 171),
-            user: Color::Rgb(80, 175, 224),
-            success: Color::Rgb(105, 202, 132),
-            warning: Color::Rgb(218, 183, 96),
-            error: Color::Rgb(228, 101, 105),
-            approval: Color::Rgb(231, 187, 83),
-            notice: Color::Rgb(113, 163, 183),
-        }
+    pub const fn card_guide(self) -> Color {
+        self.border
     }
 
-    pub const fn forest() -> Self {
-        Self {
-            root_bg: Color::Rgb(17, 27, 20),
-            surface_bg: Color::Rgb(23, 36, 27),
-            element_bg: Color::Rgb(31, 47, 35),
-            elevated_bg: Color::Rgb(42, 61, 45),
-            border: Color::Rgb(70, 92, 73),
-            text: Color::Rgb(225, 232, 218),
-            muted_text: Color::Rgb(153, 171, 146),
-            dim_text: Color::Rgb(95, 115, 91),
-            accent: Color::Rgb(150, 199, 92),
-            assistant: Color::Rgb(107, 205, 139),
-            user: Color::Rgb(126, 189, 103),
-            success: Color::Rgb(111, 203, 126),
-            warning: Color::Rgb(214, 184, 91),
-            error: Color::Rgb(227, 99, 94),
-            approval: Color::Rgb(222, 184, 81),
-            notice: Color::Rgb(138, 166, 112),
-        }
-    }
-
-    pub const fn rose() -> Self {
-        Self {
-            root_bg: Color::Rgb(31, 19, 29),
-            surface_bg: Color::Rgb(43, 25, 40),
-            element_bg: Color::Rgb(57, 32, 53),
-            elevated_bg: Color::Rgb(73, 42, 67),
-            border: Color::Rgb(101, 65, 95),
-            text: Color::Rgb(239, 224, 234),
-            muted_text: Color::Rgb(186, 151, 174),
-            dim_text: Color::Rgb(122, 89, 113),
-            accent: Color::Rgb(228, 130, 181),
-            assistant: Color::Rgb(129, 203, 169),
-            user: Color::Rgb(205, 132, 219),
-            success: Color::Rgb(112, 204, 143),
-            warning: Color::Rgb(226, 180, 96),
-            error: Color::Rgb(233, 102, 112),
-            approval: Color::Rgb(232, 177, 84),
-            notice: Color::Rgb(186, 130, 168),
-        }
-    }
-
-    /// Palette aligned with OpenCode's built-in Tokyonight dark theme
-    /// (`packages/ui/src/theme/themes/tokyonight.json`).
-    pub const fn tokyonight() -> Self {
-        Self {
-            root_bg: Color::Rgb(0x1a, 0x1b, 0x26),
-            surface_bg: Color::Rgb(0x1f, 0x23, 0x35),
-            element_bg: Color::Rgb(0x24, 0x28, 0x3b),
-            elevated_bg: Color::Rgb(0x29, 0x2e, 0x42),
-            border: Color::Rgb(0x41, 0x48, 0x68),
-            text: Color::Rgb(0xc0, 0xca, 0xf5),
-            muted_text: Color::Rgb(0xa9, 0xb1, 0xd6),
-            dim_text: Color::Rgb(0x56, 0x5f, 0x89),
-            accent: Color::Rgb(0x7a, 0xa2, 0xf7),
-            assistant: Color::Rgb(0x9e, 0xce, 0x6a),
-            user: Color::Rgb(0x7d, 0xcf, 0xff),
-            success: Color::Rgb(0x9e, 0xce, 0x6a),
-            warning: Color::Rgb(0xe0, 0xaf, 0x68),
-            error: Color::Rgb(0xf7, 0x76, 0x8e),
-            approval: Color::Rgb(0xff, 0x9e, 0x64),
-            notice: Color::Rgb(0x56, 0x5f, 0x89),
-        }
+    pub const fn card_bg(self) -> Color {
+        self.element_bg
     }
 
     pub fn for_name(name: ThemeName, frame: usize) -> Self {
-        let theme = match name {
-            ThemeName::Dark | ThemeName::Rainbow => Self::dark(),
-            ThemeName::Ocean => Self::ocean(),
-            ThemeName::Forest => Self::forest(),
-            ThemeName::Rose => Self::rose(),
-            ThemeName::TokyoNight => Self::tokyonight(),
-        };
+        let theme = Self::dark();
         if name == ThemeName::Rainbow {
             theme.with_rainbow_accent(frame)
         } else {
@@ -203,34 +125,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn regular_presets_are_distinct() {
-        assert_ne!(
-            Theme::for_name(ThemeName::Dark, 0),
-            Theme::for_name(ThemeName::Ocean, 0)
-        );
-        assert_ne!(
-            Theme::for_name(ThemeName::Ocean, 0),
-            Theme::for_name(ThemeName::Forest, 0)
-        );
-        assert_ne!(
-            Theme::for_name(ThemeName::Forest, 0),
-            Theme::for_name(ThemeName::Rose, 0)
-        );
-        assert_ne!(
-            Theme::for_name(ThemeName::Rose, 0),
-            Theme::for_name(ThemeName::TokyoNight, 0)
-        );
-        assert_eq!(
-            Theme::for_name(ThemeName::TokyoNight, 0).root_bg,
-            Color::Rgb(0x1a, 0x1b, 0x26)
-        );
-        assert_eq!(
-            Theme::for_name(ThemeName::TokyoNight, 0).accent,
-            Color::Rgb(0x7a, 0xa2, 0xf7)
-        );
-    }
-
-    #[test]
     fn rainbow_cycles_accent_without_changing_error_semantics() {
         let first = Theme::for_name(ThemeName::Rainbow, 0);
         let next = Theme::for_name(ThemeName::Rainbow, 3);
@@ -242,5 +136,9 @@ mod tests {
         assert_eq!(first.error, next.error);
         assert_eq!(first.warning, next.warning);
         assert_eq!(first.success, next.success);
+        assert_eq!(
+            Theme::for_name(ThemeName::Dark, 0),
+            Theme::dark()
+        );
     }
 }

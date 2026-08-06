@@ -1341,7 +1341,7 @@ fn root_dim_style(theme: Theme) -> ratatui::style::Style {
 
 fn reasoning_label_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
-        .fg(theme.accent)
+        .fg(theme.user)
         .bg(theme.root_bg)
 }
 

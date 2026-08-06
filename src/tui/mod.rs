@@ -28,6 +28,7 @@ pub mod state;
 pub mod surface;
 pub mod terminal;
 pub mod theme;
+pub mod theme_file;
 pub mod timeline;
 pub mod transcript_ratatui;
 pub(crate) mod transcript_read_model;

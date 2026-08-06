@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -34,7 +34,10 @@ use super::state::{
     PendingQuestionState, QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
 };
 use super::terminal::OwnedTerminal;
-use super::theme::ThemeName;
+use super::theme::{Theme, ThemeName};
+use super::theme_file::{
+    discover_custom_themes, ensure_bundled_themes, load_custom_theme, normalize_theme_id,
+};
 #[cfg(test)]
 use crate::session::RunnerPermissionRequest;
 use crate::session::{RunnerQuestionRequest, SessionEngine, SessionTransportEvent};
@@ -343,7 +346,7 @@ pub struct TuiRuntime {
     assistant_delta_buffer: Option<AssistantDeltaBuffer>,
     session_title: Option<String>,
     spinner_frame: usize,
-    theme_preview_original: Option<ThemeName>,
+    theme_preview_original: Option<(String, Option<Theme>)>,
 }
 
 impl TuiRuntime {
@@ -2109,48 +2112,60 @@ impl TuiRuntime {
         TuiPreferences {
             tool_output_expanded: self.state.tool_output_expanded,
             transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
-            theme: self.state.theme_name,
+            theme: self.state.theme_id.clone(),
         }
     }
 
     fn handle_theme_command(&mut self, command: ThemeCommand) -> SubmittedCommand {
         match command {
             ThemeCommand::Show => self.show_theme_dialog(),
-            ThemeCommand::Set(theme) => self.apply_theme_selection(theme),
+            ThemeCommand::Set(theme) => self.apply_theme_selection(&theme),
         }
         SubmittedCommand::LocalOnly
     }
 
     fn show_theme_dialog(&mut self) {
-        self.theme_preview_original = Some(self.state.theme_name);
-        let items = vec![
-            DialogItem::new("dark", "Dark", Some("Neutral dark palette".into())),
-            DialogItem::new("ocean", "Ocean", Some("Cool blue and teal palette".into())),
-            DialogItem::new("forest", "Forest", Some("Natural green palette".into())),
-            DialogItem::new("rose", "Rose", Some("Warm rose palette".into())),
+        self.theme_preview_original =
+            Some((self.state.theme_id.clone(), self.state.custom_theme));
+        ensure_bundled_themes(&self.preferences_dir);
+        let mut items = vec![
             DialogItem::new(
-                "tokyonight",
-                "TokyoNight",
-                Some("OpenCode Tokyonight palette".into()),
+                "dark",
+                "Dark",
+                Some("Neutral charcoal — calm default".into()),
             ),
-            DialogItem::new("rainbow", "Rainbow", Some("Animated accent colors".into())),
+            DialogItem::new(
+                "rainbow",
+                "Rainbow",
+                Some("Animated accents — party mode".into()),
+            ),
         ];
+        for custom in discover_custom_themes(&self.preferences_dir) {
+            items.push(DialogItem::new(
+                custom.id,
+                custom.label,
+                custom.description,
+            ));
+        }
         let mut dialog = DialogState::new(
             DialogKind::ThemePicker,
             "Select theme",
             Some("Choose the TUI color palette".into()),
             items,
         );
-        dialog.selected = ThemeName::available()
+        dialog.selected = dialog
+            .items
             .iter()
-            .position(|theme| *theme == self.state.theme_name)
+            .position(|item| item.id == self.state.theme_id)
             .unwrap_or_default();
         self.state.open_dialog(dialog);
     }
 
-    fn apply_theme_selection(&mut self, theme: ThemeName) {
+    fn apply_theme_selection(&mut self, theme_id: &str) {
         self.theme_preview_original = None;
-        self.state.set_theme_name(theme);
+        if !self.activate_theme(theme_id) {
+            return;
+        }
         let prefs = self.tui_preferences();
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
             tracing::warn!(%error, "failed to save TUI preferences");
@@ -2158,19 +2173,44 @@ impl TuiRuntime {
                 .show_toast("Theme changed; preference not saved", ToastKind::Info);
         } else {
             self.state
-                .show_toast(format!("Theme: {}", theme.as_str()), ToastKind::Info);
+                .show_toast(format!("Theme: {}", self.state.theme_id), ToastKind::Info);
+        }
+    }
+
+    fn activate_theme(&mut self, theme_id: &str) -> bool {
+        let Some(id) = normalize_theme_id(theme_id) else {
+            self.state
+                .show_toast(format!("Invalid theme id: {theme_id}"), ToastKind::Error);
+            return false;
+        };
+        if let Some(builtin) = ThemeName::parse(&id) {
+            self.state.set_theme_name(builtin);
+            return true;
+        }
+        ensure_bundled_themes(&self.preferences_dir);
+        match load_custom_theme(&self.preferences_dir, &id) {
+            Ok(palette) => {
+                self.state.set_active_theme(id, Some(palette));
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, theme = %id, "failed to load custom theme");
+                self.state
+                    .show_toast(format!("Failed to load theme '{id}'"), ToastKind::Error);
+                false
+            }
         }
     }
 
     fn preview_selected_theme(&mut self) {
-        let theme = self.state.dialog().and_then(|dialog| {
+        let theme_id = self.state.dialog().and_then(|dialog| {
             (dialog.kind == DialogKind::ThemePicker)
                 .then(|| dialog.selected_item())
                 .flatten()
-                .and_then(|item| ThemeName::parse(&item.id))
+                .map(|item| item.id.clone())
         });
-        if let Some(theme) = theme {
-            self.state.set_theme_name(theme);
+        if let Some(theme_id) = theme_id {
+            let _ = self.activate_theme(&theme_id);
         }
     }
 
@@ -2182,8 +2222,8 @@ impl TuiRuntime {
         {
             return false;
         }
-        if let Some(theme) = self.theme_preview_original.take() {
-            self.state.set_theme_name(theme);
+        if let Some((theme_id, custom_theme)) = self.theme_preview_original.take() {
+            self.state.set_active_theme(theme_id, custom_theme);
         }
         self.state.close_dialog();
         true
@@ -2634,9 +2674,7 @@ impl TuiRuntime {
             }
             DialogKind::ThemePicker => {
                 self.state.close_dialog();
-                let theme = ThemeName::parse(&selected.id)
-                    .expect("theme picker items should use valid theme ids");
-                self.apply_theme_selection(theme);
+                self.apply_theme_selection(&selected.id);
                 Ok(None)
             }
             DialogKind::SessionPicker => {
@@ -3441,6 +3479,29 @@ fn truncate_dialog_text(text: &str) -> String {
     out
 }
 
+fn apply_preferences_theme(state: &mut TuiState, preferences_dir: &Path, theme_id: &str) {
+    let Some(id) = normalize_theme_id(theme_id) else {
+        state.set_theme_name(ThemeName::Dark);
+        return;
+    };
+    if let Some(builtin) = ThemeName::parse(&id) {
+        state.set_theme_name(builtin);
+        return;
+    }
+    ensure_bundled_themes(preferences_dir);
+    match load_custom_theme(preferences_dir, &id) {
+        Ok(palette) => state.set_active_theme(id, Some(palette)),
+        Err(error) => {
+            tracing::warn!(%error, theme = %id, "failed to load preferred custom theme");
+            state.set_theme_name(ThemeName::Dark);
+            state.show_toast(
+                format!("Theme '{id}' unavailable; using dark"),
+                ToastKind::Info,
+            );
+        }
+    }
+}
+
 pub async fn run_tui(
     mut engine: SessionEngine,
     projection: crate::session::SessionEngineProjection,
@@ -3462,7 +3523,7 @@ pub async fn run_tui(
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
-    state.set_theme_name(preferences.theme);
+    apply_preferences_theme(&mut state, &preferences_dir, &preferences.theme);
     state.set_provider_label(provider_label);
     state.set_fast_mode_enabled(projection.fast_mode_enabled);
 

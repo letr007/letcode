@@ -931,7 +931,8 @@ pub struct TuiState {
     pub child_navigation_prefix_ticks_remaining: u8,
     pub tool_output_expanded: bool,
     pub tool_output_overrides: HashMap<String, bool>,
-    pub theme_name: ThemeName,
+    pub theme_id: String,
+    pub custom_theme: Option<Theme>,
     pub transcript_render_cache: TranscriptRenderCache,
     pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
     /// Composer caret cell for OS IME candidate anchoring after paint.
@@ -1005,7 +1006,8 @@ impl Default for TuiState {
             child_navigation_prefix_ticks_remaining: 0,
             tool_output_expanded: false,
             tool_output_overrides: HashMap::new(),
-            theme_name: ThemeName::default(),
+            theme_id: ThemeName::default().as_str().to_string(),
+            custom_theme: None,
             transcript_render_cache: TranscriptRenderCache::default(),
             frame_hyperlink_cells: Vec::new(),
             ime_cursor_anchor: None,
@@ -1068,16 +1070,29 @@ impl TuiState {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::for_name(self.theme_name, self.status_spinner_frame)
+        if let Some(builtin) = ThemeName::parse(&self.theme_id) {
+            Theme::for_name(builtin, self.status_spinner_frame)
+        } else {
+            self.custom_theme.unwrap_or_else(Theme::dark)
+        }
     }
 
     pub fn transcript_theme(&self) -> Theme {
-        Theme::for_name(self.theme_name, 0)
+        if let Some(builtin) = ThemeName::parse(&self.theme_id) {
+            Theme::for_name(builtin, 0)
+        } else {
+            self.custom_theme.unwrap_or_else(Theme::dark)
+        }
     }
 
     pub fn set_theme_name(&mut self, theme_name: ThemeName) {
-        if self.theme_name != theme_name {
-            self.theme_name = theme_name;
+        self.set_active_theme(theme_name.as_str().to_string(), None);
+    }
+
+    pub fn set_active_theme(&mut self, theme_id: String, custom_theme: Option<Theme>) {
+        if self.theme_id != theme_id || self.custom_theme != custom_theme {
+            self.theme_id = theme_id;
+            self.custom_theme = custom_theme;
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }
