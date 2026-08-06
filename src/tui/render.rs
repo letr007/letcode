@@ -26,6 +26,37 @@ const WELCOME_ART_RIGHT: &[&str] = &[
     "█    █  █ █  █ █▀▀▀",
     "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
 ];
+const EXIT_EPILOGUE_TITLE_CHARS: usize = 50;
+
+/// Plain-text exit banner for the restored main screen (logo + resume hint).
+pub(crate) fn format_exit_epilogue(session_id: &str, session_title: Option<&str>) -> String {
+    let mut lines = WELCOME_ART_LEFT
+        .iter()
+        .zip(WELCOME_ART_RIGHT.iter())
+        .map(|(left, right)| format!("{left} {right}"))
+        .collect::<Vec<_>>();
+    lines.push(String::new());
+
+    let title = session_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(session_id);
+    let title = truncate_chars(title, EXIT_EPILOGUE_TITLE_CHARS);
+    lines.push(format!("  {:<10}{title}", "Session"));
+    lines.push(format!("  {:<10}/resume {session_id}", "Continue"));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let kept = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{kept}…")
+    } else {
+        kept
+    }
+}
 /// Render the TUI from the current state using ratatui widgets only.
 ///
 /// Rendering may refresh viewport bookkeeping, but it never invokes tools, resolves permissions,
@@ -983,6 +1014,14 @@ mod tests {
         layout::{Position, Rect},
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn exit_epilogue_includes_logo_session_and_resume() {
+        let text = format_exit_epilogue("sess-1", Some("Build feature"));
+        assert!(text.contains("█▀▀█"), "{text}");
+        assert!(text.contains("Session   Build feature"), "{text}");
+        assert!(text.contains("Continue  /resume sess-1"), "{text}");
+    }
 
     fn sample_context_state() -> crate::tui::state::ContextPaneState {
         let tree = ContextTreeState::replay(&[ContextTreeOp::CreateNode {

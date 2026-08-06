@@ -1784,9 +1784,7 @@ fn render_diff_side(
         )];
     };
 
-    let gutter_style = Style::default()
-        .fg(theme.muted_text)
-        .bg(theme.card_bg());
+    let gutter_style = Style::default().fg(theme.muted_text).bg(theme.card_bg());
     let gutter_pad_style = Style::default().bg(theme.card_bg());
     let content_style = diff_line_style(content, theme);
     let pad_style = Style::default().bg(content_style.bg.unwrap_or(theme.card_bg()));
@@ -1913,7 +1911,8 @@ fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, Style)> {
                             if !current_text.is_empty() {
                                 segments.push((std::mem::take(&mut current_text), current_style));
                             }
-                            current_style = apply_sgr_sequence(&sequence, base_style, current_style);
+                            current_style =
+                                apply_sgr_sequence(&sequence, base_style, current_style);
                         }
                         CsiOutcome::Other | CsiOutcome::Incomplete => {}
                     }
@@ -2237,9 +2236,7 @@ fn diff_line_style(line: &str, theme: Theme) -> Style {
     } else if line.starts_with('-') {
         Style::default().fg(theme.text).bg(theme.diff_delete_bg)
     } else if line.starts_with("@@") {
-        Style::default()
-            .fg(theme.user)
-            .bg(theme.diff_hunk_bg)
+        Style::default().fg(theme.user).bg(theme.diff_hunk_bg)
     } else {
         Style::default().fg(theme.text).bg(theme.card_bg())
     }
@@ -2275,9 +2272,7 @@ fn render_diff_card_body_line(
     theme: Theme,
     width: usize,
 ) -> SemanticLine<Style> {
-    let gutter_style = Style::default()
-        .fg(theme.muted_text)
-        .bg(theme.card_bg());
+    let gutter_style = Style::default().fg(theme.muted_text).bg(theme.card_bg());
     let number = diff_line_number(new_no.or(old_no));
     let bg = content_style.bg.unwrap_or(theme.card_bg());
     let pad_style = Style::default().bg(bg);
@@ -2317,23 +2312,17 @@ fn diff_marker_and_body(content: &str, theme: Theme) -> (String, String, Style) 
         Some('+') if !content.starts_with("+++") => (
             "+".to_string(),
             content.chars().skip(1).collect(),
-            Style::default()
-                .fg(theme.success)
-                .bg(theme.card_bg()),
+            Style::default().fg(theme.success).bg(theme.card_bg()),
         ),
         Some('-') if !content.starts_with("---") => (
             "-".to_string(),
             content.chars().skip(1).collect(),
-            Style::default()
-                .fg(theme.error)
-                .bg(theme.card_bg()),
+            Style::default().fg(theme.error).bg(theme.card_bg()),
         ),
         _ => (
             " ".to_string(),
             content.to_string(),
-            Style::default()
-                .fg(theme.muted_text)
-                .bg(theme.card_bg()),
+            Style::default().fg(theme.muted_text).bg(theme.card_bg()),
         ),
     }
 }
@@ -4133,7 +4122,11 @@ mod tests {
         for (input, expected) in cases {
             let segments = ansi_sgr_segments(input, base);
             assert_segments_have_no_controls(&segments);
-            assert_eq!(segment_texts(&segments).join(""), expected, "input={input:?}");
+            assert_eq!(
+                segment_texts(&segments).join(""),
+                expected,
+                "input={input:?}"
+            );
         }
     }
 

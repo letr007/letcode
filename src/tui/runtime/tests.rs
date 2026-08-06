@@ -3951,10 +3951,7 @@ accent = "#ff6600"
             .expect("advance to custom theme");
     }
     assert_eq!(runtime.state().theme_id, "sunset");
-    assert_eq!(
-        runtime.state().theme().accent,
-        Color::Rgb(255, 102, 0)
-    );
+    assert_eq!(runtime.state().theme().accent, Color::Rgb(255, 102, 0));
 
     fs::write(
         &theme_path,
@@ -3972,10 +3969,7 @@ accent = "#00aaff"
         .handle_input_action(InputAction::DialogNext)
         .expect("reselect custom");
     assert_eq!(runtime.state().theme_id, "sunset");
-    assert_eq!(
-        runtime.state().theme().accent,
-        Color::Rgb(0, 170, 255)
-    );
+    assert_eq!(runtime.state().theme().accent, Color::Rgb(0, 170, 255));
 
     runtime
         .handle_input_action(InputAction::DialogAccept)

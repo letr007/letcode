@@ -3138,7 +3138,9 @@ mod tests {
 
         assert_eq!(
             state.transcript_click_target(0, 0),
-            Some(TranscriptClickTarget::OpenUrl("https://example.test".into()))
+            Some(TranscriptClickTarget::OpenUrl(
+                "https://example.test".into()
+            ))
         );
     }
 

@@ -946,9 +946,7 @@ mod tests {
         );
         assert_eq!(
             parse_command("/theme tokyonight"),
-            Ok(CommandIntent::Theme(ThemeCommand::Set(
-                "tokyonight".into()
-            )))
+            Ok(CommandIntent::Theme(ThemeCommand::Set("tokyonight".into())))
         );
         assert_eq!(
             parse_command("/theme sunset"),

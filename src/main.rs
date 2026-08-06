@@ -43,7 +43,6 @@ use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace::{
     SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor,
 };
-use permission::PermissionMode;
 use skills::SkillRegistry;
 use std::collections::HashMap;
 use std::env;
@@ -160,11 +159,6 @@ async fn main() -> Result<()> {
     install_expert_route_factory(&mut agent, &config)?;
     let skill_registry = Arc::new(SkillRegistry::load(&config.config_dir, &workspace_dir)?);
     agent.register_skill_registry(skill_registry.clone())?;
-    if matches!(config.permissions.mode, PermissionMode::Yolo) {
-        eprintln!(
-            "warning: permissions.mode is set to 'yolo'; write and command tools will run without confirmation"
-        );
-    }
     let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(
         &config.global.sessions_dir,
     )?));

@@ -691,8 +691,10 @@ impl TuiRuntime {
             }
             Ok(Err(error)) => {
                 self.session_list_rx = None;
-                self.state
-                    .show_toast(format!("Failed to list sessions: {error}"), ToastKind::Error);
+                self.state.show_toast(
+                    format!("Failed to list sessions: {error}"),
+                    ToastKind::Error,
+                );
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -2125,8 +2127,7 @@ impl TuiRuntime {
     }
 
     fn show_theme_dialog(&mut self) {
-        self.theme_preview_original =
-            Some((self.state.theme_id.clone(), self.state.custom_theme));
+        self.theme_preview_original = Some((self.state.theme_id.clone(), self.state.custom_theme));
         ensure_bundled_themes(&self.preferences_dir);
         let mut items = vec![
             DialogItem::new(
@@ -2141,11 +2142,7 @@ impl TuiRuntime {
             ),
         ];
         for custom in discover_custom_themes(&self.preferences_dir) {
-            items.push(DialogItem::new(
-                custom.id,
-                custom.label,
-                custom.description,
-            ));
+            items.push(DialogItem::new(custom.id, custom.label, custom.description));
         }
         let mut dialog = DialogState::new(
             DialogKind::ThemePicker,
@@ -2896,10 +2893,7 @@ impl TuiRuntime {
         match self.state.transcript_click_target(col, row) {
             Some(TranscriptClickTarget::OpenUrl(url)) if activate_link => {
                 if let Err(error) = super::transcript_ratatui::open_hyperlink_url(&url) {
-                    self.show_toast(
-                        format!("Failed to open link: {error}"),
-                        ToastKind::Error,
-                    );
+                    self.show_toast(format!("Failed to open link: {error}"), ToastKind::Error);
                 }
             }
             Some(TranscriptClickTarget::OpenUrl(_)) => {}
@@ -3546,6 +3540,7 @@ pub async fn run_tui(
 
     let ingress = engine.take_ingress();
     let session_transport_rx = engine.take_event_egress().into_receiver();
+    let mut exit_epilogue = None;
     let tui_result = async {
         let mut runtime = TuiRuntime::new(
             state,
@@ -3569,6 +3564,12 @@ pub async fn run_tui(
             runtime.draw(&mut drawer)?;
 
             if runtime.state().quit_requested {
+                if let Some(session_id) = runtime.state().session_id.as_deref() {
+                    exit_epilogue = Some(super::render::format_exit_epilogue(
+                        session_id,
+                        runtime.session_title.as_deref(),
+                    ));
+                }
                 break;
             }
             if event::poll(TUI_FRAME_POLL_INTERVAL)? {
@@ -3616,6 +3617,11 @@ pub async fn run_tui(
         Ok(())
     }
     .await;
+
+    // Terminal has left the alternate screen; print into normal scrollback.
+    if let Some(epilogue) = exit_epilogue {
+        println!("{epilogue}");
+    }
 
     let shutdown_result = ingress.shutdown().map_err(Into::into);
     drop(ingress);

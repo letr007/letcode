@@ -136,9 +136,6 @@ mod tests {
         assert_eq!(first.error, next.error);
         assert_eq!(first.warning, next.warning);
         assert_eq!(first.success, next.success);
-        assert_eq!(
-            Theme::for_name(ThemeName::Dark, 0),
-            Theme::dark()
-        );
+        assert_eq!(Theme::for_name(ThemeName::Dark, 0), Theme::dark());
     }
 }

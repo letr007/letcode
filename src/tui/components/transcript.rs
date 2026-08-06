@@ -887,13 +887,30 @@ fn build_user_message(
             boundary,
         );
     }
-    if !pushed && message.attachments.is_empty() {
+    if !pushed && message.attachments.is_empty() && message.selected_skills.is_empty() {
         push_user_card_content_line_into(
             out,
             vec![(
                 RenderSpan::decoration("", user_prompt_panel_style(theme)),
                 false,
             )],
+            None,
+            width,
+            theme,
+            Break::SoftWrap,
+        );
+    }
+
+    if !message.selected_skills.is_empty() {
+        push_user_card_line_into(out, "", Some("SKILLS"), width, theme, None);
+    }
+
+    for (index, name) in message.selected_skills.iter().enumerate() {
+        let skill_text = transcript_skill_text(index, name, content_width);
+        let skill_block = out.add_source(skill_text.clone());
+        push_user_card_content_line_into(
+            out,
+            transcript_skill_item_render_spans(index, &skill_text, skill_block, theme),
             None,
             width,
             theme,
@@ -1191,6 +1208,77 @@ fn card_bar_style(
     bg: ratatui::style::Color,
 ) -> ratatui::style::Style {
     ratatui::style::Style::default().fg(accent).bg(bg)
+}
+
+fn transcript_skill_text(index: usize, name: &str, content_width: usize) -> String {
+    let title = format!("skill {}", index + 1);
+    let prefix_width = display_width(&format!("{title} · "));
+    let detail = one_line_snippet(
+        name.trim(),
+        content_width.saturating_sub(prefix_width + 2).max(1),
+    );
+
+    if detail.is_empty() {
+        title
+    } else {
+        format!("{title} · {detail}")
+    }
+}
+
+fn transcript_skill_item_render_spans(
+    index: usize,
+    skill_text: &str,
+    block_index: usize,
+    theme: Theme,
+) -> Vec<(RenderSpan<ratatui::style::Style>, bool)> {
+    let title = format!("skill {}", index + 1);
+    let detail = skill_text
+        .strip_prefix(&title)
+        .unwrap_or(skill_text)
+        .trim_start()
+        .trim_start_matches('·')
+        .trim_start()
+        .to_string();
+
+    let title_len = title.chars().count();
+    let mut spans = vec![
+        (
+            RenderSpan::decoration("↳ ", user_prompt_padding_style(theme)),
+            false,
+        ),
+        (
+            RenderSpan::source(
+                title,
+                attachment_block_title_style(theme),
+                SourceRange::new(block_index, 0, title_len),
+            ),
+            true,
+        ),
+    ];
+    if !detail.is_empty() {
+        let detail_start = skill_text
+            .chars()
+            .count()
+            .saturating_sub(detail.chars().count());
+        spans.push((
+            RenderSpan::decoration(" · ", user_prompt_padding_style(theme)),
+            false,
+        ));
+        spans.push((
+            RenderSpan::source_with_join(
+                detail.clone(),
+                attachment_block_item_style(theme),
+                SourceRange::new(
+                    block_index,
+                    detail_start,
+                    detail_start + detail.chars().count(),
+                ),
+                CopyJoin::Space,
+            ),
+            true,
+        ));
+    }
+    spans
 }
 
 fn transcript_attachment_text(
@@ -2696,6 +2784,40 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("image 1") && line.contains("clipboard")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn user_message_renders_selected_skills_beneath_body() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::UserMessage(
+            UserMessageEvent::from_submission(UserMessageSubmission::new(
+                "user-with-skill",
+                UserMessageContent::from("use this skill")
+                    .with_selected_skills(vec!["rust-audit".into()]),
+            )),
+        ));
+
+        let lines = transcript_lines(&state, Theme::dark(), 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let body_index = lines
+            .iter()
+            .position(|line| line.contains("use this skill"))
+            .expect("message body line");
+        let skills_index = lines
+            .iter()
+            .position(|line| line.contains("SKILLS"))
+            .expect("skills badge line");
+
+        assert!(skills_index > body_index, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("skill 1") && line.contains("rust-audit")),
             "{lines:?}"
         );
     }

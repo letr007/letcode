@@ -23,8 +23,7 @@ const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_RESOURCE_BYTES: u64 = MAX_SKILL_MD_BYTES;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const BUILTIN_SKILL_LOCATION: &str = "<built-in>";
-const CUSTOMIZE_LETCODE_SKILL_CONTENT: &str =
-    include_str!("../skills/customize-letcode/SKILL.md");
+const CUSTOMIZE_LETCODE_SKILL_CONTENT: &str = include_str!("../skills/customize-letcode/SKILL.md");
 
 /// Extract persisted successful skill material without consulting the registry.
 /// `None` means this was not a successful `skill` result.
@@ -1675,7 +1674,7 @@ mod tests {
             result["content"]
                 .as_str()
                 .expect("content str")
-                .contains("# Customizing letcode")
+                .contains("# 定制 letcode")
         );
         assert_eq!(result["files"], json!([]));
     }

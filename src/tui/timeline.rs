@@ -203,6 +203,7 @@ pub struct MessageView {
     pub role: MessageRole,
     pub text: String,
     pub attachments: Vec<UserImageAttachment>,
+    pub selected_skills: Vec<String>,
     pub streaming: bool,
     pub queued: bool,
 }
@@ -210,11 +211,16 @@ pub struct MessageView {
 #[cfg(test)]
 impl MessageView {
     pub fn display_text(&self) -> String {
-        if self.attachments.is_empty() {
+        if self.attachments.is_empty() && self.selected_skills.is_empty() {
             return self.text.clone();
         }
 
         let mut lines = Vec::new();
+        lines.extend(
+            self.selected_skills
+                .iter()
+                .map(|name| format!("[Skill: {name}]")),
+        );
         if !self.text.is_empty() {
             lines.push(self.text.clone());
         }
@@ -449,6 +455,7 @@ impl Timeline {
                     role: MessageRole::User,
                     text: message.content,
                     attachments: Vec::new(),
+                    selected_skills: Vec::new(),
                     streaming: false,
                     queued: false,
                 })),
@@ -461,6 +468,7 @@ impl Timeline {
                         role: MessageRole::Assistant,
                         text: message.content,
                         attachments: Vec::new(),
+                        selected_skills: Vec::new(),
                         streaming: false,
                         queued: false,
                     }))
@@ -546,6 +554,7 @@ impl Timeline {
             role: MessageRole::User,
             text: event.content.text,
             attachments: event.content.attachments,
+            selected_skills: event.content.selected_skills,
             streaming: false,
             queued: event.queued,
         }));
@@ -559,6 +568,7 @@ impl Timeline {
                 role,
                 text,
                 attachments: Vec::new(),
+                selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
             }),
@@ -568,6 +578,7 @@ impl Timeline {
                 role,
                 text,
                 attachments: Vec::new(),
+                selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
             }),
@@ -598,6 +609,7 @@ impl Timeline {
             role: MessageRole::Assistant,
             text: event.delta,
             attachments: Vec::new(),
+            selected_skills: Vec::new(),
             streaming: true,
             queued: false,
         }));

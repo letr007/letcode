@@ -2223,8 +2223,7 @@ fn summarize_session_file(path: &Path, session_id: String) -> Result<Option<Sess
     let mut pending: Option<Vec<TranscriptRecord>> = None;
 
     for line in reader.lines() {
-        let line = line
-            .with_context(|| format!("failed to read transcript {}", path.display()))?;
+        let line = line.with_context(|| format!("failed to read transcript {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -2233,9 +2232,7 @@ fn summarize_session_file(path: &Path, session_id: String) -> Result<Option<Sess
             Ok(ParsedJournalLine::Record(entry)) => {
                 let transactional = transaction_fields(&entry.v1)?.is_some();
                 if transactional {
-                    pending
-                        .get_or_insert_with(Vec::new)
-                        .push(entry.record);
+                    pending.get_or_insert_with(Vec::new).push(entry.record);
                 } else {
                     // A non-transactional record closes any incomplete transaction tail.
                     pending = None;
@@ -2250,9 +2247,8 @@ fn summarize_session_file(path: &Path, session_id: String) -> Result<Option<Sess
                 }
             }
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to parse transcript {}", path.display())
-                });
+                return Err(error)
+                    .with_context(|| format!("failed to parse transcript {}", path.display()));
             }
         }
     }

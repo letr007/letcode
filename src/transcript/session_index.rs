@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{SessionSummary, TranscriptRecord, TranscriptEvent, summarize_text};
+use super::{SessionSummary, TranscriptEvent, TranscriptRecord, summarize_text};
 
 const INDEX_FILE: &str = "sessions-index.json";
 const INDEX_VERSION: u32 = 1;
@@ -152,10 +152,7 @@ pub(super) fn upsert_from_record(transcript_path: &Path, record: &TranscriptReco
         return;
     };
     let mut index = load_index(base_dir);
-    let entry = index
-        .sessions
-        .entry(record.session_id.clone())
-        .or_default();
+    let entry = index.sessions.entry(record.session_id.clone()).or_default();
     entry.apply_record(record);
     entry.refresh_stamp(transcript_path);
     let _ = save_index(base_dir, &index);
@@ -256,8 +253,7 @@ pub(super) fn list_sessions_with_index(
         }
     }
 
-    let live: std::collections::HashSet<&str> =
-        live_ids.iter().map(String::as_str).collect();
+    let live: std::collections::HashSet<&str> = live_ids.iter().map(String::as_str).collect();
     let before = index.sessions.len();
     index.sessions.retain(|id, _| live.contains(id.as_str()));
     if index.sessions.len() != before {
