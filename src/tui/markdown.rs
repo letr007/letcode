@@ -245,12 +245,11 @@ impl MarkdownRenderer {
                 if let Some(dest_url) = self.inline.links.pop()
                     && !dest_url.is_empty()
                 {
+                    // Destination is display/copy only. Jump stays on the underlined label.
                     self.push_styled_with_interaction(
                         &format!(" <{dest_url}>"),
                         link_dest_style(self.theme),
-                        Some(crate::tui::transcript_render::Interaction::OpenUrl(
-                            dest_url,
-                        )),
+                        None,
                     );
                 }
             }
@@ -1168,8 +1167,17 @@ mod tests {
                 .lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .filter(|span| span.text.contains("link") || span.text.contains("example"))
+                .filter(|span| span.text.contains("link") || span.text.contains("label"))
                 .all(|span| span.interaction.is_some())
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.text.contains('<') || span.text.contains("example"))
+                .all(|span| span.interaction.is_none()),
+            "destination suffix must not be jumpable: {document:?}"
         );
     }
 

@@ -38,6 +38,10 @@ pub fn project_runtime_restore_snapshot_with_children(
     let resolved =
         project_runtime_restore_snapshot(session_id.clone(), records.clone(), cursor.clone(), &[])?;
     let children = list_child_sessions_for_parent(sessions_dir.as_ref(), &resolved.records);
+    if children.is_empty() {
+        // Common case: skip a second full projection when there is nothing to attach.
+        return Ok(resolved);
+    }
     project_runtime_restore_snapshot(session_id, records, cursor, &children)
 }
 

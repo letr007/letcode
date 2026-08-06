@@ -213,7 +213,12 @@ pub fn resolve_session_prefix(
     if query.is_empty() {
         return Err(ResolveSessionError::EmptyQuery);
     }
-    let sessions = list_sessions(sessions_dir.as_ref()).map_err(ResolveSessionError::ListFailed)?;
+    let sessions_dir = sessions_dir.as_ref();
+    // Exact id (picker selection) must not pay for a full directory scan.
+    if sessions_dir.join(format!("{query}.jsonl")).is_file() {
+        return Ok(query.to_string());
+    }
+    let sessions = list_sessions(sessions_dir).map_err(ResolveSessionError::ListFailed)?;
     match resolve_session_id(&sessions, query) {
         Ok(session_id) => Ok(session_id),
         Err(matches) if matches.is_empty() => Err(ResolveSessionError::NotFound {

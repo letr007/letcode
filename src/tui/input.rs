@@ -38,7 +38,8 @@ pub enum InputAction {
     MouseScrollDown,
     MouseSelectionStart(u16, u16),
     MouseSelectionDrag(u16, u16),
-    MouseSelectionEnd(u16, u16),
+    /// Third flag is true when Ctrl/Cmd is held — used to activate underlined links.
+    MouseSelectionEnd(u16, u16, bool),
     CopySelection,
     ClearSelection,
     CycleReasoningEffort,
@@ -401,9 +402,12 @@ pub fn map_mouse_event(_state: &TuiState, mouse: MouseEvent) -> InputAction {
             InputAction::MouseSelectionDrag(mouse.column, mouse.row)
         }
 
-        // 左键松开：结束选择
+        // 左键松开：结束选择；Ctrl/Cmd+click 才激活链接跳转
         MouseEventKind::Up(MouseButton::Left) => {
-            InputAction::MouseSelectionEnd(mouse.column, mouse.row)
+            let activate_link = mouse
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+            InputAction::MouseSelectionEnd(mouse.column, mouse.row, activate_link)
         }
 
         _ => InputAction::NoOp,
@@ -1059,7 +1063,31 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 }
             ),
-            InputAction::MouseSelectionEnd(20, 15)
+            InputAction::MouseSelectionEnd(20, 15, false)
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    column: 20,
+                    row: 15,
+                    modifiers: KeyModifiers::CONTROL,
+                }
+            ),
+            InputAction::MouseSelectionEnd(20, 15, true)
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    column: 20,
+                    row: 15,
+                    modifiers: KeyModifiers::SUPER,
+                }
+            ),
+            InputAction::MouseSelectionEnd(20, 15, true)
         );
     }
 

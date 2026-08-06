@@ -75,6 +75,7 @@ pub struct TextSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptClickTarget {
+    OpenUrl(String),
     ToolCard(String),
 }
 
@@ -2383,8 +2384,11 @@ impl TuiState {
         for span in &line.spans {
             let span_width = crate::tui::measure::display_width(&span.text) as u16;
             if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
-                if matches!(span.interaction, Some(Interaction::OpenUrl(_))) {
-                    return None;
+                if let Some(Interaction::OpenUrl(url)) = &span.interaction {
+                    // Mouse capture owns the click; return the URL so the runtime
+                    // can open it. Unsafe targets stay inert and still block tool-card toggles.
+                    return crate::tui::transcript_ratatui::safe_hyperlink_url(url)
+                        .then(|| TranscriptClickTarget::OpenUrl(url.clone()));
                 }
                 break;
             }
@@ -3075,7 +3079,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_link_click_does_not_toggle_its_tool_card() {
+    fn markdown_link_label_is_open_url_click_target() {
         let mut state = TuiState::default();
         state.last_transcript_area = ratatui::layout::Rect::new(0, 0, 8, 1);
         let mut document = crate::tui::transcript_render::Document::default();
@@ -3113,7 +3117,10 @@ mod tests {
                 "run",
             ));
 
-        assert_eq!(state.transcript_click_target(0, 0), None);
+        assert_eq!(
+            state.transcript_click_target(0, 0),
+            Some(TranscriptClickTarget::OpenUrl("https://example.test".into()))
+        );
     }
 
     #[test]

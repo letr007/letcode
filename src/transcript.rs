@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +30,7 @@ use crate::tool::ToolResult;
 use crate::user_content::UserMessageContent;
 
 mod model;
+mod session_index;
 
 pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
 
@@ -1421,6 +1422,7 @@ impl TranscriptRecorder {
             return Err(error.into());
         }
         self.sequence = sequence;
+        session_index::upsert_from_record(&self.path, &envelope.record);
         Ok(())
     }
 
@@ -1451,6 +1453,7 @@ impl TranscriptRecorder {
         );
         let timestamp_ms = unix_timestamp_ms();
         let mut payload = Vec::new();
+        let mut index_records = Vec::with_capacity(count);
         for (index, (event, context_branch_id)) in events.into_iter().enumerate() {
             let sequence = base_revision + u64::try_from(index).unwrap() + 1;
             let record = TranscriptRecord {
@@ -1460,6 +1463,7 @@ impl TranscriptRecorder {
                 context_branch_id,
                 event,
             };
+            index_records.push(record.clone());
             let envelope = JournalRecordV1 {
                 schema_version: JOURNAL_SCHEMA_VERSION,
                 event_id: format!("{}:{sequence}", self.session_id),
@@ -1500,6 +1504,7 @@ impl TranscriptRecorder {
             return Err(error.into());
         }
         self.sequence = resulting_revision;
+        session_index::upsert_from_records(&self.path, &index_records);
         Ok(())
     }
 }
@@ -2106,6 +2111,7 @@ fn journal_scope_for(record: &TranscriptRecord) -> JournalScope {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: String,
     pub record_count: usize,
@@ -2169,60 +2175,102 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
         return Ok(Vec::new());
     }
 
-    let mut sessions = Vec::new();
+    session_index::list_sessions_with_index(base_dir, summarize_session_file)
+}
 
-    for entry in fs::read_dir(base_dir)? {
-        let entry = entry?;
-        let path = entry.path();
+#[derive(Default)]
+struct SessionSummaryAcc {
+    record_count: usize,
+    first_timestamp_ms: Option<u128>,
+    last_timestamp_ms: Option<u128>,
+    model: Option<String>,
+    title: Option<String>,
+    last_user_summary: Option<String>,
+    last_assistant_summary: Option<String>,
+    has_content: bool,
+}
 
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+fn fold_session_summary(acc: &mut SessionSummaryAcc, record: &TranscriptRecord) {
+    acc.record_count = acc.record_count.saturating_add(1);
+    if acc.first_timestamp_ms.is_none() {
+        acc.first_timestamp_ms = Some(record.timestamp_ms);
+    }
+    acc.last_timestamp_ms = Some(record.timestamp_ms);
+    match &record.event {
+        TranscriptEvent::SessionStarted { model } => acc.model = Some(model.clone()),
+        TranscriptEvent::ModelChanged { new_model, .. } => acc.model = Some(new_model.clone()),
+        TranscriptEvent::SessionTitle { title } => acc.title = Some(title.clone()),
+        TranscriptEvent::UserMessage { content } => {
+            acc.has_content = true;
+            acc.last_user_summary = Some(summarize_text(&content.display_text()));
+        }
+        TranscriptEvent::AssistantMessage { content } => {
+            acc.has_content = true;
+            acc.last_assistant_summary = Some(summarize_text(content));
+        }
+        event if event.is_session_content() => acc.has_content = true,
+        _ => {}
+    }
+}
+
+/// Lightweight listing scan: stream lines, accept committed transactions without
+/// digest/revision hardening, and never retain the full record list.
+fn summarize_session_file(path: &Path, session_id: String) -> Result<Option<SessionSummary>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut acc = SessionSummaryAcc::default();
+    let mut pending: Option<Vec<TranscriptRecord>> = None;
+
+    for line in reader.lines() {
+        let line = line
+            .with_context(|| format!("failed to read transcript {}", path.display()))?;
+        if line.trim().is_empty() {
             continue;
         }
 
-        let session_id = match path.file_stem().and_then(|stem| stem.to_str()) {
-            Some(session_id) => session_id.to_string(),
-            None => continue,
-        };
-
-        let records = read_records(&path)?;
-        if !has_session_content(&records) {
-            continue;
-        }
-
-        let first_timestamp_ms = records.first().map(|record| record.timestamp_ms);
-        let last_timestamp_ms = records.last().map(|record| record.timestamp_ms);
-        let model = restore_latest_model(&records);
-        let title = records.iter().rev().find_map(|record| match &record.event {
-            TranscriptEvent::SessionTitle { title } => Some(title.clone()),
-            _ => None,
-        });
-        let last_user_summary = records.iter().rev().find_map(|record| match &record.event {
-            TranscriptEvent::UserMessage { content } => {
-                Some(summarize_text(&content.display_text()))
+        match parse_journal_line(&line) {
+            Ok(ParsedJournalLine::Record(entry)) => {
+                let transactional = transaction_fields(&entry.v1)?.is_some();
+                if transactional {
+                    pending
+                        .get_or_insert_with(Vec::new)
+                        .push(entry.record);
+                } else {
+                    // A non-transactional record closes any incomplete transaction tail.
+                    pending = None;
+                    fold_session_summary(&mut acc, &entry.record);
+                }
             }
-            _ => None,
-        });
-        let last_assistant_summary = records.iter().rev().find_map(|record| match &record.event {
-            TranscriptEvent::AssistantMessage { content } => Some(summarize_text(content)),
-            _ => None,
-        });
-
-        sessions.push(SessionSummary {
-            session_id,
-            record_count: records.len(),
-            first_timestamp_ms,
-            last_timestamp_ms,
-            model,
-            title,
-            last_user_summary,
-            last_assistant_summary,
-        });
+            Ok(ParsedJournalLine::Commit(_)) => {
+                if let Some(entries) = pending.take() {
+                    for record in entries {
+                        fold_session_summary(&mut acc, &record);
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to parse transcript {}", path.display())
+                });
+            }
+        }
     }
 
-    sessions.sort_by_key(|session| session.last_timestamp_ms.unwrap_or(0));
-    sessions.reverse();
+    if !acc.has_content {
+        return Ok(None);
+    }
 
-    Ok(sessions)
+    Ok(Some(SessionSummary {
+        session_id,
+        record_count: acc.record_count,
+        first_timestamp_ms: acc.first_timestamp_ms,
+        last_timestamp_ms: acc.last_timestamp_ms,
+        model: acc.model,
+        title: acc.title,
+        last_user_summary: acc.last_user_summary,
+        last_assistant_summary: acc.last_assistant_summary,
+    }))
 }
 
 pub fn list_child_sessions_for_parent(
@@ -2415,7 +2463,7 @@ impl TranscriptEvent {
         )
     }
 
-    fn is_session_content(&self) -> bool {
+    pub(crate) fn is_session_content(&self) -> bool {
         matches!(
             self,
             Self::UserMessage { .. }
@@ -2722,12 +2770,19 @@ pub fn remove_empty_session_file(path: impl AsRef<Path>) -> Result<bool> {
         return Ok(false);
     }
 
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string);
     fs::remove_file(path).with_context(|| {
         format!(
             "failed to remove empty session transcript '{}'",
             path.display()
         )
     })?;
+    if let (Some(base_dir), Some(session_id)) = (path.parent(), session_id) {
+        session_index::remove_session(base_dir, &session_id);
+    }
     Ok(true)
 }
 
@@ -2769,7 +2824,7 @@ fn unix_timestamp_ms() -> u128 {
         .as_millis()
 }
 
-fn summarize_text(content: &str) -> String {
+pub(crate) fn summarize_text(content: &str) -> String {
     let single_line = content.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_text(&single_line, 80)
 }

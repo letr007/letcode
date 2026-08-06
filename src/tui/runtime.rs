@@ -15,10 +15,9 @@ use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::skills::SkillCard;
-#[cfg(test)]
-use crate::transcript::SessionSummary;
 use crate::transcript::{
-    TranscriptEvent, TranscriptRecord, list_sessions, read_records, transcript_projection,
+    SessionSummary, TranscriptEvent, TranscriptRecord, list_sessions, read_records,
+    transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
@@ -332,6 +331,8 @@ pub struct TuiRuntime {
     queued_prompt_lifecycle: QueuedPromptLifecycle,
     session_turn_active: bool,
     session_resume_pending: bool,
+    /// Background `/resume` directory scan; polled each frame so the UI never blocks.
+    session_list_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<SessionSummary>>>>,
     current_turn_output_tokens: u64,
     history_selection: Option<usize>,
     history_draft: Option<ComposerDraft>,
@@ -366,6 +367,7 @@ impl TuiRuntime {
             queued_prompt_lifecycle: QueuedPromptLifecycle::default(),
             session_turn_active: false,
             session_resume_pending: false,
+            session_list_rx: None,
             current_turn_output_tokens: 0,
             history_selection: None,
             history_draft: None,
@@ -656,6 +658,7 @@ impl TuiRuntime {
         // from reaching the session engine.
         const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
         self.flush_assistant_delta_buffer_if_due();
+        self.poll_session_list();
         for _ in 0..MAX_SESSION_EVENTS_PER_FRAME {
             match self.session_transport_rx.try_recv() {
                 Ok(event) => self.consume_session_transport_event(event),
@@ -664,6 +667,35 @@ impl TuiRuntime {
                     self.handle_session_event_stream_closed();
                     break;
                 }
+            }
+        }
+    }
+
+    fn poll_session_list(&mut self) {
+        let Some(rx) = self.session_list_rx.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(sessions)) => {
+                self.session_list_rx = None;
+                if sessions.is_empty() {
+                    self.push_command_notice("No previous sessions found");
+                    return;
+                }
+                let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
+                let dialog = DialogState::new(DialogKind::SessionPicker, "Sessions", None, items);
+                self.state.open_dialog(dialog);
+            }
+            Ok(Err(error)) => {
+                self.session_list_rx = None;
+                self.state
+                    .show_toast(format!("Failed to list sessions: {error}"), ToastKind::Error);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.session_list_rx = None;
+                self.state
+                    .show_toast("Session list worker stopped", ToastKind::Error);
             }
         }
     }
@@ -1528,10 +1560,8 @@ impl TuiRuntime {
                         dialog.detail_focused = false;
                         dialog.detail_scroll = 0;
                     }
-                    self.state.show_toast("Context", ToastKind::Info);
                 } else {
                     self.state.close_dialog();
-                    self.state.show_toast("Dialog closed", ToastKind::Info);
                 }
                 Ok(None)
             }
@@ -1601,8 +1631,8 @@ impl TuiRuntime {
                 self.handle_selection_drag(col, row);
                 Ok(None)
             }
-            InputAction::MouseSelectionEnd(col, row) => {
-                self.handle_selection_end(col, row);
+            InputAction::MouseSelectionEnd(col, row, activate_link) => {
+                self.handle_selection_end(col, row, activate_link);
                 Ok(None)
             }
             InputAction::CopySelection => {
@@ -1637,6 +1667,7 @@ impl TuiRuntime {
                         self.state.show_toast("Ready", ToastKind::Info);
                     }
                 }
+                self.poll_session_list();
                 self.state.apply_event(SessionEvent::Tick);
                 self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 self.tick_selection_autoscroll();
@@ -2150,7 +2181,6 @@ impl TuiRuntime {
             self.state.set_theme_name(theme);
         }
         self.state.close_dialog();
-        self.state.show_toast("Dialog closed", ToastKind::Info);
         true
     }
 
@@ -2321,15 +2351,19 @@ impl TuiRuntime {
     }
 
     fn show_resume_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
-        let sessions = list_sessions(&self.sessions_dir)?;
-        if sessions.is_empty() {
-            self.push_command_notice("No previous sessions found");
+        if self.session_list_rx.is_some() {
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
 
-        let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
-        let dialog = DialogState::new(DialogKind::SessionPicker, "Sessions", None, items);
-        self.state.open_dialog(dialog);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.session_list_rx = Some(rx);
+        let sessions_dir = self.sessions_dir.clone();
+        // ponytail: std thread + try_recv keeps the frame loop free without a
+        // dedicated async worker type; swap to spawn_blocking if we already hold
+        // a Handle in more places.
+        std::thread::spawn(move || {
+            let _ = tx.send(list_sessions(sessions_dir));
+        });
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -2815,11 +2849,21 @@ impl TuiRuntime {
         }
     }
 
-    fn handle_transcript_click(&mut self, col: u16, row: u16) {
-        if let Some(TranscriptClickTarget::ToolCard(call_id)) =
-            self.state.transcript_click_target(col, row)
-        {
-            self.state.toggle_tool_output(&call_id);
+    fn handle_transcript_click(&mut self, col: u16, row: u16, activate_link: bool) {
+        match self.state.transcript_click_target(col, row) {
+            Some(TranscriptClickTarget::OpenUrl(url)) if activate_link => {
+                if let Err(error) = super::transcript_ratatui::open_hyperlink_url(&url) {
+                    self.show_toast(
+                        format!("Failed to open link: {error}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+            Some(TranscriptClickTarget::OpenUrl(_)) => {}
+            Some(TranscriptClickTarget::ToolCard(call_id)) if !activate_link => {
+                self.state.toggle_tool_output(&call_id);
+            }
+            Some(TranscriptClickTarget::ToolCard(_)) | None => {}
         }
     }
 
@@ -2855,7 +2899,7 @@ impl TuiRuntime {
         }
     }
 
-    fn handle_selection_end(&mut self, col: u16, row: u16) {
+    fn handle_selection_end(&mut self, col: u16, row: u16, activate_link: bool) {
         let dragged = self.state.selection_dragged;
         if dragged {
             self.handle_selection_drag(col, row);
@@ -2870,7 +2914,7 @@ impl TuiRuntime {
             }
         }
         if !dragged {
-            self.handle_transcript_click(col, row);
+            self.handle_transcript_click(col, row, activate_link);
         }
     }
 

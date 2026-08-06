@@ -198,12 +198,52 @@ fn leading_cells_intersecting(
     cells
 }
 
-fn safe_hyperlink_url(url: &str) -> bool {
+pub(crate) fn safe_hyperlink_url(url: &str) -> bool {
     !url.chars().any(char::is_control)
         && matches!(
             url.split_once(':').map(|(scheme, _)| scheme),
             Some("http" | "https")
         )
+}
+
+/// Open a previously-validated http(s) URL in the platform browser.
+///
+/// Mouse capture owns clicks in this TUI, so OSC 8 alone cannot open links; the
+/// click handler must call this. Spawns and returns — never blocks the UI thread.
+pub(crate) fn open_hyperlink_url(url: &str) -> io::Result<()> {
+    if !safe_hyperlink_url(url) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to open non-http(s) hyperlink",
+        ));
+    }
+
+    // ponytail: std process spawn per platform; swap for `open` crate if we need
+    // WSL/flatpak edge cases later.
+    let mut command = {
+        #[cfg(target_os = "macos")]
+        {
+            let mut command = std::process::Command::new("open");
+            command.arg(url);
+            command
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/c", "start", "", url]);
+            command
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let mut command = std::process::Command::new("xdg-open");
+            command.arg(url);
+            command
+        }
+    };
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    command.spawn().map(|_| ())
 }
 
 #[cfg(test)]
@@ -305,6 +345,7 @@ mod tests {
 
             assert!(collect_hyperlink_cells(&buffer, area, &[Some(&document.lines[0])]).is_empty());
             assert_eq!(buffer[(0, 0)].symbol(), "d");
+            assert!(open_hyperlink_url(url).is_err());
         }
     }
 

@@ -5218,6 +5218,18 @@ fn slash_resume_without_id_opens_session_dialog() {
         .expect("command succeeds");
 
     assert_eq!(command, None);
+    assert!(runtime.state().dialog().is_none());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while runtime.state().dialog().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for async session list"
+        );
+        runtime.try_drain_session_events();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
     let dialog = runtime.state().dialog().expect("dialog should be open");
     assert_eq!(dialog.kind, DialogKind::SessionPicker);
     assert_eq!(dialog.items.len(), 1);

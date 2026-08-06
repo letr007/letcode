@@ -2827,6 +2827,52 @@ fn list_sessions_reports_latest_model_after_model_changes() {
 }
 
 #[test]
+fn list_sessions_persists_and_reuses_sidecar_index() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-list-index-test-{}",
+        unix_timestamp_ms()
+    ));
+
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_session_started("gpt-test")
+        .expect("record session start");
+    recorder
+        .record_user_message("indexed session")
+        .expect("record user message");
+    recorder
+        .record_session_title("Indexed")
+        .expect("record title");
+
+    let first = list_sessions(&base_dir).expect("first list");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].title.as_deref(), Some("Indexed"));
+    assert!(
+        base_dir.join("sessions-index.json").is_file(),
+        "sidecar index should be written"
+    );
+
+    let second = list_sessions(&base_dir).expect("second list hits index");
+    assert_eq!(first, second);
+
+    // Stale stamp forces a rescan; title written only into the jsonl via a new recorder
+    // path is covered by append updating the index — bump the transcript mtime and
+    // ensure listing still returns the session.
+    let path = recorder.path().to_path_buf();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open transcript");
+    use std::io::Write;
+    file.write_all(b"\n").expect("touch file");
+    drop(file);
+
+    let third = list_sessions(&base_dir).expect("list after stamp change");
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].session_id, recorder.session_id());
+}
+
+#[test]
 fn remove_empty_session_file_only_deletes_empty_transcripts() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-remove-empty-test-{}",
