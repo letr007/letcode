@@ -2128,6 +2128,11 @@ impl TuiRuntime {
             DialogItem::new("ocean", "Ocean", Some("Cool blue and teal palette".into())),
             DialogItem::new("forest", "Forest", Some("Natural green palette".into())),
             DialogItem::new("rose", "Rose", Some("Warm rose palette".into())),
+            DialogItem::new(
+                "tokyonight",
+                "TokyoNight",
+                Some("OpenCode Tokyonight palette".into()),
+            ),
             DialogItem::new("rainbow", "Rainbow", Some("Animated accent colors".into())),
         ];
         let mut dialog = DialogState::new(

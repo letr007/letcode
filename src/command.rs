@@ -44,6 +44,7 @@ pub enum ThemeName {
     Ocean,
     Forest,
     Rose,
+    TokyoNight,
     Rainbow,
 }
 
@@ -54,6 +55,7 @@ impl ThemeName {
             Self::Ocean => "ocean",
             Self::Forest => "forest",
             Self::Rose => "rose",
+            Self::TokyoNight => "tokyonight",
             Self::Rainbow => "rainbow",
         }
     }
@@ -64,6 +66,7 @@ impl ThemeName {
             "ocean" => Some(Self::Ocean),
             "forest" => Some(Self::Forest),
             "rose" => Some(Self::Rose),
+            "tokyonight" | "tokyo-night" | "tokyo_night" => Some(Self::TokyoNight),
             "rainbow" => Some(Self::Rainbow),
             _ => None,
         }
@@ -75,6 +78,7 @@ impl ThemeName {
             Self::Ocean,
             Self::Forest,
             Self::Rose,
+            Self::TokyoNight,
             Self::Rainbow,
         ]
     }
@@ -262,7 +266,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/theme",
         insert_text: "/theme ",
         description: "Show or switch the TUI theme",
-        usage: "/theme [dark|ocean|forest|rose|rainbow]",
+        usage: "/theme [dark|ocean|forest|rose|tokyonight|rainbow]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -577,11 +581,11 @@ fn parse_theme(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/theme", value] => match ThemeName::parse(value) {
             Some(theme) => Ok(CommandIntent::Theme(ThemeCommand::Set(theme))),
             None => Err(CommandParseError::new(
-                "Unknown theme. Use dark, ocean, forest, rose, or rainbow.",
+                "Unknown theme. Use dark, ocean, forest, rose, tokyonight, or rainbow.",
             )),
         },
         ["/theme", ..] => Err(CommandParseError::new(
-            "Usage: /theme <dark|ocean|forest|rose|rainbow>",
+            "Usage: /theme <dark|ocean|forest|rose|tokyonight|rainbow>",
         )),
         _ => unreachable!(),
     }
@@ -933,8 +937,14 @@ mod tests {
         assert_eq!(
             parse_command("/theme neon"),
             Err(CommandParseError::new(
-                "Unknown theme. Use dark, ocean, forest, rose, or rainbow."
+                "Unknown theme. Use dark, ocean, forest, rose, tokyonight, or rainbow."
             ))
+        );
+        assert_eq!(
+            parse_command("/theme tokyonight"),
+            Ok(CommandIntent::Theme(ThemeCommand::Set(
+                ThemeName::TokyoNight
+            )))
         );
         assert_eq!(
             parse_command("@fixer"),

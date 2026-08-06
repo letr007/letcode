@@ -108,12 +108,36 @@ impl Theme {
         }
     }
 
+    /// Palette aligned with OpenCode's built-in Tokyonight dark theme
+    /// (`packages/ui/src/theme/themes/tokyonight.json`).
+    pub const fn tokyonight() -> Self {
+        Self {
+            root_bg: Color::Rgb(0x1a, 0x1b, 0x26),
+            surface_bg: Color::Rgb(0x1f, 0x23, 0x35),
+            element_bg: Color::Rgb(0x24, 0x28, 0x3b),
+            elevated_bg: Color::Rgb(0x29, 0x2e, 0x42),
+            border: Color::Rgb(0x41, 0x48, 0x68),
+            text: Color::Rgb(0xc0, 0xca, 0xf5),
+            muted_text: Color::Rgb(0xa9, 0xb1, 0xd6),
+            dim_text: Color::Rgb(0x56, 0x5f, 0x89),
+            accent: Color::Rgb(0x7a, 0xa2, 0xf7),
+            assistant: Color::Rgb(0x9e, 0xce, 0x6a),
+            user: Color::Rgb(0x7d, 0xcf, 0xff),
+            success: Color::Rgb(0x9e, 0xce, 0x6a),
+            warning: Color::Rgb(0xe0, 0xaf, 0x68),
+            error: Color::Rgb(0xf7, 0x76, 0x8e),
+            approval: Color::Rgb(0xff, 0x9e, 0x64),
+            notice: Color::Rgb(0x56, 0x5f, 0x89),
+        }
+    }
+
     pub fn for_name(name: ThemeName, frame: usize) -> Self {
         let theme = match name {
             ThemeName::Dark | ThemeName::Rainbow => Self::dark(),
             ThemeName::Ocean => Self::ocean(),
             ThemeName::Forest => Self::forest(),
             ThemeName::Rose => Self::rose(),
+            ThemeName::TokyoNight => Self::tokyonight(),
         };
         if name == ThemeName::Rainbow {
             theme.with_rainbow_accent(frame)
@@ -191,6 +215,18 @@ mod tests {
         assert_ne!(
             Theme::for_name(ThemeName::Forest, 0),
             Theme::for_name(ThemeName::Rose, 0)
+        );
+        assert_ne!(
+            Theme::for_name(ThemeName::Rose, 0),
+            Theme::for_name(ThemeName::TokyoNight, 0)
+        );
+        assert_eq!(
+            Theme::for_name(ThemeName::TokyoNight, 0).root_bg,
+            Color::Rgb(0x1a, 0x1b, 0x26)
+        );
+        assert_eq!(
+            Theme::for_name(ThemeName::TokyoNight, 0).accent,
+            Color::Rgb(0x7a, 0xa2, 0xf7)
         );
     }
 

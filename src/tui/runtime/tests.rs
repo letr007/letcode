@@ -3805,8 +3805,9 @@ fn theme_command_without_name_opens_picker_on_current_theme() {
     assert_eq!(dialog.kind, DialogKind::ThemePicker);
     assert_eq!(dialog.title, "Select theme");
     assert_eq!(dialog.selected, 2);
-    assert_eq!(dialog.items.len(), 5);
-    assert_eq!(dialog.items[4].id, "rainbow");
+    assert_eq!(dialog.items.len(), 6);
+    assert_eq!(dialog.items[4].id, "tokyonight");
+    assert_eq!(dialog.items[5].id, "rainbow");
 }
 
 #[test]
