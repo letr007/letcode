@@ -547,6 +547,24 @@ enum QueuedSessionEngineControlSignal {
     Shutdown,
 }
 
+fn park_active_turn_command(
+    parked_commands: &mut VecDeque<SessionEngineCommand>,
+    command: SessionEngineCommand,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+) {
+    parked_commands.push_back(command);
+    let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+        "Turn still running · navigation only",
+    )));
+}
+
+fn flush_parked_commands(
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+    parked_commands: &mut VecDeque<SessionEngineCommand>,
+) {
+    deferred_commands.extend(parked_commands.drain(..));
+}
+
 fn drain_queued_session_controls(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
@@ -1711,6 +1729,7 @@ async fn run_engine_loop(
             dyn crate::agent::AutoReviewService<async_openai::config::OpenAIConfig>,
         >));
     let mut deferred_commands = VecDeque::new();
+    let mut parked_commands = VecDeque::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
     let mut child_refresh = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -2212,10 +2231,11 @@ async fn run_engine_loop(
                                         unreachable!("event-aware selection is not used for delegates")
                                     }
                                     ActiveSessionOperation::Command(Some(command)) => {
-                                        deferred_commands.push_front(command);
-                                        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                            NoticeEvent::info("Turn still running · navigation only"),
-                                        ));
+                                        park_active_turn_command(
+                                            &mut parked_commands,
+                                            command,
+                                            &session_transport_tx,
+                                        );
                                     }
                                     ActiveSessionOperation::Command(None) => break,
                                 }
@@ -2243,8 +2263,10 @@ async fn run_engine_loop(
                         }
                         if shutdown {
                             deferred_commands.clear();
+                            parked_commands.clear();
                             break;
                         }
+                        flush_parked_commands(&mut deferred_commands, &mut parked_commands);
                         continue;
                     }
                     SessionEngineCommand::Compact => {
@@ -2551,10 +2573,11 @@ async fn run_engine_loop(
                                     )));
                                 }
                                 Some(command) => {
-                                    deferred_commands.push_front(command);
-                                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                        NoticeEvent::info("Turn still running · navigation only"),
-                                    ));
+                                    park_active_turn_command(
+                                        &mut parked_commands,
+                                        command,
+                                        &session_transport_tx,
+                                    );
                                 }
                                 None => break,
                             },
@@ -2576,8 +2599,10 @@ async fn run_engine_loop(
                 }
                 if shutdown {
                     deferred_commands.clear();
+                    parked_commands.clear();
                     break;
                 }
+                flush_parked_commands(&mut deferred_commands, &mut parked_commands);
             }
             _ = child_refresh.tick(), if visible_child_session_id.is_some() => {
                 refresh_visible_child_session_view(
