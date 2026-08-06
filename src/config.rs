@@ -1580,7 +1580,10 @@ fn missing_config_message(path: &Path) -> String {
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    // Unix shells set HOME; Windows typically only has USERPROFILE.
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow!("neither HOME nor USERPROFILE is set"))?;
     Ok(PathBuf::from(home).join(DEFAULT_CONFIG_HOME_RELATIVE_PATH))
 }
 
