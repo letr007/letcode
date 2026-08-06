@@ -196,7 +196,11 @@ async fn main() -> Result<()> {
                 .await?;
             }
         },
-        EntryMode::Tui => {
+        mode @ (EntryMode::Tui | EntryMode::Resume { .. }) => {
+            let resume_session_id = match mode {
+                EntryMode::Resume { session_id } => Some(session_id),
+                _ => None,
+            };
             tui::run_tui(
                 engine,
                 projection,
@@ -215,6 +219,7 @@ async fn main() -> Result<()> {
                     .collect(),
                 langfuse_startup_toast(&_tracing_guards.langfuse_status),
                 skill_registry.cards(),
+                resume_session_id,
             )
             .await?;
         }
@@ -282,6 +287,7 @@ fn session_engine_config(
 enum EntryMode {
     Cli { prompt: Option<String>, json: bool },
     Tui,
+    Resume { session_id: String },
     ValidateConfig { path: Option<String> },
 }
 
@@ -314,6 +320,21 @@ impl CliOptions {
                     if prompt.is_none() {
                         entry_mode = EntryMode::Tui;
                     }
+                }
+                "resume" => {
+                    let Some(session_id) = args.next() else {
+                        bail!("resume requires a session id");
+                    };
+                    let session_id = session_id.as_ref().to_string();
+                    if session_id.is_empty() || session_id.starts_with('-') {
+                        bail!("resume requires a session id");
+                    }
+                    if args.next().is_some() {
+                        bail!("resume accepts exactly one session id");
+                    }
+                    return Ok(Self {
+                        entry_mode: EntryMode::Resume { session_id },
+                    });
                 }
                 "config" => {
                     let Some(subcommand) = args.next() else {
@@ -821,6 +842,30 @@ mod tests {
             CliOptions {
                 entry_mode: EntryMode::Tui
             }
+        );
+    }
+
+    #[test]
+    fn cli_options_support_resume() {
+        assert_eq!(
+            CliOptions::parse_from(["resume", "sess-1"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Resume {
+                    session_id: "sess-1".into()
+                }
+            }
+        );
+        assert!(
+            CliOptions::parse_from(["resume"])
+                .unwrap_err()
+                .to_string()
+                .contains("requires a session id")
+        );
+        assert!(
+            CliOptions::parse_from(["resume", "a", "b"])
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one session id")
         );
     }
 

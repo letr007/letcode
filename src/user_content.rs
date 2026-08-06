@@ -175,9 +175,10 @@ impl UserMessageContent {
 
     pub fn is_empty(&self) -> bool {
         self.selected_skills.is_empty()
-            && self.parts().iter().all(
-                |part| matches!(part, UserMessagePart::Text { text } if text.trim().is_empty()),
-            )
+            && self
+                .parts()
+                .iter()
+                .all(|part| matches!(part, UserMessagePart::Text { text } if text.trim().is_empty()))
     }
 
     pub fn trim_outer_text(&mut self) {

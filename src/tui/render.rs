@@ -30,10 +30,11 @@ const EXIT_EPILOGUE_TITLE_CHARS: usize = 50;
 
 /// Plain-text exit banner for the restored main screen (logo + resume hint).
 pub(crate) fn format_exit_epilogue(session_id: &str, session_title: Option<&str>) -> String {
+    const INDENT: &str = "  ";
     let mut lines = WELCOME_ART_LEFT
         .iter()
         .zip(WELCOME_ART_RIGHT.iter())
-        .map(|(left, right)| format!("{left} {right}"))
+        .map(|(left, right)| format!("{INDENT}{left} {right}"))
         .collect::<Vec<_>>();
     lines.push(String::new());
 
@@ -42,8 +43,11 @@ pub(crate) fn format_exit_epilogue(session_id: &str, session_title: Option<&str>
         .filter(|title| !title.is_empty())
         .unwrap_or(session_id);
     let title = truncate_chars(title, EXIT_EPILOGUE_TITLE_CHARS);
-    lines.push(format!("  {:<10}{title}", "Session"));
-    lines.push(format!("  {:<10}/resume {session_id}", "Continue"));
+    lines.push(format!("{INDENT}{:<10}{title}", "Session"));
+    lines.push(format!(
+        "{INDENT}{:<10}letcode resume {session_id}",
+        "Continue"
+    ));
     lines.push(String::new());
     lines.join("\n")
 }
@@ -1020,7 +1024,7 @@ mod tests {
         let text = format_exit_epilogue("sess-1", Some("Build feature"));
         assert!(text.contains("█▀▀█"), "{text}");
         assert!(text.contains("Session   Build feature"), "{text}");
-        assert!(text.contains("Continue  /resume sess-1"), "{text}");
+        assert!(text.contains("Continue  letcode resume sess-1"), "{text}");
     }
 
     fn sample_context_state() -> crate::tui::state::ContextPaneState {

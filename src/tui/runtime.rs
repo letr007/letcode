@@ -3506,6 +3506,7 @@ pub async fn run_tui(
     available_experts: Vec<AvailableExpert>,
     startup_toast: Option<StartupToast>,
     skill_cards: Vec<SkillCard>,
+    resume_session_id: Option<String>,
 ) -> Result<()> {
     let mut state = TuiState::new(
         projection.model_id,
@@ -3554,6 +3555,19 @@ pub async fn run_tui(
         let mut terminal = OwnedTerminal::new()?;
         runtime.update_terminal_title(&mut terminal)?;
         let mut drawer = TerminalDrawer::new(&mut terminal);
+
+        if let Some(session_id) = resume_session_id {
+            runtime.session_resume_pending = true;
+            runtime
+                .state
+                .show_toast("Resuming session", ToastKind::Info);
+            command_dispatch::dispatch_command(
+                &mut runtime,
+                RuntimeCommand::ResumeSession(session_id),
+                &ingress,
+                true,
+            );
+        }
 
         loop {
             runtime.try_drain_session_events();
