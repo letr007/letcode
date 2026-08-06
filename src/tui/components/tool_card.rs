@@ -791,7 +791,7 @@ fn question_card_line_with_boundary(
 ) -> SemanticLine<Style> {
     render_source_card_line_with_boundary(
         &[(text.to_string(), style)],
-        Style::default().bg(theme.elevated_bg),
+        Style::default().bg(theme.element_bg),
         theme,
         width,
         boundary,
@@ -806,7 +806,7 @@ fn question_card_decoration_line(
 ) -> SemanticLine<Style> {
     render_card_line(
         &[(text.to_string(), style)],
-        Style::default().bg(theme.elevated_bg),
+        Style::default().bg(theme.element_bg),
         theme,
         width,
     )
@@ -815,23 +815,23 @@ fn question_card_decoration_line(
 fn question_text_style(theme: Theme) -> Style {
     Style::default()
         .fg(theme.text)
-        .bg(theme.elevated_bg)
+        .bg(theme.element_bg)
         .add_modifier(Modifier::BOLD)
 }
 
 fn question_header_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
+    Style::default().fg(theme.muted_text).bg(theme.element_bg)
 }
 
 fn question_title_style(theme: Theme) -> Style {
     Style::default()
         .fg(theme.accent)
-        .bg(theme.elevated_bg)
+        .bg(theme.element_bg)
         .add_modifier(Modifier::BOLD)
 }
 
 fn question_answer_style(theme: Theme) -> Style {
-    Style::default().fg(theme.user).bg(theme.elevated_bg)
+    Style::default().fg(theme.user).bg(theme.element_bg)
 }
 
 fn question_card_line_limit() -> usize {
@@ -2411,11 +2411,9 @@ fn render_card_line_with_guide(
         };
     }
 
-    let leading_pad_style = if fill_style.bg == Some(theme.root_bg) {
-        fill_style
-    } else {
-        Style::default().bg(DIFF_CARD_BG)
-    };
+    // Leading pad must match the card fill. Hardcoding DIFF_CARD_BG here made
+    // elevated surfaces (e.g. "# User response") paint two body backgrounds.
+    let leading_pad_style = fill_style;
 
     let mut spans = vec![
         SemanticSpan::decoration(TOOL_GUIDE_GLYPH, guide_style),
@@ -2870,6 +2868,7 @@ mod tests {
 
     fn assert_question_padding_frame(tool: &ToolView, width: usize) {
         let lines = render_tool_card_lines(tool, Theme::dark(), width);
+        let surface = Theme::dark().element_bg;
         for line in [
             lines.first().expect("top padding"),
             lines.last().expect("bottom padding"),
@@ -2881,10 +2880,10 @@ mod tests {
                         .fg(TOOL_CARD_GUIDE)
                         .bg(Theme::dark().root_bg)
                     && line.spans[1].content == "  "
-                    && line.spans[1].style.bg == Some(DIFF_CARD_BG)
+                    && line.spans[1].style.bg == Some(surface)
                     && line.spans[2..]
                         .iter()
-                        .all(|span| span.style.bg == Some(Theme::dark().elevated_bg))
+                        .all(|span| span.style.bg == Some(surface))
             );
             assert_eq!(display_width(&line.to_string()), width);
         }
@@ -3043,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_question_card_uses_a_dedicated_response_card_palette() {
+    fn successful_question_card_uses_element_surface_like_other_cards() {
         let tool = question_tool(
             Some(
                 json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
@@ -3059,15 +3058,15 @@ mod tests {
             };
             guide.content == TOOL_GUIDE_GLYPH
                 && guide.style == Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg)
-                && surface
-                    .first()
-                    .is_some_and(|span| span.content == "  " && span.style.bg == Some(DIFF_CARD_BG))
+                && surface.first().is_some_and(|span| {
+                    span.content == "  " && span.style.bg == Some(theme.element_bg)
+                })
                 && surface[1..]
                     .iter()
-                    .all(|span| span.style.bg == Some(theme.elevated_bg))
+                    .all(|span| span.style.bg == Some(theme.element_bg))
                 && line.spans.last().is_some_and(|span| {
                     span.content.chars().all(char::is_whitespace)
-                        && span.style.bg == Some(theme.elevated_bg)
+                        && span.style.bg == Some(theme.element_bg)
                 })
                 && display_width(&line.to_string()) == width
         }));
