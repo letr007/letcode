@@ -4222,6 +4222,401 @@ impl AutoReviewService<OpenAIConfig> for MockAutoReviewService {
 }
 
 #[tokio::test]
+async fn auto_mode_child_inherits_reviewer_service() {
+    let mut parent = test_agent();
+    parent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::AllowOnce),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-inherited".into(),
+    });
+    parent.set_auto_review_service(Some(service.clone()));
+    let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+
+    let path = std::env::temp_dir().join(format!(
+        "letcode-auto-review-child-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    let call = HistoryToolCall {
+        call_id: "call-auto-child".into(),
+        name: "fs__write".into(),
+        arguments_json: json!({"path": path, "content": "ok"}).to_string(),
+    };
+    let mut human_approvals = 0usize;
+    let record = child
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            human_approvals += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
+        })
+        .await
+        .expect("child auto approval executes");
+
+    assert_eq!(human_approvals, 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(record.status, ToolExecutionStatus::Executed);
+    assert!(record.output.ok, "{:?}", record.output.error);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reviewer_child_does_not_inherit_auto_review_service() {
+    let mut parent = test_agent();
+    parent.set_permission_mode(PermissionMode::Auto);
+    parent.set_auto_review_service(Some(Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::AllowOnce),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-recursion-guard".into(),
+    })));
+
+    let reviewer = AgentFactory::create_child(&parent, &AgentTemplate::reviewer());
+
+    assert!(reviewer.auto_review_service.is_none());
+}
+
+#[test]
+fn child_permission_session_inherits_mode_without_grants() {
+    let resource = crate::permission::PermissionResource::Exact {
+        tool: "shell__exec".into(),
+        value: "curl --version".into(),
+    };
+    let mut parent = test_agent();
+    parent.set_permission_mode(PermissionMode::Auto);
+    parent
+        .permission_session
+        .lock()
+        .expect("permission session")
+        .grant(resource.clone());
+
+    let child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+    assert_eq!(child.permission_mode(), PermissionMode::Auto);
+    assert!(
+        !child
+            .permission_session
+            .lock()
+            .expect("child permission session")
+            .allows_grant(&resource)
+    );
+    assert!(child.subagent_path_scope.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn child_shell_allow_always_stays_within_child_session() {
+    let command = "curl --version";
+    let call = HistoryToolCall {
+        call_id: "call-child-shell".into(),
+        name: "shell__exec".into(),
+        arguments_json: json!({"command": command}).to_string(),
+    };
+    let resource = crate::permission::PermissionResource::Exact {
+        tool: "shell__exec".into(),
+        value: command.into(),
+    };
+
+    let mut parent = test_agent();
+    parent.set_permission_mode(PermissionMode::Default);
+    parent
+        .permission_session
+        .lock()
+        .expect("permission session")
+        .grant(resource.clone());
+
+    let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+    let mut sibling = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+    let mut child_approvals = 0usize;
+    let first = child
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            child_approvals += 1;
+            std::future::ready(Ok(PermissionApproval::AllowAlways))
+        })
+        .await
+        .expect("child first shell");
+    assert_eq!(child_approvals, 1);
+    assert_eq!(first.status, ToolExecutionStatus::Executed);
+
+    let mut second_approvals = 0usize;
+    let second = child
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            second_approvals += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
+        })
+        .await
+        .expect("child grant reuse");
+    assert_eq!(second_approvals, 0);
+    assert_eq!(second.status, ToolExecutionStatus::Executed);
+
+    let mut sibling_approvals = 0usize;
+    let sibling_record = sibling
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            sibling_approvals += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
+        })
+        .await
+        .expect("sibling isolated");
+    assert_eq!(sibling_approvals, 1);
+    assert_eq!(sibling_record.status, ToolExecutionStatus::Rejected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delegation_scope_authorizes_owned_writes_and_denies_outside() {
+    let fixture = UnixWritableFixture::new("delegation-scope-write");
+    let owned = fixture.external.join("owned");
+    let outside = fixture.external.join("outside");
+    fs::create_dir_all(&owned).expect("owned dir");
+    fs::create_dir_all(&outside).expect("outside dir");
+    let owned_file = owned.join("ok.txt");
+    let outside_file = outside.join("no.txt");
+
+    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+        objective: "scoped write".into(),
+        success_criteria: Vec::new(),
+        allowed_paths: Vec::new(),
+        forbidden_paths: Vec::new(),
+        owned_paths: vec![owned.to_string_lossy().into()],
+        timeout_secs: None,
+        max_tool_calls: None,
+        target_child_session_id: None,
+    })
+    .expect("scope")
+    .expect("non-empty scope");
+
+    let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+    child.set_permission_mode(PermissionMode::Default);
+    child.set_subagent_path_scope(Some(Arc::new(scope)));
+
+    let mut approvals = 0usize;
+    let allowed = child
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-write-ok".into(),
+                name: "fs__write".into(),
+                arguments_json: json!({
+                    "path": owned_file,
+                    "content": "ok",
+                })
+                .to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| {
+                approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            },
+        )
+        .await
+        .expect("owned write");
+    assert_eq!(approvals, 0, "owned_paths must pre-authorize writes");
+    assert_eq!(allowed.status, ToolExecutionStatus::Executed);
+    assert_eq!(fs::read_to_string(&owned_file).expect("read"), "ok");
+
+    let denied = child
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-write-denied".into(),
+                name: "fs__write".into(),
+                arguments_json: json!({
+                    "path": outside_file,
+                    "content": "no",
+                })
+                .to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| {
+                approvals += 1;
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
+            },
+        )
+        .await
+        .expect("outside write");
+    assert_eq!(approvals, 0, "scope denial must not reach approver");
+    assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        denied.rejection,
+        Some(ToolExecutionRejection::DelegationScopeDenied)
+    );
+    assert!(!outside_file.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delegation_scope_allows_reads_in_allowed_paths_and_forbids_forbidden() {
+    let fixture = UnixWritableFixture::new("delegation-scope-read");
+    let allowed = fixture.external.join("allowed");
+    let forbidden = fixture.external.join("forbidden");
+    fs::create_dir_all(&allowed).expect("allowed");
+    fs::create_dir_all(&forbidden).expect("forbidden");
+    let allowed_file = allowed.join("a.txt");
+    let forbidden_file = forbidden.join("b.txt");
+    fs::write(&allowed_file, "hello").expect("seed allowed");
+    fs::write(&forbidden_file, "secret").expect("seed forbidden");
+
+    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+        objective: "scoped read".into(),
+        success_criteria: Vec::new(),
+        allowed_paths: vec![allowed.to_string_lossy().into()],
+        forbidden_paths: vec![forbidden.to_string_lossy().into()],
+        owned_paths: Vec::new(),
+        timeout_secs: None,
+        max_tool_calls: None,
+        target_child_session_id: None,
+    })
+    .expect("scope")
+    .expect("non-empty scope");
+
+    let mut reader = AgentFactory::create_child(&test_agent(), &AgentTemplate::explorer());
+    reader.set_subagent_path_scope(Some(Arc::new(scope.clone())));
+
+    let ok = reader
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-read-ok".into(),
+                name: "fs__read".into(),
+                arguments_json: json!({"path": allowed_file}).to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("allowed read");
+    assert_eq!(ok.status, ToolExecutionStatus::Executed);
+
+    let blocked = reader
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-read-forbidden".into(),
+                name: "fs__read".into(),
+                arguments_json: json!({"path": forbidden_file}).to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("forbidden read");
+    assert_eq!(blocked.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        blocked.rejection,
+        Some(ToolExecutionRejection::DelegationScopeDenied)
+    );
+
+    let mut writer = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+    writer.set_subagent_path_scope(Some(Arc::new(scope)));
+    let write_in_allowed = writer
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-write-allowed-only".into(),
+                name: "fs__write".into(),
+                arguments_json: json!({
+                    "path": allowed.join("new.txt"),
+                    "content": "nope",
+                })
+                .to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("allowed-only write");
+    assert_eq!(write_in_allowed.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        write_in_allowed.rejection,
+        Some(ToolExecutionRejection::DelegationScopeDenied)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delegation_scope_apply_patch_requires_all_targets_owned() {
+    let fixture = UnixWritableFixture::new("delegation-scope-patch");
+    let owned = fixture.external.join("owned");
+    let other = fixture.external.join("other");
+    fs::create_dir_all(&owned).expect("owned");
+    fs::create_dir_all(&other).expect("other");
+    let owned_file = owned.join("a.txt");
+    let other_file = other.join("b.txt");
+    fs::write(&owned_file, "old-a").expect("seed a");
+    fs::write(&other_file, "old-b").expect("seed b");
+
+    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+        objective: "scoped patch".into(),
+        success_criteria: Vec::new(),
+        allowed_paths: Vec::new(),
+        forbidden_paths: Vec::new(),
+        owned_paths: vec![owned.to_string_lossy().into()],
+        timeout_secs: None,
+        max_tool_calls: None,
+        target_child_session_id: None,
+    })
+    .expect("scope")
+    .expect("non-empty scope");
+
+    let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+    child.set_permission_mode(PermissionMode::Default);
+    child.set_subagent_path_scope(Some(Arc::new(scope)));
+
+    let ok = child
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-patch-ok".into(),
+                name: "edit__apply_patch".into(),
+                arguments_json: json!({
+                    "edits": [{
+                        "path": owned_file,
+                        "find": "old-a",
+                        "replace": "new-a",
+                        "replace_all": false
+                    }]
+                })
+                .to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("owned patch");
+    assert_eq!(ok.status, ToolExecutionStatus::Executed);
+    assert_eq!(fs::read_to_string(&owned_file).expect("read a"), "new-a");
+
+    let denied = child
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "scoped-patch-mixed".into(),
+                name: "edit__apply_patch".into(),
+                arguments_json: json!({
+                    "edits": [
+                        {
+                            "path": owned_file,
+                            "find": "new-a",
+                            "replace": "mutated",
+                            "replace_all": false
+                        },
+                        {
+                            "path": other_file,
+                            "find": "old-b",
+                            "replace": "mutated-b",
+                            "replace_all": false
+                        }
+                    ]
+                })
+                .to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("mixed patch");
+    assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        denied.rejection,
+        Some(ToolExecutionRejection::DelegationScopeDenied)
+    );
+    assert_eq!(fs::read_to_string(&owned_file).expect("read a"), "new-a");
+    assert_eq!(fs::read_to_string(&other_file).expect("read b"), "old-b");
+}
+
+#[tokio::test]
 async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
@@ -5229,4 +5624,3 @@ async fn finalization_does_not_auto_reconcile_unreconciled_subagent_jobs() {
     )));
     assert_eq!(agent.pending_subagent_jobs().len(), 1);
 }
-

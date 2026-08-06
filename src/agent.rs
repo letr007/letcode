@@ -48,8 +48,9 @@ use crate::skills::{
 };
 use crate::tool::{
     NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
-    ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry, ToolResult,
-    external_workspace_access_for_tool, normalize_subagent_input, subagent_parameters_schema,
+    SubagentPathScope, ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry,
+    ToolResult, external_workspace_access_for_tool, is_delegation_path_scoped_tool,
+    normalize_subagent_input, subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
@@ -122,6 +123,7 @@ pub(crate) enum ToolExecutionRejection {
     InvalidJsonArguments,
     DirectiveBlocked,
     ToolScopeDenied,
+    DelegationScopeDenied,
     PermissionDeniedByPolicy,
     PermissionDeniedByUser,
 }
@@ -575,6 +577,8 @@ pub struct Agent<C: Config> {
     question_handler: Option<QuestionCallback>,
     auto_review_service: Option<Arc<dyn AutoReviewService<C>>>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
+    /// Run-local directory authorization for delegated children. Never inherited.
+    subagent_path_scope: Option<Arc<SubagentPathScope>>,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
@@ -699,8 +703,20 @@ impl AgentFactory {
             subagent_child_factory: parent.subagent_child_factory.clone(),
             primary_route_factory: parent.primary_route_factory.clone(),
             question_handler: None,
-            auto_review_service: None,
-            permission_session: Arc::clone(&parent.permission_session),
+            auto_review_service: if template.name == "reviewer" {
+                None
+            } else {
+                parent.auto_review_service.clone()
+            },
+            permission_session: Arc::new(Mutex::new(
+                parent
+                    .permission_session
+                    .lock()
+                    .expect("permission session poisoned")
+                    .fork_without_grants(),
+            )),
+            // Scope is installed per invocation by SubagentPool::start_run.
+            subagent_path_scope: None,
             compaction_config: parent.compaction_config.clone(),
             retry_config,
             tool_timeout_secs: parent.tool_timeout_secs,
@@ -964,6 +980,7 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             auto_review_service: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
+            subagent_path_scope: None,
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
@@ -1220,6 +1237,10 @@ impl<C: Config> Agent<C> {
             .lock()
             .expect("permission session poisoned")
             .set_mode(mode);
+    }
+
+    pub(crate) fn set_subagent_path_scope(&mut self, scope: Option<Arc<SubagentPathScope>>) {
+        self.subagent_path_scope = scope;
     }
 
     pub fn model(&self) -> &str {
@@ -2289,6 +2310,7 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             auto_review_service: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
+            subagent_path_scope: None,
             compaction_config: CompactionConfig::default(),
             retry_config: self.retry_config.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
@@ -2610,6 +2632,9 @@ impl<C: Config> Agent<C> {
             || self.tools.parallelism(&call.name) != ToolParallelism::Parallel
             || !is_executable_tool(self, &call.name)
             || !self.tools.scope().allows_tool(&call.name)
+            // ponytail: scoped children fall back to sequential execution so the
+            // single denial path in execute_with_arguments owns DelegationScopeDenied.
+            || (self.subagent_path_scope.is_some() && is_delegation_path_scoped_tool(&call.name))
         {
             return false;
         }
@@ -4598,6 +4623,7 @@ impl ToolExecutionRejection {
             Self::InvalidJsonArguments => "invalid_json_arguments",
             Self::DirectiveBlocked => "directive_blocked",
             Self::ToolScopeDenied => "tool_scope_denied",
+            Self::DelegationScopeDenied => "delegation_scope_denied",
             Self::PermissionDeniedByPolicy => "permission_denied_by_policy",
             Self::PermissionDeniedByUser => "permission_denied_by_user",
         }

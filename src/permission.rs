@@ -392,6 +392,16 @@ impl PermissionSessionState {
         self.grants.clear();
         self.generation = self.generation.wrapping_add(1);
     }
+
+    /// Fork a child session that inherits only the current permission mode.
+    /// Grants and generation stay isolated so AllowAlways never leaks across agents.
+    pub fn fork_without_grants(&self) -> Self {
+        Self {
+            policy: self.policy.clone(),
+            grants: PermissionGrantSet::default(),
+            generation: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -783,6 +793,22 @@ mod tests {
             policy.check("shell__exec", &json!({"command": "curl --version"})),
             PermissionDecision::Allow
         );
+    }
+
+    #[test]
+    fn fork_without_grants_keeps_mode_and_drops_grants() {
+        let resource = PermissionResource::Exact {
+            tool: "shell__exec".into(),
+            value: "curl --version".into(),
+        };
+        let mut parent = PermissionSessionState::default();
+        parent.set_mode(PermissionMode::Auto);
+        parent.grant(resource.clone());
+
+        let child = parent.fork_without_grants();
+        assert_eq!(child.mode(), PermissionMode::Auto);
+        assert!(!child.allows_grant(&resource));
+        assert!(parent.allows_grant(&resource));
     }
 
     #[test]

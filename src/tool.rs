@@ -158,6 +158,282 @@ fn path_matches_scope(path: &str, scope: &str) -> bool {
     !scope.is_empty() && (path == scope || path.starts_with(&format!("{scope}/")))
 }
 
+/// Run-local directory authorization for a delegated child agent.
+/// Roots are canonicalized at install time; comparisons use canonical targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentPathScope {
+    allowed_roots: Vec<PathBuf>,
+    owned_roots: Vec<PathBuf>,
+    forbidden_roots: Vec<PathBuf>,
+}
+
+impl SubagentPathScope {
+    pub(crate) fn from_input(input: &NormalizedSubagentInput) -> Result<Option<Self>> {
+        if input.allowed_paths.is_empty()
+            && input.owned_paths.is_empty()
+            && input.forbidden_paths.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            allowed_roots: canonicalize_scope_roots(&input.allowed_paths)?,
+            owned_roots: canonicalize_scope_roots(&input.owned_paths)?,
+            forbidden_roots: canonicalize_scope_roots(&input.forbidden_paths)?,
+        }))
+    }
+
+    pub(crate) fn permits_read<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> bool {
+        for path in paths {
+            if self.is_forbidden(path) {
+                return false;
+            }
+            if self.allowed_roots.is_empty() && self.owned_roots.is_empty() {
+                continue;
+            }
+            if !self.in_allowed_or_owned(path) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn permits_write<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> bool {
+        for path in paths {
+            if self.is_forbidden(path) {
+                return false;
+            }
+            if !self.in_owned(path) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn is_forbidden(&self, path: &Path) -> bool {
+        self.forbidden_roots
+            .iter()
+            .any(|root| path_under_root(path, root))
+    }
+
+    fn in_owned(&self, path: &Path) -> bool {
+        self.owned_roots
+            .iter()
+            .any(|root| path_under_root(path, root))
+    }
+
+    fn in_allowed_or_owned(&self, path: &Path) -> bool {
+        self.allowed_roots
+            .iter()
+            .any(|root| path_under_root(path, root))
+            || self.in_owned(path)
+    }
+}
+
+fn canonicalize_scope_roots(paths: &[String]) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = canonical_existing_path(path)
+            .ok_or_else(|| anyhow!("delegated path scope root cannot be resolved: {path}"))?;
+        roots.push(canonical);
+    }
+    Ok(roots)
+}
+
+fn path_under_root(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+pub(crate) fn is_delegation_path_scoped_tool(name: &str) -> bool {
+    matches!(
+        name,
+        tool_names::TOOL_FS_READ
+            | tool_names::TOOL_FS_LIST
+            | tool_names::TOOL_SEARCH_RG
+            | tool_names::TOOL_CODE_AST_SEARCH
+            | tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
+            | tool_names::TOOL_FS_WRITE
+            | tool_names::TOOL_FS_APPEND
+            | tool_names::TOOL_FS_MKDIR
+            | tool_names::TOOL_EDIT_APPLY_PATCH
+    )
+}
+
+/// Returns an error message when a structured tool target is outside the
+/// delegated path scope. `None` means either no check applied or permitted.
+pub(crate) fn delegation_scope_denial(
+    scope: &SubagentPathScope,
+    tool: &str,
+    args: &Value,
+    prepared_writable: Option<&PreparedWritableLeaf>,
+    prepared_patch: Option<&PreparedApplyPatch>,
+) -> Option<String> {
+    if !is_delegation_path_scoped_tool(tool) {
+        return None;
+    }
+
+    if tool == tool_names::TOOL_EDIT_APPLY_PATCH {
+        let Some(prepared) = prepared_patch else {
+            return Some(
+                "delegated path scope denied: edit__apply_patch missing prepared targets".into(),
+            );
+        };
+        let targets: Vec<&Path> = prepared.target_paths().collect();
+        if targets.is_empty() {
+            return Some(
+                "delegated path scope denied: edit__apply_patch has no bound targets".into(),
+            );
+        }
+        for target in &targets {
+            if scope.is_forbidden(target) {
+                return Some(format!(
+                    "delegated path scope denied: path {} is forbidden",
+                    path_preview(target)
+                ));
+            }
+        }
+        if !scope.permits_write(targets.iter().copied()) {
+            return Some(format!(
+                "delegated path scope denied: edit__apply_patch targets {}, which is outside owned_paths",
+                targets
+                    .iter()
+                    .map(|path| path_preview(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return None;
+    }
+
+    if matches!(tool, tool_names::TOOL_FS_WRITE | tool_names::TOOL_FS_APPEND) {
+        let Some(prepared) = prepared_writable else {
+            return Some(format!(
+                "delegated path scope denied: {tool} missing prepared writable leaf"
+            ));
+        };
+        let destination = prepared.destination();
+        if scope.is_forbidden(destination) {
+            return Some(format!(
+                "delegated path scope denied: path {} is forbidden",
+                path_preview(destination)
+            ));
+        }
+        if !scope.permits_write(std::iter::once(destination)) {
+            return Some(format!(
+                "delegated path scope denied: {tool} target {}, which is outside owned_paths",
+                path_preview(destination)
+            ));
+        }
+        return None;
+    }
+
+    if tool == tool_names::TOOL_FS_MKDIR {
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return Some("delegated path scope denied: fs__mkdir missing path".into());
+        };
+        let destination = match resolve_scope_destination(path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(format!(
+                    "delegated path scope denied: cannot resolve mkdir path: {error}"
+                ));
+            }
+        };
+        if scope.is_forbidden(&destination) {
+            return Some(format!(
+                "delegated path scope denied: path {} is forbidden",
+                path_preview(&destination)
+            ));
+        }
+        if !mkdir_creates_only_within_owned(&destination, scope) {
+            return Some(format!(
+                "delegated path scope denied: fs__mkdir target {}, which is outside owned_paths or would create parents outside owned_paths",
+                path_preview(&destination)
+            ));
+        }
+        return None;
+    }
+
+    // Read / preview tools.
+    let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let canonical = match canonical_existing_path(path) {
+        Some(path) => path,
+        None => {
+            return Some(format!(
+                "delegated path scope denied: cannot resolve path `{path}` for scope check"
+            ));
+        }
+    };
+    if scope.is_forbidden(&canonical) {
+        return Some(format!(
+            "delegated path scope denied: path {} is forbidden",
+            path_preview(&canonical)
+        ));
+    }
+    if !scope.permits_read(std::iter::once(canonical.as_path())) {
+        return Some(format!(
+            "delegated path scope denied: {tool} path {}, which is outside allowed_paths/owned_paths",
+            path_preview(&canonical)
+        ));
+    }
+    None
+}
+
+fn resolve_scope_destination(path: &str) -> Result<PathBuf> {
+    let root = workspace_root()?;
+    let candidate = join_workspace_path(&root, path);
+    if candidate.as_os_str().is_empty() {
+        bail!("path cannot be empty");
+    }
+    let mut existing = candidate.clone();
+    let mut suffix = Vec::new();
+    loop {
+        if existing.exists() {
+            let mut resolved = existing
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", existing.display()))?;
+            for part in suffix.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+        let file_name = existing
+            .file_name()
+            .ok_or_else(|| anyhow!("cannot resolve path: {}", candidate.display()))?
+            .to_os_string();
+        suffix.push(file_name);
+        let Some(parent) = existing.parent() else {
+            bail!("cannot resolve path: {}", candidate.display());
+        };
+        if parent.as_os_str().is_empty() || parent == existing.as_path() {
+            bail!("cannot resolve path: {}", candidate.display());
+        }
+        existing = parent.to_path_buf();
+    }
+}
+
+fn mkdir_creates_only_within_owned(destination: &Path, scope: &SubagentPathScope) -> bool {
+    if !scope.permits_write(std::iter::once(destination)) {
+        return false;
+    }
+    let mut current = destination.to_path_buf();
+    loop {
+        if current.exists() {
+            return true;
+        }
+        if !scope
+            .owned_roots
+            .iter()
+            .any(|root| path_under_root(&current, root))
+        {
+            return false;
+        }
+        match current.parent() {
+            Some(parent) if parent != current.as_path() => current = parent.to_path_buf(),
+            _ => return false,
+        }
+    }
+}
+
 pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<NormalizedSubagentInput> {
     let task = optional_trimmed_string(args, "task")?;
     let objective = optional_trimmed_string(args, "objective")?;
@@ -599,6 +875,10 @@ pub(crate) struct PreparedWritableLeaf {
 }
 
 impl PreparedWritableLeaf {
+    pub(crate) fn destination(&self) -> &Path {
+        &self.destination
+    }
+
     pub(crate) fn external_workspace_access(&self) -> Option<ExternalWorkspaceAccess> {
         (!self.destination.starts_with(&self.workspace_root)).then(|| ExternalWorkspaceAccess {
             paths: vec![path_preview(&self.destination)],
@@ -1730,6 +2010,10 @@ fn prepare_apply_patch_edits(_edits: &[ParsedApplyPatchEdit]) -> Result<Prepared
 }
 
 impl PreparedApplyPatch {
+    pub(crate) fn target_paths(&self) -> impl Iterator<Item = &Path> + '_ {
+        self.inner.targets.keys().map(PathBuf::as_path)
+    }
+
     pub(crate) fn external_workspace_access(&self) -> Option<ExternalWorkspaceAccess> {
         let paths: Vec<_> = self
             .inner
@@ -2447,10 +2731,10 @@ fn display_workspace_relative(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplyPatchWorkerPoint, ToolExecutionContext, ToolRegistry, assert_strict_tool_parameters,
-        external_workspace_access_for_tool, normalize_subagent_input, permission_resource_for_tool,
-        prepare_apply_patch_targets, prepare_writable_leaf, secure_write_writable_leaf,
-        subagent_parameters_schema,
+        ApplyPatchWorkerPoint, NormalizedSubagentInput, SubagentPathScope, ToolExecutionContext,
+        ToolRegistry, assert_strict_tool_parameters, external_workspace_access_for_tool,
+        normalize_subagent_input, permission_resource_for_tool, prepare_apply_patch_targets,
+        prepare_writable_leaf, secure_write_writable_leaf, subagent_parameters_schema,
     };
     use crate::permission::{PermissionResource, ToolScope};
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
@@ -2464,6 +2748,31 @@ mod tests {
         ToolRegistry::default_tools()
             .call("workflow__todos", json!({"items": items}))
             .await
+    }
+
+    #[test]
+    fn subagent_path_scope_from_input_empty_or_unresolvable() {
+        let empty = NormalizedSubagentInput {
+            objective: "x".into(),
+            success_criteria: Vec::new(),
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+            owned_paths: Vec::new(),
+            timeout_secs: None,
+            max_tool_calls: None,
+            target_child_session_id: None,
+        };
+        assert!(
+            SubagentPathScope::from_input(&empty)
+                .expect("empty scope")
+                .is_none()
+        );
+
+        let bad = NormalizedSubagentInput {
+            owned_paths: vec!["/definitely/missing/letcode-scope-root".into()],
+            ..empty
+        };
+        assert!(SubagentPathScope::from_input(&bad).is_err());
     }
 
     #[tokio::test]
@@ -3282,5 +3591,4 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&later).unwrap(), "old");
         let _ = std::fs::remove_dir_all(fixture);
     }
-
 }

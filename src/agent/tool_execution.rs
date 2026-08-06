@@ -808,6 +808,33 @@ where
     } else {
         None
     };
+
+    let mut delegation_scope_authorized = false;
+    if let Some(scope) = agent.subagent_path_scope.as_deref() {
+        if let Some(message) = crate::tool::delegation_scope_denial(
+            scope,
+            &call.name,
+            &args,
+            prepared_writable_leaf.as_ref(),
+            prepared_apply_patch.as_ref(),
+        ) {
+            let record = ToolExecutionRecord::new(
+                call,
+                Some(args),
+                permission_class,
+                directive,
+                ToolExecutionStatus::Rejected,
+                Some(ToolExecutionRejection::DelegationScopeDenied),
+                ToolResult::err(&call.name, message),
+            );
+            emit_finished(on_event, call, &record).await?;
+            return Ok(record);
+        }
+        if is_delegation_path_scoped_tool(&call.name) {
+            delegation_scope_authorized = true;
+        }
+    }
+
     let (external_workspace_access, resource) = if let Some(prepared) = &prepared_apply_patch {
         (
             prepared.external_workspace_access(),
@@ -845,10 +872,15 @@ where
             crate::permission::is_internal_tool(&call.name),
         )
     };
-    let permission_decision = if mode.uses_default_ask_matrix() && grant_allowed {
-        PermissionDecision::Allow
-    } else {
-        permission_decision
+    let permission_decision = match permission_decision {
+        PermissionDecision::Deny => PermissionDecision::Deny,
+        PermissionDecision::Allow => PermissionDecision::Allow,
+        PermissionDecision::Ask
+            if delegation_scope_authorized || (mode.uses_default_ask_matrix() && grant_allowed) =>
+        {
+            PermissionDecision::Allow
+        }
+        other => other,
     };
     let mut approval = None;
     let mut auto_deny_reason = None;

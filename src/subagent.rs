@@ -20,7 +20,7 @@ use crate::agent::{
 use crate::config::{ApiProtocol, ModelRoute, ProviderConfig, RetryConfig};
 use crate::request_builder::ModelRequestMetadata;
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
-use crate::tool::NormalizedSubagentInput;
+use crate::tool::{NormalizedSubagentInput, SubagentPathScope};
 use crate::transcript::transcript_projection;
 use crate::transcript::{
     ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir,
@@ -601,6 +601,8 @@ impl SubagentPool {
             &template,
             effective_max_tool_calls,
         );
+        let scope = SubagentPathScope::from_input(&governance.input)?;
+        child_agent.set_subagent_path_scope(scope.map(Arc::new));
 
         let existing_children = {
             let parent_records = parent_transcript
