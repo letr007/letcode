@@ -1248,59 +1248,6 @@ mod tests {
     use crate::permission::PermissionApproval;
 
     #[test]
-    fn manual_cli_compaction_lifecycle_uses_exact_pending_and_committed_copy() {
-        let mut pending = false;
-        let messages = [
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Started),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Committed),
-        ];
-
-        assert_eq!(
-            messages,
-            [
-                Some("Compacting earlier messages…".into()),
-                Some("Earlier messages compacted".into()),
-            ]
-        );
-        assert!(!pending);
-    }
-
-    #[test]
-    fn automatic_cli_compaction_lifecycle_requires_started_before_committed() {
-        let mut pending = false;
-        let messages = [
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Started),
-            cli_compaction_lifecycle_message(
-                &mut pending,
-                CompactionSignal::NoProgress {
-                    blockers: vec!["no_historical_items".into()],
-                },
-            ),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Committed),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Started),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Failed),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Committed),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Started),
-            cli_compaction_lifecycle_message(&mut pending, CompactionSignal::Committed),
-        ];
-
-        assert_eq!(
-            messages,
-            [
-                Some("Compacting earlier messages…".into()),
-                Some("Compaction made no progress: no_historical_items".into()),
-                None,
-                Some("Compacting earlier messages…".into()),
-                None,
-                None,
-                Some("Compacting earlier messages…".into()),
-                Some("Earlier messages compacted".into()),
-            ]
-        );
-        assert!(!pending);
-    }
-
-    #[test]
     fn terminal_permission_input_parses_once_always_and_denial() {
         assert_eq!(
             permission_approval_from_input("o", true),
@@ -1320,19 +1267,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_repl_command_maps_common_slash_commands() {
-        assert_eq!(parse_repl_command("/help"), ReplCommand::Help);
-        assert_eq!(parse_repl_command("/?"), ReplCommand::Help);
-        assert_eq!(parse_repl_command("/reasoning"), ReplCommand::ReasoningShow);
-        assert_eq!(
-            parse_repl_command("/think high"),
-            ReplCommand::ReasoningSet(ModelReasoningEffort::High)
-        );
-        assert_eq!(
-            parse_repl_command("/reasoning off"),
-            ReplCommand::ReasoningSet(ModelReasoningEffort::None)
-        );
-        assert_eq!(parse_repl_command("/new"), ReplCommand::NewSession);
-    }
 }

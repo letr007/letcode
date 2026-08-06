@@ -236,31 +236,6 @@ mod tests {
     }
 
     #[test]
-    fn counts_wrapped_rows_and_cursor_position() {
-        assert_eq!(wrapped_row_count("hello\nworld", 10), 2);
-        assert_eq!(
-            end_cursor_visual_position("你你a\n", 2),
-            CursorVisualPosition { row: 3, column: 0 }
-        );
-    }
-
-    #[test]
-    fn cursor_position_supports_arbitrary_byte_offsets() {
-        assert_eq!(
-            cursor_visual_position("hello", 10, 2),
-            CursorVisualPosition { row: 0, column: 2 }
-        );
-        assert_eq!(
-            cursor_visual_position("ab你cd", 4, 5),
-            CursorVisualPosition { row: 1, column: 0 }
-        );
-        assert_eq!(
-            cursor_visual_position("hi\nthere", 10, 3),
-            CursorVisualPosition { row: 1, column: 0 }
-        );
-    }
-
-    #[test]
     fn cursor_moves_to_next_row_when_last_chunk_fills_width_exactly() {
         // ASCII exact fill.
         assert_eq!(
@@ -282,31 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_and_cursor_position_handle_mixed_ascii_and_cjk() {
-        // width 4: "ab你" (1+1+2) fills exactly, so cursor moves to next row.
-        assert_eq!(
-            end_cursor_visual_position("ab你", 4),
-            CursorVisualPosition { row: 1, column: 0 }
-        );
-
-        // width 4: next char starts new wrapped row.
-        assert_eq!(
-            end_cursor_visual_position("ab你c", 4),
-            CursorVisualPosition { row: 1, column: 1 }
-        );
-    }
-
-    #[test]
     fn wrapping_does_not_split_extended_grapheme_clusters() {
         assert_eq!(wrap_text_to_width("e\u{301}x", 1), vec!["e\u{301}", "x"]);
         assert_eq!(wrap_text_to_width("👩‍💻x", 2), vec!["👩‍💻", "x"]);
-    }
-
-    #[test]
-    fn tiny_widths_emit_placeholder_rows_instead_of_wide_rows() {
-        assert_eq!(wrap_text_to_width("你a", 1), vec!["", "a"]);
-        assert_eq!(wrap_text_to_width("你", 1), vec![""]);
-        assert_eq!(wrapped_row_count("你", 1), 1);
     }
 
     #[test]

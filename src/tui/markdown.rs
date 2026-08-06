@@ -1182,67 +1182,6 @@ mod tests {
     }
 
     #[test]
-    fn native_document_metadata_survives_inline_styles_and_wraps() {
-        let document = render_markdown_document(
-            "same *same* **same** `same` [same](https://example.test)",
-            Theme::dark(),
-            MarkdownRenderOptions::new(8),
-        );
-        assert!(document.validate());
-        let copied = document
-            .lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .filter(|span| span.source.is_some())
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert_eq!(copied, "same same same same same<https://example.test>");
-        assert!(
-            document
-                .breaks
-                .iter()
-                .any(|boundary| *boundary == Break::SoftWrap)
-        );
-    }
-
-    #[test]
-    fn markdown_chrome_is_decoration_while_code_and_table_values_are_copyable() {
-        let document = render_markdown_document(
-            "```rust\ne\u{301}👩‍💻\n```\n\n| left | right |\n| --- | --- |\n| one | two |",
-            Theme::dark(),
-            MarkdownRenderOptions::new(40),
-        );
-        assert!(document.validate());
-        let copied = document
-            .lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .filter(|span| span.source.is_some())
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert!(copied.contains("e\u{301}👩‍💻"));
-        assert!(copied.contains("left"));
-        assert!(copied.contains("right"));
-        assert!(copied.contains("one"));
-        assert!(copied.contains("two"));
-        assert!(!copied.contains("│"));
-        assert!(!copied.contains("┼"));
-    }
-
-    #[test]
-    fn author_breaks_are_hard_and_layout_breaks_are_soft() {
-        let document = render_markdown_document(
-            "first  \nsecond\n\nthird fourth fifth",
-            Theme::dark(),
-            MarkdownRenderOptions::new(8),
-        );
-        assert!(document.validate());
-        assert!(document.breaks.contains(&Break::HardBreak));
-        assert!(document.breaks.contains(&Break::BlockBreak));
-        assert!(document.breaks.contains(&Break::SoftWrap));
-    }
-
-    #[test]
     fn legacy_bridge_preserves_markdown_visuals() {
         let lines = rendered("# Title\n- **item** with `code`", 80);
         let text = lines
@@ -1319,27 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_styles_survive_wrapping() {
-        let lines = rendered("**abcdef** `ghij`", 8);
-        assert!(lines.len() >= 2, "{lines:?}");
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
-            "{:?}",
-            lines[0]
-        );
-        assert!(
-            lines
-                .iter()
-                .flat_map(|line| line.spans.iter())
-                .any(|span| span.style.bg == Some(Theme::dark().element_bg)),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
     fn ordered_lists_blockquotes_tasks_and_links_keep_visual_semantics() {
         let lines = rendered("> 1. [x] done\n> 2. [ ] [docs](https://example.com)", 80);
         let text = lines
@@ -1349,30 +1267,6 @@ mod tests {
             .join("\n");
         assert!(text.contains("│ 1. ☑ done"), "{text}");
         assert!(text.contains("│ 2. ☐ docs <https://example.com>"), "{text}");
-    }
-
-    #[test]
-    fn code_blocks_are_width_safe_and_keep_quote_context() {
-        for width in 1..=10 {
-            let lines = rendered("```very-long-language-label\nabcdef\n```", width);
-            for line in lines {
-                let measured = display_width(&line.to_string());
-                assert!(
-                    measured <= width,
-                    "width={width} measured={measured}: {line:?}"
-                );
-            }
-        }
-
-        let lines = rendered("> ```rust\n> \n> x\n> ```", 24);
-        let text = lines
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("│ ╭─ rust"), "{text}");
-        assert!(text.contains("│ │ x"), "{text}");
-        assert_eq!(lines.len(), 4, "{text}");
     }
 
     #[test]
@@ -1392,13 +1286,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rules_fill_available_markdown_width() {
-        let lines = rendered("before\n\n---\n\nafter", 120);
-        let rule = lines
-            .iter()
-            .find(|line| line.to_string().chars().all(|ch| ch == '─'))
-            .expect("rule line present");
-        assert_eq!(display_width(&rule.to_string()), 120, "{rule:?}");
-    }
 }

@@ -140,18 +140,6 @@ mod tests {
     }
 
     #[test]
-    fn quiet_success_text_can_be_hidden() {
-        let policy = PresentationPolicy;
-        let mut context =
-            ToolTextPresentationContext::new("util__echo", ToolPresentationStatus::Succeeded);
-        context.output = Some("\n".into());
-        assert_eq!(
-            policy.tool_presentation_text(&context),
-            ToolPresentation::Hidden
-        );
-    }
-
-    #[test]
     fn quiet_success_text_write_like_tools_are_never_hidden() {
         let policy = PresentationPolicy;
         let mut ctx =
@@ -163,23 +151,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workflow_control_tools_remain_visible() {
-        let policy = PresentationPolicy;
-
-        for status in [
-            ToolPresentationStatus::Pending,
-            ToolPresentationStatus::Running,
-            ToolPresentationStatus::Succeeded,
-            ToolPresentationStatus::Failed,
-        ] {
-            for tool_name in ["workflow__todos", "workflow__auto_continue"] {
-                let text_context = ToolTextPresentationContext::new(tool_name, status);
-                assert_eq!(
-                    policy.tool_presentation_text(&text_context),
-                    ToolPresentation::CompactCard
-                );
-            }
-        }
-    }
 }

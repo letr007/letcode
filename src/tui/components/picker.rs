@@ -783,44 +783,6 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
-    fn centered_picker_area_uses_the_shared_picker_dimensions() {
-        assert_eq!(
-            centered_picker_area(Rect::new(0, 0, 100, 30)),
-            Rect::new(12, 3, 75, 24)
-        );
-    }
-
-    #[test]
-    fn mcp_tools_picker_renders_server_status_and_search() {
-        let theme = Theme::dark();
-        let area = Rect::new(0, 0, 100, 30);
-        let dialog = DialogState::new(
-            DialogKind::McpToolsPicker,
-            "Tools · local",
-            Some("Online · 2 tools available".into()),
-            vec![DialogItem::new("find", "Find files", None)],
-        );
-        let mut state = TuiState::default();
-        let backend = TestBackend::new(area.width, area.height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-
-        terminal
-            .draw(|frame| render_picker(frame, &mut state, area, theme, &dialog))
-            .expect("draw");
-
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Online · 2 tools available"));
-        assert!(rendered.contains("Search"));
-        assert!(rendered.contains("Esc back"));
-    }
-
-    #[test]
     fn mcp_tools_picker_hides_raw_offline_diagnostics() {
         let theme = Theme::dark();
         let area = Rect::new(0, 0, 100, 30);

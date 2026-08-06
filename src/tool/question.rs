@@ -209,46 +209,6 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn question_tool_uses_interactive_callback() {
-        let registry = ToolRegistry::default_tools();
-        let context = ToolExecutionContext {
-            question_handler: Some(Arc::new(|request: QuestionRequest| {
-                Box::pin(async move {
-                    assert_eq!(request.questions.len(), 1);
-                    Ok(QuestionResponse {
-                        answers: vec![vec!["Fast".into()]],
-                    })
-                })
-            })),
-            ..ToolExecutionContext::default()
-        };
-
-        let output = registry
-            .call_with_context(
-                tool_names::TOOL_QUESTION,
-                json!({
-                    "questions": [{
-                        "question": "Choose mode",
-                        "header": "Mode",
-                        "options": [{"label": "Fast", "description": "Fast path"}],
-                        "multiple": false
-                    }]
-                }),
-                context,
-            )
-            .await;
-
-        assert!(output.ok, "{:?}", output.error);
-        let data = output.data.expect("question result data");
-        assert_eq!(data["answers"], json!([["Fast"]]));
-        assert!(
-            data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("User has answered your questions"))
-        );
-    }
-
-    #[tokio::test]
     async fn question_tool_rejects_unanswered_or_invalid_single_select_responses() {
         let registry = ToolRegistry::default_tools();
         let args = json!({

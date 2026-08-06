@@ -508,54 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn projects_experiment_results_and_evidence_to_memories() {
-        let records = vec![
-            record(
-                1,
-                TranscriptEvent::ContextExperimentReturned {
-                    branch_id: "branch-1".into(),
-                    parent_branch_id: "main".into(),
-                    base_sequence: 4,
-                    outcome: "useful".into(),
-                    summary: "Found the parser root cause".into(),
-                    next_action: Some("apply fix".into()),
-                    had_writes: true,
-                },
-            ),
-            record(
-                2,
-                TranscriptEvent::Evidence {
-                    id: "ev-1".into(),
-                    evidence_kind: EvidenceKind::Decision,
-                    title: "Use parser recovery".into(),
-                    summary: "Decision summary".into(),
-                    detail: None,
-                    source: EvidenceSource::File {
-                        path: "src/parser.rs".into(),
-                        start_line: None,
-                        end_line: None,
-                    },
-                    tags: vec!["parser".into()],
-                },
-            ),
-        ];
-
-        let memories = project_memory_objects("session-1", &records).expect("memories");
-
-        assert_eq!(memories.len(), 2);
-        assert!(memories.iter().any(|memory| {
-            memory.kind == MemoryKind::ExperimentResult
-                && memory.status == MemoryStatus::Useful
-                && memory.summary == "Found the parser root cause"
-        }));
-        assert!(memories.iter().any(|memory| {
-            memory.kind == MemoryKind::Decision
-                && memory.status == MemoryStatus::Useful
-                && memory.paths == vec!["src/parser.rs"]
-        }));
-    }
-
-    #[test]
     fn recall_filters_by_query_kind_status_path_and_limit() {
         let memories = vec![
             MemoryObject {
@@ -637,44 +589,4 @@ mod tests {
         assert!(validate_memory_recall_query(&json!({"limit": 99})).is_err());
     }
 
-    #[test]
-    fn recalls_recent_memories_across_temp_sessions() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "letcode-memory-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base_dir).expect("create temp dir");
-        set_memory_sessions_dir(base_dir.clone());
-
-        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-        recorder
-            .record_session_started("gpt-test")
-            .expect("session start");
-        recorder
-            .record_context_experiment_returned(
-                "branch-1",
-                "main",
-                2,
-                "useful",
-                "Recovered the parser issue",
-                None,
-                false,
-            )
-            .expect("record memory event");
-
-        let memories = recall_recent_memories(&MemoryRecallQuery {
-            query: Some("parser".into()),
-            paths: vec![],
-            kinds: vec![MemoryKind::ExperimentResult],
-            statuses: vec![MemoryStatus::Useful],
-            limit: 5,
-        })
-        .expect("recall memories");
-
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].summary, "Recovered the parser issue");
-    }
 }

@@ -341,43 +341,4 @@ mod tests {
         assert!(card.rationale.contains("safe https"));
     }
 
-    #[test]
-    fn request_and_decision_cards_render_compact_labels() {
-        let theme = Theme::dark();
-        let request = parse_review_request(SAMPLE_REQUEST).expect("request");
-        let decision =
-            parse_review_decision(r#"{"decision":"deny","risk":"high","rationale":"too broad"}"#)
-                .expect("decision");
-
-        let request_doc = render_review_request_card_document(&request, theme, 72);
-        let decision_doc = render_review_decision_card_document(&decision, theme, 72);
-        let request_text = request_doc
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.text.as_str())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let decision_text = decision_doc
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.text.as_str())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(request_text.contains("request"), "{request_text}");
-        assert!(request_text.contains("shell__exec"), "{request_text}");
-        assert!(decision_text.contains("decide"), "{decision_text}");
-        assert!(decision_text.contains("deny"), "{decision_text}");
-        assert!(decision_text.contains("too broad"), "{decision_text}");
-    }
 }

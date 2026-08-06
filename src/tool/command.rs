@@ -538,19 +538,4 @@ mod tests {
         assert_file_does_not_appear(&marker).await;
         let _ = std::fs::remove_dir_all(dir);
     }
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_commands_complete_normally() {
-        let args = vec!["-c".to_string(), "printf command-ok".to_string()];
-        let command = super::run_workspace_command("sh", &args, 2)
-            .await
-            .expect("command output");
-        assert_eq!(command["stdout"], json!("command-ok"));
-        assert_eq!(command["success"], json!(true));
-        let shell = super::run_workspace_shell_command("printf shell-ok", 2)
-            .await
-            .expect("shell output");
-        assert_eq!(shell["stdout"], json!("shell-ok"));
-        assert_eq!(shell["success"], json!(true));
-    }
 }

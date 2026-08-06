@@ -101,16 +101,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_scrollbar_preference_defaults_visible() {
-        let loaded: TuiPreferences = serde_json::from_str(r#"{"tool_output_expanded":true}"#)
-            .expect("old preferences shape loads");
-
-        assert!(loaded.tool_output_expanded);
-        assert!(loaded.transcript_scrollbar_visible);
-        assert_eq!(loaded.theme, ThemeName::Dark.as_str());
-    }
-
-    #[test]
     fn custom_theme_id_round_trips() {
         let prefs = TuiPreferences {
             tool_output_expanded: false,

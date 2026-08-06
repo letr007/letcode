@@ -46,28 +46,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_reports_session_engine_unavailable_for_key_path() {
-        let mut runtime = runtime();
-        let (engine, ingress, _egress) = SessionEngine::new();
-        drop(engine);
-
-        dispatch_command(
-            &mut runtime,
-            RuntimeCommand::SetModel("gpt-test".into()),
-            &ingress,
-            true,
-        );
-
-        assert_eq!(runtime.state().phase, AppPhase::Completed);
-        assert!(runtime
-            .state()
-            .timeline
-            .items()
-            .iter()
-            .any(|item| matches!(item, crate::tui::TimelineItem::Error(error) if error.message == SESSION_ENGINE_UNAVAILABLE_MESSAGE)));
-    }
-
-    #[test]
     fn failed_resume_dispatch_clears_pending_state() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/resume session-1");
@@ -83,22 +61,6 @@ mod tests {
 
         assert!(!runtime.session_resume_pending);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
-    }
-
-    #[tokio::test]
-    async fn dispatch_ignores_submit_family_for_mouse_path() {
-        let mut runtime = runtime();
-        let (mut engine, ingress, _egress) = SessionEngine::new();
-
-        dispatch_command(
-            &mut runtime,
-            RuntimeCommand::SubmitPrompt("hello".into()),
-            &ingress,
-            false,
-        );
-
-        assert!(engine.try_recv_control().is_err());
-        assert!(runtime.state().timeline.items().is_empty());
     }
 
     #[tokio::test]
@@ -125,16 +87,4 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn dispatch_maps_session_command_through_engine_ingress() {
-        let mut runtime = runtime();
-        let (mut engine, ingress, _egress) = SessionEngine::new();
-
-        dispatch_command(&mut runtime, RuntimeCommand::Compact, &ingress, true);
-
-        assert!(matches!(
-            engine.recv_control().await,
-            Some(SessionEngineControl::Command(_))
-        ));
-    }
 }

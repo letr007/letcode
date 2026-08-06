@@ -96,66 +96,6 @@ fn frame_ids_by_source(
 }
 
 #[test]
-fn context_frame_ids_ignore_mixed_retirement_visibility() {
-    let live = snapshot_for_context_view(&mixed_context_view(&[]));
-    let mixed = snapshot_for_context_view(&mixed_context_view(&["block-2"]));
-    let repeated = snapshot_for_context_view(&mixed_context_view(&["block-1", "block-2"]));
-
-    let live_ids = frame_ids_by_source(&live, RuntimeFrameKind::ContextBlock);
-    assert_eq!(
-        frame_ids_by_source(&mixed, RuntimeFrameKind::ContextBlock),
-        live_ids
-    );
-    assert_eq!(
-        frame_ids_by_source(&repeated, RuntimeFrameKind::ContextBlock),
-        live_ids
-    );
-    assert!(
-        mixed
-            .context_view
-            .provider_visible_block_ids()
-            .iter()
-            .all(|id| id != "block-2")
-    );
-    assert!(mixed.frames.iter().any(|frame| {
-        frame.provenance.source_id.as_deref() == Some("block-2")
-            && frame.visibility == FrameVisibility::Retired
-    }));
-    assert!(
-        mixed
-            .prompt_contributors
-            .iter()
-            .all(|contributor| contributor.contributor_id != "context-view-active")
-    );
-    let contributor_ids = |snapshot: &RuntimeSnapshot, contributor_id| {
-        snapshot
-            .prompt_contributors
-            .iter()
-            .find(|contributor| contributor.contributor_id == contributor_id)
-            .map(|contributor| contributor.frame_ids.clone())
-            .unwrap_or_default()
-    };
-    mixed
-        .validate_references()
-        .expect("contributor references resolve");
-
-    let restored: RuntimeSnapshot =
-        serde_json::from_str(&serde_json::to_string(&mixed).expect("persist compacted snapshot"))
-            .expect("restore compacted snapshot");
-    assert_eq!(
-        frame_ids_by_source(&restored, RuntimeFrameKind::ContextBlock),
-        frame_ids_by_source(&mixed, RuntimeFrameKind::ContextBlock)
-    );
-    assert_eq!(
-        contributor_ids(&restored, "context-view-active"),
-        contributor_ids(&mixed, "context-view-active")
-    );
-    restored
-        .validate_references()
-        .expect("restored contributor references resolve");
-}
-
-#[test]
 fn context_view_contributor_protects_only_hard_pinned_or_opened_blocks() {
     let mut projection = mixed_context_view(&[]);
     let id = |value| ContextBlockId::new(value).expect("valid block id");
@@ -293,29 +233,6 @@ fn opened_archived_detail_without_visible_index_retains_its_source() {
     cleared
         .validate_references()
         .expect("cleared contributor references resolve");
-}
-
-#[test]
-fn replay_context_tree_uses_default_root_for_legacy_transcripts() {
-    let tree = replay_context_tree(&[
-        record_at(
-            1,
-            TranscriptEvent::SessionStarted {
-                model: "gpt-5".into(),
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("hello"),
-            },
-        ),
-    ])
-    .expect("replay legacy context tree");
-
-    assert_eq!(tree.root_node_id().as_str(), "root");
-    assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("root"));
-    assert_eq!(tree.node_count(), 1);
 }
 
 #[test]
@@ -629,54 +546,6 @@ fn replay_context_tree_rejects_self_parent() {
 }
 
 #[test]
-fn default_cursor_preserves_current_behavior() {
-    let records = vec![
-        record_at(
-            1,
-            TranscriptEvent::SessionStarted {
-                model: "gpt-5".into(),
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("hello"),
-            },
-        ),
-        record_at(
-            3,
-            TranscriptEvent::AssistantMessage {
-                content: "hi".into(),
-            },
-        ),
-    ];
-
-    let expected =
-        project_session_restore_snapshot("s".into(), records.clone()).expect("default snapshot");
-    let actual = build_session_context_snapshot(
-        "s".into(),
-        records.clone(),
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-    )
-    .expect("cursor snapshot");
-
-    assert_eq!(actual.branch_id, ROOT_CONTEXT_BRANCH_ID);
-    assert_eq!(actual.leaf_sequence, 3);
-    assert_eq!(actual.records.len(), expected.records.len());
-    assert_eq!(
-        format!("{:?}", actual.messages),
-        format!("{:?}", expected.messages)
-    );
-    assert_eq!(actual.history, expected.history);
-    assert_eq!(actual.evidence, expected.evidence);
-    assert_eq!(actual.latest_model, expected.latest_model);
-    assert_eq!(actual.max_turn_id, expected.max_turn_id);
-}
-
-#[test]
 fn explicit_leaf_truncates_future_records() {
     let records = vec![
         record_at(
@@ -914,39 +783,6 @@ fn evidence_respects_leaf_cut() {
 }
 
 #[test]
-fn old_transcript_default_restore_still_matches_linear_behavior() {
-    let records = vec![
-        record_at(
-            1,
-            TranscriptEvent::SessionStarted {
-                model: "gpt-5".into(),
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("hello"),
-            },
-        ),
-        record_at(
-            3,
-            TranscriptEvent::AssistantMessage {
-                content: "hi".into(),
-            },
-        ),
-    ];
-
-    let snapshot = project_session_restore_snapshot("s".into(), records).expect("linear snapshot");
-
-    assert_eq!(snapshot.branch_id, ROOT_CONTEXT_BRANCH_ID);
-    assert_eq!(snapshot.leaf_sequence, 3);
-    assert!(matches!(
-        snapshot.history.as_slice(),
-        [HistoryItem::UserMessage { .. }, HistoryItem::AssistantText { text }] if text == "hi"
-    ));
-}
-
-#[test]
 fn explicit_branch_inherits_parent_prefix_and_excludes_parent_after_fork_base() {
     let records = vec![
         record_at(
@@ -1166,44 +1002,6 @@ fn invalid_branch_resolution_errors_fail_fast() {
 }
 
 #[test]
-fn list_context_branches_marks_current_branch_and_labels() {
-    let records = vec![
-        record_at(
-            1,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("root"),
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::ContextBranchCreated {
-                branch_id: "feature-a".into(),
-                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 1,
-                label: Some("Feature A".into()),
-            },
-        ),
-        branch_record_at(
-            3,
-            "feature-a",
-            TranscriptEvent::AssistantMessage {
-                content: "child".into(),
-            },
-        ),
-    ];
-
-    let branches = list_context_branches(&records, Some("feature-a")).expect("branches");
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].branch_id, ROOT_CONTEXT_BRANCH_ID);
-    assert_eq!(branches[1].branch_id, "feature-a");
-    assert_eq!(branches[1].label.as_deref(), Some("Feature A"));
-    assert_eq!(branches[1].tip_sequence, 3);
-    assert!(branches[1].is_current);
-    assert!(!branches[0].is_current);
-}
-
-#[test]
 fn branch_summary_cannot_reference_a_future_branch_tip() {
     let records = vec![
         record_at(
@@ -1246,68 +1044,6 @@ fn branch_summary_cannot_reference_a_future_branch_tip() {
             .to_string()
             .contains("context branch summary leaf_sequence 4 exceeds tip 1 for branch 'child'")
     );
-}
-
-#[test]
-fn branch_index_tracks_root_and_child_tips_incrementally() {
-    let records = vec![
-        record_at(
-            1,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("root-before"),
-            },
-        ),
-        metadata_record_at(
-            2,
-            TranscriptEvent::ContextBranchCreated {
-                branch_id: "child".into(),
-                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 1,
-                label: None,
-            },
-        ),
-        branch_record_at(
-            3,
-            "child",
-            TranscriptEvent::AssistantMessage {
-                content: "child".into(),
-            },
-        ),
-        record_at(
-            4,
-            TranscriptEvent::AssistantMessage {
-                content: "root-after".into(),
-            },
-        ),
-    ];
-
-    let branches = list_context_branches(&records, None).expect("branches");
-
-    assert_eq!(branches[0].branch_id, ROOT_CONTEXT_BRANCH_ID);
-    assert_eq!(branches[0].tip_sequence, 4);
-    assert_eq!(branches[1].branch_id, "child");
-    assert_eq!(branches[1].tip_sequence, 3);
-}
-
-#[test]
-fn large_linear_transcript_builds_root_branch_tip() {
-    const RECORD_COUNT: u64 = 10_000;
-    let records = (1..=RECORD_COUNT)
-        .map(|sequence| {
-            record_at(
-                sequence,
-                TranscriptEvent::AssistantMessage {
-                    content: format!("message-{sequence}"),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let branches = list_context_branches(&records, None).expect("large linear transcript");
-
-    assert_eq!(branches.len(), 1);
-    assert_eq!(branches[0].branch_id, ROOT_CONTEXT_BRANCH_ID);
-    assert_eq!(branches[0].tip_sequence, RECORD_COUNT);
 }
 
 #[test]

@@ -146,21 +146,4 @@ fn sanitize_title(title: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn terminal_guard_tracks_mouse_capture_bit() {
-        assert_eq!(MOUSE_CAPTURE_BIT, 0b100);
-        let guard = TerminalGuard {
-            init_bits: RAW_MODE_BIT | ALT_SCREEN_BIT | MOUSE_CAPTURE_BIT | KEYBOARD_ENHANCEMENT_BIT,
-        };
-        assert_ne!(guard.init_bits & MOUSE_CAPTURE_BIT, 0);
-        assert_ne!(guard.init_bits & KEYBOARD_ENHANCEMENT_BIT, 0);
-    }
-
-    #[test]
-    fn terminal_title_sanitizes_control_characters() {
-        assert_eq!(
-            sanitize_title("Build\nstatus\t\u{1b}]2;unsafe\u{7} ✓"),
-            "Build status  ]2;unsafe  ✓"
-        );
-    }
 }

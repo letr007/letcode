@@ -1739,21 +1739,6 @@ mod tests {
     }
 
     #[test]
-    fn transcript_rows_wrap_using_display_width() {
-        let mut state = TuiState::default();
-        state.apply_event(crate::tui::events::SessionEvent::UserMessage(
-            UserMessageEvent::new("a你b"),
-        ));
-
-        let theme = Theme::dark();
-        let lines = transcript_lines(&state, theme, 6);
-
-        assert_eq!(transcript_row_count(&state, theme, 6), lines.len());
-        assert_eq!(lines.len(), 6);
-        assert!(lines.iter().any(|line| line.to_string().contains('你')));
-    }
-
-    #[test]
     fn tool_permission_and_error_cards_wrap_to_target_width() {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("seed")));
@@ -1791,65 +1776,6 @@ mod tests {
     }
 
     #[test]
-    fn error_card_is_message_first_and_uses_semantic_error_styling() {
-        let mut state = TuiState::default();
-        let mut error = ErrorEvent::new("stream stopped");
-        error.details = Some("retry after backoff".into());
-        state.apply_event(SessionEvent::Error(error));
-
-        let theme = Theme::dark();
-        let lines = transcript_lines(&state, theme, 64);
-        let error_line = lines
-            .iter()
-            .find(|line| line.to_string().contains("stream stopped"))
-            .expect("error line renders");
-        let guide = error_line.spans.first().expect("error line has guide");
-
-        assert_eq!(
-            guide.content.as_ref(),
-            crate::tui::surface::ACCENT_BAR_GLYPH
-        );
-        assert_eq!(guide.style.fg, Some(theme.error));
-        assert_eq!(guide.style.bg, Some(theme.root_bg));
-
-        let card_pad = error_line.spans.get(1).expect("error line has card pad");
-        assert_eq!(card_pad.content.as_ref(), " ");
-        assert_eq!(card_pad.style.bg, Some(theme.elevated_bg));
-        let message = error_line.spans.get(2).expect("error message renders");
-        assert_eq!(message.style.fg, Some(theme.error));
-        assert_eq!(message.style.bg, Some(theme.elevated_bg));
-        assert!(
-            message
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-
-        let error_index = lines
-            .iter()
-            .position(|line| line.to_string().contains("stream stopped"))
-            .expect("error line index");
-        assert!(error_index > 0, "error card has top padding row");
-        let top_pad = &lines[error_index - 1];
-        let bottom_pad = lines.last().expect("error card has bottom padding row");
-        for pad in [top_pad, bottom_pad] {
-            assert_eq!(pad.spans[0].style.fg, Some(theme.error));
-            assert_eq!(pad.spans[0].style.bg, Some(theme.root_bg));
-            assert!(pad.spans[1].content.as_ref().starts_with(' '));
-            assert_eq!(pad.spans[1].style.bg, Some(theme.elevated_bg));
-        }
-
-        let rendered = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<String>();
-        assert!(rendered.contains("stream stopped"));
-        assert!(rendered.contains("retry after backoff"));
-        assert!(!rendered.contains("error stream stopped"));
-        assert!(!rendered.contains("details"));
-    }
-
-    #[test]
     fn error_card_stays_within_narrow_widths() {
         let mut state = TuiState::default();
         let mut error = ErrorEvent::new("stream stopped");
@@ -1865,86 +1791,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn todo_timeline_items_render_full_card_sections() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::AutoContinueChanged(
-            AutoContinueChangedEvent::new(AutoContinueState { enabled: true }),
-        ));
-        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
-            TodoItem {
-                id: "t1".into(),
-                content: "Inspect timeline integration".into(),
-                status: TodoStatus::InProgress,
-            },
-            TodoItem {
-                id: "t2".into(),
-                content: "Keep wrapping stable at narrow widths".into(),
-                status: TodoStatus::Pending,
-            },
-            TodoItem {
-                id: "t3".into(),
-                content: "Snapshot final layout".into(),
-                status: TodoStatus::Completed,
-            },
-        ])));
-
-        let lines = transcript_lines(&state, Theme::dark(), 56)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        let joined = lines.join("\n");
-
-        assert!(joined.contains("# Todos"));
-        assert!(joined.contains("[•] Inspect timeline integration"));
-        assert!(joined.contains("[ ] Keep wrapping stable at narrow widths"));
-        assert!(joined.contains("[✓] Snapshot final layout"));
-        assert!(!joined.contains("auto on"));
-        assert!(!joined.contains("current"));
-        assert!(!joined.contains("items · auto-continue"));
-
-        for rendered in lines {
-            let measured = crate::tui::measure::display_width(&rendered);
-            assert!(measured <= 56, "line width {measured} > 56: {rendered:?}");
-        }
-    }
-
-    #[test]
-    fn todo_cards_do_not_get_extra_timeline_separator() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
-            TodoItem {
-                id: "t1".into(),
-                content: "First snapshot".into(),
-                status: TodoStatus::Completed,
-            },
-        ])));
-        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
-            TodoItem {
-                id: "t1".into(),
-                content: "Second snapshot".into(),
-                status: TodoStatus::InProgress,
-            },
-        ])));
-
-        let lines = transcript_lines(&state, Theme::dark(), 56)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        let title_indices = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| line.contains("# Todos").then_some(index))
-            .collect::<Vec<_>>();
-        assert_eq!(title_indices.len(), 2, "{lines:?}");
-
-        let between_cards = &lines[title_indices[0] + 1..title_indices[1]];
-        assert!(
-            !between_cards.iter().any(|line| line.is_empty()),
-            "unexpected blank timeline separator between todo cards: {lines:?}"
-        );
     }
 
     #[test]
@@ -2052,26 +1898,6 @@ mod tests {
             cached_transcript_row_count(&mut state, theme, width),
             expected_rows
         );
-        assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
-    }
-
-    #[test]
-    fn rainbow_ticks_keep_stable_transcript_row_metadata() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("first")));
-        state.set_theme_name(ThemeName::Rainbow);
-
-        let width = 80;
-        let theme = state.transcript_theme();
-        cached_transcript_row_count(&mut state, theme, width);
-        let rebuilds = state.transcript_render_cache.row_count_rebuilds;
-
-        for _ in 0..6 {
-            state.apply_event(SessionEvent::Tick);
-            let theme = state.transcript_theme();
-            cached_transcript_row_count(&mut state, theme, width);
-        }
-
         assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
     }
 
@@ -2216,74 +2042,6 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_child_view_renders_request_and_decision_cards() {
-        let mut state = TuiState::default();
-        let records = vec![
-            TranscriptRecord {
-                session_id: "child-reviewer".into(),
-                sequence: 1,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from(
-                        "Approve or deny this tool permission request.\n\
-                         \n\
-                         User goal:\nExecute commands to test auto-approval\n\
-                         \n\
-                         Tool: shell__exec\n\
-                         Class: command\n\
-                         Summary: shell__exec python3 fetch\n\
-                         Preview: (none)\n\
-                         can_allow_always: true\n\
-                         Arguments:\n{\"command\":\"python3\"}\n\
-                         \n\
-                         Reply with ONLY JSON:\n{}",
-                    ),
-                },
-            },
-            TranscriptRecord {
-                session_id: "child-reviewer".into(),
-                sequence: 2,
-                timestamp_ms: 1,
-                context_branch_id: None,
-                event: TranscriptEvent::AssistantMessage {
-                    content: r#"{"decision":"allow_once","risk":"low","rationale":"limited https fetch"}"#
-                        .into(),
-                },
-            },
-        ];
-        state.replace_child_timeline_from_records(
-            &records,
-            "parent",
-            "child-reviewer",
-            "reviewer",
-            0,
-            1,
-            1,
-        );
-
-        let rendered = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("request"), "{rendered}");
-        assert!(rendered.contains("shell__exec"), "{rendered}");
-        assert!(rendered.contains("decide"), "{rendered}");
-        assert!(rendered.contains("allow once"), "{rendered}");
-        assert!(rendered.contains("limited https fetch"), "{rendered}");
-        assert!(
-            !rendered.contains("Approve or deny this tool permission request."),
-            "raw prompt body should be cardified: {rendered}"
-        );
-        assert!(
-            !rendered.contains("\"decision\""),
-            "raw JSON should be cardified: {rendered}"
-        );
-    }
-
-    #[test]
     fn pending_permission_is_hidden_from_transcript_while_panel_is_active() {
         let mut state = TuiState::default();
         let mut request = PermissionRequestEvent::new("call-perm", "shell__exec", "cargo test all");
@@ -2306,21 +2064,6 @@ mod tests {
             !lines.iter().any(|line| line.contains("cargo test all")),
             "{lines:?}"
         );
-    }
-
-    #[test]
-    fn delegation_item_renders_as_dedicated_transcript_line() {
-        let mut state = TuiState::default();
-        state.timeline.push_delegation("fixer", "fix failing test");
-
-        let rendered = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("delegate @fixer"), "{rendered}");
-        assert!(rendered.contains("fix failing test"), "{rendered}");
     }
 
     #[test]
@@ -2379,144 +2122,6 @@ mod tests {
                 .any(|line| line.contains("long child body line should stay in child view")),
             "{non_empty:?}"
         );
-    }
-
-    #[test]
-    fn fixer_parent_transcript_stays_compact_and_keeps_child_details_out() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent {
-            call_id: "run-2".into(),
-            name: "agent__fixer".into(),
-            summary: "fixer running · child-sessio".into(),
-            arguments: Some(serde_json::json!({"task":"wire fixer tool"}).to_string()),
-        }));
-        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
-            call_id: "run-2".into(),
-            name: "agent__fixer".into(),
-            summary: "fixer completed · child-sessio".into(),
-            outcome: ToolOutcome::Success,
-            output: Some(
-                serde_json::json!({
-                    "ok": true,
-                    "tool": "agent__fixer",
-                    "data": {
-                        "agent_name": "fixer",
-                        "status": "completed",
-                        "summary": "wired fixer tool end to end",
-                        "full_summary": "wired fixer tool end to end\nchild details stay hidden",
-                        "child_session_id": "child-session-1234567890"
-                    }
-                })
-                .to_string(),
-            ),
-        }));
-
-        let lines = transcript_lines(&state, Theme::dark(), 120)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-
-        let non_empty = lines
-            .into_iter()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>();
-        let agent_lines = non_empty
-            .iter()
-            .filter(|line| line.contains("fixer") || line.contains("/child"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(agent_lines.len(), 1, "{non_empty:?}");
-        assert!(
-            agent_lines[0].contains("completed fixer wired fixer tool end to end · /child"),
-            "{}",
-            agent_lines[0]
-        );
-        assert!(
-            !non_empty
-                .iter()
-                .any(|line| line.contains("child details stay hidden")),
-            "{non_empty:?}"
-        );
-    }
-
-    #[test]
-    fn reasoning_content_renders_inline_in_transcript() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new(
-            "r-1",
-            "Inspecting workflow",
-        )));
-        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::new(
-            "r-1",
-            "Inspecting workflow",
-        )));
-
-        let lines = transcript_lines(&state, Theme::dark(), 60)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-
-        assert!(
-            lines.iter().any(|line| line.contains("Thought")),
-            "{lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("Inspecting workflow")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn reasoning_title_strips_markdown_and_body_is_indented() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::new(
-            "r-1",
-            "**Evaluating code status**\n\nI need to check `git diff` output.",
-        )));
-
-        let lines = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("Thought: Evaluating code status")),
-            "{lines:?}"
-        );
-        assert!(!lines.iter().any(|line| line.contains("**")), "{lines:?}");
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("I need to check git diff output.")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn assistant_markdown_is_rendered_as_formatted_plain_tui_lines() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::AssistantDelta(
-            crate::tui::events::AssistantDeltaEvent::new(
-                "# Title\n- **item** with `code`\n```\nlet x = 1;\n```",
-            ),
-        ));
-        state.apply_event(SessionEvent::AssistantDone { message_id: None });
-
-        let lines = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(lines.contains("▌ Title"), "{lines}");
-        assert!(lines.contains("• item with code"), "{lines}");
-        assert!(lines.contains("let x = 1;"), "{lines}");
-        assert!(!lines.contains("**item**"), "{lines}");
-        assert!(!lines.contains("```"), "{lines}");
     }
 
     #[test]

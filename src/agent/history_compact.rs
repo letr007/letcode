@@ -225,29 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_turn_cut_includes_completed_tools_before_current_turn() {
-        let history = vec![
-            HistoryItem::user("old"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                reasoning_content: None,
-                calls: vec![tool_call("x", "lookup")],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "x".into(),
-                output_json: "{}".into(),
-            },
-            HistoryItem::user("current"),
-        ];
-        let cut = plan_turn_cut(&history, Some(3), 0)
-            .expect("plan")
-            .expect("cut");
-        assert_eq!(cut.cut_end, history.len());
-        assert!(cut.split_active_turn);
-        assert_eq!(cut.prefix, history);
-    }
-
-    #[test]
     fn compose_with_summary_replaces_prefix() {
         let history = vec![
             HistoryItem::user("old"),

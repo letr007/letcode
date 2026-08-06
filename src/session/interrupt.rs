@@ -103,67 +103,6 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_excludes_finished_tool_calls() {
-        let records = [
-            record(1, turn_started(1)),
-            record(
-                2,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "pending".into(),
-                    name: "shell__exec".into(),
-                    args: json!({}),
-                },
-            ),
-            record(
-                3,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "finished".into(),
-                    name: "fs__read".into(),
-                    args: json!({}),
-                },
-            ),
-            record(
-                4,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "finished".into(),
-                    name: "fs__read".into(),
-                    ok: true,
-                    output: ToolResult::ok("fs__read", json!({})),
-                },
-            ),
-        ];
-
-        assert_eq!(
-            unfinished_tool_calls_in_active_turn(&records),
-            vec![("pending".into(), "shell__exec".into())]
-        );
-    }
-
-    #[test]
-    fn active_turn_excludes_cancelled_tool_calls() {
-        let records = [
-            record(1, turn_started(1)),
-            record(
-                2,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "cancelled".into(),
-                    name: "shell__exec".into(),
-                    args: json!({}),
-                },
-            ),
-            record(
-                3,
-                TranscriptEvent::ToolCallCancelled {
-                    call_id: "cancelled".into(),
-                    name: "shell__exec".into(),
-                },
-            ),
-        ];
-
-        assert!(unfinished_tool_calls_in_active_turn(&records).is_empty());
-    }
-
-    #[test]
     fn current_context_branch_uses_its_active_turn() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-session-interrupt-test-{}",

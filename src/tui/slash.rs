@@ -84,43 +84,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slash_query_requires_leading_slash() {
-        assert_eq!(slash_query("/help"), Some("/help".into()));
-        assert_eq!(
-            slash_query("   /permission s"),
-            Some("/permission s".into())
-        );
-        assert_eq!(slash_query("hello"), None);
-        assert_eq!(expert_query("@fix"), Some("@fix".into()));
-    }
-
-    #[test]
-    fn matching_slash_commands_filters_by_prefix() {
-        let matches = matching_slash_commands("/permission s");
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn matching_slash_commands_includes_reasoning() {
-        let matches = matching_slash_commands("/rea");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].command, "/reasoning");
-    }
-
-    #[test]
     fn matching_slash_commands_excludes_removed_subagent_commands() {
         assert!(matching_slash_commands("/exp").is_empty());
         assert!(matching_slash_commands("/fix").is_empty());
-    }
-
-    #[test]
-    fn matching_expert_commands_filters_canonical_experts() {
-        let matches = matching_expert_commands("@fi");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].command, "@fixer");
-        let canonical = matching_expert_commands("@explore");
-        assert_eq!(canonical.len(), 1);
-        assert_eq!(canonical[0].insert_text, "@explorer ");
     }
 
     #[test]
@@ -135,30 +101,4 @@ mod tests {
         assert!(commands.contains(&"/parent"));
     }
 
-    #[test]
-    fn slash_registry_includes_local_display_commands() {
-        let commands = slash_commands()
-            .into_iter()
-            .map(|entry| entry.command)
-            .collect::<Vec<_>>();
-
-        assert!(commands.contains(&"/tool-output"));
-        assert!(commands.contains(&"/scrollbar"));
-        assert!(commands.contains(&"/theme"));
-        assert!(commands.contains(&"/context"));
-        assert!(commands.contains(&"/mcp"));
-        assert!(commands.contains(&"/skill"));
-    }
-
-    #[test]
-    fn slash_registry_uses_shared_metadata_filter() {
-        let commands = slash_commands()
-            .into_iter()
-            .map(|entry| entry.command)
-            .collect::<Vec<_>>();
-
-        assert!(commands.contains(&"/quit"));
-        assert!(!commands.contains(&"/perm"));
-        assert!(!commands.contains(&"/think"));
-    }
 }

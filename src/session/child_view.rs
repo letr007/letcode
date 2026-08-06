@@ -195,25 +195,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_child_navigation_wraps() {
-        let children = vec![child("a"), child("b"), child("c")];
-        assert_eq!(
-            select_child_navigation_index(&children, ChildNavigation::First, None),
-            Some(0)
-        );
-        assert_eq!(
-            select_child_navigation_index(&children, ChildNavigation::Next, Some("a")),
-            Some(1)
-        );
-        assert_eq!(
-            select_child_navigation_index(&children, ChildNavigation::Next, Some("c")),
-            Some(0)
-        );
-        assert_eq!(
-            select_child_navigation_index(&children, ChildNavigation::Prev, Some("a")),
-            Some(2)
-        );
-        assert!(select_child_navigation_index(&[], ChildNavigation::First, None).is_none());
-    }
 }

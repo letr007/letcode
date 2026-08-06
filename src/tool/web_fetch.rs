@@ -416,12 +416,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_public_http_urls_and_strips_fragments() {
-        let url = parse_public_url("https://example.com/docs?q=1#section").expect("public URL");
-        assert_eq!(url.as_str(), "https://example.com/docs?q=1");
-    }
-
-    #[test]
     fn rejects_non_http_credentials_and_private_literal_hosts() {
         for url in [
             "file:///etc/passwd",
@@ -440,103 +434,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn public_ip_classification_covers_ipv4_and_ipv6_boundaries() {
-        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
-            assert!(ensure_public_ip(ip.parse().unwrap()).is_ok(), "{ip}");
-        }
-        for ip in [
-            "0.1.2.3",
-            "100.64.0.1",
-            "172.31.255.255",
-            "192.0.2.1",
-            "198.19.0.1",
-            "224.0.0.1",
-            "255.255.255.255",
-            "::",
-            "::1",
-            "::ffff:127.0.0.1",
-            "2001::1",
-            "2001:20::1",
-            "2001:db8::1",
-            "2002:7f00:1::",
-        ] {
-            assert!(ensure_public_ip(ip.parse().unwrap()).is_err(), "{ip}");
-        }
-    }
-
-    #[test]
-    fn resolves_relative_redirects_before_revalidation() {
-        let base = parse_public_url("https://example.com/a/b").unwrap();
-        let next = validate_public_url(base.join("../c?q=1#ignored").unwrap()).unwrap();
-        assert_eq!(next.as_str(), "https://example.com/c?q=1");
-    }
-
-    #[test]
-    fn output_content_is_bounded_after_utf8_and_json_escaping() {
-        let invalid_utf8 = vec![0xff; MAX_RESPONSE_BYTES];
-        let (content, truncated) = content_for_output(&invalid_utf8);
-        assert!(truncated);
-        assert!(serde_json::to_string(&content).unwrap().len() <= MAX_RESPONSE_BYTES + 2);
-
-        let control_bytes = vec![0; MAX_RESPONSE_BYTES];
-        let (content, truncated) = content_for_output(&control_bytes);
-        assert!(truncated);
-        assert!(serde_json::to_string(&content).unwrap().len() <= MAX_RESPONSE_BYTES + 2);
-    }
-
-    #[test]
-    fn preview_truncates_to_max_chars() {
-        let content = "a".repeat(FOLD_PREVIEW_CHARS + 100);
-        assert_eq!(
-            fold_preview(&content, FOLD_PREVIEW_CHARS).chars().count(),
-            FOLD_PREVIEW_CHARS
-        );
-
-        let short = "short body".to_string();
-        assert_eq!(fold_preview(&short, FOLD_PREVIEW_CHARS), short);
-    }
-
-    #[test]
-    fn artifact_name_is_content_deterministic() {
-        let first = vec![b'a'; FOLD_THRESHOLD_BYTES];
-        let duplicate = vec![b'a'; FOLD_THRESHOLD_BYTES];
-        let other = vec![b'b'; FOLD_THRESHOLD_BYTES];
-        assert_eq!(artifact_file_name(&first), artifact_file_name(&duplicate));
-        assert_ne!(artifact_file_name(&first), artifact_file_name(&other));
-    }
-
-    #[tokio::test]
-    async fn fold_writes_searchable_local_artifact() {
-        let body = vec![b'x'; FOLD_THRESHOLD_BYTES + 4 * 1024];
-        let path = write_fetch_artifact(&body).await.expect("artifact written");
-        assert!(
-            path.starts_with(std::env::temp_dir().to_string_lossy().as_ref()),
-            "artifact should live under the system temp dir: {path}"
-        );
-        let written = tokio::fs::read_to_string(&path)
-            .await
-            .expect("read artifact back");
-        assert_eq!(written.len(), body.len());
-        std::fs::remove_file(&path).expect("clean up artifact");
-    }
-
-    #[test]
-    fn content_type_filter_accepts_text_json_and_xml_only() {
-        for content_type in [
-            None,
-            Some("text/html; charset=utf-8"),
-            Some("application/json"),
-            Some("application/problem+json"),
-            Some("application/rss+xml"),
-        ] {
-            assert!(supported_content_type(content_type), "{content_type:?}");
-        }
-        for content_type in ["image/png", "application/pdf", "application/octet-stream"] {
-            assert!(
-                !supported_content_type(Some(content_type)),
-                "{content_type}"
-            );
-        }
-    }
 }

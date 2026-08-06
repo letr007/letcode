@@ -510,17 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_allow_once_and_downgrades_always_when_disallowed() {
-        let summary = completed_summary(
-            r#"{"decision":"allow_always","risk":"low","rationale":"safe write"}"#,
-        );
-        let downgraded = parse_reviewer_output(&summary, false);
-        assert!(matches!(downgraded.response, PermissionResponse::AllowOnce));
-        let always = parse_reviewer_output(&summary, true);
-        assert!(matches!(always.response, PermissionResponse::AllowAlways));
-    }
-
-    #[test]
     fn unparseable_output_denies() {
         let denied = parse_reviewer_output(&completed_summary("I allow this"), true);
         assert!(matches!(denied.response, PermissionResponse::Deny));

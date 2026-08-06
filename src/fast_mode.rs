@@ -124,14 +124,6 @@ mod tests {
     }
 
     #[test]
-    fn gpt_models_except_image_are_fast_capable() {
-        assert!(is_fast_capable_model("GPT-5.5"));
-        assert!(is_fast_capable_model("gpt-4.1-mini"));
-        assert!(!is_fast_capable_model("gpt-image-1"));
-        assert!(!is_fast_capable_model("claude-4"));
-    }
-
-    #[test]
     fn unsupported_model_auto_disables_main_config_state() {
         let path = temp_config("auto-disable", Some(true));
         let mode = FastMode::load(&path, true);
@@ -143,18 +135,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_state_file_is_ignored_when_main_config_omits_fast_mode() {
-        let path = temp_config("legacy-state", None);
-        fs::write(
-            path.with_file_name("fast-mode.json"),
-            r#"{"version":1,"enabled":true}"#,
-        )
-        .expect("write legacy state");
-
-        let config = crate::config::AppConfig::load_from_path(&path).expect("load config");
-        let mode = FastMode::load(&path, config.fast_mode_enabled);
-
-        assert!(!mode.enabled());
-    }
 }

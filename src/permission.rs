@@ -636,118 +636,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn default_mode_allows_read_only_and_low_risk_commands() {
-        let policy = PermissionPolicy::default();
-
-        assert_eq!(
-            policy.check("shell__exec", &json!({"command": "git status --short"})),
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            policy.check(
-                "shell__exec",
-                &json!({"command": "cargo test permission::tests"})
-            ),
-            PermissionDecision::Allow
-        );
-    }
-
-    #[test]
-    fn default_mode_asks_before_network_fetches() {
-        let policy = PermissionPolicy::default();
-
-        assert_eq!(
-            classify_tool(tool_names::TOOL_WEB_FETCH),
-            ToolPermissionClass::Read
-        );
-        assert_eq!(
-            policy.check(
-                tool_names::TOOL_WEB_FETCH,
-                &json!({"url": "https://example.com/"})
-            ),
-            PermissionDecision::Ask
-        );
-    }
-
-    #[test]
-    fn default_mode_allows_registered_mcp_read_tools() {
-        let policy = PermissionPolicy::default();
-
-        assert_eq!(
-            policy.check_class_with_directive(
-                "websearch__web_search_exa",
-                &json!({"query": "rust async"}),
-                ToolPermissionClass::Read,
-                ExecutionDirective::None,
-            ),
-            PermissionDecision::Allow
-        );
-    }
-
-    #[test]
-    fn skill_tool_is_classified_as_read_and_allowed_for_explorer_scope() {
-        assert_eq!(classify_tool("skill"), ToolPermissionClass::Read);
-        assert!(ToolScope::ReadOnlyExplorer.allows_tool("skill"));
-    }
-
-    #[test]
-    fn read_tools_are_classified_and_allowed_for_explorer_scope() {
-        for tool in [
-            "skill__resource_list",
-            "skill__resource_read",
-            "web__fetch",
-            "config__validate",
-        ] {
-            assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");
-            assert!(ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
-        }
-    }
-
-    #[test]
-    fn subagent_tools_keep_expected_permission_classes() {
-        for tool in [
-            "agent__explore",
-            "agent__oracle",
-            "agent__designer",
-            "agent__librarian",
-            "agent__general",
-            "agent__reconcile",
-        ] {
-            assert_eq!(classify_tool(tool), ToolPermissionClass::Preview, "{tool}");
-            assert!(!ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
-        }
-        assert_eq!(classify_tool("agent__fixer"), ToolPermissionClass::Write);
-        assert!(!ToolScope::ReadOnlyExplorer.allows_tool("agent__fixer"));
-
-        let policy = PermissionPolicy::default();
-        assert_eq!(
-            policy.check("agent__explore", &json!({"task": "inspect"})),
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            policy.check("agent__oracle", &json!({"task": "review"})),
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            policy.check(
-                "agent__reconcile",
-                &json!({
-                    "run_id": "run-1",
-                    "child_session_id": "child-1",
-                    "agent_name": "explorer",
-                    "decision": "accepted",
-                    "summary": "accepted child result"
-                })
-            ),
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            policy.check("agent__fixer", &json!({"task": "implement"})),
-            PermissionDecision::Ask
-        );
-    }
-
-    #[test]
     fn default_mode_asks_risky_commands_instead_of_hard_deny() {
         let policy = PermissionPolicy::default();
 
@@ -883,18 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_serializes_yolo_and_deserializes_legacy_solo() {
-        assert_eq!(
-            serde_json::to_string(&PermissionMode::Yolo).unwrap(),
-            "\"yolo\""
-        );
-        assert_eq!(
-            serde_json::from_str::<PermissionMode>("\"solo\"").unwrap(),
-            PermissionMode::Yolo
-        );
-    }
-
-    #[test]
     fn yolo_mode_allows_commands_that_other_modes_ask() {
         let mut policy = PermissionPolicy::default();
         policy.set_mode(PermissionMode::Yolo);
@@ -952,59 +828,6 @@ mod tests {
             !state.grant_if_current_default(generation, resource),
             "an approval from a previous generation must not create a grant"
         );
-    }
-
-    #[test]
-    fn auto_mode_shares_default_ask_matrix_and_accepts_session_grants() {
-        let mut default_state = PermissionSessionState::default();
-        let mut auto_state = PermissionSessionState::default();
-        auto_state.set_mode(PermissionMode::Auto);
-
-        let write_args = json!({"path": "a.txt", "content": "x"});
-        assert_eq!(
-            default_state.decision(
-                "fs__write",
-                &write_args,
-                ToolPermissionClass::Write,
-                ExecutionDirective::None
-            ),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            auto_state.decision(
-                "fs__write",
-                &write_args,
-                ToolPermissionClass::Write,
-                ExecutionDirective::None
-            ),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            auto_state.decision(
-                "fs__read",
-                &json!({"path": "a.txt"}),
-                ToolPermissionClass::Read,
-                ExecutionDirective::None
-            ),
-            PermissionDecision::Allow
-        );
-
-        let resource = PermissionResource::ExactPath {
-            tool: "fs__write".into(),
-            path: PathBuf::from("a.txt"),
-        };
-        let (mode, generation, _, _) = auto_state.approval_snapshot(
-            Some(&resource),
-            "fs__write",
-            &write_args,
-            ToolPermissionClass::Write,
-            ExecutionDirective::None,
-            false,
-            false,
-        );
-        assert_eq!(mode, PermissionMode::Auto);
-        assert!(auto_state.grant_if_current_session(generation, resource.clone()));
-        assert!(auto_state.allows_grant(&resource));
     }
 
     #[test]

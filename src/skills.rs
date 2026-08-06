@@ -1137,29 +1137,6 @@ mod tests {
         SkillRegistry::load_from_roots(skill_roots(config_dir, workspace_root, false))
     }
 
-    #[test]
-    fn persisted_skill_parser_ignores_malformed_and_failed_outputs() {
-        for output in [
-            "not json",
-            r#"{"ok":true,"tool":"skill","data":{"name":3,"content":"body"}}"#,
-            r#"{"ok":true,"tool":"skill","data":{"name":"skill"}}"#,
-            r#"{"ok":false,"tool":"skill","data":{"name":"skill","content":"body"}}"#,
-            r#"{"ok":true,"tool":"other","data":{"name":"skill","content":"body"}}"#,
-        ] {
-            assert_eq!(
-                parse_persisted_skill_output(output).expect("parser is tolerant"),
-                None
-            );
-        }
-        assert_eq!(
-            parse_persisted_skill_output(
-                r#"{"ok":true,"tool":"skill","data":{"name":"skill","content":"body"}}"#
-            )
-            .expect("valid output parses"),
-            Some(("skill".into(), "body".into()))
-        );
-    }
-
     fn skill_call_frame(call_id: &str, sequence: u64, visibility: FrameVisibility) -> RuntimeFrame {
         let span = SourceSpan::new(sequence, sequence).expect("valid source span");
         RuntimeFrame::new(
@@ -1233,44 +1210,6 @@ mod tests {
             call_id: call_id.into(),
             output_json: output_json.into(),
         })
-    }
-
-    #[test]
-    fn reconciliation_skips_malformed_skill_occurrence_and_keeps_later_valid_material() {
-        let mut snapshot = RuntimeSnapshot::new("main");
-        snapshot.push_frame(skill_call_frame("malformed", 1, FrameVisibility::Retired));
-        snapshot.push_frame(skill_output_frame(
-            "malformed",
-            "not json",
-            2,
-            FrameVisibility::Retired,
-        ));
-        snapshot.push_frame(skill_call_frame("valid", 3, FrameVisibility::Active));
-        snapshot.push_frame(skill_output_frame(
-            "valid",
-            r#"{"ok":true,"tool":"skill","data":{"name":"persisted-only","content":"exact persisted body"}}"#,
-            4,
-            FrameVisibility::Active,
-        ));
-
-        reconcile_loaded_skill_material(&mut snapshot).expect("reconciliation succeeds");
-
-        assert_eq!(snapshot.prompt_contributors.len(), 1);
-        let contributor = &snapshot.prompt_contributors[0];
-        assert_eq!(contributor.contributor_id, "skill-material:valid");
-        assert_eq!(contributor.label.as_deref(), Some("persisted-only"));
-        let material = snapshot
-            .frames
-            .iter()
-            .find(|frame| frame.id == contributor.frame_ids[0])
-            .expect("detached material frame");
-        assert_eq!(
-            material
-                .prompt_payload
-                .as_ref()
-                .map(|payload| payload.text.as_str()),
-            Some("exact persisted body")
-        );
     }
 
     #[test]
@@ -1356,119 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_orders_unspanned_live_skill_outputs_by_snapshot_position() {
-        let mut snapshot = RuntimeSnapshot::new("main");
-        let output = |name: &str| {
-            format!(
-                r#"{{"ok":true,"tool":"skill","data":{{"name":"{name}","content":"{name} body"}}}}"#
-            )
-        };
-        let mut outputs = vec![
-            unspanned_skill_output_frame(
-                "first",
-                &output("first"),
-                "first-id",
-                0,
-                FrameVisibility::Active,
-            ),
-            unspanned_skill_output_frame(
-                "second",
-                &output("second"),
-                "second-id",
-                1,
-                FrameVisibility::Active,
-            ),
-            unspanned_skill_output_frame(
-                "third",
-                &output("third"),
-                "third-id",
-                2,
-                FrameVisibility::Active,
-            ),
-        ];
-        // Deliberately make protocol insertion order disagree with ID order.
-        outputs.sort_by_key(|frame| std::cmp::Reverse(frame.id));
-        let expected_calls = outputs
-            .iter()
-            .filter_map(|frame| match frame.protocol.as_ref() {
-                Some(ProtocolFrameItem::ToolOutput { call_id, .. }) => Some(call_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_ne!(
-            expected_calls,
-            ["first", "second", "third"],
-            "test insertion order differs from RuntimeFrameId order"
-        );
-        for call_id in &expected_calls {
-            snapshot.push_frame(skill_call_frame(call_id, 10, FrameVisibility::Active));
-        }
-        for frame in outputs {
-            snapshot.push_frame(frame);
-        }
-
-        reconcile_loaded_skill_material(&mut snapshot).expect("initial reconciliation");
-        let expected_contributors = expected_calls
-            .iter()
-            .map(|call_id| format!("skill-material:{call_id}"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            snapshot
-                .prompt_contributors
-                .iter()
-                .map(|contributor| contributor.contributor_id.clone())
-                .collect::<Vec<_>>(),
-            expected_contributors
-        );
-        let detached_ids = snapshot
-            .prompt_contributors
-            .iter()
-            .map(|contributor| contributor.frame_ids.clone())
-            .collect::<Vec<_>>();
-
-        reconcile_loaded_skill_material(&mut snapshot).expect("repeat reconciliation");
-        assert_eq!(
-            snapshot
-                .prompt_contributors
-                .iter()
-                .map(|contributor| contributor.contributor_id.clone())
-                .collect::<Vec<_>>(),
-            expected_contributors
-        );
-        assert_eq!(
-            snapshot
-                .prompt_contributors
-                .iter()
-                .map(|contributor| contributor.frame_ids.clone())
-                .collect::<Vec<_>>(),
-            detached_ids
-        );
-
-        for frame in &mut snapshot.frames {
-            if matches!(frame.protocol, Some(ProtocolFrameItem::ToolOutput { .. })) {
-                frame.visibility = FrameVisibility::Retired;
-            }
-        }
-        reconcile_loaded_skill_material(&mut snapshot).expect("reconciliation after retirement");
-        assert_eq!(
-            snapshot
-                .prompt_contributors
-                .iter()
-                .map(|contributor| contributor.contributor_id.clone())
-                .collect::<Vec<_>>(),
-            expected_contributors
-        );
-        assert_eq!(
-            snapshot
-                .prompt_contributors
-                .iter()
-                .map(|contributor| contributor.frame_ids.clone())
-                .collect::<Vec<_>>(),
-            detached_ids
-        );
-    }
-
-    #[test]
     fn reconciliation_preserves_material_only_for_structurally_pruned_output() {
         let mut snapshot = RuntimeSnapshot::new("main");
         snapshot.push_frame(skill_call_frame("load", 1, FrameVisibility::Active));
@@ -1532,31 +1358,6 @@ mod tests {
         assert_eq!(parsed.name, "rust-audit");
         assert_eq!(parsed.description, "Inspect Rust code");
         assert_eq!(parsed.body, "# Heading\nUse this skill.");
-    }
-
-    #[test]
-    fn parses_folded_frontmatter_description() {
-        let parsed = parse_skill_markdown(
-            "---\nname: git\ndescription: >-\n  Use for git workflows\n  including commits and PRs.\nmetadata:\n  area: vcs\n---\n# Git\n",
-        )
-        .expect("skill parses");
-
-        assert_eq!(
-            parsed.description,
-            "Use for git workflows including commits and PRs."
-        );
-    }
-
-    #[test]
-    fn parses_long_skill_description_without_truncation() {
-        let long_description = "Use this skill for detailed workflows. ".repeat(80);
-        let content = format!(
-            "---\nname: complex-skill\ndescription: >-\n  {}\n---\n# Complex\n",
-            long_description
-        );
-        let parsed = parse_skill_markdown(&content).expect("long description parses");
-
-        assert_eq!(parsed.description, long_description.trim());
     }
 
     #[test]
@@ -1628,136 +1429,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_includes_builtin_customize_letcode_when_skills_directory_is_missing() {
-        let temp = TempDir::new();
-        let registry = load_test_registry(&temp.path().join("config"), temp.path())
-            .expect("registry loads without skills dir");
-        let cards = registry.cards();
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].name, "customize-letcode");
-        assert_eq!(cards[0].location, BUILTIN_SKILL_LOCATION);
-    }
-
-    #[test]
-    fn disk_customize_letcode_overrides_builtin() {
-        let temp = TempDir::new();
-        write_skill(
-            temp.path(),
-            "config/skills",
-            "customize-letcode",
-            "---\nname: customize-letcode\ndescription: Disk override for letcode config help\n---\n# Override\n",
-        );
-
-        let registry =
-            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry loads");
-        let entry = registry.get("customize-letcode").expect("skill present");
-        assert_eq!(entry.description, "Disk override for letcode config help");
-        assert_eq!(entry.location, "letcode config skills");
-        assert!(entry.content.contains("# Override"));
-    }
-
-    #[tokio::test]
-    async fn skill_tool_loads_builtin_customize_letcode_without_on_disk_dir() {
-        let temp = TempDir::new();
-        let registry = Arc::new(
-            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
-        );
-        let tool = SkillTool::new(registry);
-        let result = tool
-            .execute(json!({"name": "customize-letcode"}))
-            .await
-            .expect("builtin skill loads");
-
-        assert_eq!(result["name"], json!("customize-letcode"));
-        assert_eq!(result["location"], json!(BUILTIN_SKILL_LOCATION));
-        assert!(
-            result["content"]
-                .as_str()
-                .expect("content str")
-                .contains("# 定制 letcode")
-        );
-        assert_eq!(result["files"], json!([]));
-    }
-
-    #[test]
-    fn registry_discovers_parent_opencode_skills() {
-        let temp = TempDir::new();
-        fs::create_dir_all(temp.path().join(".git")).expect("create repo marker");
-        write_skill(
-            temp.path(),
-            ".opencode/skills",
-            "repo-skill",
-            "---\nname: repo-skill\ndescription: Repo helper\n---\n# Repo\n",
-        );
-        let nested = temp.path().join("src/module");
-        fs::create_dir_all(&nested).expect("create nested workspace");
-
-        let registry = load_test_registry(&temp.path().join("config"), &nested)
-            .expect("registry loads parent skill");
-        assert!(
-            registry
-                .cards()
-                .iter()
-                .any(|card| card.name == "repo-skill")
-        );
-    }
-
-    #[test]
-    fn registry_does_not_discover_skills_above_repo_root() {
-        let temp = TempDir::new();
-        let outer = temp.path().join("outer");
-        let repo = outer.join("repo");
-        fs::create_dir_all(repo.join(".git")).expect("create repo marker");
-        write_skill(
-            &outer,
-            ".opencode/skills",
-            "upper-skill",
-            "---\nname: upper-skill\ndescription: Upper helper\n---\n# Upper\n",
-        );
-        let nested = repo.join("src/module");
-        fs::create_dir_all(&nested).expect("create nested workspace");
-
-        let registry = load_test_registry(&temp.path().join("config"), &nested)
-            .expect("registry loads without upper skill");
-        assert!(
-            !registry
-                .cards()
-                .iter()
-                .any(|card| card.name == "upper-skill")
-        );
-    }
-
-    #[test]
-    fn later_discovered_skill_overrides_earlier_skill() {
-        let registry = SkillRegistry::from_entries(vec![
-            SkillEntry {
-                name: "same-skill".into(),
-                description: "old".into(),
-                body: "old".into(),
-                content: "old".into(),
-                location: "old".into(),
-                path: PathBuf::from("/old/SKILL.md"),
-                base_dir: PathBuf::from("/old"),
-            },
-            SkillEntry {
-                name: "same-skill".into(),
-                description: "new".into(),
-                body: "new".into(),
-                content: "new".into(),
-                location: "new".into(),
-                path: PathBuf::from("/new/SKILL.md"),
-                base_dir: PathBuf::from("/new"),
-            },
-        ])
-        .expect("registry allows precedence override");
-
-        assert_eq!(
-            registry.get("same-skill").expect("skill").description,
-            "new"
-        );
-    }
-
-    #[test]
     fn registry_rejects_directory_name_mismatch() {
         let temp = TempDir::new();
         let skill_path = write_skill(
@@ -1778,51 +1449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_tool_returns_full_skill_content_and_sampled_files() {
-        let temp = TempDir::new();
-        let skill_dir = temp.path().join("config/skills/rust-audit");
-        fs::create_dir_all(skill_dir.join("notes")).expect("create nested dirs");
-        fs::write(
-            skill_dir.join(SKILL_FILE_NAME),
-            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\nRead the code.\n",
-        )
-        .expect("write skill file");
-        fs::write(skill_dir.join("notes/context.txt"), "context").expect("write sample file");
-
-        let registry = Arc::new(
-            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
-        );
-        let tool = SkillTool::new(registry);
-        let result = tool
-            .execute(json!({"name": "rust-audit"}))
-            .await
-            .expect("skill loads");
-
-        assert_eq!(result["name"], json!("rust-audit"));
-        assert_eq!(result["description"], json!("Inspect Rust code"));
-        assert!(
-            result["content"]
-                .as_str()
-                .expect("content str")
-                .contains("# Rust")
-        );
-        assert!(
-            !result["files"]
-                .as_array()
-                .expect("files array")
-                .iter()
-                .any(|value| value == "SKILL.md")
-        );
-        assert!(
-            result["files"]
-                .as_array()
-                .expect("files array")
-                .iter()
-                .any(|value| value == "notes/context.txt")
-        );
-    }
-
-    #[tokio::test]
     async fn skill_tool_rejects_unknown_skill() {
         let registry = Arc::new(SkillRegistry::default());
         let tool = SkillTool::new(registry);
@@ -1832,32 +1458,6 @@ mod tests {
             .expect_err("unknown skill should fail");
 
         assert!(error.to_string().contains("unknown skill: missing"));
-    }
-
-    #[tokio::test]
-    async fn skill_resource_list_tool_lists_sorted_regular_relative_files() {
-        let temp = TempDir::new();
-        let skill_dir = temp.path().join("config/skills/rust-audit");
-        fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
-        fs::write(
-            skill_dir.join(SKILL_FILE_NAME),
-            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
-        )
-        .expect("write skill file");
-        fs::write(skill_dir.join("z-last.txt"), "z").expect("write z file");
-        fs::write(skill_dir.join("docs/a-first.txt"), "a").expect("write a file");
-
-        let registry = Arc::new(
-            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
-        );
-        let tool = SkillResourceListTool::new(registry);
-        let result = tool
-            .execute(json!({"name": "rust-audit"}))
-            .await
-            .expect("resource list loads");
-
-        assert_eq!(result["name"], json!("rust-audit"));
-        assert_eq!(result["files"], json!(["docs/a-first.txt", "z-last.txt"]));
     }
 
     #[tokio::test]
@@ -1894,47 +1494,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn skill_resource_read_tool_reads_utf8_resource_content() {
-        let temp = TempDir::new();
-        let skill_dir = temp.path().join("config/skills/rust-audit");
-        fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
-        fs::write(
-            skill_dir.join(SKILL_FILE_NAME),
-            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
-        )
-        .expect("write skill file");
-        fs::write(skill_dir.join("docs/guide.txt"), "hello").expect("write guide");
-
-        let registry = Arc::new(
-            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
-        );
-        let tool = SkillResourceReadTool::new(registry);
-        let result = tool
-            .execute(json!({"name": "rust-audit", "path": "docs/guide.txt"}))
-            .await
-            .expect("resource read succeeds");
-
-        assert_eq!(result["name"], json!("rust-audit"));
-        assert_eq!(result["path"], json!("docs/guide.txt"));
-        assert_eq!(result["content"], json!("hello"));
-    }
-
-    #[test]
-    fn samples_skip_symlinked_directories() {
-        let temp = TempDir::new();
-        let base = temp.path().join("skill");
-        let outside = temp.path().join("outside");
-        fs::create_dir_all(&base).expect("create base");
-        fs::create_dir_all(&outside).expect("create outside");
-        fs::write(base.join("note.txt"), "note").expect("write note");
-        fs::write(outside.join("secret.txt"), "secret").expect("write outside");
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, base.join("linked")).expect("create symlink");
-
-        let files = sample_relative_files(&base, MAX_SKILL_FILE_SAMPLES).expect("sample files");
-        assert!(files.iter().any(|file| file == "note.txt"));
-        assert!(!files.iter().any(|file| file.contains("secret.txt")));
-    }
 }

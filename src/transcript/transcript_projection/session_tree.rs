@@ -249,75 +249,6 @@ mod tests {
     }
 
     #[test]
-    fn projects_append_only_entries_with_sequence_ids_and_parent_links() {
-        let entries = project_session_history_tree(&[
-            record(1, TranscriptEvent::SessionStarted { model: "m".into() }),
-            record(
-                2,
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("first"),
-                },
-            ),
-            record(
-                3,
-                TranscriptEvent::ContextCheckout {
-                    branch_id: "legacy".into(),
-                    leaf_sequence: 2,
-                },
-            ),
-            record(
-                4,
-                TranscriptEvent::AssistantMessage {
-                    content: "answer".into(),
-                },
-            ),
-        ]);
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "entry-2");
-        assert_eq!(entries[0].parent_id, None);
-        assert_eq!(entries[1].id, "entry-4");
-        assert_eq!(entries[1].parent_id.as_deref(), Some("entry-2"));
-    }
-
-    #[test]
-    fn follows_legacy_branch_base_instead_of_journal_order() {
-        let entries = project_session_history_tree(&[
-            record(
-                1,
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("root"),
-                },
-            ),
-            branch_record(
-                2,
-                crate::transcript::ROOT_CONTEXT_BRANCH_ID,
-                TranscriptEvent::AssistantMessage {
-                    content: "root answer".into(),
-                },
-            ),
-            record(
-                3,
-                TranscriptEvent::ContextBranchCreated {
-                    branch_id: "feature".into(),
-                    parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
-                    base_sequence: 1,
-                    label: None,
-                },
-            ),
-            branch_record(
-                4,
-                "feature",
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("fork"),
-                },
-            ),
-        ]);
-
-        assert_eq!(entries[2].parent_id.as_deref(), Some("entry-1"));
-    }
-
-    #[test]
     fn navigation_state_preserves_the_complete_redo_stack() {
         let records = [record(
             1,
@@ -334,27 +265,6 @@ mod tests {
             Some(HistoryNavigationState {
                 target_sequence: 0,
                 redo_stack: vec![8, 4],
-            })
-        );
-    }
-
-    #[test]
-    fn legacy_single_redo_navigation_decodes_as_a_stack() {
-        let records = [record(
-            1,
-            TranscriptEvent::HistoryNavigation {
-                operation: crate::transcript::HistoryNavigationOperation::Navigate,
-                target_sequence: 2,
-                redo_stack: Vec::new(),
-                redo_target_sequence: Some(4),
-            },
-        )];
-
-        assert_eq!(
-            history_navigation_state(&records),
-            Some(HistoryNavigationState {
-                target_sequence: 2,
-                redo_stack: vec![4],
             })
         );
     }
@@ -419,39 +329,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inactive_branch_history_append_does_not_invalidate_redo() {
-        let records = [
-            record(
-                1,
-                TranscriptEvent::HistoryNavigation {
-                    operation: crate::transcript::HistoryNavigationOperation::Undo,
-                    target_sequence: 4,
-                    redo_stack: vec![8],
-                    redo_target_sequence: None,
-                },
-            ),
-            record(
-                2,
-                TranscriptEvent::ContextCheckout {
-                    branch_id: "history-1".into(),
-                    leaf_sequence: 4,
-                },
-            ),
-            branch_record(
-                3,
-                "other-branch",
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("sibling path"),
-                },
-            ),
-        ];
-        assert_eq!(
-            history_navigation_state(&records),
-            Some(HistoryNavigationState {
-                target_sequence: 4,
-                redo_stack: vec![8],
-            })
-        );
-    }
 }

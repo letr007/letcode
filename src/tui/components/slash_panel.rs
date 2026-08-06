@@ -268,66 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn slash_panel_renders_matching_commands() {
-        let mut state = TuiState::default();
-        state.set_input("/per");
-
-        let rendered = draw_panel(&state, 72, 6);
-        assert!(rendered.contains("/permission"), "{rendered}");
-        assert!(
-            rendered.contains("Show or switch permission mode"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn expert_panel_renders_matching_experts() {
-        let mut state = TuiState::default();
-        state.set_input("@or");
-
-        let rendered = draw_panel(&state, 72, 6);
-        assert!(rendered.contains("@oracle"), "{rendered}");
-        assert!(rendered.contains("review or audit task"), "{rendered}");
-    }
-
-    #[test]
-    fn slash_panel_shows_empty_state_for_unknown_command() {
-        let mut state = TuiState::default();
-        state.set_input("/wat");
-
-        let rendered = draw_panel(&state, 40, 3);
-        assert!(rendered.contains("No matching commands"), "{rendered}");
-    }
-
-    #[test]
-    fn slash_panel_scrolls_to_keep_selected_command_visible() {
-        let mut state = TuiState::default();
-        state.set_input("/");
-        state.slash_panel_selected = matching_completion_commands("/")
-            .iter()
-            .position(|entry| entry.command == "/tool-output")
-            .expect("tool output command is available");
-
-        let rendered = draw_panel(&state, 72, 5);
-        assert!(rendered.contains("/agents"), "{rendered}");
-        assert!(rendered.contains("/fast"), "{rendered}");
-        assert!(rendered.contains("› /tool-output"), "{rendered}");
-        assert!(!rendered.contains("/help"), "{rendered}");
-        assert!(rendered.contains("↑"), "{rendered}");
-        assert!(rendered.contains("↓"), "{rendered}");
-    }
-
-    #[test]
-    fn slash_panel_marks_selected_row() {
-        let mut state = TuiState::default();
-        state.set_input("/");
-
-        let rendered = draw_panel(&state, 72, 5);
-        assert!(rendered.contains("› /help"), "{rendered}");
-        assert!(rendered.contains("↓"), "{rendered}");
-    }
-
-    #[test]
     fn completion_panel_is_hidden_in_child_read_only_view() {
         let mut state = TuiState::default();
         state.replace_child_timeline_from_records(

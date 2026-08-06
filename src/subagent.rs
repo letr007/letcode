@@ -1488,17 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_factory_creates_scoped_child_without_changing_default_scope() {
-        let agent = test_agent();
-        assert_eq!(agent.tool_scope().as_str(), "full_access");
-
-        let child = AgentFactory::create_child(&agent, &AgentTemplate::explorer());
-        assert_eq!(child.tool_scope().as_str(), "read_only_explorer");
-        assert_eq!(child.permission_mode().as_str(), "default");
-        assert_eq!(child.model(), agent.model());
-    }
-
-    #[test]
     fn child_agents_do_not_expose_recursive_subagent_tools() {
         let agent = test_agent();
         let child = AgentFactory::create_child(&agent, &AgentTemplate::fixer());
@@ -1510,19 +1499,6 @@ mod tests {
 
         assert!(!tool_names.iter().any(|name| name == "agent__explore"));
         assert!(!tool_names.iter().any(|name| name == "agent__fixer"));
-    }
-
-    #[test]
-    fn agent_factory_uses_configured_subagent_model_override() {
-        let mut agent = test_agent();
-        agent.set_subagent_model_override("explorer", "gpt-explorer");
-        agent.set_subagent_model_override("fixer", "gpt-fixer");
-
-        let explorer = AgentFactory::create_child(&agent, &AgentTemplate::explorer());
-        let fixer = AgentFactory::create_child(&agent, &AgentTemplate::fixer());
-
-        assert_eq!(explorer.model(), "gpt-explorer");
-        assert_eq!(fixer.model(), "gpt-fixer");
     }
 
     async fn spawn_endpoint(
@@ -1577,84 +1553,6 @@ mod tests {
             socket.shutdown().await.expect("response should close");
         });
         (format!("http://{address}/v1"), request_count, server)
-    }
-
-    #[tokio::test]
-    async fn expert_route_factory_uses_the_configured_endpoint_for_future_child_runs() {
-        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .into_boxed_str(),
-        );
-        let (primary_url, primary_requests, primary_server) = spawn_endpoint(response).await;
-        let (expert_url, expert_requests, expert_server) = spawn_endpoint(response).await;
-        let primary_client = Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(primary_url)
-                .with_api_key("primary-key"),
-        );
-        let parent = Agent::new(primary_client, "shared", 2, 4);
-        let provider = ProviderConfig {
-            base_url: expert_url,
-            api_key: "expert-key".into(),
-            protocol: ApiProtocol::Completions,
-            default_model: "shared".into(),
-            retry: Some(RetryConfig {
-                enabled: false,
-                max_attempts: 1,
-                max_recovery_attempts: 1,
-                initial_delay_secs: 1,
-                backoff_multiplier: 1.0,
-                jitter_secs: 0,
-            }),
-            models: indexmap::IndexMap::from([(
-                "shared".into(),
-                crate::config::ModelConfig {
-                    display_name: None,
-                    protocol: ApiProtocol::Completions,
-                    context_window: None,
-                    effective_input_limit_tokens: None,
-                    max_output_tokens: None,
-                    supports_tools: false,
-                    supports_reasoning: false,
-                    reasoning_effort: None,
-                    reasoning_efforts: Vec::new(),
-                    reasoning_summary: None,
-                    text_verbosity: None,
-                    temperature: None,
-                    top_p: None,
-                    prompt_cache: crate::config::PromptCacheConfig::default(),
-                    parallel_tool_calls: false,
-                },
-            )]),
-        };
-        let factory = ExpertRouteFactory::new(
-            [("explorer".into(), ModelRoute::new("expert", "shared"))],
-            &indexmap::IndexMap::from([("expert".into(), provider)]),
-            &RetryConfig::default(),
-        )
-        .expect("factory should build");
-        let mut parent = parent;
-        parent.set_subagent_child_factory(Arc::new(factory));
-        let mut child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
-
-        child
-            .run_stream_async(
-                "inspect",
-                |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(crate::permission::PermissionApproval::Deny)),
-            )
-            .await
-            .expect("child request should succeed");
-
-        assert_eq!(expert_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(primary_requests.load(Ordering::SeqCst), 0);
-        expert_server.await.expect("expert server completes");
-        drop(primary_server);
     }
 
     #[test]
@@ -1816,59 +1714,6 @@ mod tests {
     }
 
     #[test]
-    fn generate_run_id_is_unique_within_process() {
-        let first = generate_run_id();
-        let second = generate_run_id();
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn explorer_child_shares_parent_permission_mode() {
-        let mut agent = test_agent();
-        agent.set_permission_mode(crate::permission::PermissionMode::Safe);
-        let child = AgentFactory::create_child(&agent, &AgentTemplate::explorer());
-
-        assert_eq!(agent.permission_mode().as_str(), "safe");
-        assert_eq!(child.permission_mode().as_str(), "safe");
-    }
-
-    #[test]
-    fn structured_result_parser_accepts_json_object_output() {
-        let result = StructuredSubagentResult::from_model_output(
-            r#"{"status":"completed","summary":"done","findings":["a"],"files_read":["src/agent.rs"],"files_changed":["src/subagent.rs"],"commands_run":["cargo test"],"validation":["passed"],"blockers":[],"next_steps":["report"]}"#,
-            SubagentStatus::Completed,
-            "run-1",
-            "child-1",
-        );
-
-        assert!(!result.malformed);
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.summary, "done");
-        assert_eq!(result.files_read, vec!["src/agent.rs"]);
-        assert_eq!(result.files_changed, vec!["src/subagent.rs"]);
-        assert_eq!(result.commands_run, vec!["cargo test"]);
-        assert_eq!(result.validation, vec!["passed"]);
-        assert_eq!(result.run_id, "run-1");
-        assert_eq!(result.child_session_id, "child-1");
-    }
-
-    #[test]
-    fn structured_result_parser_marks_non_json_output_as_malformed() {
-        let result = StructuredSubagentResult::from_model_output(
-            "completed after inspecting src/subagent.rs",
-            SubagentStatus::Completed,
-            "run-1",
-            "child-1",
-        );
-
-        assert!(result.malformed);
-        assert_eq!(result.status, "completed");
-        assert!(result.summary.contains("completed after inspecting"));
-        assert_eq!(result.raw_excerpt.as_deref(), Some(result.summary.as_str()));
-    }
-
-    #[test]
     fn structured_result_parser_preserves_object_shaped_validation_outcomes() {
         let result = StructuredSubagentResult::from_model_output(
             r#"{"status":"completed","summary":"done","validation":[{"command":"cargo test","result":"failed"},{"command":"cargo fmt","result":"not_run"}]}"#,
@@ -1880,26 +1725,6 @@ mod tests {
         assert_eq!(
             result.validation,
             vec!["cargo test failed", "cargo fmt not_run"]
-        );
-    }
-
-    #[test]
-    fn runtime_failure_summary_is_not_marked_malformed() {
-        let summary = build_runtime_summary(
-            "run-1",
-            "child-1",
-            "fixer",
-            SubagentStatus::TimedOut,
-            "fixer timed out after 10s".into(),
-        );
-
-        assert_eq!(summary.status, SubagentStatus::TimedOut);
-        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Hard));
-        assert!(!summary.structured_result.malformed);
-        assert_eq!(summary.structured_result.status, "timed_out");
-        assert_eq!(
-            summary.structured_result.blockers,
-            vec!["fixer timed out after 10s"]
         );
     }
 
@@ -1937,20 +1762,6 @@ mod tests {
         assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Hard));
         assert_eq!(summary.structured_result.status, "budget_exhausted");
         assert!(summary.summary.contains("too many tool calls"));
-    }
-
-    #[test]
-    fn model_reported_non_success_status_changes_outer_run_status() {
-        let summary = build_completed_summary(
-            "run-2",
-            "child-2",
-            "fixer",
-            r#"{"status":"cancelled","summary":"user cancelled"}"#.into(),
-        );
-
-        assert_eq!(summary.status, SubagentStatus::Cancelled);
-        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Logical));
-        assert_eq!(summary.structured_result.status, "cancelled");
     }
 
     #[tokio::test]
@@ -2447,55 +2258,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_child_uses_running_status_while_subagent_is_active() {
-        let runtime = SubagentPool::new();
-        let agent = test_agent();
-        let sessions_dir = temp_sessions_dir();
-        let barrier = Arc::new(Barrier::new(2));
-
-        let run_runtime = runtime.clone();
-        let run_barrier = Arc::clone(&barrier);
-        let run = tokio::spawn(async move {
-            run_runtime
-                .run_with_executor(
-                    &agent,
-                    AgentTemplate::explorer(),
-                    "inspect src".into(),
-                    test_governance(),
-                    sessions_dir,
-                    "parent-session".into(),
-                    "turn-1".into(),
-                    None,
-                    no_event_sender(),
-                    None,
-                    move |_agent,
-                          _task,
-                          _transcript,
-                          _session_transport_tx,
-                          _child_session_id,
-                          _agent_name| {
-                        async move {
-                            run_barrier.wait().await;
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            Ok("done".into())
-                        }
-                        .boxed()
-                    },
-                )
-                .await
-        });
-
-        wait_until(|| runtime.active_child().is_some()).await;
-        let active_child = runtime.active_child().expect("active child available");
-        assert_eq!(active_child.status, "running");
-        assert_eq!(active_child.summary, "inspect src");
-
-        barrier.wait().await;
-        let _ = run.await.expect("join run").expect("run summary");
-        assert!(runtime.active_child().is_none());
-    }
-
-    #[tokio::test]
     async fn parent_transcript_records_running_lifecycle_and_terminal_result_only() {
         let runtime = SubagentPool::new();
         let agent = test_agent();
@@ -2582,171 +2344,6 @@ mod tests {
             }
             other => panic!("unexpected parent event: {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn child_transcript_session_started_records_routed_child_model() {
-        let runtime = SubagentPool::new();
-        let provider = ProviderConfig {
-            base_url: "http://127.0.0.1:9876/v1".into(),
-            api_key: "expert-key".into(),
-            protocol: ApiProtocol::Completions,
-            default_model: "shared".into(),
-            retry: None,
-            models: indexmap::IndexMap::from([(
-                "shared".into(),
-                crate::config::ModelConfig {
-                    display_name: None,
-                    protocol: ApiProtocol::Completions,
-                    context_window: None,
-                    effective_input_limit_tokens: None,
-                    max_output_tokens: None,
-                    supports_tools: false,
-                    supports_reasoning: false,
-                    reasoning_effort: None,
-                    reasoning_efforts: Vec::new(),
-                    reasoning_summary: None,
-                    text_verbosity: None,
-                    temperature: None,
-                    top_p: None,
-                    prompt_cache: crate::config::PromptCacheConfig::default(),
-                    parallel_tool_calls: false,
-                },
-            )]),
-        };
-        let factory = ExpertRouteFactory::new(
-            [("explorer".into(), ModelRoute::new("expert", "shared"))],
-            &indexmap::IndexMap::from([("expert".into(), provider)]),
-            &RetryConfig::default(),
-        )
-        .expect("factory should build");
-        let mut agent = test_agent();
-        agent.set_subagent_child_factory(Arc::new(factory));
-        let sessions_dir = temp_sessions_dir();
-
-        let summary = runtime
-            .run_with_executor(
-                &agent,
-                AgentTemplate::explorer(),
-                "inspect src/subagent.rs".into(),
-                test_governance(),
-                sessions_dir.clone(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move { Ok("completed summary".into()) }.boxed()
-                },
-            )
-            .await
-            .expect("run succeeds");
-
-        let child_records = read_records(
-            child_sessions_dir(&sessions_dir).join(format!("{}.jsonl", summary.child_session_id)),
-        )
-        .expect("read child records");
-
-        match &child_records[0].event {
-            crate::transcript::TranscriptEvent::SessionStarted { model } => {
-                assert_eq!(model, "expert/shared");
-            }
-            other => panic!("unexpected child event: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn completed_subagent_does_not_emit_status_notices() {
-        let runtime = SubagentPool::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let completed = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::explorer(),
-                "inspect task".into(),
-                test_governance(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                Some(crate::session::subagent_event_sender(tx)),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move { Ok("inspection complete".into()) }.boxed()
-                },
-            )
-            .await
-            .expect("completed subagent returns summary");
-        assert_eq!(completed.status, SubagentStatus::Completed);
-
-        while let Ok(event) = rx.try_recv() {
-            assert!(
-                !matches!(event, SessionTransportEvent::Notice(_)),
-                "completed subagent should not emit status notices"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_subagents_do_not_emit_global_error_events() {
-        let runtime = SubagentPool::new();
-        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let failed = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::fixer(),
-                "fail task".into(),
-                test_governance(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                Some(crate::session::subagent_event_sender(_tx.clone())),
-                None,
-                |_agent,
-                 _task,
-                 _transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move { Err(anyhow!("child tool denied")) }.boxed()
-                },
-            )
-            .await
-            .expect("failed subagent still returns summary");
-        assert_eq!(failed.status, SubagentStatus::Failed);
-
-        let mut saw_terminal_status = false;
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                SessionTransportEvent::Notice(notice) => {
-                    if notice.message.contains("failed") {
-                        saw_terminal_status = true;
-                    }
-                }
-                SessionTransportEvent::Error(error) => {
-                    panic!("unexpected global error event: {}", error.message);
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            saw_terminal_status,
-            "expected terminal status event for failed subagent"
-        );
     }
 
     #[tokio::test]

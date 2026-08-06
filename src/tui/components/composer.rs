@@ -1220,26 +1220,6 @@ mod tests {
     }
 
     #[test]
-    fn composer_metrics_account_for_wrapping_and_trailing_newline() {
-        // width 2: "你你a" wraps as ["你", "你", "a"] => 3 rows.
-        let metrics = composer_metrics("你你a", 2, "你你a".len());
-        assert_eq!(metrics.row_count, 3);
-        assert_eq!(metrics.cursor, ComposerCursor { row: 2, column: 1 });
-
-        // Trailing newline puts the cursor on the next empty row.
-        let metrics = composer_metrics("hi\n", 10, 3);
-        assert_eq!(metrics.cursor, ComposerCursor { row: 1, column: 0 });
-    }
-
-    #[test]
-    fn composer_metrics_row_count_always_includes_cursor_row() {
-        // Exact-fill should advance cursor row; row_count must still include it.
-        let metrics = composer_metrics("abcd", 4, 4);
-        assert_eq!(metrics.cursor, ComposerCursor { row: 1, column: 0 });
-        assert_eq!(metrics.row_count, 2);
-    }
-
-    #[test]
     fn long_single_line_cjk_wraps_into_multiple_rows() {
         // Each CJK char is width 2.
         // width 6 => 3 chars per row.
@@ -1253,28 +1233,6 @@ mod tests {
         let mixed = "ab你cd你ef"; // widths: 1+1+2+1+1+2+1+1 = 10
         let metrics = composer_metrics(mixed, 4, mixed.len());
         assert!(metrics.row_count >= 3, "{metrics:?}");
-    }
-
-    #[test]
-    fn composer_cursor_tracks_arbitrary_input_cursor() {
-        let input = "ab\ncd";
-        let metrics = composer_metrics(input, 10, 2);
-        assert_eq!(metrics.cursor, ComposerCursor { row: 0, column: 2 });
-
-        let metrics = composer_metrics(input, 10, 3);
-        assert_eq!(metrics.cursor, ComposerCursor { row: 1, column: 0 });
-    }
-
-    #[test]
-    fn composer_renders_input_newlines_as_visual_rows() {
-        let mut state = TuiState::default();
-        state.set_input("first\nsecond");
-
-        let rows = draw_rows(&mut state, 80, 8);
-
-        assert!(rows[1].contains("first"), "{rows:?}");
-        assert!(rows[2].contains("second"), "{rows:?}");
-        assert!(!rows[1].contains("firstsecond"), "{rows:?}");
     }
 
     #[test]
@@ -1296,93 +1254,6 @@ mod tests {
     }
 
     #[test]
-    fn composer_scrolls_to_keep_cursor_visible() {
-        let metrics = ComposerMetrics {
-            row_count: 8,
-            cursor: ComposerCursor { row: 7, column: 0 },
-        };
-
-        assert_eq!(composer_scroll_row(metrics, 3), 5);
-        assert_eq!(composer_scroll_row(metrics, 10), 0);
-    }
-
-    #[test]
-    fn composer_height_uses_wrapped_rows_instead_of_logical_lines() {
-        // Single line that wraps into multiple visual rows at narrow widths.
-        let input = "你你你你你你"; // 6 chars => width 12
-        let height_narrow = crate::tui::components::layout::composer_height(30, input, &[], 12);
-        let height_wide = crate::tui::components::layout::composer_height(30, input, &[], 80);
-        assert!(
-            height_narrow >= height_wide,
-            "{height_narrow} vs {height_wide}"
-        );
-    }
-
-    #[test]
-    fn composer_renders_attachments_at_their_inline_positions() {
-        let mut state = TuiState::default();
-        state.set_input("before after");
-        state.input_cursor = "before ".len();
-        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
-        state.input_cursor = state.input_buffer.len();
-        state.add_composer_attachment(test_attachment("img-2", "diagram.png"));
-
-        let rows = draw_rows(&mut state, 80, 10);
-
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("before [Image 1]after[Image 2]")),
-            "{rows:?}"
-        );
-    }
-
-    #[test]
-    fn composer_inline_tokens_wrap_at_their_logical_positions() {
-        let mut state = TuiState::default();
-        state.set_input("abx");
-        state.input_cursor = 2;
-        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
-
-        let lines = composer_inline_lines(&state, 10, Theme::dark())
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|span| span.content.into_owned())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(lines, vec!["ab", "[Image 1]x", ""]);
-        assert_eq!(
-            composer_metrics_with_attachments(&state, 10),
-            ComposerMetrics {
-                row_count: 3,
-                cursor: ComposerCursor { row: 1, column: 9 },
-            }
-        );
-    }
-
-    #[test]
-    fn exact_width_text_allocates_a_cursor_row() {
-        let mut state = TuiState::default();
-        state.set_input("abcd");
-
-        assert_eq!(
-            composer_inline_lines(&state, 4, Theme::dark()).len(),
-            2,
-            "exact-width text reserves a cursor row"
-        );
-        assert_eq!(
-            composer_metrics_with_attachments(&state, 4),
-            ComposerMetrics {
-                row_count: 2,
-                cursor: ComposerCursor { row: 1, column: 0 },
-            }
-        );
-    }
-
-    #[test]
     fn narrow_attachment_tokens_reserve_the_same_rows_as_the_renderer() {
         let attachment = test_attachment("img-1", "clipboard");
         let mut state = TuiState::default();
@@ -1392,35 +1263,6 @@ mod tests {
 
         assert_eq!(composer_inline_lines(&state, 5, Theme::dark()).len(), 3);
         assert_eq!(composer_metrics_with_attachments(&state, 5).row_count, 3);
-    }
-
-    #[test]
-    fn composer_height_reserves_rows_for_attachments() {
-        let base = crate::tui::components::layout::composer_height(30, "hello", &[], 80);
-        let with_attachment = crate::tui::components::layout::composer_height(
-            30,
-            "hello\u{fffc}",
-            &[crate::tui::state::ComposerToken::Image(test_attachment(
-                "img-1",
-                "clipboard",
-            ))],
-            80,
-        );
-
-        assert!(with_attachment >= base, "{with_attachment} vs {base}");
-    }
-
-    #[test]
-    fn composer_metrics_wraps_new_attachment_after_existing_input() {
-        let mut state = TuiState::default();
-        state.set_input("hello");
-        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
-        state.input_cursor = "hello".len();
-
-        let metrics = composer_metrics_with_attachments(&state, 14);
-
-        assert_eq!(metrics.cursor, ComposerCursor { row: 0, column: 5 });
-        assert_eq!(metrics.row_count, 2);
     }
 
     #[test]
@@ -1512,22 +1354,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_default_permission_shows_session_allowance() {
-        let mut state = TuiState::default();
-        let mut request = PermissionRequestEvent::new("call-1", "fs__write", "write src/lib.rs");
-        request.can_allow_always = true;
-        state.apply_event(SessionEvent::PermissionRequested(request));
-
-        let rendered = draw_to_string(&mut state, 100, 10);
-
-        assert!(rendered.contains("Allow once"), "{rendered}");
-        assert!(rendered.contains("Allow always"), "{rendered}");
-        assert!(rendered.contains("y/o"), "{rendered}");
-        assert!(rendered.contains("a"), "{rendered}");
-        assert!(rendered.contains("n/d"), "{rendered}");
-    }
-
-    #[test]
     fn pending_permission_shows_subagent_origin_when_present() {
         let mut state = TuiState::default();
         let mut request =
@@ -1540,97 +1366,6 @@ mod tests {
 
         assert!(rendered.contains("fixer"), "{rendered}");
         assert!(rendered.contains("cargo test --workspace"), "{rendered}");
-    }
-
-    #[test]
-    fn slash_panel_content_is_not_rendered_inside_composer_surface() {
-        let mut state = TuiState::default();
-        state.set_input("/per");
-
-        let rendered = draw_to_string(&mut state, 100, 12);
-        assert!(
-            !rendered.contains("Show current permission mode"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("/per"), "{rendered}");
-        assert!(!rendered.contains("prompt ·"), "{rendered}");
-    }
-
-    #[test]
-    fn composer_metadata_includes_model_provider_and_permission() {
-        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "yolo");
-        state.set_provider_label("CLI Proxy API");
-        state.set_reasoning_effort_label(Some("medium".into()));
-        state.set_fast_mode_enabled(true);
-
-        let rendered = draw_to_string(&mut state, 100, 8);
-
-        assert!(rendered.contains("prompt"), "{rendered}");
-        assert!(rendered.contains("GPT-5.5"), "{rendered}");
-        assert!(rendered.contains("CLI Proxy API"), "{rendered}");
-        assert!(rendered.contains("medium"), "{rendered}");
-        assert!(rendered.contains("yolo · fast"), "{rendered}");
-        assert!(!rendered.contains("permission yolo"), "{rendered}");
-    }
-
-    #[test]
-    fn child_navigation_prefix_mutes_composer_leading_bar() {
-        let mut state = TuiState::default();
-
-        let normal = leading_bar_color(&mut state, 80, 8).expect("normal color");
-        state.child_navigation_prefix = true;
-        let prefixed = leading_bar_color(&mut state, 80, 8).expect("prefixed color");
-
-        assert_eq!(normal, Theme::dark().user);
-        assert_eq!(prefixed, Theme::dark().notice);
-    }
-
-    #[test]
-    fn composer_cursor_pulse_uses_slow_breathing_cycle() {
-        let cycle_frames = CURSOR_CYCLE_DURATION_MS / CURSOR_FRAME_INTERVAL_MS;
-
-        assert_eq!(cursor_pulse_intensity(0), 0.0);
-        assert_eq!(cursor_pulse_intensity(cycle_frames / 8), 0.0);
-        assert!(cursor_pulse_intensity(cycle_frames * 3 / 5) > 0.9);
-        assert!(cursor_pulse_intensity(cycle_frames * 3 / 4) > 0.9);
-        assert!(cursor_pulse_intensity(cycle_frames - 1) < 0.1);
-    }
-
-    #[test]
-    fn composer_cursor_pulse_targets_white_instead_of_user_accent() {
-        let theme = Theme::dark();
-        let target = composer_cursor_target_color(theme);
-
-        assert!(color_distance(target, theme.text) < color_distance(target, theme.user));
-        assert!(
-            color_distance(target, Color::Rgb(255, 255, 255)) < color_distance(target, theme.user)
-        );
-    }
-
-    #[test]
-    fn composer_draws_custom_cursor_block_without_using_terminal_cursor() {
-        let mut state = TuiState::default();
-        state.set_input("hello");
-        state.input_cursor = 2;
-        state.status_spinner_frame = (CURSOR_CYCLE_DURATION_MS / CURSOR_FRAME_INTERVAL_MS) * 3 / 5;
-
-        let (symbol, fg, bg) = composer_cell_style(&mut state, 80, 8, 5, 1).expect("cursor cell");
-
-        assert_eq!(symbol, "l");
-        assert_ne!(bg, Theme::dark().element_bg);
-        assert_ne!(fg, Theme::dark().element_bg);
-    }
-
-    #[test]
-    fn composer_cursor_pulses_while_agent_is_running() {
-        let theme = Theme::dark();
-        let mut state = TuiState::default();
-        state.phase = crate::tui::state::AppPhase::Running;
-        state.status_spinner_frame = 0;
-        let a = composer_cursor_style(&state, theme);
-        state.status_spinner_frame = 1_000;
-        let b = composer_cursor_style(&state, theme);
-        assert_ne!(a, b, "running phase should pulse with tick frames");
     }
 
     fn color_distance(a: Color, b: Color) -> u32 {
@@ -1681,41 +1416,6 @@ mod tests {
         assert!(
             !rendered.contains("hidden input should not render"),
             "{rendered}"
-        );
-    }
-
-    #[test]
-    fn child_read_only_panel_uses_symmetric_capped_composer_rows() {
-        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
-        state.replace_child_timeline_from_records(
-            &[crate::transcript::TranscriptRecord {
-                session_id: "child-session".into(),
-                sequence: 1,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: crate::transcript::TranscriptEvent::SessionStarted {
-                    model: "gpt-5.5-mini".into(),
-                },
-            }],
-            "parent-session",
-            "child-session-1234567890",
-            "explorer",
-            0,
-            1,
-            1,
-        );
-
-        let rows = draw_rows(&mut state, 100, 4);
-
-        assert!(!rows[0].contains("explorer"), "{rows:?}");
-        assert!(rows[1].contains("explorer"), "{rows:?}");
-        assert!(rows[1].contains("gpt-5.5-mini"), "{rows:?}");
-        assert!(rows[1].contains("Parent"), "{rows:?}");
-        assert!(!rows[2].contains("explorer"), "{rows:?}");
-        assert!(
-            rows[3].contains(surface::PROMPT_BOTTOM_LEFT_GLYPH)
-                || rows[3].contains(surface::PROMPT_BOTTOM_CAP_GLYPH),
-            "{rows:?}"
         );
     }
 

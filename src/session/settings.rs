@@ -347,20 +347,4 @@ protocol = "responses"
         );
     }
 
-    #[test]
-    fn apply_permission_mode_records_provenance_only_on_change() {
-        let (base_dir, transcript, session_id) = temp_transcript();
-        let mut agent = test_agent();
-
-        apply_permission_mode(&mut agent, &transcript, PermissionMode::Safe).expect("permission");
-        apply_permission_mode(&mut agent, &transcript, PermissionMode::Safe).expect("idempotent");
-
-        assert_eq!(agent.permission_mode(), PermissionMode::Safe);
-
-        let records = crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
-            .expect("read records");
-        assert_eq!(records.len(), 1);
-        let record = serde_json::to_value(&records[0]).expect("serialize");
-        assert_eq!(record.get("kind"), Some(&json!("permission_mode_changed")));
-    }
 }

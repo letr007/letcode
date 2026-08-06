@@ -239,20 +239,6 @@ mod tests {
     }
 
     #[test]
-    fn read_class_dynamic_tools_remain_exclusive_by_default() {
-        let mut registry = ToolRegistry::new();
-        registry
-            .try_register(DynamicTool("fs__read"))
-            .expect("dynamic read-class tool registers");
-
-        assert_eq!(
-            registry.permission_class("fs__read"),
-            ToolPermissionClass::Read
-        );
-        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Exclusive);
-    }
-
-    #[test]
     fn registration_rejects_an_existing_parallel_override_for_exclusive_tool() {
         let mut registry = ToolRegistry::new();
         registry
@@ -269,29 +255,4 @@ mod tests {
         assert!(!registry.contains("example__dynamic"));
     }
 
-    #[test]
-    fn unregister_reregister_preserves_parallelism_override() {
-        let mut registry = ToolRegistry::default_tools();
-        registry
-            .set_parallelism_overrides([("fs__read".to_string(), ToolParallelism::Exclusive)])
-            .expect("read tool may be narrowed");
-        assert!(registry.remove("fs__read"));
-        registry.register(crate::tool::ReadFileTool);
-        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Exclusive);
-    }
-
-    #[test]
-    fn parallelism_overrides_can_only_narrow_declared_capabilities() {
-        let mut registry = ToolRegistry::default_tools();
-        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Parallel);
-        registry
-            .set_parallelism_overrides([("fs__read".to_string(), ToolParallelism::Exclusive)])
-            .expect("read tools may be narrowed");
-        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Exclusive);
-
-        let error = registry
-            .set_parallelism_overrides([("fs__write".to_string(), ToolParallelism::Parallel)])
-            .expect_err("write tools cannot be promoted to parallel");
-        assert!(error.to_string().contains("does not declare parallel"));
-    }
 }

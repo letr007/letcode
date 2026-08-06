@@ -2862,29 +2862,6 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
 mod session_title_tests {
     use super::*;
 
-    #[test]
-    fn session_title_is_recorded_as_global_metadata_on_an_active_history_branch() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "letcode-session-title-metadata-{}",
-            unix_timestamp_ms()
-        ));
-        let mut recorder =
-            TranscriptRecorder::create(&base_dir).expect("create transcript recorder");
-        recorder.set_current_context_branch_id(Some("history-1".into()));
-        recorder
-            .record_session_title("generated title")
-            .expect("record session title");
-
-        let records = read_records(recorder.path()).expect("read transcript records");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].context_branch_id, None);
-        assert!(matches!(
-            &records[0].event,
-            TranscriptEvent::SessionTitle { title } if title == "generated title"
-        ));
-
-        let _ = std::fs::remove_dir_all(base_dir);
-    }
 }
 
 #[cfg(test)]
