@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use std::process::Stdio;
@@ -58,34 +58,6 @@ pub struct McpTool {
     tool_name: String,
     transport: McpTransportConfig,
     timeout_ms: u64,
-}
-
-pub async fn discover_tools(config: &IndexMap<String, McpServerConfig>) -> Result<Vec<McpTool>> {
-    let enabled_servers = config
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, server_config))| server_config.enabled)
-        .map(|(index, (server_name, server_config))| {
-            (index, server_name.clone(), server_config.clone())
-        })
-        .collect::<Vec<_>>();
-
-    let mut discovered = stream::iter(enabled_servers)
-        .map(|(index, server_name, server_config)| async move {
-            discover_server_tools(server_name, server_config)
-                .await
-                .map(|tools| (index, tools))
-        })
-        .buffer_unordered(MCP_DISCOVERY_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    discovered.sort_by_key(|(index, _)| *index);
-
-    Ok(discovered
-        .into_iter()
-        .flat_map(|(_, tools)| tools)
-        .collect())
 }
 
 /// Discover every configured MCP server independently, preserving config order.

@@ -25,7 +25,7 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, AutoReviewService, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome,
+    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome,
     PrimaryRouteFactory, SubagentInvocation,
 };
 use crate::agent_event_journal::persist_agent_event;

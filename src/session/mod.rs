@@ -62,9 +62,10 @@ pub(crate) use interrupt::unfinished_current_active_turn_tool_calls;
 pub(crate) use lifecycle::session_started_event;
 
 pub use lifecycle::{
-    ResolveSessionError, install_new_session_for_agent, install_prepared_new_session_for_agent,
-    prepare_new_session_package, resolve_session_prefix,
+    install_prepared_new_session_for_agent, prepare_new_session_package, resolve_session_prefix,
 };
+#[cfg(test)]
+pub use lifecycle::install_new_session_for_agent;
 pub use ports::SessionCommandHandler;
 pub use restore::{
     install_prepared_routed_resume_for_agent, prepare_resume_package,
@@ -77,4 +78,3 @@ pub(crate) use runner::{
     subagent_event_sender,
 };
 pub(crate) use settings::persist_and_apply_model_route_with;
-pub use settings::{apply_permission_mode, apply_reasoning_effort};

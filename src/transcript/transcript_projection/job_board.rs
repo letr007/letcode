@@ -1,8 +1,4 @@
-use crate::subagent::StructuredSubagentResult;
-use crate::transcript::{
-    ChildSessionSummary, JobBoardEntry, TranscriptEvent, TranscriptRecord,
-    read_records_allow_partial_tail,
-};
+use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -77,10 +73,13 @@ pub(crate) fn project_child_session_summaries(
     children
 }
 
+#[cfg(test)]
 pub(crate) fn project_job_board(
     child_dir: &Path,
     parent_records: &[TranscriptRecord],
-) -> anyhow::Result<Vec<JobBoardEntry>> {
+) -> anyhow::Result<Vec<crate::transcript::JobBoardEntry>> {
+    use crate::subagent::StructuredSubagentResult;
+    use crate::transcript::{JobBoardEntry, read_records_allow_partial_tail};
     let mut jobs = BTreeMap::<String, JobBoardAccumulator>::new();
 
     for record in parent_records {
@@ -205,10 +204,12 @@ pub(crate) fn project_job_board(
     Ok(entries)
 }
 
+#[cfg(test)]
 fn hydrate_active_job_from_child_transcript(
     child_dir: &Path,
     entry: &mut JobBoardAccumulator,
 ) -> anyhow::Result<()> {
+    use crate::transcript::read_records_allow_partial_tail;
     let child_records = read_records_allow_partial_tail(
         child_dir.join(format!("{}.jsonl", entry.child_session_id)),
     )?;
@@ -240,6 +241,7 @@ fn hydrate_active_job_from_child_transcript(
     Ok(())
 }
 
+#[cfg(test)]
 fn is_terminal_subagent_status(status: &str) -> bool {
     matches!(
         status,
@@ -247,6 +249,7 @@ fn is_terminal_subagent_status(status: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct JobBoardAccumulator {
     run_id: String,

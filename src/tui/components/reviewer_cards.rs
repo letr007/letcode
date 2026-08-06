@@ -39,10 +39,6 @@ pub(crate) fn looks_like_review_request(text: &str) -> bool {
         && trimmed.contains("\nTool: ")
 }
 
-pub(crate) fn looks_like_review_decision(text: &str) -> bool {
-    parse_review_decision(text).is_some()
-}
-
 pub(crate) fn parse_review_request(text: &str) -> Option<ReviewRequestCard> {
     if !looks_like_review_request(text) {
         return None;

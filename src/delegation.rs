@@ -62,6 +62,7 @@ pub fn supported_agent_names() -> impl Iterator<Item = &'static str> {
         .chain(SYSTEM_EXPERTS.iter().copied())
 }
 
+#[cfg(test)]
 pub fn is_system_expert(agent_name: &str) -> bool {
     SYSTEM_EXPERTS.contains(&agent_name)
 }

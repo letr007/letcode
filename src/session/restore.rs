@@ -49,6 +49,7 @@ pub fn project_runtime_restore_snapshot_with_children(
 /// with legacy branch adopted. Agent restore remains the caller's job.
 pub struct PreparedResume {
     pub session_id: String,
+    #[allow(dead_code)]
     pub records: Vec<TranscriptRecord>,
     pub snapshot: RuntimeRestoreSnapshot,
     pub recorder: crate::transcript::TranscriptRecorder,

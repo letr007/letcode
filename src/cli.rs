@@ -804,6 +804,7 @@ fn cli_compaction_lifecycle_message(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn record_one_shot_error(
     recorder: &std::sync::Arc<std::sync::Mutex<crate::transcript::TranscriptRecorder>>,
     err: &anyhow::Error,

@@ -11,8 +11,11 @@ use crate::permission::{PermissionApproval, PermissionRequest};
 pub struct AutoReviewResolution {
     pub approval: PermissionApproval,
     pub reason: String,
+    #[allow(dead_code)]
     pub risk: Option<String>,
+    #[allow(dead_code)]
     pub approval_label: &'static str,
+    #[allow(dead_code)]
     pub reviewer_child_session_id: String,
 }
 

@@ -2155,6 +2155,7 @@ pub fn sort_child_session_summaries(children: &mut [ChildSessionSummary]) {
     });
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobBoardEntry {
     pub active: bool,
@@ -2300,6 +2301,7 @@ pub(crate) fn read_child_session_records_allow_partial_tail(
     ))
 }
 
+#[cfg(test)]
 pub fn restore_job_board(
     base_dir: impl AsRef<Path>,
     parent_records: &[TranscriptRecord],

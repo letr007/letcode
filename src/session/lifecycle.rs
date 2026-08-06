@@ -169,6 +169,7 @@ pub(crate) fn session_started_event(
 /// TUI should call [`prepare_new_session_package`] then
 /// [`install_prepared_new_session_for_agent`] so it can emit `SessionStarted`
 /// before the recorder moves.
+#[cfg(test)]
 pub fn install_new_session_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,

@@ -59,10 +59,6 @@ impl ThemeName {
             _ => None,
         }
     }
-
-    pub const fn available() -> &'static [Self] {
-        &[Self::Dark, Self::Rainbow]
-    }
 }
 
 impl Default for ThemeName {

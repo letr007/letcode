@@ -2911,30 +2911,6 @@ impl<C: Config> Agent<C> {
         .await
     }
 
-    pub async fn run_stream_with_interactions<F, E, A, Q>(
-        &mut self,
-        user_input: &str,
-        mut on_delta: F,
-        mut on_event: E,
-        mut approve: A,
-        mut ask_question: Q,
-    ) -> Result<String>
-    where
-        F: FnMut(&str) -> Result<()>,
-        E: FnMut(AgentEvent) -> Result<()> + Send,
-        A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
-        Q: FnMut(QuestionRequest) -> Result<QuestionResponse> + Send + 'static,
-        C: Clone + Send + Sync + 'static,
-    {
-        self.run_stream_content_with_interactions_async(
-            UserMessageContent::new(user_input.to_string(), Vec::new()),
-            |delta| std::future::ready(on_delta(delta)),
-            |event| std::future::ready(on_event(event)),
-            |request| std::future::ready(approve(request)),
-            move |request| std::future::ready(ask_question(request)),
-        )
-        .await
-    }
 
     #[cfg(test)]
     pub async fn compact_session_async<E, Efut>(
