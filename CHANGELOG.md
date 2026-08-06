@@ -5,6 +5,32 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.2.0] - 2026-08-06
+
+### Added
+
+- 子代理目录授权：`allowed_paths` 只读、`owned_paths` 读写、`forbidden_paths` 优先；越界硬拒绝，scope 内结构化工具预授权，避免 auto 模式下逐文件重复审批
+- 子代理 PermissionSession 隔离：只继承权限模式，不继承 AllowAlways grants；父子/兄弟互不影响；Shell 仍按完整命令 AllowAlways
+- auto 模式下普通子代理继承 reviewer 服务；reviewer 子代理不继承，防止递归审批；并发 auto-review 串行化，避免 reviewer busy
+- TUI 主题：内置 Tokyo Night，并从 `themes/*.toml` 加载可编辑主题，选择时热重载
+- 内置 `customize-letcode` skill，以及 `config__validate` / `letcode config validate`
+- 退出横幅打印 `letcode resume <id>`；新增同名 CLI，可直接恢复指定会话
+- 已选 skill 在时间线中持续可见
+
+### Fixed
+
+- Windows 默认配置路径：无 `HOME` 时回退 `USERPROFILE`（修复 exe 启动即报 `HOME is not set`）
+- 恢复会话时投影权限模式，避免 resume 后回落到配置默认（常为 yolo）
+- 活动回合中非导航命令错误入队导致 UI 忙等卡死
+- CJK IME 光标锚定与 composer 光标脉冲；shell 输出中的 VT 转义不再污染 TUI
+- 用户回复卡片、running footer 扫描色与主题 token 对齐
+
+### Changed
+
+- `/resume` 使用 sessions sidecar 索引异步加载，避免全量扫描 transcript 阻塞 TUI
+- Markdown 链接改为 Ctrl/Cmd-click 打开；精简多余 loading/toast
+- 测试套件收敛，保留 fail-closed、恢复与数据安全相关契约
+
 ## [0.1.0] - 2026-08-05
 
 首个公开版本。
@@ -21,4 +47,5 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
+[0.2.0]: https://github.com/letr007/letcode/releases/tag/v0.2.0
 [0.1.0]: https://github.com/letr007/letcode/releases/tag/v0.1.0
