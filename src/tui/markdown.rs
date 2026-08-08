@@ -545,6 +545,9 @@ impl MarkdownRenderer {
             return false;
         };
         let direction = graph.direction;
+        // 成功渲染时不使用卡片背景，直接融入 timeline 背景。
+        let text_style = self.theme.app_style();
+        let border_style = self.theme.app_style().fg(self.theme.accent);
         let mut output = Vec::new();
         let mut rendered_nodes = HashMap::new();
 
@@ -556,49 +559,48 @@ impl MarkdownRenderer {
                 return false;
             };
             let mut spans = vec![RenderSpan::decoration(
-                if direction == MermaidDirection::Td {
-                    "↓ "
-                } else {
-                    ""
+                match direction {
+                    MermaidDirection::Td => "↓ ",
+                    MermaidDirection::Bu => "↑ ",
+                    MermaidDirection::Lr | MermaidDirection::Rl => "",
                 },
-                code_block_border_style(self.theme),
+                border_style,
             )];
             spans.push(RenderSpan::source(
                 from.label.clone(),
-                code_block_style(self.theme),
+                text_style,
                 SourceRange::new(0, from.start, from.end),
             ));
+            let line = match edge.style {
+                MermaidEdgeStyle::Solid => "─",
+                MermaidEdgeStyle::Dashed => "╌",
+                MermaidEdgeStyle::Thick => "═",
+            };
             if let Some(label) = &edge.label {
                 spans.push(RenderSpan::decoration(
-                    if direction == MermaidDirection::Td {
-                        "  ─"
-                    } else {
-                        " ──"
-                    },
-                    code_block_border_style(self.theme),
+                    format!(" {line}{line}"),
+                    border_style,
                 ));
                 spans.push(RenderSpan::source(
                     label.text.clone(),
-                    code_block_style(self.theme),
+                    text_style,
                     SourceRange::new(0, label.start, label.end),
                 ));
+                let arrow = if edge.arrow { '▶' } else { ' ' };
                 spans.push(RenderSpan::decoration(
-                    "─▶ ",
-                    code_block_border_style(self.theme),
+                    format!(" {line}{line}{arrow} "),
+                    border_style,
                 ));
             } else {
+                let arrow = if edge.arrow { '▶' } else { ' ' };
                 spans.push(RenderSpan::decoration(
-                    if direction == MermaidDirection::Td {
-                        "  →  "
-                    } else {
-                        " ──▶ "
-                    },
-                    code_block_border_style(self.theme),
+                    format!(" {line}{line}{arrow} "),
+                    border_style,
                 ));
             }
             spans.push(RenderSpan::source(
                 to.label.clone(),
-                code_block_style(self.theme),
+                text_style,
                 SourceRange::new(0, to.start, to.end),
             ));
             output.push(spans);
@@ -615,7 +617,7 @@ impl MarkdownRenderer {
         for (_, node) in isolated_nodes {
             output.push(vec![RenderSpan::source(
                 node.label.clone(),
-                code_block_style(self.theme),
+                text_style,
                 SourceRange::new(0, node.start, node.end),
             )]);
         }
@@ -627,6 +629,9 @@ impl MarkdownRenderer {
         let Some(sequence) = parse_mermaid_sequence(&code.content) else {
             return false;
         };
+        // 成功渲染时不使用卡片背景，直接融入 timeline 背景。
+        let text_style = self.theme.app_style();
+        let border_style = self.theme.app_style().fg(self.theme.accent);
         let mut output = Vec::new();
         for message in &sequence.messages {
             let Some(from) = sequence.participants.get(&message.from) else {
@@ -638,7 +643,7 @@ impl MarkdownRenderer {
             output.push(vec![
                 RenderSpan::source(
                     from.label.clone(),
-                    code_block_style(self.theme),
+                    text_style,
                     SourceRange::new(0, from.start, from.end),
                 ),
                 RenderSpan::decoration(
@@ -647,17 +652,17 @@ impl MarkdownRenderer {
                     } else {
                         " ──▶ "
                     },
-                    code_block_border_style(self.theme),
+                    border_style,
                 ),
                 RenderSpan::source(
                     to.label.clone(),
-                    code_block_style(self.theme),
+                    text_style,
                     SourceRange::new(0, to.start, to.end),
                 ),
-                RenderSpan::decoration("  ", code_block_border_style(self.theme)),
+                RenderSpan::decoration("  ", border_style),
                 RenderSpan::source(
                     message.label.text.clone(),
-                    code_block_style(self.theme),
+                    text_style,
                     SourceRange::new(0, message.label.start, message.label.end),
                 ),
             ]);
@@ -702,7 +707,6 @@ impl MarkdownRenderer {
                 line.push(RenderSpan::decoration(prefix.clone(), self.prefix_style()));
             }
             line.extend(spans);
-            pad_render_line(&mut line, self.options.width, code_block_style(self.theme));
             self.document.push_line(
                 RenderLine { spans: line },
                 if index + 1 == output_len {
@@ -1172,7 +1176,16 @@ struct CodeBlockState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MermaidDirection {
     Td,
+    Bu,
     Lr,
+    Rl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MermaidEdgeStyle {
+    Solid,
+    Dashed,
+    Thick,
 }
 
 #[derive(Debug)]
@@ -1201,6 +1214,8 @@ struct MermaidEdge {
     from: String,
     to: String,
     label: Option<MermaidLabel>,
+    style: MermaidEdgeStyle,
+    arrow: bool,
 }
 
 #[derive(Debug)]
@@ -1230,31 +1245,39 @@ fn parse_mermaid(source: &str) -> Option<MermaidGraph> {
         let leading = line.chars().count() - line.trim_start().chars().count();
         let trimmed = line.trim();
         if line_index == 0 {
-            direction = Some(match trimmed {
-                "graph TD" | "flowchart TD" => MermaidDirection::Td,
-                "graph LR" | "flowchart LR" => MermaidDirection::Lr,
+            let mut tokens = trimmed
+                .split(|ch: char| ch == ';' || ch.is_whitespace())
+                .filter(|s| !s.is_empty());
+            let keyword = tokens.next()?;
+            let dir = tokens.next()?;
+            direction = Some(match (keyword, dir) {
+                ("graph" | "flowchart", "TD" | "TB") => MermaidDirection::Td,
+                ("graph" | "flowchart", "BT") => MermaidDirection::Bu,
+                ("graph" | "flowchart", "LR") => MermaidDirection::Lr,
+                ("graph" | "flowchart", "RL") => MermaidDirection::Rl,
                 _ => return None,
             });
-        } else if !trimmed.is_empty() {
-            let base = line_offset + leading;
-            if let Some(arrow) = trimmed.find("-->") {
-                let (left, right_with_arrow) = trimmed.split_at(arrow);
-                let right = right_with_arrow.strip_prefix("-->")?;
-                let from = parse_mermaid_endpoint(left, base)?;
-                let (label, to) = parse_mermaid_edge_target(
-                    right,
-                    base + left.chars().count() + "-->".chars().count(),
-                )?;
-                insert_mermaid_node(&mut nodes, from.clone())?;
-                insert_mermaid_node(&mut nodes, to.clone())?;
-                edges.push(MermaidEdge {
-                    from: from.0,
-                    to: to.0,
-                    label,
-                });
+        } else if !trimmed.is_empty() && !trimmed.starts_with("%%") {
+            if trimmed == "end" || trimmed.starts_with("subgraph") {
+                // 子图边界：子图内节点/边照常渲染，不画子图边框。
             } else {
-                let node = parse_mermaid_endpoint(trimmed, base)?;
-                insert_mermaid_node(&mut nodes, node)?;
+                let base_line = line_offset + leading;
+                let mut segment_start = 0usize;
+                for (idx, byte) in trimmed.bytes().enumerate() {
+                    if byte == b';' {
+                        let segment = &trimmed[segment_start..idx];
+                        if !segment.trim().is_empty() {
+                            let base = base_line + trimmed[..segment_start].chars().count();
+                            parse_mermaid_statement(segment, base, &mut nodes, &mut edges)?;
+                        }
+                        segment_start = idx + 1;
+                    }
+                }
+                let segment = &trimmed[segment_start..];
+                if !segment.trim().is_empty() {
+                    let base = base_line + trimmed[..segment_start].chars().count();
+                    parse_mermaid_statement(segment, base, &mut nodes, &mut edges)?;
+                }
             }
         }
         line_offset += line.chars().count() + 1;
@@ -1276,74 +1299,206 @@ fn parse_mermaid(source: &str) -> Option<MermaidGraph> {
     })
 }
 
-fn parse_mermaid_edge_target(
+/// 形状定界符对：open 优先匹配更长的，label 从中提取。
+const MERMAID_SHAPES: &[(&str, &str)] = &[
+    ("[[", "]]"),
+    ("[(", ")]"),
+    ("((", "))"),
+    ("{{", "}}"),
+    ("[/", "/]"),
+    ("[\\", "\\]"),
+    ("[", "]"),
+    ("(", ")"),
+    ("{", "}"),
+    (">", "]"),
+];
+
+/// 解析一条语句：孤立节点或 from -> to。返回剩余部分时供连接符继续解析。
+fn parse_mermaid_statement(
     segment: &str,
     base: usize,
-) -> Option<(Option<MermaidLabel>, (String, MermaidNode))> {
-    let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
-    let trimmed = segment.trim_start();
-    if !trimmed.starts_with('|') {
-        return Some((None, parse_mermaid_endpoint(segment, base)?));
+    nodes: &mut HashMap<String, MermaidNode>,
+    edges: &mut Vec<MermaidEdge>,
+) -> Option<()> {
+    let (from, node, rest, rest_base) = parse_mermaid_endpoint_prefix(segment, base)?;
+    if rest.trim().is_empty() {
+        insert_mermaid_node(nodes, (from, node))?;
+        return Some(());
     }
-    let close = trimmed[1..].find('|')? + 1;
-    let label = &trimmed[1..close];
-    if label.trim().is_empty() {
+    let (style, arrow, label, rest2, rest2_base) = parse_mermaid_connector(rest, rest_base)?;
+    let (to, to_node, rest3, _rest3_base) = parse_mermaid_endpoint_prefix(rest2, rest2_base)?;
+    if !rest3.trim().is_empty() {
         return None;
     }
-    let label_leading = label.chars().take_while(|ch| ch.is_whitespace()).count();
-    let label_text = label.trim();
-    let label_start = base + leading + 1 + label_leading;
-    let target = &trimmed[close + 1..];
-    let target_base = base + leading + trimmed[..close + 1].chars().count();
-    Some((
-        Some(MermaidLabel {
-            text: label_text.to_string(),
-            start: label_start,
-            end: label_start + label_text.chars().count(),
-        }),
-        parse_mermaid_endpoint(target, target_base)?,
-    ))
+    insert_mermaid_node(nodes, (from.clone(), node))?;
+    insert_mermaid_node(nodes, (to.clone(), to_node))?;
+    edges.push(MermaidEdge {
+        from,
+        to,
+        label,
+        style,
+        arrow,
+    });
+    Some(())
 }
 
-fn parse_mermaid_endpoint(segment: &str, base: usize) -> Option<(String, MermaidNode)> {
+/// 解析前缀端点（id 或形状节点），返回剩余片段与偏移。
+fn parse_mermaid_endpoint_prefix(
+    segment: &str,
+    base: usize,
+) -> Option<(String, MermaidNode, &str, usize)> {
     let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
-    let trimmed = segment.trim();
+    let trimmed = segment.trim_start();
     if trimmed.is_empty() {
         return None;
     }
-    let shape = trimmed
-        .char_indices()
-        .find(|(_, ch)| matches!(ch, '[' | '{'));
-    if let Some((open, delimiter)) = shape {
-        let closing = if delimiter == '[' { ']' } else { '}' };
-        let close = trimmed.rfind(closing)?;
-        if close <= open + 1 || close + closing.len_utf8() != trimmed.len() {
-            return None;
-        }
-        let id = trimmed[..open].trim();
-        let label = &trimmed[open + delimiter.len_utf8()..close];
-        if !valid_mermaid_id(id) || label.contains(['[', ']', '{', '}']) {
-            return None;
-        }
-        let id_chars = trimmed[..open].chars().count();
-        let start = base + leading + id_chars + 1;
-        return Some((
-            id.to_string(),
-            MermaidNode {
-                label: label.to_string(),
+    let tbase = base + leading;
+    for (opener, closer) in MERMAID_SHAPES {
+        if let Some(open) = trimmed.find(opener) {
+            let id = trimmed[..open].trim();
+            if !valid_mermaid_id(id) {
+                continue;
+            }
+            let body_start = open + opener.len();
+            let Some(rel) = trimmed[body_start..].find(closer) else {
+                continue;
+            };
+            let close = body_start + rel;
+            let label_seg = &trimmed[body_start..close];
+            let label_leading = label_seg
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .count();
+            let raw = label_seg.trim().trim_matches('"');
+            if raw.is_empty() {
+                continue;
+            }
+            let id_chars = trimmed[..open].chars().count();
+            let start = tbase + id_chars + opener.chars().count() + label_leading;
+            let node = MermaidNode {
+                label: raw.to_string(),
                 start,
-                end: start + label.chars().count(),
-            },
-        ));
+                end: start + raw.chars().count(),
+            };
+            let rest = &trimmed[close + closer.len()..];
+            let rest_base = tbase + trimmed[..close + closer.len()].chars().count();
+            return Some((id.to_string(), node, rest, rest_base));
+        }
     }
-    valid_mermaid_id(trimmed).then_some((
-        trimmed.to_string(),
-        MermaidNode {
-            label: trimmed.to_string(),
-            start: base + leading,
-            end: base + leading + trimmed.chars().count(),
-        },
-    ))
+    // 裸 id：读取到空白或连接符起始为止。
+    let id_end = trimmed
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || *ch == '-' || *ch == '=')
+        .map(|(idx, _)| idx)
+        .unwrap_or(trimmed.len());
+    let id = &trimmed[..id_end];
+    if !valid_mermaid_id(id) {
+        return None;
+    }
+    let node = MermaidNode {
+        label: id.to_string(),
+        start: tbase,
+        end: tbase + id.chars().count(),
+    };
+    let rest = &trimmed[id_end..];
+    let rest_base = tbase + id.chars().count();
+    Some((id.to_string(), node, rest, rest_base))
+}
+
+/// 解析连接符，返回 (样式, 是否箭头, 标签, 剩余, 剩余偏移)。
+fn parse_mermaid_connector(
+    segment: &str,
+    base: usize,
+) -> Option<(MermaidEdgeStyle, bool, Option<MermaidLabel>, &str, usize)> {
+    let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
+    let segment = segment.trim_start();
+    let base = base + leading;
+    // 完整连接符 token 优先。
+    const TOKENS: &[(&str, MermaidEdgeStyle, bool)] = &[
+        ("-.->", MermaidEdgeStyle::Dashed, true),
+        ("-->", MermaidEdgeStyle::Solid, true),
+        ("==>", MermaidEdgeStyle::Thick, true),
+        ("-.-", MermaidEdgeStyle::Dashed, false),
+        ("---", MermaidEdgeStyle::Solid, false),
+        ("===", MermaidEdgeStyle::Thick, false),
+    ];
+    for (token, style, arrow) in TOKENS {
+        if let Some(rest) = segment.strip_prefix(token) {
+            let rest_base = base + token.chars().count();
+            let (label, rest, rest_base) = parse_mermaid_pipe_label(rest, rest_base)?;
+            return Some((*style, *arrow, label, rest, rest_base));
+        }
+    }
+    // 文本形式：-- text --> / -. text .-> / == text ==>。
+    let style = if let Some(_rest) = segment.strip_prefix("--") {
+        MermaidEdgeStyle::Solid
+    } else if let Some(_rest) = segment.strip_prefix("-.") {
+        MermaidEdgeStyle::Dashed
+    } else if let Some(_rest) = segment.strip_prefix("==") {
+        MermaidEdgeStyle::Thick
+    } else {
+        return None;
+    };
+    let rest = segment[2..].trim_start();
+    let rest_base = base + 2 + segment[2..].len() - rest.len();
+    // 找到闭合 token（文本形式，如 `-- text -->` / `-. text .->`）。
+    const CLOSERS: &[(&str, MermaidEdgeStyle, bool)] = &[
+        ("-->", MermaidEdgeStyle::Solid, true),
+        ("--->", MermaidEdgeStyle::Solid, true),
+        (".->", MermaidEdgeStyle::Dashed, true),
+        ("==>", MermaidEdgeStyle::Thick, true),
+        ("---", MermaidEdgeStyle::Solid, false),
+        ("-.-", MermaidEdgeStyle::Dashed, false),
+        ("===", MermaidEdgeStyle::Thick, false),
+    ];
+    for (closer, cstyle, carrow) in CLOSERS {
+        if let Some(pos) = rest.find(closer) {
+            let raw = rest[..pos].trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if *cstyle != style {
+                continue;
+            }
+            let label = MermaidLabel {
+                text: raw.to_string(),
+                start: rest_base,
+                end: rest_base + raw.chars().count(),
+            };
+            let rest2 = &rest[pos + closer.len()..];
+            let rest2_base = rest_base + rest[..pos + closer.len()].chars().count();
+            return Some((style, *carrow, Some(label), rest2, rest2_base));
+        }
+    }
+    None
+}
+
+/// 解析管道标签 `|text|`，返回 (标签, 剩余, 剩余偏移)。
+fn parse_mermaid_pipe_label<'a>(
+    segment: &'a str,
+    base: usize,
+) -> Option<(Option<MermaidLabel>, &'a str, usize)> {
+    let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
+    let trimmed = segment.trim_start();
+    let tbase = base + leading;
+    if !trimmed.starts_with('|') {
+        return Some((None, trimmed, tbase));
+    }
+    let close = trimmed[1..].find('|')? + 1;
+    let raw = &trimmed[1..close];
+    let lt = raw.trim();
+    if lt.is_empty() {
+        return None;
+    }
+    let lstart = tbase + 1 + raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    let label = MermaidLabel {
+        text: lt.to_string(),
+        start: lstart,
+        end: lstart + lt.chars().count(),
+    };
+    let rest = &trimmed[close + 1..];
+    let rest_base = tbase + trimmed[..close + 1].chars().count();
+    Some((Some(label), rest, rest_base))
 }
 
 fn parse_mermaid_sequence(source: &str) -> Option<MermaidSequence> {
@@ -3772,7 +3927,7 @@ mod tests {
             .join("\n");
         assert!(supported_text.contains("Start"), "{supported_text}");
         assert!(supported_text.contains("Finish"), "{supported_text}");
-        assert!(supported_text.contains('→'), "{supported_text}");
+        assert!(supported_text.contains('▶'), "{supported_text}");
         assert!(!supported_text.contains("╭─ mermaid"), "{supported_text}");
         assert!(supported.validate(), "{supported:?}");
 
@@ -3848,6 +4003,120 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(too_wide_text.contains("╭─ mermaid"), "{too_wide_text}");
+    }
+
+    #[test]
+    fn mermaid_supports_directions_shapes_edge_styles_comments_and_subgraphs() {
+        let source = concat!(
+            "```mermaid\n",
+            // 方向别名 + 注释 + 分号多语句
+            "flowchart BT\n",
+            "%% a comment line\n",
+            "subgraph SG[服务层]\n",
+            "A[开始] --> B[(数据库)]\n",
+            "B --> C((缓存)); C ==> D{{结果}}\n",
+            "end\n",
+            "D --- E[/中间/]\n",
+            "E -.-> F[结束]\n",
+            "```",
+        );
+        let document =
+            render_markdown_document(source, Theme::dark(), MarkdownRenderOptions::new(80));
+        assert!(document.validate(), "{document:?}");
+        let text = document
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("╭─ mermaid"), "{text}");
+        assert!(text.contains("开始"), "{text}");
+        assert!(text.contains("数据库"), "{text}");
+        assert!(text.contains("缓存"), "{text}");
+        assert!(text.contains("结果"), "{text}");
+        assert!(text.contains("中间"), "{text}");
+        assert!(text.contains("结束"), "{text}");
+        // 边样式映射到不同连接字符。
+        assert!(text.contains("─"), "{text}");
+        assert!(text.contains("═"), "{text}");
+        assert!(text.contains("╌"), "{text}");
+    }
+
+    #[test]
+    fn mermaid_parser_accepts_edge_text_and_pipe_labels() {
+        let cases = [
+            ("graph RL\nA -- text --> B\n", "text"),
+            ("graph RL\nC ==>|thick| D\n", "thick"),
+            ("graph RL\nE -. dashed .-> F\n", "dashed"),
+            ("graph RL\nG -- x --> H\n", "x"),
+        ];
+        for (source, expected) in cases {
+            let graph = parse_mermaid(source).unwrap_or_else(|| {
+                panic!("failed to parse: {source:?}");
+            });
+            assert_eq!(graph.edges.len(), 1, "{source:?}");
+            assert_eq!(
+                graph.edges[0].label.as_ref().map(|l| l.text.as_str()),
+                Some(expected),
+                "{source:?}"
+            );
+        }
+        let source = concat!(
+            "graph RL\n",
+            "A -- text --> B\n",
+            "C ==>|thick| D\n",
+            "E -. dashed .-> F\n",
+        );
+        let graph = parse_mermaid(source).expect("parse all edge text");
+        assert_eq!(graph.edges.len(), 3);
+        assert_eq!(graph.edges[1].style, MermaidEdgeStyle::Thick);
+        assert!(graph.edges[1].arrow);
+        assert_eq!(graph.edges[2].style, MermaidEdgeStyle::Dashed);
+        assert!(graph.edges[2].arrow);
+    }
+
+    #[test]
+    fn mermaid_edge_text_labels_and_more_directions_render() {
+        let source = concat!(
+            "```mermaid\n",
+            "graph RL\n",
+            "A -- text --> B\n",
+            "C ==>|thick| D\n",
+            "E -. dashed .-> F\n",
+            "```",
+        );
+        let document =
+            render_markdown_document(source, Theme::dark(), MarkdownRenderOptions::new(80));
+        assert!(document.validate(), "{document:?}");
+        let text = document
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("╭─ mermaid"), "{text}");
+        assert!(text.contains("text"), "{text}");
+        assert!(text.contains("thick"), "{text}");
+        assert!(text.contains("dashed"), "{text}");
+    }
+
+    #[test]
+    fn mermaid_supports_tb_bu_and_lr_aliases() {
+        for (dir, arrow) in [("TB", "↓"), ("TD", "↓"), ("BT", "↑")] {
+            let document = render_markdown_document(
+                &format!("```mermaid\ngraph {dir}\nA[Start] --> B[End]\n```"),
+                Theme::dark(),
+                MarkdownRenderOptions::new(40),
+            );
+            assert!(document.validate(), "{document:?}");
+            let text = document
+                .lines
+                .iter()
+                .map(|line| render_span_text(&line.spans))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(arrow), "{dir}: {text}");
+        }
     }
 
     #[test]
