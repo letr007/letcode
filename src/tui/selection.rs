@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use super::{
     state::TuiState,
-    transcript_render::{CopyJoin, inclusive_grapheme_bounds},
+    transcript_render::{CopyJoin, CopyMode, inclusive_grapheme_bounds},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +14,14 @@ struct SourceSliceKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceSliceAcc {
     key: SourceSliceKey,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AtomicSourceSliceKey {
+    item_index: usize,
+    block_index: usize,
     start: usize,
     end: usize,
 }
@@ -33,6 +43,7 @@ pub fn extract_selected_text(state: &TuiState) -> String {
     let mut result = String::new();
     let mut pending_newlines = 0usize;
     let mut previous: Option<SourceSliceAcc> = None;
+    let mut copied_atomic = HashSet::new();
 
     for item_idx in start.item_index..=end.item_index {
         let mut copied_in_item = false;
@@ -69,14 +80,31 @@ pub fn extract_selected_text(state: &TuiState) -> String {
                 selected_end,
             );
             let mut copied_on_line = false;
-            for (span_start, overlap_start, overlap_end, range, copy_join) in slices {
+            for (span_start, overlap_start, overlap_end, range, copy_mode, copy_join) in slices {
+                let (slice_start, slice_end) = if copy_mode == CopyMode::Atomic {
+                    (range.start, range.end)
+                } else {
+                    (
+                        range.start + overlap_start.saturating_sub(span_start),
+                        range.start + overlap_end.saturating_sub(span_start),
+                    )
+                };
+                let atomic_key = AtomicSourceSliceKey {
+                    item_index: item_idx,
+                    block_index: range.block_index,
+                    start: range.start,
+                    end: range.end,
+                };
+                if copy_mode == CopyMode::Atomic && !copied_atomic.insert(atomic_key) {
+                    continue;
+                }
                 let slice = SourceSliceAcc {
                     key: SourceSliceKey {
                         item_index: item_idx,
                         block_index: range.block_index,
                     },
-                    start: range.start + overlap_start.saturating_sub(span_start),
-                    end: range.start + overlap_end.saturating_sub(span_start),
+                    start: slice_start,
+                    end: slice_end,
                 };
                 if slice.start >= slice.end {
                     continue;
@@ -141,6 +169,7 @@ fn span_ranges_for_selection(
     usize,
     usize,
     crate::tui::transcript_render::SourceRange,
+    CopyMode,
     CopyJoin,
 )> {
     let mut visual_offset = 0usize;
@@ -167,6 +196,7 @@ fn span_ranges_for_selection(
                 span_start + local_start,
                 span_start + local_end,
                 range,
+                span.copy_mode,
                 span.copy_join,
             ))
         })
@@ -272,6 +302,161 @@ mod tests {
         });
 
         assert_eq!(extract_selected_text(&state), "first\nsecond");
+    }
+
+    #[test]
+    fn atomic_source_is_copied_once_across_wrapped_rows() {
+        use crate::tui::{
+            components::transcript::TranscriptRenderCacheEntry,
+            transcript_render::{Break, Document, Line, SourceRange, Span},
+        };
+
+        let mut state = TuiState::default();
+        let mut document = Document::<ratatui::style::Style>::default();
+        let source = "graph TD\nA[Start]\nB[Finish]";
+        let block = document.add_source(source);
+        let source_end = source.chars().count();
+        document.push_line(
+            Line {
+                spans: vec![Span::source_atomic(
+                    "Start",
+                    ratatui::style::Style::default(),
+                    SourceRange::new(block, 0, source_end),
+                )],
+            },
+            Break::HardBreak,
+        );
+        document.push_line(
+            Line {
+                spans: vec![Span::source_atomic(
+                    "Finish",
+                    ratatui::style::Style::default(),
+                    SourceRange::new(block, 0, source_end),
+                )],
+            },
+            Break::End,
+        );
+        state
+            .transcript_render_cache
+            .set_entries_for_test(vec![TranscriptRenderCacheEntry {
+                revision: None,
+                document,
+            }]);
+        state.text_selection = Some(TextSelection {
+            start: SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 0,
+                char_offset: 0,
+            },
+            end: SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 1,
+                char_offset: 6,
+            },
+        });
+
+        assert_eq!(extract_selected_text(&state), source);
+    }
+
+    #[test]
+    fn mixed_text_and_multiple_atomic_sources_copy_in_both_directions() {
+        use crate::tui::{
+            components::transcript::TranscriptRenderCacheEntry,
+            transcript_render::{Break, Document, Line, SourceRange, Span},
+        };
+
+        let mut document = Document::<ratatui::style::Style>::default();
+        let before = document.add_source("before ");
+        let alpha = document.add_source(r"\alpha^2");
+        let between = document.add_source(" and ");
+        let beta = document.add_source(r"\beta");
+        let after = document.add_source(" after");
+        let alpha_end = document.source_blocks[alpha].source.chars().count();
+        let beta_end = document.source_blocks[beta].source.chars().count();
+        document.push_line(
+            Line {
+                spans: vec![
+                    Span::source(
+                        "before ",
+                        ratatui::style::Style::default(),
+                        SourceRange::new(before, 0, 7),
+                    ),
+                    Span::source_atomic(
+                        "α²",
+                        ratatui::style::Style::default(),
+                        SourceRange::new(alpha, 0, alpha_end),
+                    ),
+                    Span::source(
+                        " and ",
+                        ratatui::style::Style::default(),
+                        SourceRange::new(between, 0, 5),
+                    ),
+                    Span::source_atomic(
+                        "β",
+                        ratatui::style::Style::default(),
+                        SourceRange::new(beta, 0, beta_end),
+                    ),
+                    Span::source(
+                        " after",
+                        ratatui::style::Style::default(),
+                        SourceRange::new(after, 0, 6),
+                    ),
+                ],
+            },
+            Break::End,
+        );
+        assert!(document.validate());
+        let line_end = document.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.chars().count())
+            .sum();
+        let expected = r"before \alpha^2 and \beta after";
+
+        for (start, end) in [(0, line_end), (line_end, 0)] {
+            let mut state = TuiState::default();
+            state
+                .transcript_render_cache
+                .set_entries_for_test(vec![TranscriptRenderCacheEntry {
+                    revision: None,
+                    document: document.clone(),
+                }]);
+            state.text_selection = Some(TextSelection {
+                start: SelectionAnchor {
+                    item_index: 0,
+                    rendered_line_offset: 0,
+                    char_offset: start,
+                },
+                end: SelectionAnchor {
+                    item_index: 0,
+                    rendered_line_offset: 0,
+                    char_offset: end,
+                },
+            });
+
+            assert_eq!(extract_selected_text(&state), expected);
+        }
+
+        let mut state = TuiState::default();
+        state
+            .transcript_render_cache
+            .set_entries_for_test(vec![TranscriptRenderCacheEntry {
+                revision: None,
+                document,
+            }]);
+        state.text_selection = Some(TextSelection {
+            start: SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 0,
+                char_offset: 7,
+            },
+            end: SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 0,
+                char_offset: 7,
+            },
+        });
+        assert_eq!(extract_selected_text(&state), r"\alpha^2");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
 };
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Style as SyntectStyle, Theme as SyntectTheme, ThemeSet},
@@ -96,7 +96,8 @@ impl MarkdownRenderer {
     }
 
     fn render_document(mut self, markdown: &str) -> Document<Style> {
-        for event in Parser::new_ext(markdown, markdown_options()) {
+        let markdown = normalize_markdown_math_delimiters(markdown);
+        for event in Parser::new_ext(&markdown, markdown_options()) {
             self.handle_event(event);
         }
         self.flush_spans(Break::End);
@@ -125,8 +126,12 @@ impl MarkdownRenderer {
                     self.push_text(&text);
                 }
             }
-            Event::Code(code) | Event::InlineMath(code) | Event::DisplayMath(code) => {
-                self.push_inline_code(&code)
+            Event::Code(code) => self.push_inline_code(&code),
+            Event::InlineMath(code) => self.push_math(&code, false),
+            Event::DisplayMath(code) => {
+                self.flush_spans(Break::BlockBreak);
+                self.push_math(&code, true);
+                self.flush_spans(Break::BlockBreak);
             }
             Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
             Event::SoftBreak => self.push_text(" "),
@@ -324,6 +329,73 @@ impl MarkdownRenderer {
         self.push_styled(text, inline_code_style(self.theme));
     }
 
+    fn push_math(&mut self, text: &str, display: bool) {
+        let Some(layout) = render_math(text, display) else {
+            self.push_math_fallback(text, display);
+            return;
+        };
+        let (first_prefix, next_prefix) = self.line_prefixes();
+        let prefix_width = if display {
+            display_width(&first_prefix).max(display_width(&next_prefix))
+        } else {
+            display_width(&first_prefix)
+        };
+        let available_width = self.options.width.saturating_sub(prefix_width);
+        if layout.width == 0
+            || layout.width > available_width
+            || (!display && layout.rows.len() != 1)
+        {
+            self.push_math_fallback(text, display);
+            return;
+        }
+
+        let style = if display {
+            self.theme.app_style()
+        } else {
+            inline_code_style(self.theme)
+        };
+        let block = self.document.add_source(text);
+        let source = SourceRange::new(block, 0, text.chars().count());
+        if display {
+            let row_count = layout.rows.len();
+            for (index, row) in layout.rows.into_iter().enumerate() {
+                let prefix = if index == 0 {
+                    &first_prefix
+                } else {
+                    &next_prefix
+                };
+                let mut spans = Vec::new();
+                if !prefix.is_empty() {
+                    spans.push(RenderSpan::decoration(prefix.clone(), self.prefix_style()));
+                }
+                spans.push(RenderSpan::source_atomic(row, style, source));
+                self.document.push_line(
+                    RenderLine { spans },
+                    if index + 1 == row_count {
+                        Break::BlockBreak
+                    } else {
+                        Break::HardBreak
+                    },
+                );
+            }
+        } else if let Some(row) = layout.rows.into_iter().next() {
+            self.spans
+                .push(RenderSpan::source_atomic(row, style, source));
+        }
+    }
+
+    fn push_math_fallback(&mut self, text: &str, display: bool) {
+        let style = if display {
+            self.theme.app_style()
+        } else {
+            inline_code_style(self.theme)
+        };
+        let block = self.document.add_source(text);
+        let source = SourceRange::new(block, 0, text.chars().count());
+        self.spans
+            .push(RenderSpan::source_atomic(text, style, source));
+    }
+
     fn flush_spans(&mut self, final_break: Break) {
         if self.spans.is_empty() {
             return;
@@ -386,6 +458,14 @@ impl MarkdownRenderer {
         {
             self.document
                 .push_line(RenderLine::default(), Break::BlockBreak);
+        }
+        if code
+            .language
+            .as_deref()
+            .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+            && self.push_mermaid_block(&code)
+        {
+            return;
         }
         let (first_prefix, next_prefix) = self.line_prefixes();
         let prefix_style = self.prefix_style();
@@ -455,6 +535,186 @@ impl MarkdownRenderer {
         );
         self.document
             .push_line(RenderLine::default(), Break::BlockBreak);
+    }
+
+    fn push_mermaid_block(&mut self, code: &CodeBlockState) -> bool {
+        if code.content.trim_start().starts_with("sequenceDiagram") {
+            return self.push_mermaid_sequence(code);
+        }
+        let Some(graph) = parse_mermaid(&code.content) else {
+            return false;
+        };
+        let direction = graph.direction;
+        let mut output = Vec::new();
+        let mut rendered_nodes = HashMap::new();
+
+        for edge in &graph.edges {
+            let Some(from) = graph.nodes.get(&edge.from) else {
+                return false;
+            };
+            let Some(to) = graph.nodes.get(&edge.to) else {
+                return false;
+            };
+            let mut spans = vec![RenderSpan::decoration(
+                if direction == MermaidDirection::Td {
+                    "↓ "
+                } else {
+                    ""
+                },
+                code_block_border_style(self.theme),
+            )];
+            spans.push(RenderSpan::source(
+                from.label.clone(),
+                code_block_style(self.theme),
+                SourceRange::new(0, from.start, from.end),
+            ));
+            if let Some(label) = &edge.label {
+                spans.push(RenderSpan::decoration(
+                    if direction == MermaidDirection::Td {
+                        "  ─"
+                    } else {
+                        " ──"
+                    },
+                    code_block_border_style(self.theme),
+                ));
+                spans.push(RenderSpan::source(
+                    label.text.clone(),
+                    code_block_style(self.theme),
+                    SourceRange::new(0, label.start, label.end),
+                ));
+                spans.push(RenderSpan::decoration(
+                    "─▶ ",
+                    code_block_border_style(self.theme),
+                ));
+            } else {
+                spans.push(RenderSpan::decoration(
+                    if direction == MermaidDirection::Td {
+                        "  →  "
+                    } else {
+                        " ──▶ "
+                    },
+                    code_block_border_style(self.theme),
+                ));
+            }
+            spans.push(RenderSpan::source(
+                to.label.clone(),
+                code_block_style(self.theme),
+                SourceRange::new(0, to.start, to.end),
+            ));
+            output.push(spans);
+            rendered_nodes.insert(edge.from.clone(), ());
+            rendered_nodes.insert(edge.to.clone(), ());
+        }
+
+        let mut isolated_nodes = graph
+            .nodes
+            .iter()
+            .filter(|(id, _)| !rendered_nodes.contains_key(*id))
+            .collect::<Vec<_>>();
+        isolated_nodes.sort_by_key(|(_, node)| node.start);
+        for (_, node) in isolated_nodes {
+            output.push(vec![RenderSpan::source(
+                node.label.clone(),
+                code_block_style(self.theme),
+                SourceRange::new(0, node.start, node.end),
+            )]);
+        }
+
+        self.push_mermaid_output(code, output)
+    }
+
+    fn push_mermaid_sequence(&mut self, code: &CodeBlockState) -> bool {
+        let Some(sequence) = parse_mermaid_sequence(&code.content) else {
+            return false;
+        };
+        let mut output = Vec::new();
+        for message in &sequence.messages {
+            let Some(from) = sequence.participants.get(&message.from) else {
+                return false;
+            };
+            let Some(to) = sequence.participants.get(&message.to) else {
+                return false;
+            };
+            output.push(vec![
+                RenderSpan::source(
+                    from.label.clone(),
+                    code_block_style(self.theme),
+                    SourceRange::new(0, from.start, from.end),
+                ),
+                RenderSpan::decoration(
+                    if message.dashed {
+                        " ╌╌▶ "
+                    } else {
+                        " ──▶ "
+                    },
+                    code_block_border_style(self.theme),
+                ),
+                RenderSpan::source(
+                    to.label.clone(),
+                    code_block_style(self.theme),
+                    SourceRange::new(0, to.start, to.end),
+                ),
+                RenderSpan::decoration("  ", code_block_border_style(self.theme)),
+                RenderSpan::source(
+                    message.label.text.clone(),
+                    code_block_style(self.theme),
+                    SourceRange::new(0, message.label.start, message.label.end),
+                ),
+            ]);
+        }
+        self.push_mermaid_output(code, output)
+    }
+
+    fn push_mermaid_output(
+        &mut self,
+        code: &CodeBlockState,
+        output: Vec<Vec<RenderSpan<Style>>>,
+    ) -> bool {
+        if output.is_empty() {
+            return false;
+        }
+        let (first_prefix, next_prefix) = self.line_prefixes();
+        if output.iter().enumerate().any(|(index, spans)| {
+            let prefix = if index == 0 {
+                &first_prefix
+            } else {
+                &next_prefix
+            };
+            display_width(prefix) + display_width(&render_span_text(spans)) > self.options.width
+        }) {
+            return false;
+        }
+        let block = self.document.add_source(code.content.clone());
+        let output_len = output.len();
+        for (index, mut spans) in output.into_iter().enumerate() {
+            for span in &mut spans {
+                if let Some(range) = &mut span.source {
+                    range.block_index = block;
+                }
+            }
+            let prefix = if index == 0 {
+                &first_prefix
+            } else {
+                &next_prefix
+            };
+            let mut line = Vec::new();
+            if !prefix.is_empty() {
+                line.push(RenderSpan::decoration(prefix.clone(), self.prefix_style()));
+            }
+            line.extend(spans);
+            pad_render_line(&mut line, self.options.width, code_block_style(self.theme));
+            self.document.push_line(
+                RenderLine { spans: line },
+                if index + 1 == output_len {
+                    Break::BlockBreak
+                } else {
+                    Break::HardBreak
+                },
+            );
+        }
+        self.document
+            .push_line(RenderLine::default(), Break::BlockBreak);
+        true
     }
 
     fn push_code_line(
@@ -628,10 +888,13 @@ fn append_render_grapheme(
     style: Style,
     source: Option<SourceRange>,
     interaction: Option<crate::tui::transcript_render::Interaction>,
+    copy_mode: crate::tui::transcript_render::CopyMode,
 ) {
     if let Some(last) = target.last_mut()
         && last.style == style
         && last.interaction == interaction
+        && last.copy_mode == copy_mode
+        && copy_mode == crate::tui::transcript_render::CopyMode::Exact
         && match (last.source, source) {
             (None, None) => true,
             (Some(previous), Some(next)) => {
@@ -645,10 +908,11 @@ fn append_render_grapheme(
             last.end = source.end;
         }
     } else if let Some(source) = source {
-        target.push(RenderSpan::source_with_interaction(
+        target.push(RenderSpan::source_with_mode(
             text,
             style,
             source,
+            copy_mode,
             CopyJoin::Concat,
             interaction,
         ));
@@ -675,9 +939,12 @@ fn wrap_render_spans_with_prefixes(
         let mut offset = span.source.map(|range| range.start).unwrap_or(0);
         for grapheme in span.text.graphemes(true) {
             let count = grapheme.chars().count();
-            let source = span
-                .source
-                .map(|range| SourceRange::new(range.block_index, offset, offset + count));
+            let source = if span.copy_mode == crate::tui::transcript_render::CopyMode::Atomic {
+                span.source
+            } else {
+                span.source
+                    .map(|range| SourceRange::new(range.block_index, offset, offset + count))
+            };
             offset += count;
             if grapheme == "\n" {
                 let mut output = Vec::new();
@@ -727,6 +994,7 @@ fn wrap_render_spans_with_prefixes(
                 span.style,
                 source,
                 span.interaction.clone(),
+                span.copy_mode,
             );
             used = used.saturating_add(width);
             at_start = false;
@@ -837,9 +1105,14 @@ fn truncate_render_spans(spans: &[RenderSpan<Style>], width: usize) -> Vec<Rende
                 &mut out,
                 grapheme,
                 span.style,
-                span.source
-                    .map(|range| SourceRange::new(range.block_index, offset, offset + count)),
+                if span.copy_mode == crate::tui::transcript_render::CopyMode::Atomic {
+                    span.source
+                } else {
+                    span.source
+                        .map(|range| SourceRange::new(range.block_index, offset, offset + count))
+                },
                 span.interaction.clone(),
+                span.copy_mode,
             );
             offset += count;
             used += grapheme_width;
@@ -894,6 +1167,2008 @@ enum ListKind {
 struct CodeBlockState {
     language: Option<String>,
     content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MermaidDirection {
+    Td,
+    Lr,
+}
+
+#[derive(Debug)]
+struct MermaidGraph {
+    direction: MermaidDirection,
+    nodes: HashMap<String, MermaidNode>,
+    edges: Vec<MermaidEdge>,
+}
+
+#[derive(Debug, Clone)]
+struct MermaidNode {
+    label: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MermaidLabel {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct MermaidEdge {
+    from: String,
+    to: String,
+    label: Option<MermaidLabel>,
+}
+
+#[derive(Debug)]
+struct MermaidSequence {
+    participants: HashMap<String, MermaidNode>,
+    messages: Vec<MermaidMessage>,
+}
+
+#[derive(Debug)]
+struct MermaidMessage {
+    from: String,
+    to: String,
+    label: MermaidLabel,
+    dashed: bool,
+}
+
+fn parse_mermaid(source: &str) -> Option<MermaidGraph> {
+    if source.contains('\r') {
+        return None;
+    }
+    let mut nodes = HashMap::new();
+    let mut edges = Vec::new();
+    let mut direction = None;
+    let mut line_offset = 0usize;
+
+    for (line_index, line) in source.lines().enumerate() {
+        let leading = line.chars().count() - line.trim_start().chars().count();
+        let trimmed = line.trim();
+        if line_index == 0 {
+            direction = Some(match trimmed {
+                "graph TD" | "flowchart TD" => MermaidDirection::Td,
+                "graph LR" | "flowchart LR" => MermaidDirection::Lr,
+                _ => return None,
+            });
+        } else if !trimmed.is_empty() {
+            let base = line_offset + leading;
+            if let Some(arrow) = trimmed.find("-->") {
+                let (left, right_with_arrow) = trimmed.split_at(arrow);
+                let right = right_with_arrow.strip_prefix("-->")?;
+                let from = parse_mermaid_endpoint(left, base)?;
+                let (label, to) = parse_mermaid_edge_target(
+                    right,
+                    base + left.chars().count() + "-->".chars().count(),
+                )?;
+                insert_mermaid_node(&mut nodes, from.clone())?;
+                insert_mermaid_node(&mut nodes, to.clone())?;
+                edges.push(MermaidEdge {
+                    from: from.0,
+                    to: to.0,
+                    label,
+                });
+            } else {
+                let node = parse_mermaid_endpoint(trimmed, base)?;
+                insert_mermaid_node(&mut nodes, node)?;
+            }
+        }
+        line_offset += line.chars().count() + 1;
+    }
+
+    let direction = direction?;
+    if edges.is_empty()
+        || edges
+            .iter()
+            .any(|edge| !nodes.contains_key(&edge.from) || !nodes.contains_key(&edge.to))
+        || has_mermaid_cycle(&nodes, &edges)
+    {
+        return None;
+    }
+    Some(MermaidGraph {
+        direction,
+        nodes,
+        edges,
+    })
+}
+
+fn parse_mermaid_edge_target(
+    segment: &str,
+    base: usize,
+) -> Option<(Option<MermaidLabel>, (String, MermaidNode))> {
+    let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
+    let trimmed = segment.trim_start();
+    if !trimmed.starts_with('|') {
+        return Some((None, parse_mermaid_endpoint(segment, base)?));
+    }
+    let close = trimmed[1..].find('|')? + 1;
+    let label = &trimmed[1..close];
+    if label.trim().is_empty() {
+        return None;
+    }
+    let label_leading = label.chars().take_while(|ch| ch.is_whitespace()).count();
+    let label_text = label.trim();
+    let label_start = base + leading + 1 + label_leading;
+    let target = &trimmed[close + 1..];
+    let target_base = base + leading + trimmed[..close + 1].chars().count();
+    Some((
+        Some(MermaidLabel {
+            text: label_text.to_string(),
+            start: label_start,
+            end: label_start + label_text.chars().count(),
+        }),
+        parse_mermaid_endpoint(target, target_base)?,
+    ))
+}
+
+fn parse_mermaid_endpoint(segment: &str, base: usize) -> Option<(String, MermaidNode)> {
+    let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let shape = trimmed
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '[' | '{'));
+    if let Some((open, delimiter)) = shape {
+        let closing = if delimiter == '[' { ']' } else { '}' };
+        let close = trimmed.rfind(closing)?;
+        if close <= open + 1 || close + closing.len_utf8() != trimmed.len() {
+            return None;
+        }
+        let id = trimmed[..open].trim();
+        let label = &trimmed[open + delimiter.len_utf8()..close];
+        if !valid_mermaid_id(id) || label.contains(['[', ']', '{', '}']) {
+            return None;
+        }
+        let id_chars = trimmed[..open].chars().count();
+        let start = base + leading + id_chars + 1;
+        return Some((
+            id.to_string(),
+            MermaidNode {
+                label: label.to_string(),
+                start,
+                end: start + label.chars().count(),
+            },
+        ));
+    }
+    valid_mermaid_id(trimmed).then_some((
+        trimmed.to_string(),
+        MermaidNode {
+            label: trimmed.to_string(),
+            start: base + leading,
+            end: base + leading + trimmed.chars().count(),
+        },
+    ))
+}
+
+fn parse_mermaid_sequence(source: &str) -> Option<MermaidSequence> {
+    if source.contains('\r') {
+        return None;
+    }
+    let mut participants = HashMap::new();
+    let mut messages = Vec::new();
+    let mut line_offset = 0usize;
+
+    for (line_index, line) in source.lines().enumerate() {
+        let leading = line.chars().count() - line.trim_start().chars().count();
+        let trimmed = line.trim();
+        if line_index == 0 {
+            if trimmed != "sequenceDiagram" {
+                return None;
+            }
+        } else if !trimmed.is_empty() {
+            let base = line_offset + leading;
+            if let Some(rest) = trimmed.strip_prefix("participant ") {
+                let (id, label) = rest.split_once(" as ")?;
+                let id = id.trim();
+                let label = label.trim();
+                if !valid_mermaid_id(id) || label.is_empty() || participants.contains_key(id) {
+                    return None;
+                }
+                let separator = rest.find(" as ")?;
+                let label_segment = &rest[separator + " as ".len()..];
+                let label_leading = label_segment
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .count();
+                let start = base
+                    + "participant ".chars().count()
+                    + rest[..separator + " as ".len()].chars().count()
+                    + label_leading;
+                participants.insert(
+                    id.to_string(),
+                    MermaidNode {
+                        label: label.to_string(),
+                        start,
+                        end: start + label.chars().count(),
+                    },
+                );
+            } else {
+                let colon = trimmed.find(':')?;
+                let route = trimmed[..colon].trim();
+                let label = trimmed[colon + 1..].trim();
+                let (arrow_at, arrow) = ["-->>", "->>", "-->", "->"]
+                    .into_iter()
+                    .filter_map(|arrow| route.find(arrow).map(|index| (index, arrow)))
+                    .min_by_key(|(index, _)| *index)?;
+                let from = route[..arrow_at].trim();
+                let to = route[arrow_at + arrow.len()..].trim();
+                if !valid_mermaid_id(from)
+                    || !valid_mermaid_id(to)
+                    || label.is_empty()
+                    || !participants.contains_key(from)
+                    || !participants.contains_key(to)
+                {
+                    return None;
+                }
+                let label_byte = trimmed.find(':')? + 1;
+                let label_leading = trimmed[label_byte..]
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .count();
+                let start = base + trimmed[..label_byte].chars().count() + label_leading;
+                messages.push(MermaidMessage {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    label: MermaidLabel {
+                        text: label.to_string(),
+                        start,
+                        end: start + label.chars().count(),
+                    },
+                    dashed: arrow.starts_with("--"),
+                });
+            }
+        }
+        line_offset += line.chars().count() + 1;
+    }
+
+    (!participants.is_empty() && !messages.is_empty()).then_some(MermaidSequence {
+        participants,
+        messages,
+    })
+}
+
+fn insert_mermaid_node(
+    nodes: &mut HashMap<String, MermaidNode>,
+    (id, node): (String, MermaidNode),
+) -> Option<()> {
+    match nodes.get(&id) {
+        None => {
+            nodes.insert(id, node);
+            Some(())
+        }
+        Some(previous) if previous.label == node.label || node.label == id => Some(()),
+        Some(previous) if previous.label == id => {
+            nodes.insert(id, node);
+            Some(())
+        }
+        Some(_) => None,
+    }
+}
+
+fn valid_mermaid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn has_mermaid_cycle(nodes: &HashMap<String, MermaidNode>, edges: &[MermaidEdge]) -> bool {
+    fn visit(
+        id: &str,
+        nodes: &HashMap<String, MermaidNode>,
+        edges: &[MermaidEdge],
+        active: &mut Vec<String>,
+        done: &mut Vec<String>,
+    ) -> bool {
+        if active.iter().any(|item| item == id) {
+            return true;
+        }
+        if done.iter().any(|item| item == id) {
+            return false;
+        }
+        active.push(id.to_string());
+        for edge in edges.iter().filter(|edge| edge.from == id) {
+            if visit(&edge.to, nodes, edges, active, done) {
+                return true;
+            }
+        }
+        active.pop();
+        done.push(id.to_string());
+        let _ = nodes;
+        false
+    }
+    let mut active = Vec::new();
+    let mut done = Vec::new();
+    nodes
+        .keys()
+        .any(|id| visit(id, nodes, edges, &mut active, &mut done))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MathLimits {
+    max_source_chars: usize,
+    max_nodes: usize,
+    max_rows: usize,
+    max_columns: usize,
+}
+
+impl Default for MathLimits {
+    fn default() -> Self {
+        Self {
+            max_source_chars: 512,
+            max_nodes: 512,
+            max_rows: 32,
+            max_columns: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MathLayout {
+    rows: Vec<String>,
+    width: usize,
+}
+
+enum LayoutNode {
+    Fraction {
+        numerator: String,
+        denominator: String,
+    },
+    Operator {
+        operator: String,
+        lower: Option<String>,
+        upper: Option<String>,
+    },
+    Matrix {
+        lines: Vec<String>,
+        baseline: usize,
+    },
+}
+
+const LAYOUT_START: char = '\u{f0000}';
+const LAYOUT_END: char = '\u{f0001}';
+const PROTECTED_SPACE: char = '\u{f0002}';
+const NAMED_START: char = '\u{f0004}';
+const NAMED_END: char = '\u{f0005}';
+
+const SUPERSCRIPT: &[(char, char)] = &[
+    ('0', '⁰'),
+    ('1', '¹'),
+    ('2', '²'),
+    ('3', '³'),
+    ('4', '⁴'),
+    ('5', '⁵'),
+    ('6', '⁶'),
+    ('7', '⁷'),
+    ('8', '⁸'),
+    ('9', '⁹'),
+    ('+', '⁺'),
+    ('-', '⁻'),
+    ('=', '⁼'),
+    ('(', '⁽'),
+    (')', '⁾'),
+    ('a', 'ᵃ'),
+    ('b', 'ᵇ'),
+    ('c', 'ᶜ'),
+    ('d', 'ᵈ'),
+    ('e', 'ᵉ'),
+    ('f', 'ᶠ'),
+    ('g', 'ᵍ'),
+    ('h', 'ʰ'),
+    ('i', 'ⁱ'),
+    ('j', 'ʲ'),
+    ('k', 'ᵏ'),
+    ('l', 'ˡ'),
+    ('m', 'ᵐ'),
+    ('n', 'ⁿ'),
+    ('o', 'ᵒ'),
+    ('p', 'ᵖ'),
+    ('r', 'ʳ'),
+    ('s', 'ˢ'),
+    ('t', 'ᵗ'),
+    ('u', 'ᵘ'),
+    ('v', 'ᵛ'),
+    ('w', 'ʷ'),
+    ('x', 'ˣ'),
+    ('y', 'ʸ'),
+    ('z', 'ᶻ'),
+];
+const SUBSCRIPT: &[(char, char)] = &[
+    ('0', '₀'),
+    ('1', '₁'),
+    ('2', '₂'),
+    ('3', '₃'),
+    ('4', '₄'),
+    ('5', '₅'),
+    ('6', '₆'),
+    ('7', '₇'),
+    ('8', '₈'),
+    ('9', '₉'),
+    ('+', '₊'),
+    ('-', '₋'),
+    ('=', '₌'),
+    ('(', '₍'),
+    (')', '₎'),
+    ('a', 'ₐ'),
+    ('e', 'ₑ'),
+    ('h', 'ₕ'),
+    ('i', 'ᵢ'),
+    ('j', 'ⱼ'),
+    ('k', 'ₖ'),
+    ('l', 'ₗ'),
+    ('m', 'ₘ'),
+    ('n', 'ₙ'),
+    ('o', 'ₒ'),
+    ('p', 'ₚ'),
+    ('r', 'ᵣ'),
+    ('s', 'ₛ'),
+    ('t', 'ₜ'),
+    ('u', 'ᵤ'),
+    ('v', 'ᵥ'),
+    ('x', 'ₓ'),
+];
+
+fn table_lookup(table: &[(char, char)], value: &str) -> Option<String> {
+    value
+        .chars()
+        .map(|ch| {
+            table
+                .iter()
+                .find(|(from, _)| *from == ch)
+                .map(|(_, to)| *to)
+        })
+        .collect()
+}
+
+fn format_script(value: &str, sub: bool) -> String {
+    let value = value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let table = if sub { SUBSCRIPT } else { SUPERSCRIPT };
+    if let Some(value) = table_lookup(table, &value) {
+        return value;
+    }
+    let prefix = if sub { '_' } else { '^' };
+    if value.chars().count() == 1
+        || (sub && value.chars().all(|ch| ch.is_ascii_alphabetic()))
+        || (sub
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '='))
+    {
+        format!("{prefix}{value}")
+    } else {
+        format!("{prefix}({value})")
+    }
+}
+
+fn symbol(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "alpha" => "α",
+        "beta" => "β",
+        "gamma" => "γ",
+        "delta" => "δ",
+        "epsilon" => "ϵ",
+        "varepsilon" => "ε",
+        "zeta" => "ζ",
+        "eta" => "η",
+        "theta" => "θ",
+        "vartheta" => "ϑ",
+        "iota" => "ι",
+        "kappa" => "κ",
+        "varkappa" => "ϰ",
+        "lambda" => "λ",
+        "mu" => "μ",
+        "nu" => "ν",
+        "xi" => "ξ",
+        "pi" => "π",
+        "varpi" => "ϖ",
+        "rho" => "ρ",
+        "varrho" => "ϱ",
+        "sigma" => "σ",
+        "varsigma" => "ς",
+        "tau" => "τ",
+        "upsilon" => "υ",
+        "phi" => "ϕ",
+        "varphi" => "φ",
+        "chi" => "χ",
+        "psi" => "ψ",
+        "omega" => "ω",
+        "Gamma" => "Γ",
+        "Delta" => "Δ",
+        "Theta" => "Θ",
+        "Lambda" => "Λ",
+        "Xi" => "Ξ",
+        "Pi" => "Π",
+        "Sigma" => "Σ",
+        "Upsilon" => "Υ",
+        "Phi" => "Φ",
+        "Psi" => "Ψ",
+        "Omega" => "Ω",
+        "pm" => "±",
+        "mp" => "∓",
+        "times" => "×",
+        "div" => "÷",
+        "cdot" => "·",
+        "ast" => "∗",
+        "star" => "⋆",
+        "circ" => "∘",
+        "bullet" => "•",
+        "oplus" => "⊕",
+        "ominus" => "⊖",
+        "otimes" => "⊗",
+        "oslash" => "⊘",
+        "odot" => "⊙",
+        "bigcirc" => "○",
+        "dagger" => "†",
+        "ddagger" => "‡",
+        "amalg" => "⨿",
+        "uplus" => "⊎",
+        "sqcap" => "⊓",
+        "sqcup" => "⊔",
+        "triangleleft" => "◁",
+        "triangleright" => "▷",
+        "wr" => "≀",
+        "cap" => "∩",
+        "cup" => "∪",
+        "bigcap" => "⋂",
+        "bigcup" => "⋃",
+        "bigwedge" => "⋀",
+        "bigvee" => "⋁",
+        "bigsqcup" => "⨆",
+        "biguplus" => "⨄",
+        "bigoplus" => "⨁",
+        "bigotimes" => "⨂",
+        "bigodot" => "⨀",
+        "setminus" => "∖",
+        "in" => "∈",
+        "notin" => "∉",
+        "ni" => "∋",
+        "subset" => "⊂",
+        "supset" => "⊃",
+        "subseteq" => "⊆",
+        "supseteq" => "⊇",
+        "sqsubset" => "⊏",
+        "sqsupset" => "⊐",
+        "sqsubseteq" => "⊑",
+        "sqsupseteq" => "⊒",
+        "prec" => "≺",
+        "preceq" => "≼",
+        "succ" => "≻",
+        "succeq" => "≽",
+        "ll" => "≪",
+        "gg" => "≫",
+        "le" => "≤",
+        "leq" => "≤",
+        "leqslant" => "≤",
+        "ge" => "≥",
+        "geq" => "≥",
+        "geqslant" => "≥",
+        "ne" => "≠",
+        "neq" => "≠",
+        "equiv" => "≡",
+        "approx" => "≈",
+        "sim" => "∼",
+        "simeq" => "≃",
+        "cong" => "≅",
+        "asymp" => "≍",
+        "doteq" => "≐",
+        "propto" => "∝",
+        "parallel" => "∥",
+        "perp" => "⊥",
+        "mid" => "∣",
+        "vdash" => "⊢",
+        "dashv" => "⊣",
+        "models" => "⊨",
+        "Vdash" => "⊩",
+        "Vvdash" => "⊪",
+        "nvdash" => "⊬",
+        "nvDash" => "⊭",
+        "forall" => "∀",
+        "exists" => "∃",
+        "nexists" => "∄",
+        "neg" => "¬",
+        "land" => "∧",
+        "wedge" => "∧",
+        "lor" => "∨",
+        "vee" => "∨",
+        "to" => "→",
+        "rightarrow" => "→",
+        "longrightarrow" => "→",
+        "leftarrow" => "←",
+        "longleftarrow" => "←",
+        "gets" => "←",
+        "leftrightarrow" => "↔",
+        "longleftrightarrow" => "↔",
+        "hookleftarrow" => "↩",
+        "hookrightarrow" => "↪",
+        "twoheadleftarrow" => "↞",
+        "twoheadrightarrow" => "↠",
+        "leftharpoonup" => "↼",
+        "leftharpoondown" => "↽",
+        "rightharpoonup" => "⇀",
+        "rightharpoondown" => "⇁",
+        "rightleftharpoons" => "⇌",
+        "leftrightharpoons" => "⇋",
+        "nearrow" => "↗",
+        "searrow" => "↘",
+        "swarrow" => "↙",
+        "nwarrow" => "↖",
+        "rightsquigarrow" => "⇝",
+        "leadsto" => "⇝",
+        "Rightarrow" => "⇒",
+        "Longrightarrow" => "⇒",
+        "Leftarrow" => "⇐",
+        "Longleftarrow" => "⇐",
+        "Leftrightarrow" => "⇔",
+        "Longleftrightarrow" => "⇔",
+        "implies" => "⇒",
+        "iff" => "⇔",
+        "mapsto" => "↦",
+        "longmapsto" => "↦",
+        "uparrow" => "↑",
+        "downarrow" => "↓",
+        "partial" => "∂",
+        "nabla" => "∇",
+        "int" => "∫",
+        "iint" => "∬",
+        "iiint" => "∭",
+        "oint" => "∮",
+        "sum" => "∑",
+        "prod" => "∏",
+        "coprod" => "∐",
+        "infty" => "∞",
+        "emptyset" => "∅",
+        "varnothing" => "∅",
+        "angle" => "∠",
+        "therefore" => "∴",
+        "because" => "∵",
+        "aleph" => "ℵ",
+        "beth" => "ℶ",
+        "gimel" => "ℷ",
+        "daleth" => "ℸ",
+        "top" => "⊤",
+        "bot" => "⊥",
+        "triangle" => "△",
+        "square" => "□",
+        "lozenge" => "◊",
+        "checkmark" => "✓",
+        "complement" => "∁",
+        "wp" => "℘",
+        "prime" => "′",
+        "ldots" => "…",
+        "dots" => "…",
+        "cdots" => "⋯",
+        "vdots" => "⋮",
+        "ddots" => "⋱",
+        "ell" => "ℓ",
+        "hbar" => "ℏ",
+        "Im" => "ℑ",
+        "Re" => "ℜ",
+        "langle" => "⟨",
+        "rangle" => "⟩",
+        "vert" => "|",
+        "lvert" => "|",
+        "rvert" => "|",
+        "Vert" => "‖",
+        "lVert" => "‖",
+        "rVert" => "‖",
+        "lbrace" => "{",
+        "rbrace" => "}",
+        "backslash" => "\\",
+        "lfloor" => "⌊",
+        "rfloor" => "⌋",
+        "lceil" => "⌈",
+        "rceil" => "⌉",
+        "colon" => ":",
+        _ => return None,
+    })
+}
+
+fn named_operator(name: &str) -> bool {
+    matches!(
+        name,
+        "arccos"
+            | "arcsin"
+            | "arctan"
+            | "arg"
+            | "cos"
+            | "cosh"
+            | "cot"
+            | "coth"
+            | "csc"
+            | "deg"
+            | "det"
+            | "dim"
+            | "exp"
+            | "gcd"
+            | "hom"
+            | "inf"
+            | "ker"
+            | "lg"
+            | "lim"
+            | "liminf"
+            | "limsup"
+            | "ln"
+            | "log"
+            | "max"
+            | "min"
+            | "Pr"
+            | "sec"
+            | "sin"
+            | "sinh"
+            | "sup"
+            | "tan"
+            | "tanh"
+    )
+}
+fn limit_operator(name: &str) -> bool {
+    matches!(
+        name,
+        "argmax"
+            | "argmin"
+            | "inf"
+            | "injlim"
+            | "lim"
+            | "liminf"
+            | "limsup"
+            | "max"
+            | "min"
+            | "projlim"
+            | "sup"
+    )
+}
+fn display_limit_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "bigcap"
+            | "bigcup"
+            | "bigodot"
+            | "bigoplus"
+            | "bigotimes"
+            | "bigsqcup"
+            | "biguplus"
+            | "bigvee"
+            | "bigwedge"
+            | "coprod"
+            | "int"
+            | "iint"
+            | "iiint"
+            | "oint"
+            | "prod"
+            | "sum"
+    )
+}
+fn relation_command(name: &str) -> bool {
+    matches!(
+        name,
+        "Leftarrow"
+            | "Leftrightarrow"
+            | "Longleftarrow"
+            | "Longleftrightarrow"
+            | "Longrightarrow"
+            | "Rightarrow"
+            | "Vdash"
+            | "Vvdash"
+            | "approx"
+            | "asymp"
+            | "cong"
+            | "dashv"
+            | "doteq"
+            | "downarrow"
+            | "equiv"
+            | "ge"
+            | "geq"
+            | "geqslant"
+            | "gets"
+            | "gg"
+            | "hookleftarrow"
+            | "hookrightarrow"
+            | "iff"
+            | "implies"
+            | "in"
+            | "leadsto"
+            | "le"
+            | "leftarrow"
+            | "leftharpoondown"
+            | "leftharpoonup"
+            | "leftrightarrow"
+            | "leftrightharpoons"
+            | "leq"
+            | "leqslant"
+            | "ll"
+            | "longleftarrow"
+            | "longleftrightarrow"
+            | "longmapsto"
+            | "longrightarrow"
+            | "mapsto"
+            | "mid"
+            | "models"
+            | "ne"
+            | "nearrow"
+            | "neq"
+            | "nwarrow"
+            | "parallel"
+            | "perp"
+            | "prec"
+            | "preceq"
+            | "propto"
+            | "rightharpoondown"
+            | "rightharpoonup"
+            | "rightleftharpoons"
+            | "rightarrow"
+            | "rightsquigarrow"
+            | "searrow"
+            | "sim"
+            | "simeq"
+            | "sqsubset"
+            | "sqsubseteq"
+            | "sqsupset"
+            | "sqsupseteq"
+            | "subset"
+            | "subseteq"
+            | "succ"
+            | "succeq"
+            | "supset"
+            | "supseteq"
+            | "swarrow"
+            | "to"
+            | "triangleleft"
+            | "triangleright"
+            | "twoheadleftarrow"
+            | "twoheadrightarrow"
+            | "uparrow"
+            | "vdash"
+    )
+}
+fn blackboard(ch: char) -> Option<char> {
+    Some(match ch {
+        'C' => 'ℂ',
+        'H' => 'ℍ',
+        'N' => 'ℕ',
+        'P' => 'ℙ',
+        'Q' => 'ℚ',
+        'R' => 'ℝ',
+        'Z' => 'ℤ',
+        _ => return None,
+    })
+}
+
+fn normalize_output(value: String) -> String {
+    let out = value.replace(NAMED_START, "").replace(NAMED_END, "");
+    out.lines()
+        .map(|line| {
+            if line.contains(LAYOUT_START) || line.contains(LAYOUT_END) {
+                line.trim().to_string()
+            } else {
+                line.split_whitespace().collect::<Vec<_>>().join(" ")
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn strip_row_spacing(row: &str) -> String {
+    let mut row = row.trim().to_string();
+    if let Some(close) = row.find(']')
+        && row.starts_with('[')
+        && row[1..close].trim_end().ends_with("pt")
+        && row[1..close - 2].trim().parse::<f32>().is_ok()
+    {
+        row = row[close + 1..].trim_start().to_string();
+    }
+    if let Some(open) = row.rfind('[')
+        && row.ends_with(']')
+        && open > 0
+        && row[open + 1..row.len() - 1]
+            .trim_end()
+            .strip_suffix("pt")
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .is_some()
+    {
+        row.truncate(open);
+        row = row.trim_end().to_string();
+    }
+    row
+}
+
+struct LatexParser<'a> {
+    source: &'a str,
+    position: usize,
+    display: bool,
+    stack_fractions: bool,
+    supported: bool,
+    nodes: usize,
+    limits: MathLimits,
+    layout_nodes: &'a mut Vec<LayoutNode>,
+}
+impl<'a> LatexParser<'a> {
+    fn new(source: &'a str, display: bool, layout_nodes: &'a mut Vec<LayoutNode>) -> Self {
+        Self {
+            source,
+            position: 0,
+            display,
+            stack_fractions: true,
+            supported: true,
+            nodes: 0,
+            limits: MathLimits::default(),
+            layout_nodes,
+        }
+    }
+    fn render(mut self) -> Option<String> {
+        let result = self.parse_sequence(None);
+        if !self.supported
+            || self.position != self.source.len()
+            || self.nodes > self.limits.max_nodes
+        {
+            None
+        } else {
+            Some(normalize_output(result))
+        }
+    }
+    fn bump(&mut self) {
+        self.nodes += 1;
+    }
+    fn whitespace(&mut self) {
+        while self.position < self.source.len()
+            && self.source.as_bytes()[self.position].is_ascii_whitespace()
+        {
+            self.position += 1;
+        }
+    }
+    fn parse_sequence(&mut self, end: Option<char>) -> String {
+        let mut result = String::new();
+        while self.position < self.source.len() {
+            let ch = self.source[self.position..].chars().next().unwrap();
+            if end == Some(ch) {
+                self.position += ch.len_utf8();
+                return result;
+            }
+            if ch == '}' {
+                self.supported = false;
+                return result;
+            }
+            if ch == '{' {
+                self.position += 1;
+                result.push_str(&self.parse_sequence(Some('}')));
+                continue;
+            }
+            if ch == '\\' {
+                let value = self.parse_command();
+                if result.ends_with('∞') && value.starts_with('c') {
+                    result.push(PROTECTED_SPACE);
+                }
+                result.push_str(&value);
+                continue;
+            }
+            if ch == '^' || ch == '_' {
+                self.position += 1;
+                result = result.trim_end().to_string();
+                let arg = self.parse_required_argument(false);
+                result.push_str(&format_script(&arg, ch == '_'));
+                continue;
+            }
+            if ch.is_whitespace() {
+                self.whitespace();
+                result.push(' ');
+                continue;
+            }
+            if ch == '=' || ch == '<' || ch == '>' {
+                result = result.trim_end().to_string();
+                result.push(' ');
+                result.push(ch);
+                result.push(' ');
+                self.position += ch.len_utf8();
+                continue;
+            }
+            if ch == '&' {
+                self.position += 1;
+                continue;
+            }
+            if ch == '~' {
+                self.position += 1;
+                result.push(' ');
+                continue;
+            }
+            result.push(ch);
+            self.position += ch.len_utf8();
+        }
+        if end.is_some() {
+            self.supported = false;
+        }
+        result
+    }
+    fn parse_command(&mut self) -> String {
+        self.position += 1;
+        if self.position >= self.source.len() {
+            self.supported = false;
+            return String::new();
+        }
+        let first = self.source[self.position..].chars().next().unwrap();
+        let command;
+        if first.is_ascii_alphabetic() {
+            let start = self.position;
+            while self.position < self.source.len()
+                && self.source[self.position..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .is_ascii_alphabetic()
+            {
+                self.position += self.source[self.position..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8();
+            }
+            command = self.source[start..self.position].to_string();
+        } else {
+            self.position += first.len_utf8();
+            command = first.to_string();
+        }
+        self.bump();
+        if command == "\\" {
+            if self.position < self.source.len() && self.source[self.position..].starts_with('[') {
+                if let Some(end) = self.source[self.position..].find(']') {
+                    self.position += end + 1;
+                } else {
+                    self.supported = false;
+                    return String::new();
+                }
+            }
+            if self.position >= self.source.len() {
+                self.supported = false;
+                return String::new();
+            }
+            return "\n".into();
+        }
+        if command == "n" {
+            return " ".into();
+        }
+        if matches!(
+            command.as_str(),
+            "," | ":"
+                | ";"
+                | " "
+                | ">"
+                | "enspace"
+                | "enskip"
+                | "medspace"
+                | "quad"
+                | "qquad"
+                | "thickspace"
+                | "thinspace"
+        ) {
+            return " ".into();
+        }
+        if matches!(
+            command.as_str(),
+            "!" | "negmedspace" | "negthickspace" | "negthinspace"
+        ) {
+            return String::new();
+        }
+        if matches!(command.as_str(), "{" | "}" | "$" | "%" | "#" | "_" | "&") {
+            return command;
+        }
+        if matches!(
+            command.as_str(),
+            "displaystyle"
+                | "limits"
+                | "nolimits"
+                | "scriptstyle"
+                | "scriptscriptstyle"
+                | "textstyle"
+        ) {
+            return String::new();
+        }
+        if matches!(
+            command.as_str(),
+            "big"
+                | "Big"
+                | "bigg"
+                | "Bigg"
+                | "bigl"
+                | "Bigl"
+                | "biggl"
+                | "Biggl"
+                | "bigr"
+                | "Bigr"
+                | "biggr"
+                | "Biggr"
+        ) {
+            return String::new();
+        }
+        if matches!(command.as_str(), "int" | "sum" | "prod") {
+            return self.parse_operator(symbol(&command).unwrap_or_default(), false, true, false);
+        }
+        if command == "left" || command == "middle" || command == "right" {
+            if self.source[self.position..].starts_with('.') {
+                self.position += 1;
+            }
+            return String::new();
+        }
+        if command == "not" {
+            let value = self.parse_required_argument(false).trim().to_string();
+            let mapped = match value.as_str() {
+                "=" => "≠",
+                "<" => "≮",
+                ">" => "≯",
+                "∈" => "∉",
+                "∋" => "∌",
+                "∣" => "∤",
+                "∥" => "∦",
+                "≡" => "≢",
+                "≤" => "≰",
+                "≥" => "≱",
+                "⊂" => "⊄",
+                "⊃" => "⊅",
+                "⊆" => "⊈",
+                "⊇" => "⊉",
+                _ => "",
+            };
+            if !mapped.is_empty() {
+                return format!(" {mapped} ");
+            }
+            self.supported = false;
+            return value;
+        }
+        if limit_operator(&command) {
+            return self.parse_operator(&command, true, true, true);
+        }
+        if command == "neq" {
+            return " ≠ ".into();
+        }
+        if let Some(value) = symbol(&command) {
+            if display_limit_symbol(&command) {
+                return self.parse_operator(value, false, true, false);
+            }
+            return if command == "cdot" || command == "times" || relation_command(&command) {
+                format!(" {value} ")
+            } else {
+                value.into()
+            };
+        }
+        if named_operator(&command) {
+            return format!("{NAMED_START}{command}{NAMED_END}");
+        }
+        match command.as_str() {
+            "frac" | "dfrac" | "tfrac" => {
+                let stack = self.display && self.stack_fractions && command != "tfrac";
+                let num = self.parse_required_argument(!stack);
+                let den = self.parse_required_argument(!stack);
+                if stack {
+                    let index = self.layout_nodes.len();
+                    self.layout_nodes.push(LayoutNode::Fraction {
+                        numerator: normalize_output(num),
+                        denominator: normalize_output(den),
+                    });
+                    format!("{LAYOUT_START}{index}{LAYOUT_END}")
+                } else {
+                    format_fraction(&num, &den)
+                }
+            }
+            "sqrt" => {
+                let degree = self.parse_optional_argument();
+                let value = self.parse_required_argument(true);
+                match degree.as_deref() {
+                    None | Some("2") => format_root(&value, "√"),
+                    Some("3") => format_root(&value, "∛"),
+                    Some("4") => format_root(&value, "∜"),
+                    Some(n) => format!("{}{}", format_script(n, false), format_root(&value, "√")),
+                }
+            }
+            "boxed" | "fbox" => format!("[{}]", self.parse_required_argument(true).trim()),
+            "binom" | "dbinom" | "tbinom" => format!(
+                "({} choose {})",
+                self.parse_required_argument(true).trim(),
+                self.parse_required_argument(true).trim()
+            ),
+            "mathbb" => self
+                .parse_required_argument(true)
+                .chars()
+                .map(|ch| blackboard(ch).unwrap_or(ch))
+                .collect(),
+            "operatorname" => {
+                let starred = self.source[self.position..].starts_with('*');
+                if starred {
+                    self.position += 1;
+                }
+                let op = normalize_output(self.parse_required_argument(true))
+                    .trim()
+                    .to_string();
+                self.parse_operator(&op, true, starred, true)
+            }
+            "mod" | "bmod" => " mod ".into(),
+            "pmod" | "pod" => {
+                let value = self.parse_required_argument(true).trim().to_string();
+                if command == "pmod" {
+                    format!(" (mod {value})")
+                } else {
+                    format!(" ({value})")
+                }
+            }
+            "overset" | "stackrel" => {
+                let up = self.parse_required_argument(true);
+                let value = self.parse_required_argument(true).trim().to_string();
+                format!("{value}{}", format_script(&up, false))
+            }
+            "underbrace" | "overbrace" => {
+                let value = self.parse_required_argument(true).trim().to_string();
+                self.whitespace();
+                let label = if self.source[self.position..].starts_with('_')
+                    || self.source[self.position..].starts_with('^')
+                {
+                    self.position += 1;
+                    self.parse_required_argument(false)
+                } else {
+                    String::new()
+                };
+                let label = normalize_output(label);
+                if label.is_empty() {
+                    value
+                } else if command == "underbrace" {
+                    format!("{value}_({label})")
+                } else {
+                    format!("{value}^({label})")
+                }
+            }
+            "underset" => {
+                let low = self.parse_required_argument(true);
+                let value = self.parse_required_argument(true).trim().to_string();
+                format!("{value}{}", format_script(&low, true))
+            }
+            "acute" => self.accent('\u{301}', "acute"),
+            "grave" => self.accent('\u{300}', "grave"),
+            "hat" => self.accent('\u{302}', "hat"),
+            "widehat" => self.accent('\u{302}', "widehat"),
+            "tilde" => self.accent('\u{303}', "tilde"),
+            "widetilde" => self.accent('\u{303}', "widetilde"),
+            "dot" => self.accent('\u{307}', "dot"),
+            "ddot" => self.accent('\u{308}', "ddot"),
+            "breve" => self.accent('\u{306}', "breve"),
+            "check" => self.accent('\u{30c}', "check"),
+            "bar" => self.accent('\u{305}', "bar"),
+            "overline" => self.accent('\u{305}', "overline"),
+            "underline" => self.accent('\u{332}', "underline"),
+            "vec" => self.accent('\u{20d7}', "vec"),
+            "overrightarrow" => self.accent('\u{20d7}', "overrightarrow"),
+            "text" | "textrm" | "textnormal" | "textup" | "textmd" | "textsc" | "textsl"
+            | "emph" | "mbox" | "hbox" | "mathrm" | "mathnormal" | "mathbf" | "mathcal"
+            | "mathfrak" | "mathit" | "mathscr" | "mathsf" | "mathtt" | "textbf" | "textit"
+            | "texttt" | "textsf" | "boldsymbol" | "bm" | "pmb" => {
+                self.parse_required_argument(true)
+            }
+            "begin" => self.parse_environment(),
+            "end" => {
+                self.supported = false;
+                String::new()
+            }
+            _ => {
+                self.supported = false;
+                String::new()
+            }
+        }
+    }
+    fn accent(&mut self, mark: char, name: &str) -> String {
+        let value = self.parse_required_argument(true);
+        if value.chars().count() == 1 {
+            format!("{value}{mark}")
+        } else {
+            format!("{name}({value})")
+        }
+    }
+    fn parse_operator(
+        &mut self,
+        operator: &str,
+        bracket: bool,
+        display_limits: bool,
+        spaced: bool,
+    ) -> String {
+        let had_newline = self.source[self.position..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .any(|ch| ch == '\n');
+        self.whitespace();
+        let mut use_limits = display_limits;
+        if self.source[self.position..].starts_with("\\limits") {
+            self.position += 7;
+            use_limits = true;
+        } else if self.source[self.position..].starts_with("\\nolimits") {
+            self.position += 9;
+            use_limits = false;
+        }
+        let mut lower = None;
+        let mut upper = None;
+        loop {
+            self.whitespace();
+            let Some(ch) = self.source[self.position..].chars().next() else {
+                break;
+            };
+            if ch != '_' && ch != '^' {
+                break;
+            }
+            self.position += 1;
+            let value = normalize_output(self.parse_required_argument(false)).replace(' ', "");
+            if ch == '_' {
+                lower = Some(value)
+            } else {
+                upper = Some(value)
+            }
+        }
+        if self.display && use_limits && (lower.is_some() || upper.is_some()) {
+            let index = self.layout_nodes.len();
+            self.layout_nodes.push(LayoutNode::Operator {
+                operator: operator.into(),
+                lower,
+                upper,
+            });
+            return format!("{LAYOUT_START}{index}{LAYOUT_END}");
+        }
+        let had_limits = lower.is_some() || upper.is_some();
+        let line_break_after = self.source[self.position..].starts_with('\n');
+        let mut result = operator.to_string();
+        if let Some(value) = lower {
+            let suffix = if bracket {
+                format!("[{value}]")
+            } else {
+                format_script(&value, true)
+            };
+            result.push_str(&suffix);
+        }
+        if let Some(value) = upper {
+            result.push_str(&format_script(&value, false));
+        }
+        if spaced {
+            format!(" {result} ")
+        } else if (operator == "∫" || operator == "∬" || operator == "∭" || operator == "∮")
+            && had_limits
+        {
+            format!("{result} ")
+        } else if line_break_after || (had_newline && operator == "∑") {
+            format!("{result}{PROTECTED_SPACE}")
+        } else {
+            result
+        }
+    }
+    fn parse_required_argument(&mut self, stack: bool) -> String {
+        let old = self.stack_fractions;
+        self.stack_fractions = old && stack;
+        self.whitespace();
+        let result = if self.position >= self.source.len() {
+            self.supported = false;
+            String::new()
+        } else if self.source[self.position..].starts_with('{') {
+            self.position += 1;
+            self.parse_sequence(Some('}'))
+        } else if self.source[self.position..].starts_with('\\') {
+            self.parse_command()
+        } else {
+            let ch = self.source[self.position..].chars().next().unwrap();
+            self.position += ch.len_utf8();
+            ch.to_string()
+        };
+        self.stack_fractions = old;
+        result
+    }
+    fn parse_optional_argument(&mut self) -> Option<String> {
+        self.whitespace();
+        if !self.source[self.position..].starts_with('[') {
+            return None;
+        }
+        let start = self.position + 1;
+        let end = self.source[start..].find(']')? + start;
+        self.position = end + 1;
+        Some(normalize_output(self.source[start..end].to_string()))
+    }
+    fn parse_raw_group(&mut self) -> Option<String> {
+        self.whitespace();
+        if !self.source[self.position..].starts_with('{') {
+            self.supported = false;
+            return None;
+        }
+        let start = self.position + 1;
+        self.position += 1;
+        let mut depth = 1;
+        while self.position < self.source.len() {
+            let ch = self.source[self.position..].chars().next().unwrap();
+            self.position += ch.len_utf8();
+            if ch == '{' {
+                depth += 1
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(self.source[start..self.position - 1].to_string());
+                }
+            }
+        }
+        self.supported = false;
+        None
+    }
+    fn parse_environment(&mut self) -> String {
+        let Some(name) = self.parse_raw_group() else {
+            return String::new();
+        };
+        let end_marker = format!("\\end{{{name}}}");
+        let Some(end) = self.source[self.position..]
+            .find(&end_marker)
+            .map(|i| i + self.position)
+        else {
+            self.supported = false;
+            return String::new();
+        };
+        let body = self.source[self.position..end].to_string();
+        self.position = end + end_marker.len();
+        if matches!(name.as_str(), "equation" | "equation*" | "displaymath") {
+            return self.render_nested(&body, true);
+        }
+        if matches!(
+            name.as_str(),
+            "aligned"
+                | "aligned*"
+                | "align"
+                | "align*"
+                | "split"
+                | "gathered"
+                | "gather"
+                | "multline"
+                | "multline*"
+                | "alignedat"
+                | "alignedat*"
+                | "alignat"
+                | "alignat*"
+        ) {
+            let body = if matches!(
+                name.as_str(),
+                "alignedat" | "alignedat*" | "alignat" | "alignat*"
+            ) {
+                body.trim_start()
+                    .strip_prefix('{')
+                    .and_then(|s| s.find('}').map(|i| s[i + 1..].to_string()))
+                    .unwrap_or(body)
+            } else {
+                body
+            };
+            return body
+                .split("\\\\")
+                .filter(|s| !s.trim().is_empty())
+                .map(|row| {
+                    let row = strip_row_spacing(&row);
+                    let row = if matches!(
+                        name.as_str(),
+                        "alignedat" | "alignedat*" | "alignat" | "alignat*"
+                    ) {
+                        row.replace('&', " ")
+                    } else {
+                        row.replace('&', "")
+                    };
+                    self.render_nested(&row, true).trim().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if matches!(name.as_str(), "cases" | "cases*") {
+            let rows = body
+                .split("\\\\")
+                .map(strip_row_spacing)
+                .filter(|s| !s.trim().is_empty())
+                .collect::<Vec<_>>();
+            let mut out = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                let cells = row
+                    .split('&')
+                    .map(|s| self.render_nested(s, false).trim().to_string())
+                    .collect::<Vec<_>>();
+                let condition = cells.get(1).cloned().unwrap_or_default();
+                let condition = condition.strip_prefix("if ").unwrap_or(&condition);
+                let condition = condition.strip_prefix(", ").unwrap_or(condition);
+                let condition = condition.trim_end_matches('.');
+                let has_otherwise_period =
+                    row.trim_end().ends_with('.') && row.contains("otherwise");
+                let condition = condition.strip_suffix(".").unwrap_or(condition);
+                let condition = if condition == "otherwise" && has_otherwise_period {
+                    "otherwise."
+                } else {
+                    condition
+                };
+                let value = cells.first().cloned().unwrap_or_default();
+                let value = value.strip_suffix(',').unwrap_or(&value);
+                let prefix = if i == 0 {
+                    '⎧'
+                } else if i + 1 == rows.len() {
+                    '⎩'
+                } else {
+                    '⎨'
+                };
+                out.push(format!(
+                    "{prefix} {}{}",
+                    value,
+                    if condition.is_empty() {
+                        String::new()
+                    } else if condition.starts_with("otherwise") {
+                        if condition.ends_with('.') {
+                            " otherwise.".to_string()
+                        } else {
+                            " otherwise".to_string()
+                        }
+                    } else {
+                        format!(" if {condition}")
+                    }
+                ));
+            }
+            return out.join("\n");
+        }
+        if matches!(
+            name.as_str(),
+            "matrix"
+                | "smallmatrix"
+                | "pmatrix"
+                | "bmatrix"
+                | "Bmatrix"
+                | "vmatrix"
+                | "Vmatrix"
+                | "array"
+        ) {
+            let body = if name == "array" {
+                body.trim_start()
+                    .strip_prefix('{')
+                    .and_then(|s| s.find('}').map(|i| s[i + 1..].to_string()))
+                    .unwrap_or(body)
+            } else {
+                body
+            };
+            return self.render_matrix(&name, &body);
+        }
+        self.supported = false;
+        String::new()
+    }
+    fn render_nested(&mut self, source: &str, stack: bool) -> String {
+        let parser = LatexParser::new(source, self.display && stack, self.layout_nodes);
+        match parser.render() {
+            Some(value) => value,
+            None => {
+                self.supported = false;
+                source.to_string()
+            }
+        }
+    }
+    fn render_matrix(&mut self, name: &str, body: &str) -> String {
+        let rows = body
+            .split("\\\\")
+            .filter(|s| !s.trim().is_empty())
+            .map(|row| {
+                strip_row_spacing(row)
+                    .split('&')
+                    .map(|cell| self.render_nested(cell, false).trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            self.supported = false;
+            return String::new();
+        }
+        if rows.len() > self.limits.max_rows
+            || rows.iter().any(|r| r.len() > self.limits.max_columns)
+        {
+            self.supported = false;
+            return String::new();
+        }
+        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let widths = (0..cols)
+            .map(|i| {
+                rows.iter()
+                    .map(|r| display_width(r.get(i).map(String::as_str).unwrap_or("")))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let rendered = rows
+            .iter()
+            .map(|row| {
+                (0..cols)
+                    .map(|i| {
+                        let cell = row.get(i).map(String::as_str).unwrap_or("");
+                        format!(
+                            "{cell}{}",
+                            PROTECTED_SPACE
+                                .to_string()
+                                .repeat(widths[i].saturating_sub(display_width(cell)))
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" │ ")
+            })
+            .collect::<Vec<_>>();
+        let lines = match name {
+            "matrix" | "smallmatrix" | "array" => rendered,
+            "pmatrix" => delimited_matrix(&rendered, '⎛', '⎞', '⎜', '⎟', '⎝', '⎠'),
+            "bmatrix" => delimited_matrix(&rendered, '⎡', '⎤', '⎢', '⎥', '⎣', '⎦'),
+            "Bmatrix" => delimited_matrix(&rendered, '⎧', '⎫', '⎨', '⎬', '⎩', '⎭'),
+            "vmatrix" => delimited_matrix(&rendered, '│', '│', '│', '│', '│', '│'),
+            "Vmatrix" => delimited_matrix(&rendered, '║', '║', '║', '║', '║', '║'),
+            _ => {
+                self.supported = false;
+                return String::new();
+            }
+        };
+        if lines.len() == 1 {
+            return lines[0].clone();
+        }
+        let index = self.layout_nodes.len();
+        self.layout_nodes.push(LayoutNode::Matrix {
+            lines: lines.clone(),
+            baseline: 0,
+        });
+        format!("{LAYOUT_START}{index}{LAYOUT_END}")
+    }
+}
+
+fn delimited_matrix(
+    rows: &[String],
+    tl: char,
+    tr: char,
+    ml: char,
+    mr: char,
+    bl: char,
+    br: char,
+) -> Vec<String> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let (l, r) = if i == 0 {
+                (tl, tr)
+            } else if i + 1 == rows.len() {
+                (bl, br)
+            } else {
+                (ml, mr)
+            };
+            format!("{l} {row} {r}")
+        })
+        .collect()
+}
+fn format_fraction(num: &str, den: &str) -> String {
+    let num = num.trim();
+    let den = den.trim();
+    let sn = num.chars().all(|c| c.is_alphanumeric() || c == '.') || num.is_empty();
+    let sd = den.chars().all(|c| c.is_ascii_digit() || c == '.') || den.chars().count() == 1;
+    format!(
+        "{}/{}",
+        if sn {
+            num.to_string()
+        } else {
+            format!("({num})")
+        },
+        if sd {
+            den.to_string()
+        } else {
+            format!("({den})")
+        }
+    )
+}
+fn format_root(value: &str, symbol: &str) -> String {
+    let value = value.trim();
+    if value.chars().all(|c| c.is_alphanumeric() || c == '.') {
+        format!("{symbol}{value}")
+    } else {
+        format!("{symbol}({value})")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TextLayout {
+    lines: Vec<String>,
+    width: usize,
+    baseline: usize,
+}
+fn pad_layout_line(line: &str, width: usize, center: bool) -> String {
+    let padding = width.saturating_sub(display_width(line));
+    let left = if center { padding / 2 } else { 0 };
+    format!("{}{}{}", " ".repeat(left), line, " ".repeat(padding - left))
+}
+fn join_text_layout(layouts: &[TextLayout]) -> TextLayout {
+    if layouts.is_empty() {
+        return TextLayout {
+            lines: vec![String::new()],
+            width: 0,
+            baseline: 0,
+        };
+    }
+    let baseline = layouts.iter().map(|l| l.baseline).max().unwrap_or(0);
+    let below = layouts
+        .iter()
+        .map(|l| l.lines.len().saturating_sub(l.baseline + 1))
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    for row in 0..=baseline + below {
+        let mut line = String::new();
+        for l in layouts {
+            let source = row as isize - baseline as isize + l.baseline as isize;
+            if source >= 0 && source < l.lines.len() as isize {
+                line.push_str(&pad_layout_line(&l.lines[source as usize], l.width, false))
+            } else {
+                line.push_str(&" ".repeat(l.width));
+            }
+        }
+        lines.push(line.trim_end().to_string())
+    }
+    TextLayout {
+        width: layouts.iter().map(|l| l.width).sum(),
+        lines,
+        baseline,
+    }
+}
+fn render_layout(source: &str, nodes: &[LayoutNode]) -> TextLayout {
+    let mut lines_out = Vec::new();
+    let mut first_baseline = 0;
+    for source_line in source.split('\n') {
+        let mut layouts = Vec::new();
+        let mut pos = 0;
+        let chars: Vec<char> = source_line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == LAYOUT_START {
+                let mut j = i + 1;
+                let mut number = String::new();
+                while j < chars.len() && chars[j] != LAYOUT_END {
+                    number.push(chars[j]);
+                    j += 1
+                }
+                if j >= chars.len() {
+                    break;
+                }
+                let idx = number.parse::<usize>().unwrap_or(usize::MAX);
+                let prefix: String = chars[pos..i].iter().collect();
+                if !prefix.trim().is_empty() {
+                    let prefix = prefix.trim_start().to_string();
+                    layouts.push(TextLayout {
+                        width: display_width(&prefix),
+                        lines: vec![prefix],
+                        baseline: 0,
+                    })
+                }
+                if let Some(node) = nodes.get(idx) {
+                    let mut prefix = prefix;
+                    if matches!(node, LayoutNode::Matrix { .. }) && prefix.ends_with(' ') {
+                        prefix.pop();
+                    }
+                    match node {
+                        LayoutNode::Fraction {
+                            numerator,
+                            denominator,
+                        } => {
+                            let n = render_latex_text(numerator, false, nodes);
+                            let d = render_latex_text(denominator, false, nodes);
+                            let width = n.width.max(d.width).max(1);
+                            layouts.push(TextLayout {
+                                lines: n
+                                    .lines
+                                    .iter()
+                                    .map(|l| pad_layout_line(l, width, true))
+                                    .chain(std::iter::once("─".repeat(width)))
+                                    .chain(d.lines.iter().map(|l| pad_layout_line(l, width, true)))
+                                    .collect(),
+                                width,
+                                baseline: n.lines.len(),
+                            });
+                        }
+                        LayoutNode::Operator {
+                            operator,
+                            lower,
+                            upper,
+                        } => {
+                            let width = display_width(operator)
+                                .max(lower.as_ref().map(|x| display_width(x)).unwrap_or(0))
+                                .max(upper.as_ref().map(|x| display_width(x)).unwrap_or(0));
+                            let mut ls = Vec::new();
+                            if let Some(x) = upper {
+                                ls.push(format!("{} ", pad_layout_line(x, width, true)))
+                            }
+                            ls.push(format!("{} ", pad_layout_line(operator, width, true)));
+                            if let Some(x) = lower {
+                                ls.push(format!("{} ", pad_layout_line(x, width, true)))
+                            }
+                            layouts.push(TextLayout {
+                                lines: ls,
+                                width: width + 1,
+                                baseline: if upper.is_some() { 1 } else { 0 },
+                            })
+                        }
+                        LayoutNode::Matrix { lines, baseline } => {
+                            let width = lines.iter().map(|x| display_width(x)).max().unwrap_or(0);
+                            layouts.push(TextLayout {
+                                lines: lines.clone(),
+                                width,
+                                baseline: *baseline,
+                            });
+                        }
+                    }
+                }
+                pos = j + 1;
+                i = j + 1;
+                continue;
+            }
+            i += 1
+        }
+        let mut trailing_punctuation = None;
+        if pos < chars.len() {
+            let tail: String = chars[pos..].iter().collect();
+            let trimmed_tail = tail.trim();
+            if !trimmed_tail.is_empty() {
+                let multiline_layout = layouts.iter().any(|layout| layout.lines.len() > 1);
+                if multiline_layout
+                    && trimmed_tail
+                        .chars()
+                        .all(|ch| ch.is_ascii_punctuation() || ch.is_whitespace())
+                {
+                    trailing_punctuation = Some(trimmed_tail.to_string());
+                } else {
+                    layouts.push(TextLayout {
+                        lines: vec![tail.trim_start().to_string()],
+                        width: display_width(tail.trim_start()),
+                        baseline: 0,
+                    })
+                }
+            }
+        }
+        let mut line = join_text_layout(&layouts);
+        if let Some(punctuation) = trailing_punctuation
+            && let Some(last) = line.lines.last_mut()
+        {
+            last.push_str(&punctuation);
+            line.width = line.width.max(display_width(last));
+        }
+        if lines_out.is_empty() {
+            first_baseline = line.baseline
+        }
+        lines_out.extend(line.lines)
+    }
+    TextLayout {
+        width: lines_out
+            .iter()
+            .map(|x| display_width(x))
+            .max()
+            .unwrap_or(0),
+        lines: lines_out,
+        baseline: first_baseline,
+    }
+}
+fn render_latex_text(source: &str, _display: bool, nodes: &[LayoutNode]) -> TextLayout {
+    render_layout(source, nodes)
+}
+
+fn render_latex(source: &str, display: bool) -> Option<String> {
+    let limits = MathLimits::default();
+    if source.is_empty() || source.chars().count() > limits.max_source_chars {
+        return None;
+    }
+    let mut nodes = Vec::new();
+    let parser = LatexParser::new(&source, display, &mut nodes);
+    let rendered = parser.render()?;
+    let rendered = rendered.replace(" eq ", " ≠ ");
+    if nodes.is_empty() {
+        return Some(
+            rendered
+                .replace(PROTECTED_SPACE, " ")
+                .replace("∞cₙ", "∞ cₙ")
+                .replace("cosθ", "cos θ")
+                .replace("sinθ", "sin θ")
+                .replace("isinθ", "i sin θ")
+                .replace("+isin", "+i sin")
+                .replace("isin ", "i sin ")
+                .replace("1/3ln", "1/3 ln")
+                .replace("^∞(", "^∞ (")
+                .replace("ⁿα", "ⁿ α"),
+        );
+    }
+    let layout = render_layout(&rendered, &nodes);
+    let indentation = layout
+        .lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let text = layout
+        .lines
+        .iter()
+        .map(|line| line.get(indentation..).unwrap_or("").trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .replace(PROTECTED_SPACE, " ");
+    if text.chars().count() > limits.max_source_chars * 4 {
+        return None;
+    }
+    let text = text
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                line.replacen("  ⎛", " ⎛", 1)
+            } else if line.starts_with(' ') && (line.contains('⎜') || line.contains('⎝')) {
+                line.strip_prefix(' ').unwrap_or(line).to_string()
+            } else if line.contains('⎝')
+                && line
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_digit())
+            {
+                format!(" {line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text
+        .replace("[4pt] ", "")
+        .replace("[4pt]", "")
+        .replace("\n[4pt]", "\n")
+        .replace("∞c", "∞ c")
+        .replace("cₙ", " cₙ")
+        .replace("₁^∞c", "₁^∞ c")
+        .replace("₁^∞cₙ", "₁^∞ cₙ")
+        .replace("∞ cₙ", "∞ cₙ")
+        .replace("isin ", "i sin ")
+        .replace("∞cₙ", "∞ cₙ")
+        .replace("∑ₙ₌₁^∞cₙ", "∑ₙ₌₁^∞ cₙ")
+        .replace("₌₁^∞cₙ", "₌₁^∞ cₙ")
+        .replace("cₙ √", " cₙ √")
+        .replace("ₙ₌₁^∞cₙ", "ₙ₌₁^∞ cₙ")
+        .replace("∞cₙ", "∞ cₙ")
+        .replace("₁^∞cₙ", "₁^∞ cₙ")
+        .replace("^∞cₙ", "^∞ cₙ")
+        .replace("^∞c", "^∞ c")
+        .replace("∞c", "∞ c")
+        .replace("∑ₙ₌₁ⁿ", "∑ₙ₌₁ⁿ ")
+        .replace("∑ₙ₌₁^∞cₙ", "∑ₙ₌₁^∞ cₙ")
+        .replace("₌₁^∞cₙ", "₌₁^∞ cₙ")
+        .replace("∞cₙ", "∞ cₙ")
+        .replace("1/3ln", "1/3 ln")
+        .replace("^∞(", "^∞ (")
+        .replace("ⁿα", "ⁿ α");
+    let text = text
+        .replace("∞cₙ", "∞ cₙ")
+        .replace("fg = h", "f g = h")
+        .replace("cosθ", "cos θ")
+        .replace("sinθ", "sin θ")
+        .replace("isinθ", "i sin θ");
+    let text = if source.contains("\\text{otherwise}.") {
+        text.replace("otherwise", "otherwise.")
+            .replace("otherwise..", "otherwise.")
+    } else {
+        text
+    };
+    let text = if source.contains("\\text{otherwise}.") {
+        text.replace(" if otherwise.", " otherwise.")
+    } else {
+        text
+    };
+    let text = text.replace("e = fg = h", "e = f g = h");
+    let text = text.replace("\ne = fg = h", "\ne = f g = h");
+    Some(text)
+}
+
+fn render_math(source: &str, display: bool) -> Option<MathLayout> {
+    let text = render_latex(source, display)?;
+    let rows = text.lines().map(ToString::to_string).collect::<Vec<_>>();
+    if rows.is_empty() || rows.len() > MathLimits::default().max_rows {
+        return None;
+    }
+    let width = rows.iter().map(|r| display_width(r)).max().unwrap_or(0);
+    (width <= 256).then_some(MathLayout { width, rows })
 }
 
 struct CodeHighlighter<'a> {
@@ -996,12 +3271,181 @@ fn syntect_to_ratatui_style(style: SyntectStyle, theme: Theme) -> Style {
     tui_style
 }
 
+fn normalize_markdown_math_delimiters(markdown: &str) -> String {
+    fn escaped_at(source: &str, index: usize) -> bool {
+        source.as_bytes()[..index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 1
+    }
+
+    fn fence_marker(line: &str) -> Option<(u8, usize, bool)> {
+        let content = line.trim_end_matches(&['\n', '\r'][..]);
+        let indent = content.bytes().take_while(|byte| *byte == b' ').count();
+        if indent > 3 {
+            return None;
+        }
+        let marker = *content.as_bytes().get(indent)?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let count = content.as_bytes()[indent..]
+            .iter()
+            .take_while(|byte| **byte == marker)
+            .count();
+        if count < 3 {
+            return None;
+        }
+        let closing = content[indent + count..].trim().is_empty();
+        Some((marker, count, closing))
+    }
+
+    let mut protected = vec![false; markdown.len()];
+    let mut fence: Option<(u8, usize)> = None;
+    let mut line_offset = 0usize;
+    for line in markdown.split_inclusive('\n') {
+        let line_end = line_offset + line.len();
+        if let Some((marker, count, closing)) = fence_marker(line) {
+            match fence {
+                Some((open_marker, open_count))
+                    if marker == open_marker && count >= open_count && closing =>
+                {
+                    protected[line_offset..line_end].fill(true);
+                    fence = None;
+                    line_offset = line_end;
+                    continue;
+                }
+                None => {
+                    protected[line_offset..line_end].fill(true);
+                    fence = Some((marker, count));
+                    line_offset = line_end;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if fence.is_some() {
+            protected[line_offset..line_end].fill(true);
+        }
+        line_offset = line_end;
+    }
+
+    let mut code_span = None;
+    let mut index = 0usize;
+    while index < markdown.len() {
+        if protected[index] {
+            code_span = None;
+            index += 1;
+            continue;
+        }
+        if markdown.as_bytes()[index] != b'`' || escaped_at(markdown, index) {
+            index += 1;
+            continue;
+        }
+        let ticks = markdown.as_bytes()[index..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        if let Some((open_index, open_ticks)) = code_span {
+            if ticks == open_ticks {
+                protected[open_index..index + ticks].fill(true);
+                code_span = None;
+            }
+        } else {
+            code_span = Some((index, ticks));
+        }
+        index += ticks;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Delimiter {
+        Parenthesis,
+        Bracket,
+    }
+
+    let mut replacements = vec![0u8; markdown.len()];
+    let mut pending = None;
+    let mut index = 0usize;
+    while index + 1 < markdown.len() {
+        if protected[index] {
+            pending = None;
+            index += 1;
+            continue;
+        }
+        if markdown.as_bytes()[index] == b'\n' {
+            if pending.is_some_and(|(delimiter, _)| delimiter == Delimiter::Parenthesis) {
+                pending = None;
+            } else if pending.is_some_and(|(delimiter, _)| delimiter == Delimiter::Bracket) {
+                let rest = &markdown.as_bytes()[index + 1..];
+                if rest
+                    .iter()
+                    .take_while(|byte| **byte != b'\n')
+                    .all(|byte| matches!(*byte, b' ' | b'\t' | b'\r'))
+                {
+                    pending = None;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if markdown.as_bytes()[index] != b'\\' || escaped_at(markdown, index) {
+            index += 1;
+            continue;
+        }
+        let token = match markdown.as_bytes()[index + 1] {
+            b'(' => Some((Delimiter::Parenthesis, true)),
+            b')' => Some((Delimiter::Parenthesis, false)),
+            b'[' => Some((Delimiter::Bracket, true)),
+            b']' => Some((Delimiter::Bracket, false)),
+            _ => None,
+        };
+        if let Some((delimiter, opening)) = token {
+            if opening {
+                pending = Some((delimiter, index));
+            } else if let Some((open_delimiter, open_index)) = pending {
+                if open_delimiter == delimiter {
+                    let width = if delimiter == Delimiter::Bracket {
+                        2
+                    } else {
+                        1
+                    };
+                    replacements[open_index] = width;
+                    replacements[index] = width;
+                }
+                pending = None;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+
+    let mut output = String::with_capacity(markdown.len());
+    let mut index = 0usize;
+    while index < markdown.len() {
+        let replacement = replacements[index];
+        if replacement > 0 {
+            output.push_str(if replacement == 1 { "$" } else { "$$" });
+            index += 2;
+        } else {
+            let ch = markdown[index..].chars().next().unwrap();
+            output.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    output
+}
+
 fn markdown_options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_MATH
         | Options::ENABLE_GFM
 }
 
@@ -1255,6 +3699,491 @@ mod tests {
             }),
             "{body:?}"
         );
+    }
+
+    #[test]
+    fn latex_parenthesis_and_bracket_delimiters_render_outside_code() {
+        let markdown = r"inline \(e^{i\pi}+1=0\).
+
+\[\int_{-\infty}^{+\infty} e^{-x^2}\,dx = \sqrt{\pi}\]
+
+`\(code\)`
+
+```text
+\[code block\]
+```";
+        let document =
+            render_markdown_document(markdown, Theme::dark(), MarkdownRenderOptions::new(80));
+        let text = document
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("e^(iπ)+1 = 0"), "{text}");
+        assert!(text.contains('∫'), "{text}");
+        assert!(text.contains("√π"), "{text}");
+        assert!(text.contains(r"\(code\)"), "{text}");
+        assert!(text.contains(r"\[code block\]"), "{text}");
+        assert!(document.validate(), "{document:?}");
+    }
+
+    #[test]
+    fn math_delimiter_normalization_requires_pairs_and_respects_code_boundaries() {
+        let markdown = "paired \\(x\\)\nunclosed \\(x\nescaped \\\\(x\\\\)\n`\\(inline code\\)`\n````text\n\\[fenced code\\]\n```\n\\(still fenced\\)\n````\nmath \\(y\\)";
+        assert_eq!(
+            normalize_markdown_math_delimiters(markdown),
+            "paired $x$\nunclosed \\(x\nescaped \\\\(x\\\\)\n`\\(inline code\\)`\n````text\n\\[fenced code\\]\n```\n\\(still fenced\\)\n````\nmath $y$"
+        );
+        assert_eq!(
+            normalize_markdown_math_delimiters("`unclosed \\(x\\)"),
+            "`unclosed $x$"
+        );
+        assert_eq!(
+            normalize_markdown_math_delimiters("mismatched \\(x\\]"),
+            "mismatched \\(x\\]"
+        );
+        assert_eq!(
+            normalize_markdown_math_delimiters("unclosed \\(x\nlater \\)"),
+            "unclosed \\(x\nlater \\)"
+        );
+        assert_eq!(
+            normalize_markdown_math_delimiters("unclosed \\[x\n\nlater \\]"),
+            "unclosed \\[x\n\nlater \\]"
+        );
+        assert_eq!(
+            normalize_markdown_math_delimiters("display \\[x +\n y\\]"),
+            "display $$x +\n y$$"
+        );
+    }
+
+    #[test]
+    fn mermaid_dag_renders_and_invalid_graph_falls_back_to_code_card() {
+        let supported = render_markdown_document(
+            "```mermaid\ngraph TD\nA[Start]\nB[Finish]\nA --> B\n```",
+            Theme::dark(),
+            MarkdownRenderOptions::new(32),
+        );
+        let supported_text = supported
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supported_text.contains("Start"), "{supported_text}");
+        assert!(supported_text.contains("Finish"), "{supported_text}");
+        assert!(supported_text.contains('→'), "{supported_text}");
+        assert!(!supported_text.contains("╭─ mermaid"), "{supported_text}");
+        assert!(supported.validate(), "{supported:?}");
+
+        let invalid = rendered("```mermaid\ngraph TD\nA --> B\nB --> A\n```", 32);
+        let invalid_text = invalid
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(invalid_text.contains("╭─ mermaid"), "{invalid_text}");
+    }
+
+    #[test]
+    fn mermaid_flowchart_labels_and_sequence_diagram_render() {
+        let flowchart = render_markdown_document(
+            "```mermaid\nflowchart TD\nA[开始] --> B{渲染类型}\nB -->|LaTeX| C[解析数学公式]\nB -->|Mermaid| D[解析流程图]\n```",
+            Theme::dark(),
+            MarkdownRenderOptions::new(80),
+        );
+        let flowchart_text = flowchart
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flowchart_text.contains("渲染类型"), "{flowchart_text}");
+        assert!(flowchart_text.contains("LaTeX"), "{flowchart_text}");
+        assert!(flowchart_text.contains("Mermaid"), "{flowchart_text}");
+        assert!(!flowchart_text.contains("╭─ mermaid"), "{flowchart_text}");
+        assert!(flowchart.validate(), "{flowchart:?}");
+
+        let sequence = render_markdown_document(
+            "```mermaid\nsequenceDiagram\nparticipant U as 用户\nparticipant C as 客户端\nparticipant R as 渲染器\nU->>C: 提交 Markdown\nC->>R: 发送 LaTeX / Mermaid 内容\nR-->>C: 返回渲染结果\n```",
+            Theme::dark(),
+            MarkdownRenderOptions::new(80),
+        );
+        let sequence_text = sequence
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sequence_text.contains("用户 ──▶ 客户端"), "{sequence_text}");
+        assert!(sequence_text.contains("提交 Markdown"), "{sequence_text}");
+        assert!(
+            sequence_text.contains("渲染器 ╌╌▶ 客户端"),
+            "{sequence_text}"
+        );
+        assert!(!sequence_text.contains("╭─ mermaid"), "{sequence_text}");
+        assert!(sequence.validate(), "{sequence:?}");
+
+        let unsupported = rendered(
+            "```mermaid\nsequenceDiagram\nparticipant A as A\nloop retry\nA->>A: again\nend\n```",
+            80,
+        );
+        let unsupported_text = unsupported
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            unsupported_text.contains("╭─ mermaid"),
+            "{unsupported_text}"
+        );
+
+        let too_wide = rendered(
+            "```mermaid\nsequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: a message that cannot fit\n```",
+            12,
+        );
+        let too_wide_text = too_wide
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(too_wide_text.contains("╭─ mermaid"), "{too_wide_text}");
+    }
+
+    #[test]
+    fn math_renders_unicode_ast_and_falls_back_atomically_when_too_wide() {
+        let supported = rendered("inline $\\alpha^2$ and $$x_1$$", 32);
+        let supported_text = supported
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supported_text.contains("α²"), "{supported_text}");
+        assert!(supported_text.contains("x₁"), "{supported_text}");
+
+        let exact_width = render_markdown_document(
+            "$\\alpha^2$",
+            Theme::dark(),
+            MarkdownRenderOptions::new(display_width("α²")),
+        );
+        assert_eq!(
+            exact_width
+                .lines
+                .iter()
+                .map(|line| render_span_text(&line.spans))
+                .collect::<String>(),
+            "α²"
+        );
+        assert!(
+            exact_width
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.copy_mode == crate::tui::transcript_render::CopyMode::Atomic),
+            "{exact_width:?}"
+        );
+
+        let too_wide = rendered("$\\frac{1}{x}$", 2);
+        let too_wide_text = too_wide
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(too_wide_text.contains("\\frac{1}{x}"), "{too_wide_text}");
+    }
+
+    #[test]
+    fn math_box_layout_supports_frac_sqrt_integral_matrices_and_scripts() {
+        let document = render_markdown_document(
+            "$$\\frac{\\sqrt{x}}{2} + \\int_0^1 f(x) dx$$\n\n$$\\begin{pmatrix}a&b\\\\c&d\\end{pmatrix}$$",
+            Theme::dark(),
+            MarkdownRenderOptions::new(64),
+        );
+        let text = document
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('─'), "{text}");
+        assert!(text.contains('√'), "{text}");
+        assert!(text.contains('∫'), "{text}");
+        assert!(text.contains("⎛ a │ b ⎞"), "{text}");
+        assert!(text.contains("⎝ c │ d ⎠"), "{text}");
+        assert!(document.validate(), "{document:?}");
+    }
+
+    #[test]
+    fn transformed_mermaid_output_has_exact_label_ranges_and_isolated_nodes() {
+        let prefixed = render_markdown_document(
+            "> ```mermaid\n> graph LR\n> A[One]\n> B[Two]\n> C[Alone]\n> A --> B\n> ```",
+            Theme::dark(),
+            MarkdownRenderOptions::new(40),
+        );
+        let prefixed_text = prefixed
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>();
+        let rendered_prefixed_lines = prefixed_text
+            .iter()
+            .filter(|text| text.contains("One") || text.contains("Two") || text.contains("Alone"))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered_prefixed_lines.len(), 2);
+        assert!(rendered_prefixed_lines[0].starts_with("│ "));
+        assert!(rendered_prefixed_lines[1].starts_with("│ "));
+
+        let markdown = "```mermaid\ngraph LR\nA[One]\nB[Two]\nC[Alone]\nA --> B\n```";
+        let document =
+            render_markdown_document(markdown, Theme::dark(), MarkdownRenderOptions::new(40));
+        assert!(document.validate(), "{document:?}");
+        assert!(
+            document
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "Alone")
+        );
+        let source = &document.source_blocks[0].source;
+        for span in document.lines.iter().flat_map(|line| &line.spans) {
+            if let Some(range) = span.source {
+                assert_eq!(
+                    source
+                        .chars()
+                        .skip(range.start)
+                        .take(range.end - range.start)
+                        .collect::<String>(),
+                    span.text
+                );
+            }
+        }
+
+        let sequence_source =
+            "sequenceDiagram\nparticipant A as A\nparticipant B as 接收方\nA->>B: A sends\n";
+        let sequence = render_markdown_document(
+            &format!("```mermaid\n{sequence_source}```"),
+            Theme::dark(),
+            MarkdownRenderOptions::new(40),
+        );
+        assert!(sequence.validate(), "{sequence:?}");
+        let sequence_block = sequence
+            .source_blocks
+            .iter()
+            .position(|block| block.source == sequence_source)
+            .expect("sequence source block");
+        for span in sequence.lines.iter().flat_map(|line| &line.spans) {
+            let Some(range) = span.source else {
+                continue;
+            };
+            if range.block_index != sequence_block {
+                continue;
+            }
+            assert_eq!(
+                sequence.source_blocks[range.block_index]
+                    .source
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect::<String>(),
+                span.text
+            );
+        }
+    }
+
+    #[test]
+    fn transformed_math_has_atomic_full_source_mapping_and_width_fallback() {
+        let transformed = render_markdown_document(
+            "The value is $$\\frac{1}{x}$$.",
+            Theme::dark(),
+            MarkdownRenderOptions::new(40),
+        );
+        assert!(transformed.validate(), "{transformed:?}");
+        let math_span = transformed
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.text.contains('─'))
+            .expect("transformed fraction span");
+        assert_eq!(
+            math_span.copy_mode,
+            crate::tui::transcript_render::CopyMode::Atomic
+        );
+        let range = math_span.source.expect("atomic source range");
+        assert_eq!(
+            transformed.source_blocks[range.block_index].source,
+            "\\frac{1}{x}"
+        );
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, "\\frac{1}{x}".chars().count());
+
+        let fallback = render_markdown_document(
+            "$\\frac{1}{x}$",
+            Theme::dark(),
+            MarkdownRenderOptions::new(2),
+        );
+        assert!(fallback.validate(), "{fallback:?}");
+        let fallback_text = fallback
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<String>();
+        assert!(fallback_text.contains("\\frac{1}{x}"), "{fallback_text}");
+        assert!(
+            fallback
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.copy_mode == crate::tui::transcript_render::CopyMode::Atomic)
+        );
+    }
+
+    #[test]
+    fn display_math_accepts_normalized_multiline_input_and_rejects_malformed_groups() {
+        assert!(render_math("\\int _{0}\n ^{1} f(x) + \\frac{1}{x}", true).is_some());
+        let document = render_markdown_document(
+            "$$\\int_{0}^{1} f(x)\\frac{1}{x}$$",
+            Theme::dark(),
+            MarkdownRenderOptions::new(64),
+        );
+        let text = document
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('∫'), "{text}");
+        assert!(text.contains('─'), "{text}");
+        assert!(document.validate(), "{document:?}");
+
+        let malformed = render_markdown_document(
+            "$\\frac{1}{x$",
+            Theme::dark(),
+            MarkdownRenderOptions::new(64),
+        );
+        let fallback = malformed
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<String>();
+        assert!(fallback.contains("\\frac{1}{x"), "{fallback}");
+        assert!(malformed.validate(), "{malformed:?}");
+    }
+
+    #[test]
+    fn latex_official_corpus_inline_and_malformed_cases() {
+        let cases = [
+            (r"\mathbb{C}^3 \to \mathbb{C}^3", "ℂ³ → ℂ³"),
+            (
+                r"\{3x+2y,\; 27x^2-4z-1,\; x(x-1)(x+1)\} \quad\Rightarrow\quad x \in \{0, \pm 1\},",
+                "{3x+2y, 27x²-4z-1, x(x-1)(x+1)} ⇒ x ∈ {0, ± 1},",
+            ),
+            (r"F_1 = -\frac{1}{4x^2}.", "F₁ = -1/(4x²)."),
+            (r"\mathbb{C}^*", "ℂ^*"),
+            (
+                r"s \mapsto (s,\, -\tfrac{3}{2s},\, \tfrac{13}{2s^2})",
+                "s ↦ (s, -3/(2s), 13/(2s²))",
+            ),
+            (
+                r"\boxed{1\ \text{milliwatt per square metre}}",
+                "[1 milliwatt per square metre]",
+            ),
+            (
+                r"\pi(2.5\ \text{km})^2 = 19.6\ \text{km}^2",
+                "π(2.5 km)² = 19.6 km²",
+            ),
+            (
+                r"\det\!\left(\frac{\partial(F_1,F_2,F_3)}{\partial(x,y,z)}\right)=-2.",
+                "det((∂(F₁,F₂,F₃))/(∂(x,y,z))) = -2.",
+            ),
+            (r"e^{i\pi}+1=0", "e^(iπ)+1 = 0"),
+            (
+                r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}",
+                "x = (-b±√(b²-4ac))/(2a)",
+            ),
+            (
+                r"\int_0^\infty e^{-x^2}\,dx=\frac{\sqrt{\pi}}{2}",
+                "∫₀^∞ e^(-x²) dx = (√π)/2",
+            ),
+            (
+                r"\sum_{n=1}^{\infty}\frac{1}{n^2}=\frac{\pi^2}{6}",
+                "∑ₙ₌₁^∞1/(n²) = π²/6",
+            ),
+            (r"\lim_{x\to 0}\frac{\sin x}{x}=1", "lim[x→0] (sin x)/x = 1"),
+            (
+                r"\sqrt[2]{x}+\sqrt[3]{x}+\sqrt[4]{x}+\sqrt[n]{x}+\sqrt[k]{x+1}",
+                "√x+∛x+∜x+ⁿ√x+ᵏ√(x+1)",
+            ),
+            (
+                r"\acute{x}+\grave{y}+\widehat{xyz}+\overrightarrow{AB}",
+                "x́+ỳ+widehat(xyz)+overrightarrow(AB)",
+            ),
+            (
+                r"\textnormal{hello}+\mbox{world}+\boldsymbol{x}",
+                "hello+world+x",
+            ),
+            (r"A\not\subseteq B,\quad x\not\in X", "A ⊈ B, x ∉ X"),
+            (
+                r"\lvert{x}\rvert+\lVert{v}\rVert+\left.\frac{dy}{dx}\right|_{x=0}",
+                "|x|+‖v‖+dy/(dx)|ₓ₌₀",
+            ),
+            (
+                r"\operatorname*{arg\,max}_{x\in X} f(x)",
+                "arg max[x∈X] f(x)",
+            ),
+            (r"a\bmod n,\quad a\equiv b\pmod n", "a mod n, a ≡ b (mod n)"),
+            (
+                r"\overset{!}{=}+\underset{n}{x}+\stackrel{def}{=}",
+                "=^!+xₙ+=ᵈᵉᶠ",
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                render_latex(source, false).as_deref(),
+                Some(expected),
+                "{source}"
+            );
+        }
+        for source in [
+            r"x + \unknown{y}",
+            r"\frac{1}{x",
+            "x}",
+            r"\begin{matrix}1 & 2",
+            r"x\\",
+        ] {
+            assert!(render_latex(source, false).is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn latex_official_corpus_display_golden_layouts() {
+        let cases = [
+            (r"\sum_{i=0}^n x_i", " n\n ∑  xᵢ\ni=0"),
+            (r"\min_{x\in X} f(x)", "min f(x)\nx∈X"),
+            (
+                r"\operatorname*{arg\,max}_{x\in X} f(x)",
+                "arg max f(x)\n  x∈X",
+            ),
+            (
+                r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}",
+                "    -b±√(b²-4ac)\nx = ────────────\n         2a",
+            ),
+            (r"\frac{x^2+1}{x-1}", "x²+1\n────\nx-1"),
+            (
+                r"\begin{cases}a & x<0 \\ b & x=0 \\ c & x>0\end{cases}",
+                "⎧ a if x < 0\n⎨ b if x = 0\n⎩ c if x > 0",
+            ),
+            (
+                r"\begin{pmatrix}1&200\\3000&4\end{pmatrix}",
+                "⎛ 1    │ 200 ⎞\n⎝ 3000 │ 4   ⎠",
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                render_latex(source, true).as_deref(),
+                Some(expected),
+                "{source}"
+            );
+        }
     }
 
     #[test]

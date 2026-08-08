@@ -22,6 +22,21 @@ impl SourceRange {
             end,
         }
     }
+
+    pub fn validate(self, source: &str) -> bool {
+        self.start < self.end
+            && self.end <= source.chars().count()
+            && is_grapheme_boundary(source, self.start)
+            && is_grapheme_boundary(source, self.end)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyMode {
+    #[default]
+    Exact,
+    /// The source range is copied in full when any visual character is selected.
+    Atomic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,6 +58,8 @@ pub struct Span<S> {
     pub style: S,
     /// `None` marks chrome: labels, borders, padding, badges, and animations.
     pub source: Option<SourceRange>,
+    /// Controls whether selection copies the selected source slice or its full range.
+    pub copy_mode: CopyMode,
     /// Separator inserted before this leaf when copying across distinct sources.
     pub copy_join: CopyJoin,
     /// Semantic local action retained through layout transformations.
@@ -55,6 +72,7 @@ impl<S> Span<S> {
             text: text.into(),
             style,
             source: None,
+            copy_mode: CopyMode::Exact,
             copy_join: CopyJoin::Concat,
             interaction: None,
         }
@@ -81,10 +99,33 @@ impl<S> Span<S> {
         copy_join: CopyJoin,
         interaction: Option<Interaction>,
     ) -> Self {
+        Self::source_with_mode(text, style, source, CopyMode::Exact, copy_join, interaction)
+    }
+
+    pub fn source_atomic(text: impl Into<String>, style: S, source: SourceRange) -> Self {
+        Self::source_with_mode(
+            text,
+            style,
+            source,
+            CopyMode::Atomic,
+            CopyJoin::Concat,
+            None,
+        )
+    }
+
+    pub fn source_with_mode(
+        text: impl Into<String>,
+        style: S,
+        source: SourceRange,
+        copy_mode: CopyMode,
+        copy_join: CopyJoin,
+        interaction: Option<Interaction>,
+    ) -> Self {
         Self {
             text: text.into(),
             style,
             source: Some(source),
+            copy_mode,
             copy_join,
             interaction,
         }
@@ -103,6 +144,7 @@ pub struct SemanticSpan<S> {
     pub text: String,
     pub style: S,
     pub copy: bool,
+    pub copy_mode: CopyMode,
     pub copy_join: CopyJoin,
     pub interaction: Option<Interaction>,
 }
@@ -113,6 +155,7 @@ impl<S> SemanticSpan<S> {
             text: text.into(),
             style,
             copy: false,
+            copy_mode: CopyMode::Exact,
             copy_join: CopyJoin::Concat,
             interaction: None,
         }
@@ -132,10 +175,21 @@ impl<S> SemanticSpan<S> {
         copy_join: CopyJoin,
         interaction: Option<Interaction>,
     ) -> Self {
+        Self::source_with_mode(text, style, CopyMode::Exact, copy_join, interaction)
+    }
+
+    pub fn source_with_mode(
+        text: impl Into<String>,
+        style: S,
+        copy_mode: CopyMode,
+        copy_join: CopyJoin,
+        interaction: Option<Interaction>,
+    ) -> Self {
         Self {
             text: text.into(),
             style,
             copy: true,
+            copy_mode,
             copy_join,
             interaction,
         }
@@ -216,10 +270,11 @@ impl<S> Document<S> {
                 if span.copy && !span.text.is_empty() {
                     let end = span.text.chars().count();
                     let block = self.add_source(span.text.clone());
-                    Span::source_with_interaction(
+                    Span::source_with_mode(
                         span.text,
                         span.style,
                         SourceRange::new(block, 0, end),
+                        span.copy_mode,
                         span.copy_join,
                         span.interaction,
                     )
@@ -286,12 +341,10 @@ impl<S> Document<S> {
                     .source_blocks
                     .get(range.block_index)
                     .is_some_and(|block| {
-                        range.start < range.end
-                            && range.end <= block.source.chars().count()
-                            && is_grapheme_boundary(&block.source, range.start)
-                            && is_grapheme_boundary(&block.source, range.end)
+                        range.validate(&block.source)
                             && !span.text.contains(['\n', '\r'])
-                            && slice_chars(&block.source, range.start, range.end) == span.text
+                            && (span.copy_mode == CopyMode::Atomic
+                                || slice_chars(&block.source, range.start, range.end) == span.text)
                     }),
             })
     }
