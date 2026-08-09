@@ -850,7 +850,7 @@ mod tests {
         assert!(text.contains('●'), "{text}");
         assert!(text.contains('◎'), "{text}");
         assert!(
-            text.contains("│ 等待 │") && text.contains("│ 完成 │"),
+            text.contains("│ 等待  │") && text.contains("│ 完成  │"),
             "{text}"
         );
         assert!(text.contains('▼'), "{text}");
@@ -900,6 +900,16 @@ mod tests {
             !text.lines().any(|line| line.contains("[ 待支付 ]")),
             "{text}"
         );
+        for line in text.lines() {
+            for label in ["支付成功", "超时", "发货", "签收"] {
+                if line.contains(label) {
+                    assert!(
+                        !line.contains('┌') && !line.contains('└') && !line.contains('▼'),
+                        "label overlaps state geometry: {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -926,6 +936,87 @@ mod tests {
             text.contains("section 设计") && text.contains("section 开发"),
             "{text}"
         );
+        assert!(
+            !text.contains("after req") && !text.contains("after ui"),
+            "{text}"
+        );
+        assert!(!text.contains("done") && !text.contains("active"), "{text}");
+    }
+
+    #[test]
+    fn gantt_scales_long_schedules_into_available_width() {
+        let source = concat!(
+            "gantt\n",
+            "title 跨年度产品基础设施交付路线图\n",
+            "dateFormat YYYY-MM-DD\n",
+            "section 产品与基础设施协同交付\n",
+            "基础设施 : done, infra, 2026-01-01, 120d\n",
+            "产品交付 : active, release, after infra, 120d\n",
+        );
+        let rendered = super::super::render(source, 64).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 64);
+        assert!(text.contains("01-01") && text.contains("08-29"), "{text}");
+        assert!(
+            text.lines().all(|line| line.chars().count() <= 64),
+            "{text}"
+        );
+        assert!(!text.contains("2026-01-01, 120d"), "{text}");
+        let first_task = text
+            .lines()
+            .find(|line| line.starts_with("基础设施"))
+            .unwrap();
+        assert!(first_task.matches('=').count() >= 20, "{text}");
+    }
+
+    #[test]
+    fn gantt_rejects_semantically_invalid_dependencies_before_fallback() {
+        for source in [
+            concat!(
+                "gantt\n",
+                "dateFormat YYYY-MM-DD\n",
+                "任务 : task, after missing, 2d\n",
+            ),
+            concat!(
+                "gantt\n",
+                "dateFormat YYYY-MM-DD\n",
+                "任务一 : a, after b, 2d\n",
+                "任务二 : b, after a, 2d\n",
+            ),
+            concat!(
+                "gantt\n",
+                "dateFormat YYYY-MM-DD\n",
+                "任务一 : same, 2026-08-01, 2d\n",
+                "任务二 : same, 2026-08-03, 2d\n",
+            ),
+        ] {
+            assert!(
+                super::super::render(source, 120).is_none(),
+                "accepted {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gantt_unsupported_canvas_semantics_use_exact_linear_fallback() {
+        for source in [
+            concat!(
+                "gantt\n",
+                "dateFormat YYYY-MM-DD\n",
+                "快速任务 : fast, 2026-08-01, 12h\n",
+            ),
+            concat!(
+                "gantt\n",
+                "dateFormat DD/MM/YYYY\n",
+                "任务 : task, 2026-08-01, 2d\n",
+            ),
+        ] {
+            let rendered = super::super::render(source, 120).unwrap();
+            assert_spans_exact(source, &rendered);
+            let text = facade_text(source, 120);
+            assert!(text.contains("2026-08-01"), "{text}");
+            assert!(!text.contains("08-03"), "expected linear fallback:\n{text}");
+        }
     }
 
     #[test]

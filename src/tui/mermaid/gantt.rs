@@ -7,10 +7,22 @@ use crate::tui::measure::display_width;
 use std::collections::{HashMap, HashSet};
 
 const STATUSES: [&str; 4] = ["done", "active", "crit", "milestone"];
+const MIN_TIMELINE_WIDTH: usize = 11;
 
 pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
     let diagram = parse(source)?;
-    if let Some(canvas) = layout(&diagram, width) {
+    let tasks = diagram
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ir::Item::Task(task) => Some(task),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    validate_task_dependencies(&tasks)?;
+    if let Some(positioned) = position_tasks(&tasks)
+        && let Some(canvas) = layout(&diagram, width, &tasks, &positioned)
+    {
         let lines = canvas.render();
         if render_line_count_within_limits(lines.len()) {
             return Some(lines);
@@ -59,26 +71,48 @@ struct PositionedTask {
     end: i64,
 }
 
-fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
-    if diagram.items.iter().any(|item| {
-        matches!(item, ir::Item::Config(config) if config.key == "axisFormat")
-            || matches!(item, ir::Item::Config(config) if config.key == "dateFormat" && config.value.text != "YYYY-MM-DD")
-    }) {
-        return None;
+fn validate_task_dependencies(tasks: &[&ir::Task]) -> Option<()> {
+    let mut ids = HashMap::new();
+    for (index, task) in tasks.iter().enumerate() {
+        if let Some(id) = &task.id
+            && ids.insert(id.text.as_str(), index).is_some()
+        {
+            return None;
+        }
     }
-
-    let tasks = diagram
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ir::Item::Task(task) => Some(task),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if tasks.is_empty() {
-        return None;
+    let mut dependencies = vec![Vec::new(); tasks.len()];
+    for (index, task) in tasks.iter().enumerate() {
+        let (start, end) = task.timing.text.split_once(',')?;
+        for token in [start.trim(), end.trim()] {
+            let referenced = token
+                .strip_prefix("after ")
+                .or_else(|| token.strip_prefix("until "));
+            if let Some(id) = referenced {
+                dependencies[index].push(*ids.get(id.trim())?);
+            }
+        }
     }
+    let mut state = vec![0u8; tasks.len()];
+    fn visit(index: usize, dependencies: &[Vec<usize>], state: &mut [u8]) -> Option<()> {
+        match state[index] {
+            1 => return None,
+            2 => return Some(()),
+            _ => {}
+        }
+        state[index] = 1;
+        for dependency in &dependencies[index] {
+            visit(*dependency, dependencies, state)?;
+        }
+        state[index] = 2;
+        Some(())
+    }
+    for index in 0..tasks.len() {
+        visit(index, &dependencies, &mut state)?;
+    }
+    Some(())
+}
 
+fn position_tasks(tasks: &[&ir::Task]) -> Option<Vec<PositionedTask>> {
     let mut ids = HashMap::new();
     for (index, task) in tasks.iter().enumerate() {
         if let Some(id) = &task.id
@@ -89,51 +123,68 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     }
     let mut resolved = vec![None; tasks.len()];
     for index in 0..tasks.len() {
-        resolve_task(index, &tasks, &ids, &mut resolved, &mut HashSet::new())?;
+        resolve_task(index, tasks, &ids, &mut resolved, &mut HashSet::new())?;
     }
-
-    let positioned = tasks
+    tasks
         .iter()
         .enumerate()
         .map(|(index, _task)| {
             let (start, end) = resolved[index]?;
             Some(PositionedTask { start, end })
         })
-        .collect::<Option<Vec<_>>>()?;
-    let min_day = positioned.iter().map(|task| task.start).min()?;
-    let max_day = positioned.iter().map(|task| task.end).max()?;
-    let timeline_days = usize::try_from(max_day.checked_sub(min_day)?).ok()?;
-    if timeline_days == 0 || timeline_days > width {
+        .collect()
+}
+
+fn layout(
+    diagram: &ir::Diagram,
+    width: usize,
+    tasks: &[&ir::Task],
+    positioned: &[PositionedTask],
+) -> Option<canvas::MermaidCanvas> {
+    if diagram.items.iter().any(|item| {
+        matches!(item, ir::Item::Config(config) if config.key == "axisFormat")
+            || matches!(item, ir::Item::Config(config) if config.key == "dateFormat" && config.value.text != "YYYY-MM-DD")
+    }) {
         return None;
     }
 
-    let title_width = diagram
+    if tasks.is_empty() || tasks.len() != positioned.len() {
+        return None;
+    }
+
+    let min_day = positioned.iter().map(|task| task.start).min()?;
+    let max_day = positioned.iter().map(|task| task.end).max()?;
+    let timeline_days = usize::try_from(max_day.checked_sub(min_day)?).ok()?;
+    if timeline_days == 0 {
+        return None;
+    }
+
+    let header_width = diagram
         .items
         .iter()
         .filter_map(|item| match item {
             ir::Item::Config(config) if config.key == "title" => {
                 Some(6 + display_width(&config.value.text))
             }
+            ir::Item::Section(label) => Some(8 + display_width(&label.text)),
             _ => None,
         })
         .max()
         .unwrap_or(0);
-    let left_width = diagram
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ir::Item::Section(label) => Some(8 + display_width(&label.text)),
-            ir::Item::Task(task) => Some(task_text_width(task)),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-        .max(title_width);
-    let timeline_start = left_width.checked_add(2)?;
-    let total_width = timeline_start.checked_add(timeline_days)?;
-    if total_width > width || total_width == 0 {
+    if header_width > width {
         return None;
     }
+    let left_width = tasks
+        .iter()
+        .map(|task| task_text_width(task))
+        .max()
+        .unwrap_or(0);
+    let timeline_start = left_width.checked_add(3)?;
+    if timeline_start.checked_add(MIN_TIMELINE_WIDTH)? > width {
+        return None;
+    }
+    let timeline_width = width.checked_sub(timeline_start)?;
+    let total_width = timeline_start.checked_add(timeline_width)?;
 
     let mut result = canvas::MermaidCanvas {
         rows: Vec::new(),
@@ -171,13 +222,23 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
                 let task_position = &positioned[index];
                 result.ensure_row(row, total_width);
                 draw_task_text(&mut result, row, task);
-                let start = timeline_start + usize::try_from(task_position.start - min_day).ok()?;
-                let length = usize::try_from(task_position.end - task_position.start)
-                    .ok()?
-                    .max(1);
+                let start = timeline_start
+                    + timeline_boundary_col(
+                        task_position.start,
+                        min_day,
+                        timeline_days,
+                        timeline_width,
+                    )?;
+                let end = timeline_start
+                    + timeline_boundary_col(
+                        task_position.end,
+                        min_day,
+                        timeline_days,
+                        timeline_width,
+                    )?;
                 let marker = status_marker(task.status.as_ref().map(|status| status.text.as_str()));
-                for offset in 0..length {
-                    result.put(start.checked_add(offset)?, row, marker);
+                for col in start..end.max(start + 1).min(total_width) {
+                    result.put(col, row, marker);
                 }
                 row += 1;
             }
@@ -186,7 +247,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     }
 
     result.ensure_row(row, total_width);
-    let axis = format_axis(min_day, max_day, timeline_days);
+    let axis = format_axis(min_day, max_day, timeline_width);
     result.blit(row, timeline_start, &axis);
     Some(result)
 }
@@ -238,55 +299,26 @@ fn resolve_task(
 
 fn task_text_width(task: &ir::Task) -> usize {
     display_width(&task.name.text)
-        + task
-            .status
-            .as_ref()
-            .map_or(0, |status| 3 + display_width(&status.text))
-        + task.id.as_ref().map_or(0, |id| 1 + display_width(&id.text))
-        + 3
-        + display_width(&task.timing.text)
+}
+
+fn timeline_boundary_col(
+    day: i64,
+    min_day: i64,
+    timeline_days: usize,
+    timeline_width: usize,
+) -> Option<usize> {
+    let offset = usize::try_from(day.checked_sub(min_day)?).ok()?;
+    offset
+        .checked_mul(timeline_width)?
+        .checked_div(timeline_days)
 }
 
 fn draw_task_text(canvas: &mut canvas::MermaidCanvas, row: usize, task: &ir::Task) {
-    let mut col = 0;
     canvas.labels.push(canvas::MermaidCanvasLabel {
         row,
-        col,
+        col: 0,
         text: task.name.text.clone(),
         source: task.name.span,
-    });
-    col += display_width(&task.name.text);
-    if let Some(status) = &task.status {
-        canvas.blit(row, col, " [");
-        col += 2;
-        canvas.labels.push(canvas::MermaidCanvasLabel {
-            row,
-            col,
-            text: status.text.clone(),
-            source: status.span,
-        });
-        col += display_width(&status.text);
-        canvas.blit(row, col, "]");
-        col += 1;
-    }
-    if let Some(id) = &task.id {
-        canvas.blit(row, col, " ");
-        col += 1;
-        canvas.labels.push(canvas::MermaidCanvasLabel {
-            row,
-            col,
-            text: id.text.clone(),
-            source: id.span,
-        });
-        col += display_width(&id.text);
-    }
-    canvas.blit(row, col, " : ");
-    col += 3;
-    canvas.labels.push(canvas::MermaidCanvasLabel {
-        row,
-        col,
-        text: task.timing.text.clone(),
-        source: task.timing.span,
     });
 }
 

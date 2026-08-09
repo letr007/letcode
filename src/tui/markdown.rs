@@ -1745,7 +1745,7 @@ mod tests {
             ),
             (
                 "```mermaid\ngantt\ntitle Release plan\ndateFormat YYYY-MM-DD\nsection Client\nImplement renderer : active, render, 2026-08-09, 3d\n```",
-                "Implement renderer [active] render : 2026-08-09, 3d",
+                "Implement renderer",
             ),
             (
                 "```mermaid\nstateDiagram-v2\nstate \"Waiting\" as Waiting\nstate Done\n[*] --> Waiting : start\nWaiting --> Done : finish\nDone --> [*]\n```",

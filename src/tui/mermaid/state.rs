@@ -247,7 +247,20 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
                 + 4 * layer.len().saturating_sub(1)
         })
         .collect::<Vec<_>>();
-    let graph_width = layer_widths.iter().copied().max().unwrap_or(0);
+    let label_clearance = transitions
+        .iter()
+        .filter_map(|transition| transition.label.as_ref())
+        .map(|label| display_width(&label.text).max(1))
+        .max()
+        .map_or(0, |label_width| {
+            label_width.saturating_mul(2).saturating_add(4)
+        });
+    let graph_width = layer_widths
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(label_clearance);
     if graph_width == 0 || graph_width > width {
         return None;
     }
@@ -265,7 +278,8 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
                     == layer - 1
             })
             .count();
-        row_starts[layer] = row_starts[layer - 1] + layer_heights[layer - 1] + edges * 2 + 2;
+        let corridor_height = edges.saturating_mul(2).saturating_add(1);
+        row_starts[layer] = row_starts[layer - 1] + layer_heights[layer - 1] + corridor_height;
     }
 
     let mut canvas = canvas::MermaidCanvas {
@@ -322,16 +336,7 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
                         &format!("└{}┘", "─".repeat(node_width - 2)),
                     );
                 } else {
-                    canvas.blit(
-                        row,
-                        col,
-                        &format!(
-                            "┌{}┐\n│ {} │\n└{}┘",
-                            "─".repeat(node_width - 2),
-                            state.label.text,
-                            "─".repeat(node_width - 2)
-                        ),
-                    );
+                    draw_state_box(&mut canvas, row, col, node_width, &state.label.text);
                     canvas.labels.push(canvas::MermaidCanvasLabel {
                         row: row + 1,
                         col: col + 2,
@@ -345,16 +350,7 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
                         .into_iter()
                         .find(|endpoint| endpoint.text == id)
                 })?;
-                canvas.blit(
-                    row,
-                    col,
-                    &format!(
-                        "┌{}┐\n│ {} │\n└{}┘",
-                        "─".repeat(node_width - 2),
-                        id,
-                        "─".repeat(node_width - 2)
-                    ),
-                );
+                draw_state_box(&mut canvas, row, col, node_width, id);
                 canvas.labels.push(canvas::MermaidCanvasLabel {
                     row: row + 1,
                     col: col + 2,
@@ -394,13 +390,18 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
         routes.connect((to_col, route_row), (to_col, to.row - 1));
         canvas.put(to_col, to.row.saturating_sub(1), '▼');
         if let Some(label) = &transition.label {
-            let label_width = display_width(&label.text);
-            if label_width > graph_width {
-                return None;
-            }
+            let label_width = display_width(&label.text).max(1);
+            let label_col = state_transition_label_col(
+                &routes,
+                label_row,
+                label_width,
+                from_col,
+                to_col,
+                graph_width,
+            )?;
             canvas.labels.push(canvas::MermaidCanvasLabel {
                 row: label_row,
-                col: (graph_width - label_width) / 2,
+                col: label_col,
                 text: label.text.clone(),
                 source: label.span,
             });
@@ -525,7 +526,20 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
                 + 4 * layer.len().saturating_sub(1)
         })
         .collect::<Vec<_>>();
-    let graph_width = layer_widths.iter().copied().max().unwrap_or(0);
+    let label_clearance = transitions
+        .iter()
+        .filter_map(|transition| transition.label.as_ref())
+        .map(|label| display_width(&label.text).max(1))
+        .max()
+        .map_or(0, |label_width| {
+            label_width.saturating_mul(2).saturating_add(4)
+        });
+    let graph_width = layer_widths
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(label_clearance);
     if graph_width == 0 || graph_width > width {
         return None;
     }
@@ -560,7 +574,8 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
                     == layer - 1
             })
             .count();
-        row_starts[layer] = row_starts[layer - 1] + layer_heights[layer - 1] + edges * 2 + 2;
+        let corridor_height = edges.saturating_mul(2).saturating_add(1);
+        row_starts[layer] = row_starts[layer - 1] + layer_heights[layer - 1] + corridor_height;
     }
 
     let mut canvas = canvas::MermaidCanvas {
@@ -594,16 +609,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
             let text = label.map_or(id, |label| label.text.as_str());
             let box_width = display_width(text).max(1) + 4;
             let box_width = box_width + usize::from(box_width.is_multiple_of(2));
-            canvas.blit(
-                row_starts[layer],
-                col,
-                &format!(
-                    "┌{}┐\n│ {} │\n└{}┘",
-                    "─".repeat(box_width - 2),
-                    text,
-                    "─".repeat(box_width - 2)
-                ),
-            );
+            draw_state_box(&mut canvas, row_starts[layer], col, box_width, text);
             if let Some(label) = label {
                 canvas.labels.push(canvas::MermaidCanvasLabel {
                     row: row_starts[layer] + 1,
@@ -656,13 +662,18 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         routes.connect((to_col, route_row), (to_col, to.row - 1));
         canvas.put(to_col, to.row.saturating_sub(1), '▼');
         if let Some(label) = &transition.label {
-            let label_width = display_width(&label.text);
-            if label_width > graph_width {
-                return None;
-            }
+            let label_width = display_width(&label.text).max(1);
+            let label_col = state_transition_label_col(
+                &routes,
+                label_row,
+                label_width,
+                from_col,
+                to_col,
+                graph_width,
+            )?;
             canvas.labels.push(canvas::MermaidCanvasLabel {
                 row: label_row,
-                col: (graph_width - label_width) / 2,
+                col: label_col,
                 text: label.text.clone(),
                 source: label.span,
             });
@@ -677,6 +688,76 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         }
     }
     Some(canvas)
+}
+
+fn draw_state_box(
+    canvas: &mut canvas::MermaidCanvas,
+    row: usize,
+    col: usize,
+    width: usize,
+    text: &str,
+) {
+    let inner_width = width.saturating_sub(2);
+    let text_width = display_width(text);
+    let left = inner_width.saturating_sub(text_width) / 2;
+    let right = inner_width.saturating_sub(text_width + left);
+    canvas.blit(
+        row,
+        col,
+        &format!(
+            "┌{}┐\n│{}{}{}│\n└{}┘",
+            "─".repeat(inner_width),
+            " ".repeat(left),
+            text,
+            " ".repeat(right),
+            "─".repeat(inner_width)
+        ),
+    );
+}
+
+fn state_transition_label_col(
+    routes: &routing::RouteGrid,
+    row: usize,
+    label_width: usize,
+    from_col: usize,
+    to_col: usize,
+    graph_width: usize,
+) -> Option<usize> {
+    if label_width > graph_width {
+        return None;
+    }
+    let span_is_free = |col: usize| {
+        col.checked_add(label_width).is_some_and(|end| {
+            end <= graph_width
+                && (col..end).all(|candidate| !routes.contains_key(&(candidate, row)))
+        })
+    };
+    let horizontal_start = from_col.min(to_col);
+    let horizontal_end = from_col.max(to_col);
+    let preferred = [
+        horizontal_start.checked_sub(label_width + 1),
+        horizontal_end
+            .checked_add(2)
+            .filter(|col| col + label_width <= graph_width),
+    ];
+    for col in preferred.into_iter().flatten() {
+        if span_is_free(col) {
+            return Some(col);
+        }
+    }
+    for distance in 1..graph_width {
+        if let Some(col) = from_col.checked_sub(label_width + distance)
+            && span_is_free(col)
+        {
+            return Some(col);
+        }
+        if let Some(col) = from_col.checked_add(distance)
+            && span_is_free(col)
+        {
+            return Some(col);
+        }
+    }
+    None
 }
 
 fn render_boxed_transitions(
