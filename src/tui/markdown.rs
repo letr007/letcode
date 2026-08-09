@@ -1733,6 +1733,50 @@ mod tests {
     }
 
     #[test]
+    fn mermaid_mindmap_and_timeline_render_and_fallback_cleanly() {
+        for (markdown, expected) in [
+            (
+                "```mermaid\nmindmap\n根🙂\n  branch[标签✅]\n    leaf((详情🚀))\n```",
+                "详情🚀",
+            ),
+            (
+                "```mermaid\ntimeline\n    title 发布计划🙂\n    section 客户端✅\n    2004 : 开始🚀 : 完成\n         : 验收\n```",
+                "验收",
+            ),
+        ] {
+            let document =
+                render_markdown_document(markdown, Theme::dark(), MarkdownRenderOptions::new(60));
+            let text = document
+                .lines
+                .iter()
+                .map(|line| render_span_text(&line.spans))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("╭─ mermaid"), "{text}");
+            assert!(document.validate(), "{document:?}");
+        }
+        let fallback = rendered("```mermaid\nmindmap\nroot\n  child:::class\n```", 60);
+        let text = fallback
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("╭─ mermaid"), "{text}");
+
+        let narrow = rendered(
+            "```mermaid\ntimeline\n    2004 : This event is too wide\n```",
+            16,
+        );
+        let text = narrow
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("╭─ mermaid"), "{text}");
+    }
+
+    #[test]
     fn common_mermaid_families_render_and_fallback_cleanly() {
         let cases = [
             (
@@ -1750,6 +1794,14 @@ mod tests {
             (
                 "```mermaid\nstateDiagram-v2\nstate \"Waiting\" as Waiting\nstate Done\n[*] --> Waiting : start\nWaiting --> Done : finish\nDone --> [*]\n```",
                 "finish",
+            ),
+            (
+                "```mermaid\nmindmap\nRoot\n  Client\n    Renderer\n```",
+                "Renderer",
+            ),
+            (
+                "```mermaid\ntimeline\n    title Release plan\n    section Client\n    2026 : Implement renderer : Ship\n```",
+                "Ship",
             ),
         ];
         for (markdown, expected) in cases {
@@ -1770,6 +1822,8 @@ mod tests {
             "```mermaid\npie\ntitle unsupported\n```",
             "```mermaid\nclassDiagram\nclass A {\n  +x\n```",
             "```mermaid\nstateDiagram\ndirection LR\nA --> B\n```",
+            "```mermaid\nmindmap\nroot\n  child:::class\n```",
+            "```mermaid\ntimeline\n    2026 : event :\n```",
         ] {
             let text = rendered(markdown, 80)
                 .iter()

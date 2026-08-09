@@ -10,11 +10,13 @@ mod flowchart_ir;
 mod flowchart_parser;
 mod gantt;
 mod gantt_ir;
+mod mindmap;
 mod routing;
 mod sequence;
 mod sequence_ir;
 mod state;
 mod state_ir;
+mod timeline;
 
 const MAX_SOURCE_CHARS: usize = 16_384;
 const MAX_SOURCE_LINES: usize = 512;
@@ -77,6 +79,8 @@ pub(crate) fn render(source: &str, width: usize) -> Option<MermaidRender> {
         "classDiagram" => class::render(source, width)?,
         "erDiagram" => er::render(source, width)?,
         "gantt" => gantt::render(source, width)?,
+        "mindmap" => mindmap::render(source, width)?,
+        "timeline" | "timeline LR" => timeline::render(source, width)?,
         "stateDiagram" | "stateDiagram-v2" => state::render(source, width)?,
         header
             if header == "graph TD"

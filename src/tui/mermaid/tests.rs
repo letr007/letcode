@@ -476,6 +476,99 @@ mod tests {
     }
 
     #[test]
+    fn mindmap_and_timeline_render_with_exact_unicode_provenance() {
+        let mindmap = concat!(
+            "mindmap\n",
+            "%% supported comment\n",
+            "根🙂\n",
+            "  branch[标签✅]\n",
+            "    leaf((详情🚀))\n",
+            "  节点[方形]\n",
+            "  cloud)云朵(\n",
+            "  bang))重点((\n",
+            "  other(\"圆形\")\n",
+        );
+        let rendered = super::super::render(mindmap, 40).unwrap();
+        assert_spans_exact(mindmap, &rendered);
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("根🙂"), "{text}");
+        assert!(text.contains("标签✅"), "{text}");
+        assert!(text.contains("详情🚀"), "{text}");
+        assert!(text.contains("方形"), "{text}");
+        assert!(text.contains("云朵"), "{text}");
+        assert!(text.contains("重点"), "{text}");
+
+        let timeline = concat!(
+            "timeline LR\n",
+            "    %% supported comment\n",
+            "    title 发布计划🙂\n",
+            "\n",
+            "    section 客户端✅\n",
+            "    2004: 开始🚀 : 完成于 10:30\n",
+            "         : 验收 : 发布\n",
+        );
+        let rendered = super::super::render(timeline, 50).unwrap();
+        assert_spans_exact(timeline, &rendered);
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("发布计划🙂"), "{text}");
+        assert!(text.contains("10:30"), "{text}");
+        assert!(text.contains("验收"), "{text}");
+        assert!(text.contains("发布"), "{text}");
+
+        let trailing_colon = "timeline\n    2004 : event:\n";
+        let rendered = super::super::render(trailing_colon, 40).unwrap();
+        assert_spans_exact(trailing_colon, &rendered);
+        assert!(facade_text(trailing_colon, 40).contains("event:"));
+    }
+
+    #[test]
+    fn mindmap_and_timeline_fail_closed_for_unsupported_or_narrow_input() {
+        for source in [
+            "mindmap\nroot\n  child:::class\n",
+            "mindmap\nroot\n  `markdown`\n",
+            "mindmap\nroot\n  icon: fa fa-home\n",
+            "mindmap\nroot\n  child[broken)\n",
+            "timeline\n\ttitle invalid\n",
+            "timeline\n    title invalid \n",
+            "timeline\n    section phase\n    title late\n    2004 : event\n",
+            "timeline\n    section Phase A : Event\n    2004 : event\n",
+            "timeline\n    2004 : event :\n",
+            "timeline\n    2004 : event <br> more\n",
+            "timeline\n    2004:Event without separator whitespace\n",
+            "timeline\n    2004 : event\n         :Continuation without whitespace\n",
+            "timeline TD\n    2004 : unsupported direction\n",
+        ] {
+            assert!(
+                super::super::render(source, 80).is_none(),
+                "accepted {source:?}"
+            );
+        }
+        assert!(super::super::render("mindmap\nVeryLongRoot\n", 4).is_none());
+        assert!(super::super::render("timeline\n    2004 : This event is too wide\n", 8).is_none());
+        for source in ["mindmapx\nroot\n", "timelineDiagram\n2026 : event\n"] {
+            assert!(super::super::render(source, 80).is_none());
+        }
+    }
+
+    #[test]
     fn common_diagram_families_render_with_exact_unicode_provenance() {
         let cases = [
             concat!(
@@ -511,6 +604,19 @@ mod tests {
                 "Waiting --> Done : 完成\n",
                 "Done --> [*]\n",
             ),
+            concat!(
+                "mindmap\n",
+                "根🙂\n",
+                "  branch[标签✅]\n",
+                "    leaf((详情🚀))\n",
+            ),
+            concat!(
+                "timeline\n",
+                "    title 发布计划🙂\n",
+                "    section 客户端✅\n",
+                "    2004 : 开始🚀 : 完成\n",
+                "         : 验收\n",
+            ),
         ];
         for source in cases {
             let rendered = super::super::render(source, 120).unwrap_or_else(|| panic!("{source}"));
@@ -530,6 +636,8 @@ mod tests {
             "stateDiagram\nstate \"Missing end as A\n",
             "stateDiagram\ndirection LR\nA --> B\n",
             "stateDiagram\nstate A {\nA --> B\n",
+            "mindmap\nroot\n  child:::class\n",
+            "timeline\n    section Phase A : Event\n    2004 : event\n",
             "pie\ntitle unsupported\n",
         ];
         for source in malformed {
@@ -544,6 +652,8 @@ mod tests {
             "erDiagram\nA {\n  string very_long_attribute\n}\nB {\n  int id\n}\nA ||--|| B : owns\n",
             "gantt\ntitle Very long release plan\n",
             "stateDiagram\nVeryLongStateName --> OtherState\n",
+            "mindmap\nVeryLongRoot\n",
+            "timeline\n    2004 : This event is too wide\n",
         ];
         for source in narrow {
             assert!(super::super::render(source, 4).is_none(), "fit {source:?}");
@@ -557,6 +667,8 @@ mod tests {
             "erDiagram \nA {\n  string id\n}\nB {\n  string id\n}\nA ||--|| B : owns\n",
             "\tgantt\ntitle release\n",
             "stateDiagram-v2  \nA --> B\n",
+            " mindmap\nroot\n",
+            "timeline \n2004 : event\n",
         ] {
             assert!(
                 super::super::render(source, 120).is_none(),
