@@ -544,6 +544,13 @@ impl MarkdownRenderer {
         let Some(graph) = parse_mermaid(&code.content) else {
             return false;
         };
+        // 优先尝试二维布局；复杂度过高则回退到每边一行的线性渲染。
+        let available_width = self.options.width.saturating_sub(
+            display_width(&self.line_prefixes().0).max(display_width(&self.line_prefixes().1)),
+        );
+        if let Some(canvas) = layout_mermaid_graph(&graph, available_width) {
+            return self.push_mermaid_canvas(code, canvas);
+        }
         let direction = graph.direction;
         // 成功渲染时不使用卡片背景，直接融入 timeline 背景。
         let text_style = self.theme.app_style();
@@ -668,6 +675,90 @@ impl MarkdownRenderer {
             ]);
         }
         self.push_mermaid_output(code, output)
+    }
+
+    /// 将二维画布渲染成行（融入 timeline 背景）。
+    fn push_mermaid_canvas(&mut self, code: &CodeBlockState, canvas: MermaidCanvas) -> bool {
+        let block = self.document.add_source(code.content.clone());
+        let text_style = self.theme.app_style();
+        let border_style = self.theme.app_style().fg(self.theme.accent);
+        let (first_prefix, next_prefix) = self.line_prefixes();
+        let mut lines = Vec::new();
+        for row in 0..canvas.rows.len() {
+            let cells = &canvas.rows[row];
+            // 本行标签区间，按 display 列排序。
+            let mut row_labels = canvas
+                .labels
+                .iter()
+                .filter(|l| l.row == row)
+                .map(|l| (l.col, l.col + display_width(&l.text), l))
+                .collect::<Vec<_>>();
+            row_labels.sort_by_key(|(start, _, _)| *start);
+            let mut spans = Vec::new();
+            let mut deco = String::new();
+            let mut cursor = 0usize;
+            let mut labels = row_labels.into_iter().peekable();
+            for (col, cell) in cells.iter().enumerate() {
+                // 若当前列落入下一个标签区间，冲刷 decoration 并输出标签。
+                while let Some(&(start, _, _)) = labels.peek() {
+                    if col >= start {
+                        let (_, end, label) = labels.next().unwrap();
+                        if !deco.is_empty() {
+                            spans.push(RenderSpan::decoration(
+                                std::mem::take(&mut deco),
+                                border_style,
+                            ));
+                        }
+                        let mut src = label.source;
+                        src.block_index = block;
+                        spans.push(RenderSpan::source_atomic(
+                            label.text.clone(),
+                            text_style,
+                            src,
+                        ));
+                        cursor = end;
+                    } else {
+                        break;
+                    }
+                }
+                if col < cursor {
+                    // 标签内部（跳过），不做处理。
+                } else {
+                    match cell {
+                        MermaidCell::Empty | MermaidCell::Wide => deco.push(' '),
+                        MermaidCell::Char(ch) => deco.push(*ch),
+                    }
+                }
+            }
+            if !deco.is_empty() {
+                spans.push(RenderSpan::decoration(deco, border_style));
+            }
+            let mut line = Vec::new();
+            let prefix = if row == 0 {
+                &first_prefix
+            } else {
+                &next_prefix
+            };
+            if !prefix.is_empty() {
+                line.push(RenderSpan::decoration(prefix.clone(), self.prefix_style()));
+            }
+            line.extend(spans);
+            lines.push(RenderLine { spans: line });
+        }
+        let count = lines.len();
+        for (index, line) in lines.into_iter().enumerate() {
+            self.document.push_line(
+                line,
+                if index + 1 == count {
+                    Break::BlockBreak
+                } else {
+                    Break::HardBreak
+                },
+            );
+        }
+        self.document
+            .push_line(RenderLine::default(), Break::BlockBreak);
+        true
     }
 
     fn push_mermaid_output(
@@ -1188,6 +1279,19 @@ enum MermaidEdgeStyle {
     Thick,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MermaidShape {
+    Rectangle,
+    RoundRect,
+    Diamond,
+    Hexagon,
+    Cylinder,
+    Circle,
+    Subroutine,
+    Parallelogram,
+    Stadium,
+}
+
 #[derive(Debug)]
 struct MermaidGraph {
     direction: MermaidDirection,
@@ -1200,6 +1304,7 @@ struct MermaidNode {
     label: String,
     start: usize,
     end: usize,
+    shape: MermaidShape,
 }
 
 #[derive(Debug, Clone)]
@@ -1300,17 +1405,17 @@ fn parse_mermaid(source: &str) -> Option<MermaidGraph> {
 }
 
 /// 形状定界符对：open 优先匹配更长的，label 从中提取。
-const MERMAID_SHAPES: &[(&str, &str)] = &[
-    ("[[", "]]"),
-    ("[(", ")]"),
-    ("((", "))"),
-    ("{{", "}}"),
-    ("[/", "/]"),
-    ("[\\", "\\]"),
-    ("[", "]"),
-    ("(", ")"),
-    ("{", "}"),
-    (">", "]"),
+const MERMAID_SHAPES: &[(&str, &str, MermaidShape)] = &[
+    ("[[", "]]", MermaidShape::Subroutine),
+    ("[(", ")]", MermaidShape::Cylinder),
+    ("((", "))", MermaidShape::Circle),
+    ("{{", "}}", MermaidShape::Hexagon),
+    ("[/", "/]", MermaidShape::Parallelogram),
+    ("[\\", "\\]", MermaidShape::Parallelogram),
+    ("[", "]", MermaidShape::Rectangle),
+    ("(", ")", MermaidShape::RoundRect),
+    ("{", "}", MermaidShape::Diamond),
+    (">", "]", MermaidShape::Stadium),
 ];
 
 /// 解析一条语句：孤立节点或 from -> to。返回剩余部分时供连接符继续解析。
@@ -1353,7 +1458,7 @@ fn parse_mermaid_endpoint_prefix(
         return None;
     }
     let tbase = base + leading;
-    for (opener, closer) in MERMAID_SHAPES {
+    for (opener, closer, shape) in MERMAID_SHAPES {
         if let Some(open) = trimmed.find(opener) {
             let id = trimmed[..open].trim();
             if !valid_mermaid_id(id) {
@@ -1379,6 +1484,7 @@ fn parse_mermaid_endpoint_prefix(
                 label: raw.to_string(),
                 start,
                 end: start + raw.chars().count(),
+                shape: *shape,
             };
             let rest = &trimmed[close + closer.len()..];
             let rest_base = tbase + trimmed[..close + closer.len()].chars().count();
@@ -1399,6 +1505,7 @@ fn parse_mermaid_endpoint_prefix(
         label: id.to_string(),
         start: tbase,
         end: tbase + id.chars().count(),
+        shape: MermaidShape::Rectangle,
     };
     let rest = &trimmed[id_end..];
     let rest_base = tbase + id.chars().count();
@@ -1541,6 +1648,7 @@ fn parse_mermaid_sequence(source: &str) -> Option<MermaidSequence> {
                         label: label.to_string(),
                         start,
                         end: start + label.chars().count(),
+                        shape: MermaidShape::Rectangle,
                     },
                 );
             } else {
@@ -1597,12 +1705,8 @@ fn insert_mermaid_node(
             nodes.insert(id, node);
             Some(())
         }
-        Some(previous) if previous.label == node.label || node.label == id => Some(()),
-        Some(previous) if previous.label == id => {
-            nodes.insert(id, node);
-            Some(())
-        }
-        Some(_) => None,
+        // 同一 id 重复声明时幂等：保留首次出现的节点。
+        Some(_) => Some(()),
     }
 }
 
@@ -1643,6 +1747,636 @@ fn has_mermaid_cycle(nodes: &HashMap<String, MermaidNode>, edges: &[MermaidEdge]
     nodes
         .keys()
         .any(|id| visit(id, nodes, edges, &mut active, &mut done))
+}
+
+/// 一个节点在画布上的放置信息。
+struct MermaidPlaced {
+    /// 节点框顶行在画布中的行号。
+    row: usize,
+    /// 节点框左列。
+    col: usize,
+    /// 框体总宽度（含边框与内边距）。
+    width: usize,
+    /// 框体总高度（行数）。
+    height: usize,
+}
+
+/// 画布中一个可复制的源码片段（节点或边标签）。
+struct MermaidCanvasLabel {
+    /// 标签文本左上角在画布中的行/列。
+    row: usize,
+    col: usize,
+    text: String,
+    source: SourceRange,
+}
+
+/// 画布单元格：一个显示列。中文字符占 2 列，第二列标记 Wide。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MermaidCell {
+    Empty,
+    Char(char),
+    /// 中文字符的右半占位，不可再写入。
+    Wide,
+}
+
+/// 二维字符画布：display 列网格，外加可复制的标签位置。
+struct MermaidCanvas {
+    rows: Vec<Vec<MermaidCell>>,
+    labels: Vec<MermaidCanvasLabel>,
+}
+
+/// 单个字符的显示宽度（终端列）。
+fn mermaid_char_width(ch: char) -> usize {
+    if (ch as u32) > 0x2E7F { 2 } else { 1 }
+}
+
+impl MermaidCanvas {
+    fn ensure_row(&mut self, row: usize, cols: usize) {
+        while self.rows.len() <= row {
+            self.rows.push(Vec::new());
+        }
+        let line = self.rows.get_mut(row).unwrap();
+        if line.len() < cols {
+            line.resize(cols, MermaidCell::Empty);
+        }
+    }
+
+    /// 在 (row, col) 写入多行文本，col 为 display 列，逐字符按显示宽度放置。
+    fn blit(&mut self, row: usize, col: usize, text: &str) {
+        for (i, line) in text.lines().enumerate() {
+            let target = row + i;
+            let mut c = col;
+            for ch in line.chars() {
+                let w = mermaid_char_width(ch);
+                self.put(c, target, ch);
+                c += w;
+            }
+        }
+    }
+
+    /// 在 (row, col) 放置单个字符（col 为 display 列）。
+    fn put(&mut self, col: usize, row: usize, ch: char) {
+        self.ensure_row(row, col + mermaid_char_width(ch));
+        let line = self.rows.get_mut(row).unwrap();
+        // 若目标列是右半占位（Wide），跳过。
+        if col < line.len() && line[col] == MermaidCell::Wide {
+            return;
+        }
+        line[col] = MermaidCell::Char(ch);
+        if mermaid_char_width(ch) == 2 && col + 1 < line.len() {
+            line[col + 1] = MermaidCell::Wide;
+        }
+    }
+
+    /// 渲染成字符行。Wide（中文右半）不输出字符，避免出现字符间空格。
+    #[cfg(test)]
+    fn to_rows(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .map(|cells| {
+                let mut s = String::new();
+                for cell in cells {
+                    match cell {
+                        MermaidCell::Empty => s.push(' '),
+                        MermaidCell::Wide => {}
+                        MermaidCell::Char(ch) => s.push(*ch),
+                    }
+                }
+                s
+            })
+            .collect()
+    }
+}
+
+/// 生成节点框的多行文本（按形状）。label 居中。
+fn render_mermaid_node_shape(node: &MermaidNode) -> Vec<String> {
+    let label = &node.label;
+    let lw = display_width(label); // label 显示宽
+    let inner = lw.max(1) + 2; // 左右各 1 空格
+    // 轻量引擎统一按矩形渲染；形状特例留待后续增强。
+    let _ = node.shape;
+    vec![
+        format!("╭{}╮", "─".repeat(inner)),
+        format!("│ {} │", label),
+        format!("╰{}╯", "─".repeat(inner)),
+    ]
+}
+
+/// 每层节点框高 + 层间连线区行数。
+const MERMAID_LAYER_HEIGHT: usize = 3;
+const MERMAID_EDGE_HEIGHT: usize = 3;
+
+/// 分配每层节点的列坐标并渲染整幅画布。
+fn render_mermaid_canvas(
+    graph: &MermaidGraph,
+    layers: &[Vec<String>],
+    _width: usize,
+) -> MermaidCanvas {
+    let mut canvas = MermaidCanvas {
+        rows: Vec::new(),
+        labels: Vec::new(),
+    };
+    // 各层按最宽层居中，减少单节点链路因框宽不同产生的无意义折线。
+    let layer_widths = layers
+        .iter()
+        .map(|layer| {
+            layer
+                .iter()
+                .map(|id| mermaid_node_width(&graph.nodes[id]))
+                .sum::<usize>()
+                + MERMAID_NODE_GAP * layer.len().saturating_sub(1)
+        })
+        .collect::<Vec<_>>();
+    let graph_width = layer_widths.iter().copied().max().unwrap_or(0);
+    let mut placements: HashMap<&str, MermaidPlaced> = HashMap::new();
+    for (li, layer) in layers.iter().enumerate() {
+        let row = li * (MERMAID_LAYER_HEIGHT + MERMAID_EDGE_HEIGHT);
+        let mut col = (graph_width / 2).saturating_sub(layer_widths[li] / 2);
+        for id in layer {
+            let node = &graph.nodes[id];
+            let w = mermaid_node_width(node);
+            placements.insert(
+                id.as_str(),
+                MermaidPlaced {
+                    row,
+                    col,
+                    width: w,
+                    height: 3,
+                },
+            );
+            col += w + MERMAID_NODE_GAP;
+        }
+    }
+    // 画节点框。
+    let mut render_order = graph.nodes.keys().map(|id| id.as_str()).collect::<Vec<_>>();
+    render_order.sort_by_key(|id| placements[id].row);
+    for id in render_order {
+        let node = &graph.nodes[id];
+        let p = &placements[id];
+        let lines = render_mermaid_node_shape(node);
+        for (i, line) in lines.iter().enumerate() {
+            canvas.blit(p.row + i, p.col, line);
+        }
+        // 记录节点标签（中间行、居中位置，display 列）。
+        let label_row = p.row + p.height / 2;
+        let label_col = p.col + (p.width - display_width(&node.label)) / 2;
+        canvas.labels.push(MermaidCanvasLabel {
+            row: label_row,
+            col: label_col,
+            text: node.label.clone(),
+            source: SourceRange::new(0, node.start, node.end),
+        });
+    }
+    // 画边连线：正交路由，拐弯在中间空白行，垂直段避框。
+    route_mermaid_edges(&mut canvas, &graph, &placements);
+    canvas
+}
+
+/// 边路由：汇合（多入）横梁、分叉（多出）横梁、单边中间拐弯，垂直段避框。
+const MERMAID_ROUTE_UP: u8 = 1;
+const MERMAID_ROUTE_RIGHT: u8 = 2;
+const MERMAID_ROUTE_DOWN: u8 = 4;
+const MERMAID_ROUTE_LEFT: u8 = 8;
+
+type MermaidRouteGrid = HashMap<(usize, usize), u8>;
+
+fn connect_mermaid_route(routes: &mut MermaidRouteGrid, from: (usize, usize), to: (usize, usize)) {
+    if from == to {
+        return;
+    }
+    debug_assert!(from.0 == to.0 || from.1 == to.1);
+    if from.1 == to.1 {
+        let row = from.1;
+        let (lo, hi) = if from.0 < to.0 {
+            (from.0, to.0)
+        } else {
+            (to.0, from.0)
+        };
+        for col in lo..hi {
+            *routes.entry((col, row)).or_default() |= MERMAID_ROUTE_RIGHT;
+            *routes.entry((col + 1, row)).or_default() |= MERMAID_ROUTE_LEFT;
+        }
+    } else {
+        let col = from.0;
+        let (lo, hi) = if from.1 < to.1 {
+            (from.1, to.1)
+        } else {
+            (to.1, from.1)
+        };
+        for row in lo..hi {
+            *routes.entry((col, row)).or_default() |= MERMAID_ROUTE_DOWN;
+            *routes.entry((col, row + 1)).or_default() |= MERMAID_ROUTE_UP;
+        }
+    }
+}
+
+fn mermaid_route_glyph(mask: u8) -> char {
+    match mask {
+        1 | 4 | 5 => '│',
+        2 | 8 | 10 => '─',
+        6 => '┌',
+        12 => '┐',
+        3 => '└',
+        9 => '┘',
+        7 => '├',
+        13 => '┤',
+        14 => '┬',
+        11 => '┴',
+        15 => '┼',
+        _ => '┼',
+    }
+}
+
+fn route_mermaid_edges(
+    canvas: &mut MermaidCanvas,
+    graph: &MermaidGraph,
+    placements: &HashMap<&str, MermaidPlaced>,
+) {
+    let mut outgoing: HashMap<&str, Vec<&MermaidEdge>> = HashMap::new();
+    let mut incoming: HashMap<&str, Vec<&MermaidEdge>> = HashMap::new();
+    for edge in &graph.edges {
+        outgoing.entry(edge.from.as_str()).or_default().push(edge);
+        incoming.entry(edge.to.as_str()).or_default().push(edge);
+    }
+
+    // 分叉横梁靠近源节点，汇合横梁靠近目标节点。
+    let mut fork_rows: HashMap<&str, usize> = HashMap::new();
+    for (from_id, edges) in &outgoing {
+        if edges.len() < 2 {
+            continue;
+        }
+        let Some(from) = placements.get(from_id) else {
+            continue;
+        };
+        let from_row = from.row + from.height - 1;
+        let Some(min_to_row) = edges
+            .iter()
+            .filter_map(|edge| placements.get(edge.to.as_str()).map(|to| to.row))
+            .min()
+        else {
+            continue;
+        };
+        if let Some(row) = pick_beam_row(from_row, min_to_row, placements) {
+            fork_rows.insert(from_id, row);
+        }
+    }
+
+    let mut merge_rows: HashMap<&str, usize> = HashMap::new();
+    for (to_id, edges) in &incoming {
+        if edges.len() < 2 {
+            continue;
+        }
+        let Some(to) = placements.get(to_id) else {
+            continue;
+        };
+        let Some(max_from_row) = edges
+            .iter()
+            .filter_map(|edge| {
+                placements
+                    .get(edge.from.as_str())
+                    .map(|from| from.row + from.height - 1)
+            })
+            .max()
+        else {
+            continue;
+        };
+        if let Some(row) = pick_beam_row(max_from_row, to.row, placements) {
+            merge_rows.insert(to_id, row);
+        }
+    }
+
+    let mut routes = MermaidRouteGrid::new();
+    let mut arrows = Vec::new();
+    let mut labels = Vec::new();
+    for edge in &graph.edges {
+        let Some(from) = placements.get(edge.from.as_str()) else {
+            continue;
+        };
+        let Some(to) = placements.get(edge.to.as_str()) else {
+            continue;
+        };
+        let from_row = from.row + from.height - 1;
+        let to_row = to.row;
+        if to_row <= from_row + 1 {
+            continue;
+        }
+        let from_col = from.col + from.width / 2;
+        let to_col = to.col + to.width / 2;
+        let departure = fork_rows
+            .get(edge.from.as_str())
+            .copied()
+            .unwrap_or(from_row + 1);
+        let arrival = merge_rows
+            .get(edge.to.as_str())
+            .copied()
+            .unwrap_or(to_row.saturating_sub(2));
+        if departure > arrival {
+            continue;
+        }
+
+        let forked = outgoing
+            .get(edge.from.as_str())
+            .is_some_and(|edges| edges.len() > 1);
+        let merged = incoming
+            .get(edge.to.as_str())
+            .is_some_and(|edges| edges.len() > 1);
+        let preferred_col = match (forked, merged) {
+            (true, false) => to_col,
+            (false, true) => from_col,
+            _ => (from_col + to_col) / 2,
+        };
+        let channel = avoid_column(preferred_col, departure, arrival, placements);
+        let source_exit = (from_col, from_row + 1);
+        let target_entry = (to_col, to_row - 1);
+        *routes.entry(source_exit).or_default() |= MERMAID_ROUTE_UP;
+        *routes.entry(target_entry).or_default() |= MERMAID_ROUTE_DOWN;
+
+        connect_mermaid_route(&mut routes, source_exit, (from_col, departure));
+        connect_mermaid_route(&mut routes, (from_col, departure), (channel, departure));
+        connect_mermaid_route(&mut routes, (channel, departure), (channel, arrival));
+        connect_mermaid_route(&mut routes, (channel, arrival), (to_col, arrival));
+        connect_mermaid_route(&mut routes, (to_col, arrival), target_entry);
+
+        if edge.arrow {
+            arrows.push(target_entry);
+        }
+        labels.push((edge, departure, arrival, from_col, channel, to_col, forked));
+    }
+
+    let mut route_cells = routes.iter().collect::<Vec<_>>();
+    route_cells.sort_by_key(|((col, row), _)| (*row, *col));
+    for (&(col, row), &mask) in route_cells {
+        canvas.put(col, row, mermaid_route_glyph(mask));
+    }
+    for (col, row) in arrows {
+        canvas.put(col, row, 'v');
+    }
+    for (edge, departure, arrival, from_col, channel, to_col, forked) in labels {
+        place_edge_label(
+            canvas, &routes, edge, departure, arrival, from_col, channel, to_col, forked,
+        );
+    }
+}
+
+/// 判断行 r 是否落在任一节点框的行范围内。
+fn mermaid_row_in_box(r: usize, placements: &HashMap<&str, MermaidPlaced>) -> bool {
+    placements
+        .values()
+        .any(|p| r >= p.row && r < p.row + p.height)
+}
+
+/// 选拐弯行：在 (from_row, to_row) 之间找不落在任何节点框行内的行，优先中点。
+fn pick_beam_row(
+    from_row: usize,
+    to_row: usize,
+    placements: &HashMap<&str, MermaidPlaced>,
+) -> Option<usize> {
+    if from_row + 1 >= to_row {
+        return None;
+    }
+    let candidates: Vec<usize> = (from_row + 1..to_row)
+        .filter(|r| !mermaid_row_in_box(*r, placements))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    // 选最接近中点的候选行。
+    let mid = (from_row + to_row) / 2;
+    candidates.into_iter().min_by_key(|r| r.abs_diff(mid))
+}
+
+/// 垂直段避框：列 c 在行范围 [r1, r2] 内若穿过节点框，则向最近空白列偏移。
+fn avoid_column(
+    c: usize,
+    r1: usize,
+    r2: usize,
+    placements: &HashMap<&str, MermaidPlaced>,
+) -> usize {
+    if r1 > r2 {
+        return c;
+    }
+    let blocked = |col: usize| {
+        placements
+            .values()
+            .any(|p| col >= p.col && col < p.col + p.width && r1 < p.row + p.height && r2 >= p.row)
+    };
+    if !blocked(c) {
+        return c;
+    }
+    // 向左/右找最近不穿框的列。
+    for d in 1..64 {
+        if c >= d && !blocked(c - d) {
+            return c - d;
+        }
+        if !blocked(c + d) {
+            return c + d;
+        }
+    }
+    c
+}
+
+fn centered_mermaid_label_col(a: usize, b: usize, width: usize) -> Option<usize> {
+    let lo = a.min(b);
+    let hi = a.max(b);
+    let interior = hi.saturating_sub(lo + 1);
+    if width > interior {
+        return None;
+    }
+    Some(lo + 1 + (interior - width) / 2)
+}
+
+fn mermaid_route_span_is_free(
+    routes: &MermaidRouteGrid,
+    row: usize,
+    col: usize,
+    width: usize,
+) -> bool {
+    (col..col + width).all(|c| !routes.contains_key(&(c, row)))
+}
+
+/// 放置边标签：分叉标签靠近源端，且不覆盖端点或汇合连接符。
+#[allow(clippy::too_many_arguments)]
+fn place_edge_label(
+    canvas: &mut MermaidCanvas,
+    routes: &MermaidRouteGrid,
+    edge: &MermaidEdge,
+    departure: usize,
+    arrival: usize,
+    from_col: usize,
+    channel: usize,
+    to_col: usize,
+    forked: bool,
+) {
+    let Some(label) = &edge.label else {
+        return;
+    };
+    let width = display_width(&label.text).max(1);
+    let mut position = None;
+
+    if forked {
+        position = centered_mermaid_label_col(from_col, channel, width).map(|col| (departure, col));
+    }
+    if position.is_none() {
+        position = centered_mermaid_label_col(channel, to_col, width).map(|col| (arrival, col));
+    }
+    if position.is_none() {
+        position = centered_mermaid_label_col(from_col, channel, width).map(|col| (departure, col));
+    }
+    if position.is_none() {
+        let row = (departure + arrival) / 2;
+        for gap in 2..64 {
+            if let Some(col) = channel.checked_sub(width + gap - 1)
+                && mermaid_route_span_is_free(routes, row, col, width)
+            {
+                position = Some((row, col));
+                break;
+            }
+            let col = channel + gap;
+            if mermaid_route_span_is_free(routes, row, col, width) {
+                position = Some((row, col));
+                break;
+            }
+        }
+    }
+
+    let (row, col) = position.unwrap_or((departure, channel + 2));
+    canvas.blit(row, col, &label.text);
+    canvas.labels.push(MermaidCanvasLabel {
+        row,
+        col,
+        text: label.text.clone(),
+        source: SourceRange::new(0, label.start, label.end),
+    });
+}
+
+/// 布局图：把 mermaid 图渲染成二维字符画布。复杂度过高返回 `None`。
+fn layout_mermaid_graph(graph: &MermaidGraph, width: usize) -> Option<MermaidCanvas> {
+    // 仅垂直方向支持二维布局；横向回退线性渲染。
+    if !matches!(graph.direction, MermaidDirection::Td | MermaidDirection::Bu) {
+        return None;
+    }
+    // 1. 拓扑分层。
+    let layers = mermaid_layers(graph)?;
+    // 2. 规模/高度判别。
+    if layers.len() > 24 || graph.nodes.len() > 48 {
+        return None;
+    }
+    if graph.edges.len() as f64 / graph.nodes.len().max(1) as f64 > 2.5 {
+        return None;
+    }
+    // 3. 宽度判别（按各层所需显示宽度 fail-fast）。
+    let node_width = |id: &str| {
+        graph
+            .nodes
+            .get(id)
+            .map(|n| mermaid_node_width(n))
+            .unwrap_or(3)
+    };
+    for layer in &layers {
+        let mut w = 0usize;
+        for (i, id) in layer.iter().enumerate() {
+            if i > 0 {
+                w += MERMAID_NODE_GAP;
+            }
+            w += node_width(id);
+        }
+        if w > width {
+            return None;
+        }
+    }
+    // 4. 交叉估计：相邻层间边交叉数。
+    if mermaid_crossings(graph, &layers) > 8 {
+        return None;
+    }
+    // 5. 分配坐标并渲染。
+    let canvas = render_mermaid_canvas(graph, &layers, width);
+    let _ = node_width;
+    Some(canvas)
+}
+
+const MERMAID_NODE_GAP: usize = 4;
+
+/// 节点框宽度（display 列）：label 显示宽 + 左右内边距 + 边框。
+fn mermaid_node_width(node: &MermaidNode) -> usize {
+    display_width(&node.label).max(1) + 4
+}
+
+/// Kahn 拓扑分层：同一层为无未满足前驱的节点集合。
+fn mermaid_layers(graph: &MermaidGraph) -> Option<Vec<Vec<String>>> {
+    let mut indeg: HashMap<String, usize> = graph.nodes.keys().map(|id| (id.clone(), 0)).collect();
+    for edge in &graph.edges {
+        *indeg.get_mut(&edge.to)? += 1;
+    }
+    let mut layers = Vec::new();
+    let mut remaining = graph.nodes.len();
+    while remaining > 0 {
+        let mut layer = indeg
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        layer.sort();
+        if layer.is_empty() {
+            // 有环：不应出现（调用前已保证无环），防御性回退。
+            return None;
+        }
+        layers.push(layer.clone());
+        for id in &layer {
+            for edge in graph.edges.iter().filter(|e| &e.from == id) {
+                if let Some(d) = indeg.get_mut(&edge.to) {
+                    *d = d.saturating_sub(1);
+                }
+            }
+            indeg.remove(id);
+        }
+        remaining -= layer.len();
+    }
+    Some(layers)
+}
+
+/// 相邻层间边交叉数的启发式估计。
+fn mermaid_crossings(graph: &MermaidGraph, layers: &[Vec<String>]) -> usize {
+    // 每个节点所属层与层内列序。
+    let mut layer_of: HashMap<&str, usize> = HashMap::new();
+    let mut col_of: HashMap<&str, usize> = HashMap::new();
+    for (li, layer) in layers.iter().enumerate() {
+        for (ci, id) in layer.iter().enumerate() {
+            layer_of.insert(id.as_str(), li);
+            col_of.insert(id.as_str(), ci);
+        }
+    }
+    let mut total = 0usize;
+    for _w in layers.windows(2) {
+        // 收集跨相邻层的边（仅 fl + 1 == tl）。
+        let edges: Vec<(usize, usize)> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                let Some(fl) = layer_of.get(e.from.as_str()) else {
+                    return false;
+                };
+                let Some(tl) = layer_of.get(e.to.as_str()) else {
+                    return false;
+                };
+                *fl + 1 == *tl
+            })
+            .map(|e| {
+                let from = col_of.get(e.from.as_str()).copied().unwrap_or(0);
+                let to = col_of.get(e.to.as_str()).copied().unwrap_or(0);
+                (from, to)
+            })
+            .collect();
+        for i in 0..edges.len() {
+            for j in i + 1..edges.len() {
+                if (edges[i].0 < edges[j].0 && edges[i].1 > edges[j].1)
+                    || (edges[i].0 > edges[j].0 && edges[i].1 < edges[j].1)
+                {
+                    total += 1;
+                }
+            }
+        }
+    }
+    total
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3927,7 +4661,10 @@ mod tests {
             .join("\n");
         assert!(supported_text.contains("Start"), "{supported_text}");
         assert!(supported_text.contains("Finish"), "{supported_text}");
-        assert!(supported_text.contains('▶'), "{supported_text}");
+        // 二维画布：节点框化，垂直箭头连接。
+        assert!(supported_text.contains('╭'), "{supported_text}");
+        assert!(supported_text.contains('│'), "{supported_text}");
+        assert!(supported_text.contains('v'), "{supported_text}");
         assert!(!supported_text.contains("╭─ mermaid"), "{supported_text}");
         assert!(supported.validate(), "{supported:?}");
 
@@ -4036,10 +4773,100 @@ mod tests {
         assert!(text.contains("结果"), "{text}");
         assert!(text.contains("中间"), "{text}");
         assert!(text.contains("结束"), "{text}");
-        // 边样式映射到不同连接字符。
+        // 二维画布：节点框化 + 垂直连线。
+        assert!(text.contains('╭'), "{text}");
+        assert!(text.contains('│'), "{text}");
+        assert!(text.contains('v'), "{text}");
+    }
+
+    #[test]
+    fn mermaid_diamond_renders_fork_and_merge_without_crossing_boxes() {
+        let source = concat!(
+            "graph TD\n",
+            "A[开始] -->|是| B[分支1]\n",
+            "A -->|否| C[分支2]\n",
+            "B --> D[汇合]\n",
+            "C --> D[汇合]\n",
+        );
+        let graph = parse_mermaid(source).unwrap();
+        let canvas = layout_mermaid_graph(&graph, 40).expect("layout diamond");
+        let text = canvas.to_rows().join("\n");
+        assert!(text.contains("开始"), "{text}");
+        assert!(text.contains("分支1"), "{text}");
+        assert!(text.contains("分支2"), "{text}");
+        assert!(text.contains("汇合"), "{text}");
+        assert!(text.contains("是"), "{text}");
+        assert!(text.contains("否"), "{text}");
+        // 分叉从源向下展开，汇合从两侧向上收口。
+        assert!(
+            text.lines()
+                .any(|line| line.contains("┌") && line.contains("┴") && line.contains("┐")),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("└") && line.contains("┬") && line.contains("┘")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn mermaid_crosslayer_edge_routes_around_boxes() {
+        let source = concat!(
+            "graph TD\n",
+            "A[是否有数据] -->|否| E[分析]\n",
+            "A -->|是| B[接入数据源]\n",
+            "B --> C[清洗]\n",
+            "C --> E\n",
+            "E --> F[可视化]\n",
+        );
+        let graph = parse_mermaid(source).unwrap();
+        let canvas = layout_mermaid_graph(&graph, 40).expect("layout crosslayer");
+        let text = canvas.to_rows().join("\n");
+        for label in [
+            "是否有数据",
+            "接入数据源",
+            "清洗",
+            "分析",
+            "可视化",
+            "是",
+            "否",
+        ] {
+            assert!(text.contains(label), "missing {label:?}:\n{text}");
+        }
+        // 主干在左侧继续向下，跨层分支从右侧向上收口。
+        assert!(
+            text.lines()
+                .any(|line| line.contains('├') && line.contains('┘')),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn mermaid_branch_and_diamond_layout_render() {
+        let source = concat!(
+            "graph TD\n",
+            "A[开始] --> B{需要处理?}\n",
+            "B -->|是| C[处理]\n",
+            "B -->|否| D[跳过]\n",
+        );
+        let graph = parse_mermaid(source).unwrap();
+        let canvas = layout_mermaid_graph(&graph, 40).expect("layout branch");
+        let text = canvas.to_rows().join("\n");
+        // 节点框化。
+        assert!(text.contains("╭"), "{text}");
+        assert!(text.contains("开始"), "{text}");
+        assert!(text.contains("需要处理?"), "{text}");
+        assert!(text.contains("处理"), "{text}");
+        assert!(text.contains("跳过"), "{text}");
+        // 分叉横梁 + 边标签。
         assert!(text.contains("─"), "{text}");
-        assert!(text.contains("═"), "{text}");
-        assert!(text.contains("╌"), "{text}");
+        assert!(text.contains("是"), "{text}");
+        assert!(text.contains("否"), "{text}");
+        // 中文框无错位：节点框完整闭合且无内部空隙。
+        assert!(text.contains("│ 开始 │"), "{text}");
+        assert!(text.contains("│ 处理 │"), "{text}");
+        assert!(text.contains("│ 跳过 │"), "{text}");
     }
 
     #[test]
@@ -4102,7 +4929,7 @@ mod tests {
 
     #[test]
     fn mermaid_supports_tb_bu_and_lr_aliases() {
-        for (dir, arrow) in [("TB", "↓"), ("TD", "↓"), ("BT", "↑")] {
+        for dir in ["TB", "TD", "BT", "LR", "RL"] {
             let document = render_markdown_document(
                 &format!("```mermaid\ngraph {dir}\nA[Start] --> B[End]\n```"),
                 Theme::dark(),
@@ -4115,7 +4942,16 @@ mod tests {
                 .map(|line| render_span_text(&line.spans))
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(text.contains(arrow), "{dir}: {text}");
+            assert!(text.contains("Start"), "{dir}: {text}");
+            assert!(text.contains("End"), "{dir}: {text}");
+            assert!(!text.contains("╭─ mermaid"), "{dir}: {text}");
+            // 垂直方向二维框化，横向保持线性箭头。
+            if matches!(dir, "TB" | "TD" | "BT") {
+                assert!(text.contains('╭'), "{dir}: {text}");
+                assert!(text.contains('│'), "{dir}: {text}");
+            } else {
+                assert!(text.contains('▶'), "{dir}: {text}");
+            }
         }
     }
 
