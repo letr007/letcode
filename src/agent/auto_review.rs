@@ -28,9 +28,4 @@ pub trait AutoReviewService<C: Config>: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<AutoReviewResolution>> + Send + 'a>>;
 
     fn clear_sticky(&self);
-
-    /// Reset per-turn counters while keeping the sticky reviewer child session.
-    fn begin_turn(&self) {
-        // Default: no-op for mock services.
-    }
 }

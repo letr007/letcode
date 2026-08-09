@@ -681,6 +681,15 @@ impl AgentFactory {
         let mut prelude = parent.prelude.clone();
         prelude.push(PromptMessage::developer(template.system_prompt.clone()));
 
+        let mut permission_session = parent
+            .permission_session
+            .lock()
+            .expect("permission session poisoned")
+            .fork_without_grants();
+        if template.permission_mode != PermissionMode::Default {
+            permission_session.set_mode(template.permission_mode);
+        }
+
         Agent {
             client,
             model: model.clone(),
@@ -708,13 +717,7 @@ impl AgentFactory {
             } else {
                 parent.auto_review_service.clone()
             },
-            permission_session: Arc::new(Mutex::new(
-                parent
-                    .permission_session
-                    .lock()
-                    .expect("permission session poisoned")
-                    .fork_without_grants(),
-            )),
+            permission_session: Arc::new(Mutex::new(permission_session)),
             // Scope is installed per invocation by SubagentPool::start_run.
             subagent_path_scope: None,
             compaction_config: parent.compaction_config.clone(),
@@ -2642,13 +2645,14 @@ impl<C: Config> Agent<C> {
             return false;
         };
         let permission_class = permission_class_for_tool_call(&self.tools, &call.name);
-        if restricted_by_directive_with_class(
-            &call.name,
-            &args,
-            permission_class,
-            self.turn.policy.directive,
-        )
-        .is_some()
+        if (self.permission_mode() != PermissionMode::Auto
+            && restricted_by_directive_with_class(
+                &call.name,
+                &args,
+                permission_class,
+                self.turn.policy.directive,
+            )
+            .is_some())
             || external_workspace_access_for_tool(&call.name, &args).is_some()
         {
             return false;
@@ -2665,7 +2669,7 @@ impl<C: Config> Agent<C> {
             false,
             crate::permission::is_internal_tool(&call.name),
         );
-        let decision = if mode.uses_default_ask_matrix() && grant_allowed {
+        let decision = if mode.supports_session_grants() && grant_allowed {
             PermissionDecision::Allow
         } else {
             decision

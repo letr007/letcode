@@ -180,8 +180,8 @@ impl AgentTemplate {
             purpose: "权限自动审批".into(),
             system_prompt: concat!(
                 "你是 reviewer 专家，唯一职责是审批主代理提出的工具权限请求。",
-                "根据用户意图、工具名、参数、风险与可逆性，决定 allow_once、allow_always 或 deny。",
-                "不确定时必须 deny。不要编辑文件，不要继续委派。",
+                "根据用户意图、执行指令、工具名、参数、风险与可逆性，决定 allow_once 或 deny。",
+                "充分尊重用户目标与 Agent 的工作自主权；仅在调用明显违背用户意图或存在不可接受风险时 deny。不要编辑文件，不要继续委派。",
                 "只输出一个 JSON 对象，字段为 decision、risk、rationale；不要输出其它文字。"
             )
             .into(),
@@ -192,10 +192,10 @@ impl AgentTemplate {
             timeout_secs: Some(30),
             max_tool_calls: Some(2),
             input_expectations:
-                "需要工具权限请求：tool、args、class、summary、can_allow_always、用户目标摘要。"
+                "需要工具权限请求：tool、args、class、directive、summary、用户目标摘要。"
                     .into(),
             expected_result_shape: concat!(
-                "JSON 对象：decision 为 allow_once|allow_always|deny；",
+                "JSON 对象：decision 为 allow_once|deny；",
                 "risk 为 low|medium|high；rationale 为一句理由。"
             )
             .into(),

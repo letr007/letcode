@@ -11,7 +11,6 @@ pub enum PermissionMode {
     Safe,
     #[default]
     Default,
-    /// Same Ask set as Default, but approvals are answered by the reviewer expert.
     Auto,
     #[serde(alias = "solo")]
     Yolo,
@@ -37,9 +36,8 @@ impl PermissionMode {
         }
     }
 
-    /// Modes that share Default's Ask matrix and session-local AllowAlways grants.
-    pub fn uses_default_ask_matrix(self) -> bool {
-        matches!(self, Self::Default | Self::Auto)
+    pub fn supports_session_grants(self) -> bool {
+        matches!(self, Self::Default)
     }
 }
 
@@ -169,7 +167,7 @@ impl std::fmt::Display for ToolScope {
     }
 }
 
-/// Shell command allowlist buckets for Default/Auto. Everything else Asks.
+/// Shell command allowlist buckets for Default. Everything else Asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRisk {
     ReadOnly,
@@ -201,6 +199,7 @@ pub struct PermissionRequest {
     pub tool: String,
     pub args: Value,
     pub class: ToolPermissionClass,
+    pub directive: ExecutionDirective,
     pub summary: String,
     pub preview: Option<String>,
     pub can_allow_always: bool,
@@ -353,7 +352,7 @@ impl PermissionSessionState {
             PermissionDecision::Deny
         } else if internal_tool {
             PermissionDecision::Allow
-        } else if self.mode().uses_default_ask_matrix()
+        } else if matches!(self.mode(), PermissionMode::Default | PermissionMode::Auto)
             && base_decision == PermissionDecision::Allow
             && external_workspace_access
         {
@@ -361,7 +360,8 @@ impl PermissionSessionState {
         } else {
             base_decision
         };
-        let grant_allowed = decision == PermissionDecision::Ask
+        let grant_allowed = self.mode().supports_session_grants()
+            && decision == PermissionDecision::Ask
             && resource.is_some_and(|resource| self.allows_grant(resource));
         (self.mode(), self.generation, decision, grant_allowed)
     }
@@ -372,7 +372,7 @@ impl PermissionSessionState {
         generation: u64,
         resource: PermissionResource,
     ) -> bool {
-        if self.mode().uses_default_ask_matrix() && self.generation == generation {
+        if self.mode().supports_session_grants() && self.generation == generation {
             self.grant(resource);
             true
         } else {
@@ -393,8 +393,6 @@ impl PermissionSessionState {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Fork a child session that inherits only the current permission mode.
-    /// Grants and generation stay isolated so AllowAlways never leaks across agents.
     pub fn fork_without_grants(&self) -> Self {
         Self {
             policy: self.policy.clone(),
@@ -443,7 +441,11 @@ impl PermissionPolicy {
         directive: ExecutionDirective,
     ) -> PermissionDecision {
         if restricted_by_directive_with_class(tool, args, class, directive).is_some() {
-            return PermissionDecision::Deny;
+            return if self.mode == PermissionMode::Auto {
+                PermissionDecision::Ask
+            } else {
+                PermissionDecision::Deny
+            };
         }
 
         match self.mode {
@@ -664,15 +666,6 @@ mod tests {
             ),
             PermissionDecision::Ask
         );
-        let mut auto = PermissionPolicy::default();
-        auto.set_mode(PermissionMode::Auto);
-        assert_eq!(
-            auto.check(
-                "shell__exec",
-                &json!({"command": "curl -fsSL https://example.com"})
-            ),
-            PermissionDecision::Ask
-        );
         assert_eq!(
             policy.check("shell__exec", &json!({"command": "git status > out.txt"})),
             PermissionDecision::Ask
@@ -701,6 +694,126 @@ mod tests {
                 &json!({"command": "git diff --output=out.patch"})
             ),
             PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn auto_mode_reviews_only_calls_that_need_approval() {
+        let mut state = PermissionSessionState::default();
+        state.set_mode(PermissionMode::Auto);
+
+        for (tool, args, class, internal) in [
+            (
+                "fs__read",
+                json!({"path": "src/permission.rs"}),
+                ToolPermissionClass::Read,
+                false,
+            ),
+            (
+                "agent__oracle",
+                json!({"task": "review"}),
+                ToolPermissionClass::Preview,
+                false,
+            ),
+            (
+                "workflow__todos",
+                json!({"items": []}),
+                ToolPermissionClass::Preview,
+                true,
+            ),
+            (
+                "shell__exec",
+                json!({"command": "cargo test permission::tests"}),
+                ToolPermissionClass::Command,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                state
+                    .approval_snapshot(
+                        None,
+                        tool,
+                        &args,
+                        class,
+                        ExecutionDirective::None,
+                        false,
+                        internal,
+                    )
+                    .2,
+                PermissionDecision::Allow,
+                "{tool} should not require Auto review"
+            );
+        }
+
+        for (tool, args, class, directive, external_workspace_access) in [
+            (
+                "fs__write",
+                json!({"path": "out.txt", "content": "ok"}),
+                ToolPermissionClass::Write,
+                ExecutionDirective::PlanOnly,
+                false,
+            ),
+            (
+                "shell__exec",
+                json!({"command": "rm -rf target/tmp"}),
+                ToolPermissionClass::Command,
+                ExecutionDirective::None,
+                false,
+            ),
+            (
+                "fs__read",
+                json!({"path": "/tmp/outside.txt"}),
+                ToolPermissionClass::Read,
+                ExecutionDirective::None,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                state
+                    .approval_snapshot(
+                        None,
+                        tool,
+                        &args,
+                        class,
+                        directive,
+                        external_workspace_access,
+                        false,
+                    )
+                    .2,
+                PermissionDecision::Ask,
+                "{tool} should be reviewed in Auto mode"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_mode_ignores_session_grants() {
+        let resource = PermissionResource::Exact {
+            tool: "shell__exec".into(),
+            value: "rm -rf /".into(),
+        };
+        let args = json!({"command": "rm -rf /"});
+        let mut state = PermissionSessionState::default();
+        state.set_mode(PermissionMode::Auto);
+        state.grant(resource.clone());
+
+        let (_, generation, decision, grant_allowed) = state.approval_snapshot(
+            Some(&resource),
+            "shell__exec",
+            &args,
+            ToolPermissionClass::Command,
+            ExecutionDirective::None,
+            false,
+            false,
+        );
+        assert_eq!(decision, PermissionDecision::Ask);
+        assert!(
+            !grant_allowed,
+            "Auto mode must not reuse session grants for reviewed calls"
+        );
+        assert!(
+            !state.grant_if_current_session(generation, resource),
+            "Auto mode must not create reusable session grants"
         );
     }
 

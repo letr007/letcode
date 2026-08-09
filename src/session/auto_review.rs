@@ -24,7 +24,6 @@ use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{TranscriptEvent, TranscriptRecorder, read_records_allow_partial_tail};
 use futures_util::FutureExt;
 
-const MAX_CONSECUTIVE_DENIALS: u32 = 3;
 const REVIEWER_AGENT_NAME: &str = "reviewer";
 
 #[derive(Clone)]
@@ -39,7 +38,6 @@ pub(crate) struct StickyAutoReviewer {
 
 struct StickyAutoReviewerState {
     child_session_id: Option<String>,
-    consecutive_denials: u32,
 }
 
 impl StickyAutoReviewer {
@@ -52,7 +50,6 @@ impl StickyAutoReviewer {
         Self {
             inner: Arc::new(Mutex::new(StickyAutoReviewerState {
                 child_session_id: None,
-                consecutive_denials: 0,
             })),
             review_gate: Arc::new(tokio::sync::Mutex::new(())),
             pool,
@@ -66,32 +63,9 @@ impl StickyAutoReviewer {
         self.clear_sticky();
     }
 
-    pub fn begin_prompt_turn(&self) {
-        self.begin_turn();
-    }
-
-    #[cfg(test)]
-    fn set_consecutive_denials_for_test(&self, count: u32) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.consecutive_denials = count;
-        }
-    }
-
     fn emit(&self, event: SessionTransportEvent) {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(event);
-        }
-    }
-
-    fn record_denial(&self) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.consecutive_denials = state.consecutive_denials.saturating_add(1);
-        }
-    }
-
-    fn reset_denials(&self) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.consecutive_denials = 0;
         }
     }
 
@@ -154,23 +128,6 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
     > {
         Box::pin(async move {
             let _review_guard = self.review_gate.lock().await;
-            {
-                let state = self
-                    .inner
-                    .lock()
-                    .map_err(|_| anyhow!("auto-reviewer state poisoned"))?;
-                if state.consecutive_denials >= MAX_CONSECUTIVE_DENIALS {
-                    let message = format!(
-                        "auto-review circuit breaker: {MAX_CONSECUTIVE_DENIALS} consecutive denials in this turn"
-                    );
-                    drop(state);
-                    self.emit(SessionTransportEvent::Notice(NoticeEvent::new(
-                        message.clone(),
-                        NoticeKind::RecoverableError,
-                    )));
-                    return Err(anyhow!(message));
-                }
-            }
 
             self.emit(SessionTransportEvent::Notice(NoticeEvent::new(
                 format!("Auto-reviewing {}…", request.tool),
@@ -254,7 +211,6 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
             {
                 Ok(summary) => summary,
                 Err(error) => {
-                    self.record_denial();
                     let parsed = ParsedReview {
                         response: PermissionResponse::Deny,
                         rationale: format!("auto-review failed: {error:#}"),
@@ -277,10 +233,6 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
             }
 
             let parsed = parse_reviewer_output(&summary, request.can_allow_always);
-            match parsed.response {
-                PermissionResponse::Deny => self.record_denial(),
-                _ => self.reset_denials(),
-            }
 
             self.record_decision(&request, &parsed, &child_session_id)?;
             self.emit_resolution(&request, &parsed);
@@ -303,13 +255,6 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
     fn clear_sticky(&self) {
         if let Ok(mut state) = self.inner.lock() {
             state.child_session_id = None;
-            state.consecutive_denials = 0;
-        }
-    }
-
-    fn begin_turn(&self) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.consecutive_denials = 0;
         }
     }
 }
@@ -381,16 +326,18 @@ fn build_review_prompt(request: &PermissionRequest, user_goal: Option<&str>) -> 
          \n\
          Tool: {}\n\
          Class: {}\n\
+         Execution directive: {}\n\
          Summary: {}\n\
          Preview: {preview}\n\
          can_allow_always: {}\n\
          Arguments:\n{args}\n\
          \n\
          Reply with ONLY JSON:\n\
-         {{\"decision\":\"allow_once|allow_always|deny\",\"risk\":\"low|medium|high\",\"rationale\":\"...\"}}\n\
-         If uncertain, deny. Use allow_always only when can_allow_always is true and the grant is clearly safe for the rest of the session.",
+         {{\"decision\":\"allow_once|deny\",\"risk\":\"low|medium|high\",\"rationale\":\"...\"}}\n\
+         Respect the user's goal and the agent's autonomy. Deny only when the call clearly conflicts with the user's intent or has unacceptable risk.",
         request.tool,
         request.class.as_str(),
+        request.directive.as_str(),
         request.summary,
         request.can_allow_always,
     )
@@ -518,6 +465,15 @@ mod tests {
         assert!(matches!(denied.response, PermissionResponse::Deny));
     }
 
+    #[test]
+    fn allow_always_is_downgraded_when_request_cannot_create_a_grant() {
+        let parsed = parse_reviewer_output(
+            &completed_summary(r#"{"decision":"allow_always","risk":"low","rationale":"safe"}"#),
+            false,
+        );
+        assert!(matches!(parsed.response, PermissionResponse::AllowOnce));
+    }
+
     #[tokio::test]
     async fn review_gate_serializes_auto_reviews() {
         let dir = std::env::temp_dir().join(format!(
@@ -555,58 +511,6 @@ mod tests {
         )
         .await
         .expect("queued review should proceed after the gate is released");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn circuit_breaker_interrupts_after_three_consecutive_denials() {
-        let dir = std::env::temp_dir().join(format!(
-            "letcode-auto-review-breaker-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("sessions dir");
-        let transcript = Arc::new(Mutex::new(
-            TranscriptRecorder::create(&dir).expect("transcript"),
-        ));
-        let reviewer = StickyAutoReviewer::new(
-            SubagentPool::new(),
-            dir.clone(),
-            Arc::clone(&transcript),
-            None,
-        );
-        reviewer.set_consecutive_denials_for_test(MAX_CONSECUTIVE_DENIALS);
-
-        let parent = Agent::new(
-            async_openai::Client::with_config(
-                OpenAIConfig::new()
-                    .with_api_base("https://api.openai.com/v1")
-                    .with_api_key("test"),
-            ),
-            "m1",
-            4,
-            4,
-        );
-        let err = reviewer
-            .review(
-                &parent,
-                PermissionRequest {
-                    call_id: Some("call-1".into()),
-                    tool: "fs__write".into(),
-                    args: serde_json::json!({"path": "a.txt", "content": "x"}),
-                    class: crate::permission::ToolPermissionClass::Write,
-                    summary: "fs__write a.txt".into(),
-                    preview: None,
-                    can_allow_always: true,
-                    grant_summary: None,
-                },
-                None,
-            )
-            .await
-            .expect_err("circuit breaker should trip");
-        assert!(err.to_string().contains("circuit breaker"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

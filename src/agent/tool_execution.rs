@@ -102,7 +102,7 @@ where
                 false,
                 crate::permission::is_internal_tool(&call.name),
             );
-            let decision = if mode.uses_default_ask_matrix() && grant_allowed {
+            let decision = if mode.supports_session_grants() && grant_allowed {
                 PermissionDecision::Allow
             } else {
                 decision
@@ -163,7 +163,7 @@ where
                     false,
                     crate::permission::is_internal_tool(&call.name),
                 );
-                let decision = if mode.uses_default_ask_matrix() && grant_allowed {
+                let decision = if mode.supports_session_grants() && grant_allowed {
                     PermissionDecision::Allow
                 } else {
                     decision
@@ -413,7 +413,7 @@ pub(super) async fn execute_subagent_tool_call_batch<C, E, A, Efut, Afut>(
     approve: &mut A,
 ) -> Result<Vec<SubagentBatchRecord>>
 where
-    C: Config,
+    C: Config + Clone + Send + Sync + 'static,
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
@@ -547,7 +547,7 @@ async fn preflight_subagent_tool_call<C, A, Afut>(
     approve: &mut A,
 ) -> Result<SubagentPreflight>
 where
-    C: Config,
+    C: Config + Clone + Send + Sync + 'static,
     A: FnMut(PermissionRequest) -> Afut,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
@@ -611,8 +611,9 @@ where
         );
         return Ok(SubagentPreflight::Rejected(record));
     }
-    if let Some(message) =
-        restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
+    if agent.permission_mode() != PermissionMode::Auto
+        && let Some(message) =
+            restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
     {
         let record = ToolExecutionRecord::new(
             call,
@@ -640,28 +641,47 @@ where
             crate::permission::is_internal_tool(&call.name),
         )
     };
-    let decision = if mode.uses_default_ask_matrix() && grant_allowed {
+    let decision = if mode.supports_session_grants() && grant_allowed {
         PermissionDecision::Allow
     } else {
         decision
     };
+    let mut auto_deny_reason = None;
     let allowed = match decision {
         PermissionDecision::Allow => true,
-        PermissionDecision::Ask => approve(PermissionRequest {
-            call_id: Some(call.call_id.clone()),
-            tool: call.name.clone(),
-            args: args.clone(),
-            class: permission_class,
-            summary: format_tool_call(&call.name, &args),
-            preview: None,
-            can_allow_always: false,
-            grant_summary: None,
-        })
-        .await?
-        .allowed(),
+        PermissionDecision::Ask => {
+            let request = PermissionRequest {
+                call_id: Some(call.call_id.clone()),
+                tool: call.name.clone(),
+                args: args.clone(),
+                class: permission_class,
+                directive,
+                summary: format_tool_call(&call.name, &args),
+                preview: None,
+                can_allow_always: false,
+                grant_summary: None,
+            };
+            let approval = if mode == PermissionMode::Auto {
+                let resolution = agent.resolve_auto_permission(request, None).await?;
+                if !resolution.approval.allowed() {
+                    auto_deny_reason = Some(resolution.reason);
+                }
+                resolution.approval
+            } else {
+                approve(request).await?
+            };
+            approval.allowed()
+        }
         PermissionDecision::Deny => false,
     };
     if !allowed {
+        let message = if matches!(decision, PermissionDecision::Deny) {
+            "permission denied by current mode".to_string()
+        } else if let Some(reason) = auto_deny_reason {
+            format!("auto-review denied permission: {reason}")
+        } else {
+            "user denied permission".to_string()
+        };
         let record = ToolExecutionRecord::new(
             call,
             Some(args),
@@ -673,14 +693,7 @@ where
             } else {
                 ToolExecutionRejection::PermissionDeniedByUser
             }),
-            ToolResult::err(
-                &call.name,
-                if matches!(decision, PermissionDecision::Deny) {
-                    "permission denied by current mode"
-                } else {
-                    "user denied permission"
-                },
-            ),
+            ToolResult::err(&call.name, message),
         );
         return Ok(SubagentPreflight::Rejected(record));
     }
@@ -740,8 +753,9 @@ where
         return Ok(record);
     }
 
-    if let Some(message) =
-        restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
+    if agent.permission_mode() != PermissionMode::Auto
+        && let Some(message) =
+            restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
     {
         let output = ToolResult::err(&call.name, message);
         let record = ToolExecutionRecord::new(
@@ -876,7 +890,7 @@ where
         PermissionDecision::Deny => PermissionDecision::Deny,
         PermissionDecision::Allow => PermissionDecision::Allow,
         PermissionDecision::Ask
-            if delegation_scope_authorized || (mode.uses_default_ask_matrix() && grant_allowed) =>
+            if delegation_scope_authorized || (mode.supports_session_grants() && grant_allowed) =>
         {
             PermissionDecision::Allow
         }
@@ -887,12 +901,13 @@ where
     let should_execute = match permission_decision {
         PermissionDecision::Allow => true,
         PermissionDecision::Ask => {
-            let can_allow_always = mode.uses_default_ask_matrix() && resource.is_some();
+            let can_allow_always = mode.supports_session_grants() && resource.is_some();
             let request = PermissionRequest {
                 call_id: Some(call.call_id.clone()),
                 tool: call.name.clone(),
                 args: args.clone(),
                 class: permission_class,
+                directive,
                 summary: format_tool_call(&call.name, &args),
                 preview: external_workspace_access
                     .as_ref()

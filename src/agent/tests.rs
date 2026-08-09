@@ -3480,19 +3480,23 @@ async fn auto_continue_runs_past_agent_limits_until_llm_disables_it() {
 #[tokio::test]
 async fn workflow_todos_tool_updates_todo_state() {
     let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
     let call = HistoryToolCall {
             call_id: "call-todos".into(),
             name: "workflow__todos".into(),
             arguments_json: r#"{"items":[{"id":"t1","content":"first","status":"pending"},{"id":"t2","content":"done","status":"completed"}]}"#.into(),
         };
 
+    let mut approvals = 0usize;
     agent
         .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            std::future::ready(Ok(PermissionApproval::AllowOnce))
+            approvals += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
         })
         .await
-        .expect("todo control tool should succeed");
+        .expect("todo control tool should succeed without reviewer or human approval");
 
+    assert_eq!(approvals, 0);
     assert_eq!(agent.todos().len(), 2);
     assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
     assert_eq!(agent.todos()[1].status, TodoStatus::Completed);
@@ -4191,6 +4195,37 @@ struct MockAutoReviewService {
     child_session_id: String,
 }
 
+struct CapturingAutoReviewService {
+    approval: PermissionApproval,
+    calls: AtomicUsize,
+    last_request: Mutex<Option<PermissionRequest>>,
+}
+
+impl AutoReviewService<OpenAIConfig> for CapturingAutoReviewService {
+    fn review<'a>(
+        &'a self,
+        _parent: &'a Agent<OpenAIConfig>,
+        request: PermissionRequest,
+        _user_goal: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<AutoReviewResolution>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_request.lock().expect("request lock") = Some(request);
+            Ok(AutoReviewResolution {
+                approval: self.approval,
+                reason: "captured".into(),
+                risk: Some("low".into()),
+                approval_label: "once",
+                reviewer_child_session_id: "reviewer-child-capturing".into(),
+            })
+        })
+    }
+
+    fn clear_sticky(&self) {}
+}
+
 impl AutoReviewService<OpenAIConfig> for MockAutoReviewService {
     fn review<'a>(
         &'a self,
@@ -4274,6 +4309,7 @@ fn reviewer_child_does_not_inherit_auto_review_service() {
     let reviewer = AgentFactory::create_child(&parent, &AgentTemplate::reviewer());
 
     assert!(reviewer.auto_review_service.is_none());
+    assert_eq!(reviewer.permission_mode(), PermissionMode::Yolo);
 }
 
 #[test]
@@ -4300,6 +4336,18 @@ fn child_permission_session_inherits_mode_without_grants() {
             .allows_grant(&resource)
     );
     assert!(child.subagent_path_scope.is_none());
+}
+
+#[test]
+fn explicit_child_permission_mode_overrides_parent_mode() {
+    let mut parent = test_agent();
+    parent.set_permission_mode(PermissionMode::Auto);
+    let mut template = AgentTemplate::fixer();
+    template.permission_mode = PermissionMode::Safe;
+
+    let child = AgentFactory::create_child(&parent, &template);
+
+    assert_eq!(child.permission_mode(), PermissionMode::Safe);
 }
 
 #[cfg(unix)]
@@ -4656,6 +4704,173 @@ async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
 }
 
 #[tokio::test]
+async fn auto_mode_reviewer_decides_calls_that_conflict_with_execution_directive() {
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    agent.turn = TurnRuntimeState::new(
+        1,
+        WorkflowTurnState::from_user_input("Read only. Analyze and report."),
+    );
+    let service = Arc::new(CapturingAutoReviewService {
+        approval: PermissionApproval::AllowOnce,
+        calls: AtomicUsize::new(0),
+        last_request: Mutex::new(None),
+    });
+    agent.set_auto_review_service(Some(service.clone()));
+
+    let path = std::env::temp_dir().join(format!(
+        "letcode-auto-review-directive-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    let call = HistoryToolCall {
+        call_id: "call-auto-directive".into(),
+        name: "fs__write".into(),
+        arguments_json: json!({"path": path, "content": "approved"}).to_string(),
+    };
+    let mut human_approvals = 0usize;
+    let record = agent
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            human_approvals += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
+        })
+        .await
+        .expect("reviewer approval overrides static directive denial");
+
+    assert_eq!(human_approvals, 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    let request = service
+        .last_request
+        .lock()
+        .expect("request lock")
+        .clone()
+        .expect("review request");
+    assert_eq!(request.directive, ExecutionDirective::ReadOnly);
+    assert!(!request.can_allow_always);
+    assert!(request.grant_summary.is_none());
+    assert_eq!(record.status, ToolExecutionStatus::Executed);
+    assert!(record.output.ok, "{:?}", record.output.error);
+    assert_eq!(fs::read_to_string(&path).expect("read output"), "approved");
+    let _ = fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
+    let fixture = UnixWritableFixture::new("auto-subagent-scope");
+    let owned = fixture.external.join("owned");
+    let outside = fixture.external.join("outside");
+    fs::create_dir_all(&owned).expect("owned dir");
+    fs::create_dir_all(&outside).expect("outside dir");
+    let owned_file = owned.join("ok.txt");
+    let outside_file = outside.join("no.txt");
+    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+        objective: "scoped auto write".into(),
+        success_criteria: Vec::new(),
+        allowed_paths: Vec::new(),
+        forbidden_paths: Vec::new(),
+        owned_paths: vec![owned.to_string_lossy().into()],
+        timeout_secs: None,
+        max_tool_calls: None,
+        target_child_session_id: None,
+    })
+    .expect("scope")
+    .expect("non-empty scope");
+
+    let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+    child.set_permission_mode(PermissionMode::Auto);
+    child.set_subagent_path_scope(Some(Arc::new(scope)));
+    let service = Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::Deny),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-scope".into(),
+    });
+    child.set_auto_review_service(Some(service.clone()));
+
+    let allowed = child
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "auto-scope-owned".into(),
+                name: "fs__write".into(),
+                arguments_json: json!({"path": owned_file, "content": "ok"}).to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("owned write");
+    assert_eq!(allowed.status, ToolExecutionStatus::Executed);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    let denied = child
+        .execute_tool_call(
+            &HistoryToolCall {
+                call_id: "auto-scope-outside".into(),
+                name: "fs__write".into(),
+                arguments_json: json!({"path": outside_file, "content": "no"}).to_string(),
+            },
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("outside write");
+    assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        denied.rejection,
+        Some(ToolExecutionRejection::DelegationScopeDenied)
+    );
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert!(!outside_file.exists());
+}
+
+#[tokio::test]
+async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        approval: Mutex::new(PermissionApproval::AllowOnce),
+        calls: AtomicUsize::new(0),
+        child_session_id: "reviewer-child-subagent".into(),
+    });
+    agent.set_auto_review_service(Some(service.clone()));
+    agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+        "agent__fixer",
+        json!({
+            "run_id": "run-auto-fixer",
+            "child_session_id": "child-auto-fixer",
+            "status": "completed",
+            "summary": "done"
+        }),
+    )));
+
+    let call = test_tool_call("agent__fixer", r#"{"task":"apply focused fix"}"#);
+    agent
+        .append_assistant_tool_calls("", std::slice::from_ref(&call))
+        .expect("append subagent call");
+    let mut human_approvals = 0usize;
+    agent
+        .execute_tool_calls_and_record(
+            std::slice::from_ref(&call),
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            },
+        )
+        .await
+        .expect("auto-reviewed subagent executes");
+
+    assert_eq!(human_approvals, 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert!(agent.history.iter().any(|item| matches!(
+        item,
+        HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
+    )));
+}
+
+#[tokio::test]
 async fn auto_mode_deny_includes_reviewer_rationale() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
@@ -4692,7 +4907,7 @@ async fn auto_mode_deny_includes_reviewer_rationale() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn auto_mode_allow_always_grant_skips_second_review() {
+async fn auto_mode_does_not_reuse_allow_always_between_reviews() {
     let fixture = UnixWritableFixture::new("auto-allow-always");
     let path = fixture.external.join("written.txt");
     let first_call = writable_call("auto-always-first", "fs__write", &path, "first");
@@ -4724,12 +4939,12 @@ async fn auto_mode_allow_always_grant_skips_second_review() {
             &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
         )
         .await
-        .expect("grant reuse");
+        .expect("second auto review");
     assert!(second.output.ok, "{:?}", second.output.error);
     assert_eq!(
         service.calls.load(Ordering::SeqCst),
-        1,
-        "session grant must skip reviewer"
+        2,
+        "Auto mode must review each call instead of reusing a session grant"
     );
 }
 

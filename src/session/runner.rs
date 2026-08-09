@@ -2292,6 +2292,7 @@ mod tests {
             tool: "shell__exec".into(),
             args: json!({"command": "cargo test"}),
             class: crate::permission::ToolPermissionClass::Command,
+            directive: crate::permission::ExecutionDirective::None,
             summary: "shell__exec cargo test".into(),
             preview: None,
             can_allow_always: false,

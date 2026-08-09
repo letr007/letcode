@@ -2454,7 +2454,6 @@ async fn run_engine_loop(
                     continue;
                 }
 
-                sticky_auto_reviewer.begin_prompt_turn();
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
                 let runner = AgentRunner::<async_openai::config::OpenAIConfig>::with_transcript(
                     runner_event_tx,
