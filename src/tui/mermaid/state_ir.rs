@@ -12,6 +12,7 @@ pub(super) struct State {
     pub(super) label: Label,
     pub(super) composite: bool,
     pub(super) depth: usize,
+    pub(super) scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub(super) struct Transition {
     pub(super) to: Label,
     pub(super) label: Option<Label>,
     pub(super) depth: usize,
+    pub(super) scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

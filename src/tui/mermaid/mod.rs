@@ -10,6 +10,7 @@ mod flowchart_ir;
 mod flowchart_parser;
 mod gantt;
 mod gantt_ir;
+mod routing;
 mod sequence;
 mod sequence_ir;
 mod state;

@@ -1,6 +1,6 @@
 use super::state_ir as ir;
 use super::{
-    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits,
+    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits, routing,
     source_within_limits,
 };
 use crate::tui::measure::display_width;
@@ -10,12 +10,20 @@ const MAX_DEPTH: usize = 4;
 const START_STATE: &str = "\0start";
 const END_STATE: &str = "\0end";
 
-fn endpoint_key(endpoint: &str, from: bool) -> &str {
+fn endpoint_key(endpoint: &str, from: bool, transition_index: usize) -> String {
     if endpoint == "[*]" {
-        if from { START_STATE } else { END_STATE }
+        if from {
+            START_STATE.to_string()
+        } else {
+            format!("{END_STATE}:{transition_index}")
+        }
     } else {
-        endpoint
+        endpoint.to_string()
     }
+}
+
+fn is_end_state(id: &str) -> bool {
+    id == END_STATE || id.starts_with(&format!("{END_STATE}:"))
 }
 
 pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
@@ -24,7 +32,14 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
         matches!(item, ir::Item::State(state) if state.composite)
             || matches!(item, ir::Item::Transition(transition) if transition.depth > 0)
     });
-    if !composite && let Some(canvas) = layout(&diagram, width) {
+    if composite {
+        if let Some(canvas) = layout_composite(&diagram, width) {
+            let lines = canvas.render();
+            if render_line_count_within_limits(lines.len()) {
+                return Some(lines);
+            }
+        }
+    } else if let Some(canvas) = layout(&diagram, width) {
         let lines = canvas.render();
         if render_line_count_within_limits(lines.len()) {
             return Some(lines);
@@ -33,16 +48,100 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
     render_boxed_transitions(&diagram, width).or_else(|| render_linear(&diagram, width))
 }
 
-fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
-    let declared = diagram
+#[derive(Clone, Copy)]
+struct CompositePlacement {
+    row: usize,
+    col: usize,
+    width: usize,
+    height: usize,
+}
+
+fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
+    let composites = diagram
         .items
         .iter()
         .filter_map(|item| match item {
-            ir::Item::State(state) => Some((state.id.as_str(), &state.label)),
+            ir::Item::State(state) if state.composite => Some(state),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if composites.is_empty()
+        || composites.iter().any(|state| state.depth != 0)
+        || diagram
+            .items
+            .iter()
+            .any(|item| matches!(item, ir::Item::Transition(transition) if transition.depth > 1))
+    {
+        return None;
+    }
+    let scopes = diagram
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ir::Item::State(state) => Some((state.id.as_str(), state.scope.as_deref())),
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    let transitions = diagram
+    if diagram.items.iter().any(|item| {
+        let ir::Item::Transition(transition) = item else {
+            return false;
+        };
+        [transition.from.text.as_str(), transition.to.text.as_str()]
+            .into_iter()
+            .filter(|endpoint| *endpoint != "[*]")
+            .any(|endpoint| {
+                scopes
+                    .get(endpoint)
+                    .is_some_and(|scope| *scope != transition.scope.as_deref())
+            })
+    }) {
+        return None;
+    }
+
+    let mut inner = HashMap::<String, canvas::MermaidCanvas>::new();
+    for composite in &composites {
+        let items = diagram
+            .items
+            .iter()
+            .filter(|item| match item {
+                ir::Item::State(state) => state.scope.as_deref() == Some(composite.id.as_str()),
+                ir::Item::Transition(transition) => {
+                    transition.scope.as_deref() == Some(composite.id.as_str())
+                }
+                ir::Item::Close(_) => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if items
+            .iter()
+            .any(|item| matches!(item, ir::Item::State(state) if state.composite))
+        {
+            return None;
+        }
+        let canvas = layout(&ir::Diagram { items }, width.saturating_sub(6))?;
+        inner.insert(composite.id.clone(), canvas);
+    }
+
+    let root_items = diagram
+        .items
+        .iter()
+        .filter(|item| match item {
+            ir::Item::State(state) => state.scope.is_none(),
+            ir::Item::Transition(transition) => transition.scope.is_none(),
+            ir::Item::Close(_) => false,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let root = ir::Diagram { items: root_items };
+    let declared = root
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ir::Item::State(state) => Some((state.id.as_str(), state)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let transitions = root
         .items
         .iter()
         .filter_map(|item| match item {
@@ -55,10 +154,10 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     }
 
     let mut ids = Vec::new();
-    for transition in &transitions {
+    for (transition_index, transition) in transitions.iter().enumerate() {
         for endpoint in [
-            endpoint_key(&transition.from.text, true),
-            endpoint_key(&transition.to.text, false),
+            endpoint_key(&transition.from.text, true, transition_index),
+            endpoint_key(&transition.to.text, false, transition_index),
         ] {
             if !ids.contains(&endpoint) {
                 ids.push(endpoint);
@@ -71,13 +170,13 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     let index = ids
         .iter()
         .enumerate()
-        .map(|(index, id)| (*id, index))
+        .map(|(index, id)| (id.clone(), index))
         .collect::<HashMap<_, _>>();
     let mut indegree = vec![0usize; ids.len()];
     let mut outgoing = vec![Vec::new(); ids.len()];
-    for transition in &transitions {
-        let from = index[endpoint_key(&transition.from.text, true)];
-        let to = index[endpoint_key(&transition.to.text, false)];
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        let from = index[&endpoint_key(&transition.from.text, true, transition_index)];
+        let to = index[&endpoint_key(&transition.to.text, false, transition_index)];
         if from == to {
             return None;
         }
@@ -102,10 +201,299 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         }
     }
     if visited != ids.len()
-        || transitions.iter().any(|transition| {
-            depths[index[endpoint_key(&transition.to.text, false)]]
-                != depths[index[endpoint_key(&transition.from.text, true)]] + 1
+        || transitions
+            .iter()
+            .enumerate()
+            .any(|(transition_index, transition)| {
+                depths[index[&endpoint_key(&transition.to.text, false, transition_index)]]
+                    != depths[index[&endpoint_key(&transition.from.text, true, transition_index)]]
+                        + 1
+            })
+    {
+        return None;
+    }
+
+    let max_depth = depths.iter().copied().max().unwrap_or(0);
+    let mut layers = vec![Vec::new(); max_depth + 1];
+    for (node, depth) in depths.iter().copied().enumerate() {
+        layers[depth].push(node);
+    }
+    let node_size = |id: &str| -> Option<(usize, usize)> {
+        if id == START_STATE || is_end_state(id) {
+            return Some((1, 1));
+        }
+        let Some(state) = declared.get(id) else {
+            let box_width = display_width(id).max(1) + 4;
+            return Some((box_width + usize::from(box_width.is_multiple_of(2)), 3));
+        };
+        if state.composite {
+            let inner = inner.get(id)?;
+            let inner_width = inner.rows.iter().map(Vec::len).max().unwrap_or(0);
+            let title_width = display_width(&state.label.text);
+            let width = inner_width.max(title_width + 4).checked_add(4)?;
+            return Some((width.max(6), inner.rows.len().checked_add(4)?));
+        }
+        let box_width = display_width(&state.label.text).max(1) + 4;
+        Some((box_width + usize::from(box_width.is_multiple_of(2)), 3))
+    };
+    let sizes = ids
+        .iter()
+        .map(|id| node_size(id))
+        .collect::<Option<Vec<_>>>()?;
+    let layer_widths = layers
+        .iter()
+        .map(|layer| {
+            layer.iter().map(|node| sizes[*node].0).sum::<usize>()
+                + 4 * layer.len().saturating_sub(1)
         })
+        .collect::<Vec<_>>();
+    let graph_width = layer_widths.iter().copied().max().unwrap_or(0);
+    if graph_width == 0 || graph_width > width {
+        return None;
+    }
+    let layer_heights = layers
+        .iter()
+        .map(|layer| layer.iter().map(|node| sizes[*node].1).max().unwrap_or(1))
+        .collect::<Vec<_>>();
+    let mut row_starts = vec![0usize; layers.len()];
+    for layer in 1..layers.len() {
+        let edges = transitions
+            .iter()
+            .enumerate()
+            .filter(|(transition_index, transition)| {
+                depths[index[&endpoint_key(&transition.from.text, true, *transition_index)]]
+                    == layer - 1
+            })
+            .count();
+        row_starts[layer] = row_starts[layer - 1] + layer_heights[layer - 1] + edges * 2 + 2;
+    }
+
+    let mut canvas = canvas::MermaidCanvas {
+        rows: Vec::new(),
+        labels: Vec::new(),
+    };
+    let mut placements = HashMap::new();
+    for (layer, nodes) in layers.iter().enumerate() {
+        let mut col = (graph_width - layer_widths[layer]) / 2;
+        for node in nodes {
+            let id = ids[*node].as_str();
+            let (node_width, node_height) = sizes[*node];
+            let row = row_starts[layer];
+            if id == START_STATE || is_end_state(id) {
+                canvas.put(col, row, if is_end_state(id) { '◎' } else { '●' });
+            } else if let Some(state) = declared.get(id) {
+                if state.composite {
+                    let content = inner.get(id)?;
+                    let title = format!("┌─ {} ", state.label.text);
+                    let title_width = display_width(&title);
+                    if title_width + 1 > node_width {
+                        return None;
+                    }
+                    let top = format!("{}{}┐", title, "─".repeat(node_width - title_width - 1));
+                    canvas.blit(row, col, &top);
+                    canvas.labels.push(canvas::MermaidCanvasLabel {
+                        row,
+                        col: col + 3,
+                        text: state.label.text.clone(),
+                        source: state.label.span,
+                    });
+                    for (inner_row, cells) in content.rows.iter().enumerate() {
+                        for (inner_col, cell) in cells.iter().enumerate() {
+                            if let canvas::MermaidCell::Char(ch) = cell {
+                                canvas.put(col + 2 + inner_col, row + 2 + inner_row, *ch);
+                            }
+                        }
+                    }
+                    for label in &content.labels {
+                        canvas.labels.push(canvas::MermaidCanvasLabel {
+                            row: row + 2 + label.row,
+                            col: col + 2 + label.col,
+                            text: label.text.clone(),
+                            source: label.source,
+                        });
+                    }
+                    for border_row in row + 1..row + node_height - 1 {
+                        canvas.put(col, border_row, '│');
+                        canvas.put(col + node_width - 1, border_row, '│');
+                    }
+                    canvas.blit(
+                        row + node_height - 1,
+                        col,
+                        &format!("└{}┘", "─".repeat(node_width - 2)),
+                    );
+                } else {
+                    canvas.blit(
+                        row,
+                        col,
+                        &format!(
+                            "┌{}┐\n│ {} │\n└{}┘",
+                            "─".repeat(node_width - 2),
+                            state.label.text,
+                            "─".repeat(node_width - 2)
+                        ),
+                    );
+                    canvas.labels.push(canvas::MermaidCanvasLabel {
+                        row: row + 1,
+                        col: col + 2,
+                        text: state.label.text.clone(),
+                        source: state.label.span,
+                    });
+                }
+            } else {
+                let source = transitions.iter().find_map(|transition| {
+                    [&transition.from, &transition.to]
+                        .into_iter()
+                        .find(|endpoint| endpoint.text == id)
+                })?;
+                canvas.blit(
+                    row,
+                    col,
+                    &format!(
+                        "┌{}┐\n│ {} │\n└{}┘",
+                        "─".repeat(node_width - 2),
+                        id,
+                        "─".repeat(node_width - 2)
+                    ),
+                );
+                canvas.labels.push(canvas::MermaidCanvasLabel {
+                    row: row + 1,
+                    col: col + 2,
+                    text: id.to_string(),
+                    source: source.span,
+                });
+            }
+            placements.insert(
+                *node,
+                CompositePlacement {
+                    row,
+                    col,
+                    width: node_width,
+                    height: node_height,
+                },
+            );
+            col += node_width + 4;
+        }
+    }
+
+    let mut routes = routing::RouteGrid::new();
+    let mut offsets = HashMap::<usize, usize>::new();
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        let from_index = index[&endpoint_key(&transition.from.text, true, transition_index)];
+        let to_index = index[&endpoint_key(&transition.to.text, false, transition_index)];
+        let from = placements[&from_index];
+        let to = placements[&to_index];
+        let layer = depths[from_index];
+        let offset = offsets.entry(layer).or_default();
+        let label_row = from.row + from.height + *offset * 2;
+        let route_row = label_row + 1;
+        *offset += 1;
+        let from_col = from.col + from.width / 2;
+        let to_col = to.col + to.width / 2;
+        routes.connect((from_col, from.row + from.height), (from_col, route_row));
+        routes.connect((from_col, route_row), (to_col, route_row));
+        routes.connect((to_col, route_row), (to_col, to.row - 1));
+        canvas.put(to_col, to.row.saturating_sub(1), '▼');
+        if let Some(label) = &transition.label {
+            let label_width = display_width(&label.text);
+            if label_width > graph_width {
+                return None;
+            }
+            canvas.labels.push(canvas::MermaidCanvasLabel {
+                row: label_row,
+                col: (graph_width - label_width) / 2,
+                text: label.text.clone(),
+                source: label.span,
+            });
+        }
+    }
+    for (&(col, row), &mask) in &*routes {
+        if !matches!(
+            canvas.rows.get(row).and_then(|line| line.get(col)),
+            Some(canvas::MermaidCell::Char('▼'))
+        ) {
+            canvas.put(col, row, routing::route_glyph(mask));
+        }
+    }
+    Some(canvas)
+}
+
+fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
+    let declared = diagram
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ir::Item::State(state) => Some((state.id.as_str(), &state.label)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let transitions = diagram
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ir::Item::Transition(transition) => Some(transition),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if transitions.is_empty() || transitions.len() > 48 {
+        return None;
+    }
+
+    let mut ids = Vec::new();
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        for endpoint in [
+            endpoint_key(&transition.from.text, true, transition_index),
+            endpoint_key(&transition.to.text, false, transition_index),
+        ] {
+            if !ids.contains(&endpoint) {
+                ids.push(endpoint);
+            }
+        }
+    }
+    if ids.len() > 24 {
+        return None;
+    }
+    let index = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut indegree = vec![0usize; ids.len()];
+    let mut outgoing = vec![Vec::new(); ids.len()];
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        let from = index[&endpoint_key(&transition.from.text, true, transition_index)];
+        let to = index[&endpoint_key(&transition.to.text, false, transition_index)];
+        if from == to {
+            return None;
+        }
+        outgoing[from].push(to);
+        indegree[to] += 1;
+    }
+    let mut queue = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut depths = vec![0usize; ids.len()];
+    let mut visited = 0;
+    while let Some(from) = queue.pop_front() {
+        visited += 1;
+        for to in &outgoing[from] {
+            depths[*to] = depths[*to].max(depths[from] + 1);
+            indegree[*to] -= 1;
+            if indegree[*to] == 0 {
+                queue.push_back(*to);
+            }
+        }
+    }
+    if visited != ids.len()
+        || transitions
+            .iter()
+            .enumerate()
+            .any(|(transition_index, transition)| {
+                depths[index[&endpoint_key(&transition.to.text, false, transition_index)]]
+                    != depths[index[&endpoint_key(&transition.from.text, true, transition_index)]]
+                        + 1
+            })
     {
         return None;
     }
@@ -116,7 +504,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         layers[depth].push(node);
     }
     let node_width = |id: &str| {
-        if matches!(id, START_STATE | END_STATE) {
+        if id == START_STATE || is_end_state(id) {
             1
         } else {
             let width = declared
@@ -132,7 +520,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         .map(|layer| {
             layer
                 .iter()
-                .map(|node| node_width(ids[*node]))
+                .map(|node| node_width(&ids[*node]))
                 .sum::<usize>()
                 + 4 * layer.len().saturating_sub(1)
         })
@@ -154,7 +542,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         .map(|layer| {
             if layer
                 .iter()
-                .any(|node| !matches!(ids[*node], START_STATE | END_STATE))
+                .any(|node| !(ids[*node] == START_STATE || is_end_state(&ids[*node])))
             {
                 3
             } else {
@@ -166,8 +554,10 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     for layer in 1..layers.len() {
         let edges = transitions
             .iter()
-            .filter(|transition| {
-                depths[index[endpoint_key(&transition.from.text, true)]] == layer - 1
+            .enumerate()
+            .filter(|(transition_index, transition)| {
+                depths[index[&endpoint_key(&transition.from.text, true, *transition_index)]]
+                    == layer - 1
             })
             .count();
         row_starts[layer] = row_starts[layer - 1] + layer_heights[layer - 1] + edges * 2 + 2;
@@ -181,12 +571,12 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     for (layer, nodes) in layers.iter().enumerate() {
         let mut col = (graph_width - layer_widths[layer]) / 2;
         for node in nodes {
-            let id = ids[*node];
-            if matches!(id, START_STATE | END_STATE) {
+            let id = ids[*node].as_str();
+            if id == START_STATE || is_end_state(id) {
                 canvas.put(
                     col,
                     row_starts[layer],
-                    if id == END_STATE { '◎' } else { '●' },
+                    if is_end_state(id) { '◎' } else { '●' },
                 );
                 placements.insert(
                     *node,
@@ -247,11 +637,11 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         }
     }
 
-    let mut routes = HashMap::<(usize, usize), u8>::new();
+    let mut routes = routing::RouteGrid::new();
     let mut layer_offsets = HashMap::<usize, usize>::new();
-    for transition in &transitions {
-        let from_index = index[endpoint_key(&transition.from.text, true)];
-        let to_index = index[endpoint_key(&transition.to.text, false)];
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        let from_index = index[&endpoint_key(&transition.from.text, true, transition_index)];
+        let to_index = index[&endpoint_key(&transition.to.text, false, transition_index)];
         let from = placements[&from_index];
         let to = placements[&to_index];
         let layer = depths[from_index];
@@ -261,16 +651,15 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         *offset += 1;
         let from_col = from.col + from.width / 2;
         let to_col = to.col + to.width / 2;
-        connect_route(
-            &mut routes,
-            (from_col, from.row + from.height),
-            (from_col, route_row),
-        );
-        connect_route(&mut routes, (from_col, route_row), (to_col, route_row));
-        connect_route(&mut routes, (to_col, route_row), (to_col, to.row - 1));
+        routes.connect((from_col, from.row + from.height), (from_col, route_row));
+        routes.connect((from_col, route_row), (to_col, route_row));
+        routes.connect((to_col, route_row), (to_col, to.row - 1));
         canvas.put(to_col, to.row.saturating_sub(1), '▼');
         if let Some(label) = &transition.label {
             let label_width = display_width(&label.text);
+            if label_width > graph_width {
+                return None;
+            }
             canvas.labels.push(canvas::MermaidCanvasLabel {
                 row: label_row,
                 col: (graph_width - label_width) / 2,
@@ -279,68 +668,15 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
             });
         }
     }
-    for (&(col, row), &mask) in &routes {
+    for (&(col, row), &mask) in &*routes {
         if !matches!(
             canvas.rows.get(row).and_then(|line| line.get(col)),
             Some(canvas::MermaidCell::Char('▼'))
         ) {
-            canvas.put(col, row, route_glyph(mask));
+            canvas.put(col, row, routing::route_glyph(mask));
         }
     }
     Some(canvas)
-}
-
-const ROUTE_UP: u8 = 1;
-const ROUTE_RIGHT: u8 = 2;
-const ROUTE_DOWN: u8 = 4;
-const ROUTE_LEFT: u8 = 8;
-
-fn connect_route(
-    routes: &mut HashMap<(usize, usize), u8>,
-    from: (usize, usize),
-    to: (usize, usize),
-) {
-    if from == to {
-        return;
-    }
-    if from.1 == to.1 {
-        let (lo, hi) = if from.0 < to.0 {
-            (from.0, to.0)
-        } else {
-            (to.0, from.0)
-        };
-        for col in lo..hi {
-            *routes.entry((col, from.1)).or_default() |= ROUTE_RIGHT;
-            *routes.entry((col + 1, from.1)).or_default() |= ROUTE_LEFT;
-        }
-    } else {
-        let (lo, hi) = if from.1 < to.1 {
-            (from.1, to.1)
-        } else {
-            (to.1, from.1)
-        };
-        for row in lo..hi {
-            *routes.entry((from.0, row)).or_default() |= ROUTE_DOWN;
-            *routes.entry((from.0, row + 1)).or_default() |= ROUTE_UP;
-        }
-    }
-}
-
-fn route_glyph(mask: u8) -> char {
-    match mask {
-        1 | 4 | 5 => '│',
-        2 | 8 | 10 => '─',
-        6 => '┌',
-        12 => '┐',
-        3 => '└',
-        9 => '┘',
-        7 => '├',
-        13 => '┤',
-        14 => '┬',
-        11 => '┴',
-        15 => '┼',
-        _ => '┼',
-    }
 }
 
 fn render_boxed_transitions(
@@ -482,7 +818,7 @@ fn parse(source: &str) -> Option<ir::Diagram> {
     }
 
     let mut items = Vec::new();
-    let mut states = HashMap::<String, String>::new();
+    let mut states = HashMap::<String, Option<String>>::new();
     let mut declared = std::collections::HashSet::<String>::new();
     let mut stack = Vec::<String>::new();
     let mut offset = header.chars().count() + 1;
@@ -509,7 +845,14 @@ fn parse(source: &str) -> Option<ir::Diagram> {
                 return None;
             }
             let label_at = base + find_char(trimmed, declaration.label)?;
-            states.insert(declaration.id.to_string(), declaration.label.to_string());
+            let scope = stack.last().cloned();
+            if states
+                .get(declaration.id)
+                .is_some_and(|existing| *existing != scope)
+            {
+                return None;
+            }
+            states.insert(declaration.id.to_string(), scope.clone());
             items.push(ir::Item::State(ir::State {
                 id: declaration.id.to_string(),
                 label: ir::Label {
@@ -521,6 +864,7 @@ fn parse(source: &str) -> Option<ir::Diagram> {
                 },
                 composite: declaration.composite,
                 depth: stack.len(),
+                scope,
             }));
             if declaration.composite {
                 stack.push(declaration.id.to_string());
@@ -528,10 +872,18 @@ fn parse(source: &str) -> Option<ir::Diagram> {
         } else if trimmed.ends_with('{') {
             return None;
         } else {
-            let transition = parse_transition(trimmed, base, stack.len())?;
+            let mut transition = parse_transition(trimmed, base, stack.len())?;
+            transition.scope = stack.last().cloned();
             for endpoint in [&transition.from.text, &transition.to.text] {
-                if endpoint != "[*]" && !states.contains_key(endpoint) {
-                    states.insert(endpoint.clone(), endpoint.clone());
+                if endpoint == "[*]" {
+                    continue;
+                }
+                match states.get(endpoint) {
+                    Some(existing) if *existing != transition.scope => return None,
+                    Some(_) => {}
+                    None => {
+                        states.insert(endpoint.clone(), transition.scope.clone());
+                    }
                 }
             }
             items.push(ir::Item::Transition(transition));
@@ -627,6 +979,7 @@ fn parse_transition(line: &str, base: usize, depth: usize) -> Option<ir::Transit
         },
         label,
         depth,
+        scope: None,
     })
 }
 

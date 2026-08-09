@@ -1,6 +1,6 @@
 use super::er_ir as ir;
 use super::{
-    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits,
+    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits, routing,
     source_within_limits,
 };
 use crate::tui::measure::display_width;
@@ -57,6 +57,11 @@ struct PlacedEntity {
     height: usize,
 }
 
+struct LayerRows {
+    starts: Vec<usize>,
+    bottoms: Vec<usize>,
+}
+
 fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
     if diagram.entities.len() > 24 || diagram.relations.len() > 48 {
         return None;
@@ -80,19 +85,36 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         .enumerate()
         .filter_map(|(index, degree)| (*degree == 0).then_some(index))
         .collect::<VecDeque<_>>();
-    let mut depths = vec![0usize; diagram.entities.len()];
-    let mut visited = 0;
+    let mut topo_order = Vec::with_capacity(diagram.entities.len());
     while let Some(from) = queue.pop_front() {
-        visited += 1;
+        topo_order.push(from);
         for to in &outgoing[from] {
-            depths[*to] = depths[*to].max(depths[from] + 1);
             indegree[*to] -= 1;
             if indegree[*to] == 0 {
                 queue.push_back(*to);
             }
         }
     }
-    if visited != diagram.entities.len() {
+    if topo_order.len() != diagram.entities.len() {
+        return None;
+    }
+
+    let mut earliest_layers = vec![0usize; diagram.entities.len()];
+    for &from in &topo_order {
+        for to in &outgoing[from] {
+            earliest_layers[*to] = earliest_layers[*to].max(earliest_layers[from] + 1);
+        }
+    }
+    let max_depth = earliest_layers.iter().copied().max().unwrap_or(0);
+    let mut depths = vec![max_depth; diagram.entities.len()];
+    for &entity in topo_order.iter().rev() {
+        if let Some(min_successor_depth) = outgoing[entity].iter().map(|to| depths[*to]).min() {
+            depths[entity] = min_successor_depth.saturating_sub(1);
+        }
+    }
+    if diagram.relations.iter().any(|relation| {
+        depths[index[relation.to.text.as_str()]] != depths[index[relation.from.text.as_str()]] + 1
+    }) {
         return None;
     }
     let mut layers = vec![Vec::new(); depths.iter().copied().max().unwrap_or(0) + 1];
@@ -134,8 +156,11 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         labels: Vec::new(),
     };
     let mut placements = HashMap::new();
+    let mut layer_starts = Vec::with_capacity(layers.len());
+    let mut layer_bottoms = Vec::with_capacity(layers.len());
     let mut row = 0;
     for (layer_index, layer) in layers.iter().enumerate() {
+        layer_starts.push(row);
         let layer_height = layer
             .iter()
             .map(|entity| sizes[*entity].1)
@@ -154,6 +179,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
             placements.insert(*entity, placed);
             col += entity_width + 6;
         }
+        layer_bottoms.push(row + layer_height);
         if layer_index + 1 < layers.len() {
             let edge_count = diagram
                 .relations
@@ -163,7 +189,18 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
             row += layer_height + edge_count * 2 + 2;
         }
     }
-    route_entity_relations(&mut canvas, diagram, &index, &depths, &placements);
+    route_entity_relations(
+        &mut canvas,
+        diagram,
+        &index,
+        &depths,
+        graph_width,
+        &placements,
+        &LayerRows {
+            starts: layer_starts,
+            bottoms: layer_bottoms,
+        },
+    )?;
     Some(canvas)
 }
 
@@ -203,64 +240,99 @@ fn route_entity_relations(
     diagram: &ir::Diagram,
     index: &HashMap<&str, usize>,
     depths: &[usize],
+    graph_width: usize,
     placements: &HashMap<usize, PlacedEntity>,
-) {
-    let layer_bottoms = placements
-        .iter()
-        .fold(HashMap::new(), |mut bottoms, (entity, placed)| {
-            bottoms
-                .entry(depths[*entity])
-                .and_modify(|bottom: &mut usize| {
-                    *bottom = (*bottom).max(placed.row + placed.height)
-                })
-                .or_insert(placed.row + placed.height);
-            bottoms
-        });
-    let mut offsets = HashMap::<usize, usize>::new();
-    for relation in &diagram.relations {
+    layer_rows: &LayerRows,
+) -> Option<()> {
+    let mut outgoing = HashMap::<usize, Vec<usize>>::new();
+    let mut incoming = HashMap::<usize, Vec<usize>>::new();
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        let from = index[relation.from.text.as_str()];
+        let to = index[relation.to.text.as_str()];
+        outgoing.entry(from).or_default().push(relation_index);
+        incoming.entry(to).or_default().push(relation_index);
+    }
+
+    let mut tracks = HashMap::<usize, routing::TrackAllocator>::new();
+    let mut routes = routing::RouteGrid::new();
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
         let from_index = index[relation.from.text.as_str()];
         let to_index = index[relation.to.text.as_str()];
         let from = placements[&from_index];
         let to = placements[&to_index];
         let layer = depths[from_index];
-        let offset = offsets.entry(layer).or_default();
-        let label_row = layer_bottoms[&layer] + *offset * 2;
-        let route_row = label_row + 1;
-        *offset += 1;
-        let from_col = from.col + from.width / 2;
-        let to_col = to.col + to.width / 2;
-        for row in from.row + from.height..=route_row {
-            canvas.put(from_col, row, '│');
-        }
-        let (lo, hi) = if from_col < to_col {
-            (from_col, to_col)
-        } else {
-            (to_col, from_col)
-        };
-        for col in lo..=hi {
-            canvas.put(col, route_row, '─');
-        }
-        for row in route_row..to.row {
-            canvas.put(to_col, row, '│');
-        }
+        let min_label_row = layer_rows.bottoms[layer] + 1;
+        let max_label_row = layer_rows.starts.get(layer + 1)?.saturating_sub(3);
+        let label_row = tracks.entry(layer).or_default().reserve(
+            min_label_row,
+            min_label_row,
+            max_label_row.checked_add(1)?,
+            2,
+        )?;
+        let route_row = label_row.checked_add(1)?;
+        let from_ordinal = outgoing[&from_index]
+            .iter()
+            .position(|index| *index == relation_index)?;
+        let to_ordinal = incoming[&to_index]
+            .iter()
+            .position(|index| *index == relation_index)?;
+        let from_col = port_col(from, from_ordinal, outgoing[&from_index].len())?;
+        let to_col = port_col(to, to_ordinal, incoming[&to_index].len())?;
+        let source_port = (from_col, from.row + from.height);
+        let target_port = (to_col, to.row - 1);
+        routes.connect(source_port, (from_col, route_row));
+        routes.connect((from_col, route_row), (to_col, route_row));
+        routes.connect((to_col, route_row), target_port);
+
         canvas.put(
-            from_col,
-            from.row + from.height - 1,
+            source_port.0,
+            source_port.1,
             cardinality_icon(&relation.from_cardinality.text),
         );
         canvas.put(
-            to_col,
-            to.row,
+            target_port.0,
+            target_port.1,
             cardinality_icon(&relation.to_cardinality.text),
         );
-        let label_width = display_width(&relation.label.text);
+
+        let label_width = display_width(&relation.label.text).max(1);
+        if label_width > graph_width {
+            return None;
+        }
+        let lo = from_col.min(to_col);
+        let hi = from_col.max(to_col);
+        let col = if hi.saturating_sub(lo) >= label_width {
+            lo + (hi - lo - label_width) / 2
+        } else {
+            (graph_width - label_width) / 2
+        };
         canvas.labels.push(canvas::MermaidCanvasLabel {
             row: label_row,
-            col: ((from_col + to_col) / 2).saturating_sub(label_width / 2),
+            col,
             text: relation.label.text.clone(),
             source: relation.label.span,
         });
     }
+
+    let mut cells = routes.iter().collect::<Vec<_>>();
+    cells.sort_by_key(|((col, row), _)| (*row, *col));
+    for (&(col, row), &mask) in cells {
+        if !matches!(
+            canvas.rows.get(row).and_then(|line| line.get(col)),
+            Some(canvas::MermaidCell::Char('1' | '○' | '┤' | '◇' | '•'))
+        ) {
+            canvas.put(col, row, routing::route_glyph(mask));
+        }
+    }
+    Some(())
+}
+
+fn port_col(placed: PlacedEntity, ordinal: usize, count: usize) -> Option<usize> {
+    let span = placed.width.saturating_sub(2);
+    if count == 0 || count > span || ordinal >= count {
+        return None;
+    }
+    Some(placed.col + ((ordinal + 1) * (span + 1) / (count + 1)))
 }
 
 fn cardinality_icon(cardinality: &str) -> char {
@@ -432,4 +504,23 @@ fn valid_name(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlacedEntity, port_col};
+
+    #[test]
+    fn full_port_capacity_uses_each_interior_column_once() {
+        let placed = PlacedEntity {
+            row: 0,
+            col: 4,
+            width: 7,
+            height: 3,
+        };
+        let ports = (0..5)
+            .map(|ordinal| port_col(placed, ordinal, 5).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ports, vec![5, 6, 7, 8, 9]);
+    }
 }

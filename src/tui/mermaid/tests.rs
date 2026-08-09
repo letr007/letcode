@@ -117,6 +117,23 @@ mod tests {
     }
 
     #[test]
+    fn flowchart_horizontal_corridor_capacity_falls_back() {
+        let source = concat!(
+            "graph LR\n",
+            "A[a] --> B[b]\n",
+            "A --> C[c]\n",
+            "A --> D[d]\n",
+            "A --> E[e]\n",
+            "A --> F[f]\n",
+            "A --> G[g]\n",
+            "A --> H[h]\n",
+        );
+        let text = rendered_text(source, 40);
+        assert!(!text.contains('╭'), "expected fallback:\n{text}");
+        assert!(text.lines().all(|line| !line.contains('┌')), "{text}");
+    }
+
+    #[test]
     fn mermaid_parser_accepts_edge_text_and_pipe_labels() {
         let cases = [
             ("graph RL\nA -- text --> B\n", "text"),
@@ -164,6 +181,45 @@ mod tests {
         let text = rendered_text(source, 80);
         assert!(!text.contains('╭'), "expected linear fallback:\n{text}");
         assert!(text.lines().all(|line| line.starts_with("↓ ")), "{text}");
+    }
+
+    #[test]
+    fn flowchart_lr_branch_labels_use_separate_tracks_and_preserve_spans() {
+        for header in ["flowchart LR", "flowchart RL"] {
+            let source = format!(
+                "{header}\nA[开始] -->|是| B[处理]\nA -->|否| C[跳过]\nB --> D[汇合]\nC --> D\n"
+            );
+            let rendered = super::super::render(&source, 120).unwrap();
+            assert_spans_exact(&source, &rendered);
+            let text = rendered
+                .lines
+                .iter()
+                .map(|line| {
+                    line.iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert!(text.iter().any(|line| line.contains("是")));
+            assert!(text.iter().any(|line| line.contains("否")));
+            assert!(
+                text.iter()
+                    .filter(|line| line.contains("是") || line.contains("否"))
+                    .count()
+                    >= 2,
+                "{header}: {text:?}"
+            );
+            assert!(
+                text.iter().all(|line| {
+                    let labels = ["是", "否"]
+                        .iter()
+                        .filter(|label| line.contains(**label))
+                        .count();
+                    labels < 2
+                }),
+                "{header}: {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -613,6 +669,131 @@ mod tests {
     }
 
     #[test]
+    fn er_screenshot_topology_uses_entity_boxes_and_relationship_routes() {
+        let source = concat!(
+            "erDiagram\n",
+            "USER {\n  int id PK\n  string name\n}\n",
+            "ORDER {\n  int id PK\n  int user_id FK\n}\n",
+            "ORDER_ITEM {\n  int order_id FK\n  int product_id FK\n  int quantity\n}\n",
+            "PRODUCT {\n  int id PK\n  string name\n}\n",
+            "USER ||--o{ ORDER : places\n",
+            "ORDER ||--|{ ORDER_ITEM : contains\n",
+            "PRODUCT ||--o{ ORDER_ITEM : references\n",
+        );
+        let rendered = super::super::render(source, 120).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 120);
+        assert!(text.contains('┌') && text.contains('└'), "{text}");
+        assert!(
+            text.lines().any(|line| line.contains("│ int id PK")),
+            "{text}"
+        );
+        assert!(
+            text.contains("places") && text.contains("contains") && text.contains("references"),
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("USER||")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn er_routes_multiple_parents_into_order_item_without_crossing_tables() {
+        let source = concat!(
+            "erDiagram\n",
+            "USER {\n  int id PK\n}\n",
+            "PRODUCT {\n  int id PK\n}\n",
+            "ORDER {\n  int id PK\n}\n",
+            "ORDER_ITEM {\n  int id PK\n}\n",
+            "USER ||--o{ ORDER : places\n",
+            "PRODUCT ||--o{ ORDER : contains\n",
+            "ORDER ||--|{ ORDER_ITEM : includes\n",
+        );
+        let rendered = super::super::render(source, 120).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 120);
+        for label in [
+            "USER",
+            "PRODUCT",
+            "ORDER",
+            "ORDER_ITEM",
+            "places",
+            "contains",
+            "includes",
+            "int id PK",
+        ] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        let relation_lines = text
+            .lines()
+            .filter(|line| {
+                line.contains("places") || line.contains("contains") || line.contains("includes")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relation_lines.len(), 3, "{text}");
+        assert!(text.matches('1').count() >= 2, "{text}");
+        assert!(text.matches('◇').count() >= 2, "{text}");
+        assert!(text.matches('┤').count() >= 1, "{text}");
+        assert!(
+            text.lines().any(|line| line.contains("│ int id PK │")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn state_implicit_endpoint_scope_is_registered_and_cross_scope_fails_closed() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "state Parent {\n",
+            "  [*] --> Child\n",
+            "}\n",
+            "Child --> Outside\n",
+        );
+        assert!(super::super::render(source, 120).is_none());
+    }
+
+    #[test]
+    fn mermaid_layout_invariants_fail_closed_at_capacity_boundaries() {
+        let er = concat!(
+            "erDiagram\n",
+            "A {\n  int id\n}\n",
+            "B {\n  int id\n}\n",
+            "C {\n  int id\n}\n",
+            "A ||--|| B : first\n",
+            "A ||--|| C : second\n",
+        );
+        assert!(super::super::render(er, 80).is_some());
+        let flow = concat!(
+            "flowchart LR\n",
+            "A[a] --> B[b]\n",
+            "A --> C[c]\n",
+            "A --> D[d]\n",
+            "A --> E[e]\n",
+        );
+        assert!(super::super::render(flow, 80).is_some());
+
+        let cross_scope = concat!(
+            "stateDiagram-v2\n",
+            "state Parent {\n",
+            "  [*] --> Child\n",
+            "}\n",
+            "Child --> Outside\n",
+        );
+        assert!(super::super::render(cross_scope, 120).is_none());
+        let nested = concat!(
+            "stateDiagram-v2\n",
+            "state Outer {\n",
+            "  state Inner {\n",
+            "    [*] --> Leaf\n",
+            "  }\n",
+            "}\n",
+        );
+        let nested_text = facade_text(nested, 120);
+        assert!(!nested_text.contains('╭'), "{nested_text}");
+    }
+
+    #[test]
     fn class_renders_compartment_boxes_and_inheritance_connector() {
         let source = concat!(
             "classDiagram\n",
@@ -695,6 +876,97 @@ mod tests {
         assert!(text.contains("支付处理中"), "{text}");
         assert!(text.contains("┌") || text.contains("[ "), "{text}");
         assert!(text.contains("验证订单"), "{text}");
+    }
+
+    #[test]
+    fn state_screenshot_topology_boxes_states_with_independent_endpoints() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "[*] --> 待支付\n",
+            "待支付 --> 已支付 : 支付成功\n",
+            "待支付 --> 已取消 : 超时\n",
+            "已支付 --> 配送中 : 发货\n",
+            "配送中 --> 已完成 : 签收\n",
+            "已取消 --> [*]\n",
+            "已完成 --> [*]\n",
+        );
+        let rendered = super::super::render(source, 120).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 120);
+        assert!(text.contains('┌') && text.contains('└'), "{text}");
+        assert!(text.matches('◎').count() >= 2, "{text}");
+        assert!(text.contains('▼'), "{text}");
+        assert!(
+            !text.lines().any(|line| line.contains("[ 待支付 ]")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn gantt_screenshot_schedule_renders_timeline_bars() {
+        let source = concat!(
+            "gantt\n",
+            "title 项目排期\n",
+            "dateFormat YYYY-MM-DD\n",
+            "section 设计\n",
+            "需求分析 : done, req, 2026-08-01, 3d\n",
+            "原型设计 : active, ui, after req, 4d\n",
+            "section 开发\n",
+            "功能开发 : crit, dev, after ui, 7d\n",
+            "测试验收 : test, after dev, 3d\n",
+        );
+        let rendered = super::super::render(source, 120).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 120);
+        for marker in ['=', '#', '!', '-'] {
+            assert!(text.contains(marker), "missing {marker}:\n{text}");
+        }
+        assert!(text.contains("08-01") && text.contains("08-18"), "{text}");
+        assert!(
+            text.contains("section 设计") && text.contains("section 开发"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn gantt_axis_format_uses_linear_fallback_with_exact_spans() {
+        let source = concat!(
+            "gantt\n",
+            "dateFormat YYYY-MM-DD\n",
+            "axisFormat %Y-%m-%d\n",
+            "section 计划\n",
+            "交付 : task, 2026-08-01, 2d\n",
+        );
+        let rendered = super::super::render(source, 120).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 120);
+        assert!(text.contains("axisFormat %Y-%m-%d"), "{text}");
+        assert_eq!(text.lines().count(), 4, "expected linear fallback:\n{text}");
+        assert!(!text.contains("08-03"), "expected linear fallback:\n{text}");
+    }
+
+    #[test]
+    fn state_composite_renders_root_and_inner_orthogonal_layout_with_exact_spans() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "[*] --> 待支付\n",
+            "待支付 --> 支付处理中 : 提交支付\n",
+            "state 支付处理中 {\n",
+            "  [*] --> 验证订单\n",
+            "  验证订单 --> 支付成功 : 验证通过\n",
+            "  支付成功 --> [*]\n",
+            "}\n",
+            "支付处理中 --> 已支付 : 支付完成\n",
+            "已支付 --> [*]\n",
+        );
+        let rendered = super::super::render(source, 120).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 120);
+        for label in ["待支付", "支付处理中", "验证订单", "支付成功", "已支付"] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        assert!(text.contains('┌') && text.contains('└'), "{text}");
+        assert!(text.contains('▼'), "{text}");
     }
 
     #[test]
