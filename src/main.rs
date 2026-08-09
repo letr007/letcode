@@ -674,10 +674,11 @@ mod tests {
 
         let prepared = session::prepare_resume_package(&base_dir, target_id.clone())
             .expect("prepare resume target");
+        assert_eq!(prepared.snapshot.max_turn_id, 2);
         session::install_prepared_routed_resume_for_agent(&mut agent, &recorder, prepared)
             .expect("resume target");
 
-        assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(2));
+        assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, None);
         assert_eq!(
             recorder.lock().expect("recorder poisoned").session_id(),
             target_id

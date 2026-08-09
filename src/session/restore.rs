@@ -95,8 +95,9 @@ pub fn prepare_resume_package(
 
     let sessions_dir = sessions_dir.as_ref();
     let session_id = session_id.into();
-    let (records, fingerprint) = load_session_records_with_fingerprint(sessions_dir, &session_id)?;
-    let snapshot = project_runtime_restore_snapshot_with_children(
+    let (mut records, fingerprint) =
+        load_session_records_with_fingerprint(sessions_dir, &session_id)?;
+    let mut snapshot = project_runtime_restore_snapshot_with_children(
         session_id.clone(),
         records.clone(),
         default_resume_cursor(),
@@ -109,6 +110,35 @@ pub fn prepare_resume_package(
         &fingerprint,
     )?;
     recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
+
+    if let Some(turn_id) = snapshot.snapshot.current_turn_id {
+        for (call_id, name) in
+            super::interrupt::unfinished_tool_calls_in_active_turn(&snapshot.records)
+        {
+            recorder.record_tool_call_cancelled(call_id, name)?;
+        }
+        for run in super::interrupt::unfinished_subagent_runs_in_active_turn(&snapshot.records) {
+            recorder.record_subagent_result_structured(
+                run.run_id,
+                run.parent_session_id,
+                run.parent_run_id,
+                run.child_session_id,
+                run.agent_name,
+                "cancelled",
+                "Interrupted while resuming the parent session",
+                None,
+            )?;
+        }
+        recorder.record_turn_interrupted(Some(turn_id))?;
+        records = crate::transcript::read_records(recorder.path())?;
+        snapshot = project_runtime_restore_snapshot_with_children(
+            session_id.clone(),
+            records.clone(),
+            default_resume_cursor(),
+            sessions_dir,
+        )?;
+    }
+
     Ok(PreparedResume {
         session_id,
         records,
@@ -508,6 +538,179 @@ mod tests {
         assert_eq!(agent.model(), "shared");
         assert!(!fast_mode_auto_disabled);
         assert_eq!(token_usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn prepare_resume_interrupts_orphaned_active_turn() {
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("gpt-5.5")
+            .expect("record session start");
+        recorder
+            .record_user_message("continue")
+            .expect("record user message");
+        recorder
+            .record_turn_started(crate::agent::TurnStartedEvent {
+                turn_id: 7,
+                intent: "engineering".into(),
+                directive: "none".into(),
+                validation_reminder: "focused".into(),
+            })
+            .expect("record turn start");
+        recorder
+            .record_assistant_tool_call_batch(
+                None,
+                None,
+                vec![crate::request_builder::HistoryToolCall {
+                    call_id: "call-orphan".into(),
+                    name: "agent__oracle".into(),
+                    arguments_json: "{}".into(),
+                }],
+            )
+            .expect("record tool batch");
+        recorder
+            .record_tool_call_started("call-orphan", "agent__oracle", serde_json::json!({}))
+            .expect("record tool start");
+        let session_id = recorder.session_id().to_string();
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let mut child = TranscriptRecorder::create(&child_dir).expect("create child transcript");
+        child
+            .record_session_started("gpt-5.5")
+            .expect("record child session start");
+        let child_session_id = child.session_id().to_string();
+        drop(child);
+        recorder
+            .record_subagent_started(
+                "run-orphan",
+                session_id.clone(),
+                "turn-7",
+                child_session_id.clone(),
+                "oracle",
+                "inspect crash",
+                1,
+            )
+            .expect("record subagent start");
+        drop(recorder);
+
+        let prepared = prepare_resume_package(&sessions_dir, &session_id).expect("prepare resume");
+        assert_eq!(prepared.snapshot.snapshot.current_turn_id, None);
+        assert!(
+            prepared
+                .snapshot
+                .snapshot
+                .child_sessions
+                .iter()
+                .any(|child| {
+                    child.child_session_id == child_session_id && child.status == "cancelled"
+                })
+        );
+        let history =
+            crate::protocol_frames::history_items_from_frames(&prepared.snapshot.protocol_frames);
+        crate::protocol_frames::validate_history_items_complete(&history, None)
+            .expect("repaired history is protocol-complete");
+
+        let records = crate::transcript::read_records(prepared.recorder.path())
+            .expect("read repaired transcript");
+        assert!(matches!(
+            &records[records.len() - 3].event,
+            crate::transcript::TranscriptEvent::ToolCallCancelled { call_id, name }
+                if call_id == "call-orphan" && name == "agent__oracle"
+        ));
+        assert!(matches!(
+            &records[records.len() - 2].event,
+            crate::transcript::TranscriptEvent::SubagentResult {
+                run_id,
+                child_session_id: result_child_session_id,
+                status,
+                ..
+            } if run_id == "run-orphan"
+                && result_child_session_id == &child_session_id
+                && status == "cancelled"
+        ));
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(crate::transcript::TranscriptEvent::TurnInterrupted { turn_id: Some(7) })
+        ));
+        assert!(
+            crate::subagent::SubagentPool::child_sessions(&sessions_dir, &records)
+                .iter()
+                .any(|child| child.child_session_id == child_session_id
+                    && child.status == "cancelled")
+        );
+        let repaired_record_count = records.len();
+        drop(prepared);
+
+        let prepared = prepare_resume_package(&sessions_dir, &session_id)
+            .expect("prepare repaired session again");
+        assert_eq!(prepared.snapshot.snapshot.current_turn_id, None);
+        assert_eq!(
+            crate::transcript::read_records(prepared.recorder.path())
+                .expect("read idempotently repaired transcript")
+                .len(),
+            repaired_record_count
+        );
+    }
+
+    #[test]
+    fn prepare_resume_repairs_orphaned_turn_on_selected_branch() {
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("gpt-5.5")
+            .expect("record session start");
+        recorder
+            .record_user_message("base")
+            .expect("record base user message");
+        recorder
+            .record_context_branch_created("history-1", "main", 2, None)
+            .expect("record branch");
+        recorder
+            .record_context_checkout("history-1", 2)
+            .expect("record checkout");
+        recorder
+            .adopt_legacy_linear_branch("history-1")
+            .expect("adopt selected branch");
+        recorder
+            .record_turn_started(crate::agent::TurnStartedEvent {
+                turn_id: 8,
+                intent: "engineering".into(),
+                directive: "none".into(),
+                validation_reminder: "focused".into(),
+            })
+            .expect("record turn start");
+        recorder
+            .record_assistant_tool_call_batch(
+                None,
+                None,
+                vec![crate::request_builder::HistoryToolCall {
+                    call_id: "call-branch-orphan".into(),
+                    name: "agent__oracle".into(),
+                    arguments_json: "{}".into(),
+                }],
+            )
+            .expect("record tool batch");
+        let session_id = recorder.session_id().to_string();
+        drop(recorder);
+
+        let prepared = prepare_resume_package(&sessions_dir, &session_id).expect("prepare resume");
+        assert_eq!(prepared.snapshot.branch_id, "history-1");
+        assert_eq!(prepared.snapshot.snapshot.current_turn_id, None);
+
+        let records = crate::transcript::read_records(prepared.recorder.path())
+            .expect("read repaired transcript");
+        for record in &records[records.len() - 2..] {
+            assert_eq!(record.context_branch_id.as_deref(), Some("history-1"));
+        }
+        assert!(matches!(
+            &records[records.len() - 2].event,
+            crate::transcript::TranscriptEvent::ToolCallCancelled { call_id, .. }
+                if call_id == "call-branch-orphan"
+        ));
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(crate::transcript::TranscriptEvent::TurnInterrupted { turn_id: Some(8) })
+        ));
     }
 
     #[test]
