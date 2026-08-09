@@ -18,6 +18,7 @@ pub mod events;
 pub mod input;
 pub mod markdown;
 pub mod measure;
+pub(crate) mod mermaid;
 pub mod preferences;
 pub mod presentation;
 pub mod render;
