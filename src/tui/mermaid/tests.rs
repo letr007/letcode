@@ -392,6 +392,150 @@ mod tests {
     }
 
     #[test]
+    fn common_diagram_families_render_with_exact_unicode_provenance() {
+        let cases = [
+            concat!(
+                "classDiagram\n",
+                "class 用户 {\n",
+                "  +名称🙂: String\n",
+                "}\n",
+                "class 服务\n",
+                "用户 --> 服务 : 调用🚀\n",
+            ),
+            concat!(
+                "erDiagram\n",
+                "用户 {\n",
+                "  string 名称🙂\n",
+                "}\n",
+                "订单 {\n",
+                "  int 编号✅\n",
+                "}\n",
+                "用户 ||--o{ 订单 : 创建🚀\n",
+            ),
+            concat!(
+                "gantt\n",
+                "title 发布计划🙂\n",
+                "dateFormat YYYY-MM-DD\n",
+                "section 客户端✅\n",
+                "实现渲染🚀 : active, render, 2026-08-09, 3d\n",
+            ),
+            concat!(
+                "stateDiagram-v2\n",
+                "state \"等待🙂\" as Waiting\n",
+                "state \"完成✅\" as Done\n",
+                "[*] --> Waiting : 启动🚀\n",
+                "Waiting --> Done : 完成\n",
+                "Done --> [*]\n",
+            ),
+        ];
+        for source in cases {
+            let rendered = super::super::render(source, 120).unwrap_or_else(|| panic!("{source}"));
+            assert_spans_exact(source, &rendered);
+        }
+    }
+
+    #[test]
+    fn common_diagram_families_fail_closed_and_honor_width() {
+        let malformed = [
+            "classDiagram\nclass A {\n  +x\n",
+            "classDiagram\nclass A\nA --> Missing\n",
+            "erDiagram\nA {\n  string id\n}\nA ||--o{ B : owns\n",
+            "erDiagram\nA {\n  string id\n}\nB {\n  string id\n}\nA broken B : owns\n",
+            "gantt\ntitle x\nTask : active, id, someday, later\n",
+            "gantt\nexcludes weekends\n",
+            "stateDiagram\nstate \"Missing end as A\n",
+            "stateDiagram\ndirection LR\nA --> B\n",
+            "stateDiagram\nstate A {\nA --> B\n",
+            "pie\ntitle unsupported\n",
+        ];
+        for source in malformed {
+            assert!(
+                super::super::render(source, 120).is_none(),
+                "accepted {source:?}"
+            );
+        }
+
+        let narrow = [
+            "classDiagram\nclass VeryLongClassName\n",
+            "erDiagram\nA {\n  string very_long_attribute\n}\nB {\n  int id\n}\nA ||--|| B : owns\n",
+            "gantt\ntitle Very long release plan\n",
+            "stateDiagram\nVeryLongStateName --> OtherState\n",
+        ];
+        for source in narrow {
+            assert!(super::super::render(source, 4).is_none(), "fit {source:?}");
+        }
+    }
+
+    #[test]
+    fn common_diagram_families_reject_noncanonical_headers_and_resource_overflow() {
+        for source in [
+            " classDiagram\nclass A\n",
+            "erDiagram \nA {\n  string id\n}\nB {\n  string id\n}\nA ||--|| B : owns\n",
+            "\tgantt\ntitle release\n",
+            "stateDiagram-v2  \nA --> B\n",
+        ] {
+            assert!(
+                super::super::render(source, 120).is_none(),
+                "accepted {source:?}"
+            );
+        }
+
+        let too_many_lines = format!(
+            "classDiagram\n{}",
+            "%% comment\n".repeat(super::super::MAX_SOURCE_LINES)
+        );
+        assert!(super::super::render(&too_many_lines, 120).is_none());
+
+        let too_many_chars = format!(
+            "gantt\ntitle {}\n",
+            "x".repeat(super::super::MAX_SOURCE_CHARS)
+        );
+        assert!(super::super::render(&too_many_chars, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn class_colon_members_and_state_composites_render() {
+        let class = concat!(
+            "classDiagram\n",
+            "class User\n",
+            "User : +name String\n",
+            "class Service\n",
+            "User ..> Service : uses\n",
+        );
+        let class_rendered = super::super::render(class, 80).unwrap();
+        assert_spans_exact(class, &class_rendered);
+        assert!(
+            class_rendered
+                .lines
+                .iter()
+                .flatten()
+                .any(|span| span.text == "+name String")
+        );
+
+        let state = concat!(
+            "stateDiagram\n",
+            "state Parent {\n",
+            "  state Child\n",
+            "  [*] --> Child\n",
+            "}\n",
+        );
+        let state_rendered = super::super::render(state, 80).unwrap();
+        assert_spans_exact(state, &state_rendered);
+        let text = state_rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Parent {"), "{text}");
+        assert!(text.contains("  Child"), "{text}");
+    }
+
+    #[test]
     fn sequence_has_separate_parser_and_renderer_ownership() {
         let source = concat!(
             "sequenceDiagram\n",

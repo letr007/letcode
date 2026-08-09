@@ -17,6 +17,7 @@ pub mod components;
 pub mod events;
 pub mod input;
 pub mod markdown;
+pub(crate) mod math;
 pub mod measure;
 pub(crate) mod mermaid;
 pub mod preferences;
