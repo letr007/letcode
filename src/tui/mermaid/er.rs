@@ -1,14 +1,25 @@
 use super::er_ir as ir;
 use super::{
-    MermaidRenderSpan, MermaidSourceSpan, render_line_count_within_limits, source_within_limits,
+    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits,
+    source_within_limits,
 };
 use crate::tui::measure::display_width;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const CARDINALITIES: [&str; 7] = ["||", "o|", "|o", "o{", "}o", "|{", "}|"];
 
 pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
     let diagram = parse(source)?;
+    if let Some(canvas) = layout(&diagram, width) {
+        let lines = canvas.render();
+        if render_line_count_within_limits(lines.len()) {
+            return Some(lines);
+        }
+    }
+    render_linear(&diagram, width)
+}
+
+fn render_linear(diagram: &ir::Diagram, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
     let mut lines = Vec::new();
     for entity in &diagram.entities {
         lines.push(vec![
@@ -36,6 +47,230 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
             .iter()
             .all(|line| line.iter().map(|s| display_width(&s.text)).sum::<usize>() <= width))
     .then_some(lines)
+}
+
+#[derive(Clone, Copy)]
+struct PlacedEntity {
+    row: usize,
+    col: usize,
+    width: usize,
+    height: usize,
+}
+
+fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
+    if diagram.entities.len() > 24 || diagram.relations.len() > 48 {
+        return None;
+    }
+    let index = diagram
+        .entities
+        .iter()
+        .enumerate()
+        .map(|(index, entity)| (entity.name.text.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut indegree = vec![0usize; diagram.entities.len()];
+    let mut outgoing = vec![Vec::new(); diagram.entities.len()];
+    for relation in &diagram.relations {
+        let from = index[relation.from.text.as_str()];
+        let to = index[relation.to.text.as_str()];
+        outgoing[from].push(to);
+        indegree[to] += 1;
+    }
+    let mut queue = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut depths = vec![0usize; diagram.entities.len()];
+    let mut visited = 0;
+    while let Some(from) = queue.pop_front() {
+        visited += 1;
+        for to in &outgoing[from] {
+            depths[*to] = depths[*to].max(depths[from] + 1);
+            indegree[*to] -= 1;
+            if indegree[*to] == 0 {
+                queue.push_back(*to);
+            }
+        }
+    }
+    if visited != diagram.entities.len() {
+        return None;
+    }
+    let mut layers = vec![Vec::new(); depths.iter().copied().max().unwrap_or(0) + 1];
+    for (entity, depth) in depths.iter().copied().enumerate() {
+        layers[depth].push(entity);
+    }
+    let sizes = diagram
+        .entities
+        .iter()
+        .map(|entity| {
+            let inner = std::iter::once(display_width(&entity.name.text))
+                .chain(
+                    entity
+                        .attributes
+                        .iter()
+                        .map(|attribute| display_width(&attribute.text)),
+                )
+                .max()
+                .unwrap_or(1)
+                .max(1)
+                + 2;
+            (inner + 2, entity.attributes.len() + 4)
+        })
+        .collect::<Vec<_>>();
+    let layer_widths = layers
+        .iter()
+        .map(|layer| {
+            layer.iter().map(|entity| sizes[*entity].0).sum::<usize>()
+                + 6 * layer.len().saturating_sub(1)
+        })
+        .collect::<Vec<_>>();
+    let graph_width = layer_widths.iter().copied().max().unwrap_or(0);
+    if graph_width == 0 || graph_width > width {
+        return None;
+    }
+
+    let mut canvas = canvas::MermaidCanvas {
+        rows: Vec::new(),
+        labels: Vec::new(),
+    };
+    let mut placements = HashMap::new();
+    let mut row = 0;
+    for (layer_index, layer) in layers.iter().enumerate() {
+        let layer_height = layer
+            .iter()
+            .map(|entity| sizes[*entity].1)
+            .max()
+            .unwrap_or(0);
+        let mut col = (graph_width - layer_widths[layer_index]) / 2;
+        for entity in layer {
+            let (entity_width, entity_height) = sizes[*entity];
+            let placed = PlacedEntity {
+                row,
+                col,
+                width: entity_width,
+                height: entity_height,
+            };
+            draw_entity(&mut canvas, &diagram.entities[*entity], placed);
+            placements.insert(*entity, placed);
+            col += entity_width + 6;
+        }
+        if layer_index + 1 < layers.len() {
+            let edge_count = diagram
+                .relations
+                .iter()
+                .filter(|relation| depths[index[relation.from.text.as_str()]] == layer_index)
+                .count();
+            row += layer_height + edge_count * 2 + 2;
+        }
+    }
+    route_entity_relations(&mut canvas, diagram, &index, &depths, &placements);
+    Some(canvas)
+}
+
+fn draw_entity(canvas: &mut canvas::MermaidCanvas, entity: &ir::Entity, placed: PlacedEntity) {
+    let inner = placed.width - 2;
+    canvas.blit(placed.row, placed.col, &format!("┌{}┐", "─".repeat(inner)));
+    canvas.put(placed.col, placed.row + 1, '│');
+    canvas.put(placed.col + placed.width - 1, placed.row + 1, '│');
+    canvas.labels.push(canvas::MermaidCanvasLabel {
+        row: placed.row + 1,
+        col: placed.col + 1 + (inner - display_width(&entity.name.text)) / 2,
+        text: entity.name.text.clone(),
+        source: entity.name.span,
+    });
+    canvas.blit(
+        placed.row + 2,
+        placed.col,
+        &format!("├{}┤", "─".repeat(inner)),
+    );
+    let mut row = placed.row + 3;
+    for attribute in &entity.attributes {
+        canvas.put(placed.col, row, '│');
+        canvas.put(placed.col + placed.width - 1, row, '│');
+        canvas.labels.push(canvas::MermaidCanvasLabel {
+            row,
+            col: placed.col + 2,
+            text: attribute.text.clone(),
+            source: attribute.span,
+        });
+        row += 1;
+    }
+    canvas.blit(row, placed.col, &format!("└{}┘", "─".repeat(inner)));
+}
+
+fn route_entity_relations(
+    canvas: &mut canvas::MermaidCanvas,
+    diagram: &ir::Diagram,
+    index: &HashMap<&str, usize>,
+    depths: &[usize],
+    placements: &HashMap<usize, PlacedEntity>,
+) {
+    let layer_bottoms = placements
+        .iter()
+        .fold(HashMap::new(), |mut bottoms, (entity, placed)| {
+            bottoms
+                .entry(depths[*entity])
+                .and_modify(|bottom: &mut usize| {
+                    *bottom = (*bottom).max(placed.row + placed.height)
+                })
+                .or_insert(placed.row + placed.height);
+            bottoms
+        });
+    let mut offsets = HashMap::<usize, usize>::new();
+    for relation in &diagram.relations {
+        let from_index = index[relation.from.text.as_str()];
+        let to_index = index[relation.to.text.as_str()];
+        let from = placements[&from_index];
+        let to = placements[&to_index];
+        let layer = depths[from_index];
+        let offset = offsets.entry(layer).or_default();
+        let label_row = layer_bottoms[&layer] + *offset * 2;
+        let route_row = label_row + 1;
+        *offset += 1;
+        let from_col = from.col + from.width / 2;
+        let to_col = to.col + to.width / 2;
+        for row in from.row + from.height..=route_row {
+            canvas.put(from_col, row, '│');
+        }
+        let (lo, hi) = if from_col < to_col {
+            (from_col, to_col)
+        } else {
+            (to_col, from_col)
+        };
+        for col in lo..=hi {
+            canvas.put(col, route_row, '─');
+        }
+        for row in route_row..to.row {
+            canvas.put(to_col, row, '│');
+        }
+        canvas.put(
+            from_col,
+            from.row + from.height - 1,
+            cardinality_icon(&relation.from_cardinality.text),
+        );
+        canvas.put(
+            to_col,
+            to.row,
+            cardinality_icon(&relation.to_cardinality.text),
+        );
+        let label_width = display_width(&relation.label.text);
+        canvas.labels.push(canvas::MermaidCanvasLabel {
+            row: label_row,
+            col: ((from_col + to_col) / 2).saturating_sub(label_width / 2),
+            text: relation.label.text.clone(),
+            source: relation.label.span,
+        });
+    }
+}
+
+fn cardinality_icon(cardinality: &str) -> char {
+    match cardinality {
+        "||" => '1',
+        "o|" | "|o" => '○',
+        "|{" | "}|" => '┤',
+        "o{" | "}o" => '◇',
+        _ => '•',
+    }
 }
 
 fn span(label: &ir::Label) -> MermaidRenderSpan {

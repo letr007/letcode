@@ -28,6 +28,16 @@ mod tests {
             .join("\n")
     }
 
+    fn facade_text(source: &str, width: usize) -> String {
+        super::super::render(source, width)
+            .unwrap()
+            .lines
+            .into_iter()
+            .map(|line| line.into_iter().map(|span| span.text).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn mermaid_diamond_renders_fork_and_merge_without_crossing_boxes() {
         let source = concat!(
@@ -154,6 +164,24 @@ mod tests {
         let text = rendered_text(source, 80);
         assert!(!text.contains('╭'), "expected linear fallback:\n{text}");
         assert!(text.lines().all(|line| line.starts_with("↓ ")), "{text}");
+    }
+
+    #[test]
+    fn flowchart_lr_renders_boxed_nodes_and_horizontal_routes() {
+        let source = concat!(
+            "flowchart LR\n",
+            "A[接收请求] --> B{校验通过?}\n",
+            "B -->|是| C[处理业务]\n",
+            "B -->|否| D[返回错误]\n",
+            "C --> E[返回结果]\n",
+        );
+        let text = facade_text(source, 100);
+        for label in ["接收请求", "校验通过?", "处理业务", "返回错误", "返回结果"]
+        {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        assert!(text.matches('╭').count() >= 4, "{text}");
+        assert!(text.contains('▶'), "{text}");
     }
 
     #[test]
@@ -531,8 +559,142 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Parent {"), "{text}");
-        assert!(text.contains("  Child"), "{text}");
+        assert!(text.contains("Parent"), "{text}");
+        assert!(text.contains("Child"), "{text}");
+    }
+
+    #[test]
+    fn sequence_renders_participant_lifelines_and_bidirectional_messages() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "participant Client as Client\n",
+            "participant Server as Server\n",
+            "Client->>Server: request\n",
+            "Server-->>Client: response\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].contains("Client") && lines[0].contains("Server"),
+            "{text}"
+        );
+        assert!(text.matches('│').count() >= 4, "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("request") && line.contains('▶')),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("response") && line.contains('◀')),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn er_renders_entities_as_tables_with_relationships() {
+        let source = concat!(
+            "erDiagram\n",
+            "USER {\n  int id PK\n  string name\n}\n",
+            "ORDER {\n  int id PK\n  int user_id FK\n}\n",
+            "USER ||--o{ ORDER : places\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains("┌") && text.contains("├"), "{text}");
+        assert!(
+            text.contains("int id PK") && text.contains("int user_id FK"),
+            "{text}"
+        );
+        assert!(text.contains("places"), "{text}");
+    }
+
+    #[test]
+    fn class_renders_compartment_boxes_and_inheritance_connector() {
+        let source = concat!(
+            "classDiagram\n",
+            "class Animal {\n",
+            "  +name: str\n",
+            "  +speak()\n",
+            "}\n",
+            "class Dog\n",
+            "Animal <|-- Dog\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains("┌") && text.contains("┐"), "{text}");
+        assert!(text.matches('├').count() >= 2, "{text}");
+        assert!(text.contains("△"), "{text}");
+        assert!(
+            text.find("Animal").unwrap() < text.find("Dog").unwrap(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn class_accepts_common_cardinality_and_annotation_syntax() {
+        let source = concat!(
+            "classDiagram\n",
+            "class User {\n",
+            "  +String id\n",
+            "  +createOrder() Order\n",
+            "}\n",
+            "class Order {\n  +String id\n}\n",
+            "User \"1\" --> \"*\" Order : creates\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains("User") && text.contains("Order"), "{text}");
+        assert!(text.contains("createOrder"), "{text}");
+    }
+
+    #[test]
+    fn state_renders_start_and_end_icons_with_boxed_states() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "state \"等待\" as Waiting\n",
+            "state \"完成\" as Done\n",
+            "[*] --> Waiting : start\n",
+            "Waiting --> Done : finish\n",
+            "Done --> [*]\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains('●'), "{text}");
+        assert!(text.contains('◎'), "{text}");
+        assert!(
+            text.contains("│ 等待 │") && text.contains("│ 完成 │"),
+            "{text}"
+        );
+        assert!(text.contains('▼'), "{text}");
+    }
+
+    #[test]
+    fn state_accepts_chinese_composites_declared_after_transitions() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "[*] --> 待支付\n",
+            "待支付 --> 支付处理中 : 提交支付\n",
+            "state 支付处理中 {\n",
+            "  [*] --> 验证订单\n",
+            "  验证订单 --> 支付成功 : 验证通过\n",
+            "  支付成功 --> [*]\n",
+            "}\n",
+            "支付处理中 --> 已支付 : 支付成功\n",
+        );
+        let rendered = super::super::render(source, 100).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 100);
+        assert!(text.contains('●') && text.contains('◎'), "{text}");
+        assert!(text.contains("支付处理中"), "{text}");
+        assert!(text.contains("┌") || text.contains("[ "), "{text}");
+        assert!(text.contains("验证订单"), "{text}");
     }
 
     #[test]

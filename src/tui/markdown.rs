@@ -1685,10 +1685,19 @@ mod tests {
             .map(|line| render_span_text(&line.spans))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(sequence_text.contains("用户 ──▶ 客户端"), "{sequence_text}");
-        assert!(sequence_text.contains("提交 Markdown"), "{sequence_text}");
+        assert!(sequence_text.contains("用户"), "{sequence_text}");
+        assert!(sequence_text.contains("客户端"), "{sequence_text}");
+        assert!(sequence_text.contains("渲染器"), "{sequence_text}");
         assert!(
-            sequence_text.contains("渲染器 ╌╌▶ 客户端"),
+            sequence_text
+                .lines()
+                .any(|line| line.contains("提交 Markdown") && line.contains('▶')),
+            "{sequence_text}"
+        );
+        assert!(
+            sequence_text
+                .lines()
+                .any(|line| line.contains("返回渲染结果") && line.contains('◀')),
             "{sequence_text}"
         );
         assert!(!sequence_text.contains("╭─ mermaid"), "{sequence_text}");
@@ -1728,11 +1737,11 @@ mod tests {
         let cases = [
             (
                 "```mermaid\nclassDiagram\nclass User {\n  +name String\n}\nclass Service\nUser --> Service : calls\n```",
-                "User --> Service : calls",
+                "calls",
             ),
             (
                 "```mermaid\nerDiagram\nUSER {\n  string name\n}\nORDER {\n  int id\n}\nUSER ||--o{ ORDER : creates\n```",
-                "USER||--o{ORDER : creates",
+                "creates",
             ),
             (
                 "```mermaid\ngantt\ntitle Release plan\ndateFormat YYYY-MM-DD\nsection Client\nImplement renderer : active, render, 2026-08-09, 3d\n```",
@@ -1740,7 +1749,7 @@ mod tests {
             ),
             (
                 "```mermaid\nstateDiagram-v2\nstate \"Waiting\" as Waiting\nstate Done\n[*] --> Waiting : start\nWaiting --> Done : finish\nDone --> [*]\n```",
-                "Waiting --> Done : finish",
+                "finish",
             ),
         ];
         for (markdown, expected) in cases {
@@ -1861,12 +1870,14 @@ mod tests {
             assert!(text.contains("Start"), "{dir}: {text}");
             assert!(text.contains("End"), "{dir}: {text}");
             assert!(!text.contains("╭─ mermaid"), "{dir}: {text}");
-            // 垂直方向二维框化，横向保持线性箭头。
+            // 垂直与横向布局都保留方向对应的连线。
             if matches!(dir, "TB" | "TD" | "BT") {
                 assert!(text.contains('╭'), "{dir}: {text}");
                 assert!(text.contains('│'), "{dir}: {text}");
-            } else {
+            } else if dir == "LR" {
                 assert!(text.contains('▶'), "{dir}: {text}");
+            } else {
+                assert!(text.contains('◀'), "{dir}: {text}");
             }
         }
     }
@@ -1950,9 +1961,20 @@ mod tests {
             .iter()
             .filter(|text| text.contains("One") || text.contains("Two") || text.contains("Alone"))
             .collect::<Vec<_>>();
-        assert_eq!(rendered_prefixed_lines.len(), 2);
-        assert!(rendered_prefixed_lines[0].starts_with("│ "));
-        assert!(rendered_prefixed_lines[1].starts_with("│ "));
+        assert!(rendered_prefixed_lines.len() >= 2);
+        for label in ["One", "Two", "Alone"] {
+            assert!(
+                rendered_prefixed_lines
+                    .iter()
+                    .any(|line| line.contains(label)),
+                "missing {label}: {prefixed_text:?}"
+            );
+        }
+        assert!(
+            rendered_prefixed_lines
+                .iter()
+                .all(|line| line.starts_with("│ "))
+        );
 
         let markdown = "```mermaid\ngraph LR\nA[One]\nB[Two]\nC[Alone]\nA --> B\n```";
         let document =

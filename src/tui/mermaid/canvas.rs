@@ -1,6 +1,7 @@
 //! Generic Mermaid display canvas primitives.
 
-use super::MermaidSourceSpan;
+use super::{MermaidRenderSpan, MermaidSourceSpan};
+use crate::tui::measure::display_width;
 
 /// A source-backed label placed on a display grid.
 pub(crate) struct MermaidCanvasLabel {
@@ -29,6 +30,53 @@ fn mermaid_char_width(ch: char) -> usize {
 }
 
 impl MermaidCanvas {
+    pub(crate) fn render(self) -> Vec<Vec<MermaidRenderSpan>> {
+        let mut lines = Vec::new();
+        for row in 0..self.rows.len() {
+            let mut labels = self
+                .labels
+                .iter()
+                .filter(|label| label.row == row)
+                .map(|label| (label.col, label.col + display_width(&label.text), label))
+                .collect::<Vec<_>>();
+            labels.sort_by_key(|(col, _, _)| *col);
+            let mut spans = Vec::new();
+            let mut decoration = String::new();
+            let mut cursor = 0usize;
+            let mut labels = labels.into_iter().peekable();
+            for (col, cell) in self.rows[row].iter().enumerate() {
+                while let Some(&(start, _, _)) = labels.peek() {
+                    if col < start {
+                        break;
+                    }
+                    let (_, end, label) = labels.next().unwrap();
+                    if !decoration.is_empty() {
+                        spans.push(MermaidRenderSpan::decoration(std::mem::take(
+                            &mut decoration,
+                        )));
+                    }
+                    spans.push(MermaidRenderSpan::source(
+                        label.text.clone(),
+                        label.source,
+                        true,
+                    ));
+                    cursor = end;
+                }
+                if col >= cursor {
+                    match cell {
+                        MermaidCell::Empty | MermaidCell::Wide => decoration.push(' '),
+                        MermaidCell::Char(ch) => decoration.push(*ch),
+                    }
+                }
+            }
+            if !decoration.is_empty() {
+                spans.push(MermaidRenderSpan::decoration(decoration));
+            }
+            lines.push(spans);
+        }
+        lines
+    }
+
     pub(crate) fn ensure_row(&mut self, row: usize, cols: usize) {
         while self.rows.len() <= row {
             self.rows.push(Vec::new());

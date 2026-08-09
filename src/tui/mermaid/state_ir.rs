@@ -8,6 +8,7 @@ pub(super) struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct State {
+    pub(super) id: String,
     pub(super) label: Label,
     pub(super) composite: bool,
     pub(super) depth: usize,

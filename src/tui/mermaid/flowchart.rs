@@ -17,6 +17,7 @@ const MERMAID_ROUTE_LEFT: u8 = 8;
 type MermaidRouteGrid = HashMap<(usize, usize), u8>;
 type PlacementMap<'a> = HashMap<&'a str, MermaidPlaced>;
 
+#[derive(Debug, Clone, Copy)]
 struct MermaidPlaced {
     row: usize,
     col: usize,
@@ -26,12 +27,12 @@ struct MermaidPlaced {
 
 pub(crate) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
     let graph = super::flowchart_parser::parse(source)?;
-    if matches!(
-        graph.direction,
-        ir::MermaidDirection::Td | ir::MermaidDirection::Bu
-    ) && let Some(canvas) = layout(&graph, width)
-    {
-        return Some(render_canvas(canvas));
+    let canvas = match graph.direction {
+        ir::MermaidDirection::Td | ir::MermaidDirection::Bu => layout(&graph, width),
+        ir::MermaidDirection::Lr | ir::MermaidDirection::Rl => layout_horizontal(&graph, width),
+    };
+    if let Some(canvas) = canvas {
+        return Some(canvas.render());
     }
     render_linear(&graph, width)
 }
@@ -120,52 +121,165 @@ fn layout(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::MermaidCanva
     Some(render_mermaid_canvas(graph, &layers))
 }
 
-fn render_canvas(canvas: canvas::MermaidCanvas) -> Vec<Vec<MermaidRenderSpan>> {
-    let mut lines = Vec::new();
-    for row in 0..canvas.rows.len() {
-        let mut labels = canvas
-            .labels
-            .iter()
-            .filter(|label| label.row == row)
-            .map(|label| (label.col, label.col + display_width(&label.text), label))
-            .collect::<Vec<_>>();
-        labels.sort_by_key(|(col, _, _)| *col);
-        let mut spans = Vec::new();
-        let mut decoration = String::new();
-        let mut cursor = 0usize;
-        let mut labels = labels.into_iter().peekable();
-        for (col, cell) in canvas.rows[row].iter().enumerate() {
-            while let Some(&(start, _, _)) = labels.peek() {
-                if col >= start {
-                    let (_, end, label) = labels.next().unwrap();
-                    if !decoration.is_empty() {
-                        spans.push(MermaidRenderSpan::decoration(std::mem::take(
-                            &mut decoration,
-                        )));
-                    }
-                    spans.push(MermaidRenderSpan::source(
-                        label.text.clone(),
-                        label.source,
-                        true,
-                    ));
-                    cursor = end;
-                } else {
-                    break;
-                }
-            }
-            if col >= cursor {
-                match cell {
-                    canvas::MermaidCell::Empty | canvas::MermaidCell::Wide => decoration.push(' '),
-                    canvas::MermaidCell::Char(ch) => decoration.push(*ch),
-                }
-            }
-        }
-        if !decoration.is_empty() {
-            spans.push(MermaidRenderSpan::decoration(decoration));
-        }
-        lines.push(spans);
+fn layout_horizontal(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::MermaidCanvas> {
+    let layers = mermaid_layers(graph)?;
+    if layers.len() > 16 || graph.nodes.len() > 32 || mermaid_crossings(graph, &layers) > 8 {
+        return None;
     }
-    lines
+    let layer_of = layers
+        .iter()
+        .enumerate()
+        .flat_map(|(layer, nodes)| nodes.iter().map(move |id| (id.as_str(), layer)))
+        .collect::<HashMap<_, _>>();
+    if graph.edges.iter().any(|edge| {
+        layer_of
+            .get(edge.from.as_str())
+            .zip(layer_of.get(edge.to.as_str()))
+            .is_none_or(|(from, to)| *to != *from + 1)
+    }) {
+        return None;
+    }
+
+    let column_widths = layers
+        .iter()
+        .map(|layer| {
+            layer
+                .iter()
+                .map(|id| mermaid_node_width(&graph.nodes[id]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let gaps = layers
+        .windows(2)
+        .enumerate()
+        .map(|(layer, _)| {
+            let label = graph
+                .edges
+                .iter()
+                .filter(|edge| layer_of[edge.from.as_str()] == layer)
+                .filter_map(|edge| edge.label.as_ref())
+                .map(|label| display_width(&label.text))
+                .max()
+                .unwrap_or(0);
+            (label + 4).max(8)
+        })
+        .collect::<Vec<_>>();
+    let graph_width = column_widths.iter().sum::<usize>() + gaps.iter().sum::<usize>();
+    if graph_width == 0 || graph_width > width {
+        return None;
+    }
+    let graph_height = layers
+        .iter()
+        .map(|layer| layer.len() * 5usize - 2)
+        .max()
+        .unwrap_or(0);
+    let mut starts = Vec::with_capacity(layers.len());
+    let mut col = 0;
+    for layer in 0..layers.len() {
+        starts.push(col);
+        col += column_widths[layer];
+        if let Some(gap) = gaps.get(layer) {
+            col += gap;
+        }
+    }
+    if matches!(graph.direction, ir::MermaidDirection::Rl) {
+        for (layer, start) in starts.iter_mut().enumerate() {
+            *start = graph_width - *start - column_widths[layer];
+        }
+    }
+
+    let mut canvas = canvas::MermaidCanvas {
+        rows: Vec::new(),
+        labels: Vec::new(),
+    };
+    let mut placements = HashMap::new();
+    for (layer, nodes) in layers.iter().enumerate() {
+        let layer_height = nodes.len() * 5 - 2;
+        let mut row = (graph_height - layer_height) / 2;
+        for id in nodes {
+            let node = &graph.nodes[id];
+            let node_width = mermaid_node_width(node);
+            let node_col = starts[layer] + (column_widths[layer] - node_width) / 2;
+            for (offset, line) in render_mermaid_node_shape(node).iter().enumerate() {
+                canvas.blit(row + offset, node_col, line);
+            }
+            canvas.labels.push(canvas::MermaidCanvasLabel {
+                row: row + 1,
+                col: node_col + (node_width - display_width(&node.label)) / 2,
+                text: node.label.clone(),
+                source: MermaidSourceSpan::new(node.start, node.end),
+            });
+            placements.insert(
+                id.as_str(),
+                MermaidPlaced {
+                    row,
+                    col: node_col,
+                    width: node_width,
+                    height: 3,
+                },
+            );
+            row += 5;
+        }
+    }
+    route_horizontal_edges(&mut canvas, graph, &placements);
+    Some(canvas)
+}
+
+fn route_horizontal_edges(
+    canvas: &mut canvas::MermaidCanvas,
+    graph: &ir::MermaidGraph,
+    placements: &PlacementMap<'_>,
+) {
+    let left_to_right = matches!(graph.direction, ir::MermaidDirection::Lr);
+    let mut routes = MermaidRouteGrid::new();
+    let mut arrows = Vec::new();
+    for edge in &graph.edges {
+        let Some(from) = placements.get(edge.from.as_str()) else {
+            continue;
+        };
+        let Some(to) = placements.get(edge.to.as_str()) else {
+            continue;
+        };
+        let from_row = from.row + 1;
+        let to_row = to.row + 1;
+        let source_exit = if left_to_right {
+            (from.col + from.width, from_row)
+        } else {
+            (from.col.saturating_sub(1), from_row)
+        };
+        let target_entry = if left_to_right {
+            (to.col.saturating_sub(1), to_row)
+        } else {
+            (to.col + to.width, to_row)
+        };
+        let channel = (source_exit.0 + target_entry.0) / 2;
+        connect_mermaid_route(&mut routes, source_exit, (channel, from_row));
+        connect_mermaid_route(&mut routes, (channel, from_row), (channel, to_row));
+        connect_mermaid_route(&mut routes, (channel, to_row), target_entry);
+        if edge.arrow {
+            arrows.push((target_entry, if left_to_right { '▶' } else { '◀' }));
+        }
+        if let Some(label) = &edge.label {
+            let lo = source_exit.0.min(target_entry.0);
+            let hi = source_exit.0.max(target_entry.0);
+            let label_width = display_width(&label.text);
+            if hi.saturating_sub(lo + 1) >= label_width {
+                canvas.labels.push(canvas::MermaidCanvasLabel {
+                    row: from_row,
+                    col: lo + 1 + (hi - lo - 1 - label_width) / 2,
+                    text: label.text.clone(),
+                    source: MermaidSourceSpan::new(label.start, label.end),
+                });
+            }
+        }
+    }
+    for (&(col, row), &mask) in &routes {
+        canvas.put(col, row, mermaid_route_glyph(mask));
+    }
+    for ((col, row), arrow) in arrows {
+        canvas.put(col, row, arrow);
+    }
 }
 
 fn render_mermaid_canvas(
