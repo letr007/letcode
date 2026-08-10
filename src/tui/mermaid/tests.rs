@@ -488,7 +488,7 @@ mod tests {
             "  bang))重点((\n",
             "  other(\"圆形\")\n",
         );
-        let rendered = super::super::render(mindmap, 40).unwrap();
+        let rendered = super::super::render(mindmap, 60).unwrap();
         assert_spans_exact(mindmap, &rendered);
         let text = rendered
             .lines
@@ -506,6 +506,21 @@ mod tests {
         assert!(text.contains("方形"), "{text}");
         assert!(text.contains("云朵"), "{text}");
         assert!(text.contains("重点"), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("根🙂") && line.contains('┼')),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("┌──") && line.contains("标签✅")),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("└──") && line.contains("圆形")),
+            "{text}"
+        );
 
         let timeline = concat!(
             "timeline LR\n",
@@ -516,7 +531,7 @@ mod tests {
             "    2004: 开始🚀 : 完成于 10:30\n",
             "         : 验收 : 发布\n",
         );
-        let rendered = super::super::render(timeline, 50).unwrap();
+        let rendered = super::super::render(timeline, 60).unwrap();
         assert_spans_exact(timeline, &rendered);
         let text = rendered
             .lines
@@ -532,6 +547,48 @@ mod tests {
         assert!(text.contains("10:30"), "{text}");
         assert!(text.contains("验收"), "{text}");
         assert!(text.contains("发布"), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains('┌') && line.contains('┐')),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.chars().filter(|ch| *ch == '┬').count() >= 1),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.chars().filter(|ch| *ch == '┴').count() >= 1),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("2004") && !line.contains("开始🚀")),
+            "{text}"
+        );
+
+        let multi_period = concat!(
+            "timeline\n",
+            "    2024 : Alpha : Beta\n",
+            "    2025 : Ship\n",
+        );
+        let rendered = super::super::render(multi_period, 50).unwrap();
+        assert_spans_exact(multi_period, &rendered);
+        let text = facade_text(multi_period, 50);
+        assert!(
+            text.lines().any(|line| line.matches('┬').count() == 2),
+            "{text}"
+        );
+        assert!(
+            text.lines().any(|line| line.matches('┴').count() == 2),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("2024") && line.contains("2025")),
+            "{text}"
+        );
 
         let trailing_colon = "timeline\n    2004 : event:\n";
         let rendered = super::super::render(trailing_colon, 40).unwrap();
