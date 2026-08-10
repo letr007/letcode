@@ -37,6 +37,7 @@ impl MermaidBlockKind {
 pub(crate) struct MermaidSequence {
     pub(crate) participants: HashMap<String, MermaidNode>,
     pub(crate) items: Vec<MermaidSequenceItem>,
+    pub(crate) autonumber: bool,
 }
 
 #[derive(Debug)]

@@ -995,6 +995,109 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
+    fn sequence_supports_actor_and_autonumber() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "autonumber\n",
+            "actor U as 用户\n",
+            "participant S as 服务\n",
+            "U->>S: 请求\n",
+            "S-->>U: 响应\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains("用户") && text.contains("服务"), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("1 ") && line.contains("请求")),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("2 ") && line.contains("响应")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn sequence_supports_activation_shorthand_in_nested_checkout_flow() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "autonumber\n",
+            "actor U as 用户\n",
+            "participant W as Web\n",
+            "participant G as 网关\n",
+            "participant O as 订单服务\n",
+            "participant I as 库存服务\n",
+            "participant P as 支付服务\n",
+            "participant D as 数据库\n",
+            "U->>W: 点击购买\n",
+            "W->>+G: 提交订单\n",
+            "G->>+O: 创建订单\n",
+            "O->>+I: 检查库存\n",
+            "alt 库存充足\n",
+            "I-->>-O: 锁定库存\n",
+            "O->>+P: 发起支付\n",
+            "alt 支付成功\n",
+            "P-->>-O: 支付成功\n",
+            "O->>D: 保存已支付订单\n",
+            "D-->>O: 保存成功\n",
+            "O-->>-G: 返回订单\n",
+            "G-->>-W: 订单创建成功\n",
+            "W-->>U: 显示支付成功\n",
+            "else 支付失败\n",
+            "P-->>-O: 支付失败\n",
+            "O->>I: 释放库存\n",
+            "O-->>-G: 返回支付失败\n",
+            "G-->>-W: 显示错误\n",
+            "W-->>U: 支付失败\n",
+            "end\n",
+            "else 库存不足\n",
+            "I-->>-O: 库存不足\n",
+            "O-->>-G: 返回库存不足\n",
+            "G-->>-W: 显示错误\n",
+            "W-->>U: 商品库存不足\n",
+            "end\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(
+            text.contains("提交订单") && text.contains("商品库存不足"),
+            "{text}"
+        );
+        assert!(text.lines().any(|line| line.contains("20 ")), "{text}");
+    }
+
+    #[test]
+    fn sequence_autonumber_is_visible_in_linear_fallback() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "actor U as 用户\n",
+            "autonumber\n",
+            "U->>U: 自己\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains("1 ") && text.contains("自己"), "{text}");
+    }
+
+    #[test]
+    fn sequence_rejects_misplaced_or_duplicate_autonumber_and_actor_declarations() {
+        for source in [
+            "sequenceDiagram\nautonumber\nautonumber\nparticipant A as A\nparticipant B as B\nA->>B: x\n",
+            "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: x\nautonumber\n",
+            "sequenceDiagram\nparticipant A as A\nparticipant B as B\nalt branch\nautonumber\nA->>B: x\nend\n",
+            "sequenceDiagram\nactor A\nparticipant B as B\nA->>B: x\n",
+            "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>++B: x\n",
+        ] {
+            assert!(super::super::render(source, 80).is_none(), "{source}");
+        }
+    }
+
+    #[test]
     fn er_renders_entities_as_tables_with_relationships() {
         let source = concat!(
             "erDiagram\n",

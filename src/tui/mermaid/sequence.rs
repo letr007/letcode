@@ -19,7 +19,15 @@ pub(crate) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
     }
 
     let mut lines = Vec::new();
-    render_linear_items(&sequence, &sequence.items, 0, &mut lines)?;
+    let mut message_number = 1;
+    render_linear_items(
+        &sequence,
+        &sequence.items,
+        0,
+        &mut lines,
+        sequence.autonumber,
+        &mut message_number,
+    )?;
     (render_line_count_within_limits(lines.len())
         && lines.iter().all(|line| {
             line.iter()
@@ -37,12 +45,22 @@ fn layout(sequence: &ir::MermaidSequence, width: usize) -> Option<canvas::Mermai
     let mut participants = sequence.participants.iter().collect::<Vec<_>>();
     participants.sort_by_key(|(_, participant)| participant.start);
     let message_width = max_message_width(&sequence.items).max(1);
+    let number_width = if sequence.autonumber {
+        message_count(&sequence.items)
+            .max(1)
+            .to_string()
+            .chars()
+            .count()
+            + 1
+    } else {
+        0
+    };
     let block_width = max_block_width(&sequence.items);
     let label_widths = participants
         .iter()
         .map(|(_, participant)| display_width(&participant.label).max(1))
         .collect::<Vec<_>>();
-    let mut centers = vec![(label_widths[0] + 1) / 2 + 1];
+    let mut centers = vec![(label_widths[0] + 1) / 2 + 1 + number_width];
     for index in 1..participants.len() {
         let labels_gap = (label_widths[index - 1] + 1) / 2 + (label_widths[index] + 1) / 2 + 4;
         centers.push(centers[index - 1] + (message_width + 6).max(labels_gap).max(12));
@@ -73,6 +91,7 @@ fn layout(sequence: &ir::MermaidSequence, width: usize) -> Option<canvas::Mermai
     }
     draw_lifelines(&mut canvas, 1, diagram_width, &centers);
     let mut row = 2;
+    let mut message_number = 1;
     draw_sequence_items(
         &mut canvas,
         &sequence.items,
@@ -80,6 +99,8 @@ fn layout(sequence: &ir::MermaidSequence, width: usize) -> Option<canvas::Mermai
         &centers,
         diagram_width,
         &mut row,
+        sequence.autonumber,
+        &mut message_number,
     )?;
     Some(canvas)
 }
@@ -91,6 +112,8 @@ fn draw_sequence_items(
     centers: &[usize],
     width: usize,
     row: &mut usize,
+    autonumber: bool,
+    message_number: &mut usize,
 ) -> Option<()> {
     for item in items {
         match item {
@@ -98,6 +121,10 @@ fn draw_sequence_items(
                 let from = *columns.get(message.from.as_str())?;
                 let to = *columns.get(message.to.as_str())?;
                 draw_lifelines(canvas, *row, width, centers);
+                if autonumber {
+                    canvas.blit(*row, 0, &format!("{} ", *message_number));
+                    *message_number += 1;
+                }
                 let (left, right) = if from < to { (from, to) } else { (to, from) };
                 let line = if message.dashed { '╌' } else { '─' };
                 for col in left + 1..right {
@@ -150,7 +177,16 @@ fn draw_sequence_items(
                         );
                         *row += 1;
                     }
-                    draw_sequence_items(canvas, &branch.items, columns, centers, width, row)?;
+                    draw_sequence_items(
+                        canvas,
+                        &branch.items,
+                        columns,
+                        centers,
+                        width,
+                        row,
+                        autonumber,
+                        message_number,
+                    )?;
                 }
                 draw_frame_row(canvas, *row, width, centers, '└', '┘', "", None);
                 *row += 1;
@@ -255,14 +291,23 @@ fn render_linear_items(
     items: &[ir::MermaidSequenceItem],
     indent: usize,
     lines: &mut Vec<Vec<MermaidRenderSpan>>,
+    autonumber: bool,
+    message_number: &mut usize,
 ) -> Option<()> {
     for item in items {
         match item {
             ir::MermaidSequenceItem::Message(message) => {
                 let from = sequence.participants.get(&message.from)?;
                 let to = sequence.participants.get(&message.to)?;
-                lines.push(vec![
-                    MermaidRenderSpan::decoration(" ".repeat(indent)),
+                let mut line = vec![MermaidRenderSpan::decoration(" ".repeat(indent))];
+                if autonumber {
+                    line.push(MermaidRenderSpan::decoration(format!(
+                        "{} ",
+                        *message_number
+                    )));
+                    *message_number += 1;
+                }
+                line.extend([
                     MermaidRenderSpan::source(
                         from.label.clone(),
                         MermaidSourceSpan::new(from.start, from.end),
@@ -285,6 +330,7 @@ fn render_linear_items(
                         false,
                     ),
                 ]);
+                lines.push(line);
             }
             ir::MermaidSequenceItem::Block(block) => {
                 lines.push(vec![
@@ -313,7 +359,14 @@ fn render_linear_items(
                             ));
                         }
                     }
-                    render_linear_items(sequence, &branch.items, indent + 2, lines)?;
+                    render_linear_items(
+                        sequence,
+                        &branch.items,
+                        indent + 2,
+                        lines,
+                        autonumber,
+                        message_number,
+                    )?;
                 }
                 lines.push(vec![
                     MermaidRenderSpan::decoration(" ".repeat(indent)),
@@ -346,13 +399,22 @@ fn parse(source: &str) -> Option<ir::MermaidSequence> {
     }
     let mut participants = HashMap::new();
     let mut cursor = 1;
-    let items = parse_items(&lines, &mut cursor, &mut participants, true, false)?;
+    let mut autonumber = false;
+    let items = parse_items(
+        &lines,
+        &mut cursor,
+        &mut participants,
+        true,
+        false,
+        &mut autonumber,
+    )?;
     if cursor != lines.len() || participants.is_empty() || !contains_message(&items) {
         return None;
     }
     Some(ir::MermaidSequence {
         participants,
         items,
+        autonumber,
     })
 }
 
@@ -367,6 +429,7 @@ fn parse_items<'a>(
     participants: &mut HashMap<String, ir::MermaidNode>,
     allow_participant: bool,
     in_block: bool,
+    autonumber: &mut bool,
 ) -> Option<Vec<ir::MermaidSequenceItem>> {
     let mut items = Vec::new();
     while *cursor < lines.len() {
@@ -385,6 +448,19 @@ fn parse_items<'a>(
             .text
             .split_once(char::is_whitespace)
             .map_or((line.text, ""), |(keyword, rest)| (keyword, rest.trim()));
+        if keyword == "autonumber" {
+            if !allow_participant
+                || in_block
+                || !items.is_empty()
+                || !rest.is_empty()
+                || *autonumber
+            {
+                return None;
+            }
+            *autonumber = true;
+            *cursor += 1;
+            continue;
+        }
         if let Some(kind) = match keyword {
             "loop" => Some(ir::MermaidBlockKind::Loop),
             "alt" => Some(ir::MermaidBlockKind::Alt),
@@ -403,16 +479,16 @@ fn parse_items<'a>(
                 end: label_start + rest.chars().count(),
             };
             *cursor += 1;
-            let branches = parse_block(lines, cursor, participants, kind)?;
+            let branches = parse_block(lines, cursor, participants, kind, autonumber)?;
             items.push(ir::MermaidSequenceItem::Block(ir::MermaidBlock {
                 kind,
                 label,
                 branches,
             }));
-        } else if keyword == "participant" && allow_participant {
-            parse_participant(line, participants)?;
+        } else if matches!(keyword, "participant" | "actor") && allow_participant {
+            parse_participant(line, participants, keyword)?;
             *cursor += 1;
-        } else if keyword == "participant" {
+        } else if matches!(keyword, "participant" | "actor") {
             return None;
         } else if matches!(keyword, "loop" | "alt" | "opt" | "else" | "end") {
             return None;
@@ -430,12 +506,13 @@ fn parse_block<'a>(
     cursor: &mut usize,
     participants: &mut HashMap<String, ir::MermaidNode>,
     kind: ir::MermaidBlockKind,
+    autonumber: &mut bool,
 ) -> Option<Vec<ir::MermaidBranch>> {
     let mut branches = Vec::new();
     let mut label = None;
     let mut seen_else = false;
     loop {
-        let items = parse_items(lines, cursor, participants, false, true)?;
+        let items = parse_items(lines, cursor, participants, false, true, autonumber)?;
         if items.is_empty() {
             return None;
         }
@@ -479,8 +556,9 @@ fn parse_block<'a>(
 fn parse_participant(
     line: &ParsedLine<'_>,
     participants: &mut HashMap<String, ir::MermaidNode>,
+    keyword: &str,
 ) -> Option<()> {
-    let rest = line.text.strip_prefix("participant ")?;
+    let rest = line.text.strip_prefix(keyword)?.strip_prefix(' ')?;
     let (id, label) = rest.split_once(" as ")?;
     let id = id.trim();
     let label = label.trim();
@@ -494,7 +572,8 @@ fn parse_participant(
         .take_while(|ch| ch.is_whitespace())
         .count();
     let start = line.base
-        + "participant ".chars().count()
+        + keyword.chars().count()
+        + 1
         + rest[..separator + " as ".len()].chars().count()
         + label_leading;
     participants.insert(
@@ -520,8 +599,13 @@ fn parse_message(
         .filter_map(|arrow| route.find(arrow).map(|index| (index, arrow)))
         .min_by_key(|(index, _)| *index)?;
     let from = route[..arrow_at].trim();
-    let to = route[arrow_at + arrow.len()..].trim();
-    if !valid_id(from)
+    let raw_to = route[arrow_at + arrow.len()..].trim();
+    let to = match raw_to.as_bytes().first() {
+        Some(b'+' | b'-') => &raw_to[1..],
+        _ => raw_to,
+    };
+    if matches!(to.as_bytes().first(), Some(b'+' | b'-'))
+        || !valid_id(from)
         || !valid_id(to)
         || label.is_empty()
         || !participants.contains_key(from)
@@ -545,6 +629,20 @@ fn parse_message(
         },
         dashed: arrow.starts_with("--"),
     })
+}
+
+fn message_count(items: &[ir::MermaidSequenceItem]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            ir::MermaidSequenceItem::Message(_) => 1,
+            ir::MermaidSequenceItem::Block(block) => block
+                .branches
+                .iter()
+                .map(|branch| message_count(&branch.items))
+                .sum(),
+        })
+        .sum()
 }
 
 fn contains_message(items: &[ir::MermaidSequenceItem]) -> bool {
