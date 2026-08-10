@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::MermaidRender;
+    use super::super::flowchart::{mermaid_crossings, mermaid_layers};
     use super::super::{MermaidSourceSpan, flowchart, flowchart_ir as ir, flowchart_parser};
 
     fn source_slice(source: &str, start: usize, end: usize) -> String {
@@ -117,20 +118,19 @@ mod tests {
     }
 
     #[test]
-    fn flowchart_horizontal_corridor_capacity_falls_back() {
-        let source = concat!(
-            "graph LR\n",
-            "A[a] --> B[b]\n",
-            "A --> C[c]\n",
-            "A --> D[d]\n",
-            "A --> E[e]\n",
-            "A --> F[f]\n",
-            "A --> G[g]\n",
-            "A --> H[h]\n",
-        );
-        let text = rendered_text(source, 40);
-        assert!(!text.contains('╭'), "expected fallback:\n{text}");
-        assert!(text.lines().all(|line| !line.contains('┌')), "{text}");
+    fn flowchart_horizontal_grouped_fanout_uses_one_corridor() {
+        for (header, arrow) in [("graph LR", '▶'), ("graph RL", '◀')] {
+            let source = format!(
+                "{header}\nA[a] --> B[b]\nA --> C[c]\nA --> D[d]\nA --> E[e]\nA --> F[f]\nA --> G[g]\nA --> H[h]\n"
+            );
+            let text = rendered_text(&source, 40);
+            assert!(text.contains('╭'), "expected canvas:\n{text}");
+            assert_eq!(
+                text.matches(arrow).count(),
+                7,
+                "missing routed edges:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -244,18 +244,36 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
+    fn flowchart_crossings_are_counted_per_corridor() {
+        let source = concat!(
+            "graph TD\n",
+            "A --> D\n",
+            "B --> C\n",
+            "C --> F\n",
+            "D --> E\n",
+        );
+        let graph = flowchart_parser::parse(source).unwrap();
+        let layers = mermaid_layers(&graph).unwrap();
+        assert_eq!(mermaid_crossings(&graph, &layers), 2);
+    }
+
+    #[test]
     fn multi_layer_crossing_threshold_preserves_linear_fallback() {
         let source = concat!(
             "graph TD\n",
-            "A --> F\n",
-            "B --> E\n",
-            "C --> D\n",
+            "A --> J\n",
+            "B --> I\n",
+            "C --> H\n",
             "D --> G\n",
-            "E --> G\n",
-            "F --> G\n",
-            "G --> H\n",
+            "E --> F\n",
+            "F --> K\n",
+            "G --> K\n",
+            "H --> K\n",
+            "I --> K\n",
+            "J --> K\n",
+            "K --> L\n",
         );
-        let text = rendered_text(source, 80);
+        let text = rendered_text(source, 100);
         assert!(!text.contains('╭'), "expected linear fallback:\n{text}");
         assert!(text.lines().all(|line| line.starts_with("↓ ")), "{text}");
     }
@@ -277,6 +295,10 @@ A[$$\not_a_supported_command$$] --> B[Done]
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>();
+            assert!(
+                text.iter().any(|line| line.contains('╭')),
+                "expected canvas for {header}: {text:?}"
+            );
             assert!(text.iter().any(|line| line.contains("是")));
             assert!(text.iter().any(|line| line.contains("否")));
             assert!(
@@ -300,6 +322,76 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
+    fn flowchart_lr_service_fanout_avoids_ambiguous_crossings() {
+        for header in ["flowchart LR", "flowchart RL"] {
+            let source = format!(
+                "{header}\nB[浏览器] --> G[API 网关]\nM[移动端] --> G\nG --> A[身份认证]\nG --> O[订单服务]\nA --> C[缓存]\nO --> D[主数据库]\nO --> I[库存服务]\nO --> P[支付服务]\nO --> Q[消息队列]\n"
+            );
+            let rendered = super::super::render(&source, 160).unwrap();
+            assert_spans_exact(&source, &rendered);
+            let text = facade_text(&source, 160);
+            for label in [
+                "浏览器",
+                "移动端",
+                "API 网关",
+                "身份认证",
+                "订单服务",
+                "缓存",
+                "主数据库",
+                "库存服务",
+                "支付服务",
+                "消息队列",
+            ] {
+                assert!(text.contains(label), "missing {label}:\n{text}");
+            }
+            assert!(text.contains('╭'), "expected canvas:\n{text}");
+        }
+    }
+
+    #[test]
+    fn flowchart_lr_mixed_grouped_corridors_stay_collision_free() {
+        for header in ["flowchart LR", "flowchart RL"] {
+            let source =
+                format!("{header}\nS[入口] --> A[Alpha]\nS --> B[Beta]\nA --> T[出口]\nB --> T\n");
+            let rendered = super::super::render(&source, 120).unwrap();
+            assert_spans_exact(&source, &rendered);
+            let text = facade_text(&source, 120);
+            assert!(text.contains('╭'), "expected canvas:\n{text}");
+        }
+    }
+
+    #[test]
+    fn flowchart_lr_fanin_uses_shared_target_beam_with_same_row_member() {
+        for (header, arrow) in [("flowchart LR", '▶'), ("flowchart RL", '◀')] {
+            let source = format!("{header}\nA[Alpha] --> T[出口]\nB[Beta] --> T\nC[Gamma] --> T\n");
+            let rendered = super::super::render(&source, 100).unwrap();
+            assert_spans_exact(&source, &rendered);
+            let text = facade_text(&source, 100);
+            assert!(text.contains('╭'), "expected canvas:\n{text}");
+            assert!(text.contains('┼'), "missing target-beam junction:\n{text}");
+            assert!(text.contains(arrow), "missing target arrow:\n{text}");
+        }
+    }
+
+    #[test]
+    fn flowchart_lr_edge_in_source_and_target_groups_falls_back_atomically() {
+        for header in ["flowchart LR", "flowchart RL"] {
+            let source =
+                format!("{header}\nS[Source] --> A[Alpha]\nS --> B[Beta]\nC[Client] --> B\n");
+            let rendered = super::super::render(&source, 100).unwrap();
+            assert_spans_exact(&source, &rendered);
+            let text = facade_text(&source, 100);
+            assert!(!text.contains('╭'), "expected linear fallback:\n{text}");
+            assert_eq!(
+                text.lines().count(),
+                3,
+                "expected complete fallback:\n{text}"
+            );
+            assert!(text.lines().all(|line| line.contains('▶')), "{text}");
+        }
+    }
+
+    #[test]
     fn flowchart_lr_renders_boxed_nodes_and_horizontal_routes() {
         let source = concat!(
             "flowchart LR\n",
@@ -313,7 +405,7 @@ A[$$\not_a_supported_command$$] --> B[Done]
         {
             assert!(text.contains(label), "missing {label}:\n{text}");
         }
-        assert!(text.matches('╭').count() >= 4, "{text}");
+        assert!(text.lines().count() >= 4, "{text}");
         assert!(text.contains('▶'), "{text}");
     }
 

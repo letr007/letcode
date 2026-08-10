@@ -256,6 +256,155 @@ fn layout_horizontal(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::M
     Some(canvas)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HorizontalBeam {
+    col: usize,
+    first_row: usize,
+    last_row: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalBeamKind {
+    Source,
+    Target,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HorizontalBeamCandidate<'a> {
+    kind: HorizontalBeamKind,
+    id: &'a str,
+    corridor: usize,
+    preferred: usize,
+    min_col: usize,
+    max_col: usize,
+    first_row: usize,
+    last_row: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HorizontalRouteOwner<'a> {
+    Source(&'a str),
+    Target(&'a str),
+    Edge(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HorizontalRouteSegment<'a> {
+    from: (usize, usize),
+    to: (usize, usize),
+    owner: HorizontalRouteOwner<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HorizontalLabelRoute<'a> {
+    edge: &'a ir::MermaidEdge,
+    departure: usize,
+    arrival: usize,
+    source_col: usize,
+    channel: usize,
+    target_col: usize,
+}
+
+fn horizontal_source_exit(
+    placement: &MermaidPlaced,
+    row: usize,
+    left_to_right: bool,
+) -> (usize, usize) {
+    if left_to_right {
+        (placement.col + placement.width, row)
+    } else {
+        (placement.col.saturating_sub(1), row)
+    }
+}
+
+fn horizontal_target_entry(
+    placement: &MermaidPlaced,
+    row: usize,
+    left_to_right: bool,
+) -> (usize, usize) {
+    if left_to_right {
+        (placement.col.saturating_sub(1), row)
+    } else {
+        (placement.col + placement.width, row)
+    }
+}
+
+fn horizontal_channel_bounds(a: usize, b: usize) -> Option<(usize, usize)> {
+    let lo = a.min(b).checked_add(1)?;
+    let hi = a.max(b).checked_sub(1)?;
+    (lo <= hi).then_some((lo, hi))
+}
+
+fn midpoint_toward(a: usize, b: usize, toward: usize) -> usize {
+    let lo = a.min(b);
+    let hi = a.max(b);
+    let distance = hi - lo;
+    let mut midpoint = lo + distance / 2;
+    if distance % 2 == 1 && toward == hi {
+        midpoint += 1;
+    }
+    midpoint
+}
+
+fn push_horizontal_segment<'a>(
+    segments: &mut Vec<HorizontalRouteSegment<'a>>,
+    from: (usize, usize),
+    to: (usize, usize),
+    owner: HorizontalRouteOwner<'a>,
+) {
+    if from != to {
+        segments.push(HorizontalRouteSegment { from, to, owner });
+    }
+}
+
+fn horizontal_routes_do_not_conflict(segments: &[HorizontalRouteSegment<'_>]) -> bool {
+    let mut vertices = HashMap::new();
+    let mut units = HashMap::new();
+    for segment in segments {
+        if segment.from.0 != segment.to.0 && segment.from.1 != segment.to.1 {
+            return false;
+        }
+        let mut claim = |from: (usize, usize), to: (usize, usize)| {
+            for point in [from, to] {
+                if let Some(owner) = vertices.get(&point)
+                    && *owner != segment.owner
+                {
+                    return false;
+                }
+                vertices.entry(point).or_insert(segment.owner);
+            }
+            let unit = if from <= to { (from, to) } else { (to, from) };
+            if let Some(owner) = units.get(&unit)
+                && *owner != segment.owner
+            {
+                return false;
+            }
+            units.insert(unit, segment.owner);
+            true
+        };
+        if segment.from.1 == segment.to.1 {
+            let row = segment.from.1;
+            let lo = segment.from.0.min(segment.to.0);
+            let hi = segment.from.0.max(segment.to.0);
+            for col in lo..hi {
+                if !claim((col, row), (col + 1, row)) {
+                    return false;
+                }
+            }
+        } else {
+            let col = segment.from.0;
+            let lo = segment.from.1.min(segment.to.1);
+            let hi = segment.from.1.max(segment.to.1);
+            for row in lo..hi {
+                if !claim((col, row), (col, row + 1)) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn route_horizontal_edges(
     canvas: &mut canvas::MermaidCanvas,
     graph: &ir::MermaidGraph,
@@ -263,62 +412,280 @@ fn route_horizontal_edges(
     layer_of: &HashMap<&str, usize>,
 ) -> Option<()> {
     let left_to_right = matches!(graph.direction, ir::MermaidDirection::Lr);
-    let mut routes = MermaidRouteGrid::new();
-    let mut tracks = HashMap::<usize, routing::TrackAllocator>::new();
-    let mut arrows = Vec::new();
+    let mut outgoing: HashMap<&str, Vec<&ir::MermaidEdge>> = HashMap::new();
+    let mut incoming: HashMap<&str, Vec<&ir::MermaidEdge>> = HashMap::new();
     for edge in &graph.edges {
-        let Some(from) = placements.get(edge.from.as_str()) else {
+        outgoing.entry(edge.from.as_str()).or_default().push(edge);
+        incoming.entry(edge.to.as_str()).or_default().push(edge);
+    }
+    if graph.edges.iter().any(|edge| {
+        outgoing
+            .get(edge.from.as_str())
+            .is_some_and(|edges| edges.len() >= 2)
+            && incoming
+                .get(edge.to.as_str())
+                .is_some_and(|edges| edges.len() >= 2)
+    }) {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    for (&from_id, edges) in &outgoing {
+        if edges.len() < 2 || edges.iter().any(|edge| edge.label.is_some()) {
             continue;
-        };
-        let Some(to) = placements.get(edge.to.as_str()) else {
+        }
+        let corridor = *layer_of.get(from_id)?;
+        let from = placements.get(from_id)?;
+        let from_row = from.row + 1;
+        let source_exit = horizontal_source_exit(from, from_row, left_to_right);
+        let mut min_col = 0usize;
+        let mut max_col = usize::MAX;
+        let mut first_row = from_row;
+        let mut last_row = from_row;
+        let mut target_side = if left_to_right { usize::MAX } else { 0 };
+        for edge in edges {
+            if *layer_of.get(edge.from.as_str())? != corridor {
+                return None;
+            }
+            let to = placements.get(edge.to.as_str())?;
+            let to_row = to.row + 1;
+            let target_entry = horizontal_target_entry(to, to_row, left_to_right);
+            let (edge_min, edge_max) = horizontal_channel_bounds(source_exit.0, target_entry.0)?;
+            min_col = min_col.max(edge_min);
+            max_col = max_col.min(edge_max);
+            first_row = first_row.min(to_row);
+            last_row = last_row.max(to_row);
+            if left_to_right {
+                target_side = target_side.min(to.col);
+            } else {
+                target_side = target_side.max(to.col + to.width - 1);
+            }
+        }
+        if min_col > max_col {
+            return None;
+        }
+        candidates.push(HorizontalBeamCandidate {
+            kind: HorizontalBeamKind::Source,
+            id: from_id,
+            corridor,
+            preferred: midpoint_toward(source_exit.0, target_side, target_side),
+            min_col,
+            max_col,
+            first_row,
+            last_row,
+        });
+    }
+    for (&to_id, edges) in &incoming {
+        if edges.len() < 2 || edges.iter().any(|edge| edge.label.is_some()) {
             continue;
+        }
+        let corridor = *layer_of.get(edges[0].from.as_str())?;
+        if edges
+            .iter()
+            .any(|edge| layer_of.get(edge.from.as_str()).copied() != Some(corridor))
+        {
+            return None;
+        }
+        let to = placements.get(to_id)?;
+        let to_row = to.row + 1;
+        let target_entry = horizontal_target_entry(to, to_row, left_to_right);
+        let mut min_col = 0usize;
+        let mut max_col = usize::MAX;
+        let mut first_row = to_row;
+        let mut last_row = to_row;
+        let mut source_side = if left_to_right { 0 } else { usize::MAX };
+        for edge in edges {
+            let from = placements.get(edge.from.as_str())?;
+            let from_row = from.row + 1;
+            let source_exit = horizontal_source_exit(from, from_row, left_to_right);
+            let (edge_min, edge_max) = horizontal_channel_bounds(source_exit.0, target_entry.0)?;
+            min_col = min_col.max(edge_min);
+            max_col = max_col.min(edge_max);
+            first_row = first_row.min(from_row);
+            last_row = last_row.max(from_row);
+            if left_to_right {
+                source_side = source_side.max(from.col + from.width - 1);
+            } else {
+                source_side = source_side.min(from.col);
+            }
+        }
+        if min_col > max_col {
+            return None;
+        }
+        candidates.push(HorizontalBeamCandidate {
+            kind: HorizontalBeamKind::Target,
+            id: to_id,
+            corridor,
+            preferred: midpoint_toward(source_side, target_entry.0, source_side),
+            min_col,
+            max_col,
+            first_row,
+            last_row,
+        });
+    }
+    candidates.sort_by(|a, b| {
+        let kind_order = |kind| match (left_to_right, kind) {
+            (true, HorizontalBeamKind::Source) | (false, HorizontalBeamKind::Target) => 0,
+            _ => 1,
         };
+        a.corridor
+            .cmp(&b.corridor)
+            .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
+            .then_with(|| a.id.cmp(b.id))
+    });
+
+    let mut tracks = HashMap::<usize, routing::TrackAllocator>::new();
+    let mut source_beams = HashMap::<&str, HorizontalBeam>::new();
+    let mut target_beams = HashMap::<&str, HorizontalBeam>::new();
+    for candidate in candidates {
+        let col = tracks.entry(candidate.corridor).or_default().allocate(
+            candidate.preferred,
+            candidate.min_col,
+            candidate.max_col,
+        )?;
+        let beam = HorizontalBeam {
+            col,
+            first_row: candidate.first_row,
+            last_row: candidate.last_row,
+        };
+        match candidate.kind {
+            HorizontalBeamKind::Source => {
+                source_beams.insert(candidate.id, beam);
+            }
+            HorizontalBeamKind::Target => {
+                target_beams.insert(candidate.id, beam);
+            }
+        }
+    }
+
+    let mut segments = Vec::new();
+    let mut beam_segments = Vec::new();
+    for (&id, beam) in &source_beams {
+        push_horizontal_segment(
+            &mut beam_segments,
+            (beam.col, beam.first_row),
+            (beam.col, beam.last_row),
+            HorizontalRouteOwner::Source(id),
+        );
+    }
+    for (&id, beam) in &target_beams {
+        push_horizontal_segment(
+            &mut beam_segments,
+            (beam.col, beam.first_row),
+            (beam.col, beam.last_row),
+            HorizontalRouteOwner::Target(id),
+        );
+    }
+
+    let mut arrows = Vec::new();
+    let mut label_routes = Vec::new();
+    for (edge_index, edge) in graph.edges.iter().enumerate() {
+        let from = placements.get(edge.from.as_str())?;
+        let to = placements.get(edge.to.as_str())?;
         let from_row = from.row + 1;
         let to_row = to.row + 1;
-        let source_exit = if left_to_right {
-            (from.col + from.width, from_row)
+        let source_exit = horizontal_source_exit(from, from_row, left_to_right);
+        let target_entry = horizontal_target_entry(to, to_row, left_to_right);
+        let source_beam = source_beams.get(edge.from.as_str());
+        let target_beam = target_beams.get(edge.to.as_str());
+        let source_grouped = outgoing
+            .get(edge.from.as_str())
+            .is_some_and(|edges| edges.len() >= 2);
+        let target_grouped = incoming
+            .get(edge.to.as_str())
+            .is_some_and(|edges| edges.len() >= 2);
+        let owner = if source_grouped {
+            HorizontalRouteOwner::Source(edge.from.as_str())
+        } else if target_grouped {
+            HorizontalRouteOwner::Target(edge.to.as_str())
         } else {
-            (from.col.saturating_sub(1), from_row)
+            HorizontalRouteOwner::Edge(edge_index)
         };
-        let target_entry = if left_to_right {
-            (to.col.saturating_sub(1), to_row)
-        } else {
-            (to.col + to.width, to_row)
+        let channel = match (source_beam, target_beam) {
+            (Some(_), Some(_)) => return None,
+            (Some(source), None) => {
+                push_horizontal_segment(&mut segments, source_exit, (source.col, from_row), owner);
+                push_horizontal_segment(&mut segments, (source.col, to_row), target_entry, owner);
+                source.col
+            }
+            (None, Some(target)) => {
+                let source_joint = (target.col, from_row);
+                let target_joint = (target.col, to_row);
+                if source_joint == target_joint {
+                    push_horizontal_segment(&mut segments, source_exit, target_entry, owner);
+                } else {
+                    push_horizontal_segment(&mut segments, source_exit, source_joint, owner);
+                    push_horizontal_segment(&mut segments, target_joint, target_entry, owner);
+                }
+                target.col
+            }
+            (None, None) => {
+                let (min_col, max_col) = horizontal_channel_bounds(source_exit.0, target_entry.0)?;
+                let preferred = source_exit.0;
+                let channel = tracks
+                    .entry(*layer_of.get(edge.from.as_str())?)
+                    .or_default()
+                    .allocate(preferred, min_col, max_col)?;
+                push_horizontal_segment(&mut segments, source_exit, (channel, from_row), owner);
+                push_horizontal_segment(
+                    &mut segments,
+                    (channel, from_row),
+                    (channel, to_row),
+                    owner,
+                );
+                push_horizontal_segment(&mut segments, (channel, to_row), target_entry, owner);
+                channel
+            }
         };
-        let lo = source_exit.0.min(target_entry.0);
-        let hi = source_exit.0.max(target_entry.0);
-        let preferred = (source_exit.0 + target_entry.0) / 2;
-        let channel = tracks
-            .entry(layer_of[edge.from.as_str()])
-            .or_default()
-            .allocate(preferred, lo.saturating_add(1), hi.saturating_sub(1))?;
-        routes.connect(source_exit, (channel, from_row));
-        routes.connect((channel, from_row), (channel, to_row));
-        routes.connect((channel, to_row), target_entry);
         if edge.arrow {
             arrows.push((target_entry, if left_to_right { '▶' } else { '◀' }));
         }
-        if let Some(label) = &edge.label {
-            let label_width = display_width(&label.text).max(1);
-            let (row, col) = if from_row != to_row {
-                let row = (from_row + to_row) / 2;
-                let left = channel.saturating_sub(label_width + 1);
-                if mermaid_route_span_is_free(&routes, row, left, label_width) {
-                    (row, left)
-                } else {
-                    (row, channel + 1)
-                }
-            } else {
-                let col = lo + 1 + (hi - lo - 1).saturating_sub(label_width) / 2;
-                (from_row, col)
-            };
-            canvas.labels.push(canvas::MermaidCanvasLabel {
-                row,
-                col,
-                text: label.text.clone(),
-                source: MermaidSourceSpan::new(label.start, label.end),
+        if edge.label.is_some() {
+            label_routes.push(HorizontalLabelRoute {
+                edge,
+                departure: from_row,
+                arrival: to_row,
+                source_col: source_exit.0,
+                channel,
+                target_col: target_entry.0,
             });
         }
+    }
+    segments.extend(beam_segments);
+    if !horizontal_routes_do_not_conflict(&segments) {
+        return None;
+    }
+
+    let mut routes = MermaidRouteGrid::new();
+    for segment in segments {
+        routes.connect(segment.from, segment.to);
+    }
+    let mut edge_labels = Vec::new();
+    for route in label_routes {
+        let label = route.edge.label.as_ref()?;
+        let label_width = display_width(&label.text).max(1);
+        let (row, col) = if route.departure != route.arrival {
+            let row = (route.departure + route.arrival) / 2;
+            let left = route.channel.saturating_sub(label_width + 1);
+            if mermaid_route_span_is_free(&routes, row, left, label_width) {
+                (row, left)
+            } else {
+                (row, route.channel + 1)
+            }
+        } else {
+            let lo = route.source_col.min(route.target_col);
+            let hi = route.source_col.max(route.target_col);
+            (
+                route.departure,
+                lo + 1 + (hi - lo - 1).saturating_sub(label_width) / 2,
+            )
+        };
+        edge_labels.push(canvas::MermaidCanvasLabel {
+            row,
+            col,
+            text: label.text.clone(),
+            source: MermaidSourceSpan::new(label.start, label.end),
+        });
     }
     for (&(col, row), &mask) in routes.iter() {
         canvas.put(col, row, mermaid_route_glyph(mask));
@@ -326,6 +693,7 @@ fn route_horizontal_edges(
     for ((col, row), arrow) in arrows {
         canvas.put(col, row, arrow);
     }
+    canvas.labels.extend(edge_labels);
     Some(())
 }
 
@@ -651,7 +1019,7 @@ fn place_edge_label(
     });
 }
 
-fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>>> {
+pub(super) fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>>> {
     let mut indeg: HashMap<String, usize> = graph.nodes.keys().map(|id| (id.clone(), 0)).collect();
     for edge in &graph.edges {
         *indeg.get_mut(&edge.to)? += 1;
@@ -681,7 +1049,7 @@ fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>>> {
     }
     Some(layers)
 }
-fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]) -> usize {
+pub(super) fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]) -> usize {
     let mut layer_of = HashMap::new();
     let mut col_of = HashMap::new();
     for (li, layer) in layers.iter().enumerate() {
@@ -691,14 +1059,15 @@ fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]) -> usize 
         }
     }
     let mut total = 0usize;
-    for _ in layers.windows(2) {
+    for (corridor, _) in layers.windows(2).enumerate() {
         let edges = graph
             .edges
             .iter()
             .filter_map(|edge| {
                 let from = *layer_of.get(edge.from.as_str())?;
                 let to = *layer_of.get(edge.to.as_str())?;
-                (from + 1 == to).then_some((col_of[edge.from.as_str()], col_of[edge.to.as_str()]))
+                (from == corridor && to == corridor + 1)
+                    .then_some((col_of[edge.from.as_str()], col_of[edge.to.as_str()]))
             })
             .collect::<Vec<_>>();
         for (index, edge) in edges.iter().enumerate() {
@@ -711,4 +1080,34 @@ fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]) -> usize 
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HorizontalRouteOwner, HorizontalRouteSegment, horizontal_routes_do_not_conflict};
+
+    #[test]
+    fn horizontal_route_ownership_allows_same_net_junctions_and_rejects_foreign_contacts() {
+        let owner = HorizontalRouteOwner::Source("S");
+        let mut segments = vec![
+            HorizontalRouteSegment {
+                from: (2, 0),
+                to: (2, 2),
+                owner,
+            },
+            HorizontalRouteSegment {
+                from: (0, 1),
+                to: (2, 1),
+                owner,
+            },
+        ];
+        assert!(horizontal_routes_do_not_conflict(&segments));
+
+        segments.push(HorizontalRouteSegment {
+            from: (2, 1),
+            to: (4, 1),
+            owner: HorizontalRouteOwner::Edge(0),
+        });
+        assert!(!horizontal_routes_do_not_conflict(&segments));
+    }
 }
