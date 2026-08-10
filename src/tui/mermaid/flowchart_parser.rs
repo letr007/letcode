@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::tui::math;
+
 use super::flowchart_ir::{
     MermaidDirection, MermaidEdge, MermaidEdgeStyle, MermaidGraph, MermaidLabel, MermaidNode,
     MermaidShape,
@@ -225,10 +227,12 @@ fn parse_endpoint_prefix(
                 + opener.chars().count()
                 + label_leading
                 + usize::from(label_seg.trim_start().starts_with('"'));
+            let (label, atomic) = parse_label(raw)?;
             let node = MermaidNode {
-                label: raw.to_string(),
+                label,
                 start,
                 end: start + raw.chars().count(),
+                atomic,
                 shape: *shape,
             };
             let rest = &trimmed[close + closer.len()..];
@@ -251,6 +255,7 @@ fn parse_endpoint_prefix(
             label: id.to_string(),
             start: tbase,
             end: tbase + id.chars().count(),
+            atomic: false,
             shape: MermaidShape::Rectangle,
         },
         false,
@@ -317,10 +322,14 @@ fn parse_connector(
                 return Some((
                     style,
                     *carrow,
-                    Some(MermaidLabel {
-                        text: raw.to_string(),
-                        start,
-                        end: start + raw.chars().count(),
+                    Some({
+                        let (text, atomic) = parse_label(raw)?;
+                        MermaidLabel {
+                            text,
+                            start,
+                            end: start + raw.chars().count(),
+                            atomic,
+                        }
                     }),
                     &rest[pos + closer.len()..],
                     rest_base + rest[..pos + closer.len()].chars().count(),
@@ -345,15 +354,32 @@ fn parse_pipe_label(segment: &str, base: usize) -> Option<(Option<MermaidLabel>,
         return None;
     }
     let start = tbase + 1 + raw.chars().count() - raw.trim_start().chars().count();
+    let (text, atomic) = parse_label(lt)?;
     Some((
         Some(MermaidLabel {
-            text: lt.to_string(),
+            text,
             start,
             end: start + lt.chars().count(),
+            atomic,
         }),
         &trimmed[close + 1..],
         tbase + trimmed[..close + 1].chars().count(),
     ))
+}
+
+fn parse_label(raw: &str) -> Option<(String, bool)> {
+    if !raw.contains("$$") {
+        return Some((raw.to_string(), false));
+    }
+    let body = raw.strip_prefix("$$")?.strip_suffix("$$")?;
+    if body.is_empty() || body.contains("$$") {
+        return None;
+    }
+    let rendered = math::render_text(body, false)?;
+    if rendered.trim().is_empty() || rendered.contains('\n') {
+        return None;
+    }
+    Some((rendered, true))
 }
 
 fn insert_node(

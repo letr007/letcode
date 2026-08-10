@@ -571,6 +571,60 @@ fn normalize_output(value: String) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone)]
+struct ArraySpec {
+    alignments: Vec<char>,
+    vertical: Vec<bool>,
+    leading_vertical: bool,
+    trailing_vertical: bool,
+}
+
+fn parse_array_spec(spec: &str) -> Option<ArraySpec> {
+    let chars = spec.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut position = 0;
+    let leading_vertical = chars.first() == Some(&'|');
+    if leading_vertical {
+        position += 1;
+    }
+    let mut alignments = Vec::new();
+    let mut vertical = Vec::new();
+    while position < chars.len() {
+        let alignment = chars[position];
+        if !matches!(alignment, 'l' | 'c' | 'r') {
+            return None;
+        }
+        alignments.push(alignment);
+        position += 1;
+        if position == chars.len() {
+            break;
+        }
+        if chars[position] == '|' {
+            position += 1;
+            if position == chars.len() {
+                break;
+            }
+            if chars[position] == '|' {
+                return None;
+            }
+            vertical.push(true);
+        } else {
+            vertical.push(false);
+        }
+    }
+    if alignments.is_empty() || vertical.len() + 1 != alignments.len() {
+        return None;
+    }
+    Some(ArraySpec {
+        alignments,
+        vertical,
+        leading_vertical,
+        trailing_vertical: chars.last() == Some(&'|'),
+    })
+}
+
 fn strip_row_spacing(row: &str) -> String {
     let mut row = row.trim().to_string();
     if let Some(close) = row.find(']')
@@ -962,6 +1016,31 @@ impl<'a> LatexParser<'a> {
                 self.parse_required_argument(true)
             }
             "begin" => self.parse_environment(),
+            "xrightarrow" | "xleftarrow" => {
+                let lower = self
+                    .parse_optional_argument()
+                    .map(|lower| normalize_output(self.render_nested(&lower, false)));
+                self.whitespace();
+                if !self.source[self.position..].starts_with('{') {
+                    self.supported = false;
+                    return String::new();
+                }
+                let upper = normalize_output(self.parse_required_argument(true));
+                if upper.is_empty() || lower.as_deref().is_some_and(str::is_empty) {
+                    self.supported = false;
+                    String::new()
+                } else {
+                    let arrow = if command == "xrightarrow" {
+                        '→'
+                    } else {
+                        '←'
+                    };
+                    match lower {
+                        Some(lower) => format!("─{upper} ({lower}){arrow}"),
+                        None => format!("─{upper}{arrow}"),
+                    }
+                }
+            }
             "end" => {
                 self.supported = false;
                 String::new()
@@ -1235,15 +1314,25 @@ impl<'a> LatexParser<'a> {
                 | "Vmatrix"
                 | "array"
         ) {
-            let body = if name == "array" {
-                body.trim_start()
-                    .strip_prefix('{')
-                    .and_then(|s| s.find('}').map(|i| s[i + 1..].to_string()))
-                    .unwrap_or(body)
+            let (body, array_spec) = if name == "array" {
+                let body = body.trim_start();
+                let Some(spec_body) = body.strip_prefix('{') else {
+                    self.supported = false;
+                    return String::new();
+                };
+                let Some(end) = spec_body.find('}') else {
+                    self.supported = false;
+                    return String::new();
+                };
+                let Some(spec) = parse_array_spec(&spec_body[..end]) else {
+                    self.supported = false;
+                    return String::new();
+                };
+                (spec_body[end + 1..].trim_start().to_string(), Some(spec))
             } else {
-                body
+                (body, None)
             };
-            return self.render_matrix(&name, &body);
+            return self.render_matrix(&name, &body, array_spec.as_ref());
         }
         self.supported = false;
         String::new()
@@ -1258,31 +1347,76 @@ impl<'a> LatexParser<'a> {
             }
         }
     }
-    fn render_matrix(&mut self, name: &str, body: &str) -> String {
-        let rows = body
-            .split("\\\\")
-            .filter(|s| !s.trim().is_empty())
-            .map(|row| {
-                strip_row_spacing(row)
+    fn render_matrix(&mut self, name: &str, body: &str, array_spec: Option<&ArraySpec>) -> String {
+        let mut rows = Vec::new();
+        for raw_row in body.split("\\\\") {
+            let raw_row = raw_row.trim();
+            if raw_row.is_empty() {
+                continue;
+            }
+            if let Some(after_hline) = array_spec
+                .is_some()
+                .then(|| raw_row.strip_prefix(r"\hline"))
+                .flatten()
+            {
+                if after_hline
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| !ch.is_whitespace())
+                {
+                    self.supported = false;
+                    return String::new();
+                }
+                rows.push(None);
+                let raw_row = after_hline.trim_start();
+                if raw_row.is_empty() {
+                    continue;
+                }
+                let cells = strip_row_spacing(raw_row)
                     .split('&')
                     .map(|cell| self.render_nested(cell, false).trim().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
+                    .collect::<Vec<_>>();
+                if cells.iter().any(String::is_empty) {
+                    self.supported = false;
+                    return String::new();
+                }
+                rows.push(Some(cells));
+                continue;
+            }
+            let cells = strip_row_spacing(raw_row)
+                .split('&')
+                .map(|cell| self.render_nested(cell, false).trim().to_string())
+                .collect::<Vec<_>>();
+            if array_spec.is_some() && cells.iter().any(String::is_empty) {
+                self.supported = false;
+                return String::new();
+            }
+            rows.push(Some(cells));
+        }
+        if rows.is_empty() || !rows.iter().any(Option::is_some) {
             self.supported = false;
             return String::new();
         }
+        let data_rows = rows.iter().filter_map(Option::as_ref).collect::<Vec<_>>();
         if rows.len() > self.limits.max_rows
-            || rows.iter().any(|r| r.len() > self.limits.max_columns)
+            || data_rows
+                .iter()
+                .any(|row| row.len() > self.limits.max_columns)
         {
             self.supported = false;
             return String::new();
         }
-        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let cols = data_rows.iter().map(|row| row.len()).max().unwrap_or(0);
+        if let Some(spec) = array_spec
+            && (spec.alignments.len() != cols || data_rows.iter().any(|row| row.len() != cols))
+        {
+            self.supported = false;
+            return String::new();
+        }
         let widths = (0..cols)
             .map(|i| {
-                rows.iter()
+                data_rows
+                    .iter()
                     .map(|r| display_width(r.get(i).map(String::as_str).unwrap_or("")))
                     .max()
                     .unwrap_or(0)
@@ -1291,18 +1425,55 @@ impl<'a> LatexParser<'a> {
         let rendered = rows
             .iter()
             .map(|row| {
-                (0..cols)
-                    .map(|i| {
-                        let cell = row.get(i).map(String::as_str).unwrap_or("");
-                        format!(
-                            "{cell}{}",
-                            PROTECTED_SPACE
-                                .to_string()
-                                .repeat(widths[i].saturating_sub(display_width(cell)))
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" │ ")
+                let Some(row) = row else {
+                    let row_width = if let Some(spec) = array_spec {
+                        widths.iter().sum::<usize>()
+                            + 3usize.saturating_mul(cols.saturating_sub(1))
+                            + usize::from(spec.leading_vertical) * 2
+                            + usize::from(spec.trailing_vertical) * 2
+                    } else {
+                        widths.iter().sum::<usize>() + 3usize.saturating_mul(cols.saturating_sub(1))
+                    };
+                    return "─".repeat(row_width);
+                };
+                if let Some(spec) = array_spec {
+                    let mut line = String::new();
+                    if spec.leading_vertical {
+                        line.push_str("│ ");
+                    }
+                    for i in 0..cols {
+                        if i > 0 {
+                            line.push_str(if spec.vertical[i - 1] { " │ " } else { "   " });
+                        }
+                        let cell = row[i].as_str();
+                        let padding = widths[i].saturating_sub(display_width(cell));
+                        let (left, right) = match spec.alignments[i] {
+                            'r' => (padding, 0),
+                            'c' => (padding / 2, padding - padding / 2),
+                            _ => (0, padding),
+                        };
+                        line.push_str(&" ".repeat(left));
+                        line.push_str(cell);
+                        line.push_str(&" ".repeat(right));
+                    }
+                    if spec.trailing_vertical {
+                        line.push_str(" │");
+                    }
+                    line
+                } else {
+                    (0..cols)
+                        .map(|i| {
+                            let cell = row.get(i).map(String::as_str).unwrap_or("");
+                            format!(
+                                "{cell}{}",
+                                PROTECTED_SPACE
+                                    .to_string()
+                                    .repeat(widths[i].saturating_sub(display_width(cell)))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" │ ")
+                }
             })
             .collect::<Vec<_>>();
         let lines = match name {
@@ -1699,6 +1870,58 @@ pub(crate) fn render(source: &str, display: bool) -> Option<MathLayout> {
 #[cfg(test)]
 mod tests {
     use super::{LAYOUT_END, LAYOUT_START, NAMED_END, NAMED_START, PROTECTED_SPACE};
+
+    #[test]
+    fn arrays_require_valid_column_specs_and_render_rules() {
+        let rendered = super::render_text(
+            r"\begin{array}{|l|c|r|} a & b & c \\ \hline d & e & f \\ g & h & i \end{array}",
+            true,
+        )
+        .expect("array");
+        assert!(rendered.contains("│ a"));
+        assert!(rendered.contains("──"));
+        assert!(rendered.contains("│ c │"));
+        assert!(
+            super::render_text(
+                r"\begin{array}{c|ccc} r_1 & 1 & 0 & 2 \\ r_2 & 0 & 1 & 3 \end{array}",
+                true,
+            )
+            .is_some()
+        );
+        assert!(super::render_text(r"\begin{array}{ccc} a & b & c \end{array}", true).is_some());
+        assert!(super::render_text(r"\begin{array}{|l||c} a & b \end{array}", true).is_none());
+        assert!(super::render_text(r"\begin{array}{lq} a & b \end{array}", true).is_none());
+        assert!(super::render_text(r"\begin{array} a & b \end{array}", true).is_none());
+        assert!(super::render_text(r"\begin{array}{lc} a & b \end{array}", true).is_some());
+        assert!(super::render_text(r"\begin{array}{l} a & b \end{array}", true).is_none());
+        assert!(super::render_text(r"\begin{array}{l} \hline \end{array}", true).is_none());
+        assert!(super::render_text(r"\begin{array}{l} \hlinefoo x \end{array}", true).is_none());
+    }
+
+    #[test]
+    fn extended_arrows_require_upper_labels_and_keep_optional_lower_labels() {
+        assert_eq!(
+            super::render_text(r"A \xrightarrow{f} B", false).as_deref(),
+            Some("A ─f→ B")
+        );
+        assert_eq!(
+            super::render_text(r"A \xleftarrow[g]{h} B", false).as_deref(),
+            Some("A ─h (g)← B")
+        );
+        assert_eq!(
+            super::render_text(r"A \xleftarrow[\alpha] {\beta} B", false).as_deref(),
+            Some("A ─β (α)← B")
+        );
+        assert!(super::render_text(r"A \xrightarrow B", false).is_none());
+        assert!(super::render_text(r"A \xrightarrow{} B", false).is_none());
+        assert!(super::render_text(r"A \xrightarrow[] {f} B", false).is_none());
+        assert!(super::render_text(r"A \xrightarrow[g{f} B", false).is_none());
+    }
+
+    #[test]
+    fn latex_space_command_is_not_a_matrix_row_separator() {
+        assert_eq!(super::render_text(r"a\ b", false).as_deref(), Some("a b"));
+    }
 
     #[test]
     fn malformed_optional_arguments_and_internal_sentinels_fail_closed() {

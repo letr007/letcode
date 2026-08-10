@@ -29,9 +29,32 @@ pub(crate) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
         ir::MermaidDirection::Lr | ir::MermaidDirection::Rl => layout_horizontal(&graph, width),
     };
     if let Some(canvas) = canvas {
-        return Some(canvas.render());
+        let mut lines = canvas.render();
+        apply_atomic_labels(&graph, &mut lines);
+        if fits(&lines, width) {
+            return Some(lines);
+        }
     }
     render_linear(&graph, width)
+}
+
+fn apply_atomic_labels(graph: &ir::MermaidGraph, lines: &mut [Vec<MermaidRenderSpan>]) {
+    for span in lines.iter_mut().flatten() {
+        let Some(source) = span.source else {
+            continue;
+        };
+        span.atomic = graph
+            .nodes
+            .values()
+            .any(|node| node.start == source.start && node.end == source.end && node.atomic)
+            || graph
+                .edges
+                .iter()
+                .filter_map(|edge| edge.label.as_ref())
+                .any(|label| {
+                    label.start == source.start && label.end == source.end && label.atomic
+                });
+    }
 }
 
 fn render_linear(graph: &ir::MermaidGraph, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
@@ -50,10 +73,15 @@ fn render_linear(graph: &ir::MermaidGraph, width: usize) -> Option<Vec<Vec<Merma
             ir::MermaidDirection::Bu => "↑ ",
             ir::MermaidDirection::Lr | ir::MermaidDirection::Rl => "",
         })];
-        spans.push(source_span(&from.label, from.start, from.end));
+        spans.push(source_span(&from.label, from.start, from.end, from.atomic));
         if let Some(label) = &edge.label {
             spans.push(MermaidRenderSpan::decoration(format!(" {line}{line}")));
-            spans.push(source_span(&label.text, label.start, label.end));
+            spans.push(source_span(
+                &label.text,
+                label.start,
+                label.end,
+                label.atomic,
+            ));
             spans.push(MermaidRenderSpan::decoration(format!(
                 " {line}{line}{} ",
                 if edge.arrow { '▶' } else { ' ' }
@@ -64,7 +92,7 @@ fn render_linear(graph: &ir::MermaidGraph, width: usize) -> Option<Vec<Vec<Merma
                 if edge.arrow { '▶' } else { ' ' }
             )));
         }
-        spans.push(source_span(&to.label, to.start, to.end));
+        spans.push(source_span(&to.label, to.start, to.end, to.atomic));
         lines.push(spans);
         rendered_nodes.insert(edge.from.as_str());
         rendered_nodes.insert(edge.to.as_str());
@@ -76,13 +104,18 @@ fn render_linear(graph: &ir::MermaidGraph, width: usize) -> Option<Vec<Vec<Merma
         .collect::<Vec<_>>();
     isolated.sort_by_key(|(_, node)| node.start);
     for (_, node) in isolated {
-        lines.push(vec![source_span(&node.label, node.start, node.end)]);
+        lines.push(vec![source_span(
+            &node.label,
+            node.start,
+            node.end,
+            node.atomic,
+        )]);
     }
     fits(&lines, width).then_some(lines)
 }
 
-fn source_span(text: &str, start: usize, end: usize) -> MermaidRenderSpan {
-    MermaidRenderSpan::source(text.to_string(), MermaidSourceSpan::new(start, end), false)
+fn source_span(text: &str, start: usize, end: usize, atomic: bool) -> MermaidRenderSpan {
+    MermaidRenderSpan::source(text.to_string(), MermaidSourceSpan::new(start, end), atomic)
 }
 
 fn fits(lines: &[Vec<MermaidRenderSpan>], width: usize) -> bool {

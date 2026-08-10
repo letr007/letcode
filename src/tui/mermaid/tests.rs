@@ -134,6 +134,83 @@ mod tests {
     }
 
     #[test]
+    fn flowchart_math_labels_transform_atomically_and_preserve_wrapper_spans() {
+        let source = concat!(
+            "flowchart TD\n",
+            "A[$$E=mc^2$$] -->|$$\\int_0^1 x^2 dx$$| B[Done]\n",
+        );
+        let graph = flowchart_parser::parse(source).unwrap();
+        let node = graph.nodes.get("A").unwrap();
+        assert!(node.atomic);
+        assert_eq!(source_slice(source, node.start, node.end), "$$E=mc^2$$");
+        assert!(!node.label.contains('$'));
+        let label = graph.edges[0].label.as_ref().unwrap();
+        assert!(label.atomic);
+        assert_eq!(
+            source_slice(source, label.start, label.end),
+            "$$\\int_0^1 x^2 dx$$"
+        );
+        assert!(!label.text.contains('$'));
+
+        let rendered = super::super::render(source, 80).unwrap();
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for span in rendered
+            .lines
+            .iter()
+            .flatten()
+            .filter(|span| span.text == node.label || span.text == label.text)
+        {
+            assert!(span.atomic);
+            let span_source =
+                source_slice(source, span.source.unwrap().start, span.source.unwrap().end);
+            assert!(span_source == "$$E=mc^2$$" || span_source == "$$\\int_0^1 x^2 dx$$");
+        }
+        let ordinary = rendered
+            .lines
+            .iter()
+            .flatten()
+            .find(|span| span.text == "Done")
+            .unwrap();
+        assert!(!ordinary.atomic);
+        assert!(text.contains(&node.label));
+        assert!(text.contains(&label.text));
+
+        let too_wide = concat!(
+            "flowchart TD\n",
+            "A[a] -->|$$abcdefghijklmnopqrstuvwxyz$$| B[b]\n",
+        );
+        assert!(super::super::render(too_wide, 20).is_none());
+    }
+
+    #[test]
+    fn flowchart_math_labels_fail_closed_for_malformed_or_multiline_latex() {
+        for source in [
+            "flowchart TD\nA[$$E=mc^2] --> B[Done]\n",
+            "flowchart TD\nA[foo$$E=mc^2$$] --> B[Done]\n",
+            r#"flowchart TD
+A[$$\begin{aligned}x\\ny\end{aligned}$$] --> B[Done]
+"#,
+            r#"flowchart TD
+A[$$\not_a_supported_command$$] --> B[Done]
+"#,
+        ] {
+            assert!(
+                flowchart_parser::parse(source).is_none(),
+                "accepted {source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mermaid_parser_accepts_edge_text_and_pipe_labels() {
         let cases = [
             ("graph RL\nA -- text --> B\n", "text"),

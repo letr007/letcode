@@ -42,6 +42,7 @@ pub(crate) struct MermaidNode {
     pub(crate) label: String,
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) atomic: bool,
     pub(crate) shape: MermaidShape,
 }
 
@@ -50,6 +51,7 @@ pub(crate) struct MermaidLabel {
     pub(crate) text: String,
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) atomic: bool,
 }
 
 #[derive(Debug)]
