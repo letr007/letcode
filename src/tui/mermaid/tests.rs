@@ -318,6 +318,13 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
+    fn flowchart_td_uses_filled_triangle_arrows() {
+        let source = concat!("flowchart TD\n", "A[开始] --> B[结束]\n");
+        let text = facade_text(source, 40);
+        assert!(text.contains('▼'), "{text}");
+    }
+
+    #[test]
     fn flowchart_facade_spans_are_exact_for_td_canvas_and_lr_linear_output() {
         for source in [
             concat!("graph TD\n", "A[\"开始🙂\"] -->|通过 ✅| B[\"结束\"]\n"),

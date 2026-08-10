@@ -519,7 +519,7 @@ fn route_mermaid_edges(
         canvas.put(col, row, mermaid_route_glyph(mask));
     }
     for (col, row) in arrows {
-        canvas.put(col, row, 'v');
+        canvas.put(col, row, '▼');
     }
     for (edge, departure, arrival, from_col, channel, to_col, forked) in labels {
         place_edge_label(
