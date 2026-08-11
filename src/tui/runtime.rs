@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -40,6 +41,7 @@ use super::theme_file::{
 };
 #[cfg(test)]
 use crate::session::RunnerPermissionRequest;
+use crate::session::runner::{ModelCatalogEntry, ModelCatalogUpdatedEvent};
 use crate::session::{RunnerQuestionRequest, SessionEngine, SessionTransportEvent};
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
@@ -77,6 +79,7 @@ const TERMINAL_TITLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '
 const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 3;
 const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
 const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
+const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -95,11 +98,65 @@ fn next_submission_id() -> String {
     )
 }
 
+fn read_git_branch(workspace_dir: &Path) -> Option<String> {
+    let branch = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(workspace_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty());
+    if branch.is_some() {
+        return branch;
+    }
+
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(workspace_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| format!("detached@{}", commit.trim()))
+        .filter(|commit| !commit.ends_with('@'))
+}
+
 fn next_attachment_id() -> String {
     format!(
         "user-attachment-{}",
         NEXT_ATTACHMENT_ID.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardPasteContext {
+    Composer,
+    Dialog,
+    Question,
+    Permission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardPasteChoice {
+    Image,
+    Text,
+    None,
+}
+
+fn choose_clipboard_paste(
+    context: ClipboardPasteContext,
+    has_text: bool,
+    has_image: bool,
+) -> ClipboardPasteChoice {
+    if matches!(context, ClipboardPasteContext::Composer) && has_image {
+        ClipboardPasteChoice::Image
+    } else if has_text {
+        ClipboardPasteChoice::Text
+    } else {
+        ClipboardPasteChoice::None
+    }
 }
 
 fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {
@@ -202,6 +259,26 @@ pub struct AvailableModel {
 }
 
 impl AvailableModel {
+    fn from_catalog_entry(entry: &ModelCatalogEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            label: entry.label.clone(),
+            provider: entry.provider.clone(),
+            context_window_tokens: entry.context_window_tokens,
+            reasoning_effort: entry
+                .reasoning
+                .effort
+                .as_deref()
+                .map(parse_catalog_reasoning_effort),
+            reasoning_efforts: entry
+                .reasoning
+                .efforts
+                .iter()
+                .map(|effort| parse_catalog_reasoning_effort(effort))
+                .collect(),
+        }
+    }
+
     #[cfg(test)]
     pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
         let id = id.into();
@@ -248,6 +325,19 @@ impl AvailableModel {
             reasoning_effort,
             reasoning_efforts,
         }
+    }
+}
+
+fn parse_catalog_reasoning_effort(value: &str) -> ModelReasoningEffort {
+    match value {
+        "none" => ModelReasoningEffort::None,
+        "minimal" => ModelReasoningEffort::Minimal,
+        "low" => ModelReasoningEffort::Low,
+        "medium" => ModelReasoningEffort::Medium,
+        "high" => ModelReasoningEffort::High,
+        "xhigh" => ModelReasoningEffort::Xhigh,
+        "max" => ModelReasoningEffort::Max,
+        other => ModelReasoningEffort::Custom(other.to_string()),
     }
 }
 
@@ -341,6 +431,10 @@ pub struct TuiRuntime {
     history_draft: Option<ComposerDraft>,
     available_models: Vec<AvailableModel>,
     available_experts: Vec<AvailableExpert>,
+    model_absence_notified_for: Option<String>,
+    workspace_dir: Option<PathBuf>,
+    git_branch_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
+    next_git_branch_refresh: Instant,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
     assistant_delta_buffer: Option<AssistantDeltaBuffer>,
@@ -376,6 +470,10 @@ impl TuiRuntime {
             history_draft: None,
             available_models,
             available_experts,
+            model_absence_notified_for: None,
+            workspace_dir: None,
+            git_branch_rx: None,
+            next_git_branch_refresh: Instant::now(),
             sessions_dir,
             preferences_dir,
             assistant_delta_buffer: None,
@@ -385,6 +483,12 @@ impl TuiRuntime {
         }
     }
 
+    pub fn set_workspace_dir(&mut self, workspace_dir: PathBuf) {
+        self.workspace_dir = Some(workspace_dir);
+        self.next_git_branch_refresh = Instant::now();
+        self.poll_git_branch();
+    }
+
     pub fn state(&self) -> &TuiState {
         &self.state
     }
@@ -392,6 +496,11 @@ impl TuiRuntime {
     #[cfg(test)]
     pub fn state_mut(&mut self) -> &mut TuiState {
         &mut self.state
+    }
+
+    #[cfg(test)]
+    pub fn available_models(&self) -> &[AvailableModel] {
+        &self.available_models
     }
 
     fn terminal_title(&self) -> String {
@@ -662,6 +771,7 @@ impl TuiRuntime {
         const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
         self.flush_assistant_delta_buffer_if_due();
         self.poll_session_list();
+        self.poll_git_branch();
         for _ in 0..MAX_SESSION_EVENTS_PER_FRAME {
             match self.session_transport_rx.try_recv() {
                 Ok(event) => self.consume_session_transport_event(event),
@@ -672,6 +782,35 @@ impl TuiRuntime {
                 }
             }
         }
+    }
+
+    fn poll_git_branch(&mut self) {
+        if let Some(rx) = self.git_branch_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(branch) => {
+                    self.git_branch_rx = None;
+                    self.state.set_git_branch(branch);
+                    self.next_git_branch_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.git_branch_rx = None;
+                    self.state.set_git_branch(None);
+                    self.next_git_branch_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return,
+            }
+        }
+        if self.git_branch_rx.is_some() || Instant::now() < self.next_git_branch_refresh {
+            return;
+        }
+        let Some(workspace_dir) = self.workspace_dir.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.git_branch_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(read_git_branch(&workspace_dir));
+        });
     }
 
     fn poll_session_list(&mut self) {
@@ -910,6 +1049,7 @@ impl TuiRuntime {
             SessionTransportEvent::ModelChanged { model_id } => {
                 self.apply_restored_model(model_id.clone());
                 self.state.set_provider_label_from_model_route(model_id);
+                self.state.clear_pending_model_if(model_id);
                 self.show_toast("Model updated", ToastKind::Success);
             }
             SessionTransportEvent::ExpertModelChanged {
@@ -924,6 +1064,28 @@ impl TuiRuntime {
                     expert.route_id = model_id.clone();
                 }
                 self.show_toast(format!("{agent_name} model updated"), ToastKind::Success);
+            }
+            SessionTransportEvent::PermissionModeChanged { mode } => {
+                self.state.set_permission_mode_label(mode.clone());
+                self.state.clear_pending_permission_mode_if(mode);
+                self.show_toast(
+                    format!("Permission mode updated · {mode}"),
+                    ToastKind::Success,
+                );
+            }
+            SessionTransportEvent::ReasoningEffortChanged { effort } => {
+                let label = reasoning_effort_status_label(Some(effort.clone()));
+                self.state.set_reasoning_effort_label(Some(label.clone()));
+                self.state.clear_pending_reasoning_effort_if(&label);
+                self.show_toast("Reasoning effort updated", ToastKind::Success);
+            }
+            SessionTransportEvent::SettingChangeFailed { command } => {
+                self.clear_failed_pending_setting(command);
+                suppress_session_event = true;
+            }
+            SessionTransportEvent::ModelCatalogUpdated(catalog) => {
+                self.apply_model_catalog_update(catalog);
+                suppress_session_event = true;
             }
             SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
@@ -1009,6 +1171,7 @@ impl TuiRuntime {
                 model_id,
                 token_usage,
                 runtime_context,
+                expert_models,
             } => {
                 let _message_count = messages.len();
                 if let Err(error) = self
@@ -1026,6 +1189,7 @@ impl TuiRuntime {
                     return;
                 }
                 self.session_resume_pending = false;
+                self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
                 self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear_if_parent();
@@ -1037,6 +1201,12 @@ impl TuiRuntime {
                 if let Some(model_id) = model_id {
                     self.apply_restored_model(model_id.clone());
                     self.state.set_provider_label_from_model_route(model_id);
+                }
+                for expert in &mut self.available_experts {
+                    expert.route_id = expert_models
+                        .get(&expert.agent_name)
+                        .cloned()
+                        .unwrap_or_else(|| self.state.model_id.clone());
                 }
                 if let Some(mode) = crate::transcript::restore_latest_permission_mode(records) {
                     self.state.set_permission_mode_label(mode);
@@ -1138,8 +1308,6 @@ impl TuiRuntime {
                     );
                     return;
                 }
-                self.state
-                    .show_toast(format!("Viewing {agent_name}"), ToastKind::Info);
             }
             SessionTransportEvent::SessionHistoryLoaded { entries } => {
                 self.open_history_tree_dialog(entries);
@@ -1148,6 +1316,7 @@ impl TuiRuntime {
                 session_id,
                 records,
                 runtime_context,
+                expert_models,
             } => {
                 if let Err(error) = self
                     .state
@@ -1162,6 +1331,7 @@ impl TuiRuntime {
                     );
                     return;
                 }
+                self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
                 self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear();
@@ -1170,6 +1340,12 @@ impl TuiRuntime {
                 self.session_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
+                for expert in &mut self.available_experts {
+                    expert.route_id = expert_models
+                        .get(&expert.agent_name)
+                        .cloned()
+                        .unwrap_or_else(|| self.state.model_id.clone());
+                }
                 // A newly created, still-empty session remains on the dashboard.
                 self.state.active_session = false;
                 self.state
@@ -1347,7 +1523,6 @@ impl TuiRuntime {
             }
             InputAction::CycleReasoningEffort => {
                 if self.state.is_read_only_child_view() {
-                    self.push_child_view_read_only_notice();
                     Ok(None)
                 } else {
                     Ok(self.cycle_reasoning_effort_command())
@@ -1357,7 +1532,6 @@ impl TuiRuntime {
                 self.state.child_navigation_prefix = true;
                 self.state.child_navigation_prefix_ticks_remaining =
                     CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS;
-                self.state.show_toast("Child navigation", ToastKind::Info);
                 Ok(None)
             }
             InputAction::ChildFirst => Ok(Some(RuntimeCommand::ViewChild {
@@ -1375,7 +1549,6 @@ impl TuiRuntime {
             InputAction::ChildParent => {
                 if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();
-                    self.state.show_toast("Parent transcript", ToastKind::Info);
                 }
                 Ok(Some(RuntimeCommand::ViewParent))
             }
@@ -1672,7 +1845,6 @@ impl TuiRuntime {
                     }
                     if self.state.child_navigation_prefix_ticks_remaining == 0 {
                         self.state.child_navigation_prefix = false;
-                        self.state.show_toast("Ready", ToastKind::Info);
                     }
                 }
                 self.poll_session_list();
@@ -1696,6 +1868,81 @@ impl TuiRuntime {
 
     pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
         drawer.draw(&mut self.state)
+    }
+
+    pub(super) fn clear_mcp_server_updating(&mut self, server_name: &str) {
+        self.state
+            .set_mcp_server_updating(server_name.to_string(), false);
+        self.refresh_open_mcp_dialog();
+    }
+
+    fn clear_failed_pending_setting(&mut self, command: &crate::session::SessionCommand) {
+        match command {
+            crate::session::SessionCommand::SetModel(model_id) => {
+                self.state.clear_pending_model_if(model_id);
+            }
+            crate::session::SessionCommand::SetReasoningEffort(effort) => {
+                let label = reasoning_effort_status_label(Some(effort.clone()));
+                self.state.clear_pending_reasoning_effort_if(&label);
+            }
+            crate::session::SessionCommand::SetPermissionMode(mode) => {
+                self.state
+                    .clear_pending_permission_mode_if(&mode.to_string());
+            }
+            crate::session::SessionCommand::SetExpertModel { .. }
+            | crate::session::SessionCommand::ToggleFastMode
+            | crate::session::SessionCommand::ToggleMcpServer(_)
+            | crate::session::SessionCommand::SubmitPrompt(_)
+            | crate::session::SessionCommand::DelegateSubagent { .. }
+            | crate::session::SessionCommand::Compact
+            | crate::session::SessionCommand::ShowHistoryTree
+            | crate::session::SessionCommand::Undo
+            | crate::session::SessionCommand::Redo
+            | crate::session::SessionCommand::NavigateHistory { .. }
+            | crate::session::SessionCommand::ViewChild { .. }
+            | crate::session::SessionCommand::ViewParent
+            | crate::session::SessionCommand::ResumeSession(_)
+            | crate::session::SessionCommand::NewSession
+            | crate::session::SessionCommand::Interrupt => {}
+        }
+    }
+
+    pub(super) fn project_deferred_setting(&mut self, command: &crate::session::SessionCommand) {
+        match command {
+            crate::session::SessionCommand::SetModel(model_id) => {
+                let model_label = self
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == *model_id)
+                    .map(|model| model.label.clone())
+                    .unwrap_or_else(|| model_id.clone());
+                self.state.set_pending_model(model_id.clone(), model_label);
+            }
+            crate::session::SessionCommand::SetReasoningEffort(effort) => {
+                self.state
+                    .set_pending_reasoning_effort(reasoning_effort_status_label(Some(
+                        effort.clone(),
+                    )));
+            }
+            crate::session::SessionCommand::SetPermissionMode(mode) => {
+                self.state.set_pending_permission_mode(mode.to_string());
+            }
+            crate::session::SessionCommand::SetExpertModel { .. }
+            | crate::session::SessionCommand::ToggleFastMode
+            | crate::session::SessionCommand::ToggleMcpServer(_)
+            | crate::session::SessionCommand::SubmitPrompt(_)
+            | crate::session::SessionCommand::DelegateSubagent { .. }
+            | crate::session::SessionCommand::Compact
+            | crate::session::SessionCommand::ShowHistoryTree
+            | crate::session::SessionCommand::Undo
+            | crate::session::SessionCommand::Redo
+            | crate::session::SessionCommand::NavigateHistory { .. }
+            | crate::session::SessionCommand::ViewChild { .. }
+            | crate::session::SessionCommand::ViewParent
+            | crate::session::SessionCommand::ResumeSession(_)
+            | crate::session::SessionCommand::NewSession
+            | crate::session::SessionCommand::Interrupt => {}
+        }
     }
 
     fn has_active_or_pending_session_turn(&self) -> bool {
@@ -1756,37 +2003,54 @@ impl TuiRuntime {
         }
         self.reset_history_navigation();
         let active_session_turn = self.has_active_or_pending_session_turn();
-        let active_turn_command_allowed = matches!(
+        let active_turn_disposition = parsed_command.as_ref().ok().and_then(|intent| {
+            crate::session::SessionCommand::from_command_intent(intent.clone())
+                .map(|command| command.active_turn_disposition())
+        });
+        let active_turn_local_rejected = matches!(
+            &parsed_command,
+            Ok(CommandIntent::Exit | CommandIntent::ResumeShow)
+        );
+        let active_turn_local_command_allowed = matches!(
             &parsed_command,
             Ok(CommandIntent::Help
+                | CommandIntent::PermissionShow
+                | CommandIntent::ModelShow
+                | CommandIntent::AgentsShow
+                | CommandIntent::ReasoningShow
                 | CommandIntent::ContextBrowse
                 | CommandIntent::McpBrowse
                 | CommandIntent::SkillBrowse
                 | CommandIntent::ToolOutputSet(_)
                 | CommandIntent::TranscriptScrollbarSet(_)
-                | CommandIntent::Theme(_)
-                | CommandIntent::Child(_)
-                | CommandIntent::Parent)
+                | CommandIntent::Theme(_))
         );
-        if active_session_turn && !active_turn_command_allowed {
-            if matches!(&parsed_command, Ok(CommandIntent::Delegate { .. })) {
-                self.state.show_toast("Turn still running", ToastKind::Info);
-                return Ok(None);
+        if active_session_turn {
+            match active_turn_disposition {
+                Some(crate::session::ActiveTurnCommandDisposition::QueuePrompt)
+                    if !self.state.is_read_only_child_view() =>
+                {
+                    self.queue_prompt(UserMessageSubmission::new(next_submission_id(), content));
+                    return Ok(None);
+                }
+                Some(crate::session::ActiveTurnCommandDisposition::Reject)
+                | Some(crate::session::ActiveTurnCommandDisposition::Interrupt)
+                | None
+                    if active_turn_local_rejected || !active_turn_local_command_allowed =>
+                {
+                    self.state.show_toast("Turn still running", ToastKind::Info);
+                    return Ok(None);
+                }
+                Some(crate::session::ActiveTurnCommandDisposition::QueuePrompt)
+                | Some(crate::session::ActiveTurnCommandDisposition::Immediate)
+                | Some(crate::session::ActiveTurnCommandDisposition::Defer)
+                | Some(crate::session::ActiveTurnCommandDisposition::Reject)
+                | Some(crate::session::ActiveTurnCommandDisposition::Interrupt)
+                | None => {}
             }
-
-            if matches!(&parsed_command, Ok(CommandIntent::Prompt(_)))
-                && !self.state.is_read_only_child_view()
-            {
-                self.queue_prompt(UserMessageSubmission::new(next_submission_id(), content));
-                return Ok(None);
-            }
-
-            self.state.show_toast("Turn still running", ToastKind::Info);
-            return Ok(None);
         }
 
         if self.state.is_read_only_child_view() && !child_view_allows_prompt(&command_input) {
-            self.push_child_view_read_only_notice();
             return Ok(None);
         }
 
@@ -2038,7 +2302,6 @@ impl TuiRuntime {
             SessionCommand::ViewParent => {
                 if self.state.transcript_view.is_child() {
                     self.state.restore_parent_timeline_view();
-                    self.state.show_toast("Parent transcript", ToastKind::Info);
                 }
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
             }
@@ -2254,7 +2517,13 @@ impl TuiRuntime {
             Some("Select how much freedom the agent has when using tools".into()),
             items,
         );
-        dialog.selected = match self.state.permission_mode_label.as_str() {
+        dialog.selected = match self
+            .state
+            .pending_composer_settings
+            .permission_mode
+            .as_deref()
+            .unwrap_or(&self.state.permission_mode_label)
+        {
             "safe" => 0,
             "auto" => 2,
             "yolo" => 3,
@@ -2262,6 +2531,48 @@ impl TuiRuntime {
         };
         self.state.open_dialog(dialog);
         Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn apply_model_catalog_update(&mut self, catalog: &ModelCatalogUpdatedEvent) {
+        let current_model_id = self.state.model_id.clone();
+        self.available_models = catalog
+            .models
+            .iter()
+            .map(AvailableModel::from_catalog_entry)
+            .collect();
+
+        if self
+            .available_models
+            .iter()
+            .any(|model| model.id == current_model_id)
+        {
+            self.model_absence_notified_for = None;
+        } else if self.model_absence_notified_for.as_deref() != Some(&current_model_id) {
+            self.model_absence_notified_for = Some(current_model_id.clone());
+            self.show_toast(
+                format!("Current model is no longer available: {current_model_id}"),
+                ToastKind::Info,
+            );
+        }
+
+        let items = self.model_dialog_items();
+        let Some(dialog) = self.state.dialog_mut() else {
+            return;
+        };
+        if !matches!(
+            dialog.kind,
+            DialogKind::ModelPicker | DialogKind::ExpertModelPicker(_)
+        ) {
+            return;
+        }
+        let selected_id = dialog.selected_item().map(|item| item.id.clone());
+        let query = dialog.query.clone();
+        let old_selected = dialog.selected;
+        dialog.items = items;
+        dialog.query = query;
+        dialog.selected = selected_id
+            .and_then(|id| dialog.items.iter().position(|item| item.id == id))
+            .unwrap_or_else(|| old_selected.min(dialog.items.len().saturating_sub(1)));
     }
 
     fn model_dialog_items(&self) -> Vec<DialogItem> {
@@ -2277,10 +2588,17 @@ impl TuiRuntime {
     fn show_model_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let items = self.model_dialog_items();
         let mut dialog = DialogState::new(DialogKind::ModelPicker, "Select model", None, items);
+        let selected_model_id = self
+            .state
+            .pending_composer_settings
+            .model
+            .as_ref()
+            .map(|(model_id, _)| model_id.as_str())
+            .unwrap_or(&self.state.model_id);
         if let Some(index) = self
             .available_models
             .iter()
-            .position(|model| model.id == self.state.model_id)
+            .position(|model| model.id == selected_model_id)
         {
             dialog.selected = index;
         }
@@ -2596,20 +2914,15 @@ impl TuiRuntime {
         else {
             return Ok(None);
         };
-        if self.session_turn_active {
-            self.show_toast(
-                "MCP changes unavailable while a turn is active",
-                ToastKind::Error,
-            );
-            return Ok(None);
-        }
         if self.state.mcp_updating.contains(&server_name) {
             self.show_toast("MCP server update is still in progress", ToastKind::Error);
             return Ok(None);
         }
-        self.state
-            .set_mcp_server_updating(server_name.clone(), true);
-        self.refresh_open_mcp_dialog();
+        if !self.has_active_or_pending_session_turn() {
+            self.state
+                .set_mcp_server_updating(server_name.clone(), true);
+            self.refresh_open_mcp_dialog();
+        }
         Ok(Some(RuntimeCommand::ToggleMcpServer(server_name)))
     }
 
@@ -2627,7 +2940,13 @@ impl TuiRuntime {
         match kind {
             DialogKind::ModelPicker => {
                 self.state.close_dialog();
-                Ok(Some(RuntimeCommand::SetModel(selected.id)))
+                self.handle_backend_session_command(crate::session::SessionCommand::SetModel(
+                    selected.id,
+                ))
+                .map(|command| match command {
+                    Some(SubmittedCommand::Runtime(command)) => Some(command),
+                    Some(SubmittedCommand::LocalOnly) | None => None,
+                })
             }
             DialogKind::AgentPicker => {
                 self.show_expert_model_dialog(selected.id);
@@ -2648,12 +2967,6 @@ impl TuiRuntime {
                     "yolo" => PermissionMode::Yolo,
                     _ => PermissionMode::Default,
                 };
-                let label = mode.to_string();
-                self.state.set_permission_mode_label(label.clone());
-                self.show_toast(
-                    format!("Permission mode updated · {label}"),
-                    ToastKind::Success,
-                );
                 Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
             }
             DialogKind::ReasoningPicker => {
@@ -2666,10 +2979,6 @@ impl TuiRuntime {
                     );
                     return Ok(None);
                 }
-                self.state
-                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(
-                        effort.clone(),
-                    ))));
                 Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
             }
             DialogKind::ThemePicker => {
@@ -2790,12 +3099,6 @@ impl TuiRuntime {
     }
 
     fn set_permission_mode_command(&mut self, mode: PermissionMode) -> SubmittedCommand {
-        let label = mode.to_string();
-        self.state.set_permission_mode_label(label.clone());
-        self.show_toast(
-            format!("Permission mode updated · {label}"),
-            ToastKind::Success,
-        );
         SubmittedCommand::Runtime(RuntimeCommand::SetPermissionMode(mode))
     }
 
@@ -2806,8 +3109,6 @@ impl TuiRuntime {
             );
             return SubmittedCommand::LocalOnly;
         }
-        self.state
-            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort.clone()))));
         SubmittedCommand::Runtime(RuntimeCommand::SetReasoningEffort(effort))
     }
 
@@ -2817,8 +3118,6 @@ impl TuiRuntime {
             self.push_command_notice("The selected model does not support configurable reasoning");
             return None;
         };
-        self.state
-            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(next.clone()))));
         Some(RuntimeCommand::SetReasoningEffort(next))
     }
 
@@ -2833,8 +3132,10 @@ impl TuiRuntime {
     fn current_reasoning_effort(&self) -> Option<ModelReasoningEffort> {
         match parse_reasoning_effort(
             self.state
-                .reasoning_effort_label
+                .pending_composer_settings
+                .reasoning_effort
                 .as_deref()
+                .or(self.state.reasoning_effort_label.as_deref())
                 .unwrap_or("off"),
         ) {
             Some(ModelReasoningEffort::None) | None => None,
@@ -2844,11 +3145,6 @@ impl TuiRuntime {
 
     fn push_command_notice(&mut self, message: impl Into<String>) {
         self.state.show_toast(message.into(), ToastKind::Info);
-    }
-
-    fn push_child_view_read_only_notice(&mut self) {
-        self.state
-            .show_toast("Viewing child transcript", ToastKind::Info);
     }
 
     fn selected_slash_command(&self) -> Option<SlashCommandEntry> {
@@ -3032,18 +3328,25 @@ impl TuiRuntime {
 
         match Clipboard::new() {
             Ok(mut clipboard) => {
-                if let Ok(text) = clipboard.get_text()
-                    && !text.is_empty()
-                {
-                    let action = map_paste_event(&self.state, text);
-                    let _ = self.handle_input_action(action)?;
-                    return Ok(());
-                }
+                let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
+                let context = if self.state.dialog_is_open() {
+                    ClipboardPasteContext::Dialog
+                } else if self.state.pending_question.is_some() {
+                    ClipboardPasteContext::Question
+                } else if self.state.pending_permission.is_some() {
+                    ClipboardPasteContext::Permission
+                } else {
+                    ClipboardPasteContext::Composer
+                };
+                let image = if matches!(context, ClipboardPasteContext::Composer) {
+                    clipboard.get_image().ok()
+                } else {
+                    None
+                };
 
-                // Follow the opencode-style fallback order: if there is no plain text,
-                // try to read a native clipboard image and attach it to the composer draft.
-                if !self.state.dialog_is_open() && self.state.pending_permission.is_none() {
-                    if let Ok(image) = clipboard.get_image() {
+                match choose_clipboard_paste(context, text.is_some(), image.is_some()) {
+                    ClipboardPasteChoice::Image => {
+                        let image = image.expect("clipboard image choice requires an image");
                         let mut png_bytes = Vec::new();
                         PngEncoder::new(&mut png_bytes).write_image(
                             image.bytes.as_ref(),
@@ -3062,11 +3365,18 @@ impl TuiRuntime {
                         });
                         self.reset_history_navigation();
                         self.show_toast("Image added", ToastKind::Success);
-                        return Ok(());
+                    }
+                    ClipboardPasteChoice::Text => {
+                        let action = map_paste_event(
+                            &self.state,
+                            text.expect("clipboard text choice requires text"),
+                        );
+                        let _ = self.handle_input_action(action)?;
+                    }
+                    ClipboardPasteChoice::None => {
+                        self.show_toast("Couldn’t paste from clipboard", ToastKind::Error);
                     }
                 }
-
-                self.show_toast("Couldn’t paste from clipboard", ToastKind::Error);
             }
             Err(_) => {
                 self.show_toast("Clipboard unavailable", ToastKind::Error);
@@ -3504,6 +3814,7 @@ pub async fn run_tui(
     projection: crate::session::SessionEngineProjection,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
+    workspace_dir: PathBuf,
     provider_label: String,
     available_models: Vec<AvailableModel>,
     available_experts: Vec<AvailableExpert>,
@@ -3554,6 +3865,7 @@ pub async fn run_tui(
             sessions_dir,
             preferences_dir,
         );
+        runtime.set_workspace_dir(workspace_dir);
         runtime.session_title = projection.session_title;
         let mut terminal = OwnedTerminal::new()?;
         runtime.update_terminal_title(&mut terminal)?;
@@ -3666,12 +3978,10 @@ impl<'a> TerminalDrawer<'a> {
 
 impl RuntimeDrawer for TerminalDrawer<'_> {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
-        // Keep the hardware cursor hidden during buffer flush so it does not sweep
-        // the screen. After paint (and hyperlink OSC writes, which move the VT
-        // cursor), pin it to the composer caret and hide again: CJK IMEs anchor
-        // their candidate window to the real cursor cell even while hidden.
+        // Ratatui keeps the hardware cursor hidden for frames without a requested
+        // cursor. Avoid per-frame cursor moves here: some CJK IMEs follow the VT
+        // cursor even while hidden, which made their candidate window jitter.
         let terminal = self.terminal.terminal_mut();
-        let _ = terminal.hide_cursor();
         let completed = terminal.draw(|frame| render::render(frame, state))?;
         let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
             completed.buffer,
@@ -3680,11 +3990,106 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
         );
         super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
         self.applied_hyperlink_cells = overlay.applied;
-        if let Some((x, y)) = state.ime_cursor_anchor {
-            let _ = terminal.set_cursor_position(ratatui::layout::Position { x, y });
-        }
-        let _ = terminal.hide_cursor();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod git_branch_tests {
+    use super::{TuiRuntime, read_git_branch};
+    use crate::tui::TuiState;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "letcode-git-branch-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn runtime() -> TuiRuntime {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            Vec::new(),
+            Vec::new(),
+            temp_dir("sessions"),
+            temp_dir("preferences"),
+        )
+    }
+
+    fn deliver_branch_refresh(runtime: &mut TuiRuntime, branch: Option<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(branch).expect("queue branch refresh");
+        runtime.git_branch_rx = Some(rx);
+        runtime.poll_git_branch();
+    }
+
+    #[test]
+    fn branch_refresh_replaces_and_clears_cached_state() {
+        let mut runtime = runtime();
+
+        deliver_branch_refresh(&mut runtime, Some("main".into()));
+        assert_eq!(runtime.state().git_branch.as_deref(), Some("main"));
+
+        deliver_branch_refresh(&mut runtime, Some("detached@abc1234".into()));
+        assert_eq!(
+            runtime.state().git_branch.as_deref(),
+            Some("detached@abc1234")
+        );
+
+        deliver_branch_refresh(&mut runtime, None);
+        assert_eq!(runtime.state().git_branch, None);
+    }
+
+    #[test]
+    fn reads_named_and_detached_git_branches() {
+        let path = temp_dir("repository");
+        std::fs::create_dir_all(&path).expect("create temp repository");
+        git(&path, &["init", "-q", "-b", "main"]);
+        git(&path, &["config", "user.email", "test@example.com"]);
+        git(&path, &["config", "user.name", "LetCode Test"]);
+        std::fs::write(path.join("file.txt"), "content").expect("write file");
+        git(&path, &["add", "file.txt"]);
+        git(&path, &["commit", "-q", "-m", "initial"]);
+
+        assert_eq!(read_git_branch(&path).as_deref(), Some("main"));
+        git(&path, &["checkout", "-q", "--detach", "HEAD"]);
+        let branch = read_git_branch(&path).expect("detached branch label");
+        assert!(branch.starts_with("detached@"), "{branch}");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn non_git_directory_has_no_branch() {
+        let path = temp_dir("non-repository");
+        std::fs::create_dir_all(&path).expect("create temp directory");
+
+        assert_eq!(read_git_branch(&path), None);
+
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 

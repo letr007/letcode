@@ -417,14 +417,20 @@ fn timeline_item_needs_separator_before(index: usize, items: &[TimelineItem]) ->
 }
 
 fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool {
-    match item {
-        TimelineItem::Tool(tool) => state
-            .tool_output_overrides
-            .get(&tool.call_id)
-            .copied()
-            .unwrap_or(state.tool_output_expanded),
-        _ => state.tool_output_expanded,
-    }
+    let key = match item {
+        TimelineItem::Tool(tool) => Some(tool.call_id.as_str()),
+        TimelineItem::AutoReviewAggregate(_) => None,
+        _ => return state.tool_output_expanded,
+    };
+    let key = key.map(str::to_string).or_else(|| match item {
+        TimelineItem::AutoReviewAggregate(aggregate) => Some(format!(
+            "auto-review:{}",
+            aggregate.reviewer_child_session_id
+        )),
+        _ => None,
+    });
+    key.and_then(|key| state.tool_output_overrides.get(&key).copied())
+        .unwrap_or(state.tool_output_expanded)
 }
 
 fn cached_item_line_count(state: &mut TuiState, index: usize, theme: Theme, width: usize) -> usize {
@@ -592,6 +598,13 @@ impl Component<Style> for TimelineItemComponent<'_> {
             TimelineItem::Permission(permission) => {
                 build_permission_lines(&mut out, permission, self.theme, self.width)
             }
+            TimelineItem::AutoReviewAggregate(aggregate) => build_auto_review_aggregate_lines(
+                &mut out,
+                aggregate,
+                self.theme,
+                self.width,
+                self.expanded_output,
+            ),
             TimelineItem::Error(error) => {
                 build_error_lines(&mut out, error, self.theme, self.width)
             }
@@ -622,13 +635,17 @@ fn try_render_reviewer_view_item(
         TimelineItem::User(message) => {
             let card = reviewer_cards::parse_review_request(message_text(message))?;
             Some(reviewer_cards::render_review_request_card_document(
-                &card, theme, width,
+                &card,
+                theme,
+                card_content_width(width),
             ))
         }
         TimelineItem::Assistant(message) => {
             let card = reviewer_cards::parse_review_decision(message_text(message))?;
             Some(reviewer_cards::render_review_decision_card_document(
-                &card, theme, width,
+                &card,
+                theme,
+                card_content_width(width),
             ))
         }
         _ => None,
@@ -667,6 +684,7 @@ fn build_compaction_block_lines(
     theme: Theme,
     width: usize,
 ) {
+    let width = card_content_width(width);
     if width == 0 {
         return;
     }
@@ -679,6 +697,10 @@ fn build_compaction_block_lines(
     if !streaming {
         push_drawn_horizontal_rule(out, theme, width);
     }
+}
+
+fn card_content_width(width: usize) -> usize {
+    width.saturating_sub(surface::CARD_PAD_RIGHT as usize)
 }
 
 /// Full-width drawn divider (box-drawing line), not a character label string.
@@ -1055,7 +1077,11 @@ fn build_assistant_message_lines(
 
     if let Some(result) = try_parse_structured_subagent_result(text) {
         out.document.append(
-            structured_subagent::render_structured_subagent_result_document(&result, theme, width),
+            structured_subagent::render_structured_subagent_result_document(
+                &result,
+                theme,
+                card_content_width(width),
+            ),
         );
         return;
     }
@@ -1092,7 +1118,13 @@ fn build_tool_lines(
 ) {
     append_component_document(
         out,
-        tool_card::render_tool_card_document(tool, theme, width, frame, expanded_output),
+        tool_card::render_tool_card_document(
+            tool,
+            theme,
+            card_content_width(width),
+            frame,
+            expanded_output,
+        ),
     );
 }
 
@@ -1104,7 +1136,7 @@ fn build_todo_card(
 ) {
     append_component_document(
         out,
-        todo_card::render_todo_card_document(todo, theme, width),
+        todo_card::render_todo_card_document(todo, theme, card_content_width(width)),
     );
 }
 
@@ -1117,12 +1149,97 @@ fn build_permission_lines(
     if permission.status != PermissionPromptStatus::Pending {
         append_component_document(
             out,
-            tool_card::render_permission_card_document(permission, theme, width),
+            tool_card::render_permission_card_document(
+                permission,
+                theme,
+                card_content_width(width),
+            ),
         );
     }
 }
 
+fn build_auto_review_aggregate_lines(
+    out: &mut TimelineDocument,
+    aggregate: &crate::tui::timeline::AutoReviewAggregateView,
+    theme: Theme,
+    width: usize,
+    expanded: bool,
+) {
+    let width = card_content_width(width);
+    if width == 0 {
+        return;
+    }
+    let approved = aggregate
+        .decisions
+        .iter()
+        .filter(|decision| decision.allowed)
+        .count();
+    let denied = aggregate.decisions.len().saturating_sub(approved);
+    let title = format!(
+        "auto-review · {} decisions · {} approved · {} denied · {}",
+        aggregate.decisions.len(),
+        approved,
+        denied,
+        if expanded { "collapse" } else { "expand" },
+    );
+    for line in wrap_text_to_width(&title, width) {
+        out.push_decoration(
+            Line::from(Span::styled(line, root_muted_style(theme))),
+            Break::HardBreak,
+        );
+    }
+    if expanded {
+        for decision in &aggregate.decisions {
+            let risk = decision.risk.as_deref().unwrap_or("unknown");
+            let line = format!(
+                "{} · {} · {} · {} · {} · call {}",
+                decision.tool_name,
+                decision.approval,
+                risk,
+                decision.rationale,
+                if decision.allowed {
+                    "approved"
+                } else {
+                    "denied"
+                },
+                decision.call_id,
+            );
+            push_auto_review_text(out, &line, root_dim_style(theme), width, Break::HardBreak);
+        }
+    }
+}
+
+fn push_auto_review_text(
+    out: &mut TimelineDocument,
+    text: &str,
+    style: Style,
+    width: usize,
+    final_boundary: Break,
+) {
+    let block = out.add_source(text);
+    let chunks = wrap_text_to_width_with_offsets(text, width.max(1));
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.source_start_char < chunk.source_end_char {
+            out.push_line(
+                RenderLine {
+                    spans: vec![RenderSpan::source(
+                        chunk.text.clone(),
+                        style,
+                        SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
+                    )],
+                },
+                if index + 1 < chunks.len() {
+                    chunk_boundary(&chunks, index)
+                } else {
+                    final_boundary
+                },
+            );
+        }
+    }
+}
+
 fn build_error_lines(out: &mut TimelineDocument, error: &ErrorView, theme: Theme, width: usize) {
+    let width = card_content_width(width);
     if width == 0 {
         return;
     }
@@ -1594,7 +1711,8 @@ fn split_grapheme_span(text: &str, start: usize, end: usize) -> (String, String,
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_transcript_row_count, render_transcript, transcript_lines, transcript_row_count,
+        cached_transcript_row_count, render_timeline_item_document, render_transcript,
+        transcript_lines, transcript_row_count, try_render_reviewer_view_item,
         visible_cached_transcript_lines, visible_transcript_lines,
     };
     use crate::{
@@ -1608,7 +1726,10 @@ mod tests {
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             state::{ContextDetailTarget, TuiState},
             theme::{Theme, ThemeName},
-            timeline::Timeline,
+            timeline::{
+                CompactionView, ErrorView, MessageRole, MessageView, PermissionPromptStatus,
+                PermissionView, Timeline, TimelineItem, TodoView, ToolExecutionStatus, ToolView,
+            },
         },
         user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission},
     };
@@ -1776,6 +1897,211 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_aggregate_renders_summary_and_expanded_decisions() {
+        let item =
+            TimelineItem::AutoReviewAggregate(crate::tui::timeline::AutoReviewAggregateView {
+                reviewer_child_session_id: "reviewer-child".into(),
+                decisions: vec![
+                    crate::tui::timeline::AutoReviewDecisionView {
+                        call_id: "call-allow".into(),
+                        tool_name: "fs__write".into(),
+                        approval: "once".into(),
+                        risk: Some("low".into()),
+                        rationale: "safe edit".into(),
+                        allowed: true,
+                    },
+                    crate::tui::timeline::AutoReviewDecisionView {
+                        call_id: "call-deny".into(),
+                        tool_name: "shell__exec".into(),
+                        approval: "deny".into(),
+                        risk: Some("high".into()),
+                        rationale: "unsafe command".into(),
+                        allowed: false,
+                    },
+                ],
+            });
+        let theme = Theme::dark();
+
+        let collapsed = render_timeline_item_document(&item, theme, 80, 0, false, false);
+        let expanded = render_timeline_item_document(&item, theme, 80, 0, true, false);
+        let collapsed_text = collapsed
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        let expanded_text = expanded
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(
+            collapsed_text.contains("auto-review · 2 decisions · 1 approved · 1 denied · expand")
+        );
+        assert!(!collapsed_text.contains("unsafe command"));
+        assert!(
+            expanded_text.contains("auto-review · 2 decisions · 1 approved · 1 denied · collapse")
+        );
+        assert!(
+            expanded_text
+                .contains("fs__write · once · low · safe edit · approved · call call-allow")
+        );
+        assert!(
+            expanded_text
+                .contains("shell__exec · deny · high · unsafe command · denied · call call-deny")
+        );
+        assert!(expanded.validate());
+        assert!(
+            expanded
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.source.is_some() && span.text.contains("unsafe command"))
+        );
+
+        let narrow = render_timeline_item_document(&item, theme, 24, 0, true, false);
+        assert!(narrow.validate());
+        assert!(
+            narrow.lines.iter().all(|line| {
+                crate::tui::measure::display_width(
+                    &line
+                        .spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                ) <= 24usize.saturating_sub(crate::tui::surface::CARD_PAD_RIGHT as usize)
+            }),
+            "{narrow:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_cards_use_right_pad_without_narrowing_ordinary_assistant() {
+        let theme = Theme::dark();
+        let width = 32usize;
+        let long_text = "x".repeat(width);
+        let cards = [
+            TimelineItem::Tool(ToolView {
+                call_id: "call-tool".into(),
+                name: "shell__exec".into(),
+                summary: "run command".into(),
+                arguments: Some("arg".into()),
+                output: Some("output".into()),
+                status: ToolExecutionStatus::Failed,
+            }),
+            TimelineItem::Todo(TodoView {
+                items: vec![TodoItem {
+                    id: "todo-1".into(),
+                    content: long_text.clone(),
+                    status: TodoStatus::Pending,
+                }],
+                auto_continue: AutoContinueState::default(),
+            }),
+            TimelineItem::Permission(PermissionView {
+                call_id: "call-perm".into(),
+                tool_name: "shell__exec".into(),
+                summary: long_text.clone(),
+                arguments: None,
+                rationale: Some("because".into()),
+                origin_label: None,
+                can_allow_always: false,
+                grant_summary: None,
+                status: PermissionPromptStatus::Approved,
+                resolution_reason: Some("approved".into()),
+            }),
+            TimelineItem::Error(ErrorView {
+                message: long_text.clone(),
+                details: Some("details".into()),
+            }),
+            TimelineItem::Compaction(CompactionView {
+                summary: long_text.clone(),
+                streaming: false,
+            }),
+            TimelineItem::Assistant(MessageView {
+                id: None,
+                submission_id: None,
+                role: MessageRole::Assistant,
+                text: json!({
+                    "status": "completed",
+                    "summary": long_text.clone(),
+                    "findings": ["finding"],
+                })
+                .to_string(),
+                attachments: Vec::new(),
+                selected_skills: Vec::new(),
+                streaming: false,
+                queued: false,
+            }),
+        ];
+
+        let max_card_width = width.saturating_sub(crate::tui::surface::CARD_PAD_RIGHT as usize);
+        for item in cards {
+            let lines =
+                ratatui::text::Text::from(crate::tui::transcript_ratatui::document_to_ratatui(
+                    &render_timeline_item_document(&item, theme, width, 0, false, false),
+                ));
+            assert!(
+                lines.lines.iter().all(|line| {
+                    crate::tui::measure::display_width(&line.to_string()) <= max_card_width
+                }),
+                "card exceeded {max_card_width}: {lines:?}"
+            );
+        }
+
+        let ordinary = TimelineItem::Assistant(MessageView {
+            id: None,
+            submission_id: None,
+            role: MessageRole::Assistant,
+            text: long_text,
+            attachments: Vec::new(),
+            selected_skills: Vec::new(),
+            streaming: false,
+            queued: false,
+        });
+        let ordinary_lines = crate::tui::transcript_ratatui::document_to_ratatui(
+            &render_timeline_item_document(&ordinary, theme, width, 0, false, false),
+        );
+        assert!(
+            ordinary_lines
+                .iter()
+                .any(|line| { crate::tui::measure::display_width(&line.to_string()) == width })
+        );
+
+        let review_request = TimelineItem::User(MessageView {
+            id: None,
+            submission_id: None,
+            role: MessageRole::User,
+            text: "Approve or deny this tool permission request.\nTool: shell__exec\nClass: tool\nSummary: run command\ncan_allow_always: false".into(),
+            attachments: Vec::new(),
+            selected_skills: Vec::new(),
+            streaming: false,
+            queued: false,
+        });
+        let review_decision = TimelineItem::Assistant(MessageView {
+            id: None,
+            submission_id: None,
+            role: MessageRole::Assistant,
+            text: json!({"decision": "deny", "risk": "high", "rationale": "unsafe"}).to_string(),
+            attachments: Vec::new(),
+            selected_skills: Vec::new(),
+            streaming: false,
+            queued: false,
+        });
+        for item in [&review_request, &review_decision] {
+            let document = try_render_reviewer_view_item(item, theme, width)
+                .expect("reviewer card should parse");
+            assert!(
+                crate::tui::transcript_ratatui::document_to_ratatui(&document)
+                    .iter()
+                    .all(|line| crate::tui::measure::display_width(&line.to_string())
+                        <= max_card_width)
+            );
+        }
+    }
+
+    #[test]
     fn error_card_stays_within_narrow_widths() {
         let mut state = TuiState::default();
         let mut error = ErrorEvent::new("stream stopped");
@@ -1810,7 +2136,7 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
-        let rule = "─".repeat(80);
+        let rule = "─".repeat(80 - crate::tui::surface::CARD_PAD_RIGHT as usize);
         assert_eq!(
             nonempty_lines.iter().filter(|line| **line == rule).count(),
             2,
@@ -2218,7 +2544,7 @@ mod tests {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::CompactionStarted);
 
-        let rule = "─".repeat(80);
+        let rule = "─".repeat(80 - crate::tui::surface::CARD_PAD_RIGHT as usize);
         let started = transcript_lines(&state, Theme::dark(), 80)
             .into_iter()
             .map(|line| line.to_string())

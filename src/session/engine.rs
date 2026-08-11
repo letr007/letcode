@@ -19,22 +19,22 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_openai::config::Config;
 use serde_json::json;
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome, PrimaryRouteFactory,
-    SubagentInvocation,
+    Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome, SubagentInvocation,
 };
 use crate::agent_event_journal::persist_agent_event;
 use crate::config::{AppConfig, ModelRoute, ProviderConfig, RetryConfig};
 use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
+use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
 use crate::session::{
     AgentRunner, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
-    SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent, session_started_event,
+    SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent,
     unfinished_current_active_turn_tool_calls,
 };
 use crate::subagent::SubagentPool;
@@ -233,8 +233,14 @@ pub struct SessionEngineConfig {
     pub model_routes: indexmap::IndexMap<String, ModelRoute>,
     /// Whether each route has a non-empty credential configured.
     pub route_api_key_configured: indexmap::IndexMap<String, bool>,
-    /// Expert routes keyed by role name; roles without an entry use the active primary route.
+    /// Global default route used only when starting a new session.
+    pub new_session_default_route: ModelRoute,
+    /// Global expert defaults used only when starting a new session.
+    pub new_session_default_expert_routes: indexmap::IndexMap<String, ModelRoute>,
+    /// Expert routes for the current session.
     pub expert_model_routes: indexmap::IndexMap<String, ModelRoute>,
+    /// Provider-qualified routes allowed for per-invocation expert selection and takeover.
+    pub expert_allowed_models: indexmap::IndexMap<String, Vec<ModelRoute>>,
     /// Legacy model-only expert assignments keyed by role name. Their provider
     /// follows successful primary-route changes while their model id is retained.
     pub legacy_expert_models: indexmap::IndexMap<String, String>,
@@ -326,7 +332,10 @@ impl SessionEngine {
             config.sessions_dir,
             config.model_routes,
             config.route_api_key_configured,
+            config.new_session_default_route,
+            config.new_session_default_expert_routes,
             config.expert_model_routes,
+            config.expert_allowed_models,
             config.legacy_expert_models,
             config.providers,
             config.global_retry,
@@ -482,7 +491,7 @@ impl SessionEngine {
 }
 
 /// Map private session transport commands that the session coordinator owns as idle work.
-fn session_engine_command_as_idle_session_command(
+fn session_engine_command_as_session_command(
     command: &SessionEngineCommand,
 ) -> Option<crate::session::SessionCommand> {
     match command {
@@ -513,16 +522,68 @@ fn session_engine_command_as_idle_session_command(
             navigation: *navigation,
             anchor_child_session_id: anchor_child_session_id.clone(),
         }),
-        SessionEngineCommand::Prompt(_)
-        | SessionEngineCommand::DelegateSubagent { .. }
-        | SessionEngineCommand::Compact
-        | SessionEngineCommand::SetModel(_)
-        | SessionEngineCommand::SetExpertModel { .. }
-        | SessionEngineCommand::ResumeSession(_)
-        | SessionEngineCommand::NewSession
-        | SessionEngineCommand::ToggleMcpServer(_) => None,
+        SessionEngineCommand::DelegateSubagent { agent_name, task } => {
+            Some(crate::session::SessionCommand::DelegateSubagent {
+                agent_name: agent_name.clone(),
+                task: task.clone(),
+            })
+        }
+        SessionEngineCommand::Compact => Some(crate::session::SessionCommand::Compact),
+        SessionEngineCommand::SetModel(model) => {
+            Some(crate::session::SessionCommand::SetModel(model.clone()))
+        }
+        SessionEngineCommand::SetExpertModel {
+            agent_name,
+            model_id,
+        } => Some(crate::session::SessionCommand::SetExpertModel {
+            agent_name: agent_name.clone(),
+            model_id: model_id.clone(),
+        }),
+        SessionEngineCommand::ResumeSession(session_id) => Some(
+            crate::session::SessionCommand::ResumeSession(session_id.clone()),
+        ),
+        SessionEngineCommand::NewSession => Some(crate::session::SessionCommand::NewSession),
+        SessionEngineCommand::ToggleMcpServer(server_name) => Some(
+            crate::session::SessionCommand::ToggleMcpServer(server_name.clone()),
+        ),
+        SessionEngineCommand::Prompt(_) => None,
         #[cfg(test)]
         SessionEngineCommand::InspectHistory(_) => None,
+    }
+}
+
+fn send_setting_change_failed(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    command: crate::session::SessionCommand,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    let _ = session_transport_tx.send(SessionTransportEvent::SettingChangeFailed { command });
+    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(message)));
+}
+
+fn session_engine_command_as_idle_session_command(
+    command: &SessionEngineCommand,
+) -> Option<crate::session::SessionCommand> {
+    match session_engine_command_as_session_command(command)? {
+        command @ (crate::session::SessionCommand::ShowHistoryTree
+        | crate::session::SessionCommand::Undo
+        | crate::session::SessionCommand::Redo
+        | crate::session::SessionCommand::NavigateHistory { .. }
+        | crate::session::SessionCommand::SetPermissionMode(_)
+        | crate::session::SessionCommand::ToggleFastMode
+        | crate::session::SessionCommand::SetReasoningEffort(_)
+        | crate::session::SessionCommand::ViewParent
+        | crate::session::SessionCommand::ViewChild { .. }) => Some(command),
+        crate::session::SessionCommand::SubmitPrompt(_)
+        | crate::session::SessionCommand::DelegateSubagent { .. }
+        | crate::session::SessionCommand::Compact
+        | crate::session::SessionCommand::SetModel(_)
+        | crate::session::SessionCommand::SetExpertModel { .. }
+        | crate::session::SessionCommand::ResumeSession(_)
+        | crate::session::SessionCommand::NewSession
+        | crate::session::SessionCommand::ToggleMcpServer(_)
+        | crate::session::SessionCommand::Interrupt => None,
     }
 }
 
@@ -532,6 +593,31 @@ pub(crate) enum ActiveSessionOperation<T> {
     Completed(T),
     RunnerEvent(SessionTransportEvent),
     Command(Option<SessionEngineCommand>),
+}
+
+pub(crate) fn handle_active_turn_command(
+    command: SessionEngineCommand,
+    parked_commands: &mut VecDeque<SessionEngineCommand>,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+) {
+    let disposition = session_engine_command_as_session_command(&command)
+        .map(|command| command.active_turn_disposition())
+        .unwrap_or(crate::session::ActiveTurnCommandDisposition::Defer);
+    match disposition {
+        crate::session::ActiveTurnCommandDisposition::Defer => {
+            park_active_turn_command(parked_commands, command, session_transport_tx);
+        }
+        crate::session::ActiveTurnCommandDisposition::Reject => {
+            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                "Turn still running",
+            )));
+        }
+        crate::session::ActiveTurnCommandDisposition::QueuePrompt
+        | crate::session::ActiveTurnCommandDisposition::Immediate
+        | crate::session::ActiveTurnCommandDisposition::Interrupt => {
+            unreachable!("active turn command is handled before the deferred fallback")
+        }
+    }
 }
 
 pub(crate) enum ManualCompactionOperation<T> {
@@ -547,22 +633,86 @@ enum QueuedSessionEngineControlSignal {
     Shutdown,
 }
 
-fn park_active_turn_command(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferredCommandKey {
+    PermissionMode,
+    Model,
+    ExpertModel(String),
+    ReasoningEffort,
+}
+
+fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredCommandKey> {
+    match command {
+        SessionEngineCommand::SetPermissionMode(_) => Some(DeferredCommandKey::PermissionMode),
+        SessionEngineCommand::SetModel(_) => Some(DeferredCommandKey::Model),
+        SessionEngineCommand::SetExpertModel { agent_name, .. } => {
+            Some(DeferredCommandKey::ExpertModel(agent_name.clone()))
+        }
+        SessionEngineCommand::SetReasoningEffort(_) => Some(DeferredCommandKey::ReasoningEffort),
+        SessionEngineCommand::Prompt(_)
+        | SessionEngineCommand::DelegateSubagent { .. }
+        | SessionEngineCommand::Compact
+        | SessionEngineCommand::ShowHistoryTree
+        | SessionEngineCommand::Undo
+        | SessionEngineCommand::Redo
+        | SessionEngineCommand::NavigateHistory { .. }
+        | SessionEngineCommand::ViewChild { .. }
+        | SessionEngineCommand::ViewParent
+        | SessionEngineCommand::ToggleFastMode
+        | SessionEngineCommand::ResumeSession(_)
+        | SessionEngineCommand::NewSession
+        | SessionEngineCommand::ToggleMcpServer(_) => None,
+        #[cfg(test)]
+        SessionEngineCommand::InspectHistory(_) => None,
+    }
+}
+
+pub(crate) fn enqueue_deferred_command(
+    commands: &mut VecDeque<SessionEngineCommand>,
+    command: SessionEngineCommand,
+) {
+    if let Some(key) = deferred_command_key(&command) {
+        let batch_start = commands
+            .iter()
+            .rposition(|queued| deferred_command_key(queued).is_none())
+            .map_or(0, |index| index + 1);
+        if let Some(index) = commands
+            .iter()
+            .enumerate()
+            .skip(batch_start)
+            .rev()
+            .find_map(|(index, queued)| {
+                (deferred_command_key(queued).as_ref() == Some(&key)).then_some(index)
+            })
+        {
+            commands.remove(index);
+        }
+    }
+    commands.push_back(command);
+}
+
+pub(crate) fn park_active_turn_command(
     parked_commands: &mut VecDeque<SessionEngineCommand>,
     command: SessionEngineCommand,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) {
-    parked_commands.push_back(command);
+    enqueue_deferred_command(parked_commands, command);
     let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-        "Turn still running · navigation only",
+        "Change queued for after the current turn",
     )));
 }
 
-fn flush_parked_commands(
+pub(crate) fn flush_parked_commands(
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
     parked_commands: &mut VecDeque<SessionEngineCommand>,
 ) {
-    deferred_commands.extend(parked_commands.drain(..));
+    let mut remaining = std::mem::take(deferred_commands);
+    while let Some(command) = parked_commands.pop_front() {
+        enqueue_deferred_command(deferred_commands, command);
+    }
+    while let Some(command) = remaining.pop_front() {
+        enqueue_deferred_command(deferred_commands, command);
+    }
 }
 
 fn drain_queued_session_controls(
@@ -572,7 +722,9 @@ fn drain_queued_session_controls(
     let mut interrupted = false;
     loop {
         match control_rx.try_recv() {
-            Ok(SessionEngineControl::Command(command)) => deferred_commands.push_back(command),
+            Ok(SessionEngineControl::Command(command)) => {
+                enqueue_deferred_command(deferred_commands, command)
+            }
             Ok(SessionEngineControl::Interrupt) => interrupted = true,
             Ok(SessionEngineControl::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 return QueuedSessionEngineControlSignal::Shutdown;
@@ -661,7 +813,9 @@ where
                         }
                     };
                 }
-                Some(SessionEngineControl::Command(command)) => deferred_commands.push_back(command),
+                Some(SessionEngineControl::Command(command)) => {
+                    enqueue_deferred_command(deferred_commands, command)
+                }
                 Some(SessionEngineControl::Shutdown) | None => {
                     return ActiveSessionOperation::Shutdown;
                 }
@@ -722,7 +876,9 @@ where
         tokio::select! {
             biased;
             control = control_rx.recv() => match control {
-                Some(SessionEngineControl::Command(command)) => deferred_commands.push_back(command),
+                Some(SessionEngineControl::Command(command)) => {
+                    enqueue_deferred_command(deferred_commands, command)
+                }
                 Some(SessionEngineControl::Interrupt) => {
                     return match drain_queued_session_controls(control_rx, deferred_commands) {
                         QueuedSessionEngineControlSignal::Shutdown => ManualCompactionOperation::Shutdown,
@@ -782,7 +938,7 @@ where
                     shutdown = true;
                 }
                 Some(SessionEngineControl::Command(command)) => {
-                    deferred_commands.push_back(command);
+                    enqueue_deferred_command(deferred_commands, command);
                 }
             },
             _ = cancel_tick.tick() => {
@@ -800,28 +956,79 @@ where
     }
 }
 
+fn reload_has_runtime_delta(
+    providers_runtime_unchanged: bool,
+    maps_unchanged: bool,
+    settings_unchanged: bool,
+    current_provider_runtime_unchanged: bool,
+    catalog_unchanged: bool,
+    new_session_default_unchanged: bool,
+) -> bool {
+    !(providers_runtime_unchanged
+        && maps_unchanged
+        && settings_unchanged
+        && current_provider_runtime_unchanged
+        && catalog_unchanged
+        && new_session_default_unchanged)
+}
+
+fn model_catalog_updated_event(config: &AppConfig) -> ModelCatalogUpdatedEvent {
+    ModelCatalogUpdatedEvent {
+        models: config
+            .providers
+            .iter()
+            .flat_map(|(provider_name, provider)| {
+                provider.models.iter().map(move |(model_id, model)| {
+                    let metadata = model.request_metadata();
+                    ModelCatalogEntry {
+                        id: ModelRoute::new(provider_name, model_id).display_name(),
+                        label: provider.model_label(model_id),
+                        provider: provider_name.clone(),
+                        context_window_tokens: model.context_window,
+                        reasoning: ModelCatalogReasoning {
+                            effort: model
+                                .reasoning_effort
+                                .as_ref()
+                                .map(|effort| effort.as_str().to_string()),
+                            efforts: metadata
+                                .selectable_reasoning_efforts()
+                                .into_iter()
+                                .map(|effort| effort.as_str().to_string())
+                                .collect(),
+                        },
+                    }
+                })
+            })
+            .collect(),
+    }
+}
+
 fn apply_config_reload(
     agent: &mut Agent<async_openai::config::OpenAIConfig>,
     config_path: &std::path::Path,
     model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
     route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
     expert_model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
+    new_session_default_expert_routes: &mut indexmap::IndexMap<String, ModelRoute>,
+    expert_allowed_models: &mut indexmap::IndexMap<String, Vec<ModelRoute>>,
     legacy_expert_models: &mut indexmap::IndexMap<String, String>,
     providers: &mut indexmap::IndexMap<String, ProviderConfig>,
     global_retry: &mut RetryConfig,
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
+    new_session_default_route: &mut ModelRoute,
     event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) -> Result<()> {
     let config = AppConfig::load_from_path(config_path)?;
+    let catalog_event = model_catalog_updated_event(&config);
     let previous_active_route = agent
         .primary_route()
         .cloned()
         .ok_or_else(|| anyhow!("active agent route is unavailable during configuration reload"))?;
-    let active_route = config.active_route();
-    let provider = config.provider_for_route(&active_route)?;
+    let next_new_session_default_route = config.active_route();
+    config.resolve_route(&next_new_session_default_route)?;
+    let current_route_available = config.resolve_route(&previous_active_route).is_ok();
     let primary_factory =
         ConfiguredPrimaryRouteFactory::new(config.providers.clone(), config.global.retry.clone());
-    let prepared = primary_factory.prepare_route(active_route.clone())?;
 
     let next_model_routes = config
         .providers
@@ -843,12 +1050,24 @@ fn apply_config_reload(
             })
         })
         .collect::<indexmap::IndexMap<_, _>>();
-    let next_expert_model_routes = crate::delegation::supported_agent_names()
+    let next_new_session_default_expert_routes = crate::delegation::supported_agent_names()
         .filter_map(|name| {
             config
                 .model_route_for(name)
                 .cloned()
                 .map(|route| (name.to_string(), route))
+        })
+        .collect::<indexmap::IndexMap<_, _>>();
+    let next_expert_allowed_models = crate::delegation::supported_agent_names()
+        .map(|name| {
+            (
+                name.to_string(),
+                config
+                    .agents
+                    .allowed_models_for(name)
+                    .unwrap_or_default()
+                    .to_vec(),
+            )
         })
         .collect::<indexmap::IndexMap<_, _>>();
     let next_legacy_expert_models = crate::delegation::supported_agent_names()
@@ -873,19 +1092,59 @@ fn apply_config_reload(
             )
         })
         .collect::<indexmap::IndexMap<_, _>>();
-    let expert_factory = crate::subagent::ExpertRouteFactory::new(
-        next_expert_model_routes
-            .iter()
-            .map(|(name, route)| (name.clone(), route.clone())),
-        &config.providers,
+    let mut session_providers = config.providers.clone();
+    for route in expert_model_routes.values() {
+        if config.resolve_route(route).is_ok() {
+            continue;
+        }
+        let provider = providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "current expert route provider '{}' is unavailable during configuration reload",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "current expert route '{}' is unavailable during configuration reload",
+                route.display_name()
+            );
+        }
+        session_providers
+            .entry(route.provider.clone())
+            .or_insert_with(|| provider.clone());
+        if let Some(session_provider) = session_providers.get_mut(&route.provider) {
+            if !session_provider.has_model(&route.model) {
+                let model = provider.models.get(&route.model).cloned().ok_or_else(|| {
+                    anyhow!(
+                        "current expert route '{}' is unavailable during configuration reload",
+                        route.display_name()
+                    )
+                })?;
+                session_provider.models.insert(route.model.clone(), model);
+            }
+        }
+    }
+    let expert_factory = crate::subagent::ExpertRouteFactory::new_with_policies(
+        crate::delegation::supported_agent_names().map(|name| {
+            (
+                name.to_string(),
+                expert_model_routes.get(name).cloned(),
+                next_expert_allowed_models
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        }),
+        &session_providers,
         &config.global.retry,
     )?;
-    let next_providers = config.providers.clone();
     let next_global_retry = config.global.retry.clone();
-    let next_agent_retry = provider
-        .retry
-        .clone()
-        .unwrap_or_else(|| next_global_retry.clone());
+    let current_provider = current_route_available
+        .then(|| config.providers.get(&previous_active_route.provider))
+        .flatten();
+    let next_agent_retry = current_provider
+        .and_then(|provider| provider.retry.clone())
+        .unwrap_or_else(|| agent.retry_config().clone());
     let next_parallelism = config
         .tools
         .parallelism
@@ -893,37 +1152,11 @@ fn apply_config_reload(
         .map(|(name, mode)| (name.clone(), *mode))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let previous_expert_routes = crate::delegation::supported_agent_names()
-        .map(|name| {
-            (
-                name.to_string(),
-                effective_expert_route(
-                    expert_model_routes,
-                    legacy_expert_models,
-                    &previous_active_route,
-                    name,
-                ),
-            )
-        })
-        .collect::<indexmap::IndexMap<_, _>>();
-    let next_expert_routes = crate::delegation::supported_agent_names()
-        .map(|name| {
-            (
-                name.to_string(),
-                effective_expert_route(
-                    &next_expert_model_routes,
-                    &next_legacy_expert_models,
-                    &active_route,
-                    name,
-                ),
-            )
-        })
-        .collect::<indexmap::IndexMap<_, _>>();
-
-    let providers_runtime_unchanged = providers_runtime_eq(providers, &next_providers);
+    let providers_runtime_unchanged = providers_runtime_eq(providers, &session_providers);
     let maps_unchanged = *model_routes == next_model_routes
         && *route_api_key_configured == next_route_api_key_configured
-        && *expert_model_routes == next_expert_model_routes
+        && *new_session_default_expert_routes == next_new_session_default_expert_routes
+        && *expert_allowed_models == next_expert_allowed_models
         && *legacy_expert_models == next_legacy_expert_models
         && *provider_api_key_hints == next_provider_api_key_hints
         && *global_retry == next_global_retry;
@@ -931,38 +1164,50 @@ fn apply_config_reload(
         && agent.tool_timeout_secs() == config.global.tool_timeout_secs
         && agent.retry_config() == &next_agent_retry
         && agent.tool_parallelism_overrides() == &next_parallelism;
-    let route_unchanged = previous_active_route == active_route;
     let previous_provider = providers.get(&previous_active_route.provider);
-    let client_unchanged = route_unchanged
-        && previous_provider.is_some_and(|previous| {
+    let current_provider_runtime_unchanged = current_provider.is_none_or(|provider| {
+        previous_provider.is_some_and(|previous| {
             previous.api_key == provider.api_key
                 && previous.base_url == provider.base_url
                 && previous.protocol == provider.protocol
-        });
-    let next_model_protocols = provider
-        .models
-        .iter()
-        .map(|(id, model)| (id.clone(), model.protocol))
-        .collect::<HashMap<_, _>>();
-    let next_model_catalog = provider
-        .models
-        .iter()
-        .map(|(id, model)| (id.clone(), model.request_metadata()))
-        .collect::<HashMap<_, _>>();
-    let catalog_unchanged = agent.default_protocol() == provider.protocol
-        && agent.model_protocols() == &next_model_protocols
-        && agent.model_catalog() == &next_model_catalog;
-    let expert_routes_unchanged = previous_expert_routes == next_expert_routes;
+        })
+    });
+    let next_model_protocols = current_provider.map(|provider| {
+        provider
+            .models
+            .iter()
+            .map(|(id, model)| (id.clone(), model.protocol))
+            .collect::<HashMap<_, _>>()
+    });
+    let next_model_catalog = current_provider.map(|provider| {
+        provider
+            .models
+            .iter()
+            .map(|(id, model)| (id.clone(), model.request_metadata()))
+            .collect::<HashMap<_, _>>()
+    });
+    let catalog_unchanged = current_provider.is_none_or(|provider| {
+        agent.default_protocol() == provider.protocol
+            && next_model_protocols
+                .as_ref()
+                .is_some_and(|protocols| agent.model_protocols() == protocols)
+            && next_model_catalog
+                .as_ref()
+                .is_some_and(|catalog| agent.model_catalog() == catalog)
+    });
 
     // Self-writes (model/fast-mode/MCP persist) and duplicate watcher events often
     // land here with no reloadable runtime delta — stay silent and keep usage anchors.
-    if providers_runtime_unchanged
-        && maps_unchanged
-        && settings_unchanged
-        && client_unchanged
-        && catalog_unchanged
-        && expert_routes_unchanged
-    {
+    let new_session_default_unchanged =
+        *new_session_default_route == next_new_session_default_route;
+    if !reload_has_runtime_delta(
+        providers_runtime_unchanged,
+        maps_unchanged,
+        settings_unchanged,
+        current_provider_runtime_unchanged,
+        catalog_unchanged,
+        new_session_default_unchanged,
+    ) {
         return Ok(());
     }
 
@@ -979,35 +1224,34 @@ fn apply_config_reload(
     }
     agent.set_primary_route_factory(Arc::new(primary_factory));
     agent.set_subagent_child_factory(Arc::new(expert_factory));
-    if !client_unchanged {
-        // Rebuilding the client/route clears provider usage anchors intentionally.
+    if current_route_available && (!current_provider_runtime_unchanged || !catalog_unchanged) {
+        let prepared = agent.prepare_primary_route(previous_active_route.clone())?;
         prepared.into_install().apply(agent);
-    } else if !catalog_unchanged {
-        agent.set_default_protocol(provider.protocol);
-        agent.set_model_protocols(next_model_protocols);
-        agent.set_model_catalog(next_model_catalog);
+    } else if !current_route_available {
+        let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(format!(
+            "Current model '{}' is no longer in the configured model catalog; this session will keep using its existing route until you switch models or start a new session",
+            previous_active_route.display_name()
+        ))));
     }
 
-    if !route_unchanged {
-        let _ = event_tx.send(SessionTransportEvent::ModelChanged {
-            model_id: active_route.display_name(),
-        });
-    }
     *model_routes = next_model_routes;
     *route_api_key_configured = next_route_api_key_configured;
-    *expert_model_routes = next_expert_model_routes;
+    for route in expert_model_routes.values() {
+        let retained_credential = providers
+            .get(&route.provider)
+            .is_some_and(|provider| !provider.api_key.trim().is_empty());
+        route_api_key_configured
+            .entry(route.display_name())
+            .or_insert(retained_credential);
+    }
+    *new_session_default_expert_routes = next_new_session_default_expert_routes;
+    *expert_allowed_models = next_expert_allowed_models;
     *legacy_expert_models = next_legacy_expert_models;
     *provider_api_key_hints = next_provider_api_key_hints;
-    *providers = next_providers;
+    *providers = session_providers;
     *global_retry = next_global_retry;
-    for (agent_name, route) in next_expert_routes {
-        if previous_expert_routes.get(&agent_name) != Some(&route) {
-            let _ = event_tx.send(SessionTransportEvent::ExpertModelChanged {
-                agent_name,
-                model_id: route.display_name(),
-            });
-        }
-    }
+    *new_session_default_route = next_new_session_default_route;
+    let _ = event_tx.send(SessionTransportEvent::ModelCatalogUpdated(catalog_event));
     let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
         "configuration reloaded (supported runtime fields only; MCP, permissions, Fast Mode, max_iterations/max_tool_calls unchanged)",
     )));
@@ -1092,32 +1336,18 @@ fn active_route_has_api_key(
     agent: &Agent<async_openai::config::OpenAIConfig>,
     route_api_key_configured: &indexmap::IndexMap<String, bool>,
 ) -> bool {
-    route_has_api_key(route_api_key_configured, &agent.route_display_name())
+    route_api_key_configured
+        .get(&agent.route_display_name())
+        .copied()
+        .unwrap_or(true)
 }
 
-fn effective_expert_route(
-    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
-    legacy_expert_models: &indexmap::IndexMap<String, String>,
-    primary_route: &ModelRoute,
-    agent_name: &str,
-) -> ModelRoute {
-    expert_model_routes
-        .get(agent_name)
-        .cloned()
-        .or_else(|| {
-            legacy_expert_models
-                .get(agent_name)
-                .map(|model| ModelRoute::new(primary_route.provider.clone(), model))
-        })
-        .unwrap_or_else(|| primary_route.clone())
-}
-
-fn expert_routes_after_primary_switch(
-    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+fn config_default_expert_routes_for_primary(
+    configured_expert_routes: &indexmap::IndexMap<String, ModelRoute>,
     legacy_expert_models: &indexmap::IndexMap<String, String>,
     primary_route: &ModelRoute,
 ) -> indexmap::IndexMap<String, ModelRoute> {
-    let mut routes = expert_model_routes.clone();
+    let mut routes = configured_expert_routes.clone();
     for (agent_name, model) in legacy_expert_models {
         routes.insert(
             agent_name.clone(),
@@ -1125,6 +1355,187 @@ fn expert_routes_after_primary_switch(
         );
     }
     routes
+}
+
+fn reviewer_policy_changed(
+    previous_primary_route: Option<&ModelRoute>,
+    current_primary_route: Option<&ModelRoute>,
+    previous_expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    current_expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    previous_expert_allowed_models: &indexmap::IndexMap<String, Vec<ModelRoute>>,
+    current_expert_allowed_models: &indexmap::IndexMap<String, Vec<ModelRoute>>,
+) -> bool {
+    previous_primary_route != current_primary_route
+        || previous_expert_model_routes.get("reviewer")
+            != current_expert_model_routes.get("reviewer")
+        || previous_expert_allowed_models.get("reviewer")
+            != current_expert_allowed_models.get("reviewer")
+}
+
+fn expert_routes_after_primary_switch(
+    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    legacy_expert_models: &indexmap::IndexMap<String, String>,
+    providers: &indexmap::IndexMap<String, ProviderConfig>,
+    primary_route: &ModelRoute,
+) -> Result<indexmap::IndexMap<String, ModelRoute>> {
+    let mut routes = expert_model_routes.clone();
+    let provider = providers.get(&primary_route.provider).ok_or_else(|| {
+        anyhow!(
+            "provider '{}' is not configured for expert route updates",
+            primary_route.provider
+        )
+    })?;
+    for (agent_name, model) in legacy_expert_models {
+        if !provider.has_model(model) {
+            bail!(
+                "expert '{agent_name}' model '{model}' is not configured for provider '{}'",
+                primary_route.provider
+            );
+        }
+        routes.insert(
+            agent_name.clone(),
+            ModelRoute::new(primary_route.provider.clone(), model.clone()),
+        );
+    }
+    Ok(routes)
+}
+
+#[cfg(test)]
+mod expert_route_switch_tests {
+    use super::*;
+
+    fn provider(models: &[&str]) -> ProviderConfig {
+        ProviderConfig {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api_key: "key".into(),
+            protocol: crate::config::ApiProtocol::Completions,
+            default_model: models.first().copied().unwrap_or_default().into(),
+            retry: None,
+            models: models
+                .iter()
+                .map(|model| {
+                    (
+                        (*model).to_string(),
+                        crate::config::ModelConfig {
+                            display_name: None,
+                            protocol: crate::config::ApiProtocol::Completions,
+                            context_window: None,
+                            effective_input_limit_tokens: None,
+                            max_output_tokens: None,
+                            supports_tools: false,
+                            supports_reasoning: false,
+                            reasoning_effort: None,
+                            reasoning_efforts: Vec::new(),
+                            reasoning_summary: None,
+                            text_verbosity: None,
+                            temperature: None,
+                            top_p: None,
+                            prompt_cache: crate::config::PromptCacheConfig::default(),
+                            parallel_tool_calls: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn default_route_only_reload_is_not_treated_as_noop() {
+        assert!(reload_has_runtime_delta(
+            true, true, true, true, true, false
+        ));
+        assert!(!reload_has_runtime_delta(
+            true, true, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn inherited_reviewer_policy_changes_when_primary_route_changes() {
+        let old_primary = ModelRoute::new("old", "shared");
+        let new_primary = ModelRoute::new("new", "shared");
+        let expert_routes = indexmap::IndexMap::new();
+        let allowed_models = indexmap::IndexMap::new();
+
+        assert!(reviewer_policy_changed(
+            Some(&old_primary),
+            Some(&new_primary),
+            &expert_routes,
+            &expert_routes,
+            &allowed_models,
+            &allowed_models,
+        ));
+    }
+
+    #[test]
+    fn configured_expert_defaults_do_not_inherit_current_session_overrides() {
+        let configured = indexmap::IndexMap::from([(
+            "reviewer".into(),
+            ModelRoute::new("configured", "reviewer"),
+        )]);
+        let legacy = indexmap::IndexMap::from([("explorer".into(), "legacy".into())]);
+        let primary = ModelRoute::new("next", "primary");
+
+        let routes = config_default_expert_routes_for_primary(&configured, &legacy, &primary);
+
+        assert_eq!(
+            routes.get("reviewer"),
+            Some(&ModelRoute::new("configured", "reviewer"))
+        );
+        assert_eq!(
+            routes.get("explorer"),
+            Some(&ModelRoute::new("next", "legacy"))
+        );
+        assert!(!routes.contains_key("fixer"));
+    }
+
+    #[test]
+    fn unrelated_expert_reload_does_not_change_reviewer_policy() {
+        let primary = ModelRoute::new("primary", "shared");
+        let previous_routes = indexmap::IndexMap::from([(
+            "explorer".into(),
+            ModelRoute::new("primary", "old-explorer"),
+        )]);
+        let current_routes = indexmap::IndexMap::from([(
+            "explorer".into(),
+            ModelRoute::new("primary", "new-explorer"),
+        )]);
+        let allowed_models = indexmap::IndexMap::new();
+
+        assert!(!reviewer_policy_changed(
+            Some(&primary),
+            Some(&primary),
+            &previous_routes,
+            &current_routes,
+            &allowed_models,
+            &allowed_models,
+        ));
+    }
+
+    #[test]
+    fn primary_switch_rejects_missing_legacy_expert_model_without_mutating_routes() {
+        let routes = indexmap::IndexMap::from([(
+            "reviewer".into(),
+            ModelRoute::new("fixed", "reviewer-model"),
+        )]);
+        let legacy = indexmap::IndexMap::from([("explorer".into(), "legacy-model".into())]);
+        let providers = indexmap::IndexMap::from([("next".into(), provider(&["primary-model"]))]);
+
+        let error = expert_routes_after_primary_switch(
+            &routes,
+            &legacy,
+            &providers,
+            &ModelRoute::new("next", "primary-model"),
+        )
+        .expect_err("missing follows-active-provider model must fail before switching");
+
+        assert!(error.to_string().contains(
+            "expert 'explorer' model 'legacy-model' is not configured for provider 'next'"
+        ));
+        assert_eq!(
+            routes.get("reviewer"),
+            Some(&ModelRoute::new("fixed", "reviewer-model"))
+        );
+    }
 }
 
 fn delegated_route_display_name(
@@ -1689,7 +2100,10 @@ async fn run_engine_loop(
     sessions_dir: PathBuf,
     model_routes: indexmap::IndexMap<String, ModelRoute>,
     route_api_key_configured: indexmap::IndexMap<String, bool>,
+    new_session_default_route: ModelRoute,
+    new_session_default_expert_routes: indexmap::IndexMap<String, ModelRoute>,
     expert_model_routes: indexmap::IndexMap<String, ModelRoute>,
+    expert_allowed_models: indexmap::IndexMap<String, Vec<ModelRoute>>,
     legacy_expert_models: indexmap::IndexMap<String, String>,
     providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
     global_retry: crate::config::RetryConfig,
@@ -1709,12 +2123,15 @@ async fn run_engine_loop(
     let mut mcp_tools_rx = Some(mcp_tools_rx);
     let mut mcp_config = mcp_config;
     let mut model_routes = model_routes;
-    let mut route_api_key_configured = route_api_key_configured;
+    let route_api_key_configured = Arc::new(StdMutex::new(route_api_key_configured));
+    let mut new_session_default_route = new_session_default_route;
+    let mut new_session_default_expert_routes = new_session_default_expert_routes;
     let mut expert_model_routes = expert_model_routes;
+    let mut expert_allowed_models = expert_allowed_models;
     let mut legacy_expert_models = legacy_expert_models;
     let mut providers = providers;
     let mut global_retry = global_retry;
-    let mut provider_api_key_hints = provider_api_key_hints;
+    let provider_api_key_hints = Arc::new(StdMutex::new(provider_api_key_hints));
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
     let sticky_auto_reviewer =
@@ -1723,6 +2140,9 @@ async fn run_engine_loop(
             sessions_dir.clone(),
             Arc::clone(&transcript),
             Some(session_transport_tx.clone()),
+            Arc::clone(&route_api_key_configured),
+            Arc::clone(&provider_api_key_hints),
+            api_key_hint.clone(),
         ));
     agent.set_auto_review_service(Some(sticky_auto_reviewer.clone()
         as std::sync::Arc<
@@ -1743,21 +2163,40 @@ async fn run_engine_loop(
                     break;
                 }
                 while reload_rx.try_recv().is_ok() {}
+                let previous_primary_route = agent.primary_route().cloned();
+                let previous_expert_model_routes = expert_model_routes.clone();
+                let previous_expert_allowed_models = expert_allowed_models.clone();
                 if let Err(error) = apply_config_reload(
                     &mut agent,
                     &mcp_config_path,
                     &mut model_routes,
-                    &mut route_api_key_configured,
+                    &mut route_api_key_configured
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
                     &mut expert_model_routes,
+                    &mut new_session_default_expert_routes,
+                    &mut expert_allowed_models,
                     &mut legacy_expert_models,
                     &mut providers,
                     &mut global_retry,
-                    &mut provider_api_key_hints,
+                    &mut provider_api_key_hints
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    &mut new_session_default_route,
                     &session_transport_tx,
                 ) {
                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
                         format!("failed to reload configuration: {error}"),
                     )));
+                } else if reviewer_policy_changed(
+                    previous_primary_route.as_ref(),
+                    agent.primary_route(),
+                    &previous_expert_model_routes,
+                    &expert_model_routes,
+                    &previous_expert_allowed_models,
+                    &expert_allowed_models,
+                ) {
+                    sticky_auto_reviewer.clear_sticky_session();
                 }
             }
             command = next_idle_session_command(&mut control_rx, &mut deferred_commands) => {
@@ -1782,58 +2221,127 @@ async fn run_engine_loop(
                         ));
                         continue;
                     };
-                    if let Err(error) = crate::config::persist_expert_model_route(
-                        &mcp_config_path,
-                        agent_name,
-                        &route,
+                    let mut updated_expert_model_routes = expert_model_routes.clone();
+                    updated_expert_model_routes.insert(agent_name.clone(), route.clone());
+                    let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
+                        crate::delegation::supported_agent_names().map(|name| {
+                            (
+                                name.to_string(),
+                                updated_expert_model_routes.get(name).cloned(),
+                                expert_allowed_models
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        }),
+                        &providers,
+                        &global_retry,
                     ) {
+                        Ok(factory) => factory,
+                        Err(error) => {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!("failed to set expert model: {error}")),
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Err(error) = transcript
+                        .lock()
+                        .map_err(|_| anyhow!("transcript recorder poisoned"))
+                        .and_then(|mut recorder| {
+                            recorder.record_expert_model_changed(
+                                agent_name.clone(),
+                                route.display_name(),
+                            )
+                        })
+                    {
                         let _ = session_transport_tx.send(SessionTransportEvent::Error(
                             ErrorEvent::new(format!("failed to set expert model: {error}")),
                         ));
                         continue;
                     }
-                    if let Err(error) = apply_config_reload(
-                        &mut agent,
-                        &mcp_config_path,
-                        &mut model_routes,
-                        &mut route_api_key_configured,
-                        &mut expert_model_routes,
-                        &mut legacy_expert_models,
-                        &mut providers,
-                        &mut global_retry,
-                        &mut provider_api_key_hints,
-                        &session_transport_tx,
-                    ) {
-                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                            ErrorEvent::new(format!("failed to reload configuration: {error}")),
-                        ));
+                    agent.set_subagent_child_factory(Arc::new(expert_factory));
+                    expert_model_routes = updated_expert_model_routes;
+                    if agent_name == "reviewer" {
+                        sticky_auto_reviewer.clear_sticky_session();
                     }
+                    let _ = session_transport_tx.send(SessionTransportEvent::ExpertModelChanged {
+                        agent_name: agent_name.clone(),
+                        model_id: route.display_name(),
+                    });
                     continue;
                 }
 
                 if let SessionEngineCommand::SetModel(model) = &command {
                     let Some(route) = model_routes.get(model).cloned() else {
-                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                            ErrorEvent::new(format!("unknown model: {model}")),
-                        ));
+                        send_setting_change_failed(
+                            &session_transport_tx,
+                            crate::session::SessionCommand::SetModel(model.clone()),
+                            format!("unknown model: {model}"),
+                        );
                         continue;
                     };
                     let model_id = route.display_name();
-                    let prepared_route = match agent.prepare_primary_route(route.clone()) {
-                        Ok(prepared_route) => prepared_route,
+                    let updated_expert_model_routes = match expert_routes_after_primary_switch(
+                        &expert_model_routes,
+                        &legacy_expert_models,
+                        &providers,
+                        &route,
+                    ) {
+                        Ok(routes) => routes,
                         Err(error) => {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                                ErrorEvent::new(format!("failed to set model: {error}")),
-                            ));
+                            send_setting_change_failed(
+                                &session_transport_tx,
+                                crate::session::SessionCommand::SetModel(model.clone()),
+                                format!(
+                                    "failed to set model because expert routes could not be updated: {error}"
+                                ),
+                            );
                             continue;
                         }
                     };
-                    match crate::session::persist_and_apply_model_route_with(
+                    let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
+                        crate::delegation::supported_agent_names().map(|name| {
+                            (
+                                name.to_string(),
+                                updated_expert_model_routes.get(name).cloned(),
+                                expert_allowed_models
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        }),
+                        &providers,
+                        &global_retry,
+                    ) {
+                        Ok(factory) => factory,
+                        Err(error) => {
+                            send_setting_change_failed(
+                                &session_transport_tx,
+                                crate::session::SessionCommand::SetModel(model.clone()),
+                                format!(
+                                    "failed to set model because expert routes could not be rebuilt: {error}"
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    let prepared_route = match agent.prepare_primary_route(route.clone()) {
+                        Ok(prepared_route) => prepared_route,
+                        Err(error) => {
+                            send_setting_change_failed(
+                                &session_transport_tx,
+                                crate::session::SessionCommand::SetModel(model.clone()),
+                                format!("failed to set model: {error}"),
+                            );
+                            continue;
+                        }
+                    };
+                    match crate::session::apply_model_route_with(
                         &mut agent,
                         &transcript,
                         route.clone(),
                         prepared_route,
-                        |route| crate::config::persist_primary_model_route(&mcp_config_path, route),
                     ) {
                         Ok(fast_mode_auto_disabled) => {
                             if fast_mode_auto_disabled {
@@ -1846,29 +2354,25 @@ async fn run_engine_loop(
                                     ),
                                 ));
                             }
-                            let updated_expert_model_routes = expert_routes_after_primary_switch(
-                                &expert_model_routes,
-                                &legacy_expert_models,
-                                &route,
-                            );
-                            let factory = crate::subagent::ExpertRouteFactory::new(
-                                updated_expert_model_routes
-                                    .iter()
-                                    .map(|(name, route)| (name.clone(), route.clone())),
-                                &providers,
-                                &global_retry,
-                            )
-                            .expect("configured expert routes remain constructible after a primary switch");
-                            agent.set_subagent_child_factory(Arc::new(factory));
+                            agent.set_subagent_child_factory(Arc::new(expert_factory));
                             expert_model_routes = updated_expert_model_routes;
+                            // A sticky reviewer session records its actual route. Drop it after a
+                            // primary-route change so the next review starts with the new policy.
+                            sticky_auto_reviewer.clear_sticky_session();
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                                 model_id: model_id.clone(),
                             });
-                            if !route_has_api_key(&route_api_key_configured, &model_id) {
+                            let route_api_keys = route_api_key_configured
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            if !route_has_api_key(&route_api_keys, &model_id) {
+                                let provider_hints = provider_api_key_hints
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     missing_api_key_error(&route_api_key_hint(
                                         &model_id,
-                                        &provider_api_key_hints,
+                                        &provider_hints,
                                         &api_key_hint,
                                     )),
                                 ));
@@ -1885,9 +2389,11 @@ async fn run_engine_loop(
                                     ),
                                 ));
                             }
-                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                                ErrorEvent::new(format!("failed to set model: {error}")),
-                            ));
+                            send_setting_change_failed(
+                                &session_transport_tx,
+                                crate::session::SessionCommand::SetModel(model.clone()),
+                                format!("failed to set model: {error}"),
+                            );
                         }
                     }
                     continue;
@@ -1912,13 +2418,89 @@ async fn run_engine_loop(
                         );
                         visible_child_view_state = None;
                     } else {
-                        let _ = crate::session::SessionCoordinator::dispatch_idle_command(
-                            session_command,
-                            &mut agent,
-                            &transcript,
-                            &session_transport_tx,
-                            Some(sessions_dir.as_path()),
+                        let history_navigation = matches!(
+                            command,
+                            SessionEngineCommand::Undo
+                                | SessionEngineCommand::Redo
+                                | SessionEngineCommand::NavigateHistory { .. }
                         );
+                        let prepared_history_factory = std::cell::RefCell::new(None);
+                        let prepared_history_routes = std::cell::RefCell::new(None);
+                        let current_primary_route = agent.primary_route().cloned();
+                        let dispatch_result =
+                            crate::session::SessionCoordinator::dispatch_idle_command_with_history_prepare(
+                                session_command,
+                                &mut agent,
+                                &transcript,
+                                &session_transport_tx,
+                                Some(sessions_dir.as_path()),
+                                |snapshot| {
+                                    let restored_expert_models =
+                                        crate::transcript::restore_latest_expert_models(
+                                            &snapshot.records,
+                                        );
+                                    let mut restored_routes =
+                                        config_default_expert_routes_for_primary(
+                                            &new_session_default_expert_routes,
+                                            &legacy_expert_models,
+                                            snapshot.latest_model.as_deref()
+                                                .map(ModelRoute::parse)
+                                                .transpose()?
+                                                .as_ref()
+                                                .or(current_primary_route.as_ref())
+                                                .unwrap_or(&new_session_default_route),
+                                        );
+                                    for (agent_name, route) in restored_expert_models {
+                                        restored_routes.insert(
+                                            agent_name,
+                                            ModelRoute::parse(&route).map_err(|error| {
+                                                anyhow!(
+                                                    "failed to restore expert model '{route}': {error}"
+                                                )
+                                            })?,
+                                        );
+                                    }
+                                    let factory =
+                                        crate::subagent::ExpertRouteFactory::new_with_policies(
+                                            crate::delegation::supported_agent_names().map(|name| {
+                                                (
+                                                    name.to_string(),
+                                                    restored_routes.get(name).cloned(),
+                                                    expert_allowed_models
+                                                        .get(name)
+                                                        .cloned()
+                                                        .unwrap_or_default(),
+                                                )
+                                            }),
+                                            &providers,
+                                            &global_retry,
+                                        )?;
+                                    *prepared_history_routes.borrow_mut() = Some(restored_routes);
+                                    *prepared_history_factory.borrow_mut() = Some(factory);
+                                    Ok(())
+                                },
+                            );
+                        if let Err(error) = dispatch_result {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!("failed to dispatch session command: {error}")),
+                            ));
+                            continue;
+                        }
+                        if history_navigation
+                            && matches!(
+                                dispatch_result,
+                                Ok(crate::session::IdleDispatch::HistoryNavigated)
+                            )
+                        {
+                            if let (Some(factory), Some(routes)) = (
+                                prepared_history_factory.into_inner(),
+                                prepared_history_routes.into_inner(),
+                            ) {
+                                expert_model_routes = routes;
+                                agent.set_subagent_child_factory(Arc::new(factory));
+                                sticky_auto_reviewer.clear_sticky_session();
+                            }
+                        }
                         if matches!(command, SessionEngineCommand::ViewParent) {
                             visible_child_session_id = None;
                             visible_child_view_state = None;
@@ -2059,6 +2641,7 @@ async fn run_engine_loop(
                             Ok(input) => SubagentInvocation {
                                 prompt: input.objective.clone(),
                                 input,
+                                model: None,
                                 parent_tool_call_id: None,
                             },
                             Err(error) => {
@@ -2085,13 +2668,29 @@ async fn run_engine_loop(
                                 continue;
                             }
                         };
-                        if !route_has_api_key(&route_api_key_configured, &route_display_name) {
-                            send_missing_api_key_error(
-                                &session_transport_tx,
-                                &route_display_name,
-                                &provider_api_key_hints,
-                                &api_key_hint,
-                            );
+                        let route_has_credentials = {
+                            let route_api_keys = route_api_key_configured
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            route_has_api_key(&route_api_keys, &route_display_name)
+                                || delegated_route_display_name(
+                                    &agent,
+                                    &expert_model_routes,
+                                    &agent_name,
+                                ) == route_display_name
+                        };
+                        if !route_has_credentials {
+                            {
+                                let provider_hints = provider_api_key_hints
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                send_missing_api_key_error(
+                                    &session_transport_tx,
+                                    &route_display_name,
+                                    &provider_hints,
+                                    &api_key_hint,
+                                );
+                            }
                             continue;
                         }
 
@@ -2231,9 +2830,9 @@ async fn run_engine_loop(
                                         unreachable!("event-aware selection is not used for delegates")
                                     }
                                     ActiveSessionOperation::Command(Some(command)) => {
-                                        park_active_turn_command(
-                                            &mut parked_commands,
+                                        handle_active_turn_command(
                                             command,
+                                            &mut parked_commands,
                                             &session_transport_tx,
                                         );
                                     }
@@ -2270,14 +2869,25 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::Compact => {
-                        if !active_route_has_api_key(&agent, &route_api_key_configured) {
+                        let active_route_has_credentials = {
+                            let route_api_keys = route_api_key_configured
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            active_route_has_api_key(&agent, &route_api_keys)
+                        };
+                        if !active_route_has_credentials {
                             let route_display_name = agent.route_display_name();
-                            send_missing_api_key_error(
-                                &session_transport_tx,
-                                &route_display_name,
-                                &provider_api_key_hints,
-                                &api_key_hint,
-                            );
+                            {
+                                let provider_hints = provider_api_key_hints
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                send_missing_api_key_error(
+                                    &session_transport_tx,
+                                    &route_display_name,
+                                    &provider_hints,
+                                    &api_key_hint,
+                                );
+                            }
                             continue;
                         }
                         if subagent_runtime.is_running() {
@@ -2351,6 +2961,58 @@ async fn run_engine_loop(
                                 continue;
                             }
                         };
+                        let restored_expert_models =
+                            crate::transcript::restore_latest_expert_models(&prepared.snapshot.records);
+                        let mut resumed_expert_model_routes =
+                            config_default_expert_routes_for_primary(
+                                &new_session_default_expert_routes,
+                                &legacy_expert_models,
+                                &new_session_default_route,
+                            );
+                        let mut expert_restore_error = None;
+                        for (agent_name, route) in restored_expert_models {
+                            match ModelRoute::parse(&route) {
+                                Ok(route) => {
+                                    resumed_expert_model_routes.insert(agent_name, route);
+                                }
+                                Err(error) => {
+                                    expert_restore_error = Some(format!(
+                                        "failed to restore expert model for '{agent_name}': {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(error) = expert_restore_error {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(error),
+                            ));
+                            continue;
+                        }
+                        let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
+                            crate::delegation::supported_agent_names().map(|name| {
+                                (
+                                    name.to_string(),
+                                    resumed_expert_model_routes.get(name).cloned(),
+                                    expert_allowed_models
+                                        .get(name)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                )
+                            }),
+                            &providers,
+                            &global_retry,
+                        ) {
+                            Ok(factory) => factory,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(format!(
+                                        "failed to configure expert models for the resumed session: {error}"
+                                    )),
+                                ));
+                                continue;
+                            }
+                        };
                         let resumed_event_session_id = prepared.session_id.clone();
                         let resumed_event_branch_id = prepared.snapshot.branch_id.clone();
                         let resumed_event_messages =
@@ -2384,6 +3046,8 @@ async fn run_engine_loop(
                                 "Fast mode auto-disabled: current model is unavailable",
                             )));
                         }
+                        expert_model_routes = resumed_expert_model_routes;
+                        agent.set_subagent_child_factory(Arc::new(expert_factory));
                         sticky_auto_reviewer.clear_sticky_session();
                         let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
                             session_id: resumed_event_session_id,
@@ -2394,6 +3058,10 @@ async fn run_engine_loop(
                             model_id: Some(agent.route_display_name()),
                             token_usage: Some(token_usage),
                             runtime_context,
+                            expert_models: expert_model_routes
+                                .iter()
+                                .map(|(name, route)| (name.clone(), route.display_name()))
+                                .collect(),
                         });
                         continue;
                     }
@@ -2405,10 +3073,52 @@ async fn run_engine_loop(
                             continue;
                         }
 
-                        let model = agent.route_display_name();
+                        let prepared_route = match agent
+                            .prepare_primary_route(new_session_default_route.clone())
+                        {
+                            Ok(route) => route,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(format!(
+                                        "failed to prepare the default model for a new session: {error}"
+                                    )),
+                                ));
+                                continue;
+                            }
+                        };
+                        let new_session_expert_model_routes =
+                            config_default_expert_routes_for_primary(
+                                &new_session_default_expert_routes,
+                                &legacy_expert_models,
+                                &new_session_default_route,
+                            );
+                        let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
+                            crate::delegation::supported_agent_names().map(|name| {
+                                (
+                                    name.to_string(),
+                                    new_session_expert_model_routes.get(name).cloned(),
+                                    expert_allowed_models
+                                        .get(name)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                )
+                            }),
+                            &providers,
+                            &global_retry,
+                        ) {
+                            Ok(factory) => factory,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(format!(
+                                        "failed to configure expert models for the new session: {error}"
+                                    )),
+                                ));
+                                continue;
+                            }
+                        };
                         let prepared = match crate::session::prepare_new_session_package(
                             &sessions_dir,
-                            model,
+                            new_session_default_route.display_name(),
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -2418,7 +3128,33 @@ async fn run_engine_loop(
                                 continue;
                             }
                         };
-                        let started_event = session_started_event(&prepared);
+                        let mut prepared = prepared;
+                        if let Err(error) = (|| -> Result<()> {
+                            for (agent_name, route) in &new_session_expert_model_routes {
+                                prepared.recorder.record_expert_model_changed(
+                                    agent_name.clone(),
+                                    route.display_name(),
+                                )?;
+                            }
+                            Ok(())
+                        })() {
+                            let _ = remove_empty_session_file(prepared.recorder.path());
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!(
+                                    "failed to record expert models for the new session: {error}"
+                                )),
+                            ));
+                            continue;
+                        }
+                        let started_event = SessionTransportEvent::SessionStarted {
+                            session_id: prepared.session_id.clone(),
+                            records: prepared.snapshot.records.clone(),
+                            runtime_context: prepared.runtime_context.clone(),
+                            expert_models: new_session_expert_model_routes
+                                .iter()
+                                .map(|(name, route)| (name.clone(), route.display_name()))
+                                .collect(),
+                        };
                         let new_path = prepared.recorder.path().to_path_buf();
                         if let Err(error) =
                             crate::session::install_prepared_new_session_for_agent(
@@ -2433,8 +3169,23 @@ async fn run_engine_loop(
                             ))));
                             continue;
                         }
+                        agent.apply_prepared_route(prepared_route);
+                        let new_session_model_id = agent.route_display_name();
+                        expert_model_routes = new_session_expert_model_routes;
+                        agent.set_subagent_child_factory(Arc::new(expert_factory));
                         sticky_auto_reviewer.clear_sticky_session();
+                        for (agent_name, route) in &expert_model_routes {
+                            let _ = session_transport_tx.send(
+                                SessionTransportEvent::ExpertModelChanged {
+                                    agent_name: agent_name.clone(),
+                                    model_id: route.display_name(),
+                                },
+                            );
+                        }
                         let _ = session_transport_tx.send(started_event);
+                        let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
+                            model_id: new_session_model_id,
+                        });
                         continue;
                     }
                 };
@@ -2443,14 +3194,25 @@ async fn run_engine_loop(
                     prompt: prompt.clone(),
                 });
 
-                if !active_route_has_api_key(&agent, &route_api_key_configured) {
+                let active_route_has_credentials = {
+                    let route_api_keys = route_api_key_configured
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    active_route_has_api_key(&agent, &route_api_keys)
+                };
+                if !active_route_has_credentials {
                     let route_display_name = agent.route_display_name();
-                    send_missing_api_key_error(
-                        &session_transport_tx,
-                        &route_display_name,
-                        &provider_api_key_hints,
-                        &api_key_hint,
-                    );
+                    {
+                        let provider_hints = provider_api_key_hints
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        send_missing_api_key_error(
+                            &session_transport_tx,
+                            &route_display_name,
+                            &provider_hints,
+                            &api_key_hint,
+                        );
+                    }
                     continue;
                 }
 
@@ -2464,8 +3226,14 @@ async fn run_engine_loop(
                         subagent_runtime.clone(),
                         sessions_dir.clone(),
                         expert_model_routes.clone(),
-                        route_api_key_configured.clone(),
-                        provider_api_key_hints.clone(),
+                        route_api_key_configured
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone(),
+                        provider_api_key_hints
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone(),
                         api_key_hint.clone(),
                     );
                 let (interrupted, shutdown) = {
@@ -2572,9 +3340,9 @@ async fn run_engine_loop(
                                     )));
                                 }
                                 Some(command) => {
-                                    park_active_turn_command(
-                                        &mut parked_commands,
+                                    handle_active_turn_command(
                                         command,
+                                        &mut parked_commands,
                                         &session_transport_tx,
                                     );
                                 }
@@ -2899,12 +3667,15 @@ mod tests {
         let mut route_api_key_configured = indexmap::IndexMap::from([(route.display_name(), true)]);
         let mut expert_model_routes =
             indexmap::IndexMap::from([(String::from("explorer"), route.clone())]);
+        let mut new_session_default_expert_routes = expert_model_routes.clone();
+        let mut expert_allowed_models = indexmap::IndexMap::new();
         let mut legacy_expert_models =
             indexmap::IndexMap::from([(String::from("explorer"), String::from("old"))]);
         let mut providers = old_config.providers.clone();
         let mut global_retry = old_config.global.retry.clone();
         let mut provider_api_key_hints =
             indexmap::IndexMap::from([(String::from("primary"), String::from("old hint"))]);
+        let mut new_session_default_route = route.clone();
         let old_model_routes = model_routes.clone();
         let old_route_api_key_configured = route_api_key_configured.clone();
         let old_expert_model_routes = expert_model_routes.clone();
@@ -2912,6 +3683,7 @@ mod tests {
         let old_providers = providers.clone();
         let old_global_retry = global_retry.clone();
         let old_provider_api_key_hints = provider_api_key_hints.clone();
+        let old_new_session_default_route = new_session_default_route.clone();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         assert!(
@@ -2921,10 +3693,13 @@ mod tests {
                 &mut model_routes,
                 &mut route_api_key_configured,
                 &mut expert_model_routes,
+                &mut new_session_default_expert_routes,
+                &mut expert_allowed_models,
                 &mut legacy_expert_models,
                 &mut providers,
                 &mut global_retry,
                 &mut provider_api_key_hints,
+                &mut new_session_default_route,
                 &event_tx,
             )
             .is_err()
@@ -2949,10 +3724,215 @@ mod tests {
         );
         assert_eq!(global_retry, old_global_retry);
         assert_eq!(provider_api_key_hints, old_provider_api_key_hints);
+        assert_eq!(new_session_default_route, old_new_session_default_route);
         assert!(event_rx.try_recv().is_err());
 
         let _ = fs::remove_file(old_path);
         let _ = fs::remove_file(bad_path);
+    }
+
+    #[test]
+    fn reload_keeps_current_route_when_it_leaves_the_catalog() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-removed-current-route-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            [providers.primary.models.session-model]
+            "#,
+        )
+        .expect("write initial config");
+
+        let current_route = ModelRoute::new("primary", "session-model");
+        let default_route = ModelRoute::new("primary", "primary-model");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            current_route.model.clone(),
+            1,
+            1,
+        );
+        agent.set_primary_route(current_route.clone());
+        let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
+        let mut model_routes = indexmap::IndexMap::new();
+        let mut route_api_key_configured = indexmap::IndexMap::new();
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = indexmap::IndexMap::new();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let mut new_session_default_route = current_route.clone();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            "#,
+        )
+        .expect("remove current session model from config");
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &event_tx,
+        )
+        .expect("catalog reload should keep the current route alive");
+
+        assert_eq!(agent.primary_route(), Some(&current_route));
+        assert_eq!(new_session_default_route, default_route);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::Notice(notice)
+                if notice.message.contains("is no longer in the configured model catalog")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::ModelCatalogUpdated(catalog)
+                if catalog.models.iter().all(|model| model.id != current_route.display_name())
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionTransportEvent::ModelChanged { .. }))
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_keeps_current_expert_route_when_it_leaves_the_catalog() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-removed-current-expert-route-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            [providers.primary.models.expert-model]
+            "#,
+        )
+        .expect("write initial config");
+
+        let primary_route = ModelRoute::new("primary", "primary-model");
+        let expert_route = ModelRoute::new("primary", "expert-model");
+        let mut agent = Agent::new(
+            Client::with_config(OpenAIConfig::new()),
+            primary_route.model.clone(),
+            1,
+            1,
+        );
+        agent.set_primary_route(primary_route.clone());
+        let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
+        let mut model_routes = indexmap::IndexMap::new();
+        let mut route_api_key_configured = indexmap::IndexMap::new();
+        let mut expert_model_routes =
+            indexmap::IndexMap::from([("explorer".into(), expert_route.clone())]);
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = indexmap::IndexMap::new();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let mut new_session_default_route = primary_route.clone();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            "#,
+        )
+        .expect("remove current expert model from config");
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &event_tx,
+        )
+        .expect("catalog reload should keep the current expert route alive");
+
+        assert_eq!(expert_model_routes.get("explorer"), Some(&expert_route));
+        assert!(
+            providers
+                .get("primary")
+                .is_some_and(|provider| provider.has_model("expert-model"))
+        );
+        assert!(
+            !model_routes.contains_key(&expert_route.display_name()),
+            "removed expert route must not remain selectable in the global catalog"
+        );
+        assert_eq!(
+            route_api_key_configured.get(&expert_route.display_name()),
+            Some(&true),
+            "the retained session route keeps the credential state of its live provider"
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -3001,10 +3981,13 @@ mod tests {
         let mut model_routes = indexmap::IndexMap::new();
         let mut route_api_key_configured = indexmap::IndexMap::new();
         let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = indexmap::IndexMap::new();
         let mut legacy_expert_models = indexmap::IndexMap::new();
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
         let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let mut new_session_default_route = primary_route.clone();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         fs::write(
@@ -3037,19 +4020,22 @@ mod tests {
             &mut model_routes,
             &mut route_api_key_configured,
             &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
             &mut legacy_expert_models,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
+            &mut new_session_default_route,
             &event_tx,
         )
         .expect("active route config should reload");
 
-        assert_eq!(agent.primary_route(), Some(&secondary_route));
+        assert_eq!(agent.primary_route(), Some(&primary_route));
+        assert_eq!(new_session_default_route, secondary_route);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(SessionTransportEvent::ModelChanged { model_id })
-                if model_id == "secondary/secondary-model"
+            Ok(SessionTransportEvent::ModelCatalogUpdated(_))
         ));
 
         let _ = fs::remove_file(path);

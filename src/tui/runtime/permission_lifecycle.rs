@@ -208,6 +208,9 @@ mod tests {
                 tool_name: None,
                 summary: None,
                 origin_label: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
             })
         ));
         assert!(!controller.clears_for_child_event(
@@ -219,6 +222,9 @@ mod tests {
                 tool_name: None,
                 summary: None,
                 origin_label: None,
+                approval: None,
+                risk: None,
+                reviewer_child_session_id: None,
             })
         ));
         assert!(controller.clears_for_child_event(

@@ -6,7 +6,11 @@
 
 use anyhow::{Result, bail};
 
-use crate::session::{SessionCommand, SessionCommandHandler, SessionEngineIngress};
+use crate::session::{
+    ActiveTurnCommandDisposition, SessionCommand, SessionCommandHandler, SessionEngineIngress,
+};
+
+use crate::tui::state::ToastKind;
 
 use super::{TuiRuntime, child_navigation_anchor};
 
@@ -33,8 +37,36 @@ impl<'a> TuiSessionCommandAdapter<'a> {
     }
 
     fn submit(&mut self, command: SessionCommand) -> Result<()> {
-        if self.ingress.submit(command).is_err() {
+        let active_turn = self.runtime.has_active_or_pending_session_turn();
+        let pending_mcp_server = match &command {
+            SessionCommand::ToggleMcpServer(server_name) => Some(server_name.clone()),
+            _ => None,
+        };
+        let deferred = active_turn
+            && matches!(
+                command.active_turn_disposition(),
+                ActiveTurnCommandDisposition::Defer
+            );
+        let rejected = active_turn
+            && matches!(
+                command.active_turn_disposition(),
+                ActiveTurnCommandDisposition::Reject
+            );
+        if rejected {
+            self.runtime
+                .show_toast("Turn still running", ToastKind::Info);
+            return Ok(());
+        }
+        if self.ingress.submit(command.clone()).is_err() {
+            if let Some(server_name) = pending_mcp_server {
+                self.runtime.clear_mcp_server_updating(&server_name);
+            }
             bail!(SESSION_ENGINE_UNAVAILABLE_MESSAGE);
+        }
+        if deferred {
+            self.runtime.project_deferred_setting(&command);
+            self.runtime
+                .show_toast("Change queued for after the current turn", ToastKind::Info);
         }
         Ok(())
     }

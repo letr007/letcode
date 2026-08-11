@@ -1120,6 +1120,7 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
                 output_json:
                     r#"{"status":0,"body":"SURVIVING-PROTOCOL-SENTINEL ACTIVE-FOLDED-SENTINEL"}"#
                         .into(),
+                images: Vec::new(),
             },
         ),
         (

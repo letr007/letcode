@@ -64,6 +64,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_destructive_command_is_rejected_before_engine_ingress() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state.phase = AppPhase::Running;
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+
+        dispatch_command(
+            &mut runtime,
+            crate::session::SessionCommand::NewSession,
+            &ingress,
+            true,
+        );
+
+        assert!(matches!(
+            engine.try_recv_control(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Turn still running")
+        );
+    }
+
+    #[tokio::test]
+    async fn running_setting_dispatch_is_queued_with_pending_notice() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state.phase = AppPhase::Running;
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+
+        dispatch_command(
+            &mut runtime,
+            crate::session::SessionCommand::SetModel("provider/model".into()),
+            &ingress,
+            true,
+        );
+
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Command(
+                crate::session::engine::SessionEngineCommand::SetModel(model)
+            )) if model == "provider/model"
+        ));
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Change queued for after the current turn")
+        );
+        assert_eq!(
+            runtime.state().pending_composer_settings.model,
+            Some(("provider/model".into(), "provider/model".into()))
+        );
+        assert_eq!(runtime.state().model_id, "pending-runtime-model");
+    }
+
+    #[test]
+    fn failed_mcp_dispatch_clears_updating_state() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_mcp_server_updating("docs".into(), true);
+        let (engine, ingress, _egress) = SessionEngine::new();
+        drop(engine);
+
+        dispatch_command(
+            &mut runtime,
+            crate::session::SessionCommand::ToggleMcpServer("docs".into()),
+            &ingress,
+            true,
+        );
+
+        assert!(!runtime.state().mcp_updating.contains("docs"));
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+    }
+
+    #[test]
+    fn failed_setting_dispatch_does_not_project_pending_value() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state.phase = AppPhase::Running;
+        let (engine, ingress, _egress) = SessionEngine::new();
+        drop(engine);
+
+        dispatch_command(
+            &mut runtime,
+            crate::session::SessionCommand::SetPermissionMode(
+                crate::permission::PermissionMode::Safe,
+            ),
+            &ingress,
+            true,
+        );
+
+        assert_eq!(
+            runtime.state().pending_composer_settings.permission_mode,
+            None
+        );
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+    }
+
+    #[tokio::test]
     async fn double_escape_dispatches_frontend_neutral_interrupt() {
         let mut runtime = runtime();
         runtime.session_turn_active = true;

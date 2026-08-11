@@ -59,6 +59,7 @@ static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Persist the selected primary route without rewriting unrelated configuration
 /// content.
+#[allow(dead_code)]
 pub fn persist_primary_model_route(config_path: &Path, route: &ModelRoute) -> Result<()> {
     persist_config_document(config_path, "primary model route", true, |document| {
         let provider = document
@@ -87,8 +88,30 @@ pub fn persist_fast_mode_enabled(config_path: &Path, enabled: bool) -> Result<()
     })
 }
 
+pub(crate) fn validate_fast_mode_update(config_path: &Path, enabled: bool) -> Result<()> {
+    let config_target = fs::canonicalize(config_path)
+        .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
+    let mut config_file = fs::File::open(&config_target)
+        .with_context(|| format!("failed to open config file {}", config_target.display()))?;
+    let mut config_text = String::new();
+    config_file
+        .read_to_string(&mut config_text)
+        .with_context(|| format!("failed to read config file {}", config_target.display()))?;
+    let mut document = config_text
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse config file {}", config_target.display()))?;
+    document["fast_mode"] = value(enabled);
+    validate_updated_config_document(
+        &config_target,
+        &document.to_string(),
+        "Fast Mode state",
+        true,
+    )
+}
+
 /// Persist one expert's provider-qualified route without rewriting unrelated
 /// configuration content.
+#[allow(dead_code)]
 pub fn persist_expert_model_route(
     config_path: &Path,
     agent_name: &str,
@@ -617,7 +640,7 @@ impl AppConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelRoute {
     pub provider: String,
     pub model: String,
@@ -633,6 +656,19 @@ impl ModelRoute {
 
     pub fn display_name(&self) -> String {
         format!("{}/{}", self.provider, self.model)
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let Some((provider, model)) = value.split_once('/') else {
+            bail!("model route '{value}' must use provider/model form");
+        };
+        let provider = required_non_empty("model route provider", provider.to_string())?;
+        let model = required_non_empty("model route model", model.to_string())?;
+        if model.contains('/') {
+            bail!("model route '{value}' must use provider/model form");
+        }
+        Ok(Self::new(provider, model))
     }
 
     pub fn build_client(&self, provider: &ProviderConfig) -> Client<OpenAIConfig> {
@@ -659,6 +695,11 @@ impl AgentsConfig {
     pub fn route_for(&self, agent_name: &str) -> Option<&ModelRoute> {
         self.config_for(agent_name)
             .and_then(|config| config.route.as_ref())
+    }
+
+    pub fn allowed_models_for(&self, agent_name: &str) -> Option<&[ModelRoute]> {
+        self.config_for(agent_name)
+            .map(|config| config.allowed_models.as_slice())
     }
 
     #[allow(dead_code)]
@@ -689,6 +730,7 @@ impl AgentsConfig {
 #[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
     pub route: Option<ModelRoute>,
+    pub allowed_models: Vec<ModelRoute>,
     #[allow(dead_code)]
     pub follows_active_provider: bool,
 }
@@ -912,6 +954,8 @@ struct RawAgentsConfig {
 struct RawAgentConfig {
     provider: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    allowed_models: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1343,6 +1387,45 @@ fn build_agent_config(
         return Ok(AgentConfig::default());
     };
 
+    let allowed_models = raw
+        .allowed_models
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            ModelRoute::parse(&required_non_empty(
+                &format!("agents.{agent_name}.allowed_models[{index}]"),
+                value,
+            )?)
+            .with_context(|| {
+                format!(
+                    "agents.{agent_name}.allowed_models[{index}] must be a provider/model route"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen_allowed = std::collections::HashSet::new();
+    for route in &allowed_models {
+        let provider = providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "agents.{agent_name}.allowed_models references unknown provider '{}'",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "agents.{agent_name}.allowed_models model '{}' is not defined under [providers.{}.models]",
+                route.model,
+                route.provider
+            );
+        }
+        if !seen_allowed.insert(route.clone()) {
+            bail!(
+                "agents.{agent_name}.allowed_models contains duplicate route '{}'",
+                route.display_name()
+            );
+        }
+    }
+
     let provider_name = raw
         .provider
         .map(|value| required_non_empty(&format!("agents.{agent_name}.provider"), value))
@@ -1378,6 +1461,7 @@ fn build_agent_config(
 
     Ok(AgentConfig {
         route,
+        allowed_models,
         follows_active_provider,
     })
 }
@@ -1733,6 +1817,13 @@ mod tests {
         assert_eq!(config.agents.model_for("explorer"), Some("shared"));
         assert_eq!(config.agents.model_for("fixer"), Some("shared"));
         assert_eq!(config.active_route(), ModelRoute::new("primary", "shared"));
+        assert!(
+            config
+                .agents
+                .allowed_models_for("explorer")
+                .expect("known expert")
+                .is_empty()
+        );
         assert_eq!(
             config
                 .resolve_route(config.model_route_for("fixer").expect("fixer route"))
@@ -1747,6 +1838,93 @@ mod tests {
                 .protocol,
             ApiProtocol::Completions
         );
+    }
+
+    #[test]
+    fn parses_and_validates_expert_allowed_models() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "primary"
+
+            [agents.explorer]
+            model = "shared"
+            allowed_models = ["expert/special"]
+
+            [providers.primary]
+            base_url = "https://primary.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "shared"
+
+            [providers.primary.models.shared]
+
+            [providers.expert]
+            base_url = "https://expert.invalid/v1"
+            api_key = "expert-key"
+            protocol = "responses"
+            default_model = "special"
+
+            [providers.expert.models.special]
+            "#,
+        );
+        let before = fs::read_to_string(&path).expect("read config before load");
+        let config = AppConfig::load_from_path(&path).expect("allowed model config loads");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read config after load"),
+            before,
+            "loading and selecting allowed models must not persist configuration changes"
+        );
+        assert_eq!(
+            config.agents.allowed_models_for("explorer"),
+            Some([ModelRoute::new("expert", "special")].as_slice())
+        );
+        assert_eq!(
+            config.model_route_for("explorer"),
+            Some(&ModelRoute::new("primary", "shared")),
+            "allowlist must not change the legacy default route"
+        );
+
+        for (allowed_models, expected) in [
+            ("[\"special\"]", "must use provider/model form"),
+            (
+                "[\"missing/special\"]",
+                "references unknown provider 'missing'",
+            ),
+            (
+                "[\"expert/missing\"]",
+                "model 'missing' is not defined under [providers.expert.models]",
+            ),
+            (
+                "[\"expert/special\", \"expert/special\"]",
+                "contains duplicate route 'expert/special'",
+            ),
+        ] {
+            let path = write_temp_config(&format!(
+                r#"
+                [agents.explorer]
+                allowed_models = {allowed_models}
+
+                [providers.primary]
+                base_url = "https://primary.invalid/v1"
+                api_key = "primary-key"
+                protocol = "responses"
+                default_model = "shared"
+
+                [providers.primary.models.shared]
+
+                [providers.expert]
+                base_url = "https://expert.invalid/v1"
+                api_key = "expert-key"
+                protocol = "responses"
+                default_model = "special"
+
+                [providers.expert.models.special]
+                "#
+            ));
+            let error = AppConfig::load_from_path(&path).expect_err("invalid allowlist fails");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]

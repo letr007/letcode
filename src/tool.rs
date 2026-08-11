@@ -43,6 +43,7 @@ pub use registry::ToolRegistry;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const MAX_READ_LINE_LIMIT: usize = 5_000;
 const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
+const MAX_READ_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 300;
 const MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS: usize = 2_000;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
@@ -57,6 +58,7 @@ pub struct NormalizedSubagentInput {
     pub owned_paths: Vec<String>,
     pub timeout_secs: Option<u64>,
     pub max_tool_calls: Option<usize>,
+    pub model: Option<String>,
     pub target_child_session_id: Option<String>,
 }
 
@@ -77,6 +79,9 @@ impl NormalizedSubagentInput {
         }
         if !self.owned_paths.is_empty() {
             lines.push(format!("负责路径：{}", self.owned_paths.join(", ")));
+        }
+        if let Some(model) = &self.model {
+            lines.push(format!("单次模型路由：{model}"));
         }
         if let Some(target) = &self.target_child_session_id {
             lines.push(format!("接管子会话：{target}"));
@@ -443,6 +448,12 @@ pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<Normali
         )
     })?;
 
+    let model = optional_trimmed_string(args, "model")?;
+    let target_child_session_id = optional_trimmed_string(args, "target_child_session_id")?;
+    if model.is_some() && target_child_session_id.is_some() {
+        bail!("field 'model' cannot be combined with 'target_child_session_id'");
+    }
+
     Ok(NormalizedSubagentInput {
         objective,
         success_criteria: optional_trimmed_string_list(args, "success_criteria")?,
@@ -451,7 +462,8 @@ pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<Normali
         owned_paths: optional_trimmed_string_list(args, "owned_paths")?,
         timeout_secs: optional_u64(args, "timeout_secs")?,
         max_tool_calls: optional_u64(args, "max_tool_calls")?.map(|value| value as usize),
-        target_child_session_id: optional_trimmed_string(args, "target_child_session_id")?,
+        model,
+        target_child_session_id,
     })
 }
 
@@ -557,6 +569,10 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
                 "items": {"type": "string"},
                 "description": "当前委派拥有编辑权的路径集合"
             },
+            "model": {
+                "type": ["string", "null"],
+                "description": "仅用于新建子代理的单次 provider/model 路由覆盖"
+            },
             "target_child_session_id": {
                 "type": ["string", "null"],
                 "description": "接替已有终态子会话并复用其上下文；省略则新建子代理会话"
@@ -571,6 +587,7 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
             "allowed_paths",
             "forbidden_paths",
             "owned_paths",
+            "model",
             "target_child_session_id"
         ],
         "additionalProperties": false
@@ -584,6 +601,9 @@ pub struct ToolResult {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::user_content::UserImageAttachment>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ToolError>,
@@ -624,6 +644,7 @@ impl ToolResult {
             ok: true,
             tool: tool.into(),
             data: Some(data),
+            images: Vec::new(),
             error: None,
         }
     }
@@ -633,6 +654,7 @@ impl ToolResult {
             ok: false,
             tool: tool.into(),
             data: None,
+            images: Vec::new(),
             error: Some(ToolError {
                 message: message.into(),
                 recoverable: true,
@@ -645,11 +667,23 @@ impl ToolResult {
             ok: false,
             tool: tool.into(),
             data: Some(data),
+            images: Vec::new(),
             error: Some(ToolError {
                 message: message.into(),
                 recoverable: true,
             }),
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<crate::user_content::UserImageAttachment>) -> Self {
+        self.images = images;
+        self
+    }
+
+    pub fn for_text_history(&self) -> Self {
+        let mut output = self.clone();
+        output.images.clear();
+        output
     }
 }
 
@@ -677,6 +711,16 @@ pub trait ToolHandler: Send + Sync {
 
     async fn execute(&self, args: Value) -> Result<Value>;
 
+    async fn execute_tool_result(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        self.execute_with_context(args, context)
+            .await
+            .map(|data| ToolResult::ok(self.name(), data))
+    }
+
     async fn execute_with_context(
         &self,
         args: Value,
@@ -690,8 +734,8 @@ pub trait ToolHandler: Send + Sync {
         args: Value,
         context: ToolExecutionContext,
         _emit: ToolOutputEmitter<'_>,
-    ) -> Result<Value> {
-        self.execute_with_context(args, context).await
+    ) -> Result<ToolResult> {
+        self.execute_tool_result(args, context).await
     }
 
     fn spec(&self) -> ToolSpec {
@@ -1405,7 +1449,7 @@ impl ToolHandler for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text file by 1-based line offset and line limit. Use workspace-relative paths by default; external paths require explicit authorization. Returns the selected text directly, subject only to the documented line and byte limits."
+        "Read a UTF-8 text file or supported image. Text reads use 1-based line offset and line limits; image reads return the image as multimodal content. Use workspace-relative paths by default; external paths require explicit authorization."
     }
 
     fn parameters(&self) -> Value {
@@ -1435,7 +1479,21 @@ impl ToolHandler for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        read_file(args, ToolExecutionContext::default()).await
+        read_file(args, ToolExecutionContext::default())
+            .await
+            .and_then(|output| {
+                output
+                    .data
+                    .ok_or_else(|| anyhow!("fs__read returned no data"))
+            })
+    }
+
+    async fn execute_tool_result(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        read_file(args, context).await
     }
 
     async fn execute_with_context(
@@ -1443,7 +1501,13 @@ impl ToolHandler for ReadFileTool {
         args: Value,
         context: ToolExecutionContext,
     ) -> Result<Value> {
-        read_file(args, context).await
+        self.execute_tool_result(args, context)
+            .await
+            .and_then(|output| {
+                output
+                    .data
+                    .ok_or_else(|| anyhow!("fs__read returned no data"))
+            })
     }
 }
 
@@ -1664,11 +1728,15 @@ async fn list_dir(args: Value, context: ToolExecutionContext) -> Result<Value> {
     Ok(json!({ "entries": result }))
 }
 
-async fn read_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
+async fn read_file(args: Value, context: ToolExecutionContext) -> Result<ToolResult> {
     let path = existing_workspace_path(required_string(&args, "path")?, &context)?;
     let metadata = fs::metadata(&path).await?;
     if !metadata.is_file() {
         bail!("path is not a file: {}", path.display());
+    }
+
+    if let Some(mime) = supported_image_mime(&path) {
+        return read_image_file(&path, &metadata, mime).await;
     }
 
     let offset = optional_usize(&args, "offset").unwrap_or(1);
@@ -1741,20 +1809,71 @@ async fn read_file(args: Value, context: ToolExecutionContext) -> Result<Value> 
         Value::Null
     };
 
-    Ok(json!({
-        "path": display_workspace_relative(&path)?,
-        "content": content,
-        "offset": offset,
-        "limit": limit,
-        "start_line": offset,
-        "end_line": end_line,
-        "lines_read": lines_read,
-        "next_offset": next_offset,
-        "has_more": has_more,
-        "truncated": has_more || byte_truncated,
-        "content_bytes": content_bytes,
-        "total_bytes": metadata.len(),
-    }))
+    Ok(ToolResult::ok(
+        "fs__read",
+        json!({
+            "path": display_workspace_relative(&path)?,
+            "content": content,
+            "offset": offset,
+            "limit": limit,
+            "start_line": offset,
+            "end_line": end_line,
+            "lines_read": lines_read,
+            "next_offset": next_offset,
+            "has_more": has_more,
+            "truncated": has_more || byte_truncated,
+            "content_bytes": content_bytes,
+            "total_bytes": metadata.len(),
+        }),
+    ))
+}
+
+fn supported_image_mime(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    }
+}
+
+async fn read_image_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mime: &str,
+) -> Result<ToolResult> {
+    if metadata.len() > MAX_READ_IMAGE_BYTES {
+        bail!(
+            "image exceeds max read bytes ({MAX_READ_IMAGE_BYTES}) in {}",
+            path.display()
+        );
+    }
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("failed to read image {}", path.display()))?;
+    let display_path = display_workspace_relative(path)?;
+    let label = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string();
+    let image = crate::user_content::UserImageAttachment::from_bytes(label, mime, &bytes);
+    Ok(ToolResult::ok(
+        "fs__read",
+        json!({
+            "path": display_path,
+            "kind": "image",
+            "mime": mime,
+            "bytes": bytes.len(),
+        }),
+    )
+    .with_images(vec![image]))
 }
 
 async fn write_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
@@ -2740,6 +2859,7 @@ mod tests {
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use crate::tool::ToolOutputStream;
     use crate::tool_names;
+    use base64::Engine as _;
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -2760,6 +2880,7 @@ mod tests {
             owned_paths: Vec::new(),
             timeout_secs: None,
             max_tool_calls: None,
+            model: None,
             target_child_session_id: None,
         };
         assert!(
@@ -2825,6 +2946,103 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(outside_path);
+    }
+
+    #[tokio::test]
+    async fn fs_read_text_output_remains_compatible_and_has_no_images() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-read-text-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "alpha\nbeta\n").expect("write text fixture");
+
+        let output = ToolRegistry::default_tools()
+            .call_with_context(
+                "fs__read",
+                json!({
+                    "path": path.to_string_lossy(),
+                    "offset": 2,
+                    "limit": 1,
+                }),
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+
+        assert!(output.ok, "{:?}", output.error);
+        assert!(output.images.is_empty());
+        assert_eq!(
+            output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("content"))
+                .and_then(Value::as_str),
+            Some("beta\n")
+        );
+        assert_eq!(
+            output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("start_line"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn fs_read_returns_supported_images_as_multimodal_content() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-read-image-{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n3sAAAAASUVORK5CYII=")
+            .expect("decode png fixture");
+        std::fs::write(&path, &png).expect("write png fixture");
+
+        let output = ToolRegistry::default_tools()
+            .call_with_context(
+                "fs__read",
+                json!({
+                    "path": path.to_string_lossy(),
+                    "offset": 1,
+                    "limit": 10,
+                }),
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+
+        assert!(output.ok, "{:?}", output.error);
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].mime, "image/png");
+        assert!(
+            output.images[0]
+                .data_url
+                .starts_with("data:image/png;base64,")
+        );
+        assert_eq!(
+            output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("kind"))
+                .and_then(Value::as_str),
+            Some("image")
+        );
+        assert!(
+            output
+                .data
+                .as_ref()
+                .is_some_and(|data| !data.to_string().contains("iVBOR"))
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]
@@ -3051,6 +3269,31 @@ mod tests {
     }
 
     #[test]
+    fn normalize_subagent_input_accepts_model_and_rejects_takeover_conflict() {
+        let input = normalize_subagent_input(
+            "agent__explore",
+            &json!({"objective": "inspect", "model": "expert/special"}),
+        )
+        .expect("model override normalizes");
+        assert_eq!(input.model.as_deref(), Some("expert/special"));
+
+        let error = normalize_subagent_input(
+            "agent__explore",
+            &json!({
+                "objective": "inspect",
+                "model": "expert/special",
+                "target_child_session_id": "child-1"
+            }),
+        )
+        .expect_err("override and takeover conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("field 'model' cannot be combined with 'target_child_session_id'")
+        );
+    }
+
+    #[test]
     fn normalized_subagent_input_enforces_write_scope_paths() {
         let input = normalize_subagent_input(
             "agent__fixer",
@@ -3090,22 +3333,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_todos_rejects_multiple_in_progress_items() {
+    async fn workflow_todos_allows_multiple_in_progress_items() {
         let output = call_workflow_todos(json!([
             {"id": "todo-1", "content": "first", "status": "in_progress"},
             {"id": "todo-2", "content": "second", "status": "in_progress"}
         ]))
         .await;
 
-        assert!(!output.ok);
-        assert!(
-            output
-                .error
-                .as_ref()
-                .expect("todo error")
-                .message
-                .contains("at most one item with status 'in_progress'")
-        );
+        assert!(output.ok);
     }
 
     #[tokio::test]

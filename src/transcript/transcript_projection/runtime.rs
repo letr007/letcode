@@ -632,9 +632,17 @@ fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, St
         HistoryItem::ToolOutput {
             call_id,
             output_json,
+            images,
         } => Some((
             RuntimeFrameKind::ToolOutput,
-            format!("tool-output:{call_id}:{output_json}"),
+            format!(
+                "tool-output:{call_id}:{output_json}:{}",
+                images
+                    .iter()
+                    .map(crate::user_content::UserImageAttachment::prompt_plan_placeholder)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
             format!("tool output {call_id}"),
         )),
     }

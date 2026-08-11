@@ -80,6 +80,10 @@ pub enum TranscriptEvent {
         previous_model: String,
         new_model: String,
     },
+    ExpertModelChanged {
+        agent_name: String,
+        model: String,
+    },
     ContextBranchCreated {
         branch_id: String,
         parent_branch_id: String,

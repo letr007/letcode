@@ -32,6 +32,19 @@ use crate::user_content::{
 pub const COMPOSER_ATTACHMENT_MARKER: char = '\u{fffc}';
 pub const COMPOSER_ATTACHMENT_MARKER_STR: &str = "\u{fffc}";
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingComposerSettings {
+    pub model: Option<(String, String)>,
+    pub reasoning_effort: Option<String>,
+    pub permission_mode: Option<String>,
+}
+
+impl PendingComposerSettings {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerToken {
     Image(UserImageAttachment),
@@ -391,6 +404,8 @@ pub struct PendingQuestionState {
     pub active_row: usize,
     pub editing_custom: bool,
     pub origin_label: Option<String>,
+    pub confirm_scroll: usize,
+    confirm_scroll_max: usize,
 }
 
 impl PendingQuestionState {
@@ -405,6 +420,8 @@ impl PendingQuestionState {
             active_row: 0,
             editing_custom: false,
             origin_label,
+            confirm_scroll: 0,
+            confirm_scroll_max: 0,
         }
     }
 
@@ -464,6 +481,7 @@ impl PendingQuestionState {
 
     pub fn move_next_row(&mut self) {
         if self.is_confirm_tab() {
+            self.scroll_confirm_down(1);
             return;
         }
         let row_count = self.current_row_count();
@@ -474,6 +492,7 @@ impl PendingQuestionState {
 
     pub fn move_prev_row(&mut self) {
         if self.is_confirm_tab() {
+            self.scroll_confirm_up(1);
             return;
         }
         let row_count = self.current_row_count();
@@ -486,6 +505,32 @@ impl PendingQuestionState {
         }
     }
 
+    pub fn scroll_confirm_up(&mut self, amount: usize) {
+        self.confirm_scroll = self.confirm_scroll.saturating_sub(amount);
+    }
+
+    pub fn scroll_confirm_down(&mut self, amount: usize) {
+        self.confirm_scroll = self
+            .confirm_scroll
+            .saturating_add(amount)
+            .min(self.confirm_scroll_max);
+    }
+
+    pub fn set_confirm_scroll_max(&mut self, max_scroll: usize) {
+        self.confirm_scroll_max = max_scroll;
+        self.confirm_scroll = self.confirm_scroll.min(max_scroll);
+    }
+
+    #[cfg(test)]
+    pub fn confirm_scroll_max(&self) -> usize {
+        self.confirm_scroll_max
+    }
+
+    fn reset_confirm_scroll(&mut self) {
+        self.confirm_scroll = 0;
+        self.confirm_scroll_max = 0;
+    }
+
     pub fn move_next_tab(&mut self) {
         let total_tabs = self.total_tabs();
         if total_tabs == 0 {
@@ -493,6 +538,7 @@ impl PendingQuestionState {
         }
         self.editing_custom = false;
         self.active_tab = (self.active_tab + 1) % total_tabs;
+        self.reset_confirm_scroll();
         self.clamp_active_row();
     }
 
@@ -507,6 +553,7 @@ impl PendingQuestionState {
         } else {
             self.active_tab - 1
         };
+        self.reset_confirm_scroll();
         self.clamp_active_row();
     }
 
@@ -514,6 +561,7 @@ impl PendingQuestionState {
         let active_tab = self.active_tab;
         let questions_len = self.questions.len();
         let show_confirm = self.show_confirm_tab();
+        self.reset_confirm_scroll();
         let Some(question) = self.questions.get_mut(active_tab) else {
             return QuestionAdvance::None;
         };
@@ -581,6 +629,7 @@ impl PendingQuestionState {
         let active_tab = self.active_tab;
         let questions_len = self.questions.len();
         let show_confirm = self.show_confirm_tab();
+        self.reset_confirm_scroll();
         let Some(question) = self.questions.get_mut(active_tab) else {
             return QuestionAdvance::None;
         };
@@ -643,6 +692,7 @@ impl PendingQuestionState {
 
         self.editing_custom = false;
         self.active_tab = tab_index;
+        self.reset_confirm_scroll();
         self.clamp_active_row();
     }
 
@@ -657,10 +707,12 @@ impl PendingQuestionState {
         } else if active_tab + 1 < questions_len {
             self.active_tab += 1;
             self.active_row = 0;
+            self.reset_confirm_scroll();
             QuestionAdvance::Advanced
         } else if show_confirm {
             self.active_tab = questions_len;
             self.active_row = 0;
+            self.reset_confirm_scroll();
             QuestionAdvance::Advanced
         } else {
             QuestionAdvance::None
@@ -917,7 +969,9 @@ pub struct TuiState {
     pub compaction_animation_start_frame: usize,
     pub reasoning_effort_label: Option<String>,
     pub permission_mode_label: String,
+    pub pending_composer_settings: PendingComposerSettings,
     pub session_id: Option<String>,
+    pub git_branch: Option<String>,
     pub current_context_branch: String,
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
@@ -935,9 +989,6 @@ pub struct TuiState {
     pub custom_theme: Option<Theme>,
     pub transcript_render_cache: TranscriptRenderCache,
     pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
-    /// Composer caret cell for OS IME candidate anchoring after paint.
-    /// Cleared each frame; set only while drawing an editable composer caret.
-    pub ime_cursor_anchor: Option<(u16, u16)>,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub toast: Option<ToastState>,
@@ -992,7 +1043,9 @@ impl Default for TuiState {
             compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
             permission_mode_label: "default".into(),
+            pending_composer_settings: PendingComposerSettings::default(),
             session_id: None,
+            git_branch: None,
             current_context_branch: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             active_tool_call_id: None,
             latest_auto_continue: AutoContinueState::default(),
@@ -1010,7 +1063,6 @@ impl Default for TuiState {
             custom_theme: None,
             transcript_render_cache: TranscriptRenderCache::default(),
             frame_hyperlink_cells: Vec::new(),
-            ime_cursor_anchor: None,
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
             toast: None,
@@ -1067,6 +1119,61 @@ impl TuiState {
 
     pub fn set_reasoning_effort_label(&mut self, label: Option<String>) {
         self.reasoning_effort_label = label;
+    }
+
+    pub fn set_pending_model(
+        &mut self,
+        model_id: impl Into<String>,
+        model_label: impl Into<String>,
+    ) {
+        self.pending_composer_settings.model = Some((model_id.into(), model_label.into()));
+    }
+
+    pub fn set_pending_reasoning_effort(&mut self, label: impl Into<String>) {
+        self.pending_composer_settings.reasoning_effort = Some(label.into());
+    }
+
+    pub fn set_pending_permission_mode(&mut self, label: impl Into<String>) {
+        self.pending_composer_settings.permission_mode = Some(label.into());
+    }
+
+    pub fn clear_pending_model(&mut self) {
+        self.pending_composer_settings.model = None;
+    }
+
+    pub fn clear_pending_model_if(&mut self, model_id: &str) {
+        if self
+            .pending_composer_settings
+            .model
+            .as_ref()
+            .is_some_and(|(pending_id, _)| pending_id == model_id)
+        {
+            self.clear_pending_model();
+        }
+    }
+
+    pub fn clear_pending_reasoning_effort(&mut self) {
+        self.pending_composer_settings.reasoning_effort = None;
+    }
+
+    pub fn clear_pending_reasoning_effort_if(&mut self, label: &str) {
+        if self.pending_composer_settings.reasoning_effort.as_deref() == Some(label) {
+            self.clear_pending_reasoning_effort();
+        }
+    }
+
+    pub fn clear_pending_permission_mode(&mut self) {
+        self.pending_composer_settings.permission_mode = None;
+    }
+
+    pub fn clear_pending_permission_mode_if(&mut self, label: &str) {
+        if self.pending_composer_settings.permission_mode.as_deref() == Some(label) {
+            self.clear_pending_permission_mode();
+        }
+    }
+
+    pub fn clear_pending_composer_settings(&mut self) {
+        self.pending_composer_settings.clear();
     }
 
     pub fn theme(&self) -> Theme {
@@ -1638,6 +1745,10 @@ impl TuiState {
         self.permission_mode_label = label.into();
     }
 
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
+    }
+
     pub fn set_current_context_branch(&mut self, branch_id: impl Into<String>) {
         self.current_context_branch = branch_id.into();
     }
@@ -2019,23 +2130,6 @@ impl TuiState {
         parent_tool_call_id: Option<&str>,
         event: SessionEvent,
     ) {
-        match event {
-            SessionEvent::Notice(notice) => {
-                let kind = match notice.kind {
-                    crate::tui::events::NoticeKind::Info => ToastKind::Info,
-                    crate::tui::events::NoticeKind::Success => ToastKind::Success,
-                    crate::tui::events::NoticeKind::RecoverableError => ToastKind::Error,
-                };
-                self.show_toast(notice.message, kind);
-                return;
-            }
-            SessionEvent::ProcessIssue(issue) => {
-                self.show_toast(issue.message, ToastKind::Error);
-                return;
-            }
-            _ => {}
-        }
-
         let viewing_child = matches!(
             &self.transcript_view,
             TranscriptViewState::Child {
@@ -2043,6 +2137,36 @@ impl TuiState {
                 ..
             } if active_child_session_id == child_session_id
         );
+
+        match event {
+            SessionEvent::Notice(notice) => {
+                match notice.kind {
+                    crate::tui::events::NoticeKind::Info if viewing_child => {
+                        self.show_toast(notice.message, ToastKind::Info);
+                    }
+                    crate::tui::events::NoticeKind::Success if viewing_child => {
+                        self.show_toast(notice.message, ToastKind::Success);
+                    }
+                    crate::tui::events::NoticeKind::RecoverableError => {
+                        self.show_toast(
+                            child_feedback_message(agent_name, child_session_id, &notice.message),
+                            ToastKind::Error,
+                        );
+                    }
+                    crate::tui::events::NoticeKind::Info
+                    | crate::tui::events::NoticeKind::Success => {}
+                }
+                return;
+            }
+            SessionEvent::ProcessIssue(issue) => {
+                self.show_toast(
+                    child_feedback_message(agent_name, child_session_id, &issue.message),
+                    ToastKind::Error,
+                );
+                return;
+            }
+            _ => {}
+        }
 
         self.project_child_event_to_parent_subagent_tool(
             child_session_id,
@@ -2418,6 +2542,12 @@ impl TuiState {
             Some(TimelineItem::Tool(tool)) => {
                 Some(TranscriptClickTarget::ToolCard(tool.call_id.clone()))
             }
+            Some(TimelineItem::AutoReviewAggregate(aggregate)) => {
+                Some(TranscriptClickTarget::ToolCard(format!(
+                    "auto-review:{}",
+                    aggregate.reviewer_child_session_id
+                )))
+            }
             _ => None,
         }
     }
@@ -2556,6 +2686,18 @@ mod event_projection;
 use event_projection::*;
 pub(crate) use event_projection::{context_detail_target_exists, context_dialog_items};
 
+fn child_feedback_message(
+    agent_name: Option<&str>,
+    child_session_id: &str,
+    message: &str,
+) -> String {
+    let child = crate::tui::components::tool_card::truncate_display_width(child_session_id, 16);
+    match agent_name.filter(|name| !name.is_empty()) {
+        Some(agent_name) => format!("{agent_name} · {child}: {message}"),
+        None => format!("{child}: {message}"),
+    }
+}
+
 impl From<TokenUsageEvent> for ModelTokenUsage {
     fn from(event: TokenUsageEvent) -> Self {
         Self {
@@ -2667,6 +2809,66 @@ mod tests {
         assert_eq!(state.commit_custom_answer(), QuestionAdvance::Advanced);
         assert_eq!(state.active_tab, 1);
         assert_eq!(state.questions[0].answers(), vec!["Gamma".to_string()]);
+    }
+
+    #[test]
+    fn auto_review_toggle_key_uses_synthetic_child_session_id() {
+        let mut state = TuiState::default();
+        assert!(
+            !state
+                .tool_output_overrides
+                .contains_key("auto-review:reviewer-child")
+        );
+
+        state.toggle_tool_output("auto-review:reviewer-child");
+        assert_eq!(
+            state
+                .tool_output_overrides
+                .get("auto-review:reviewer-child"),
+            Some(&true)
+        );
+
+        state.toggle_tool_output("auto-review:reviewer-child");
+        assert_eq!(
+            state
+                .tool_output_overrides
+                .get("auto-review:reviewer-child"),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn confirm_scroll_clamps_and_resets_on_tab_or_answer_changes() {
+        let mut state = question_state(vec![
+            QuestionSpec {
+                question: "First".into(),
+                header: "One".into(),
+                options: vec![option("A")],
+                multiple: true,
+            },
+            QuestionSpec {
+                question: "Second".into(),
+                header: "Two".into(),
+                options: vec![option("B")],
+                multiple: true,
+            },
+        ]);
+        state.focus_tab(2);
+        state.set_confirm_scroll_max(3);
+        state.move_next_row();
+        state.move_next_row();
+        state.move_next_row();
+        state.move_next_row();
+        assert_eq!(state.confirm_scroll, 3);
+        state.move_prev_row();
+        assert_eq!(state.confirm_scroll, 2);
+        state.focus_tab(0);
+        assert_eq!(state.confirm_scroll, 0);
+        state.focus_tab(2);
+        state.set_confirm_scroll_max(3);
+        state.move_next_row();
+        state.pick_option(0);
+        assert_eq!(state.confirm_scroll, 0);
     }
 
     #[test]
@@ -3213,15 +3415,8 @@ mod tests {
     }
 
     #[test]
-    fn child_feedback_uses_shared_latest_wins_toast_in_child_view() {
+    fn child_feedback_respects_view_ownership_and_labels_errors() {
         let mut state = TuiState::default();
-        state.apply_event(SessionEvent::ToolStarted(
-            crate::tui::events::ToolStartedEvent::new(
-                "parent-call",
-                "agent__explore",
-                "inspect src/tui",
-            ),
-        ));
         state.replace_child_timeline_from_records(
             &[],
             "parent-session",
@@ -3231,24 +3426,91 @@ mod tests {
             1,
             1,
         );
-        let parent_timeline = state.timeline.clone();
 
-        state.apply_child_session_event(
-            "child-session",
-            SessionEvent::Notice(NoticeEvent::info("child info")),
+        for (kind, message, expected_kind) in [
+            (NoticeKind::Info, "child info", ToastKind::Info),
+            (NoticeKind::Success, "child success", ToastKind::Success),
+        ] {
+            state.apply_child_session_event_with_agent(
+                "child-session",
+                Some("explorer"),
+                None,
+                SessionEvent::Notice(NoticeEvent::new(message, kind)),
+            );
+            assert_eq!(
+                state
+                    .toast()
+                    .map(|toast| (toast.message.as_str(), toast.kind)),
+                Some((message, expected_kind))
+            );
+        }
+
+        for kind in [NoticeKind::Info, NoticeKind::Success] {
+            state.show_toast("keep me", ToastKind::Success);
+            state.apply_child_session_event_with_agent(
+                "background-child",
+                Some("fixer"),
+                None,
+                SessionEvent::Notice(NoticeEvent::new("background notice", kind)),
+            );
+            assert_eq!(
+                state
+                    .toast()
+                    .map(|toast| (toast.message.as_str(), toast.kind)),
+                Some(("keep me", ToastKind::Success))
+            );
+        }
+
+        state.apply_child_session_event_with_agent(
+            "background-child",
+            None,
+            None,
+            SessionEvent::Notice(NoticeEvent::new(
+                "child recoverable error",
+                NoticeKind::RecoverableError,
+            )),
         );
-        state.apply_event(SessionEvent::Tick);
-        state.apply_child_session_event(
-            "child-session",
+        assert_eq!(
+            state
+                .toast()
+                .map(|toast| (toast.message.as_str(), toast.kind)),
+            Some((
+                "background-child: child recoverable error",
+                ToastKind::Error
+            ))
+        );
+
+        state.apply_child_session_event_with_agent(
+            "background-child-session-with-long-id",
+            Some("fixer"),
+            None,
             SessionEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
         );
-
-        let toast = state.toast().expect("replacement child issue toast");
-        assert_eq!(toast.message, "child process issue");
+        let toast = state.toast().expect("background child issue toast");
         assert_eq!(toast.kind, ToastKind::Error);
+        assert!(
+            toast.message.starts_with("fixer · background-chil…:"),
+            "{}",
+            toast.message
+        );
+        assert!(
+            toast.message.ends_with("child process issue"),
+            "{}",
+            toast.message
+        );
         assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
-        assert!(state.active_timeline().items().is_empty());
-        assert_eq!(state.timeline, parent_timeline);
+    }
+
+    #[test]
+    fn parent_notice_still_uses_plain_message() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::Notice(NoticeEvent::info("parent info")));
+        assert_eq!(
+            state
+                .toast()
+                .map(|toast| (toast.message.as_str(), toast.kind)),
+            Some(("parent info", ToastKind::Info))
+        );
     }
 
     #[test]

@@ -1,5 +1,4 @@
-use anyhow::{Result, anyhow};
-use async_openai::Client;
+use anyhow::{Context, Result, anyhow, bail};
 use async_openai::config::{Config, OpenAIConfig};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -17,8 +16,7 @@ use crate::agent::{
     Agent, AgentFactory, AgentTemplate, PrimaryRouteFactory, SubagentChildFactory,
     SubagentInvocation,
 };
-use crate::config::{ApiProtocol, ModelRoute, ProviderConfig, RetryConfig};
-use crate::request_builder::ModelRequestMetadata;
+use crate::config::{ModelRoute, ProviderConfig, RetryConfig};
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::{NormalizedSubagentInput, SubagentPathScope};
 use crate::transcript::transcript_projection;
@@ -192,14 +190,20 @@ type BoxExecFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 pub struct SubagentRunGovernance {
     pub timeout_secs: Option<u64>,
     pub max_tool_calls: Option<usize>,
+    pub model: Option<ModelRoute>,
     pub input: NormalizedSubagentInput,
 }
 
 impl SubagentRunGovernance {
-    fn from_template_and_input(template: &AgentTemplate, input: NormalizedSubagentInput) -> Self {
+    fn from_template_and_input(
+        template: &AgentTemplate,
+        input: NormalizedSubagentInput,
+        model: Option<ModelRoute>,
+    ) -> Self {
         Self {
             timeout_secs: input.effective_timeout_secs(template.timeout_secs),
             max_tool_calls: input.effective_max_tool_calls(template.max_tool_calls),
+            model,
             input,
         }
     }
@@ -215,17 +219,15 @@ pub struct SubagentPool {
 
 #[derive(Clone)]
 pub struct ExpertRouteFactory {
-    routes: HashMap<String, ExpertRoute>,
+    policies: HashMap<String, ExpertRoutePolicy>,
+    providers: indexmap::IndexMap<String, ProviderConfig>,
+    global_retry: RetryConfig,
 }
 
 #[derive(Clone)]
-struct ExpertRoute {
-    route: ModelRoute,
-    client: Client<OpenAIConfig>,
-    default_protocol: ApiProtocol,
-    model_protocols: HashMap<String, ApiProtocol>,
-    model_catalog: HashMap<String, ModelRequestMetadata>,
-    retry_config: RetryConfig,
+struct ExpertRoutePolicy {
+    default_route: Option<ModelRoute>,
+    allowed_models: Vec<ModelRoute>,
 }
 
 #[derive(Debug)]
@@ -288,69 +290,103 @@ impl ExpertRouteFactory {
         &self,
         route: ModelRoute,
     ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
-        let expert_route = self
-            .routes
-            .values()
-            .find(|expert_route| expert_route.route == route)
-            .ok_or_else(|| {
-                anyhow!(
-                    "child route provider '{}' model '{}' is not configured",
-                    route.provider,
-                    route.model
-                )
-            })?;
+        let provider = self.providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "child route provider '{}' is not configured",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "child route provider '{}' model '{}' is not configured",
+                route.provider,
+                route.model
+            );
+        }
         Ok(crate::agent::PreparedPrimaryRoute::new(
-            expert_route.client.clone(),
-            route,
-            expert_route.default_protocol,
-            expert_route.model_protocols.clone(),
-            expert_route.model_catalog.clone(),
-            expert_route.retry_config.clone(),
+            route.clone().build_client(provider),
+            route.clone(),
+            provider.protocol,
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+            provider
+                .retry
+                .clone()
+                .unwrap_or_else(|| self.global_retry.clone()),
         ))
     }
 
+    #[allow(dead_code)]
     pub fn new(
         routes: impl IntoIterator<Item = (String, ModelRoute)>,
         providers: &indexmap::IndexMap<String, ProviderConfig>,
         global_retry: &RetryConfig,
     ) -> Result<Self> {
-        let routes = routes
-            .into_iter()
-            .map(|(agent_name, route)| {
-                let provider = providers.get(&route.provider).ok_or_else(|| {
-                    anyhow!(
-                        "expert route for '{agent_name}' references unknown provider '{}'",
-                        route.provider
-                    )
-                })?;
-                let model = provider.models.get(&route.model).ok_or_else(|| {
-                    anyhow!(
-                        "expert route for '{agent_name}' references unknown model '{}' under provider '{}'",
-                        route.model,
-                        route.provider
-                    )
-                })?;
-                let client = route.build_client(provider);
-                let model_catalog = HashMap::from([(route.model.clone(), model.request_metadata())]);
-                let model_protocols = HashMap::from([(route.model.clone(), model.protocol)]);
-                let retry_config = provider
-                    .retry
-                    .clone()
-                    .unwrap_or_else(|| global_retry.clone());
-                Ok((
-                    agent_name,
-                    ExpertRoute {
-                        route,
-                        client,
-                        default_protocol: provider.protocol,
-                        model_protocols,
-                        model_catalog,
-                        retry_config,
-                    },
-                ))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        Ok(Self { routes })
+        Self::new_with_policies(
+            routes
+                .into_iter()
+                .map(|(name, route)| (name, Some(route), Vec::new())),
+            providers,
+            global_retry,
+        )
+    }
+
+    pub fn new_with_policies(
+        policies: impl IntoIterator<Item = (String, Option<ModelRoute>, Vec<ModelRoute>)>,
+        providers: &indexmap::IndexMap<String, ProviderConfig>,
+        global_retry: &RetryConfig,
+    ) -> Result<Self> {
+        let mut prepared = HashMap::new();
+        for (agent_name, default_route, allowed_models) in policies {
+            if let Some(route) = &default_route {
+                Self::validate_configured_route(providers, &agent_name, "default", route)?;
+            }
+            for route in &allowed_models {
+                Self::validate_configured_route(providers, &agent_name, "allowed", route)?;
+            }
+            prepared.insert(
+                agent_name,
+                ExpertRoutePolicy {
+                    default_route,
+                    allowed_models,
+                },
+            );
+        }
+        Ok(Self {
+            policies: prepared,
+            providers: providers.clone(),
+            global_retry: global_retry.clone(),
+        })
+    }
+
+    fn validate_configured_route(
+        providers: &indexmap::IndexMap<String, ProviderConfig>,
+        agent_name: &str,
+        kind: &str,
+        route: &ModelRoute,
+    ) -> Result<()> {
+        let provider = providers.get(&route.provider).ok_or_else(|| {
+            anyhow!(
+                "expert {kind} route for '{agent_name}' references unknown provider '{}'",
+                route.provider
+            )
+        })?;
+        if !provider.has_model(&route.model) {
+            bail!(
+                "expert {kind} route for '{agent_name}' references unknown model '{}' under provider '{}'",
+                route.model,
+                route.provider
+            );
+        }
+        Ok(())
     }
 }
 
@@ -364,26 +400,66 @@ impl PrimaryRouteFactory<OpenAIConfig> for ExpertRouteFactory {
 }
 
 impl SubagentChildFactory<OpenAIConfig> for ExpertRouteFactory {
+    fn resolve_route(
+        &self,
+        parent: &Agent<OpenAIConfig>,
+        template: &AgentTemplate,
+        requested_route: Option<&ModelRoute>,
+        takeover: bool,
+    ) -> Result<ModelRoute> {
+        let policy = self
+            .policies
+            .get(&template.name)
+            .ok_or_else(|| anyhow!("no route policy configured for expert '{}'", template.name))?;
+        if let Some(route) = requested_route {
+            let effective_default = policy
+                .default_route
+                .as_ref()
+                .or_else(|| parent.primary_route());
+            let allowed = policy.allowed_models.iter().any(|allowed| allowed == route);
+            let default_takeover = takeover && effective_default == Some(route);
+            if !allowed && !default_takeover {
+                let action = if takeover { "historical" } else { "requested" };
+                bail!(
+                    "{action} model route '{}' is not allowed for expert '{}'",
+                    route.display_name(),
+                    template.name
+                );
+            }
+            self.prepare_route(route.clone())?;
+            return Ok(route.clone());
+        }
+        if takeover {
+            bail!("takeover requires a recorded provider/model route");
+        }
+        policy
+            .default_route
+            .clone()
+            .or_else(|| parent.primary_route().cloned())
+            .ok_or_else(|| {
+                anyhow!(
+                    "parent model route is unavailable for expert '{}'",
+                    template.name
+                )
+            })
+    }
+
     fn create_child(
         &self,
         parent: &Agent<OpenAIConfig>,
         template: &AgentTemplate,
+        route: &ModelRoute,
         max_tool_calls_override: Option<usize>,
-    ) -> Option<Agent<OpenAIConfig>> {
-        let Some(route) = self.routes.get(&template.name) else {
-            return None;
-        };
-        Some(AgentFactory::create_routed_child_with_max_tool_calls(
-            parent,
-            template,
-            route.client.clone(),
-            route.route.clone(),
-            route.default_protocol,
-            route.model_protocols.clone(),
-            route.model_catalog.clone(),
-            route.retry_config.clone(),
-            max_tool_calls_override,
-        ))
+    ) -> Result<Agent<OpenAIConfig>> {
+        let prepared = self.prepare_route(route.clone())?;
+        Ok(
+            AgentFactory::create_prepared_routed_child_with_max_tool_calls(
+                parent,
+                template,
+                prepared,
+                max_tool_calls_override,
+            ),
+        )
     }
 }
 
@@ -492,8 +568,11 @@ impl SubagentPool {
     ) -> Result<SubagentRunSummary> {
         let template = AgentTemplate::from_name(agent_name)
             .ok_or_else(|| anyhow!("unknown subagent template: {agent_name}"))?;
-        let governance =
-            SubagentRunGovernance::from_template_and_input(&template, invocation.input.clone());
+        let governance = SubagentRunGovernance::from_template_and_input(
+            &template,
+            invocation.input.clone(),
+            invocation.model.clone(),
+        );
         self.run_with_executor(
             parent,
             template,
@@ -595,15 +674,11 @@ impl SubagentPool {
 
         let effective_timeout_secs = governance.timeout_secs.or(template.timeout_secs);
         let effective_max_tool_calls = governance.max_tool_calls.or(template.max_tool_calls);
+        if takeover_child_session_id.is_some() && governance.model.is_some() {
+            bail!("model override cannot be used when taking over a child session");
+        }
 
-        let mut child_agent = AgentFactory::create_child_with_max_tool_calls(
-            parent,
-            &template,
-            effective_max_tool_calls,
-        );
         let scope = SubagentPathScope::from_input(&governance.input)?;
-        child_agent.set_subagent_path_scope(scope.map(Arc::new));
-
         let existing_children = {
             let parent_records = parent_transcript
                 .as_ref()
@@ -613,7 +688,13 @@ impl SubagentPool {
             Self::child_sessions(&sessions_dir, &parent_records)
         };
 
-        let setup = (|| -> Result<(String, String, u32, Arc<Mutex<TranscriptRecorder>>)> {
+        let setup = (|| -> Result<(
+            String,
+            String,
+            u32,
+            Arc<Mutex<TranscriptRecorder>>,
+            Agent<C>,
+        )> {
             let run_id = generate_run_id();
             let child_dir = child_sessions_dir(&sessions_dir);
 
@@ -659,12 +740,25 @@ impl SubagentPool {
                 };
 
                 let mut child_recorder = TranscriptRecorder::open(&child_dir, target_id.clone())?;
-                child_agent.set_context_scope_state(child_recorder.context_scope_state());
                 let child_records = read_records_allow_partial_tail(child_recorder.path())?;
                 let recorded_route = crate::transcript::restore_latest_model(&child_records)
                     .ok_or_else(|| {
                         anyhow!("takeover failed: child `{target_id}` has no recorded model route")
                     })?;
+                let recorded_route = ModelRoute::parse(&recorded_route).with_context(|| {
+                    format!(
+                        "takeover failed: child `{target_id}` recorded an invalid model route"
+                    )
+                })?;
+                let mut child_agent = AgentFactory::create_child_with_route_and_max_tool_calls(
+                    parent,
+                    &template,
+                    Some(recorded_route),
+                    true,
+                    effective_max_tool_calls,
+                )?;
+                child_agent.set_subagent_path_scope(scope.clone().map(Arc::new));
+                child_agent.set_context_scope_state(child_recorder.context_scope_state());
                 let snapshot = transcript_projection::project_runtime_restore_snapshot(
                     target_id.clone(),
                     child_records,
@@ -680,10 +774,6 @@ impl SubagentPool {
                         snapshot.protocol_frames,
                         snapshot.snapshot,
                     )?;
-                let restored_route = crate::session::restore::prepare_restored_model_route(
-                    &child_agent,
-                    Some(&recorded_route),
-                )?;
 
                 child_recorder.record_subagent_lifecycle(
                     run_id.clone(),
@@ -704,10 +794,6 @@ impl SubagentPool {
                     pool_ordinal,
                 )?;
 
-                crate::session::restore::apply_prepared_restored_route(
-                    &mut child_agent,
-                    restored_route,
-                );
                 child_agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
                 child_agent.restore_turn_sequence(snapshot.max_turn_id);
 
@@ -716,10 +802,19 @@ impl SubagentPool {
                     target_id.clone(),
                     pool_ordinal,
                     Arc::new(Mutex::new(child_recorder)),
+                    child_agent,
                 ))
             } else {
                 let pool_ordinal = self.allocate_ordinal_from_children(&existing_children);
                 let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
+                let mut child_agent = AgentFactory::create_child_with_route_and_max_tool_calls(
+                    parent,
+                    &template,
+                    governance.model.clone(),
+                    false,
+                    effective_max_tool_calls,
+                )?;
+                child_agent.set_subagent_path_scope(scope.clone().map(Arc::new));
                 child_agent.set_context_scope_state(child_recorder.context_scope_state());
                 child_recorder.record_session_started(child_agent.route_display_name())?;
                 let child_session_id = child_recorder.session_id().to_string();
@@ -745,11 +840,12 @@ impl SubagentPool {
                     child_session_id,
                     pool_ordinal,
                     Arc::new(Mutex::new(child_recorder)),
+                    child_agent,
                 ))
             }
         })();
 
-        let (run_id, child_session_id, pool_ordinal, child_transcript) = match setup {
+        let (run_id, child_session_id, pool_ordinal, child_transcript, child_agent) = match setup {
             Ok(values) => values,
             Err(error) => return Err(error),
         };
@@ -1436,6 +1532,7 @@ fn push_unique_path(paths: &mut Vec<String>, path: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ApiProtocol;
     use crate::session::SessionTransportEvent;
     use crate::transcript::read_records;
     use async_openai::Client;
@@ -1463,6 +1560,7 @@ mod tests {
         SubagentRunGovernance {
             timeout_secs: None,
             max_tool_calls: None,
+            model: None,
             input: NormalizedSubagentInput {
                 objective: "test".into(),
                 success_criteria: Vec::new(),
@@ -1471,6 +1569,7 @@ mod tests {
                 owned_paths: Vec::new(),
                 timeout_secs: None,
                 max_tool_calls: None,
+                model: None,
                 target_child_session_id: None,
             },
         }
@@ -1555,6 +1654,164 @@ mod tests {
             socket.shutdown().await.expect("response should close");
         });
         (format!("http://{address}/v1"), request_count, server)
+    }
+
+    fn test_model_config(protocol: ApiProtocol) -> crate::config::ModelConfig {
+        crate::config::ModelConfig {
+            display_name: None,
+            protocol,
+            context_window: None,
+            effective_input_limit_tokens: None,
+            max_output_tokens: None,
+            supports_tools: false,
+            supports_reasoning: false,
+            reasoning_effort: None,
+            reasoning_efforts: Vec::new(),
+            reasoning_summary: None,
+            text_verbosity: None,
+            temperature: None,
+            top_p: None,
+            prompt_cache: crate::config::PromptCacheConfig::default(),
+            parallel_tool_calls: false,
+        }
+    }
+
+    fn test_provider(
+        base_url: &str,
+        api_key: &str,
+        protocol: ApiProtocol,
+        models: &[&str],
+    ) -> ProviderConfig {
+        ProviderConfig {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            protocol,
+            default_model: models.first().copied().unwrap_or_default().into(),
+            retry: None,
+            models: models
+                .iter()
+                .map(|model| ((*model).to_string(), test_model_config(protocol)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn expert_policy_default_inherits_parent_without_allowing_implicit_override() {
+        let providers = indexmap::IndexMap::from([(
+            "primary".into(),
+            test_provider(
+                "http://127.0.0.1:9876/v1",
+                "primary-key",
+                ApiProtocol::Completions,
+                &["shared"],
+            ),
+        )]);
+        let factory = ExpertRouteFactory::new_with_policies(
+            [("explorer".into(), None, Vec::new())],
+            &providers,
+            &RetryConfig::default(),
+        )
+        .expect("factory should build");
+        let mut parent = test_agent();
+        parent.set_primary_route(ModelRoute::new("primary", "shared"));
+
+        let inherited = ModelRoute::new("primary", "shared");
+        assert_eq!(
+            SubagentChildFactory::resolve_route(
+                &factory,
+                &parent,
+                &AgentTemplate::explorer(),
+                None,
+                false,
+            )
+            .expect("default route inherits parent"),
+            inherited
+        );
+        assert_eq!(
+            SubagentChildFactory::resolve_route(
+                &factory,
+                &parent,
+                &AgentTemplate::explorer(),
+                Some(&inherited),
+                true,
+            )
+            .expect("takeover may reuse the effective default route"),
+            inherited
+        );
+        let error = SubagentChildFactory::resolve_route(
+            &factory,
+            &parent,
+            &AgentTemplate::explorer(),
+            Some(&ModelRoute::new("primary", "shared")),
+            false,
+        )
+        .expect_err("empty allowlist rejects explicit selection");
+        assert!(
+            error
+                .to_string()
+                .contains("is not allowed for expert 'explorer'")
+        );
+    }
+
+    #[test]
+    fn expert_policy_allows_cross_provider_override_and_takeover() {
+        let providers = indexmap::IndexMap::from([
+            (
+                "primary".into(),
+                test_provider(
+                    "http://127.0.0.1:9876/v1",
+                    "primary-key",
+                    ApiProtocol::Responses,
+                    &["shared"],
+                ),
+            ),
+            (
+                "expert".into(),
+                test_provider(
+                    "http://127.0.0.1:9877/v1",
+                    "expert-key",
+                    ApiProtocol::Completions,
+                    &["special"],
+                ),
+            ),
+        ]);
+        let selected = ModelRoute::new("expert", "special");
+        let factory = ExpertRouteFactory::new_with_policies(
+            [(
+                "explorer".into(),
+                Some(ModelRoute::new("primary", "shared")),
+                vec![selected.clone()],
+            )],
+            &providers,
+            &RetryConfig::default(),
+        )
+        .expect("factory should build");
+        let mut parent = test_agent();
+        parent.set_primary_route(ModelRoute::new("primary", "shared"));
+
+        for takeover in [false, true] {
+            assert_eq!(
+                SubagentChildFactory::resolve_route(
+                    &factory,
+                    &parent,
+                    &AgentTemplate::explorer(),
+                    Some(&selected),
+                    takeover,
+                )
+                .expect("allowlisted route resolves"),
+                selected
+            );
+        }
+        let child = SubagentChildFactory::create_child(
+            &factory,
+            &parent,
+            &AgentTemplate::explorer(),
+            &selected,
+            None,
+        )
+        .expect("allowlisted child builds");
+        assert_eq!(child.primary_route(), Some(&selected));
+        assert_eq!(child.default_protocol_for_test(), ApiProtocol::Completions);
     }
 
     #[test]
@@ -1911,7 +2168,7 @@ mod tests {
                     async move {
                         let mut transcript = transcript.lock().expect("lock child transcript");
                         transcript.record_user_message("initial prompt")?;
-                        transcript.record_model_changed("gpt-test", "child-resume-model")?;
+                        transcript.record_model_changed("gpt-test", "test/child-resume-model")?;
                         transcript.record_assistant_tool_call_batch(
                             None,
                             None,
@@ -1938,12 +2195,32 @@ mod tests {
             .await
             .expect("initial run succeeds");
 
+        let takeover_route = ModelRoute::new("test", "child-resume-model");
+        let factory = Arc::new(
+            ExpertRouteFactory::new_with_policies(
+                [("explorer".into(), None, vec![takeover_route.clone()])],
+                &indexmap::IndexMap::from([(
+                    "test".into(),
+                    test_provider(
+                        "http://127.0.0.1:9878/v1",
+                        "test-key",
+                        ApiProtocol::Completions,
+                        &["child-resume-model"],
+                    ),
+                )]),
+                &RetryConfig::default(),
+            )
+            .expect("takeover route factory"),
+        );
+        let mut takeover_parent = test_agent();
+        takeover_parent.set_primary_route(takeover_route);
+        takeover_parent.set_subagent_child_factory(factory);
         let mut takeover_governance = test_governance();
         takeover_governance.input.target_child_session_id = Some(first.child_session_id.clone());
         let resumed_child_session_id = first.child_session_id.clone();
         let resumed = runtime
             .run_with_executor(
-                &test_agent(),
+                &takeover_parent,
                 AgentTemplate::explorer(),
                 "continue inspection".into(),
                 takeover_governance,
@@ -2025,9 +2302,14 @@ mod tests {
                 },
             )]),
         };
+        let expert_route = ModelRoute::new("expert", "shared");
         let factory = Arc::new(
-            ExpertRouteFactory::new(
-                [("explorer".into(), ModelRoute::new("expert", "shared"))],
+            ExpertRouteFactory::new_with_policies(
+                [(
+                    "explorer".into(),
+                    Some(expert_route.clone()),
+                    vec![expert_route],
+                )],
                 &indexmap::IndexMap::from([("expert".into(), provider)]),
                 &RetryConfig::default(),
             )
@@ -2070,7 +2352,8 @@ mod tests {
 
         let mut current_expert_parent = test_agent();
         current_expert_parent.set_primary_route(ModelRoute::new("primary", "shared"));
-        current_expert_parent.set_primary_route_factory(factory);
+        current_expert_parent.set_primary_route_factory(factory.clone());
+        current_expert_parent.set_subagent_child_factory(factory);
         let mut takeover_governance = test_governance();
         takeover_governance.input.target_child_session_id = Some(first.child_session_id.clone());
         let resumed_child_session_id = first.child_session_id.clone();

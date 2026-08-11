@@ -679,7 +679,7 @@ fn render_panel_composer_cursor(
 
 fn render_composer_cursor_block(
     frame: &mut Frame<'_>,
-    state: &mut TuiState,
+    _state: &mut TuiState,
     cursor_area: Rect,
     theme: Theme,
     pulse: ComposerCursorPulse,
@@ -688,8 +688,7 @@ fn render_composer_cursor_block(
     if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
         cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
     }
-    // Soft caret is visual only; the real VT cursor anchors CJK IME popups.
-    state.ime_cursor_anchor = Some((cursor_area.x, cursor_area.y));
+    // Soft caret remains buffer-only so terminal cursor movement cannot disturb IME popups.
 }
 
 /// Soft pulse driven by the shared tick clock. Spinner only advances on Tick now,
@@ -761,6 +760,10 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
     }
 
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let pending_style = Style::default()
+        .fg(theme.dim_text)
+        .bg(theme.element_bg)
+        .add_modifier(Modifier::DIM);
     let accent = surface::accent_style(
         theme,
         surface::SurfaceEmphasis::User,
@@ -775,20 +778,44 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
         "prompt"
     };
 
+    let (model_label, model_style) = state
+        .pending_composer_settings
+        .model
+        .as_ref()
+        .map(|(_, label)| (label.clone(), pending_style))
+        .unwrap_or_else(|| (state.model_label.clone(), element_style));
+    let reasoning = state
+        .pending_composer_settings
+        .reasoning_effort
+        .as_ref()
+        .map(|label| (label.clone(), pending_style))
+        .or_else(|| {
+            state
+                .reasoning_effort_label
+                .as_ref()
+                .map(|label| (label.clone(), element_style))
+        });
+    let (permission_mode, permission_style) = state
+        .pending_composer_settings
+        .permission_mode
+        .as_ref()
+        .map(|label| (label.clone(), pending_style))
+        .unwrap_or_else(|| (state.permission_mode_label.clone(), element_style));
+
     let mut spans = vec![
         Span::styled(mode, accent),
         Span::styled(" · ", dim),
-        Span::styled(state.model_label.clone(), element_style),
+        Span::styled(model_label, model_style),
         Span::styled(" · ", dim),
         Span::styled(state.provider_label.clone(), element_style),
     ];
-    if let Some(reasoning) = &state.reasoning_effort_label {
+    if let Some((reasoning, reasoning_style)) = reasoning {
         spans.push(Span::styled(" · ", dim));
-        spans.push(Span::styled(reasoning.clone(), element_style));
+        spans.push(Span::styled(reasoning, reasoning_style));
     }
     spans.extend([
         Span::styled(" · ", dim),
-        Span::styled(state.permission_mode_label.clone(), element_style),
+        Span::styled(permission_mode, permission_style),
     ]);
     if state.fast_mode_enabled {
         spans.push(Span::styled(" · ", dim));
@@ -1437,6 +1464,49 @@ mod tests {
 
         assert!(rendered.contains("/tool-output"), "{rendered}");
         assert!(!rendered.contains("Read-only child view"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_settings_use_dimmed_target_values_without_status_copy() {
+        let mut state = TuiState::new("old/model", "Old", "default");
+        state.set_provider_label("provider");
+        state.set_reasoning_effort_label(Some("medium".into()));
+        state.set_pending_model("new/model", "New");
+        state.set_pending_reasoning_effort("high");
+        state.set_pending_permission_mode("safe");
+
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_composer(frame, &mut state, Rect::new(0, 0, 100, 8), Theme::dark());
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let row_cells = (0..100)
+            .filter_map(|x| buffer.cell((x, 6)))
+            .collect::<Vec<_>>();
+        let row = row_cells
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(row.contains("New · provider · high · safe"), "{row}");
+        assert!(!row.contains("pending"), "{row}");
+        assert!(!row.contains("Old"), "{row}");
+        assert!(!row.contains("medium"), "{row}");
+
+        for value in ["New", "high", "safe"] {
+            let start = row_cells
+                .windows(value.chars().count())
+                .position(|cells| {
+                    cells.iter().map(|cell| cell.symbol()).collect::<String>() == value
+                })
+                .expect("pending value is visible");
+            let cell = row_cells[start];
+            assert_eq!(cell.fg, Theme::dark().dim_text, "{value}");
+            assert!(cell.modifier.contains(Modifier::DIM), "{value}");
+        }
     }
 
     #[test]

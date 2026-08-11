@@ -14,6 +14,7 @@ use crate::agent::{
 };
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::{PermissionApproval, PermissionRequest};
+use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::subagent::{SubagentFailureKind, SubagentPool, SubagentStatus};
 use crate::subagent_events::SubagentEventSender;
@@ -130,6 +131,26 @@ impl RunnerPermissionRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCatalogReasoning {
+    pub effort: Option<String>,
+    pub efforts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub provider: String,
+    pub context_window_tokens: Option<u64>,
+    pub reasoning: ModelCatalogReasoning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCatalogUpdatedEvent {
+    pub models: Vec<ModelCatalogEntry>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum SessionTransportEvent {
     UserMessage(UserMessageEvent),
@@ -165,6 +186,16 @@ pub(crate) enum SessionTransportEvent {
     ExpertModelChanged {
         agent_name: String,
         model_id: String,
+    },
+    PermissionModeChanged {
+        mode: String,
+    },
+    ReasoningEffortChanged {
+        effort: ModelReasoningEffort,
+    },
+    ModelCatalogUpdated(ModelCatalogUpdatedEvent),
+    SettingChangeFailed {
+        command: crate::session::SessionCommand,
     },
     PermissionRequested {
         event: PermissionRequestEvent,
@@ -247,6 +278,7 @@ pub(crate) enum SessionTransportEvent {
         model_id: Option<String>,
         token_usage: Option<TokenUsageEvent>,
         runtime_context: RuntimeActiveContext,
+        expert_models: indexmap::IndexMap<String, String>,
     },
     #[allow(dead_code)]
     // Branch changes are consumed by the TUI transport projection.
@@ -281,6 +313,7 @@ pub(crate) enum SessionTransportEvent {
         session_id: String,
         records: Vec<TranscriptRecord>,
         runtime_context: RuntimeActiveContext,
+        expert_models: indexmap::IndexMap<String, String>,
     },
     Error(ErrorEvent),
     Done,
@@ -309,6 +342,10 @@ impl SessionTransportEvent {
             Self::FastModeChanged { .. }
             | Self::ModelChanged { .. }
             | Self::ExpertModelChanged { .. }
+            | Self::PermissionModeChanged { .. }
+            | Self::ReasoningEffortChanged { .. }
+            | Self::ModelCatalogUpdated(_)
+            | Self::SettingChangeFailed { .. }
             | Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(SessionEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => {
@@ -415,8 +452,8 @@ struct RunnerSubagentDelegate {
     sessions_dir: PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: Option<SessionTransportEventSender>,
-    expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
     route_api_key_configured: indexmap::IndexMap<String, bool>,
+    retained_session_routes: std::collections::HashSet<String>,
     provider_api_key_hints: indexmap::IndexMap<String, String>,
     api_key_hint: String,
 }
@@ -426,13 +463,25 @@ impl RunnerSubagentDelegate {
         &self,
         parent: &Agent<async_openai::config::OpenAIConfig>,
         agent_name: &str,
-        target_child_session_id: Option<&str>,
+        invocation: &SubagentInvocation,
     ) -> Result<String> {
-        let Some(target_child_session_id) = target_child_session_id else {
-            return Ok(self.expert_model_routes.get(agent_name).map_or_else(
-                || parent.route_display_name(),
-                crate::config::ModelRoute::display_name,
-            ));
+        let template = crate::agent::AgentTemplate::from_name(agent_name)
+            .ok_or_else(|| anyhow!("unknown subagent template: {agent_name}"))?;
+        if let Some(route) = &invocation.model {
+            return crate::agent::AgentFactory::resolve_subagent_route(
+                parent,
+                &template,
+                Some(route),
+                false,
+            )
+            .map(|route| route.display_name());
+        }
+        let Some(target_child_session_id) = invocation.input.target_child_session_id.as_deref()
+        else {
+            return crate::agent::AgentFactory::resolve_subagent_route(
+                parent, &template, None, false,
+            )
+            .map(|route| route.display_name());
         };
         let parent_records = self
             .transcript
@@ -459,11 +508,20 @@ impl RunnerSubagentDelegate {
             crate::transcript::child_sessions_dir(&self.sessions_dir)
                 .join(format!("{target_child_session_id}.jsonl")),
         )?;
-        crate::transcript::restore_latest_model(&child_records).ok_or_else(|| {
-            anyhow!(
-                "takeover failed: child `{target_child_session_id}` has no recorded model route"
-            )
-        })
+        let recorded_route =
+            crate::transcript::restore_latest_model(&child_records).ok_or_else(|| {
+                anyhow!(
+                    "takeover failed: child `{target_child_session_id}` has no recorded model route"
+                )
+            })?;
+        let recorded_route = crate::config::ModelRoute::parse(&recorded_route)?;
+        crate::agent::AgentFactory::resolve_subagent_route(
+            parent,
+            &template,
+            Some(&recorded_route),
+            true,
+        )
+        .map(|route| route.display_name())
     }
 
     fn missing_api_key_result(
@@ -508,16 +566,31 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
         Box::pin(async move {
             let tool_name = subagent_tool_name_for_agent_name(agent_name)
                 .expect("runner dispatched unknown subagent agent name");
-            let route_display_name = self.route_display_name(
-                parent,
-                agent_name,
-                invocation.input.target_child_session_id.as_deref(),
-            )?;
+            let route_display_name = match self.route_display_name(parent, agent_name, &invocation)
+            {
+                Ok(route) => route,
+                Err(error) => {
+                    let summary = error.to_string();
+                    let data = json!({
+                        "agent_name": agent_name,
+                        "child_session_id": invocation.input.target_child_session_id,
+                        "status": SubagentStatus::Failed.as_str(),
+                        "failure_kind": SubagentFailureKind::Hard.as_str(),
+                        "summary": compact_subagent_summary(&summary),
+                        "full_summary": summary,
+                        "active": false,
+                        "unreconciled": false,
+                        "reconciled": false,
+                        "reusable": false,
+                    });
+                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                }
+            };
             if !self
                 .route_api_key_configured
                 .get(&route_display_name)
                 .copied()
-                .unwrap_or(false)
+                .unwrap_or_else(|| self.retained_session_routes.contains(&route_display_name))
             {
                 return Ok(self.missing_api_key_result(tool_name, agent_name, route_display_name));
             }
@@ -628,8 +701,11 @@ impl AgentRunner<async_openai::config::OpenAIConfig> {
                 sessions_dir,
                 transcript,
                 event_tx: self_.event_tx.clone(),
-                expert_model_routes,
                 route_api_key_configured,
+                retained_session_routes: expert_model_routes
+                    .into_values()
+                    .map(|route| route.display_name())
+                    .collect(),
                 provider_api_key_hints,
                 api_key_hint,
             }));
@@ -1676,7 +1752,10 @@ fn wrap_child_session_transport_event(
         }
         SessionTransportEvent::FastModeChanged { .. }
         | SessionTransportEvent::ModelChanged { .. }
-        | SessionTransportEvent::ExpertModelChanged { .. } => event,
+        | SessionTransportEvent::ExpertModelChanged { .. }
+        | SessionTransportEvent::PermissionModeChanged { .. }
+        | SessionTransportEvent::ReasoningEffortChanged { .. }
+        | SessionTransportEvent::SettingChangeFailed { .. } => event,
         SessionTransportEvent::PermissionResolved(event) => {
             SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
@@ -1988,6 +2067,9 @@ fn permission_resolution_event(
             tool_name: None,
             summary: None,
             origin_label: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         },
         PermissionResponse::AllowAlways => PermissionResolutionEvent {
             call_id,
@@ -1996,6 +2078,9 @@ fn permission_resolution_event(
             tool_name: None,
             summary: None,
             origin_label: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         },
         PermissionResponse::Deny => {
             PermissionResolutionEvent::denied(call_id, Some("Denied".into()))
@@ -2165,6 +2250,11 @@ fn summarize_web_fetch(data: &Value) -> String {
 
 fn summarize_read_file(data: &Value) -> String {
     let path = data.get("path").and_then(Value::as_str).unwrap_or("file");
+    if data.get("kind").and_then(Value::as_str) == Some("image") {
+        let bytes = data.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+        let mime = data.get("mime").and_then(Value::as_str).unwrap_or("image");
+        return format!("read image {path} ({mime}, {bytes} bytes)");
+    }
     let lines = data.get("lines_read").and_then(Value::as_u64).unwrap_or(0);
     let start = data.get("start_line").and_then(Value::as_u64);
     let end = data.get("end_line").and_then(Value::as_u64);
@@ -2285,6 +2375,63 @@ mod tests {
         );
     }
 
+    fn credential_delegate(
+        parent: &mut Agent<OpenAIConfig>,
+        default_route: crate::config::ModelRoute,
+        allowed_models: Vec<crate::config::ModelRoute>,
+    ) -> RunnerSubagentDelegate {
+        let provider = crate::config::ProviderConfig {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api_key: "expert-key".into(),
+            protocol: crate::config::ApiProtocol::Completions,
+            default_model: "shared".into(),
+            retry: None,
+            models: indexmap::IndexMap::from([(
+                "shared".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: crate::config::ApiProtocol::Completions,
+                    context_window: None,
+                    effective_input_limit_tokens: None,
+                    max_output_tokens: None,
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = crate::subagent::ExpertRouteFactory::new_with_policies(
+            [("explorer".into(), Some(default_route), allowed_models)],
+            &indexmap::IndexMap::from([("expert".into(), provider)]),
+            &crate::config::RetryConfig::default(),
+        )
+        .expect("credential test factory");
+        parent.set_subagent_child_factory(Arc::new(factory));
+        RunnerSubagentDelegate {
+            runtime: SubagentPool::new(),
+            sessions_dir: std::env::temp_dir(),
+            transcript: temp_transcript(),
+            event_tx: None,
+            route_api_key_configured: indexmap::IndexMap::from([
+                ("primary/shared".into(), true),
+                ("expert/shared".into(), false),
+            ]),
+            retained_session_routes: std::collections::HashSet::new(),
+            provider_api_key_hints: indexmap::IndexMap::from([(
+                "expert".into(),
+                "Set EXPERT_API_KEY.".into(),
+            )]),
+            api_key_hint: "Set <PROVIDER>_API_KEY.".into(),
+        }
+    }
+
     #[test]
     fn permission_request_event_carries_subagent_origin() {
         let request = PermissionRequest {
@@ -2307,28 +2454,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_driven_expert_delegation_requires_its_route_credential() {
-        let delegate = RunnerSubagentDelegate {
-            runtime: SubagentPool::new(),
-            sessions_dir: std::env::temp_dir(),
-            transcript: temp_transcript(),
-            event_tx: None,
-            expert_model_routes: indexmap::IndexMap::from([(
-                "explorer".into(),
-                crate::config::ModelRoute::new("expert", "shared"),
-            )]),
-            route_api_key_configured: indexmap::IndexMap::from([
-                ("primary/shared".into(), true),
-                ("expert/shared".into(), false),
-            ]),
-            provider_api_key_hints: indexmap::IndexMap::from([(
-                "expert".into(),
-                "Set EXPERT_API_KEY.".into(),
-            )]),
-            api_key_hint: "Set <PROVIDER>_API_KEY.".into(),
-        };
+    fn tool_driven_invalid_override_is_reported_before_credential_lookup() {
         let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+        let selected = crate::config::ModelRoute::new("expert", "shared");
+        let delegate = credential_delegate(
+            &mut parent,
+            crate::config::ModelRoute::new("expert", "shared"),
+            Vec::new(),
+        );
         let invocation = SubagentInvocation {
             input: crate::tool::NormalizedSubagentInput {
                 objective: "inspect route credentials".into(),
@@ -2338,8 +2472,48 @@ mod tests {
                 owned_paths: Vec::new(),
                 timeout_secs: None,
                 max_tool_calls: None,
+                model: Some(selected.display_name()),
                 target_child_session_id: None,
             },
+            model: Some(selected),
+            prompt: "inspect route credentials".into(),
+            parent_tool_call_id: Some("call-invalid".into()),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        let output = runtime
+            .block_on(delegate.run_named(&parent, "explorer", invocation))
+            .expect("invalid route is a tool result");
+        let message = &output.error.as_ref().expect("route error").message;
+        assert!(message.contains("requested model route 'expert/shared' is not allowed"));
+        assert!(!message.contains("API key is not set"));
+    }
+
+    #[test]
+    fn tool_driven_expert_delegation_requires_its_route_credential() {
+        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+        let delegate = credential_delegate(
+            &mut parent,
+            crate::config::ModelRoute::new("expert", "shared"),
+            Vec::new(),
+        );
+        let invocation = SubagentInvocation {
+            input: crate::tool::NormalizedSubagentInput {
+                objective: "inspect route credentials".into(),
+                success_criteria: Vec::new(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: Vec::new(),
+                owned_paths: Vec::new(),
+                timeout_secs: None,
+                max_tool_calls: None,
+                model: None,
+                target_child_session_id: None,
+            },
+            model: None,
             prompt: "inspect route credentials".into(),
             parent_tool_call_id: Some("call-1".into()),
         };
@@ -2362,6 +2536,73 @@ mod tests {
             .expect("credential denial includes route metadata");
         assert_eq!(data.get("route"), Some(&json!("expert/shared")));
         assert_eq!(data.get("agent_name"), Some(&json!("explorer")));
+    }
+
+    #[test]
+    fn retained_current_expert_route_keeps_its_session_credential() {
+        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+        let retained = crate::config::ModelRoute::new("expert", "shared");
+        let mut delegate = credential_delegate(&mut parent, retained.clone(), Vec::new());
+        delegate
+            .route_api_key_configured
+            .shift_remove(&retained.display_name());
+        delegate
+            .retained_session_routes
+            .insert(retained.display_name());
+
+        let has_credential = delegate
+            .route_api_key_configured
+            .get(&retained.display_name())
+            .copied()
+            .unwrap_or_else(|| {
+                delegate
+                    .retained_session_routes
+                    .contains(&retained.display_name())
+            });
+
+        assert!(has_credential);
+    }
+
+    #[test]
+    fn tool_driven_override_credential_check_uses_the_requested_route() {
+        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+        let selected = crate::config::ModelRoute::new("expert", "shared");
+        let delegate = credential_delegate(
+            &mut parent,
+            crate::config::ModelRoute::new("expert", "shared"),
+            vec![selected.clone()],
+        );
+        let invocation = SubagentInvocation {
+            input: crate::tool::NormalizedSubagentInput {
+                objective: "inspect route credentials".into(),
+                success_criteria: Vec::new(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: Vec::new(),
+                owned_paths: Vec::new(),
+                timeout_secs: None,
+                max_tool_calls: None,
+                model: Some(selected.display_name()),
+                target_child_session_id: None,
+            },
+            model: Some(selected),
+            prompt: "inspect route credentials".into(),
+            parent_tool_call_id: Some("call-2".into()),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        let output = runtime
+            .block_on(delegate.run_named(&parent, "explorer", invocation))
+            .expect("credential denial is a tool result");
+        assert!(!output.ok);
+        assert_eq!(
+            output.data.as_ref().and_then(|data| data.get("route")),
+            Some(&json!("expert/shared"))
+        );
     }
 
     fn temp_transcript() -> Arc<Mutex<TranscriptRecorder>> {

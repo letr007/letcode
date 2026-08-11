@@ -24,77 +24,193 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
     // Root background.
     frame.render_widget(Block::new().style(theme.app_style()), area);
 
-    let left_spans = footer_status_spans(state, theme);
-
-    // Keep this compact: right side acts like a stable status hint bar.
-    let right_line = Line::from(footer_hint_spans(state, theme));
-
-    let right_width = right_line.width() as u16;
-    let left_line = Line::from(left_spans);
-    let left_width = left_line.width() as u16;
-
-    // Render the right side first so it doesn't overlap the left.
-    frame.render_widget(
-        Paragraph::new(right_line)
-            .style(theme.app_style())
-            .alignment(Alignment::Right),
-        area,
-    );
-
-    // Leave 1 col padding between sides when possible.
-    let left_available_width = area
+    let left_line = Line::from(footer_status_spans(state, theme));
+    let left_width = left_line.width().min(area.width as usize) as u16;
+    let left_padding = u16::from(area.width > left_width);
+    let gap_width =
+        u16::from(left_width > 0 && area.width > left_padding.saturating_add(left_width));
+    let right_max_width = area
         .width
-        .saturating_sub(1)
-        .saturating_sub(right_width.saturating_add(1));
+        .saturating_sub(left_padding)
+        .saturating_sub(left_width)
+        .saturating_sub(gap_width) as usize;
+    let right_line = Line::from(footer_hint_spans(state, theme, right_max_width));
+    let right_width = right_line.width() as u16;
 
-    if left_width > 0 && left_available_width > 0 {
+    if right_width > 0 {
         frame.render_widget(
-            Paragraph::new(left_line).style(theme.app_style()),
+            Paragraph::new(right_line)
+                .style(theme.app_style())
+                .alignment(Alignment::Right),
             Rect::new(
-                area.x.saturating_add(1),
+                area.right().saturating_sub(right_width),
                 area.y,
-                left_width.min(left_available_width),
+                right_width,
                 1,
             ),
         );
     }
+
+    if left_width > 0 {
+        frame.render_widget(
+            Paragraph::new(left_line).style(theme.app_style()),
+            Rect::new(area.x.saturating_add(left_padding), area.y, left_width, 1),
+        );
+    }
 }
 
-fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-
-    if !state.current_context_branch.is_empty() {
-        spans.push(Span::styled(
-            state.current_context_branch.clone(),
-            footer_value_style(theme),
-        ));
+fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Span<'static>> {
+    if max_width == 0 {
+        return Vec::new();
     }
 
-    if state.compaction_active {
+    let status = if state.compaction_active {
         // 压缩中：指示条转为开火车式往返扫描，隐藏过期的 token 数字。
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", footer_dim_style(theme)));
-        }
         let animation_frame = state
             .status_spinner_frame
             .wrapping_sub(state.compaction_animation_start_frame);
-        spans.extend(compaction_indicator_spans(animation_frame, theme));
+        compaction_indicator_spans(animation_frame, theme)
     } else if let Some(usage) = &state.model_token_usage {
+        token_budget_spans(usage, theme)
+    } else {
+        Vec::new()
+    };
+    let status_width = spans_width(&status);
+    if status_width > max_width {
+        return truncate_spans_display_width(status, max_width);
+    }
+
+    let metadata_max_width = max_width.saturating_sub(
+        status_width.saturating_add((status_width > 0).then_some(3).unwrap_or_default()),
+    );
+    let metadata = footer_metadata_spans(state, theme, metadata_max_width);
+
+    let mut spans = metadata;
+    if !status.is_empty() {
         if !spans.is_empty() {
             spans.push(Span::styled(" · ", footer_dim_style(theme)));
         }
-        spans.extend(token_budget_spans(usage, theme));
+        spans.extend(status);
     }
 
     if !state.slash_panel_is_open() {
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", footer_dim_style(theme)));
-        }
-        spans.push(Span::styled("/help", footer_dim_style(theme)));
-        spans.push(Span::styled(" commands", footer_muted_style(theme)));
+        append_help_hint(&mut spans, theme, max_width);
+    }
+    spans
+}
+
+fn footer_metadata_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Span<'static>> {
+    if max_width == 0 {
+        return Vec::new();
     }
 
-    spans
+    let git = state
+        .git_branch
+        .as_deref()
+        .map(|branch| labeled_footer_value_spans("git:", branch, theme, usize::MAX));
+    let context = (!state.current_context_branch.is_empty()).then(|| {
+        labeled_footer_value_spans("ctx:", &state.current_context_branch, theme, usize::MAX)
+    });
+
+    match (git, context) {
+        (Some(git), Some(context)) => {
+            let git_width = spans_width(&git);
+            let context_width = spans_width(&context);
+            if git_width.saturating_add(3).saturating_add(context_width) <= max_width {
+                let mut spans = git;
+                spans.push(Span::styled(" · ", footer_dim_style(theme)));
+                spans.extend(context);
+                return spans;
+            }
+            if context_width >= max_width {
+                return truncate_spans_display_width(context, max_width);
+            }
+
+            let git_max_width = max_width.saturating_sub(context_width).saturating_sub(3);
+            let git = truncate_spans_display_width(git, git_max_width);
+            if git.is_empty() {
+                return context;
+            }
+            let mut spans = git;
+            spans.push(Span::styled(" · ", footer_dim_style(theme)));
+            spans.extend(context);
+            spans
+        }
+        (Some(git), None) => truncate_spans_display_width(git, max_width),
+        (None, Some(context)) => truncate_spans_display_width(context, max_width),
+        (None, None) => Vec::new(),
+    }
+}
+
+fn labeled_footer_value_spans(
+    label: &'static str,
+    value: &str,
+    theme: Theme,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    truncate_spans_display_width(
+        vec![
+            Span::styled(label, footer_dim_style(theme)),
+            Span::styled(value.to_string(), footer_value_style(theme)),
+        ],
+        max_width,
+    )
+}
+
+fn append_help_hint(spans: &mut Vec<Span<'static>>, theme: Theme, max_width: usize) {
+    let current_width = spans_width(spans);
+    let separator_width = usize::from(!spans.is_empty()) * 3;
+    let remaining = max_width
+        .saturating_sub(current_width)
+        .saturating_sub(separator_width);
+    let full_help = vec![
+        Span::styled("/help", footer_dim_style(theme)),
+        Span::styled(" commands", footer_muted_style(theme)),
+    ];
+    let compact_help = vec![Span::styled("/help", footer_dim_style(theme))];
+    let help = if spans_width(&full_help) <= remaining {
+        full_help
+    } else if spans_width(&compact_help) <= remaining {
+        compact_help
+    } else {
+        return;
+    };
+
+    if !spans.is_empty() {
+        spans.push(Span::styled(" · ", footer_dim_style(theme)));
+    }
+    spans.extend(help);
+}
+
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    Line::from(spans.to_vec()).width()
+}
+
+fn truncate_spans_display_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    let mut remaining = max_width;
+    let mut truncated = Vec::new();
+
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let width = crate::tui::measure::display_width(span.content.as_ref());
+        if width <= remaining {
+            remaining = remaining.saturating_sub(width);
+            truncated.push(span);
+            continue;
+        }
+
+        let content = crate::tui::components::tool_card::truncate_display_width(
+            span.content.as_ref(),
+            remaining,
+        );
+        if !content.is_empty() {
+            truncated.push(Span::styled(content, span.style));
+        }
+        break;
+    }
+    truncated
 }
 
 fn token_budget_spans(
@@ -640,13 +756,142 @@ mod tests {
     use super::{
         TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_status_spans,
         render_footer, token_budget_cache_hit_percent, token_budget_cell,
-        token_budget_segment_units,
+        token_budget_segment_units, token_budget_spans,
     };
     use crate::{
         session::RetryLifecycleEvent,
         tui::{AppPhase, TuiState},
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    #[test]
+    fn footer_places_git_branch_before_context_branch() {
+        let mut state = TuiState::default();
+        state.set_git_branch(Some("feature/branch".into()));
+        state.set_current_context_branch("context-2");
+
+        let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(
+            rendered.starts_with("git:feature/branch · ctx:context-2"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn footer_preserves_context_when_long_git_branch_is_truncated() {
+        let mut state = TuiState::default();
+        state.set_git_branch(Some("feature/超长分支名称-for-footer-budget".into()));
+        state.set_current_context_branch("root");
+
+        let spans = footer_hint_spans(&state, crate::tui::Theme::dark(), 18);
+        let line = ratatui::text::Line::from(spans);
+        let rendered = line.to_string();
+
+        assert!(line.width() <= 18, "{rendered}");
+        assert!(rendered.contains("ctx:root"), "{rendered}");
+        assert!(rendered.contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn footer_prioritizes_token_status_over_metadata_and_help() {
+        let mut state = TuiState::default();
+        state.set_git_branch(Some("feature/long-branch".into()));
+        state.set_current_context_branch("root");
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            input_tokens: 600,
+            output_tokens: 100,
+            cached_tokens: 200,
+            used_tokens: 700,
+            context_window_tokens: 1_000,
+            cache_report: None,
+        });
+
+        let status = token_budget_spans(
+            state.model_token_usage.as_ref().expect("token usage"),
+            crate::tui::Theme::dark(),
+        );
+        let status_width = ratatui::text::Line::from(status.clone()).width();
+        let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), status_width)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let expected = status
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("git:"), "{rendered}");
+        assert!(!rendered.contains("ctx:"), "{rendered}");
+        assert!(!rendered.contains("/help"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_truncates_long_metadata_without_exceeding_budget() {
+        let mut state = TuiState::default();
+        state.set_git_branch(Some(
+            "feature/a-very-long-branch-name-that-must-be-clipped".into(),
+        ));
+        state.set_current_context_branch("context-with-a-long-name");
+
+        let spans = footer_hint_spans(&state, crate::tui::Theme::dark(), 24);
+        let line = ratatui::text::Line::from(spans);
+        let rendered = line.to_string();
+
+        assert!(line.width() <= 24, "{rendered}");
+        assert!(rendered.contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn narrow_footer_keeps_phase_indicator_visible() {
+        let mut state = TuiState::default();
+        state.set_git_branch(Some("feature/extremely-long-branch-name".into()));
+        state.set_current_context_branch("context-long");
+        let backend = TestBackend::new(12, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                render_footer(
+                    frame,
+                    &state,
+                    Rect::new(0, 0, 12, 1),
+                    crate::tui::Theme::dark(),
+                )
+            })
+            .expect("render footer");
+
+        let row = (0..12)
+            .map(|x| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, 0))
+                    .expect("footer cell")
+                    .symbol()
+            })
+            .collect::<String>();
+        assert!(row.contains('◆'), "{row}");
+    }
+
+    #[test]
+    fn footer_hides_git_branch_outside_a_repository() {
+        let mut state = TuiState::default();
+        state.set_git_branch(None);
+        state.set_current_context_branch("root");
+
+        let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.starts_with("ctx:root"), "{rendered}");
+        assert!(!rendered.contains("git:"), "{rendered}");
+    }
 
     #[test]
     fn token_budget_units_keep_cache_input_and_output_segments() {

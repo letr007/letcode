@@ -151,12 +151,22 @@ pub(super) fn prompt_segment_to_response_inputs(segment: &PromptSegment) -> Vec<
             PromptSegmentContent::ToolOutput {
                 call_id,
                 output_json,
+                images,
             },
         ) => {
+            let output = if images.is_empty() {
+                FunctionCallOutput::Text(output_json.clone())
+            } else {
+                let mut content = vec![InputContent::InputText(InputTextContent {
+                    text: output_json.clone(),
+                })];
+                content.extend(images.iter().cloned().map(response_image_part));
+                FunctionCallOutput::Content(content)
+            };
             vec![InputItem::Item(Item::FunctionCallOutput(
                 FunctionCallOutputItemParam {
                     call_id: call_id.clone(),
-                    output: FunctionCallOutput::Text(output_json.clone()),
+                    output,
                     id: None,
                     status: None,
                 },
@@ -236,6 +246,7 @@ pub(super) fn prompt_segment_to_chat_message(
             PromptSegmentContent::ToolOutput {
                 call_id,
                 output_json,
+                ..
             },
         ) => ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content: ChatCompletionRequestToolMessageContent::Text(output_json.clone()),
@@ -307,7 +318,17 @@ pub(super) fn build_completions_request(
     model: ModelRequestMetadata,
     prompt_plan: &PromptPlan,
     tools: &[ToolSpec],
-) -> CreateChatCompletionRequest {
+) -> anyhow::Result<CreateChatCompletionRequest> {
+    if prompt_plan.segments.iter().any(|segment| {
+        matches!(
+            &segment.content,
+            PromptSegmentContent::ToolOutput { images, .. } if !images.is_empty()
+        )
+    }) {
+        anyhow::bail!(
+            "Chat Completions does not support image content in tool outputs; use a Responses API provider route"
+        );
+    }
     let messages = prompt_plan
         .segments
         .iter()
@@ -329,7 +350,7 @@ pub(super) fn build_completions_request(
     };
     let parallel_tool_calls = model.supports_tools.then_some(model.parallel_tool_calls);
 
-    CreateChatCompletionRequest {
+    Ok(CreateChatCompletionRequest {
         model: model_id.to_string(),
         messages,
         max_completion_tokens: model.max_output_tokens.and_then(u64_to_u32),
@@ -353,7 +374,7 @@ pub(super) fn build_completions_request(
         prompt_cache_key: cache.key,
         service_tier: model.fast_mode.then_some(ChatServiceTier::Priority),
         ..Default::default()
-    }
+    })
 }
 
 fn u64_to_u32(value: u64) -> Option<u32> {

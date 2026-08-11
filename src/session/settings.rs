@@ -97,6 +97,7 @@ pub(crate) fn apply_model_route_with(
 
 /// Persist a primary-route selection before installing it. If the live route
 /// cannot be applied afterwards, restore the previous persisted selection.
+#[cfg(test)]
 pub(crate) fn persist_and_apply_model_route_with(
     agent: &mut Agent<async_openai::config::OpenAIConfig>,
     transcript: &Arc<Mutex<TranscriptRecorder>>,

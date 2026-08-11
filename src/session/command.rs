@@ -12,6 +12,15 @@ use crate::user_content::UserMessageSubmission;
 ///
 /// This is the stable FE→BE command surface. TUI historically called the same
 /// shape `RuntimeCommand`; that name remains as a compatibility alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveTurnCommandDisposition {
+    QueuePrompt,
+    Immediate,
+    Defer,
+    Reject,
+    Interrupt,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     SubmitPrompt(UserMessageSubmission),
@@ -47,6 +56,28 @@ pub enum SessionCommand {
 }
 
 impl SessionCommand {
+    pub(crate) fn active_turn_disposition(&self) -> ActiveTurnCommandDisposition {
+        match self {
+            Self::SubmitPrompt(_) => ActiveTurnCommandDisposition::QueuePrompt,
+            Self::ViewChild { .. } | Self::ViewParent => ActiveTurnCommandDisposition::Immediate,
+            Self::SetPermissionMode(_)
+            | Self::SetModel(_)
+            | Self::SetExpertModel { .. }
+            | Self::ToggleFastMode
+            | Self::SetReasoningEffort(_)
+            | Self::ToggleMcpServer(_) => ActiveTurnCommandDisposition::Defer,
+            Self::Interrupt => ActiveTurnCommandDisposition::Interrupt,
+            Self::DelegateSubagent { .. }
+            | Self::Compact
+            | Self::ShowHistoryTree
+            | Self::Undo
+            | Self::Redo
+            | Self::NavigateHistory { .. }
+            | Self::ResumeSession(_)
+            | Self::NewSession => ActiveTurnCommandDisposition::Reject,
+        }
+    }
+
     /// Map a shared slash/line [`crate::command::CommandIntent`] into a session
     /// command when the intent is backend-owned. Presentation-only intents
     /// (`Help`, browse UIs, local display toggles) return `None`.

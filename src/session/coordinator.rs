@@ -52,6 +52,8 @@ use tokio::sync::mpsc;
 pub enum IdleDispatch {
     /// Command fully handled (events emitted / agent mutated as needed).
     Handled,
+    /// History navigation committed successfully.
+    HistoryNavigated,
     /// Command requires turn execution or frontend-private orchestration.
     NotIdle,
 }
@@ -72,6 +74,7 @@ impl SessionCoordinator {
     ///
     /// `sessions_dir` is required for child/parent view commands; when `None`,
     /// those commands resolve the directory from the live transcript path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dispatch_idle_command(
         command: SessionCommand,
         agent: &mut Agent<async_openai::config::OpenAIConfig>,
@@ -79,6 +82,27 @@ impl SessionCoordinator {
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
     ) -> Result<IdleDispatch> {
+        Self::dispatch_idle_command_with_history_prepare(
+            command,
+            agent,
+            transcript,
+            event_tx,
+            sessions_dir,
+            |_| Ok(()),
+        )
+    }
+
+    pub(crate) fn dispatch_idle_command_with_history_prepare<F>(
+        command: SessionCommand,
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        transcript: &Arc<Mutex<TranscriptRecorder>>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+        sessions_dir: Option<&Path>,
+        mut prepare_history: F,
+    ) -> Result<IdleDispatch>
+    where
+        F: FnMut(&crate::transcript::transcript_projection::RuntimeRestoreSnapshot) -> Result<()>,
+    {
         match command {
             SessionCommand::ShowHistoryTree => {
                 let entries = (|| {
@@ -106,7 +130,7 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::NavigateHistory { target_entry_id } => {
-                match Self::entry_sequence(&target_entry_id) {
+                let navigated = match Self::entry_sequence(&target_entry_id) {
                     Ok(target_sequence) => Self::navigate_history(
                         agent,
                         transcript,
@@ -114,28 +138,46 @@ impl SessionCoordinator {
                         target_sequence,
                         crate::transcript::HistoryNavigationOperation::Navigate,
                         Vec::new(),
+                        &mut prepare_history,
                     ),
                     Err(error) => {
                         let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
                             error.to_string(),
                         )));
+                        false
                     }
-                }
-                Ok(IdleDispatch::Handled)
+                };
+                Ok(if navigated {
+                    IdleDispatch::HistoryNavigated
+                } else {
+                    IdleDispatch::Handled
+                })
             }
-            SessionCommand::Undo => {
-                Self::navigate_undo(agent, transcript, event_tx);
-                Ok(IdleDispatch::Handled)
-            }
-            SessionCommand::Redo => {
-                Self::navigate_redo(agent, transcript, event_tx);
-                Ok(IdleDispatch::Handled)
-            }
+            SessionCommand::Undo => Ok(
+                if Self::navigate_undo(agent, transcript, event_tx, &mut prepare_history) {
+                    IdleDispatch::HistoryNavigated
+                } else {
+                    IdleDispatch::Handled
+                },
+            ),
+            SessionCommand::Redo => Ok(
+                if Self::navigate_redo(agent, transcript, event_tx, &mut prepare_history) {
+                    IdleDispatch::HistoryNavigated
+                } else {
+                    IdleDispatch::Handled
+                },
+            ),
             SessionCommand::SetPermissionMode(mode) => {
                 if let Err(error) = apply_permission_mode(agent, transcript, mode) {
-                    let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                        "failed to set permission mode: {error}"
-                    ))));
+                    let message = format!("failed to set permission mode: {error}");
+                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
+                        command: SessionCommand::SetPermissionMode(mode),
+                    });
+                    let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(message)));
+                } else {
+                    let _ = event_tx.send(SessionTransportEvent::PermissionModeChanged {
+                        mode: mode.to_string(),
+                    });
                 }
                 Ok(IdleDispatch::Handled)
             }
@@ -175,10 +217,15 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetReasoningEffort(effort) => {
-                if let Err(error) = apply_reasoning_effort(agent, effort) {
-                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                        error.to_string(),
-                    )));
+                if let Err(error) = apply_reasoning_effort(agent, effort.clone()) {
+                    let message = error.to_string();
+                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
+                        command: SessionCommand::SetReasoningEffort(effort),
+                    });
+                    let _ =
+                        event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(message)));
+                } else {
+                    let _ = event_tx.send(SessionTransportEvent::ReasoningEffortChanged { effort });
                 }
                 Ok(IdleDispatch::Handled)
             }
@@ -209,11 +256,15 @@ impl SessionCoordinator {
         }
     }
 
-    fn navigate_undo(
+    fn navigate_undo<F>(
         agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
-    ) {
+        prepare_history: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&crate::transcript::transcript_projection::RuntimeRestoreSnapshot) -> Result<()>,
+    {
         let result = (|| -> Result<(u64, Vec<u64>)> {
             let recorder = transcript
                 .lock()
@@ -285,20 +336,26 @@ impl SessionCoordinator {
                 target,
                 crate::transcript::HistoryNavigationOperation::Undo,
                 redo_stack,
+                prepare_history,
             ),
             Err(error) => {
                 let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
                     error.to_string(),
                 )));
+                false
             }
         }
     }
 
-    fn navigate_redo(
+    fn navigate_redo<F>(
         agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
-    ) {
+        prepare_history: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&crate::transcript::transcript_projection::RuntimeRestoreSnapshot) -> Result<()>,
+    {
         let result = (|| -> Result<(u64, Vec<u64>)> {
             let recorder = transcript
                 .lock()
@@ -329,11 +386,13 @@ impl SessionCoordinator {
                 target,
                 crate::transcript::HistoryNavigationOperation::Redo,
                 redo_stack,
+                prepare_history,
             ),
             Err(error) => {
                 let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
                     error.to_string(),
                 )));
+                false
             }
         }
     }
@@ -353,14 +412,18 @@ impl SessionCoordinator {
             .map_err(Into::into)
     }
 
-    fn navigate_history(
+    fn navigate_history<F>(
         agent: &mut Agent<async_openai::config::OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         target_sequence: u64,
         operation: crate::transcript::HistoryNavigationOperation,
         redo_stack: Vec<u64>,
-    ) {
+        prepare_history: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&crate::transcript::transcript_projection::RuntimeRestoreSnapshot) -> Result<()>,
+    {
         let result = (|| -> std::result::Result<_, NavigationError> {
             let mut recorder = transcript
                 .lock()
@@ -445,6 +508,7 @@ impl SessionCoordinator {
                 )?;
             let runtime_context =
                 crate::runtime_context::RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+            prepare_history(&snapshot)?;
             let (protocol_frames, runtime_snapshot) = agent.validate_runtime_snapshot_restore(
                 snapshot.protocol_frames.clone(),
                 snapshot.snapshot.clone(),
@@ -453,18 +517,34 @@ impl SessionCoordinator {
             let fast_mode_model = route
                 .as_ref()
                 .map_or_else(|| agent.model(), |route| route.target_model());
-            let fast_mode_auto_disabled = agent
-                .auto_disable_fast_mode_for_model(fast_mode_model)
+            let prepared_fast_mode_disable = agent
+                .prepare_fast_mode_auto_disable(fast_mode_model)
                 .map_err(|error| NavigationError {
-                error,
-                fast_mode_auto_disabled: false,
-            })?;
+                    error,
+                    fast_mode_auto_disabled: false,
+                })?;
+            let fast_mode_auto_disabled = prepared_fast_mode_disable.is_some();
             #[cfg(test)]
             if FAIL_HISTORY_NAVIGATION_COMMIT.with(|fail| fail.replace(false)) {
                 return Err(NavigationError {
                     error: anyhow::anyhow!("injected history navigation commit failure"),
-                    fast_mode_auto_disabled,
+                    fast_mode_auto_disabled: false,
                 });
+            }
+            recorder.preflight_history_navigation_transaction(
+                branch_id.clone(),
+                parent_branch_id.clone(),
+                target_sequence,
+                operation,
+                redo_stack.clone(),
+            )?;
+            if let Some(prepared_fast_mode_disable) = prepared_fast_mode_disable {
+                prepared_fast_mode_disable
+                    .commit()
+                    .map_err(|error| NavigationError {
+                        error,
+                        fast_mode_auto_disabled: false,
+                    })?;
             }
             recorder
                 .record_history_navigation_transaction(
@@ -504,6 +584,8 @@ impl SessionCoordinator {
                 if fast_mode_auto_disabled {
                     Self::emit_fast_mode_auto_disabled(event_tx);
                 }
+                let expert_models =
+                    crate::transcript::restore_latest_expert_models(&snapshot.records);
                 let _ = event_tx.send(SessionTransportEvent::SessionResumed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
@@ -513,7 +595,9 @@ impl SessionCoordinator {
                     model_id: Some(agent.route_display_name()),
                     token_usage: None,
                     runtime_context,
+                    expert_models,
                 });
+                true
             }
             Err(error) => {
                 if error.fast_mode_auto_disabled {
@@ -534,6 +618,7 @@ impl SessionCoordinator {
                     }
                 };
                 let _ = event_tx.send(event);
+                false
             }
         }
     }
@@ -819,7 +904,7 @@ protocol = "responses"
     }
 
     #[test]
-    fn navigation_commit_failure_projects_persisted_fast_mode_disable() {
+    fn navigation_commit_failure_keeps_fast_mode_unchanged() {
         let (transcript, mut agent, _fast_mode_dir) = history_navigation_with_unsupported_model();
         let before = {
             let recorder = transcript.lock().expect("recorder");
@@ -840,25 +925,66 @@ protocol = "responses"
         .expect("dispatch");
 
         assert_eq!(agent.model(), "gpt-5.5");
-        assert!(!agent.fast_mode_enabled());
+        assert!(agent.fast_mode_enabled());
         let after = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read final records")
         };
         assert_eq!(after.len(), before.len());
         assert!(matches!(
-            rx.try_recv().expect("fast mode state"),
-            SessionTransportEvent::FastModeChanged { enabled: false }
-        ));
-        assert!(matches!(
-            rx.try_recv().expect("fast mode notice"),
-            SessionTransportEvent::Notice(_)
-        ));
-        assert!(matches!(
             rx.try_recv().expect("navigation error"),
-            SessionTransportEvent::Error(error) if error.message.contains("injected history navigation commit failure")
+            SessionTransportEvent::Error(error)
+                if error.message.contains("injected history navigation commit failure")
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn history_prepare_failure_prevents_navigation_commit() {
+        let transcript = temp_transcript();
+        {
+            let mut recorder = transcript.lock().expect("recorder");
+            recorder.record_user_message("first").expect("first user");
+        }
+        let before = {
+            let recorder = transcript.lock().expect("recorder");
+            crate::transcript::read_records(recorder.path()).expect("records before navigation")
+        };
+        let mut agent = test_agent();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        SessionCoordinator::dispatch_idle_command_with_history_prepare(
+            SessionCommand::NavigateHistory {
+                target_entry_id: "entry-0".into(),
+            },
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+            |_| anyhow::bail!("expert factory unavailable"),
+        )
+        .expect("dispatch");
+
+        let after = {
+            let recorder = transcript.lock().expect("recorder");
+            crate::transcript::read_records(recorder.path()).expect("records after navigation")
+        };
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            rx.try_recv().expect("navigation error"),
+            SessionTransportEvent::Error(error)
+                if error.message.contains("expert factory unavailable")
+        ));
     }
 
     #[test]
@@ -881,7 +1007,7 @@ protocol = "responses"
                 None,
             )
             .expect("dispatch"),
-            IdleDispatch::Handled
+            IdleDispatch::HistoryNavigated
         );
         assert!(matches!(
             rx.try_recv().expect("navigation result"),
@@ -903,7 +1029,7 @@ protocol = "responses"
         assert_eq!(
             SessionCoordinator::dispatch_idle_command(command, agent, transcript, tx, None)
                 .expect("dispatch navigation"),
-            IdleDispatch::Handled
+            IdleDispatch::HistoryNavigated
         );
         match rx.try_recv().expect("navigation result") {
             SessionTransportEvent::SessionResumed { .. } => {}

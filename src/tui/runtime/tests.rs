@@ -14,12 +14,14 @@ use crate::runtime_context::RuntimeActiveContext;
 use crate::session::AgentRunner;
 use crate::session::engine::{
     ActiveSessionOperation, InterruptRequest, ManualCompactionOperation, SessionEngineCommand,
-    SessionEngineControl, derive_interrupt_request, initial_session_metadata,
-    manual_compaction_session_token_usage, next_idle_session_command, record_interrupt_transcript,
+    SessionEngineControl, derive_interrupt_request, enqueue_deferred_command,
+    flush_parked_commands, initial_session_metadata, manual_compaction_session_token_usage,
+    next_idle_session_command, park_active_turn_command, record_interrupt_transcript,
     rehydrate_agent_from_transcript, run_manual_compaction, select_active_session_operation,
     select_manual_compaction_operation, send_subagent_interrupted, wait_for_subagent_cancel_settle,
 };
 use crate::session::restore::restored_session_token_usage;
+use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
 use crate::session::{
     PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
 };
@@ -164,7 +166,7 @@ fn sample_multi_question_request() -> crate::tool::QuestionRequest {
     }
 }
 
-fn runtime() -> TuiRuntime {
+fn runtime_with_experts(available_experts: Vec<AvailableExpert>) -> TuiRuntime {
     static NEXT_RUNTIME_DIR: AtomicU64 = AtomicU64::new(0);
 
     let (_tx, rx) = mpsc::unbounded_channel();
@@ -193,10 +195,201 @@ fn runtime() -> TuiRuntime {
                 ModelReasoningEffort::Xhigh,
             ],
         )],
-        Vec::new(),
+        available_experts,
         std::env::temp_dir(),
         base,
     )
+}
+
+fn runtime() -> TuiRuntime {
+    runtime_with_experts(Vec::new())
+}
+
+#[test]
+fn model_catalog_update_refreshes_open_picker_and_notifies_once_per_absence() {
+    let mut runtime = runtime();
+    let mut dialog = DialogState::new(
+        DialogKind::ModelPicker,
+        "Select model",
+        None,
+        vec![
+            DialogItem::new("gpt-5.5", "GPT-5.5", None),
+            DialogItem::new("gpt-4", "GPT-4", None),
+        ],
+    );
+    dialog.query = "gpt".into();
+    dialog.selected = 0;
+    runtime.state_mut().open_dialog(dialog);
+
+    let removed = ModelCatalogUpdatedEvent {
+        models: vec![ModelCatalogEntry {
+            id: "gpt-4".into(),
+            label: "GPT-4 refreshed".into(),
+            provider: "openai".into(),
+            context_window_tokens: Some(128_000),
+            reasoning: ModelCatalogReasoning {
+                effort: None,
+                efforts: Vec::new(),
+            },
+        }],
+    };
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(removed));
+
+    assert_eq!(runtime.state().model_id, "gpt-5.5");
+    assert_eq!(runtime.available_models().len(), 1);
+    assert_eq!(runtime.available_models()[0].label, "GPT-4 refreshed");
+    assert_eq!(
+        runtime.state().toast().map(|toast| toast.message.as_str()),
+        Some("Current model is no longer available: gpt-5.5")
+    );
+    assert_eq!(
+        runtime.state().dialog().map(|dialog| dialog.query.as_str()),
+        Some("gpt")
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .and_then(|dialog| dialog.selected_item())
+            .map(|item| item.id.as_str()),
+        Some("gpt-4")
+    );
+
+    let first_toast = runtime.state().toast().cloned();
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(
+        ModelCatalogUpdatedEvent {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-4".into(),
+                label: "GPT-4 refreshed".into(),
+                provider: "openai".into(),
+                context_window_tokens: Some(128_000),
+                reasoning: ModelCatalogReasoning {
+                    effort: None,
+                    efforts: Vec::new(),
+                },
+            }],
+        },
+    ));
+    assert_eq!(runtime.state().toast().cloned(), first_toast);
+
+    runtime.state_mut().toast = None;
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(
+        ModelCatalogUpdatedEvent {
+            models: vec![
+                ModelCatalogEntry {
+                    id: "gpt-5.5".into(),
+                    label: "GPT-5.5 updated".into(),
+                    provider: "openai".into(),
+                    context_window_tokens: Some(200_000),
+                    reasoning: ModelCatalogReasoning {
+                        effort: Some("high".into()),
+                        efforts: vec!["none".into(), "high".into()],
+                    },
+                },
+                ModelCatalogEntry {
+                    id: "gpt-4".into(),
+                    label: "GPT-4 refreshed".into(),
+                    provider: "openai".into(),
+                    context_window_tokens: Some(128_000),
+                    reasoning: ModelCatalogReasoning {
+                        effort: None,
+                        efforts: Vec::new(),
+                    },
+                },
+            ],
+        },
+    ));
+
+    assert!(runtime.state().toast().is_none());
+    assert_eq!(runtime.state().model_id, "gpt-5.5");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .and_then(|dialog| dialog.selected_item())
+            .map(|item| item.id.as_str()),
+        Some("gpt-4")
+    );
+    assert_eq!(
+        runtime.available_models()[0].context_window_tokens,
+        Some(200_000)
+    );
+    assert_eq!(
+        runtime.available_models()[0].reasoning_effort,
+        Some(ModelReasoningEffort::High)
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(
+        ModelCatalogUpdatedEvent {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-4".into(),
+                label: "GPT-4 refreshed".into(),
+                provider: "openai".into(),
+                context_window_tokens: Some(128_000),
+                reasoning: ModelCatalogReasoning {
+                    effort: None,
+                    efforts: Vec::new(),
+                },
+            }],
+        },
+    ));
+    assert!(runtime.state().toast().is_some());
+}
+
+#[test]
+fn clipboard_paste_prefers_image_only_in_composer_context() {
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Composer, true, true),
+        ClipboardPasteChoice::Image
+    );
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Composer, false, true),
+        ClipboardPasteChoice::Image
+    );
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Composer, true, false),
+        ClipboardPasteChoice::Text
+    );
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Composer, false, false),
+        ClipboardPasteChoice::None
+    );
+}
+
+#[test]
+fn clipboard_paste_dialog_is_text_first() {
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Dialog, true, true),
+        ClipboardPasteChoice::Text
+    );
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Dialog, false, true),
+        ClipboardPasteChoice::None
+    );
+}
+
+#[test]
+fn clipboard_paste_pending_question_is_text_first() {
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Question, true, true),
+        ClipboardPasteChoice::Text
+    );
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Question, false, true),
+        ClipboardPasteChoice::None
+    );
+}
+
+#[test]
+fn clipboard_paste_permission_is_text_first() {
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Permission, true, true),
+        ClipboardPasteChoice::Text
+    );
+    assert_eq!(
+        choose_clipboard_paste(ClipboardPasteContext::Permission, false, true),
+        ClipboardPasteChoice::None
+    );
 }
 
 fn test_agent() -> Agent<OpenAIConfig> {
@@ -213,7 +406,7 @@ fn test_agent() -> Agent<OpenAIConfig> {
 }
 
 #[test]
-fn mcp_toggle_is_rejected_while_a_turn_is_running() {
+fn mcp_toggle_is_deferred_while_a_turn_is_running() {
     let mut runtime = runtime();
     runtime
         .state_mut()
@@ -227,9 +420,12 @@ fn mcp_toggle_is_rejected_while_a_turn_is_running() {
 
     let command = runtime
         .handle_input_action(InputAction::DialogToggle)
-        .expect("toggle is rejected");
+        .expect("toggle is deferred");
 
-    assert_eq!(command, None);
+    assert_eq!(
+        command,
+        Some(RuntimeCommand::ToggleMcpServer("docs".into()))
+    );
     assert!(!runtime.state().mcp_updating.contains("docs"));
 }
 
@@ -528,6 +724,166 @@ fn child_interrupted_event_updates_child_view_without_touching_parent() {
     assert_eq!(
         runtime.state().toast().map(|toast| toast.message.as_str()),
         Some("Interrupted by user")
+    );
+}
+
+#[test]
+fn running_turn_opens_session_setting_dialogs() {
+    for command_text in ["/model", "/agents", "/permission", "/reasoning"] {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input(command_text);
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("dialog command succeeds");
+
+        assert_eq!(command, None, "{command_text}");
+        assert!(runtime.state().dialog_is_open(), "{command_text}");
+        assert_eq!(runtime.state().input_buffer, "", "{command_text}");
+    }
+}
+
+#[test]
+fn reasoning_shortcut_waits_for_backend_confirmation() {
+    let mut runtime = runtime();
+    let previous = runtime.state().reasoning_effort_label.clone();
+
+    assert!(matches!(
+        runtime
+            .handle_input_action(InputAction::CycleReasoningEffort)
+            .expect("reasoning shortcut succeeds"),
+        Some(RuntimeCommand::SetReasoningEffort(_))
+    ));
+    assert_eq!(runtime.state().reasoning_effort_label, previous);
+}
+
+#[tokio::test]
+async fn running_turn_projects_session_setting_until_backend_confirmation() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("/permission safe");
+
+    let command = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("permission setting is accepted")
+        .expect("permission setting is dispatched");
+    assert_eq!(
+        command,
+        RuntimeCommand::SetPermissionMode(crate::permission::PermissionMode::Safe)
+    );
+
+    let (mut engine, ingress, _egress) = SessionEngine::new();
+    command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+    assert!(matches!(
+        engine.recv_control().await,
+        Some(SessionEngineControl::Command(
+            SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Safe)
+        ))
+    ));
+    assert_eq!(runtime.state().permission_mode_label, "default");
+    assert_eq!(
+        runtime
+            .state()
+            .pending_composer_settings
+            .permission_mode
+            .as_deref(),
+        Some("safe")
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::PermissionModeChanged {
+        mode: "safe".into(),
+    });
+    assert_eq!(runtime.state().permission_mode_label, "safe");
+    assert_eq!(
+        runtime.state().pending_composer_settings.permission_mode,
+        None
+    );
+}
+
+#[test]
+fn setting_failure_clears_only_the_matching_pending_projection() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_pending_model("p/new", "New");
+    runtime.state_mut().set_pending_reasoning_effort("high");
+    runtime.state_mut().set_pending_permission_mode("safe");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::SettingChangeFailed {
+        command: crate::session::SessionCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Safe,
+        ),
+    });
+
+    assert_eq!(
+        runtime.state().pending_composer_settings.permission_mode,
+        None
+    );
+    assert!(runtime.state().pending_composer_settings.model.is_some());
+    assert_eq!(
+        runtime
+            .state()
+            .pending_composer_settings
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn stale_setting_result_does_not_clear_a_newer_pending_projection() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_pending_permission_mode("auto");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::PermissionModeChanged {
+        mode: "safe".into(),
+    });
+    assert_eq!(
+        runtime
+            .state()
+            .pending_composer_settings
+            .permission_mode
+            .as_deref(),
+        Some("auto")
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::SettingChangeFailed {
+        command: crate::session::SessionCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Safe,
+        ),
+    });
+    assert_eq!(
+        runtime
+            .state()
+            .pending_composer_settings
+            .permission_mode
+            .as_deref(),
+        Some("auto")
+    );
+}
+
+#[test]
+fn parent_view_refresh_preserves_pending_setting_projection() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_pending_reasoning_effort("high");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    });
+
+    assert_eq!(
+        runtime
+            .state()
+            .pending_composer_settings
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
     );
 }
 
@@ -1011,6 +1367,84 @@ fn child_transcript_view_blocks_parent_mutating_submit_paths() {
         assert_eq!(command, None, "{input}");
         assert!(runtime.submitted_prompts().is_empty(), "{input}");
     }
+}
+
+#[test]
+fn child_view_navigation_and_read_only_actions_do_not_show_toasts() {
+    let mut runtime = runtime();
+    runtime.state_mut().replace_child_timeline_from_records(
+        &[],
+        "parent-session",
+        "child-session",
+        "explorer",
+        0,
+        1,
+        1,
+    );
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::CycleReasoningEffort)
+            .expect("read-only reasoning action"),
+        None
+    );
+    assert!(runtime.state().toast().is_none());
+
+    runtime
+        .handle_input_action(InputAction::ChildPrefix)
+        .expect("child navigation prefix");
+    assert!(runtime.state().toast().is_none());
+    for _ in 0..CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS {
+        runtime
+            .handle_input_action(InputAction::Tick)
+            .expect("prefix timeout tick");
+    }
+    assert!(!runtime.state().child_navigation_prefix);
+    assert!(runtime.state().toast().is_none());
+
+    runtime.state_mut().set_input("/model gpt-5.5");
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("read-only command"),
+        None
+    );
+    assert!(runtime.state().toast().is_none());
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::ChildParent)
+            .expect("return to parent"),
+        Some(RuntimeCommand::ViewParent)
+    );
+    assert!(runtime.state().toast().is_none());
+    assert!(!runtime.state().transcript_view.is_child());
+}
+
+#[test]
+fn child_view_transport_navigation_does_not_show_toasts() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    assert!(runtime.state().toast().is_none());
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    });
+    assert!(runtime.state().toast().is_none());
 }
 
 #[test]
@@ -2129,6 +2563,7 @@ fn session_resumed_event_replaces_timeline_not_appends() {
         model_id: None,
         token_usage: None,
         runtime_context: event_context("session-1", 1),
+        expert_models: indexmap::IndexMap::new(),
     });
 
     assert!(matches!(
@@ -2178,6 +2613,7 @@ fn session_resume_projection_failure_clears_pending_and_reports_error() {
         model_id: None,
         token_usage: None,
         runtime_context: event_context("session-1", 1),
+        expert_models: indexmap::IndexMap::new(),
     });
 
     assert!(!runtime.session_resume_pending);
@@ -2221,6 +2657,7 @@ fn session_resumed_event_restores_recorded_model() {
         model_id: Some("gpt-5.5-mini".into()),
         token_usage: Some(TokenUsageEvent::new(12_345, 64_000)),
         runtime_context: event_context("session-1", 1),
+        expert_models: indexmap::IndexMap::new(),
     });
 
     assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
@@ -2253,6 +2690,52 @@ fn session_resumed_event_restores_recorded_model() {
 }
 
 #[test]
+fn session_resume_expert_snapshot_clears_previous_session_route() {
+    let mut runtime = runtime_with_experts(vec![
+        AvailableExpert {
+            agent_name: "explorer".into(),
+            route_id: "p/previous".into(),
+        },
+        AvailableExpert {
+            agent_name: "reviewer".into(),
+            route_id: "p/previous-reviewer".into(),
+        },
+    ]);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
+        session_id: "session-1".into(),
+        branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+        messages: Vec::new(),
+        records: Vec::new(),
+        evidence_count: 0,
+        model_id: Some("p/main".into()),
+        token_usage: None,
+        runtime_context: event_context("session-1", 1),
+        expert_models: indexmap::IndexMap::from([("explorer".into(), "p/session".into())]),
+    });
+
+    assert_eq!(runtime.available_experts[0].route_id, "p/session");
+    assert_eq!(runtime.available_experts[1].route_id, "p/main");
+}
+
+#[test]
+fn session_started_event_uses_complete_expert_snapshot() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "p/previous".into(),
+    }]);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::SessionStarted {
+        session_id: "new-session".into(),
+        records: Vec::new(),
+        runtime_context: event_context("new-session", 1),
+        expert_models: indexmap::IndexMap::from([("explorer".into(), "p/new".into())]),
+    });
+
+    assert_eq!(runtime.available_experts[0].route_id, "p/new");
+}
+
+#[test]
 fn session_started_event_clears_timeline_for_new_session() {
     let mut runtime = runtime();
     runtime
@@ -2264,6 +2747,7 @@ fn session_started_event_clears_timeline_for_new_session() {
         session_id: "new-session".into(),
         records: Vec::new(),
         runtime_context: event_context("new-session", 1),
+        expert_models: indexmap::IndexMap::new(),
     });
 
     assert_eq!(runtime.state().timeline.items().len(), 0);
@@ -2299,6 +2783,7 @@ fn invalid_lifecycle_timeline_does_not_clear_parent_permission() {
         model_id: None,
         token_usage: None,
         runtime_context: event_context("new-session", 1),
+        expert_models: indexmap::IndexMap::new(),
     });
 
     assert!(runtime.pending_permission_handle().is_some());
@@ -2607,6 +3092,7 @@ fn resumed_session_restores_latest_todo_state_from_records() {
         model_id: None,
         token_usage: None,
         runtime_context: event_context("s", 2),
+        expert_models: indexmap::IndexMap::new(),
     });
 
     let todo = runtime
@@ -2844,7 +3330,7 @@ fn integration_agent_with_tools(
 ) -> Agent<OpenAIConfig> {
     let client = Client::with_config(
         OpenAIConfig::new()
-            .with_api_base(base_url)
+            .with_api_base(base_url.clone())
             .with_api_key("test"),
     );
     let mut agent = Agent::new(client, "m1", 4, 4);
@@ -2863,6 +3349,47 @@ fn integration_agent_with_tools(
     agent.set_compaction_config(CompactionConfig {
         preserve_recent_tokens: Some(0),
     });
+    if supports_tools {
+        let provider = crate::config::ProviderConfig {
+            base_url,
+            api_key: "test".into(),
+            protocol: crate::config::ApiProtocol::Responses,
+            default_model: "m1".into(),
+            retry: None,
+            models: indexmap::IndexMap::from([(
+                "m1".into(),
+                crate::config::ModelConfig {
+                    display_name: None,
+                    protocol: crate::config::ApiProtocol::Responses,
+                    context_window: Some(m1_input_limit_tokens.saturating_add(1_000)),
+                    effective_input_limit_tokens: Some(m1_input_limit_tokens),
+                    max_output_tokens: Some(128),
+                    supports_tools: true,
+                    supports_reasoning: false,
+                    reasoning_effort: None,
+                    reasoning_efforts: Vec::new(),
+                    reasoning_summary: None,
+                    text_verbosity: None,
+                    temperature: None,
+                    top_p: None,
+                    prompt_cache: crate::config::PromptCacheConfig::default(),
+                    parallel_tool_calls: false,
+                },
+            )]),
+        };
+        let factory = crate::subagent::ExpertRouteFactory::new_with_policies(
+            [(
+                "explorer".into(),
+                Some(crate::config::ModelRoute::new("test", "m1")),
+                Vec::new(),
+            )],
+            &indexmap::IndexMap::from([("test".into(), provider)]),
+            &crate::config::RetryConfig::default(),
+        )
+        .expect("integration expert factory");
+        agent.set_primary_route(crate::config::ModelRoute::new("test", "m1"));
+        agent.set_subagent_child_factory(Arc::new(factory));
+    }
     agent
 }
 
@@ -3134,6 +3661,7 @@ async fn test_session_executor_loop(
                 let invocation = SubagentInvocation {
                     prompt: input.objective.clone(),
                     input,
+                    model: None,
                     parent_tool_call_id: None,
                 };
                 let (interrupted, child_started, interrupted_child_session_id, shutdown) = {
@@ -3342,6 +3870,99 @@ fn terminal_count(events: &[SessionTransportEvent]) -> usize {
             )
         })
         .count()
+}
+
+#[tokio::test]
+async fn session_prompt_auto_continue_lifecycle_has_one_public_done() {
+    let mut server = spawn_controlled_sse_server(vec![
+        ControlledSseResponse::Immediate(responses_sse_tool_call_body(
+            "workflow__auto_continue",
+            serde_json::json!({ "enabled": true }),
+        )),
+        ControlledSseResponse::Blocked(responses_sse_tool_call_body(
+            "workflow__todos",
+            serde_json::json!({
+                "items": [{
+                    "id": "middle",
+                    "content": "blocked middle iteration",
+                    "status": "blocked"
+                }]
+            }),
+        )),
+        ControlledSseResponse::Immediate(responses_sse_tool_call_body(
+            "workflow__auto_continue",
+            serde_json::json!({ "enabled": false }),
+        )),
+        ControlledSseResponse::Immediate(responses_sse_body("prompt completed")),
+    ])
+    .await;
+    let (sessions_dir, transcript) = test_transcript("auto-continue-lifecycle", Vec::new());
+    let agent = integration_agent_with_tools(server.base_url.clone(), 32_000, true);
+    let mut harness = start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+    harness
+        .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+            "auto-continue-lifecycle",
+            crate::user_content::UserMessageContent::new("complete the task", Vec::new()),
+        )))
+        .expect("session executor accepts lifecycle prompt");
+    server.expect_request(0).await;
+    server.expect_request(1).await;
+
+    tokio::task::yield_now().await;
+    let mut events = Vec::new();
+    while let Ok(event) = harness.event_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SessionTransportEvent::Done)),
+        "runner-internal completion must not become public Done: {events:?}"
+    );
+
+    let blocked_deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    while std::time::Instant::now() < blocked_deadline {
+        let remaining = blocked_deadline.saturating_duration_since(std::time::Instant::now());
+        match timeout(remaining, harness.event_rx.recv()).await {
+            Ok(Some(event)) => {
+                assert!(
+                    !matches!(event, SessionTransportEvent::Done),
+                    "public Done appeared while the middle provider iteration was blocked"
+                );
+                events.push(event);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    let midpoint_runtime = project_terminal_runtime(&events);
+    assert!(midpoint_runtime.session_turn_active);
+    assert_eq!(midpoint_runtime.state().phase, AppPhase::Running);
+
+    server.release.notify_one();
+    events.extend(session_transport_events_until_terminal(&mut harness).await);
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionTransportEvent::Done))
+            .count(),
+        1,
+        "the prompt must expose exactly one public Done: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionTransportEvent::AutoContinueChanged(_)))
+    );
+
+    let final_runtime = project_terminal_runtime(&events);
+    assert!(!final_runtime.session_turn_active);
+    assert_eq!(final_runtime.state().phase, AppPhase::Completed);
+
+    let _ = finish_session_executor_harness(harness).await;
+    server.finish().await;
 }
 
 #[tokio::test]
@@ -4508,6 +5129,236 @@ async fn completed_operation_forwards_queued_events_before_done() {
         Some(SessionTransportEvent::Done)
     ));
     assert!(session_rx.try_recv().is_err());
+}
+
+#[test]
+fn deferred_settings_use_last_write_wins_per_category() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetModel("first".into()),
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Safe),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetExpertModel {
+            agent_name: "explorer".into(),
+            model_id: "explorer-first".into(),
+        },
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetExpertModel {
+            agent_name: "reviewer".into(),
+            model_id: "reviewer-only".into(),
+        },
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetExpertModel {
+            agent_name: "explorer".into(),
+            model_id: "explorer-last".into(),
+        },
+    );
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Safe
+        ))
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetExpertModel { agent_name, model_id })
+            if agent_name == "reviewer" && model_id == "reviewer-only"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetExpertModel { agent_name, model_id })
+            if agent_name == "explorer" && model_id == "explorer-last"
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn last_write_wins_does_not_cross_relative_command_barriers() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetModel("first".into()),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "first"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn last_write_wins_does_not_cross_prompt_barriers() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetModel("first".into()),
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::Prompt(UserMessageSubmission::new(
+            "prompt",
+            crate::user_content::UserMessageContent::from("prompt"),
+        )),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "first"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::Prompt(prompt)) if prompt.id == "prompt"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn reasoning_last_write_wins_does_not_cross_toggle_barriers() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetReasoningEffort(crate::request_builder::ModelReasoningEffort::Low),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetReasoningEffort(
+            crate::request_builder::ModelReasoningEffort::High,
+        ),
+    );
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetReasoningEffort(
+            crate::request_builder::ModelReasoningEffort::Low
+        ))
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetReasoningEffort(
+            crate::request_builder::ModelReasoningEffort::High
+        ))
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn deferred_toggles_retain_each_operation() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::ToggleMcpServer("docs".into()),
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::ToggleMcpServer("docs".into()),
+    );
+
+    assert_eq!(commands.len(), 4);
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleMcpServer(server)) if server == "docs"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleMcpServer(server)) if server == "docs"
+    ));
+}
+
+#[test]
+fn parked_commands_stay_before_later_deferred_commands() {
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let mut parked_commands = VecDeque::new();
+    let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetPermissionMode(
+        crate::permission::PermissionMode::Auto,
+    )]);
+
+    park_active_turn_command(
+        &mut parked_commands,
+        SessionEngineCommand::SetModel("earlier".into()),
+        &session_tx,
+    );
+    flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "earlier"
+    ));
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Auto
+        ))
+    ));
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::Notice(notice))
+            if notice.message == "Change queued for after the current turn"
+    ));
+}
+
+#[test]
+fn active_turn_reject_is_not_parked_by_engine() {
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let mut parked_commands = VecDeque::new();
+
+    crate::session::engine::handle_active_turn_command(
+        SessionEngineCommand::NewSession,
+        &mut parked_commands,
+        &session_tx,
+    );
+
+    assert!(parked_commands.is_empty());
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::Notice(notice)) if notice.message == "Turn still running"
+    ));
 }
 
 #[tokio::test]

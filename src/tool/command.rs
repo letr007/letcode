@@ -54,9 +54,11 @@ impl ToolHandler for RunCommandTool {
         args: Value,
         _context: ToolExecutionContext,
         emit: ToolOutputEmitter<'_>,
-    ) -> Result<Value> {
+    ) -> Result<super::ToolResult> {
         let command = required_string(&args, "command")?;
-        run_workspace_shell_command_streaming(command, COMMAND_TIMEOUT_SECS, emit).await
+        run_workspace_shell_command_streaming(command, COMMAND_TIMEOUT_SECS, emit)
+            .await
+            .map(|data| super::ToolResult::ok(self.name(), data))
     }
 }
 

@@ -23,6 +23,7 @@ pub enum TimelineItem {
     Tool(ToolView),
     Todo(TodoView),
     Permission(PermissionView),
+    AutoReviewAggregate(AutoReviewAggregateView),
     Error(ErrorView),
     /// Durable compaction block: drawn rules + markdown summary (streaming or final).
     Compaction(CompactionView),
@@ -145,6 +146,23 @@ impl TimelineItem {
 
                 blocks
             }
+            Self::AutoReviewAggregate(aggregate) => vec![DisplayBlock::StatusLine {
+                label: "auto-review".into(),
+                text: format!(
+                    "{} decisions · {} approved · {} denied",
+                    aggregate.decisions.len(),
+                    aggregate
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.allowed)
+                        .count(),
+                    aggregate
+                        .decisions
+                        .iter()
+                        .filter(|decision| !decision.allowed)
+                        .count(),
+                ),
+            }],
             Self::Error(error) => {
                 let mut blocks = vec![DisplayBlock::StatusLine {
                     label: "error".into(),
@@ -346,6 +364,22 @@ fn append_streaming_tool_output(
         })
         .to_string(),
     );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReviewDecisionView {
+    pub call_id: String,
+    pub tool_name: String,
+    pub approval: String,
+    pub risk: Option<String>,
+    pub rationale: String,
+    pub allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReviewAggregateView {
+    pub reviewer_child_session_id: String,
+    pub decisions: Vec<AutoReviewDecisionView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -983,6 +1017,27 @@ impl Timeline {
     }
 
     pub fn resolve_permission(&mut self, event: PermissionResolutionEvent) {
+        if event.origin_label.as_deref() == Some("reviewer") {
+            self.push_auto_review_decision(
+                event
+                    .reviewer_child_session_id
+                    .filter(|session_id| !session_id.is_empty())
+                    .unwrap_or_else(|| "reviewer".into()),
+                AutoReviewDecisionView {
+                    call_id: event.call_id,
+                    tool_name: event.tool_name.unwrap_or_else(|| "unknown tool".into()),
+                    approval: event.approval.unwrap_or_else(|| match event.decision {
+                        PermissionDecision::Approved => "once".into(),
+                        PermissionDecision::Denied => "deny".into(),
+                    }),
+                    risk: event.risk,
+                    rationale: event.reason.unwrap_or_else(|| "no rationale".into()),
+                    allowed: matches!(event.decision, PermissionDecision::Approved),
+                },
+            );
+            return;
+        }
+
         if let Some(index) = self.find_permission_index(&event.call_id) {
             if let TimelineItem::Permission(permission) = &mut self.items[index] {
                 permission.status = match event.decision {
@@ -1014,6 +1069,56 @@ impl Timeline {
         }));
     }
 
+    pub(crate) fn push_auto_review_decision(
+        &mut self,
+        reviewer_child_session_id: String,
+        decision: AutoReviewDecisionView,
+    ) {
+        let mut index = self.items.iter().position(|item| {
+            matches!(
+                item,
+                TimelineItem::AutoReviewAggregate(aggregate)
+                    if aggregate.reviewer_child_session_id == reviewer_child_session_id
+            )
+        });
+        if index.is_none()
+            && reviewer_child_session_id != "reviewer"
+            && let Some(legacy_index) = self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    TimelineItem::AutoReviewAggregate(aggregate)
+                        if aggregate.reviewer_child_session_id == "reviewer"
+                )
+            })
+        {
+            if let TimelineItem::AutoReviewAggregate(aggregate) = &mut self.items[legacy_index] {
+                aggregate.reviewer_child_session_id = reviewer_child_session_id.clone();
+            }
+            index = Some(legacy_index);
+        }
+
+        if let Some(index) = index {
+            if let TimelineItem::AutoReviewAggregate(aggregate) = &mut self.items[index] {
+                if let Some(existing) = aggregate
+                    .decisions
+                    .iter_mut()
+                    .find(|existing| existing.call_id == decision.call_id)
+                {
+                    *existing = decision;
+                } else {
+                    aggregate.decisions.push(decision);
+                }
+            }
+            self.bump_revision(index);
+            return;
+        }
+
+        self.push_item(TimelineItem::AutoReviewAggregate(AutoReviewAggregateView {
+            reviewer_child_session_id,
+            decisions: vec![decision],
+        }));
+    }
+
     pub(crate) fn push_restored_permission_decision(
         &mut self,
         call_id: String,
@@ -1023,7 +1128,31 @@ impl Timeline {
         status: PermissionPromptStatus,
         resolution_reason: Option<String>,
         origin_label: Option<String>,
+        approval: Option<String>,
+        risk: Option<String>,
+        reviewer_child_session_id: Option<String>,
     ) {
+        if origin_label.as_deref() == Some("reviewer") {
+            self.push_auto_review_decision(
+                reviewer_child_session_id
+                    .filter(|session_id| !session_id.is_empty())
+                    .unwrap_or_else(|| "reviewer".into()),
+                AutoReviewDecisionView {
+                    call_id,
+                    tool_name,
+                    approval: approval.unwrap_or_else(|| match status {
+                        PermissionPromptStatus::Approved => "once".into(),
+                        PermissionPromptStatus::Denied => "deny".into(),
+                        PermissionPromptStatus::Pending => "pending".into(),
+                    }),
+                    risk,
+                    rationale: resolution_reason.unwrap_or_else(|| "no rationale".into()),
+                    allowed: status == PermissionPromptStatus::Approved,
+                },
+            );
+            return;
+        }
+
         self.push_item(TimelineItem::Permission(PermissionView {
             call_id,
             tool_name,
@@ -1513,6 +1642,92 @@ mod tests {
             }
             other => panic!("expected permission item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reviewer_permission_resolutions_group_by_child_session() {
+        let mut timeline = Timeline::new();
+        for (call_id, child_id, decision, approval) in [
+            ("call-1", "reviewer-a", PermissionDecision::Approved, "once"),
+            ("call-2", "reviewer-a", PermissionDecision::Denied, "deny"),
+            (
+                "call-3",
+                "reviewer-b",
+                PermissionDecision::Approved,
+                "always",
+            ),
+        ] {
+            timeline.resolve_permission(PermissionResolutionEvent {
+                call_id: call_id.into(),
+                decision,
+                reason: Some(format!("reason-{call_id}")),
+                tool_name: Some("shell__exec".into()),
+                summary: Some("run command".into()),
+                origin_label: Some("reviewer".into()),
+                approval: Some(approval.into()),
+                risk: Some("low".into()),
+                reviewer_child_session_id: Some(child_id.into()),
+            });
+        }
+
+        assert_eq!(timeline.items().len(), 2);
+        let TimelineItem::AutoReviewAggregate(first) = &timeline.items()[0] else {
+            panic!("expected first auto-review aggregate");
+        };
+        assert_eq!(first.reviewer_child_session_id, "reviewer-a");
+        assert_eq!(first.decisions.len(), 2);
+        assert_eq!(first.decisions[0].approval, "once");
+        assert!(!first.decisions[1].allowed);
+
+        timeline.resolve_permission(PermissionResolutionEvent {
+            call_id: "call-1".into(),
+            decision: PermissionDecision::Denied,
+            reason: Some("updated reason".into()),
+            tool_name: Some("fs__write".into()),
+            summary: Some("write file".into()),
+            origin_label: Some("reviewer".into()),
+            approval: Some("deny".into()),
+            risk: Some("high".into()),
+            reviewer_child_session_id: Some("reviewer-a".into()),
+        });
+        let TimelineItem::AutoReviewAggregate(first) = &timeline.items()[0] else {
+            panic!("expected updated auto-review aggregate");
+        };
+        assert_eq!(first.decisions.len(), 2);
+        assert_eq!(first.decisions[0].approval, "deny");
+        assert_eq!(first.decisions[0].rationale, "updated reason");
+        assert!(!first.decisions[0].allowed);
+
+        let TimelineItem::AutoReviewAggregate(second) = &timeline.items()[1] else {
+            panic!("expected second auto-review aggregate");
+        };
+        assert_eq!(second.reviewer_child_session_id, "reviewer-b");
+        assert_eq!(second.decisions.len(), 1);
+    }
+
+    #[test]
+    fn reviewer_permission_resolutions_adopt_child_id_after_initial_failure() {
+        let mut timeline = Timeline::new();
+        for (call_id, child_id) in [("call-failed", None), ("call-next", Some("reviewer-a"))] {
+            timeline.resolve_permission(PermissionResolutionEvent {
+                call_id: call_id.into(),
+                decision: PermissionDecision::Denied,
+                reason: Some("blocked".into()),
+                tool_name: Some("shell__exec".into()),
+                summary: Some("run command".into()),
+                origin_label: Some("reviewer".into()),
+                approval: Some("deny".into()),
+                risk: Some("high".into()),
+                reviewer_child_session_id: child_id.map(str::to_string),
+            });
+        }
+
+        assert_eq!(timeline.items().len(), 1);
+        let TimelineItem::AutoReviewAggregate(aggregate) = &timeline.items()[0] else {
+            panic!("expected migrated auto-review aggregate");
+        };
+        assert_eq!(aggregate.reviewer_child_session_id, "reviewer-a");
+        assert_eq!(aggregate.decisions.len(), 2);
     }
 
     #[test]

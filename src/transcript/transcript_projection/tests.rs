@@ -1141,7 +1141,7 @@ fn legacy_cancelled_tool_call_restores_as_terminal_output() {
 
     let mut restored = restore_session_history_projection(&records);
     assert!(
-        matches!(restored.last(), Some(HistoryItem::ToolOutput { call_id, output_json })
+        matches!(restored.last(), Some(HistoryItem::ToolOutput { call_id, output_json, .. })
         if call_id == "call-1" && output_json == r#"{"status":"cancelled","summary":"user cancelled"}"#)
     );
     restored.push(HistoryItem::user("new prompt"));

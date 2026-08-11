@@ -16,6 +16,18 @@ pub struct UserImageAttachment {
 }
 
 impl UserImageAttachment {
+    pub fn from_bytes(label: impl Into<String>, mime: impl Into<String>, bytes: &[u8]) -> Self {
+        let label = label.into();
+        let mime = mime.into();
+        let data_url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
+        Self {
+            id: format!("image-{}", stable_hash64(&data_url)),
+            label,
+            mime,
+            data_url,
+        }
+    }
+
     pub fn placeholder_summary(&self) -> String {
         format!("[Image: {}]", self.label)
     }
@@ -328,6 +340,18 @@ mod tests {
             mime: "image/png".into(),
             data_url: "data:image/png;base64,AAAA".into(),
         }
+    }
+
+    #[test]
+    fn image_attachment_from_bytes_builds_stable_data_url_descriptor() {
+        let first = UserImageAttachment::from_bytes("pixel.png", "image/png", b"bytes");
+        let second = UserImageAttachment::from_bytes("pixel.png", "image/png", b"bytes");
+
+        assert_eq!(first, second);
+        assert_eq!(first.label, "pixel.png");
+        assert_eq!(first.mime, "image/png");
+        assert!(first.id.starts_with("image-"));
+        assert_eq!(first.data_url, "data:image/png;base64,Ynl0ZXM=");
     }
 
     #[test]

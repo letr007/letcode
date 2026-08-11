@@ -253,6 +253,24 @@ fn journal_io_failures_poison_recorder_without_advancing_sequence() {
 }
 
 #[test]
+fn expert_model_changes_require_durable_commit() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut recorder = recorder_with_sink(FailingSink {
+        fail: FailPoint::Sync,
+        calls: Arc::clone(&calls),
+    });
+
+    assert!(
+        recorder
+            .record_expert_model_changed("explorer", "provider/model")
+            .is_err()
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["write", "flush", "sync"]);
+    assert_eq!(recorder.health, RecorderHealth::Poisoned);
+    assert_eq!(recorder.sequence, 0);
+}
+
+#[test]
 fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() {
     let base_dir = journal_test_dir("transaction-tail");
     let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
@@ -562,6 +580,7 @@ fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancell
         Some(HistoryItem::ToolOutput {
             call_id,
             output_json,
+            ..
         }) if call_id == "call-1"
             && output_json == r#"{"status":"cancelled","summary":"user cancelled"}"#
     ));
@@ -850,6 +869,58 @@ fn restore_session_history_closes_dangling_user_turn_on_interrupt() {
     assert!(matches!(messages[0].role, ConversationRole::User));
     assert!(matches!(messages[1].role, ConversationRole::Assistant));
     assert!(messages[1].content.is_empty());
+}
+
+#[test]
+fn restore_session_history_preserves_multimodal_tool_output_images() {
+    let image = crate::user_content::UserImageAttachment::from_bytes(
+        "pixel.png",
+        "image/png",
+        b"image-bytes",
+    );
+    let output = ToolResult::ok(
+        "fs__read",
+        json!({"path": "pixel.png", "kind": "image", "mime": "image/png"}),
+    )
+    .with_images(vec![image.clone()]);
+    let records = vec![
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::ToolCallStarted {
+                call_id: "call-image".into(),
+                name: "fs__read".into(),
+                args: json!({"path": "pixel.png", "offset": 1, "limit": 10}),
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 2,
+            timestamp_ms: 1,
+            context_branch_id: None,
+            event: TranscriptEvent::ToolCallFinished {
+                call_id: "call-image".into(),
+                name: "fs__read".into(),
+                ok: true,
+                output,
+            },
+        },
+    ];
+
+    let history = restore_session_history(&records).expect("restore image tool output");
+    let HistoryItem::ToolOutput {
+        output_json,
+        images,
+        ..
+    } = &history[1]
+    else {
+        panic!("expected restored tool output");
+    };
+    assert_eq!(images, &[image]);
+    assert!(!output_json.contains("data:image/png;base64,"));
+    assert!(!output_json.contains("\"images\""));
 }
 
 #[test]
@@ -2001,6 +2072,7 @@ mod compaction_legacy_schema_tests {
                     ok: true,
                     tool: "read".into(),
                     data: Some(serde_json::json!("ok")),
+                    images: Vec::new(),
                     error: None,
                 },
             })
@@ -2096,4 +2168,122 @@ mod compaction_legacy_schema_tests {
                 if text == "legacy summary" && reply == "reply"
         ));
     }
+}
+
+#[test]
+fn expert_model_changes_restore_latest_route_per_agent() {
+    let records = vec![
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::ExpertModelChanged {
+                agent_name: "explorer".into(),
+                model: "p/first".into(),
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 2,
+            timestamp_ms: 1,
+            context_branch_id: None,
+            event: TranscriptEvent::ExpertModelChanged {
+                agent_name: "reviewer".into(),
+                model: "p/reviewer".into(),
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 3,
+            timestamp_ms: 2,
+            context_branch_id: None,
+            event: TranscriptEvent::ExpertModelChanged {
+                agent_name: "explorer".into(),
+                model: "p/latest".into(),
+            },
+        },
+    ];
+
+    let restored = restore_latest_expert_models(&records);
+    assert_eq!(
+        restored.get("explorer").map(String::as_str),
+        Some("p/latest")
+    );
+    assert_eq!(
+        restored.get("reviewer").map(String::as_str),
+        Some("p/reviewer")
+    );
+}
+
+#[test]
+fn expert_model_restore_for_cursor_ignores_sibling_branch_updates() {
+    let records = vec![
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::ExpertModelChanged {
+                agent_name: "explorer".into(),
+                model: "p/root".into(),
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 2,
+            timestamp_ms: 1,
+            context_branch_id: None,
+            event: TranscriptEvent::ContextBranchCreated {
+                branch_id: "left".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 3,
+            timestamp_ms: 2,
+            context_branch_id: Some("left".into()),
+            event: TranscriptEvent::ExpertModelChanged {
+                agent_name: "explorer".into(),
+                model: "p/left".into(),
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 4,
+            timestamp_ms: 3,
+            context_branch_id: None,
+            event: TranscriptEvent::ContextBranchCreated {
+                branch_id: "right".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 5,
+            timestamp_ms: 4,
+            context_branch_id: Some("right".into()),
+            event: TranscriptEvent::ExpertModelChanged {
+                agent_name: "explorer".into(),
+                model: "p/right".into(),
+            },
+        },
+    ];
+
+    let restored = restore_latest_expert_models_for_cursor(
+        "s",
+        &records,
+        SessionContextCursor {
+            branch_id: Some("left".into()),
+            leaf_sequence: None,
+        },
+    )
+    .expect("left branch projection");
+
+    assert_eq!(restored.get("explorer").map(String::as_str), Some("p/left"));
 }

@@ -123,45 +123,29 @@ pub fn prepare_new_session_package(
     }
 }
 
-/// Restore empty runtime + context-scope onto the agent (no live swap).
-pub(crate) fn apply_prepared_new_session_to_agent<C: Config>(
-    agent: &mut Agent<C>,
-    prepared: &PreparedNewSession,
-) -> Result<()> {
-    agent.restore_new_session_runtime_snapshot(
-        prepared.snapshot.protocol_frames.clone(),
-        prepared.snapshot.snapshot.clone(),
-        prepared.snapshot.max_turn_id,
-    )?;
-    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
-    apply_prepared_context_scope(agent, prepared_scope);
-    Ok(())
-}
-
-/// Apply prepared new-session state, swap the live recorder, then clean a prior empty file.
-///
-/// Build `session_started_event` from `prepared` before this call (recorder is moved).
+/// Install a prepared new session and clean a prior empty file.
+/// All fallible agent preparation completes before the recorder swap.
 pub fn install_prepared_new_session_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedNewSession,
 ) -> Result<()> {
-    apply_prepared_new_session_to_agent(agent, &prepared)?;
+    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
+    let (protocol_frames, runtime_snapshot) = agent.validate_runtime_snapshot_restore(
+        prepared.snapshot.protocol_frames,
+        prepared.snapshot.snapshot,
+    )?;
+    agent.prepare_new_session_permission_reset()?;
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)?;
+    agent.install_new_session_runtime_snapshot(
+        protocol_frames,
+        runtime_snapshot,
+        prepared.snapshot.max_turn_id,
+    );
+    apply_prepared_context_scope(agent, prepared_scope);
     let _ = cleanup_replaced_empty_session(old_path, &new_path);
     Ok(())
-}
-
-/// Build the session transport event emitted after a successful new-session install.
-pub(crate) fn session_started_event(
-    prepared: &PreparedNewSession,
-) -> crate::session::runner::SessionTransportEvent {
-    crate::session::runner::SessionTransportEvent::SessionStarted {
-        session_id: prepared.session_id.clone(),
-        records: prepared.snapshot.records.clone(),
-        runtime_context: prepared.runtime_context.clone(),
-    }
 }
 
 /// Line-CLI new session: prepare package, install onto agent/live recorder.

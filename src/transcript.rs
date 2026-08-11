@@ -414,6 +414,17 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_expert_model_changed(
+        &mut self,
+        agent_name: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ExpertModelChanged {
+            agent_name: agent_name.into(),
+            model: model.into(),
+        })
+    }
+
     pub fn record_model_changed(
         &mut self,
         previous_model: impl Into<String>,
@@ -518,7 +529,42 @@ impl TranscriptRecorder {
         operation: HistoryNavigationOperation,
         redo_stack: Vec<u64>,
     ) -> Result<()> {
-        self.append_transaction(vec![
+        let events = Self::history_navigation_events(
+            branch_id,
+            parent_branch_id,
+            target_sequence,
+            operation,
+            redo_stack,
+        );
+        self.append_transaction(events)
+    }
+
+    pub(crate) fn preflight_history_navigation_transaction(
+        &self,
+        branch_id: String,
+        parent_branch_id: String,
+        target_sequence: u64,
+        operation: HistoryNavigationOperation,
+        redo_stack: Vec<u64>,
+    ) -> Result<()> {
+        let events = Self::history_navigation_events(
+            branch_id,
+            parent_branch_id,
+            target_sequence,
+            operation,
+            redo_stack,
+        );
+        self.prepare_transaction_buffer(&events).map(|_| ())
+    }
+
+    fn history_navigation_events(
+        branch_id: String,
+        parent_branch_id: String,
+        target_sequence: u64,
+        operation: HistoryNavigationOperation,
+        redo_stack: Vec<u64>,
+    ) -> Vec<(TranscriptEvent, Option<String>)> {
+        vec![
             (
                 TranscriptEvent::ContextBranchCreated {
                     branch_id: branch_id.clone(),
@@ -544,7 +590,7 @@ impl TranscriptRecorder {
                 },
                 None,
             ),
-        ])
+        ]
     }
 
     #[cfg(test)]
@@ -1426,10 +1472,10 @@ impl TranscriptRecorder {
         Ok(())
     }
 
-    pub fn append_transaction(
-        &mut self,
-        events: Vec<(TranscriptEvent, Option<String>)>,
-    ) -> Result<()> {
+    fn prepare_transaction_buffer(
+        &self,
+        events: &[(TranscriptEvent, Option<String>)],
+    ) -> Result<(Vec<u8>, Vec<TranscriptRecord>, u64)> {
         ensure!(
             self.health == RecorderHealth::Healthy,
             "transcript recorder is poisoned after a previous I/O failure"
@@ -1454,7 +1500,7 @@ impl TranscriptRecorder {
         let timestamp_ms = unix_timestamp_ms();
         let mut payload = Vec::new();
         let mut index_records = Vec::with_capacity(count);
-        for (index, (event, context_branch_id)) in events.into_iter().enumerate() {
+        for (index, (event, context_branch_id)) in events.iter().cloned().enumerate() {
             let sequence = base_revision + u64::try_from(index).unwrap() + 1;
             let record = TranscriptRecord {
                 session_id: self.session_id.clone(),
@@ -1491,6 +1537,15 @@ impl TranscriptRecorder {
         let mut buffer = payload;
         serde_json::to_writer(&mut buffer, &commit)?;
         buffer.push(b'\n');
+        Ok((buffer, index_records, resulting_revision))
+    }
+
+    pub fn append_transaction(
+        &mut self,
+        events: Vec<(TranscriptEvent, Option<String>)>,
+    ) -> Result<()> {
+        let (buffer, index_records, resulting_revision) =
+            self.prepare_transaction_buffer(&events)?;
         if let Err(error) = self.sink.write_all(&buffer) {
             self.health = RecorderHealth::Poisoned;
             return Err(error.into());
@@ -2365,6 +2420,32 @@ pub fn restore_latest_model(records: &[TranscriptRecord]) -> Option<String> {
     transcript_projection::restore_latest_model_projection(records)
 }
 
+pub fn restore_latest_expert_models(
+    records: &[TranscriptRecord],
+) -> indexmap::IndexMap<String, String> {
+    let mut models = indexmap::IndexMap::new();
+    for record in records {
+        if let TranscriptEvent::ExpertModelChanged { agent_name, model } = &record.event {
+            models.insert(agent_name.clone(), model.clone());
+        }
+    }
+    models
+}
+
+#[cfg(test)]
+pub(crate) fn restore_latest_expert_models_for_cursor(
+    session_id: &str,
+    records: &[TranscriptRecord],
+    cursor: transcript_projection::SessionContextCursor,
+) -> anyhow::Result<indexmap::IndexMap<String, String>> {
+    let snapshot = transcript_projection::build_session_context_snapshot(
+        session_id.to_string(),
+        records.to_vec(),
+        cursor,
+    )?;
+    Ok(restore_latest_expert_models(&snapshot.records))
+}
+
 pub fn restore_latest_permission_mode(records: &[TranscriptRecord]) -> Option<String> {
     transcript_projection::restore_latest_permission_mode_projection(records)
 }
@@ -2490,6 +2571,7 @@ fn requires_durable_commit(event: &TranscriptEvent) -> bool {
         event,
         TranscriptEvent::SessionStarted { .. }
             | TranscriptEvent::ModelChanged { .. }
+            | TranscriptEvent::ExpertModelChanged { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::SubagentResult { .. }
             | TranscriptEvent::ContextBranchCreated { .. }
@@ -2662,7 +2744,9 @@ fn append_history_item_from_transcript_record(record: &TranscriptRecord) -> Opti
             call_id, output, ..
         } => Some(HistoryItem::ToolOutput {
             call_id: call_id.clone(),
-            output_json: serde_json::to_string(output).unwrap_or_else(|_| "null".to_string()),
+            output_json: serde_json::to_string(&output.for_text_history())
+                .unwrap_or_else(|_| "null".to_string()),
+            images: output.images.clone(),
         }),
         TranscriptEvent::ToolCallCancelled { .. } => None,
         TranscriptEvent::ContextExperimentReturned {

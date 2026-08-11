@@ -23,7 +23,7 @@ impl ToolHandler for WorkflowTodosTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update the agent's current todo list for this turn."
+        "Replace the agent's current todo list with a full snapshot. One snapshot may update multiple items, and multiple items may be in_progress."
     }
 
     fn parameters(&self) -> Value {
@@ -55,7 +55,7 @@ impl ToolHandler for WorkflowTodosTool {
                         "required": ["id", "content", "status"],
                         "additionalProperties": false
                     },
-                    "description": "Current turn todo list snapshot"
+                    "description": "Full current-turn todo list snapshot; one snapshot may update multiple items, including multiple items with status in_progress"
                 }
             },
             "required": ["items"],
@@ -112,7 +112,6 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
     }
 
     let mut seen_ids = BTreeSet::new();
-    let mut in_progress_count = 0;
 
     for (index, item) in items.iter().enumerate() {
         let mut id_value = None;
@@ -144,13 +143,6 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
             bail!("workflow__todos item {index} has duplicate id '{id}'");
         }
 
-        if item.get("status").and_then(Value::as_str) == Some("in_progress") {
-            in_progress_count += 1;
-            if in_progress_count > 1 {
-                bail!("workflow__todos allows at most one item with status 'in_progress'");
-            }
-        }
-
         match item.get("status").and_then(Value::as_str) {
             Some("pending" | "in_progress" | "blocked" | "completed" | "cancelled") => {}
             Some(status) => {
@@ -161,6 +153,37 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_workflow_todos;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_multiple_simultaneous_status_changes_in_one_snapshot() {
+        let snapshot = json!({
+            "items": [
+                {"id": "investigate", "content": "Investigate issue", "status": "completed"},
+                {"id": "implement", "content": "Implement fix", "status": "in_progress"},
+                {"id": "validate", "content": "Validate fix", "status": "pending"}
+            ]
+        });
+
+        assert!(validate_workflow_todos(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn accepts_multiple_in_progress_items() {
+        let snapshot = json!({
+            "items": [
+                {"id": "implement", "content": "Implement fix", "status": "in_progress"},
+                {"id": "review", "content": "Review fix", "status": "in_progress"}
+            ]
+        });
+
+        assert!(validate_workflow_todos(&snapshot).is_ok());
+    }
 }
 
 fn validate_workflow_auto_continue(args: &Value) -> Result<()> {

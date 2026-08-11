@@ -2937,6 +2937,57 @@ mod tests {
         assert_eq!(call.arguments, "{\"value\":1}");
     }
 
+    fn response_output_item_added_function_call(item: Value) -> Value {
+        json!({
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": item,
+        })
+    }
+
+    #[test]
+    fn output_item_added_function_call_descriptor_deserializes_strictly() {
+        let complete = response_output_item_added_function_call(json!({
+            "type": "function_call",
+            "id": "fc_test",
+            "call_id": "call_test",
+            "name": "test_function",
+            "arguments": "{}",
+            "status": "in_progress",
+        }));
+        let Some(ResponseStreamEvent::ResponseOutputItemAdded(event)) =
+            project_response_stream_event(&complete)
+                .expect("complete descriptor should deserialize")
+        else {
+            panic!("expected output_item.added event")
+        };
+        let async_openai::types::responses::OutputItem::FunctionCall(call) = event.item else {
+            panic!("expected function_call output item")
+        };
+        assert_eq!(call.call_id, "call_test");
+        assert_eq!(call.name, "test_function");
+
+        for incomplete in ["call_id", "name"] {
+            let mut item = json!({
+                "type": "function_call",
+                "id": "fc_test",
+                "call_id": "call_test",
+                "name": "test_function",
+                "arguments": "{}",
+                "status": "in_progress",
+            });
+            item.as_object_mut()
+                .expect("function_call item is an object")
+                .remove(incomplete);
+            let event = response_output_item_added_function_call(item);
+            assert!(
+                project_response_stream_event(&event).is_err(),
+                "missing {incomplete} must fail strict deserialization"
+            );
+        }
+    }
+
     struct Group16Tool;
 
     #[async_trait::async_trait]

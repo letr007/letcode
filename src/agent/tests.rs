@@ -234,10 +234,12 @@ fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
         HistoryItem::ToolOutput {
             call_id: "call-1".into(),
             output_json: r#"{"value":1}"#.into(),
+            images: Vec::new(),
         },
         HistoryItem::ToolOutput {
             call_id: "call-2".into(),
             output_json: r#"{"value":2}"#.into(),
+            images: Vec::new(),
         },
     ]
 }
@@ -341,6 +343,7 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
         HistoryItem::ToolOutput {
             call_id: "orphan".into(),
             output_json: "{}".into(),
+            images: Vec::new(),
         },
     ] {
         let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
@@ -706,6 +709,43 @@ fn chat_tool_batch_sse(name: &str, call_id: &str, arguments: String) -> &'static
     sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
 }
 
+fn chat_tool_call_fragment_sse() -> &'static str {
+    let first = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "same delta",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": "{"}
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let second = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-8",
+                    "type": "function",
+                    "function": {"name": "workflow__todos", "arguments": "\\\"items\\\":[]}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let first = serde_json::to_string(&first).expect("first response serializes");
+    let second = serde_json::to_string(&second).expect("second response serializes");
+    sse_response(format!(
+        "data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n"
+    ))
+}
+
 fn responses_terminal_sse(
     event_type: &str,
     status: &str,
@@ -880,6 +920,70 @@ async fn chat_tool_calls_round_trip_reasoning_content_in_follow_up_request() {
         .expect("chat stream completes");
 
     assert_eq!(result, "done");
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn chat_tool_call_pending_waits_for_complete_descriptor_and_follows_text_delta() {
+    #[derive(Debug, PartialEq, Eq)]
+    enum Observation {
+        Text(String),
+        ToolCallPending { call_id: String, name: String },
+    }
+
+    let (base_url, _, server) =
+        spawn_chat_completion_server(vec![chat_tool_call_fragment_sse(), chat_final_sse("done")])
+            .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 2, 1);
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let delta_observations = observations.clone();
+    let event_observations = observations.clone();
+
+    let result = agent
+        .run_oai_comp_stream_async(
+            "hello",
+            move |delta| {
+                delta_observations
+                    .lock()
+                    .expect("observation lock")
+                    .push(Observation::Text(delta.to_string()));
+                std::future::ready(Ok(()))
+            },
+            move |event| {
+                if let AgentEvent::ToolCallPending { call_id, name } = event {
+                    event_observations
+                        .lock()
+                        .expect("observation lock")
+                        .push(Observation::ToolCallPending { call_id, name });
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("chat stream completes");
+
+    assert_eq!(result, "same deltadone");
+    let observations = Arc::try_unwrap(observations)
+        .expect("all observation callbacks have completed")
+        .into_inner()
+        .expect("observation lock is not poisoned");
+    assert_eq!(
+        observations,
+        vec![
+            Observation::Text("same delta".into()),
+            Observation::ToolCallPending {
+                call_id: "call-8".into(),
+                name: "workflow__todos".into(),
+            },
+            Observation::Text("done".into()),
+        ]
+    );
     server.await.expect("server task should finish");
 }
 
@@ -2149,6 +2253,7 @@ async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() 
         Some(HistoryItem::ToolOutput {
             call_id,
             output_json,
+            ..
         }) if call_id == "call-agent__explore"
             && output_json.contains("cancelled")
             && output_json.contains("child-session")
@@ -2347,6 +2452,7 @@ fn protocol_frames_remain_authoritative_for_history_cache() {
         .append_history_item(HistoryItem::ToolOutput {
             call_id: "call-fs__read".into(),
             output_json: r#"{"ok":true}"#.into(),
+            images: Vec::new(),
         })
         .expect("tool output append succeeds");
 
@@ -2375,6 +2481,7 @@ fn append_history_item_is_atomic_when_protocol_validation_fails() {
         .append_history_item(HistoryItem::ToolOutput {
             call_id: "call-orphan".into(),
             output_json: "{}".into(),
+            images: Vec::new(),
         })
         .expect_err("orphan tool output must fail");
 
@@ -2824,6 +2931,7 @@ fn render_compaction_tool_output_caps_large_payloads() {
     let rendered = compaction::describe_history_item(&HistoryItem::ToolOutput {
         call_id: "call-big".into(),
         output_json: large_tool_output_json("stdout"),
+        images: Vec::new(),
     });
 
     assert!(rendered.contains(COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER));
@@ -2841,6 +2949,7 @@ fn render_compaction_tool_output_strips_media_like_fields() {
             "stdout": "kept text"
         })
         .to_string(),
+        images: Vec::new(),
     });
 
     assert!(rendered.contains("stripped media/blob-like field"));
@@ -2855,6 +2964,7 @@ fn render_compaction_prompt_applies_total_history_cap() {
         .map(|index| HistoryItem::ToolOutput {
             call_id: format!("call-{index}"),
             output_json: large_tool_output_json("stdout"),
+            images: Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -4427,6 +4537,7 @@ async fn delegation_scope_authorizes_owned_writes_and_denies_outside() {
         owned_paths: vec![owned.to_string_lossy().into()],
         timeout_secs: None,
         max_tool_calls: None,
+        model: None,
         target_child_session_id: None,
     })
     .expect("scope")
@@ -4509,6 +4620,7 @@ async fn delegation_scope_allows_reads_in_allowed_paths_and_forbids_forbidden() 
         owned_paths: Vec::new(),
         timeout_secs: None,
         max_tool_calls: None,
+        model: None,
         target_child_session_id: None,
     })
     .expect("scope")
@@ -4595,6 +4707,7 @@ async fn delegation_scope_apply_patch_requires_all_targets_owned() {
         owned_paths: vec![owned.to_string_lossy().into()],
         timeout_secs: None,
         max_tool_calls: None,
+        model: None,
         target_child_session_id: None,
     })
     .expect("scope")
@@ -4774,6 +4887,7 @@ async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
         owned_paths: vec![owned.to_string_lossy().into()],
         timeout_secs: None,
         max_tool_calls: None,
+        model: None,
         target_child_session_id: None,
     })
     .expect("scope")

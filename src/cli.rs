@@ -65,7 +65,8 @@ enum CommandWait {
     UntilHistoryLoaded,
     UntilSessionResumed,
     UntilSessionStarted,
-    BriefDrain,
+    UntilPermissionModeChanged,
+    UntilReasoningEffortChanged,
 }
 
 pub async fn run_repl(
@@ -97,44 +98,21 @@ pub async fn run_repl(
                     view.permission_mode_label
                 );
             }
-            ReplCommand::PermissionSet(PermissionMode::Safe) => {
-                submit_and_wait(
+            ReplCommand::PermissionSet(
+                mode @ (PermissionMode::Safe | PermissionMode::Default | PermissionMode::Auto),
+            ) => {
+                let outcome = submit_and_wait(
                     &ingress,
                     &mut events,
                     &mut view,
-                    SessionCommand::SetPermissionMode(PermissionMode::Safe),
-                    CommandWait::BriefDrain,
+                    SessionCommand::SetPermissionMode(mode),
+                    CommandWait::UntilPermissionModeChanged,
                     OutputMode::Streaming,
                 )
                 .await?;
-                view.permission_mode_label = PermissionMode::Safe.to_string();
-                println!("permission mode set to safe");
-            }
-            ReplCommand::PermissionSet(PermissionMode::Default) => {
-                submit_and_wait(
-                    &ingress,
-                    &mut events,
-                    &mut view,
-                    SessionCommand::SetPermissionMode(PermissionMode::Default),
-                    CommandWait::BriefDrain,
-                    OutputMode::Streaming,
-                )
-                .await?;
-                view.permission_mode_label = PermissionMode::Default.to_string();
-                println!("permission mode set to default");
-            }
-            ReplCommand::PermissionSet(PermissionMode::Auto) => {
-                submit_and_wait(
-                    &ingress,
-                    &mut events,
-                    &mut view,
-                    SessionCommand::SetPermissionMode(PermissionMode::Auto),
-                    CommandWait::BriefDrain,
-                    OutputMode::Streaming,
-                )
-                .await?;
-                view.permission_mode_label = PermissionMode::Auto.to_string();
-                println!("permission mode set to auto");
+                if outcome.error.is_none() {
+                    println!("permission mode set to {mode}");
+                }
             }
             ReplCommand::PermissionSet(PermissionMode::Yolo) => {
                 print!(
@@ -147,17 +125,18 @@ pub async fn run_repl(
                 let confirm = confirm.trim().to_ascii_lowercase();
 
                 if matches!(confirm.as_str(), "y" | "yes") {
-                    submit_and_wait(
+                    let outcome = submit_and_wait(
                         &ingress,
                         &mut events,
                         &mut view,
                         SessionCommand::SetPermissionMode(PermissionMode::Yolo),
-                        CommandWait::BriefDrain,
+                        CommandWait::UntilPermissionModeChanged,
                         OutputMode::Streaming,
                     )
                     .await?;
-                    view.permission_mode_label = PermissionMode::Yolo.to_string();
-                    println!("permission mode set to yolo");
+                    if outcome.error.is_none() {
+                        println!("permission mode set to yolo");
+                    }
                 } else {
                     println!("YOLO mode not enabled");
                 }
@@ -254,15 +233,13 @@ pub async fn run_repl(
                     &mut events,
                     &mut view,
                     SessionCommand::SetReasoningEffort(effort.clone()),
-                    CommandWait::BriefDrain,
+                    CommandWait::UntilReasoningEffortChanged,
                     OutputMode::Streaming,
                 )
                 .await?;
-                // Engine stays silent on success and emits Notice/Error on rejection.
                 if outcome.error.is_some() || !outcome.notices.is_empty() {
                     continue;
                 }
-                view.reasoning_effort = Some(effort.clone());
                 println!(
                     "reasoning effort set to {}",
                     reasoning_effort_status_label(Some(effort))
@@ -428,30 +405,11 @@ async fn wait_for_command(
     let mut assistant = String::new();
     let mut error = None;
     let mut notices = Vec::new();
-    let mut settled = matches!(wait, CommandWait::BriefDrain);
-    let brief_deadline = Instant::now() + Duration::from_millis(80);
 
     loop {
-        if matches!(wait, CommandWait::BriefDrain) && Instant::now() >= brief_deadline {
-            break;
-        }
-
-        let event = if matches!(wait, CommandWait::BriefDrain) {
-            match tokio::time::timeout(
-                brief_deadline.saturating_duration_since(Instant::now()),
-                events.recv(),
-            )
-            .await
-            {
-                Ok(Some(event)) => event,
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        } else {
-            match events.recv().await {
-                Some(event) => event,
-                None => bail!("session engine event stream closed"),
-            }
+        let event = match events.recv().await {
+            Some(event) => event,
+            None => bail!("session engine event stream closed"),
         };
 
         let marker = present_transport_event(
@@ -466,10 +424,6 @@ async fn wait_for_command(
             &mut notices,
         )?;
 
-        if matches!(wait, CommandWait::BriefDrain) {
-            continue;
-        }
-
         let done = match wait {
             CommandWait::UntilDone => marker.done,
             CommandWait::UntilModelChanged => marker.model_changed || marker.error,
@@ -481,10 +435,14 @@ async fn wait_for_command(
             CommandWait::UntilSessionStarted => {
                 marker.session_started || marker.error || marker.notice
             }
-            CommandWait::BriefDrain => false,
+            CommandWait::UntilPermissionModeChanged => {
+                marker.permission_mode_changed || marker.error
+            }
+            CommandWait::UntilReasoningEffortChanged => {
+                marker.reasoning_effort_changed || marker.error || marker.notice
+            }
         };
         if done {
-            settled = true;
             // Model switch may emit a follow-up missing-key Error after ModelChanged.
             if matches!(wait, CommandWait::UntilModelChanged) && marker.model_changed {
                 drain_brief(
@@ -504,9 +462,6 @@ async fn wait_for_command(
 
     if let Some(spinner) = spinner.take() {
         let _ = spinner.stop();
-    }
-    if !settled && !matches!(wait, CommandWait::BriefDrain) {
-        bail!("session command did not complete");
     }
     Ok(WaitOutcome {
         assistant,
@@ -566,6 +521,8 @@ struct EventMarker {
     history_loaded: bool,
     session_resumed: bool,
     session_started: bool,
+    permission_mode_changed: bool,
+    reasoning_effort_changed: bool,
 }
 
 fn present_transport_event(
@@ -670,6 +627,15 @@ fn present_transport_event(
         SessionTransportEvent::ModelChanged { model_id } => {
             marker.model_changed = true;
             view.model_id = model_id;
+        }
+        SessionTransportEvent::SettingChangeFailed { .. } => {}
+        SessionTransportEvent::PermissionModeChanged { mode } => {
+            marker.permission_mode_changed = true;
+            view.permission_mode_label = mode.clone();
+        }
+        SessionTransportEvent::ReasoningEffortChanged { effort } => {
+            marker.reasoning_effort_changed = true;
+            view.reasoning_effort = Some(effort);
         }
         SessionTransportEvent::SessionHistoryLoaded { entries } => {
             marker.history_loaded = true;
@@ -1246,6 +1212,71 @@ impl ToolSpinner {
 mod tests {
     use super::*;
     use crate::permission::PermissionApproval;
+
+    fn cli_view() -> CliView {
+        CliView {
+            session_id: "session".into(),
+            model_id: "provider/model".into(),
+            model_label: "Model".into(),
+            permission_mode_label: "default".into(),
+            reasoning_effort: None,
+        }
+    }
+
+    fn project_cli_event(view: &mut CliView, event: SessionTransportEvent) -> EventMarker {
+        present_transport_event(
+            event,
+            OutputMode::FinalOnly,
+            false,
+            &mut None,
+            &mut false,
+            view,
+            &mut String::new(),
+            &mut None,
+            &mut Vec::new(),
+        )
+        .expect("event projection")
+    }
+
+    #[test]
+    fn permission_mode_changes_only_on_authoritative_event() {
+        let mut view = cli_view();
+        let marker = project_cli_event(
+            &mut view,
+            SessionTransportEvent::PermissionModeChanged {
+                mode: "safe".into(),
+            },
+        );
+
+        assert!(marker.permission_mode_changed);
+        assert_eq!(view.permission_mode_label, "safe");
+    }
+
+    #[test]
+    fn permission_error_does_not_change_cli_state() {
+        let mut view = cli_view();
+        let marker = project_cli_event(
+            &mut view,
+            SessionTransportEvent::Error(crate::session::ErrorEvent::new("failed")),
+        );
+
+        assert!(marker.error);
+        assert_eq!(view.permission_mode_label, "default");
+    }
+
+    #[test]
+    fn reasoning_effort_changes_only_on_authoritative_event() {
+        let mut view = cli_view();
+        let marker = project_cli_event(
+            &mut view,
+            SessionTransportEvent::ReasoningEffortChanged {
+                effort: ModelReasoningEffort::High,
+            },
+        );
+
+        assert!(marker.reasoning_effort_changed);
+        assert_eq!(view.reasoning_effort, Some(ModelReasoningEffort::High));
+    }
 
     #[test]
     fn terminal_permission_input_parses_once_always_and_denial() {

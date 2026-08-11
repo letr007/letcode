@@ -554,6 +554,7 @@ fn latest_todos_from_history(history: &[HistoryItem]) -> Option<Vec<TodoItem>> {
             HistoryItem::ToolOutput {
                 call_id,
                 output_json,
+                ..
             } => {
                 let Some(items) = pending.remove(call_id) else {
                     continue;
@@ -727,6 +728,7 @@ pub(super) fn describe_history_item(item: &HistoryItem) -> String {
         HistoryItem::ToolOutput {
             call_id,
             output_json,
+            ..
         } => format!(
             "工具输出 {call_id}: {}",
             render_tool_output_for_compaction(output_json)
@@ -1089,6 +1091,7 @@ mod transaction_tests {
             HistoryItem::ToolOutput {
                 call_id: "t1".into(),
                 output_json: r#"{"ok":true,"tool":"workflow__todos","data":{"items":[{"id":"a","content":"one","status":"pending"}]}}"#.into(),
+                images: Vec::new(),
             },
         ];
         let todos = latest_todos_from_history(&history).expect("todos restored");

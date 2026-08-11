@@ -407,6 +407,7 @@ fn normalize_incomplete_tool_call_groups(
                     item: HistoryItem::ToolOutput {
                         call_id: call_id.clone(),
                         output_json: r#"{"status":"cancelled","summary":"user cancelled"}"#.into(),
+                        images: Vec::new(),
                     },
                     source_spans: Vec::new(),
                     turn_id: None,

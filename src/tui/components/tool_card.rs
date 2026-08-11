@@ -213,7 +213,7 @@ pub fn render_tool_card_document(
         return document;
     }
     let lines = if is_subagent_tool(&tool.name) {
-        render_subagent_lines(tool, theme, width, frame)
+        render_subagent_lines(tool, theme, width, frame, expanded_output)
     } else {
         let body = render_tool_body_lines(tool, theme, width, expanded_output);
         if body.is_empty() {
@@ -849,6 +849,7 @@ fn render_subagent_lines(
     theme: Theme,
     width: usize,
     frame: usize,
+    expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     if width == 0 {
         return Vec::new();
@@ -944,7 +945,9 @@ fn render_subagent_lines(
     let text_style = root_text_style(theme);
     let muted = root_muted_style(theme);
     let mut lines = Vec::new();
-    let has_structured_details = structured.is_some();
+    let has_structured_details = structured
+        .as_ref()
+        .is_some_and(structured_subagent_has_details);
     lines.push(render_card_line_with_guide(
         &[
             SemanticSpan::decoration(format!("{status_label}{state_suffix}"), status_style),
@@ -972,77 +975,84 @@ fn render_subagent_lines(
     let Some(structured) = structured else {
         return lines;
     };
+    if !has_structured_details {
+        lines[0].boundary = Break::End;
+        return lines;
+    }
+
+    let activity = subagent_activity_summary(&structured);
+    if !expanded_output {
+        let activity_label = if activity.is_empty() {
+            "details · expand".to_string()
+        } else {
+            format!("{activity} · expand")
+        };
+        lines.push(render_subagent_compact_line(
+            &activity_label,
+            muted,
+            theme,
+            width,
+            Break::End,
+        ));
+        return lines;
+    }
+
+    lines.push(render_subagent_compact_line(
+        "details · collapse",
+        muted,
+        theme,
+        width,
+        Break::HardBreak,
+    ));
 
     let run_id = data
         .as_ref()
         .and_then(|data| data.get("run_id"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or(structured.run_id.as_str());
-    let activity = subagent_activity_summary(&structured);
-    lines.push(render_subagent_metadata_line(
-        run_id,
-        &child_id,
-        &activity,
-        muted,
-        text_style,
-        theme,
-        width,
-        Break::HardBreak,
-    ));
-
-    let detail_values = structured_subagent_detail_values(&structured);
-    let detail_count = detail_values.len();
-    for (index, (label, value)) in detail_values.into_iter().enumerate() {
-        let is_last = index + 1 == detail_count;
-        lines.push(render_subagent_detail_line(
-            label,
-            value,
+    if !run_id.is_empty() {
+        lines.push(render_subagent_compact_line(
+            &format!("run {run_id}"),
             muted,
-            text_style,
             theme,
             width,
-            if is_last {
-                Break::End
-            } else {
-                Break::HardBreak
-            },
+            Break::HardBreak,
         ));
     }
-
-    if lines.len() > 1
-        && lines
-            .last()
-            .is_some_and(|line| line.boundary == Break::HardBreak)
-    {
-        if let Some(last) = lines.last_mut() {
-            last.boundary = Break::End;
-        }
+    render_subagent_wrapped_field(
+        &mut lines,
+        "summary",
+        std::slice::from_ref(&structured.summary),
+        muted,
+        theme,
+        width,
+    );
+    for (label, values) in [
+        ("blocker", &structured.blockers),
+        ("finding", &structured.findings),
+        ("next_step", &structured.next_steps),
+        ("validation", &structured.validation),
+        ("changed", &structured.files_changed),
+        ("read", &structured.files_read),
+        ("command", &structured.commands_run),
+    ] {
+        render_subagent_wrapped_field(&mut lines, label, values, muted, theme, width);
+    }
+    if let Some(last) = lines.last_mut() {
+        last.boundary = Break::End;
     }
     lines
 }
 
-fn render_subagent_metadata_line(
-    run_id: &str,
-    child_id: &str,
-    activity: &str,
+fn render_subagent_compact_line(
+    text: &str,
     muted: Style,
-    text_style: Style,
     theme: Theme,
     width: usize,
     boundary: Break,
 ) -> SemanticLine<Style> {
-    let mut segments = vec![
-        SemanticSpan::decoration("run ", muted),
-        SemanticSpan::source(truncate_display_width(run_id, 16), text_style),
-        SemanticSpan::decoration(" · /child ", muted),
-        SemanticSpan::source(child_id.to_string(), text_style),
-    ];
-    if !activity.is_empty() {
-        segments.push(SemanticSpan::decoration(" · ", muted));
-        segments.push(SemanticSpan::source(activity.to_string(), muted));
-    }
     render_card_line_with_guide(
-        &segments,
+        &[SemanticSpan::decoration(text.to_string(), muted)],
         Style::default().bg(theme.root_bg),
         theme.card_guide(),
         theme,
@@ -1051,26 +1061,57 @@ fn render_subagent_metadata_line(
     )
 }
 
-fn render_subagent_detail_line(
+fn render_subagent_wrapped_field(
+    lines: &mut Vec<SemanticLine<Style>>,
     label: &str,
-    value: String,
+    values: &[String],
     muted: Style,
-    text_style: Style,
     theme: Theme,
     width: usize,
-    boundary: Break,
-) -> SemanticLine<Style> {
-    render_card_line_with_guide(
-        &[
-            SemanticSpan::decoration(format!("{label}: "), muted),
-            SemanticSpan::source(value, text_style),
-        ],
-        Style::default().bg(theme.root_bg),
-        theme.card_guide(),
-        theme,
-        width,
-        boundary,
-    )
+) {
+    let label_text = format!("{label}: ");
+    let label_width = display_width(&label_text);
+    let content_width = width
+        .saturating_sub(display_width(TOOL_GUIDE_GLYPH).saturating_add(2))
+        .max(1);
+    let value_width = content_width.saturating_sub(label_width).max(1);
+    for value in values {
+        let wrapped = wrap_text_to_width(value, value_width);
+        for (index, chunk) in wrapped.into_iter().enumerate() {
+            let prefix = if index == 0 {
+                label_text.clone()
+            } else {
+                " ".repeat(label_width)
+            };
+            let mut segments = vec![SemanticSpan::decoration(prefix, muted)];
+            if !chunk.is_empty() {
+                segments.push(SemanticSpan::source_with_join(
+                    chunk,
+                    muted,
+                    CopyJoin::Space,
+                ));
+            }
+            lines.push(render_card_line_with_guide(
+                &segments,
+                Style::default().bg(theme.root_bg),
+                theme.card_guide(),
+                theme,
+                width,
+                Break::HardBreak,
+            ));
+        }
+    }
+}
+
+fn structured_subagent_has_details(result: &StructuredSubagentResult) -> bool {
+    !result.summary.trim().is_empty()
+        || !result.blockers.is_empty()
+        || !result.findings.is_empty()
+        || !result.next_steps.is_empty()
+        || !result.validation.is_empty()
+        || !result.files_changed.is_empty()
+        || !result.files_read.is_empty()
+        || !result.commands_run.is_empty()
 }
 
 fn subagent_activity_summary(result: &StructuredSubagentResult) -> String {
@@ -1085,37 +1126,6 @@ fn subagent_activity_summary(result: &StructuredSubagentResult) -> String {
     .map(|(label, count)| format!("{label} {count}"))
     .collect::<Vec<_>>()
     .join(" · ")
-}
-
-fn structured_subagent_detail_values(
-    result: &StructuredSubagentResult,
-) -> Vec<(&'static str, String)> {
-    [
-        ("blocker", &result.blockers),
-        ("next", &result.next_steps),
-        ("finding", &result.findings),
-        ("changed", &result.files_changed),
-        ("validation", &result.validation),
-    ]
-    .into_iter()
-    .filter_map(|(label, values)| subagent_list_summary(values).map(|value| (label, value)))
-    .collect()
-}
-
-fn subagent_list_summary(values: &[String]) -> Option<String> {
-    let mut visible = values
-        .iter()
-        .map(|value| one_line_snippet(value))
-        .filter(|value| !value.is_empty())
-        .take(2)
-        .collect::<Vec<_>>();
-    if visible.is_empty() {
-        return None;
-    }
-    if values.len() > visible.len() {
-        visible.push(format!("+{} more", values.len() - visible.len()));
-    }
-    Some(visible.join(" · "))
 }
 
 fn subagent_task(tool: &ToolView) -> Option<String> {
@@ -3021,6 +3031,152 @@ mod tests {
     }
 
     #[test]
+    fn subagent_card_collapsed_and_expanded_render_all_structured_items() {
+        let tool = ToolView {
+            call_id: "run-expanded".into(),
+            name: "agent__explore".into(),
+            summary: "explorer completed".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "explorer",
+                        "status": "completed",
+                        "summary": "short card summary",
+                        "child_session_id": "child-expanded",
+                        "structured_result": {
+                            "status": "completed",
+                            "summary": "The complete expanded summary survives across transcript rows.",
+                            "malformed": false,
+                            "blockers": ["blocker one", "blocker two"],
+                            "findings": ["finding one", "finding two"],
+                            "next_steps": ["next step one", "next step two"],
+                            "validation": ["validation one", "validation two"],
+                            "files_changed": ["changed one", "changed two"],
+                            "files_read": ["read one", "read two"],
+                            "commands_run": ["command one", "command two"],
+                            "run_id": "run-expanded",
+                            "child_session_id": "child-expanded"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let collapsed = render_tool_card_lines_with_frame(&tool, Theme::dark(), 80, 0, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let expanded = render_tool_card_lines_with_frame(&tool, Theme::dark(), 80, 0, true)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let collapsed_text = collapsed.join("\n");
+        let expanded_text = expanded.join("\n");
+
+        assert_ne!(collapsed, expanded);
+        assert!(collapsed_text.contains("expand"), "{collapsed_text}");
+        assert!(!collapsed_text.contains("blocker one"), "{collapsed_text}");
+        assert!(!collapsed_text.contains("command two"), "{collapsed_text}");
+        assert!(
+            expanded_text
+                .contains("The complete expanded summary survives across transcript rows."),
+            "{expanded_text}"
+        );
+        for item in [
+            "blocker one",
+            "blocker two",
+            "finding one",
+            "finding two",
+            "next step one",
+            "next step two",
+            "validation one",
+            "validation two",
+            "changed one",
+            "changed two",
+            "read one",
+            "read two",
+            "command one",
+            "command two",
+        ] {
+            assert!(
+                expanded_text.contains(item),
+                "missing {item}: {expanded_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_card_summary_only_expands_and_remains_copyable() {
+        let tool = ToolView {
+            call_id: "run-summary-only".into(),
+            name: "agent__explore".into(),
+            summary: "explorer completed".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "explorer",
+                        "status": "completed",
+                        "summary": "fallback summary",
+                        "child_session_id": "child-summary-only",
+                        "structured_result": {
+                            "status": "completed",
+                            "summary": "A summary-only structured result expands in full.",
+                            "malformed": false,
+                            "blockers": [],
+                            "findings": [],
+                            "next_steps": [],
+                            "validation": [],
+                            "files_changed": [],
+                            "files_read": [],
+                            "commands_run": [],
+                            "run_id": "run-summary-only",
+                            "child_session_id": "child-summary-only"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let collapsed = render_tool_card_lines_with_frame(&tool, Theme::dark(), 80, 0, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let expanded_document = render_tool_card_document(&tool, Theme::dark(), 80, 0, true);
+        let expanded = render_tool_card_lines_with_frame(&tool, Theme::dark(), 80, 0, true)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            collapsed
+                .join("\n")
+                .contains("completed explorer fallback summary")
+        );
+        assert!(collapsed.join("\n").contains("expand"));
+        assert!(
+            expanded
+                .join("\n")
+                .contains("A summary-only structured result expands in full.")
+        );
+        assert!(
+            expanded_document
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| {
+                    span.source.is_some() && span.text.contains("A summary-only structured result")
+                })
+        );
+        assert!(expanded_document.validate());
+    }
+
+    #[test]
     fn subagent_card_keeps_structured_details_width_safe_and_truncated() {
         let tool = ToolView {
             call_id: "run-narrow".into(),
@@ -3056,14 +3212,17 @@ mod tests {
             status: ToolExecutionStatus::Succeeded,
         };
 
-        let rendered = render_tool_card_lines(&tool, Theme::dark(), 32);
-        assert!(rendered.iter().any(|line| line.to_string().contains('…')));
-        assert!(
-            rendered
-                .iter()
-                .all(|line| display_width(&line.to_string()) <= 32),
-            "{rendered:?}"
-        );
+        for expanded_output in [false, true] {
+            let rendered =
+                render_tool_card_lines_with_frame(&tool, Theme::dark(), 32, 0, expanded_output);
+            assert!(rendered.iter().any(|line| line.to_string().contains('…')));
+            assert!(
+                rendered
+                    .iter()
+                    .all(|line| display_width(&line.to_string()) <= 32),
+                "{rendered:?}"
+            );
+        }
     }
 
     #[test]

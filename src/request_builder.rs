@@ -855,7 +855,7 @@ pub(crate) fn build_request_from_selected_prompt(
                 input.model.clone(),
                 &input.prompt_plan,
                 input.tools,
-            );
+            )?;
             let needs_reasoning_content = input.prompt_plan.segments.iter().any(|segment| {
                 matches!(
                     segment.content,
@@ -1203,11 +1203,34 @@ fn build_completions_request(
     model: ModelRequestMetadata,
     prompt_plan: &PromptPlan,
     tools: &[ToolSpec],
-) -> CreateChatCompletionRequest {
+) -> Result<CreateChatCompletionRequest> {
     provider_serialization::build_completions_request(model_id, model, prompt_plan, tools)
 }
 
 pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
+    if let HistoryItem::ToolOutput {
+        call_id,
+        output_json,
+        images,
+    } = item
+        && !images.is_empty()
+    {
+        let compact_text = format!(
+            "{call_id}\n{output_json}\n{}",
+            images
+                .iter()
+                .map(crate::user_content::UserImageAttachment::prompt_plan_placeholder)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let text_tokens = ((compact_text.len() as u64 + 2) / 3).saturating_add(8);
+        let visual_tokens = images
+            .iter()
+            .map(crate::user_content::UserImageAttachment::visual_token_charge)
+            .sum::<u64>();
+        return text_tokens.saturating_add(visual_tokens);
+    }
+
     if let HistoryItem::UserMessage { content } = item
         && !content.attachments.is_empty()
     {

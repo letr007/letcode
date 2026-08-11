@@ -827,6 +827,36 @@ mod tests {
     }
 
     #[test]
+    fn pending_question_confirm_tab_maps_vertical_keys_to_scroll_actions() {
+        let mut state = TuiState::default();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose one".into(),
+                    header: "Mode".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Fast path".into(),
+                    }],
+                    multiple: true,
+                }],
+            },
+            None,
+        );
+        question.active_tab = 1;
+        state.pending_question = Some(question);
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::QuestionPrevOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('j'))),
+            InputAction::QuestionNextOption
+        );
+    }
+
+    #[test]
     fn pending_question_confirm_tab_maps_enter_to_submit() {
         let mut state = TuiState::default();
         let mut question = crate::tui::state::PendingQuestionState::new(

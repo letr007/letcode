@@ -9,7 +9,18 @@ use crate::transcript::{TranscriptEvent, TranscriptRecord};
 use crate::user_content::UserMessageSubmission;
 
 pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> Timeline {
-    let mut projection = TranscriptTimelineProjection::default();
+    let legacy_reviewer_child_session_id = records.iter().find_map(|record| match &record.event {
+        TranscriptEvent::PermissionDecision {
+            reviewer: Some(reviewer),
+            reviewer_child_session_id: Some(child_session_id),
+            ..
+        } if reviewer == "auto" && !child_session_id.is_empty() => Some(child_session_id.clone()),
+        _ => None,
+    });
+    let mut projection = TranscriptTimelineProjection {
+        legacy_reviewer_child_session_id,
+        ..TranscriptTimelineProjection::default()
+    };
     for record in records {
         projection.apply_record(record);
     }
@@ -20,6 +31,7 @@ pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> 
 struct TranscriptTimelineProjection {
     timeline: Timeline,
     current_auto_continue: AutoContinueState,
+    legacy_reviewer_child_session_id: Option<String>,
 }
 
 impl TranscriptTimelineProjection {
@@ -120,20 +132,18 @@ impl TranscriptTimelineProjection {
                 allowed,
                 reason,
                 reviewer,
-                approval: _,
+                approval,
                 risk,
-                reviewer_child_session_id: _,
+                reviewer_child_session_id,
             } => {
-                let restored_reason = match (reviewer.as_deref(), risk.as_deref(), reason.as_ref())
-                {
-                    (Some("auto"), Some(risk), Some(reason)) => {
-                        Some(format!("auto-review ({risk}): {reason}"))
-                    }
-                    (Some("auto"), _, Some(reason)) => Some(format!("auto-review: {reason}")),
-                    _ => reason.clone(),
-                };
-                let origin_label =
-                    matches!(reviewer.as_deref(), Some("auto")).then(|| "reviewer".to_string());
+                let restored_reason = reason.clone();
+                let auto_review = matches!(reviewer.as_deref(), Some("auto"));
+                let origin_label = auto_review.then(|| "reviewer".to_string());
+                let reviewer_child_session_id = reviewer_child_session_id.clone().or_else(|| {
+                    auto_review
+                        .then(|| self.legacy_reviewer_child_session_id.clone())
+                        .flatten()
+                });
                 self.timeline.push_restored_permission_decision(
                     call_id.clone().unwrap_or_else(|| tool.clone()),
                     tool.clone(),
@@ -146,6 +156,9 @@ impl TranscriptTimelineProjection {
                     },
                     restored_reason,
                     origin_label,
+                    approval.clone(),
+                    risk.clone(),
+                    reviewer_child_session_id,
                 );
             }
             TranscriptEvent::Error { message } => {
@@ -177,6 +190,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::FoldedOutputMetadata { .. }
             | TranscriptEvent::TurnStarted(_)
             | TranscriptEvent::ModelChanged { .. }
+            | TranscriptEvent::ExpertModelChanged { .. }
             | TranscriptEvent::PermissionModeChanged { .. }
             | TranscriptEvent::AutoContinuationScheduled { .. }
             | TranscriptEvent::AssistantToolCallBatch { .. }
@@ -235,31 +249,89 @@ mod tests {
 
     #[test]
     fn restored_auto_review_permissions_keep_reviewer_identity() {
-        let timeline = timeline_from_transcript_records(&[record(
-            1,
-            TranscriptEvent::PermissionDecision {
-                call_id: Some("call-auto".into()),
-                tool: "fs__write".into(),
-                args: json!({"path": "a.txt", "content": "x"}),
-                allowed: true,
-                reason: Some("safe edit".into()),
-                reviewer: Some("auto".into()),
-                approval: Some("once".into()),
-                risk: Some("low".into()),
-                reviewer_child_session_id: Some("child-reviewer".into()),
-            },
-        )]);
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::PermissionDecision {
+                    call_id: Some("call-auto".into()),
+                    tool: "fs__write".into(),
+                    args: json!({"path": "a.txt", "content": "x"}),
+                    allowed: true,
+                    reason: Some("safe edit".into()),
+                    reviewer: Some("auto".into()),
+                    approval: Some("once".into()),
+                    risk: Some("low".into()),
+                    reviewer_child_session_id: Some("child-reviewer".into()),
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::PermissionDecision {
+                    call_id: Some("call-auto-2".into()),
+                    tool: "shell__exec".into(),
+                    args: json!({"command": "git status"}),
+                    allowed: false,
+                    reason: Some("unsafe".into()),
+                    reviewer: Some("auto".into()),
+                    approval: Some("deny".into()),
+                    risk: Some("high".into()),
+                    reviewer_child_session_id: Some("child-reviewer".into()),
+                },
+            ),
+        ]);
 
-        assert!(matches!(
-            timeline.items().first(),
-            Some(TimelineItem::Permission(permission))
-                if permission.status == PermissionPromptStatus::Approved
-                    && permission.origin_label.as_deref() == Some("reviewer")
-                    && permission
-                        .resolution_reason
-                        .as_deref()
-                        == Some("auto-review (low): safe edit")
-        ));
+        let TimelineItem::AutoReviewAggregate(aggregate) = &timeline.items()[0] else {
+            panic!("expected restored auto-review aggregate");
+        };
+        assert_eq!(aggregate.reviewer_child_session_id, "child-reviewer");
+        assert_eq!(aggregate.decisions.len(), 2);
+        assert_eq!(aggregate.decisions[0].approval, "once");
+        assert_eq!(aggregate.decisions[0].risk.as_deref(), Some("low"));
+        assert_eq!(aggregate.decisions[0].rationale, "safe edit");
+        assert!(aggregate.decisions[0].allowed);
+        assert_eq!(aggregate.decisions[1].approval, "deny");
+        assert!(!aggregate.decisions[1].allowed);
+    }
+
+    #[test]
+    fn restored_legacy_auto_review_permissions_share_stable_reviewer_group() {
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::PermissionDecision {
+                    call_id: Some("legacy-1".into()),
+                    tool: "fs__read".into(),
+                    args: json!({"path": "a.txt"}),
+                    allowed: true,
+                    reason: Some("safe".into()),
+                    reviewer: Some("auto".into()),
+                    approval: Some("once".into()),
+                    risk: Some("low".into()),
+                    reviewer_child_session_id: None,
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::PermissionDecision {
+                    call_id: Some("current-2".into()),
+                    tool: "shell__exec".into(),
+                    args: json!({"command": "git status"}),
+                    allowed: false,
+                    reason: Some("blocked".into()),
+                    reviewer: Some("auto".into()),
+                    approval: Some("deny".into()),
+                    risk: Some("high".into()),
+                    reviewer_child_session_id: Some("child-reviewer".into()),
+                },
+            ),
+        ]);
+
+        assert_eq!(timeline.items().len(), 1);
+        let TimelineItem::AutoReviewAggregate(aggregate) = &timeline.items()[0] else {
+            panic!("expected legacy auto-review aggregate");
+        };
+        assert_eq!(aggregate.reviewer_child_session_id, "child-reviewer");
+        assert_eq!(aggregate.decisions.len(), 2);
     }
 
     #[test]

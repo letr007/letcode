@@ -478,6 +478,9 @@ pub struct PermissionResolutionEvent {
     pub summary: Option<String>,
     /// Fixed identity label for auto-review cards (`"reviewer"`).
     pub origin_label: Option<String>,
+    pub approval: Option<String>,
+    pub risk: Option<String>,
+    pub reviewer_child_session_id: Option<String>,
 }
 
 impl PermissionResolutionEvent {
@@ -490,6 +493,9 @@ impl PermissionResolutionEvent {
             tool_name: None,
             summary: None,
             origin_label: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         }
     }
 
@@ -501,6 +507,9 @@ impl PermissionResolutionEvent {
             tool_name: None,
             summary: None,
             origin_label: None,
+            approval: None,
+            risk: None,
+            reviewer_child_session_id: None,
         }
     }
 }

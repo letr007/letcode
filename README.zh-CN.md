@@ -70,6 +70,8 @@ mode = "default" # safe/default/auto/yolo；读取时兼容旧的 solo
 # [agents.reviewer]
 # provider = "openai"
 # model = "gpt-5.5"
+# 可选：单次委派时允许选择的 provider-qualified 路由
+# allowed_models = ["openai/gpt-5.5"]
 
 # 可选的本地执行策略。经过审查的读取工具可以声明支持并行；
 # 其他工具保持单例执行，除非其处理器明确选择并行。

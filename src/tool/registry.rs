@@ -173,7 +173,7 @@ impl ToolRegistry {
         };
 
         match tool.execute_streaming(args, context, emit).await {
-            Ok(data) => ToolResult::ok(name, data),
+            Ok(output) => output,
             Err(err) => {
                 warn!(tool_name = %name, error = %err, "tool execution failed");
                 ToolResult::err(name, err.to_string())

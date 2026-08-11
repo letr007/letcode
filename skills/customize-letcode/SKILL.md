@@ -80,6 +80,7 @@ mode = "default" # safe | default | auto | yolo（solo 是 yolo 的别名）
 # [agents.explorer]
 # provider = "openai"
 # model = "gpt-5.5"
+# allowed_models = ["openai/gpt-5.5"] # 单次委派可选路由；不改变默认模型
 # 同样适用于：fixer, oracle, designer, librarian, general, reviewer
 
 [tools.parallelism]
@@ -143,6 +144,8 @@ text_verbosity = "medium"         # low|medium|high
   remote 不能设 `command`/`environment`；local 不能设 `url`/`headers`/`oauth`。
 - 内置 expert agent 键固定为：`explorer`、`fixer`、`oracle`、`designer`、
   `librarian`、`general`、`reviewer`。没有自由形式的 agent map。
+- `agents.<expert>.allowed_models` 仅接受 `provider/model`，用于 `agent__*`
+  单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的
   `reviewer` expert 来回答审批。
 

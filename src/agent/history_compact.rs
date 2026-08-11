@@ -135,6 +135,7 @@ mod tests {
             HistoryItem::ToolOutput {
                 call_id: "c1".into(),
                 output_json: "{}".into(),
+                images: Vec::new(),
             },
         ];
         let cut = plan_turn_cut(&history, Some(2), 0)
@@ -180,6 +181,7 @@ mod tests {
             HistoryItem::ToolOutput {
                 call_id: "c1".into(),
                 output_json: "{}".into(),
+                images: Vec::new(),
             },
             HistoryItem::assistant("recent tail"),
         ];
@@ -251,6 +253,7 @@ mod tests {
             HistoryItem::ToolOutput {
                 call_id: "c1".into(),
                 output_json: r#"{"ok":true}"#.into(),
+                images: Vec::new(),
             },
         ];
         let cut = plan_turn_cut(&history, Some(2), 0)
@@ -273,6 +276,7 @@ mod tests {
             HistoryItem::ToolOutput {
                 call_id: "c1".into(),
                 output_json: "{}".into(),
+                images: Vec::new(),
             },
             HistoryItem::assistant("recent tail"),
         ];

@@ -70,6 +70,8 @@ mode = "default" # safe/default/auto/yolo; legacy solo remains accepted when rea
 # [agents.reviewer]
 # provider = "openai"
 # model = "gpt-5.5"
+# Optional provider-qualified routes selectable per delegation:
+# allowed_models = ["openai/gpt-5.5"]
 
 # Optional local execution policy. Reviewed read tools may declare parallel support;
 # all other tools stay exclusive unless their handler explicitly opts in.

@@ -85,6 +85,7 @@ pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) ->
             let ProtocolFrameItem::ToolOutput {
                 call_id,
                 output_json,
+                ..
             } = frame.protocol.as_ref()?
             else {
                 return None;
@@ -1184,6 +1185,7 @@ mod tests {
         .with_protocol(ProtocolFrameItem::ToolOutput {
             call_id: call_id.into(),
             output_json: output_json.into(),
+            images: Vec::new(),
         })
     }
 
@@ -1209,6 +1211,7 @@ mod tests {
         .with_protocol(ProtocolFrameItem::ToolOutput {
             call_id: call_id.into(),
             output_json: output_json.into(),
+            images: Vec::new(),
         })
     }
 

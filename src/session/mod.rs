@@ -43,8 +43,10 @@ pub mod settings;
 #[cfg(test)]
 pub(crate) use child_view::project_parent_session_view;
 pub use child_view::{current_session_records, list_child_sessions_for_view};
+pub(crate) use command::ActiveTurnCommandDisposition;
 pub use command::SessionCommand;
 pub use context_scope::sync_agent_context_scope_from_recorder;
+pub(crate) use coordinator::IdleDispatch;
 pub use coordinator::SessionCoordinator;
 pub use engine::{
     SessionEngine, SessionEngineConfig, SessionEngineIngress, SessionEngineProjection,
@@ -59,7 +61,6 @@ pub use event::{
     ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
 pub(crate) use interrupt::unfinished_current_active_turn_tool_calls;
-pub(crate) use lifecycle::session_started_event;
 
 #[cfg(test)]
 pub use lifecycle::install_new_session_for_agent;
@@ -77,4 +78,4 @@ pub(crate) use runner::{
     AgentRunner, RunnerPermissionRequest, RunnerQuestionRequest, SessionTransportEvent,
     subagent_event_sender,
 };
-pub(crate) use settings::persist_and_apply_model_route_with;
+pub(crate) use settings::apply_model_route_with;

@@ -325,12 +325,21 @@ impl LogicalRequestObservationTracker {
 }
 
 pub trait SubagentChildFactory<C: Config>: Send + Sync {
+    fn resolve_route(
+        &self,
+        parent: &Agent<C>,
+        template: &AgentTemplate,
+        requested_route: Option<&ModelRoute>,
+        takeover: bool,
+    ) -> Result<ModelRoute>;
+
     fn create_child(
         &self,
         parent: &Agent<C>,
         template: &AgentTemplate,
+        route: &ModelRoute,
         max_tool_calls_override: Option<usize>,
-    ) -> Option<Agent<C>>;
+    ) -> Result<Agent<C>>;
 }
 
 pub trait PrimaryRouteFactory<C: Config>: Send + Sync {
@@ -473,6 +482,7 @@ pub trait SubagentDelegate<C: Config>: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentInvocation {
     pub input: NormalizedSubagentInput,
+    pub model: Option<ModelRoute>,
     pub prompt: String,
     /// Stable identity of the parent subagent tool call, when launched by a tool.
     /// Direct slash delegation intentionally has no parent call.
@@ -606,15 +616,36 @@ impl AgentFactory {
         Self::create_child_with_max_tool_calls(parent, template, None)
     }
 
+    #[allow(dead_code)]
     pub fn create_child_with_max_tool_calls<C: Config + Clone>(
         parent: &Agent<C>,
         template: &AgentTemplate,
         max_tool_calls_override: Option<usize>,
     ) -> Agent<C> {
-        if let Some(factory) = &parent.subagent_child_factory
-            && let Some(child) = factory.create_child(parent, template, max_tool_calls_override)
-        {
-            return child;
+        Self::create_child_with_route_and_max_tool_calls(
+            parent,
+            template,
+            None,
+            false,
+            max_tool_calls_override,
+        )
+        .expect("default child route should be constructible")
+    }
+
+    pub fn create_child_with_route_and_max_tool_calls<C: Config + Clone>(
+        parent: &Agent<C>,
+        template: &AgentTemplate,
+        requested_route: Option<ModelRoute>,
+        takeover: bool,
+        max_tool_calls_override: Option<usize>,
+    ) -> Result<Agent<C>> {
+        if let Some(factory) = &parent.subagent_child_factory {
+            let route =
+                factory.resolve_route(parent, template, requested_route.as_ref(), takeover)?;
+            return factory.create_child(parent, template, &route, max_tool_calls_override);
+        }
+        if requested_route.is_some() || takeover {
+            bail!("subagent model route selection is not configured");
         }
 
         let model = parent
@@ -637,7 +668,46 @@ impl AgentFactory {
         {
             child.set_primary_route(route);
         }
-        child
+        Ok(child)
+    }
+
+    pub fn resolve_subagent_route(
+        parent: &Agent<OpenAIConfig>,
+        template: &AgentTemplate,
+        requested_route: Option<&ModelRoute>,
+        takeover: bool,
+    ) -> Result<ModelRoute> {
+        if let Some(factory) = &parent.subagent_child_factory {
+            return factory.resolve_route(parent, template, requested_route, takeover);
+        }
+        if requested_route.is_some() || takeover {
+            bail!("subagent model route selection is not configured");
+        }
+        parent.primary_route().cloned().ok_or_else(|| {
+            anyhow!(
+                "parent model route is unavailable for expert '{}'",
+                template.name
+            )
+        })
+    }
+
+    pub fn create_prepared_routed_child_with_max_tool_calls(
+        parent: &Agent<OpenAIConfig>,
+        template: &AgentTemplate,
+        prepared: PreparedPrimaryRoute<OpenAIConfig>,
+        max_tool_calls_override: Option<usize>,
+    ) -> Agent<OpenAIConfig> {
+        Self::create_routed_child_with_max_tool_calls(
+            parent,
+            template,
+            prepared.client,
+            prepared.route,
+            prepared.default_protocol,
+            prepared.model_protocols,
+            prepared.model_catalog,
+            prepared.retry_config,
+            max_tool_calls_override,
+        )
     }
 
     pub fn create_routed_child_with_max_tool_calls(
@@ -1105,6 +1175,15 @@ impl<C: Config> Agent<C> {
         })
     }
 
+    pub(crate) fn prepare_fast_mode_auto_disable(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<crate::fast_mode::PreparedFastModeDisable>> {
+        self.fast_mode.as_ref().map_or(Ok(None), |fast_mode| {
+            fast_mode.prepare_auto_disable_for_model(model_id)
+        })
+    }
+
     /// Returns whether request preparation persistently auto-disabled Fast Mode.
     pub(crate) fn prepare_fast_mode_for_request(&mut self) -> Result<bool> {
         self.auto_disable_fast_mode_for_model(&self.model)
@@ -1543,19 +1622,41 @@ impl<C: Config> Agent<C> {
 
     /// Commit a snapshot for a wholly new session.  Unlike ordinary restores,
     /// the turn sequence must not retain an id from the abandoned session.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn restore_new_session_runtime_snapshot(
         &mut self,
         protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         runtime_snapshot: RuntimeSnapshot,
         max_turn_id: u64,
     ) -> Result<()> {
-        self.restore_runtime_snapshot(protocol_frames, runtime_snapshot)?;
+        let (protocol_frames, runtime_snapshot) =
+            self.validate_runtime_snapshot_restore(protocol_frames, runtime_snapshot)?;
+        self.prepare_new_session_permission_reset()?;
+        self.install_new_session_runtime_snapshot(protocol_frames, runtime_snapshot, max_turn_id);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_new_session_permission_reset(&self) -> Result<()> {
+        drop(
+            self.permission_session
+                .lock()
+                .map_err(|_| anyhow!("permission session poisoned"))?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn install_new_session_runtime_snapshot(
+        &mut self,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        runtime_snapshot: RuntimeSnapshot,
+        max_turn_id: u64,
+    ) {
+        self.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
         self.permission_session
             .lock()
-            .map_err(|_| anyhow!("permission session poisoned"))?
+            .expect("permission session was validated before new-session install")
             .clear_grants();
         self.next_turn_id = max_turn_id;
-        Ok(())
     }
 
     pub fn add_evidence(&mut self, evidence: EvidenceRecord) -> Result<()> {
@@ -2530,8 +2631,13 @@ impl<C: Config> Agent<C> {
         };
 
         let task = self.render_subagent_prompt(tool_name, &input);
+        let model = match input.model.as_deref().map(ModelRoute::parse).transpose() {
+            Ok(model) => model,
+            Err(error) => return ToolResult::err(tool_name, error.to_string()),
+        };
         let invocation = SubagentInvocation {
             input,
+            model,
             prompt: task,
             parent_tool_call_id,
         };
@@ -2879,10 +2985,11 @@ impl<C: Config> Agent<C> {
             "tool call completed"
         );
 
-        let output_json = serde_json::to_string(&record.output)?;
+        let output_json = serde_json::to_string(&record.output.for_text_history())?;
         self.append_history_item(HistoryItem::ToolOutput {
             call_id: call.call_id.clone(),
             output_json,
+            images: record.output.images.clone(),
         })?;
         reconcile_loaded_skill_material(&mut self.runtime_snapshot)?;
         if let Some(usage) = self.projected_token_usage() {
@@ -3841,9 +3948,11 @@ pub(crate) fn protocol_frame_item_from_history_item(
         HistoryItem::ToolOutput {
             call_id,
             output_json,
+            images,
         } => crate::protocol_frames::ProtocolFrameItem::ToolOutput {
             call_id: call_id.clone(),
             output_json: output_json.clone(),
+            images: images.clone(),
         },
     }
 }
@@ -3895,6 +4004,7 @@ fn runtime_frame_from_protocol_frame(
         crate::protocol_frames::ProtocolFrameItem::ToolOutput {
             call_id,
             output_json,
+            ..
         } => (
             RuntimeFrameKind::ToolOutput,
             format!("tool-output:{}", call_id),

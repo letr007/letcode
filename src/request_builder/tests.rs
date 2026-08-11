@@ -272,6 +272,7 @@ fn orphan_tool_outputs_fail_fast_when_building_chat_request() {
         HistoryItem::ToolOutput {
             call_id: "call-orphan".into(),
             output_json: r#"{"ok":true}"#.into(),
+            images: Vec::new(),
         },
         HistoryItem::user("continue"),
     ];
@@ -320,6 +321,104 @@ fn truncates_oldest_history_but_keeps_protected_items() {
     };
     let json = serde_json::to_string(&request).expect("request serializes");
     assert!(json.contains("current"));
+}
+
+#[test]
+fn responses_serializes_tool_output_images_as_input_image_content() {
+    let image = crate::user_content::UserImageAttachment::from_bytes(
+        "pixel.png",
+        "image/png",
+        b"image-bytes",
+    );
+    let history = vec![
+        HistoryItem::user("inspect"),
+        HistoryItem::AssistantToolCalls {
+            text: None,
+            reasoning_content: None,
+            calls: vec![HistoryToolCall {
+                call_id: "call-image".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"pixel.png"}"#.into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-image".into(),
+            output_json: r#"{"ok":true,"tool":"fs__read","data":{"kind":"image"}}"#.into(),
+            images: vec![image.clone()],
+        },
+    ];
+
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Responses,
+        model_id: "gpt-test",
+        model: metadata(16_384),
+        prelude: &[],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("responses request builds");
+    let request = request_value(&result);
+    let output = request["input"]
+        .as_array()
+        .expect("responses input")
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("function call output");
+    let content = output["output"].as_array().expect("multimodal output");
+
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["image_url"], image.data_url);
+}
+
+#[test]
+fn completions_rejects_tool_output_images_without_text_fallback() {
+    let history = vec![
+        HistoryItem::user("inspect"),
+        HistoryItem::AssistantToolCalls {
+            text: None,
+            reasoning_content: None,
+            calls: vec![HistoryToolCall {
+                call_id: "call-image".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"pixel.png"}"#.into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-image".into(),
+            output_json: r#"{"ok":true}"#.into(),
+            images: vec![crate::user_content::UserImageAttachment::from_bytes(
+                "pixel.png",
+                "image/png",
+                b"image-bytes",
+            )],
+        },
+    ];
+
+    let error = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Completions,
+        model_id: "chat-test",
+        model: metadata(16_384),
+        prelude: &[],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect_err("chat completions must reject image tool outputs");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not support image content in tool outputs"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -795,6 +894,7 @@ fn planner_is_pure_deterministic_and_preserves_protected_tool_groups() {
         ProtocolFrameItem::ToolOutput {
             call_id: "call-1".into(),
             output_json: r#"{"ok":true}"#.into(),
+            images: Vec::new(),
         },
     );
     let user = frame(
@@ -917,6 +1017,7 @@ fn canonical_tool_result_snapshot(bytes: usize) -> RuntimeSnapshot {
         ProtocolFrameItem::ToolOutput {
             call_id: "phase1b-call".into(),
             output_json: output_json.clone(),
+            images: Vec::new(),
         },
     );
     let user = frame(

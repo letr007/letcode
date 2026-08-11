@@ -8,6 +8,10 @@ pub struct FastMode {
     state: Mutex<bool>,
 }
 
+pub(crate) struct PreparedFastModeDisable {
+    mode: Arc<FastMode>,
+}
+
 impl FastMode {
     pub fn load(config_path: impl Into<PathBuf>, enabled: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -43,6 +47,20 @@ impl FastMode {
         Ok(false)
     }
 
+    pub(crate) fn prepare_auto_disable_for_model(
+        self: &Arc<Self>,
+        model_id: &str,
+    ) -> Result<Option<PreparedFastModeDisable>> {
+        let state = self.state.lock().expect("Fast Mode state poisoned");
+        if !*state || is_fast_capable_model(model_id) {
+            return Ok(None);
+        }
+        crate::config::validate_fast_mode_update(&self.config_path, false)?;
+        Ok(Some(PreparedFastModeDisable {
+            mode: Arc::clone(self),
+        }))
+    }
+
     fn set_enabled_locked(&self, current: &mut bool, enabled: bool) -> Result<()> {
         crate::config::persist_fast_mode_enabled(&self.config_path, enabled).with_context(
             || {
@@ -53,6 +71,15 @@ impl FastMode {
             },
         )?;
         *current = enabled;
+        Ok(())
+    }
+}
+
+impl PreparedFastModeDisable {
+    pub(crate) fn commit(self) -> Result<()> {
+        let mut state = self.mode.state.lock().expect("Fast Mode state poisoned");
+        crate::config::persist_fast_mode_enabled(&self.mode.config_path, false)?;
+        *state = false;
         Ok(())
     }
 }

@@ -47,6 +47,8 @@ pub enum ProtocolItem {
     ToolOutput {
         call_id: String,
         output_json: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::user_content::UserImageAttachment>,
     },
 }
 
@@ -152,9 +154,17 @@ impl ProtocolFrame {
             ProtocolFrameItem::ToolOutput {
                 call_id,
                 output_json,
+                images,
             } => format!(
-                "tool_output:{}:{}:{}",
-                self.history_index, call_id, output_json
+                "tool_output:{}:{}:{}:{}",
+                self.history_index,
+                call_id,
+                output_json,
+                images
+                    .iter()
+                    .map(crate::user_content::UserImageAttachment::prompt_plan_placeholder)
+                    .collect::<Vec<_>>()
+                    .join("|")
             ),
         }
     }
@@ -454,10 +464,12 @@ mod tests {
             HistoryItem::ToolOutput {
                 call_id: "call-1".into(),
                 output_json: "{}".into(),
+                images: Vec::new(),
             },
             HistoryItem::ToolOutput {
                 call_id: "call-2".into(),
                 output_json: "{}".into(),
+                images: Vec::new(),
             },
             HistoryItem::assistant("done"),
         ];
@@ -477,6 +489,7 @@ mod tests {
             HistoryItem::ToolOutput {
                 call_id: "call-1".into(),
                 output_json: "{}".into(),
+                images: Vec::new(),
             },
         ];
 

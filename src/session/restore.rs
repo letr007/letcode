@@ -322,9 +322,15 @@ pub fn install_prepared_routed_resume_for_agent(
             prepared.snapshot.snapshot.clone(),
         )
         .map_err(|error| ResumeInstallError::new(error, false))?;
-    let fast_mode_auto_disabled = agent
-        .auto_disable_fast_mode_for_model(target_model)
+    let prepared_fast_mode_disable = agent
+        .prepare_fast_mode_auto_disable(target_model)
         .map_err(|error| ResumeInstallError::new(error, false))?;
+    let fast_mode_auto_disabled = prepared_fast_mode_disable.is_some();
+    if let Some(prepared_fast_mode_disable) = prepared_fast_mode_disable {
+        prepared_fast_mode_disable
+            .commit()
+            .map_err(|error| ResumeInstallError::new(error, false))?;
+    }
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
@@ -414,6 +420,7 @@ fn session_resumed_event(
         model_id: snapshot.latest_model.clone(),
         token_usage,
         runtime_context,
+        expert_models: crate::transcript::restore_latest_expert_models(&snapshot.records),
     }
 }
 

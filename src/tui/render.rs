@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::{
     components::{composer, dialog, footer, layout, slash_panel, transcript},
-    measure::{display_width, wrapped_row_count},
+    measure::{display_width, wrap_text_to_width, wrapped_row_count},
     state::{ToastKind, TuiState},
     surface,
     theme::Theme,
@@ -67,7 +67,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// persists transcripts, or mutates runtime/business state.
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.frame_hyperlink_cells.clear();
-    state.ime_cursor_anchor = None;
     let theme = state.theme();
     let area = frame.area();
 
@@ -143,8 +142,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     dialog::render_dialog(frame, state, area, theme);
 }
 
-fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
-    let Some(question) = state.pending_question.as_ref() else {
+fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+    let Some(question) = state.pending_question.as_ref().cloned() else {
         return;
     };
 
@@ -164,77 +163,70 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
 
     let panel_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let inner = shell.content_area;
+    let is_confirm = question.is_confirm_tab();
+    let tab_rows = if question.show_confirm_tab() {
+        question_tab_row_count(&question, inner.width.max(1) as usize)
+    } else {
+        0
+    };
 
     let mut lines = Vec::new();
-    if question.show_confirm_tab() {
-        let tabs: Vec<Span<'static>> = (0..question.total_tabs())
-            .flat_map(|index| {
-                let label = question
-                    .active_tab_label(index)
-                    .unwrap_or_default()
-                    .to_string();
-                let answered = question
-                    .questions
-                    .get(index)
-                    .is_some_and(|item| item.is_answered());
-                let style = if index == question.active_tab {
-                    Style::default()
-                        .fg(theme.root_bg)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else if answered {
-                    Style::default().fg(theme.text).bg(theme.element_bg)
-                } else {
-                    Style::default().fg(theme.muted_text).bg(theme.element_bg)
-                };
-                [
-                    Span::styled(format!(" {} ", label), style),
-                    Span::styled(" ", Style::default().bg(theme.element_bg)),
-                ]
-            })
-            .collect();
-        lines.push(Line::from(tabs));
+    if question.show_confirm_tab() && !is_confirm {
+        lines.extend(question_tab_lines(
+            &question,
+            inner.width.max(1) as usize,
+            theme,
+        ));
         lines.push(Line::default());
     }
 
     if question.is_confirm_tab() {
-        lines.push(Line::from(Span::styled(
-            "Confirm",
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::default());
-        for (index, item) in question.questions.iter().enumerate() {
-            let answers = item.answers();
-            let unanswered = answers.is_empty();
-            let answer_text = if unanswered {
-                "(not answered)".to_string()
-            } else {
-                answers.join(", ")
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{}. {} ", index + 1, item.header),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    answer_text,
-                    if unanswered {
-                        Style::default()
-                            .fg(theme.error)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.muted_text)
-                    },
-                ),
-            ]));
+        let body_lines = confirm_body_lines(&question, theme);
+        let tab_height = tab_rows.min(inner.height as usize) as u16;
+        let body_height = inner.height.saturating_sub(tab_height).saturating_sub(1);
+        let body_rows = confirm_body_row_count(&question, inner.width.max(1) as usize);
+        let scroll_max = body_rows.saturating_sub(body_height as usize);
+        if let Some(question) = state.pending_question.as_mut() {
+            question.set_confirm_scroll_max(scroll_max);
+        }
+        let scroll = state
+            .pending_question
+            .as_ref()
+            .map(|question| question.confirm_scroll)
+            .unwrap_or_default();
+        if inner.width > 0 && tab_height > 0 {
+            let tabs_area = Rect::new(inner.x, inner.y, inner.width, tab_height);
+            frame.render_widget(
+                Paragraph::new(question_tab_lines(
+                    &question,
+                    inner.width.max(1) as usize,
+                    theme,
+                )),
+                tabs_area,
+            );
+        }
+        if inner.width > 0 && body_height > 0 {
+            let body_area = Rect::new(
+                inner.x,
+                inner.y.saturating_add(tab_height).saturating_add(1),
+                inner.width,
+                body_height,
+            );
+            frame.render_widget(
+                Paragraph::new(body_lines)
+                    .style(panel_style)
+                    .wrap(Wrap { trim: false })
+                    .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+                body_area,
+            );
         }
     } else if let Some(current) = question.current_question() {
         let content_width = inner.width.max(1) as usize;
         let compact_options =
-            question_full_row_count(question, content_width) > shell.content_area.height as usize;
+            question_full_row_count(&question, content_width) > shell.content_area.height as usize;
         if compact_options {
             lines = compact_question_lines(
-                question,
+                &question,
                 content_width,
                 shell.content_area.height as usize,
                 theme,
@@ -339,16 +331,28 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
         }
     }
 
-    let footer_detail = question_enter_detail(question);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(panel_style)
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+    let footer_detail = question_enter_detail(&question);
+    if !is_confirm {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(panel_style)
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 
     if let Some(footer_area) = shell.footer_area {
-        let mut footer = if question.editing_custom {
+        let mut footer = if question.is_confirm_tab() {
+            vec![
+                Span::styled(
+                    "↑↓",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" scroll  ", Style::default().fg(theme.muted_text)),
+            ]
+        } else if question.editing_custom {
             vec![
                 Span::styled(
                     "typing",
@@ -404,6 +408,144 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
             footer_area,
         );
     }
+}
+
+fn question_tab_token(label: &str, width: usize) -> (String, bool, usize) {
+    let width = width.max(1);
+    if width <= 2 {
+        let token = crate::tui::components::tool_card::truncate_display_width(label, width);
+        let token_width = display_width(&token);
+        return (token, false, token_width);
+    }
+
+    let label_width = width.saturating_sub(3).max(1);
+    let label = crate::tui::components::tool_card::truncate_display_width(label, label_width);
+    let token = format!(" {label} ");
+    let token_width = display_width(&token);
+    let has_separator = width >= 4;
+    (
+        token,
+        has_separator,
+        token_width + usize::from(has_separator),
+    )
+}
+
+fn question_tab_lines(
+    question: &crate::tui::state::PendingQuestionState,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = Vec::new();
+    let mut current_width = 0usize;
+    for index in 0..question.total_tabs() {
+        let label = question.active_tab_label(index).unwrap_or_default();
+        let (token, has_separator, token_width) = question_tab_token(label, width);
+        if !current.is_empty() && current_width.saturating_add(token_width) > width {
+            rows.push(Line::from(std::mem::take(&mut current)));
+            current_width = 0;
+        }
+        let answered = question
+            .questions
+            .get(index)
+            .is_some_and(|item| item.is_answered());
+        let style = if index == question.active_tab {
+            Style::default()
+                .fg(theme.root_bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if answered {
+            Style::default().fg(theme.text).bg(theme.element_bg)
+        } else {
+            Style::default().fg(theme.muted_text).bg(theme.element_bg)
+        };
+        current.push(Span::styled(token, style));
+        if has_separator {
+            current.push(Span::styled(" ", Style::default().bg(theme.element_bg)));
+        }
+        current_width = current_width.saturating_add(token_width);
+    }
+    if !current.is_empty() {
+        rows.push(Line::from(current));
+    }
+    rows
+}
+
+fn question_tab_row_count(
+    question: &crate::tui::state::PendingQuestionState,
+    width: usize,
+) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut row_width = 0usize;
+    for index in 0..question.total_tabs() {
+        let label = question.active_tab_label(index).unwrap_or_default();
+        let (_, _, token_width) = question_tab_token(label, width);
+        if row_width > 0 && row_width.saturating_add(token_width) > width {
+            rows += 1;
+            row_width = 0;
+        }
+        row_width = row_width.saturating_add(token_width);
+    }
+    rows
+}
+
+fn confirm_body_lines(
+    question: &crate::tui::state::PendingQuestionState,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Confirm",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    for (index, item) in question.questions.iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!("{}. {}", index + 1, item.header),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )));
+        let answers = item.answers();
+        if answers.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (not answered)",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            for answer in answers {
+                lines.push(Line::from(Span::styled(
+                    format!("  - {answer}"),
+                    Style::default().fg(theme.muted_text),
+                )));
+            }
+        }
+    }
+    lines
+}
+
+fn confirm_body_row_count(
+    question: &crate::tui::state::PendingQuestionState,
+    width: usize,
+) -> usize {
+    let width = width.max(1);
+    let mut rows = wrapped_row_count("Confirm", width) + 1;
+    for (index, item) in question.questions.iter().enumerate() {
+        rows += wrapped_row_count(&format!("{}. {}", index + 1, item.header), width);
+        let answers = item.answers();
+        if answers.is_empty() {
+            rows += wrapped_row_count("  (not answered)", width);
+        } else {
+            rows += answers
+                .iter()
+                .map(|answer| wrapped_row_count(&format!("  - {answer}"), width))
+                .sum::<usize>();
+        }
+    }
+    rows
 }
 
 fn question_content_width(area_width: u16) -> usize {
@@ -476,36 +618,16 @@ fn question_full_row_count(
     let width = width.max(1);
     let rows = |text: &str| wrapped_row_count(text, width);
     if question.is_confirm_tab() {
-        let tabs = (0..question.total_tabs())
-            .filter_map(|index| question.active_tab_label(index))
-            .map(|label| format!(" {label}  "))
-            .collect::<String>();
-        return rows(&tabs)
-            + 2
-            + question
-                .questions
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let answer = if item.answers().is_empty() {
-                        "(not answered)".to_string()
-                    } else {
-                        item.answers().join(", ")
-                    };
-                    rows(&format!("{}. {} {}", index + 1, item.header, answer))
-                })
-                .sum::<usize>();
+        return question_tab_row_count(question, width)
+            + 1
+            + confirm_body_row_count(question, width);
     }
     let Some(current) = question.current_question() else {
         return 0;
     };
     let mut total = 0;
     if question.show_confirm_tab() {
-        let tabs = (0..question.total_tabs())
-            .filter_map(|index| question.active_tab_label(index))
-            .map(|label| format!(" {label}  "))
-            .collect::<String>();
-        total += rows(&tabs) + 1;
+        total += question_tab_row_count(question, width) + 1;
     }
     if let Some(origin) = &question.origin_label {
         total += rows(origin);
@@ -733,6 +855,73 @@ fn take_display_suffix(text: &str, width: usize) -> (String, bool) {
     (out.chars().rev().collect(), false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NoticeGeometry {
+    width: u16,
+    height: u16,
+}
+
+fn notice_geometry(area: Rect, message: &str) -> NoticeGeometry {
+    const MIN_WIDTH: u16 = 14;
+    const HORIZONTAL_CHROME: u16 = 4;
+    const VERTICAL_CHROME: u16 = 2;
+
+    let available_width = area.width.saturating_sub(1);
+    let min_width = MIN_WIDTH.min(available_width);
+    let width_cap = available_width
+        .saturating_mul(3)
+        .saturating_div(5)
+        .max(min_width)
+        .min(available_width);
+    let content_width = message
+        .split('\n')
+        .map(display_width)
+        .max()
+        .unwrap_or_default();
+    let desired_width = u16::try_from(content_width.saturating_add(8)).unwrap_or(u16::MAX);
+    let width = desired_width.clamp(min_width, width_cap);
+    let message_width = width.saturating_sub(HORIZONTAL_CHROME).max(1) as usize;
+    let measured_rows = wrapped_row_count(message, message_width);
+    let available_height = area.height.saturating_sub(1);
+    let min_height = 3.min(available_height);
+    let height_cap = available_height
+        .saturating_mul(2)
+        .saturating_div(5)
+        .max(min_height)
+        .min(available_height);
+    let desired_height =
+        u16::try_from(measured_rows.saturating_add(VERTICAL_CHROME as usize)).unwrap_or(u16::MAX);
+
+    NoticeGeometry {
+        width,
+        height: desired_height.clamp(min_height, height_cap),
+    }
+}
+
+fn notice_message_lines(
+    message: &str,
+    width: u16,
+    max_rows: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let max_rows = max_rows.max(1) as usize;
+    let mut rows = wrap_text_to_width(message, width);
+    let truncated = rows.len() > max_rows;
+    rows.truncate(max_rows);
+    if truncated {
+        if let Some(last) = rows.last_mut() {
+            let mut marked = last.clone();
+            marked.push('…');
+            *last = crate::tui::components::tool_card::truncate_display_width(&marked, width);
+        }
+    }
+
+    rows.into_iter()
+        .map(|row| Line::from(Span::styled(row, style)))
+        .collect()
+}
+
 fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     let Some(toast) = state.toast() else {
         return;
@@ -745,14 +934,13 @@ fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
             area
         };
 
-    if area.width < 12 || area.height < 3 {
+    if area.width < 12 || area.height < 4 {
         return;
     }
 
-    let max_width = area.width.saturating_sub(2).clamp(12, 44);
-    let content_width = display_width(&toast.message) as u16;
-    let toast_width = content_width.saturating_add(8).clamp(14, max_width);
-    let toast_height = 3;
+    let geometry = notice_geometry(area, &toast.message);
+    let toast_width = geometry.width;
+    let toast_height = geometry.height;
     let toast_x = area.right().saturating_sub(toast_width).saturating_sub(1);
     let toast_y = area.y.saturating_add(1);
     let toast_area = Rect::new(toast_x, toast_y, toast_width, toast_height.min(area.height));
@@ -788,16 +976,21 @@ fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
         body_area.x.saturating_add(1),
         body_area.y.saturating_add(1),
         body_area.width.saturating_sub(2),
-        1,
+        toast_area.height.saturating_sub(2),
     );
     let bar_lines = vec![
         Line::from(Span::styled(surface::ACCENT_BAR_GLYPH, bar_style));
         toast_area.height as usize
     ];
-    let paragraph = Paragraph::new(Line::from(Span::styled(toast.message.clone(), body_style)))
-        .alignment(Alignment::Center)
-        .style(body_style)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(notice_message_lines(
+        &toast.message,
+        message_area.width,
+        message_area.height,
+        body_style,
+    ))
+    .alignment(Alignment::Center)
+    .style(body_style)
+    .wrap(Wrap { trim: true });
 
     frame.render_widget(Clear, toast_area);
     frame.render_widget(Block::new().style(body_style), body_area);
@@ -1078,6 +1271,72 @@ mod tests {
     }
 
     #[test]
+    fn notice_geometry_adapts_width_and_height_to_content_and_area() {
+        let area = Rect::new(0, 0, 100, 30);
+        let short = notice_geometry(area, "ok");
+        let long = notice_geometry(
+            area,
+            "a long notice that wraps over several rows "
+                .repeat(4)
+                .as_str(),
+        );
+
+        assert_eq!(short.width, 14);
+        assert_eq!(short.height, 3);
+        assert!(long.width > short.width);
+        assert!(long.width <= 60);
+        assert!(long.height > short.height);
+        assert!(long.height <= 12);
+    }
+
+    #[test]
+    fn long_toast_renders_wrapped_rows_and_visible_truncation() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        state.show_toast(
+            "A very long toast message that must wrap and be visibly truncated when the transcript is short.",
+            ToastKind::Info,
+        );
+
+        let rendered = draw_to_string(&mut state, 80, 24);
+
+        assert!(rendered.contains("A very long toast"), "{rendered}");
+        assert!(rendered.contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn notice_geometry_handles_narrow_terminals_and_wide_characters() {
+        let narrow = notice_geometry(Rect::new(0, 0, 16, 10), "hello world");
+        let wide = notice_geometry(Rect::new(0, 0, 40, 20), "你好世界");
+
+        assert_eq!(narrow.width, 14);
+        assert!(narrow.width <= 16);
+        assert!(wide.width >= 16);
+        assert!(wide.height >= 3);
+    }
+
+    #[test]
+    fn notice_geometry_caps_wrapped_content_and_marks_truncation() {
+        let area = Rect::new(0, 0, 80, 10);
+        let geometry = notice_geometry(area, &"long message ".repeat(100));
+        let lines = notice_message_lines(
+            &"long message ".repeat(100),
+            geometry.width.saturating_sub(4),
+            geometry.height.saturating_sub(2),
+            Style::default(),
+        );
+
+        assert_eq!(geometry.width, 47);
+        assert_eq!(geometry.height, 3);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.to_string().contains('…'))
+        );
+    }
+
+    #[test]
     fn empty_welcome_view_renders_wordmark_without_panic() {
         let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
 
@@ -1157,6 +1416,124 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("message letcode"), "{rendered}");
+    }
+
+    #[test]
+    fn confirm_body_keeps_answers_on_independent_indented_lines() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![
+                    crate::tool::QuestionSpec {
+                        question: "Pick features".into(),
+                        header: "Features".into(),
+                        options: vec![
+                            crate::tool::QuestionOption {
+                                label: "Alpha".into(),
+                                description: "A".into(),
+                            },
+                            crate::tool::QuestionOption {
+                                label: "Beta".into(),
+                                description: "B".into(),
+                            },
+                        ],
+                        multiple: true,
+                    },
+                    crate::tool::QuestionSpec {
+                        question: "Pick mode".into(),
+                        header: "Mode".into(),
+                        options: vec![],
+                        multiple: false,
+                    },
+                ],
+            },
+            None,
+        );
+        question.questions[0].selected_labels = vec!["Alpha".into(), "Beta".into()];
+        question.focus_tab(2);
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("1. Features"), "{rendered}");
+        assert!(rendered.contains("  - Alpha"), "{rendered}");
+        assert!(rendered.contains("  - Beta"), "{rendered}");
+        assert!(rendered.contains("2. Mode"), "{rendered}");
+        assert!(rendered.contains("(not answered)"), "{rendered}");
+        assert!(!rendered.contains("Alpha, Beta"), "{rendered}");
+    }
+
+    #[test]
+    fn narrow_confirm_tabs_wrap_into_multiple_rows() {
+        let question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: (0..3)
+                    .map(|index| crate::tool::QuestionSpec {
+                        question: format!("Question {index}"),
+                        header: format!("Long tab {index}"),
+                        options: vec![],
+                        multiple: true,
+                    })
+                    .collect(),
+            },
+            None,
+        );
+        assert!(question_tab_row_count(&question, 12) > 1);
+        assert_eq!(question_tab_row_count(&question, 200), 1);
+    }
+
+    #[test]
+    fn oversized_tab_label_is_truncated_without_exceeding_row_width() {
+        let question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Question".into(),
+                    header: "A header much longer than the panel".into(),
+                    options: vec![],
+                    multiple: true,
+                }],
+            },
+            None,
+        );
+        let width = 7;
+        let lines = question_tab_lines(&question, width, Theme::default());
+
+        assert_eq!(question_tab_row_count(&question, width), lines.len());
+        assert!(!lines.is_empty());
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= width)
+        );
+    }
+
+    #[test]
+    fn very_short_confirm_panel_skips_zero_height_body_safely() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Question".into(),
+                    header: "Header".into(),
+                    options: vec![],
+                    multiple: true,
+                }],
+            },
+            None,
+        );
+        question.focus_tab(1);
+        question.confirm_scroll = usize::MAX;
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 12, 5);
+        assert!(!rendered.is_empty());
+        let question = state
+            .pending_question
+            .as_ref()
+            .expect("question remains pending");
+        assert!(question.confirm_scroll <= question.confirm_scroll_max());
     }
 
     #[test]

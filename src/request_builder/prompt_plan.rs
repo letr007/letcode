@@ -11,7 +11,7 @@ use crate::runtime_context::{
     PromptContributorKind, RuntimeFrameId, RuntimeFrameProvenance, RuntimePromptRole,
     RuntimeSnapshot, RuntimeSource,
 };
-use crate::user_content::UserMessageContent;
+use crate::user_content::{UserImageAttachment, UserMessageContent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +127,8 @@ pub(crate) enum PromptSegmentContent {
     ToolOutput {
         call_id: String,
         output_json: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<UserImageAttachment>,
     },
 }
 
@@ -1253,7 +1255,15 @@ fn history_item_text(item: &HistoryItem) -> String {
         HistoryItem::ToolOutput {
             call_id,
             output_json,
-        } => format!("{call_id}\n{output_json}"),
+            images,
+        } => format!(
+            "{call_id}\n{output_json}{}",
+            images
+                .iter()
+                .map(UserImageAttachment::prompt_plan_placeholder)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
     }
 }
 
@@ -1326,9 +1336,11 @@ fn history_item_content(item: &HistoryItem) -> PromptSegmentContent {
         HistoryItem::ToolOutput {
             call_id,
             output_json,
+            images,
         } => PromptSegmentContent::ToolOutput {
             call_id: call_id.clone(),
             output_json: output_json.clone(),
+            images: images.clone(),
         },
     }
 }

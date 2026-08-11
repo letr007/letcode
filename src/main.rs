@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
                 projection,
                 config.global.sessions_dir.clone(),
                 config.config_dir.clone(),
+                workspace_dir,
                 active_provider_label,
                 available_models,
                 supported_agent_names()
@@ -258,12 +259,33 @@ fn session_engine_config(
                 })
             })
             .collect(),
+        new_session_default_route: config.active_route(),
+        new_session_default_expert_routes: supported_agent_names()
+            .filter_map(|agent_name| {
+                config
+                    .model_route_for(agent_name)
+                    .cloned()
+                    .map(|route| (agent_name.to_string(), route))
+            })
+            .collect(),
         expert_model_routes: supported_agent_names()
             .filter_map(|agent_name| {
                 config
                     .model_route_for(agent_name)
                     .cloned()
                     .map(|route| (agent_name.to_string(), route))
+            })
+            .collect(),
+        expert_allowed_models: supported_agent_names()
+            .map(|agent_name| {
+                (
+                    agent_name.to_string(),
+                    config
+                        .agents
+                        .allowed_models_for(agent_name)
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
             })
             .collect(),
         legacy_expert_models: supported_agent_names()
@@ -430,13 +452,19 @@ fn run_config_validate(path: Option<String>) -> Result<()> {
 }
 
 fn install_expert_route_factory(agent: &mut Agent<OpenAIConfig>, config: &AppConfig) -> Result<()> {
-    let routes = supported_agent_names().filter_map(|agent_name| {
-        config
-            .model_route_for(agent_name)
-            .cloned()
-            .map(|route| (agent_name.to_string(), route))
+    let policies = supported_agent_names().map(|agent_name| {
+        (
+            agent_name.to_string(),
+            config.model_route_for(agent_name).cloned(),
+            config
+                .agents
+                .allowed_models_for(agent_name)
+                .unwrap_or_default()
+                .to_vec(),
+        )
     });
-    let factory = ExpertRouteFactory::new(routes, &config.providers, &config.global.retry)?;
+    let factory =
+        ExpertRouteFactory::new_with_policies(policies, &config.providers, &config.global.retry)?;
     agent.set_subagent_child_factory(Arc::new(factory));
     Ok(())
 }
