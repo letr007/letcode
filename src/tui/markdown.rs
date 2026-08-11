@@ -1642,7 +1642,7 @@ mod tests {
         // 二维画布：节点框化，垂直箭头连接。
         assert!(supported_text.contains('╭'), "{supported_text}");
         assert!(supported_text.contains('│'), "{supported_text}");
-        assert!(supported_text.contains('v'), "{supported_text}");
+        assert!(supported_text.contains('▼'), "{supported_text}");
         assert!(!supported_text.contains("╭─ mermaid"), "{supported_text}");
         assert!(supported.validate(), "{supported:?}");
 
@@ -1878,7 +1878,7 @@ mod tests {
         // 二维画布：节点框化 + 垂直连线。
         assert!(text.contains('╭'), "{text}");
         assert!(text.contains('│'), "{text}");
-        assert!(text.contains('v'), "{text}");
+        assert!(text.contains('▼'), "{text}");
     }
 
     #[test]
