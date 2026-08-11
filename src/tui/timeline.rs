@@ -23,7 +23,7 @@ pub enum TimelineItem {
     Tool(ToolView),
     Todo(TodoView),
     Permission(PermissionView),
-    AutoReviewAggregate(AutoReviewAggregateView),
+    AutoReview(AutoReviewDecisionView),
     Error(ErrorView),
     /// Durable compaction block: drawn rules + markdown summary (streaming or final).
     Compaction(CompactionView),
@@ -146,21 +146,17 @@ impl TimelineItem {
 
                 blocks
             }
-            Self::AutoReviewAggregate(aggregate) => vec![DisplayBlock::StatusLine {
+            Self::AutoReview(decision) => vec![DisplayBlock::StatusLine {
                 label: "auto-review".into(),
                 text: format!(
-                    "{} decisions · {} approved · {} denied",
-                    aggregate.decisions.len(),
-                    aggregate
-                        .decisions
-                        .iter()
-                        .filter(|decision| decision.allowed)
-                        .count(),
-                    aggregate
-                        .decisions
-                        .iter()
-                        .filter(|decision| !decision.allowed)
-                        .count(),
+                    "{} · {} · {}",
+                    if decision.allowed {
+                        "approved"
+                    } else {
+                        "denied"
+                    },
+                    decision.tool_name,
+                    decision.approval,
                 ),
             }],
             Self::Error(error) => {
@@ -256,6 +252,8 @@ pub struct ReasoningView {
     pub item_id: String,
     pub text: String,
     pub streaming: bool,
+    pub started_at: Option<std::time::Instant>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,12 +375,6 @@ pub struct AutoReviewDecisionView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AutoReviewAggregateView {
-    pub reviewer_child_session_id: String,
-    pub decisions: Vec<AutoReviewDecisionView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionView {
     pub call_id: String,
     pub tool_name: String,
@@ -450,6 +442,7 @@ pub struct Timeline {
     next_revision: u64,
     mutation_revision: u64,
     cache_id: u64,
+    last_reasoning_tick_second: Option<u64>,
 }
 
 impl PartialEq for Timeline {
@@ -468,6 +461,7 @@ impl Default for Timeline {
             next_revision: 0,
             mutation_revision: 0,
             cache_id: next_timeline_cache_id(),
+            last_reasoning_tick_second: None,
         }
     }
 }
@@ -619,11 +613,18 @@ impl Timeline {
         });
     }
 
-    pub(crate) fn push_restored_reasoning(&mut self, item_id: String, text: String) {
+    pub(crate) fn push_restored_reasoning(
+        &mut self,
+        item_id: String,
+        text: String,
+        duration_ms: Option<u64>,
+    ) {
         self.push_item(TimelineItem::Reasoning(ReasoningView {
             item_id,
             text,
             streaming: false,
+            started_at: None,
+            duration_ms,
         }));
     }
 
@@ -758,11 +759,66 @@ impl Timeline {
             return;
         }
 
+        let previous_reasoning_index = self
+            .items
+            .iter()
+            .position(is_queued_user_item)
+            .unwrap_or(self.items.len())
+            .checked_sub(1)
+            .filter(|index| matches!(self.items[*index], TimelineItem::Reasoning(_)));
         self.push_item(TimelineItem::Reasoning(ReasoningView {
             item_id: event.item_id,
             text: event.delta,
             streaming: true,
+            started_at: Some(event.observed_at),
+            duration_ms: None,
         }));
+        if let Some(index) = previous_reasoning_index {
+            self.bump_revision(index);
+        }
+        self.last_reasoning_tick_second = Some(0);
+    }
+
+    pub fn tick_reasoning_elapsed(&mut self, now: std::time::Instant) {
+        const TICK_MS: u128 = 100;
+        let current_tick = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Reasoning(reasoning) if reasoning.streaming => {
+                    reasoning.started_at.map(|started_at| {
+                        let elapsed_ms = now.saturating_duration_since(started_at).as_millis();
+                        if elapsed_ms < 1_000 {
+                            elapsed_ms / TICK_MS
+                        } else {
+                            10 + elapsed_ms / 1_000
+                        }
+                    })
+                }
+                _ => None,
+            })
+            .max()
+            .map(|tick| u64::try_from(tick).unwrap_or(u64::MAX));
+        if current_tick.is_none() {
+            self.last_reasoning_tick_second = None;
+            return;
+        }
+        if current_tick == self.last_reasoning_tick_second {
+            return;
+        }
+        self.last_reasoning_tick_second = current_tick;
+        let indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(item, TimelineItem::Reasoning(reasoning) if reasoning.streaming)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in indices {
+            self.bump_revision(index);
+        }
     }
 
     pub fn push_delegation(&mut self, agent_name: impl Into<String>, task: impl Into<String>) {
@@ -772,21 +828,77 @@ impl Timeline {
         }));
     }
 
-    pub fn finalize_reasoning(&mut self, item_id: &str, text: &str) {
-        if let Some(index) = self.find_reasoning_index(item_id) {
+    pub fn finalize_reasoning(&mut self, event: crate::tui::events::ReasoningDoneEvent) {
+        if let Some(index) = self.active_reasoning_index(&event.item_id) {
             if let TimelineItem::Reasoning(reasoning) = &mut self.items[index] {
-                reasoning.text = text.to_string();
+                reasoning.text = event.text.clone();
                 reasoning.streaming = false;
+                reasoning.duration_ms = reasoning.started_at.map(|started_at| {
+                    u64::try_from(
+                        event
+                            .observed_at
+                            .saturating_duration_since(started_at)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX)
+                });
+                reasoning.started_at = None;
             }
             self.bump_revision(index);
+            if !self.has_streaming_reasoning() {
+                self.last_reasoning_tick_second = None;
+            }
             return;
         }
 
+        let previous_reasoning_index = self
+            .items
+            .iter()
+            .position(is_queued_user_item)
+            .unwrap_or(self.items.len())
+            .checked_sub(1)
+            .filter(|index| matches!(self.items[*index], TimelineItem::Reasoning(_)));
         self.push_item(TimelineItem::Reasoning(ReasoningView {
-            item_id: item_id.to_string(),
-            text: text.to_string(),
+            item_id: event.item_id,
+            text: event.text,
             streaming: false,
+            started_at: None,
+            duration_ms: None,
         }));
+        if let Some(index) = previous_reasoning_index {
+            self.bump_revision(index);
+        }
+        if !self.has_streaming_reasoning() {
+            self.last_reasoning_tick_second = None;
+        }
+    }
+
+    pub fn seal_active_reasoning(&mut self, observed_at: std::time::Instant) {
+        let indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(item, TimelineItem::Reasoning(reasoning) if reasoning.streaming)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in indices {
+            if let TimelineItem::Reasoning(reasoning) = &mut self.items[index] {
+                reasoning.duration_ms = reasoning.started_at.map(|started_at| {
+                    u64::try_from(
+                        observed_at
+                            .saturating_duration_since(started_at)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX)
+                });
+                reasoning.started_at = None;
+                reasoning.streaming = false;
+            }
+            self.bump_revision(index);
+        }
+        self.last_reasoning_tick_second = None;
     }
 
     pub fn finalize_assistant_message(&mut self, message_id: Option<&str>) {
@@ -1018,23 +1130,17 @@ impl Timeline {
 
     pub fn resolve_permission(&mut self, event: PermissionResolutionEvent) {
         if event.origin_label.as_deref() == Some("reviewer") {
-            self.push_auto_review_decision(
-                event
-                    .reviewer_child_session_id
-                    .filter(|session_id| !session_id.is_empty())
-                    .unwrap_or_else(|| "reviewer".into()),
-                AutoReviewDecisionView {
-                    call_id: event.call_id,
-                    tool_name: event.tool_name.unwrap_or_else(|| "unknown tool".into()),
-                    approval: event.approval.unwrap_or_else(|| match event.decision {
-                        PermissionDecision::Approved => "once".into(),
-                        PermissionDecision::Denied => "deny".into(),
-                    }),
-                    risk: event.risk,
-                    rationale: event.reason.unwrap_or_else(|| "no rationale".into()),
-                    allowed: matches!(event.decision, PermissionDecision::Approved),
-                },
-            );
+            self.push_auto_review_decision(AutoReviewDecisionView {
+                call_id: event.call_id,
+                tool_name: event.tool_name.unwrap_or_else(|| "unknown tool".into()),
+                approval: event.approval.unwrap_or_else(|| match event.decision {
+                    PermissionDecision::Approved => "once".into(),
+                    PermissionDecision::Denied => "deny".into(),
+                }),
+                risk: event.risk,
+                rationale: event.reason.unwrap_or_else(|| "no rationale".into()),
+                allowed: matches!(event.decision, PermissionDecision::Approved),
+            });
             return;
         }
 
@@ -1069,54 +1175,15 @@ impl Timeline {
         }));
     }
 
-    pub(crate) fn push_auto_review_decision(
-        &mut self,
-        reviewer_child_session_id: String,
-        decision: AutoReviewDecisionView,
-    ) {
-        let mut index = self.items.iter().position(|item| {
-            matches!(
-                item,
-                TimelineItem::AutoReviewAggregate(aggregate)
-                    if aggregate.reviewer_child_session_id == reviewer_child_session_id
-            )
-        });
-        if index.is_none()
-            && reviewer_child_session_id != "reviewer"
-            && let Some(legacy_index) = self.items.iter().position(|item| {
-                matches!(
-                    item,
-                    TimelineItem::AutoReviewAggregate(aggregate)
-                        if aggregate.reviewer_child_session_id == "reviewer"
-                )
-            })
-        {
-            if let TimelineItem::AutoReviewAggregate(aggregate) = &mut self.items[legacy_index] {
-                aggregate.reviewer_child_session_id = reviewer_child_session_id.clone();
-            }
-            index = Some(legacy_index);
-        }
-
-        if let Some(index) = index {
-            if let TimelineItem::AutoReviewAggregate(aggregate) = &mut self.items[index] {
-                if let Some(existing) = aggregate
-                    .decisions
-                    .iter_mut()
-                    .find(|existing| existing.call_id == decision.call_id)
-                {
-                    *existing = decision;
-                } else {
-                    aggregate.decisions.push(decision);
-                }
-            }
+    pub(crate) fn push_auto_review_decision(&mut self, decision: AutoReviewDecisionView) {
+        if let Some(index) = self.items.iter().position(|item| {
+            matches!(item, TimelineItem::AutoReview(existing) if existing.call_id == decision.call_id)
+        }) {
+            self.items[index] = TimelineItem::AutoReview(decision);
             self.bump_revision(index);
             return;
         }
-
-        self.push_item(TimelineItem::AutoReviewAggregate(AutoReviewAggregateView {
-            reviewer_child_session_id,
-            decisions: vec![decision],
-        }));
+        self.push_item(TimelineItem::AutoReview(decision));
     }
 
     pub(crate) fn push_restored_permission_decision(
@@ -1133,23 +1200,19 @@ impl Timeline {
         reviewer_child_session_id: Option<String>,
     ) {
         if origin_label.as_deref() == Some("reviewer") {
-            self.push_auto_review_decision(
-                reviewer_child_session_id
-                    .filter(|session_id| !session_id.is_empty())
-                    .unwrap_or_else(|| "reviewer".into()),
-                AutoReviewDecisionView {
-                    call_id,
-                    tool_name,
-                    approval: approval.unwrap_or_else(|| match status {
-                        PermissionPromptStatus::Approved => "once".into(),
-                        PermissionPromptStatus::Denied => "deny".into(),
-                        PermissionPromptStatus::Pending => "pending".into(),
-                    }),
-                    risk,
-                    rationale: resolution_reason.unwrap_or_else(|| "no rationale".into()),
-                    allowed: status == PermissionPromptStatus::Approved,
-                },
-            );
+            let _ = reviewer_child_session_id;
+            self.push_auto_review_decision(AutoReviewDecisionView {
+                call_id,
+                tool_name,
+                approval: approval.unwrap_or_else(|| match status {
+                    PermissionPromptStatus::Approved => "once".into(),
+                    PermissionPromptStatus::Denied => "deny".into(),
+                    PermissionPromptStatus::Pending => "pending".into(),
+                }),
+                risk,
+                rationale: resolution_reason.unwrap_or_else(|| "no rationale".into()),
+                allowed: status == PermissionPromptStatus::Approved,
+            });
             return;
         }
 
@@ -1337,18 +1400,17 @@ impl Timeline {
         })
     }
 
+    fn has_streaming_reasoning(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, TimelineItem::Reasoning(reasoning) if reasoning.streaming))
+    }
+
     fn active_reasoning_index(&self, item_id: &str) -> Option<usize> {
         self.items.iter().rposition(|item| match item {
             TimelineItem::Reasoning(reasoning) => {
                 reasoning.streaming && reasoning.item_id == item_id
             }
-            _ => false,
-        })
-    }
-
-    fn find_reasoning_index(&self, item_id: &str) -> Option<usize> {
-        self.items.iter().position(|item| match item {
-            TimelineItem::Reasoning(reasoning) => reasoning.item_id == item_id,
             _ => false,
         })
     }
@@ -1395,6 +1457,123 @@ mod tests {
     use crate::tool::{ToolOutputStream, ToolResult};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
+
+    #[test]
+    fn reasoning_elapsed_ticks_at_subsecond_then_second_boundaries() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new();
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at("reasoning-1", "Inspecting", start));
+        let initial_revision = timeline.item_revisions()[0];
+
+        timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(99));
+        assert_eq!(timeline.item_revisions()[0], initial_revision);
+
+        timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(100));
+        let subsecond_revision = timeline.item_revisions()[0];
+        assert_ne!(subsecond_revision, initial_revision);
+
+        timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(999));
+        let last_subsecond_revision = timeline.item_revisions()[0];
+        assert_ne!(last_subsecond_revision, subsecond_revision);
+
+        timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(1_500));
+        let first_second_revision = timeline.item_revisions()[0];
+        assert_ne!(first_second_revision, last_subsecond_revision);
+
+        timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(1_999));
+        assert_eq!(timeline.item_revisions()[0], first_second_revision);
+
+        timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(2_000));
+        assert_ne!(timeline.item_revisions()[0], first_second_revision);
+    }
+
+    #[test]
+    fn reasoning_done_without_delta_refreshes_preceding_compact_item() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new();
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at("reasoning-1", "First", start));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reasoning-1",
+            "First",
+            start + std::time::Duration::from_millis(100),
+        ));
+        let preceding_revision = timeline.item_revisions()[0];
+
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reasoning-without-delta",
+            "Second",
+            start + std::time::Duration::from_millis(200),
+        ));
+
+        assert_ne!(timeline.item_revisions()[0], preceding_revision);
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Reasoning(first), TimelineItem::Reasoning(second)]
+                if first.text == "First" && second.text == "Second"
+        ));
+    }
+
+    #[test]
+    fn reused_reasoning_item_id_finalizes_the_latest_streaming_item() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new();
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at("reused", "First draft", start));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reused",
+            "First final",
+            start + std::time::Duration::from_millis(100),
+        ));
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at(
+            "reused",
+            "Second draft",
+            start + std::time::Duration::from_millis(200),
+        ));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reused",
+            "Second final",
+            start + std::time::Duration::from_millis(500),
+        ));
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Reasoning(first), TimelineItem::Reasoning(second)]
+                if first.text == "First final"
+                    && first.duration_ms == Some(100)
+                    && !first.streaming
+                    && second.text == "Second final"
+                    && second.duration_ms == Some(300)
+                    && !second.streaming
+        ));
+    }
+
+    #[test]
+    fn reasoning_done_records_duration_and_missing_start_stays_unknown() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new();
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at("reasoning-1", "Draft", start));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reasoning-1",
+            "Final",
+            start + std::time::Duration::from_millis(725),
+        ));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reasoning-without-delta",
+            "Recovered",
+            start + std::time::Duration::from_secs(1),
+        ));
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Reasoning(first), TimelineItem::Reasoning(second)]
+                if !first.streaming
+                    && first.started_at.is_none()
+                    && first.duration_ms == Some(725)
+                    && first.text == "Final"
+                    && !second.streaming
+                    && second.started_at.is_none()
+                    && second.duration_ms.is_none()
+        ));
+    }
 
     #[test]
     fn compaction_preview_accumulates_and_commits_as_durable_block() {
@@ -1645,89 +1824,74 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_permission_resolutions_group_by_child_session() {
+    fn reviewer_permission_resolutions_keep_event_order() {
         let mut timeline = Timeline::new();
-        for (call_id, child_id, decision, approval) in [
-            ("call-1", "reviewer-a", PermissionDecision::Approved, "once"),
-            ("call-2", "reviewer-a", PermissionDecision::Denied, "deny"),
-            (
-                "call-3",
-                "reviewer-b",
-                PermissionDecision::Approved,
-                "always",
-            ),
-        ] {
-            timeline.resolve_permission(PermissionResolutionEvent {
-                call_id: call_id.into(),
-                decision,
-                reason: Some(format!("reason-{call_id}")),
-                tool_name: Some("shell__exec".into()),
-                summary: Some("run command".into()),
-                origin_label: Some("reviewer".into()),
-                approval: Some(approval.into()),
-                risk: Some("low".into()),
-                reviewer_child_session_id: Some(child_id.into()),
-            });
-        }
-
-        assert_eq!(timeline.items().len(), 2);
-        let TimelineItem::AutoReviewAggregate(first) = &timeline.items()[0] else {
-            panic!("expected first auto-review aggregate");
-        };
-        assert_eq!(first.reviewer_child_session_id, "reviewer-a");
-        assert_eq!(first.decisions.len(), 2);
-        assert_eq!(first.decisions[0].approval, "once");
-        assert!(!first.decisions[1].allowed);
-
         timeline.resolve_permission(PermissionResolutionEvent {
             call_id: "call-1".into(),
-            decision: PermissionDecision::Denied,
-            reason: Some("updated reason".into()),
+            decision: PermissionDecision::Approved,
+            reason: Some("safe".into()),
             tool_name: Some("fs__write".into()),
             summary: Some("write file".into()),
+            origin_label: Some("reviewer".into()),
+            approval: Some("once".into()),
+            risk: Some("low".into()),
+            reviewer_child_session_id: Some("reviewer-a".into()),
+        });
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "tool-between",
+            "fs__read",
+            "read file",
+        ));
+        timeline.resolve_permission(PermissionResolutionEvent {
+            call_id: "call-2".into(),
+            decision: PermissionDecision::Denied,
+            reason: Some("blocked".into()),
+            tool_name: Some("shell__exec".into()),
+            summary: Some("run command".into()),
             origin_label: Some("reviewer".into()),
             approval: Some("deny".into()),
             risk: Some("high".into()),
             reviewer_child_session_id: Some("reviewer-a".into()),
         });
-        let TimelineItem::AutoReviewAggregate(first) = &timeline.items()[0] else {
-            panic!("expected updated auto-review aggregate");
-        };
-        assert_eq!(first.decisions.len(), 2);
-        assert_eq!(first.decisions[0].approval, "deny");
-        assert_eq!(first.decisions[0].rationale, "updated reason");
-        assert!(!first.decisions[0].allowed);
 
-        let TimelineItem::AutoReviewAggregate(second) = &timeline.items()[1] else {
-            panic!("expected second auto-review aggregate");
-        };
-        assert_eq!(second.reviewer_child_session_id, "reviewer-b");
-        assert_eq!(second.decisions.len(), 1);
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::AutoReview(first), TimelineItem::Tool(_), TimelineItem::AutoReview(second)]
+                if first.call_id == "call-1"
+                    && first.allowed
+                    && second.call_id == "call-2"
+                    && !second.allowed
+        ));
     }
 
     #[test]
-    fn reviewer_permission_resolutions_adopt_child_id_after_initial_failure() {
+    fn reviewer_permission_resolution_updates_matching_call_in_place() {
         let mut timeline = Timeline::new();
-        for (call_id, child_id) in [("call-failed", None), ("call-next", Some("reviewer-a"))] {
-            timeline.resolve_permission(PermissionResolutionEvent {
-                call_id: call_id.into(),
-                decision: PermissionDecision::Denied,
-                reason: Some("blocked".into()),
-                tool_name: Some("shell__exec".into()),
-                summary: Some("run command".into()),
-                origin_label: Some("reviewer".into()),
-                approval: Some("deny".into()),
-                risk: Some("high".into()),
-                reviewer_child_session_id: child_id.map(str::to_string),
-            });
-        }
-
-        assert_eq!(timeline.items().len(), 1);
-        let TimelineItem::AutoReviewAggregate(aggregate) = &timeline.items()[0] else {
-            panic!("expected migrated auto-review aggregate");
+        let resolution = |decision, reason: &str| PermissionResolutionEvent {
+            call_id: "call-1".into(),
+            decision,
+            reason: Some(reason.into()),
+            tool_name: Some("shell__exec".into()),
+            summary: Some("run command".into()),
+            origin_label: Some("reviewer".into()),
+            approval: Some(if decision == PermissionDecision::Approved {
+                "once".into()
+            } else {
+                "deny".into()
+            }),
+            risk: Some("high".into()),
+            reviewer_child_session_id: None,
         };
-        assert_eq!(aggregate.reviewer_child_session_id, "reviewer-a");
-        assert_eq!(aggregate.decisions.len(), 2);
+        timeline.resolve_permission(resolution(PermissionDecision::Approved, "safe"));
+        timeline.resolve_permission(resolution(PermissionDecision::Denied, "updated"));
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::AutoReview(decision)]
+                if decision.call_id == "call-1"
+                    && !decision.allowed
+                    && decision.rationale == "updated"
+        ));
     }
 
     #[test]

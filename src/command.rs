@@ -37,6 +37,42 @@ pub enum TranscriptScrollbarMode {
     Hidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThoughtsDisplayMode {
+    Compact,
+    Titles,
+    #[default]
+    Full,
+}
+
+impl ThoughtsDisplayMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Titles => "titles",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "compact" => Some(Self::Compact),
+            "2" | "titles" => Some(Self::Titles),
+            "3" | "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Titles => "Titles",
+            Self::Full => "Full",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeName {
@@ -87,6 +123,8 @@ pub enum CommandIntent {
     FastToggle,
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
+    ThoughtsShow,
+    ThoughtsSet(ThoughtsDisplayMode),
     ToolOutputSet(ToolOutputMode),
     TranscriptScrollbarSet(TranscriptScrollbarMode),
     Theme(ThemeCommand),
@@ -220,6 +258,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_slash: false,
         visible_in_help: true,
         visible_in_summary: false,
+    },
+    CommandMetadata {
+        name: "/thoughts",
+        insert_text: "/thoughts",
+        description: "Show or switch thinking display",
+        usage: "/thoughts <compact|titles|full>",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
     },
     CommandMetadata {
         name: "/tool-output",
@@ -371,6 +418,7 @@ pub fn help_summary() -> String {
         "/agents",
         "/fast",
         "/reasoning",
+        "/thoughts",
         "/permission",
         "/tool-output",
         "/scrollbar",
@@ -438,6 +486,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/agents" => expect_no_extra_args(&parts, "/agents", CommandIntent::AgentsShow),
         "/fast" => expect_no_extra_args(&parts, "/fast", CommandIntent::FastToggle),
         "/reasoning" | "/think" => parse_reasoning(&parts),
+        "/thoughts" => parse_thoughts(&parts),
         "/tool-output" => parse_tool_output(&parts),
         "/scrollbar" => parse_transcript_scrollbar(&parts),
         "/theme" => parse_theme(&parts),
@@ -515,6 +564,22 @@ fn parse_reasoning(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         )),
         ["/think", ..] => Err(CommandParseError::new(
             "Usage: /think <off|none|minimal|low|medium|high|xhigh|max>",
+        )),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_thoughts(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/thoughts"] => Ok(CommandIntent::ThoughtsShow),
+        ["/thoughts", value] => match ThoughtsDisplayMode::parse(value) {
+            Some(mode) => Ok(CommandIntent::ThoughtsSet(mode)),
+            None => Err(CommandParseError::new(
+                "Unknown thinking display. Use compact, titles, full, 1, 2, or 3.",
+            )),
+        },
+        ["/thoughts", ..] => Err(CommandParseError::new(
+            "Usage: /thoughts <compact|titles|full>",
         )),
         _ => unreachable!(),
     }
@@ -786,6 +851,21 @@ mod tests {
             parse_command("/reasoning absurd"),
             Err(CommandParseError::new(
                 "Unknown reasoning effort: absurd. Use off, none, minimal, low, medium, high, xhigh, or max."
+            ))
+        );
+        assert_eq!(parse_command("/thoughts"), Ok(CommandIntent::ThoughtsShow));
+        assert_eq!(
+            parse_command("/thoughts 2"),
+            Ok(CommandIntent::ThoughtsSet(ThoughtsDisplayMode::Titles))
+        );
+        assert_eq!(
+            parse_command("/thoughts full"),
+            Ok(CommandIntent::ThoughtsSet(ThoughtsDisplayMode::Full))
+        );
+        assert_eq!(
+            parse_command("/thoughts verbose"),
+            Err(CommandParseError::new(
+                "Unknown thinking display. Use compact, titles, full, 1, 2, or 3."
             ))
         );
     }

@@ -60,6 +60,7 @@ fn recorder_with_sink(sink: impl JournalSink + 'static) -> TranscriptRecorder {
         health: RecorderHealth::Healthy,
         current_context_branch_id: None,
         context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
+        reasoning_started_at: std::collections::HashMap::new(),
     }
 }
 

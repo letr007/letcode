@@ -283,6 +283,14 @@ fn render_picker_body(
                             &item.id,
                         ),
                     ),
+                    DialogKind::ThoughtsPicker => render_reasoning_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        item.id == state.thoughts_display.as_str(),
+                    ),
                     DialogKind::ContextDetail => {
                         render_session_row(frame, row, theme, item, selected, None)
                     }
@@ -306,6 +314,7 @@ fn render_picker_body(
             DialogKind::PermissionPicker => "No permission modes found",
             DialogKind::ThemePicker => "No themes found",
             DialogKind::ReasoningPicker => "No reasoning efforts found",
+            DialogKind::ThoughtsPicker => "No thinking display modes found",
             DialogKind::AgentPicker => "No experts found",
             DialogKind::ExpertModelPicker(_) | DialogKind::ModelPicker => "No models found",
             _ => "No items found",

@@ -124,6 +124,8 @@ impl SessionCommand {
             | CommandIntent::ModelShow
             | CommandIntent::AgentsShow
             | CommandIntent::ReasoningShow
+            | CommandIntent::ThoughtsShow
+            | CommandIntent::ThoughtsSet(_)
             | CommandIntent::ToolOutputSet(_)
             | CommandIntent::TranscriptScrollbarSet(_)
             | CommandIntent::Theme(_)

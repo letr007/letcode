@@ -47,6 +47,9 @@ pub(super) fn apply_projected_session_event(
     match event {
         SessionEvent::Tick => {
             *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
+            projection
+                .timeline
+                .tick_reasoning_elapsed(std::time::Instant::now());
             if let Some(retry) = projection.retry.as_mut() {
                 // Sticky red countdown for the whole backoff window.
                 retry.tick_frame();
@@ -82,9 +85,7 @@ pub(super) fn apply_projected_session_event(
             projection.timeline.push_reasoning_delta(reasoning);
         }
         SessionEvent::ReasoningDone(reasoning) => {
-            projection
-                .timeline
-                .finalize_reasoning(&reasoning.item_id, &reasoning.text);
+            projection.timeline.finalize_reasoning(reasoning);
         }
         SessionEvent::AssistantDelta(delta) => {
             *projection.phase = AppPhase::Running;
@@ -216,6 +217,9 @@ pub(super) fn apply_projected_session_event(
             ));
         }
         SessionEvent::Interrupted => {
+            projection
+                .timeline
+                .seal_active_reasoning(std::time::Instant::now());
             *projection.retry = None;
             *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
@@ -233,6 +237,9 @@ pub(super) fn apply_projected_session_event(
             ));
         }
         SessionEvent::Error(error) => {
+            projection
+                .timeline
+                .seal_active_reasoning(std::time::Instant::now());
             let had_retry = projection.retry.take().is_some();
             *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
@@ -248,6 +255,9 @@ pub(super) fn apply_projected_session_event(
             projection.timeline.push_error(error);
         }
         SessionEvent::Done => {
+            projection
+                .timeline
+                .seal_active_reasoning(std::time::Instant::now());
             let had_retry = projection.retry.take().is_some();
             *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);

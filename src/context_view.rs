@@ -609,7 +609,7 @@ pub(crate) fn index_context_blocks(
                     }
                 }
             }
-            TranscriptEvent::ReasoningMessage { content } => {
+            TranscriptEvent::ReasoningMessage { content, .. } => {
                 if !content.trim().is_empty() {
                     insert_block(
                         &mut blocks,

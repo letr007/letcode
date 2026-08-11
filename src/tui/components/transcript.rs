@@ -219,7 +219,7 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
     }
 
     for (index, item) in items.iter().enumerate() {
-        if timeline_item_needs_separator_before(index, items) {
+        if timeline_item_needs_separator_before(index, items, state.thoughts_display) {
             lines.push(Line::from(""));
         }
 
@@ -231,6 +231,8 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 state.status_spinner_frame,
                 tool_output_expanded_for_item(state, item),
                 is_reviewer_child_view(state),
+                state.thoughts_display,
+                index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_)),
             ),
         ));
     }
@@ -276,12 +278,15 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     state.transcript_render_cache.row_counts.clear();
 
     for index in 0..item_count {
-        let separator_rows =
-            if timeline_item_needs_separator_before(index, &state.active_timeline().items()) {
-                1
-            } else {
-                0
-            };
+        let separator_rows = if timeline_item_needs_separator_before(
+            index,
+            &state.active_timeline().items(),
+            state.thoughts_display,
+        ) {
+            1
+        } else {
+            0
+        };
         rows = rows.saturating_add(separator_rows);
         state.transcript_render_cache.row_starts.push(rows);
         let line_count = cached_item_line_count(state, index, theme, width);
@@ -343,12 +348,15 @@ fn visible_cached_transcript_lines(
     for index in first_item..item_count {
         let item_start = state.transcript_render_cache.row_starts[index];
         let item_count = state.transcript_render_cache.row_counts[index];
-        let separator_rows =
-            if timeline_item_needs_separator_before(index, &state.active_timeline().items()) {
-                1
-            } else {
-                0
-            };
+        let separator_rows = if timeline_item_needs_separator_before(
+            index,
+            &state.active_timeline().items(),
+            state.thoughts_display,
+        ) {
+            1
+        } else {
+            0
+        };
         let separator_start = item_start.saturating_sub(separator_rows);
         let item_end = item_start.saturating_add(item_count);
 
@@ -390,7 +398,11 @@ fn visible_document_lines(
 ) -> Vec<Option<&RenderLine<Style>>> {
     let mut rows = vec![None; surface::TRANSCRIPT_TOP_SPACER];
     for (index, entry) in state.transcript_render_cache.entries.iter().enumerate() {
-        if timeline_item_needs_separator_before(index, &state.active_timeline().items()) {
+        if timeline_item_needs_separator_before(
+            index,
+            &state.active_timeline().items(),
+            state.thoughts_display,
+        ) {
             rows.push(None);
         }
         rows.extend(entry.document.lines.iter().map(Some));
@@ -406,27 +418,31 @@ fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
         && state.transcript_render_cache.total_rows.is_some()
 }
 
-fn timeline_item_needs_separator_before(index: usize, items: &[TimelineItem]) -> bool {
-    // 连续的 Todo 快照之间不加空行（实时状态更新不跳动）；
-    // 其余卡片之间保留空行，避免不同卡片（如工具输出卡片紧贴 TODO 卡片）粘合。
-    index > 0
-        && !matches!(
-            (&items[index - 1], &items[index]),
-            (TimelineItem::Todo(_), TimelineItem::Todo(_))
-        )
+fn timeline_item_needs_separator_before(
+    index: usize,
+    items: &[TimelineItem],
+    thoughts_display: crate::command::ThoughtsDisplayMode,
+) -> bool {
+    if index == 0 {
+        return false;
+    }
+    match (&items[index - 1], &items[index]) {
+        (TimelineItem::Todo(_), TimelineItem::Todo(_)) => false,
+        (TimelineItem::Reasoning(_), TimelineItem::Reasoning(_)) => {
+            thoughts_display != crate::command::ThoughtsDisplayMode::Compact
+        }
+        _ => true,
+    }
 }
 
 fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool {
     let key = match item {
         TimelineItem::Tool(tool) => Some(tool.call_id.as_str()),
-        TimelineItem::AutoReviewAggregate(_) => None,
+        TimelineItem::AutoReview(_) => None,
         _ => return state.tool_output_expanded,
     };
     let key = key.map(str::to_string).or_else(|| match item {
-        TimelineItem::AutoReviewAggregate(aggregate) => Some(format!(
-            "auto-review:{}",
-            aggregate.reviewer_child_session_id
-        )),
+        TimelineItem::AutoReview(decision) => Some(format!("auto-review:{}", decision.call_id)),
         _ => None,
     });
     key.and_then(|key| state.tool_output_overrides.get(&key).copied())
@@ -471,12 +487,18 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
                 crate::tui::timeline::ToolExecutionStatus::Pending
                     | crate::tui::timeline::ToolExecutionStatus::Running
             )
+    ) || matches!(
+        &state.active_timeline().items()[index],
+        TimelineItem::Reasoning(reasoning) if reasoning.streaming
     );
     if state.transcript_render_cache.entries[index].revision == revision && !live {
         return;
     }
 
     let item = state.active_timeline().items()[index].clone();
+    let items = state.active_timeline().items();
+    let next_reasoning =
+        index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_));
     let document = render_timeline_item_document(
         &item,
         theme,
@@ -484,6 +506,8 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         state.status_spinner_frame,
         tool_output_expanded_for_item(state, &item),
         is_reviewer_child_view(state),
+        state.thoughts_display,
+        next_reasoning,
     );
     let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;
@@ -554,6 +578,8 @@ struct TimelineItemComponent<'a> {
     frame: usize,
     expanded_output: bool,
     reviewer_view: bool,
+    thoughts_display: crate::command::ThoughtsDisplayMode,
+    next_reasoning: bool,
 }
 
 impl Component<Style> for TimelineItemComponent<'_> {
@@ -573,9 +599,14 @@ impl Component<Style> for TimelineItemComponent<'_> {
             TimelineItem::User(message) => {
                 build_user_message(&mut out, message, self.theme, self.width)
             }
-            TimelineItem::Reasoning(reasoning) => {
-                build_reasoning_lines(&mut out, reasoning, self.theme, self.width)
-            }
+            TimelineItem::Reasoning(reasoning) => build_reasoning_lines(
+                &mut out,
+                reasoning,
+                self.theme,
+                self.width,
+                self.thoughts_display,
+                self.next_reasoning,
+            ),
             TimelineItem::Delegation(delegation) => {
                 build_delegation_lines(&mut out, delegation, self.theme, self.width)
             }
@@ -598,9 +629,9 @@ impl Component<Style> for TimelineItemComponent<'_> {
             TimelineItem::Permission(permission) => {
                 build_permission_lines(&mut out, permission, self.theme, self.width)
             }
-            TimelineItem::AutoReviewAggregate(aggregate) => build_auto_review_aggregate_lines(
+            TimelineItem::AutoReview(decision) => build_auto_review_lines(
                 &mut out,
-                aggregate,
+                decision,
                 self.theme,
                 self.width,
                 self.expanded_output,
@@ -659,6 +690,8 @@ fn render_timeline_item_document(
     frame: usize,
     expanded_output: bool,
     reviewer_view: bool,
+    thoughts_display: crate::command::ThoughtsDisplayMode,
+    next_reasoning: bool,
 ) -> Document<Style> {
     let mut document = Document::default();
     TimelineItemComponent {
@@ -668,6 +701,8 @@ fn render_timeline_item_document(
         frame,
         expanded_output,
         reviewer_view,
+        thoughts_display,
+        next_reasoning,
     }
     .render(&mut document);
     document.finish();
@@ -719,6 +754,8 @@ fn build_reasoning_lines(
     reasoning: &ReasoningView,
     theme: Theme,
     width: usize,
+    display: crate::command::ThoughtsDisplayMode,
+    next_reasoning: bool,
 ) {
     let content_width = width.saturating_sub(2).max(1);
     let (title, body) = reasoning_title_and_body(&reasoning.text);
@@ -729,24 +766,28 @@ fn build_reasoning_lines(
             "Thought".to_string()
         }
     });
-    let title_suffix = if reasoning.streaming { " …" } else { "" };
+    let elapsed = format_reasoning_elapsed(reasoning);
 
-    // 标题行：作为单独 source block（已清洗，prefix "  Thought: " 长度 11，
-    // 但只用原文本部分，suffix " …" 不计入）。
-    let title_block = out.add_source(title.clone());
-    let title_len = title.chars().count();
-    out.push_content(
-        "  Thought: ",
-        reasoning_label_style(theme),
-        title,
-        reasoning_label_style(theme),
-        SourceRange::new(title_block, 0, title_len),
-        title_suffix,
-        reasoning_label_style(theme),
-        Break::HardBreak,
-    );
+    if display == crate::command::ThoughtsDisplayMode::Compact {
+        if next_reasoning {
+            return;
+        }
+        push_reasoning_status_line(out, reasoning.streaming, &elapsed, theme, width);
+        push_wrapped_reasoning_title(out, &title, theme, width, Break::End);
+        return;
+    }
 
-    // body 行：先清洗每行拼成 cleaned_body，再 wrap 一次得到 chunk + 字符区间。
+    let suffix = format!(" · {elapsed}");
+    if 2 + "Thought: ".chars().count() + title.chars().count() + suffix.chars().count() <= width {
+        push_reasoning_title_line(out, "Thought: ", &title, &suffix, theme, Break::HardBreak);
+    } else {
+        push_reasoning_status_line(out, reasoning.streaming, &elapsed, theme, width);
+        push_wrapped_reasoning_title(out, &title, theme, width, Break::HardBreak);
+    }
+    if display == crate::command::ThoughtsDisplayMode::Titles {
+        return;
+    }
+
     let cleaned_body: String = {
         let mut s = String::new();
         let mut first = true;
@@ -785,6 +826,110 @@ fn build_reasoning_lines(
             Line::from(Span::styled("  …", root_dim_style(theme))),
             Break::End,
         );
+    }
+}
+
+fn push_reasoning_status_line(
+    out: &mut TimelineDocument,
+    streaming: bool,
+    elapsed: &str,
+    theme: Theme,
+    width: usize,
+) {
+    let label = if streaming { "Thinking…" } else { "Thought" };
+    let status = format!("  {label} · {elapsed}");
+    for line in wrap_text_to_width(&status, width) {
+        out.push_decoration(
+            Line::from(Span::styled(line, reasoning_label_style(theme))),
+            Break::HardBreak,
+        );
+    }
+}
+
+fn push_reasoning_title_line(
+    out: &mut TimelineDocument,
+    label: &str,
+    title: &str,
+    suffix: &str,
+    theme: Theme,
+    boundary: Break,
+) {
+    let title_block = out.add_source(title.to_string());
+    let title_len = title.chars().count();
+    out.push_content(
+        format!("  {label}"),
+        reasoning_label_style(theme),
+        title.to_string(),
+        reasoning_label_style(theme),
+        SourceRange::new(title_block, 0, title_len),
+        suffix.to_string(),
+        reasoning_label_style(theme),
+        boundary,
+    );
+}
+
+fn push_wrapped_reasoning_title(
+    out: &mut TimelineDocument,
+    title: &str,
+    theme: Theme,
+    width: usize,
+    boundary: Break,
+) {
+    let title_block = out.add_source(title.to_string());
+    let chunks = wrap_text_to_width_with_offsets(title, width.saturating_sub(2).max(1));
+    let last_chunk = chunks.len().saturating_sub(1);
+
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        if chunk.source_start_char == chunk.source_end_char {
+            continue;
+        }
+        out.push_content(
+            "  ",
+            reasoning_label_style(theme),
+            chunk.text,
+            reasoning_label_style(theme),
+            SourceRange::new(title_block, chunk.source_start_char, chunk.source_end_char),
+            "",
+            reasoning_label_style(theme),
+            if index == last_chunk {
+                boundary
+            } else {
+                Break::SoftWrap
+            },
+        );
+    }
+}
+
+fn format_reasoning_elapsed(reasoning: &ReasoningView) -> String {
+    let elapsed_ms = reasoning.duration_ms.or_else(|| {
+        reasoning.started_at.map(|started_at| {
+            u64::try_from(
+                std::time::Instant::now()
+                    .saturating_duration_since(started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+        })
+    });
+    elapsed_ms
+        .map(format_elapsed_duration)
+        .unwrap_or_else(|| "—".into())
+}
+
+fn format_elapsed_duration(elapsed_ms: u64) -> String {
+    if elapsed_ms < 1_000 {
+        format!("{elapsed_ms}ms")
+    } else if elapsed_ms < 60_000 {
+        format!("{}s", elapsed_ms / 1_000)
+    } else {
+        let total_seconds = elapsed_ms / 1_000;
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        if seconds == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {seconds}s")
+        }
     }
 }
 
@@ -1158,9 +1303,9 @@ fn build_permission_lines(
     }
 }
 
-fn build_auto_review_aggregate_lines(
+fn build_auto_review_lines(
     out: &mut TimelineDocument,
-    aggregate: &crate::tui::timeline::AutoReviewAggregateView,
+    decision: &crate::tui::timeline::AutoReviewDecisionView,
     theme: Theme,
     width: usize,
     expanded: bool,
@@ -1169,44 +1314,42 @@ fn build_auto_review_aggregate_lines(
     if width == 0 {
         return;
     }
-    let approved = aggregate
-        .decisions
-        .iter()
-        .filter(|decision| decision.allowed)
-        .count();
-    let denied = aggregate.decisions.len().saturating_sub(approved);
+    let status = if decision.allowed {
+        "approved"
+    } else {
+        "denied"
+    };
     let title = format!(
-        "auto-review · {} decisions · {} approved · {} denied · {}",
-        aggregate.decisions.len(),
-        approved,
-        denied,
-        if expanded { "collapse" } else { "expand" },
+        "⛨ Auto-review {status} {} · {}{}",
+        decision.tool_name,
+        decision.approval,
+        if expanded {
+            " · collapse"
+        } else {
+            " · expand"
+        },
     );
+    let status_style = auto_review_status_style(decision.allowed, theme);
     for line in wrap_text_to_width(&title, width) {
         out.push_decoration(
-            Line::from(Span::styled(line, root_muted_style(theme))),
+            Line::from(Span::styled(line, status_style)),
             Break::HardBreak,
         );
     }
     if expanded {
-        for decision in &aggregate.decisions {
-            let risk = decision.risk.as_deref().unwrap_or("unknown");
-            let line = format!(
-                "{} · {} · {} · {} · {} · call {}",
-                decision.tool_name,
-                decision.approval,
-                risk,
-                decision.rationale,
-                if decision.allowed {
-                    "approved"
-                } else {
-                    "denied"
-                },
-                decision.call_id,
-            );
-            push_auto_review_text(out, &line, root_dim_style(theme), width, Break::HardBreak);
-        }
+        let risk = decision.risk.as_deref().unwrap_or("unknown");
+        let detail = format!(
+            "risk {risk} · {} · call {}",
+            decision.rationale, decision.call_id,
+        );
+        push_auto_review_text(out, &detail, root_dim_style(theme), width, Break::HardBreak);
     }
+}
+
+fn auto_review_status_style(allowed: bool, theme: Theme) -> Style {
+    Style::default()
+        .fg(if allowed { theme.success } else { theme.error })
+        .bg(theme.root_bg)
 }
 
 fn push_auto_review_text(
@@ -1724,6 +1867,7 @@ mod tests {
             ReasoningDoneEvent, SessionEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
             UserMessageEvent,
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
+            measure::display_width,
             state::{ContextDetailTarget, TuiState},
             theme::{Theme, ThemeName},
             timeline::{
@@ -1897,33 +2041,37 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_aggregate_renders_summary_and_expanded_decisions() {
-        let item =
-            TimelineItem::AutoReviewAggregate(crate::tui::timeline::AutoReviewAggregateView {
-                reviewer_child_session_id: "reviewer-child".into(),
-                decisions: vec![
-                    crate::tui::timeline::AutoReviewDecisionView {
-                        call_id: "call-allow".into(),
-                        tool_name: "fs__write".into(),
-                        approval: "once".into(),
-                        risk: Some("low".into()),
-                        rationale: "safe edit".into(),
-                        allowed: true,
-                    },
-                    crate::tui::timeline::AutoReviewDecisionView {
-                        call_id: "call-deny".into(),
-                        tool_name: "shell__exec".into(),
-                        approval: "deny".into(),
-                        risk: Some("high".into()),
-                        rationale: "unsafe command".into(),
-                        allowed: false,
-                    },
-                ],
-            });
+    fn auto_review_renders_lock_status_and_expanded_rationale() {
+        let item = TimelineItem::AutoReview(crate::tui::timeline::AutoReviewDecisionView {
+            call_id: "call-deny".into(),
+            tool_name: "shell__exec".into(),
+            approval: "deny".into(),
+            risk: Some("high".into()),
+            rationale: "unsafe command".into(),
+            allowed: false,
+        });
         let theme = Theme::dark();
 
-        let collapsed = render_timeline_item_document(&item, theme, 80, 0, false, false);
-        let expanded = render_timeline_item_document(&item, theme, 80, 0, true, false);
+        let collapsed = render_timeline_item_document(
+            &item,
+            theme,
+            80,
+            0,
+            false,
+            false,
+            crate::command::ThoughtsDisplayMode::Full,
+            false,
+        );
+        let expanded = render_timeline_item_document(
+            &item,
+            theme,
+            80,
+            0,
+            true,
+            false,
+            crate::command::ThoughtsDisplayMode::Full,
+            false,
+        );
         let collapsed_text = collapsed
             .lines
             .iter()
@@ -1937,31 +2085,22 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
 
-        assert!(
-            collapsed_text.contains("auto-review · 2 decisions · 1 approved · 1 denied · expand")
-        );
+        assert!(collapsed_text.contains("⛨ Auto-review denied shell__exec · deny · expand"));
         assert!(!collapsed_text.contains("unsafe command"));
-        assert!(
-            expanded_text.contains("auto-review · 2 decisions · 1 approved · 1 denied · collapse")
-        );
-        assert!(
-            expanded_text
-                .contains("fs__write · once · low · safe edit · approved · call call-allow")
-        );
-        assert!(
-            expanded_text
-                .contains("shell__exec · deny · high · unsafe command · denied · call call-deny")
-        );
+        assert!(expanded_text.contains("⛨ Auto-review denied shell__exec · deny · collapse"));
+        assert!(expanded_text.contains("risk high · unsafe command · call call-deny"));
         assert!(expanded.validate());
-        assert!(
-            expanded
-                .lines
-                .iter()
-                .flat_map(|line| line.spans.iter())
-                .any(|span| span.source.is_some() && span.text.contains("unsafe command"))
-        );
 
-        let narrow = render_timeline_item_document(&item, theme, 24, 0, true, false);
+        let narrow = render_timeline_item_document(
+            &item,
+            theme,
+            24,
+            0,
+            true,
+            false,
+            crate::command::ThoughtsDisplayMode::Full,
+            false,
+        );
         assert!(narrow.validate());
         assert!(
             narrow.lines.iter().all(|line| {
@@ -2040,7 +2179,16 @@ mod tests {
         for item in cards {
             let lines =
                 ratatui::text::Text::from(crate::tui::transcript_ratatui::document_to_ratatui(
-                    &render_timeline_item_document(&item, theme, width, 0, false, false),
+                    &render_timeline_item_document(
+                        &item,
+                        theme,
+                        width,
+                        0,
+                        false,
+                        false,
+                        crate::command::ThoughtsDisplayMode::Full,
+                        false,
+                    ),
                 ));
             assert!(
                 lines.lines.iter().all(|line| {
@@ -2060,9 +2208,17 @@ mod tests {
             streaming: false,
             queued: false,
         });
-        let ordinary_lines = crate::tui::transcript_ratatui::document_to_ratatui(
-            &render_timeline_item_document(&ordinary, theme, width, 0, false, false),
-        );
+        let ordinary_lines =
+            crate::tui::transcript_ratatui::document_to_ratatui(&render_timeline_item_document(
+                &ordinary,
+                theme,
+                width,
+                0,
+                false,
+                false,
+                crate::command::ThoughtsDisplayMode::Full,
+                false,
+            ));
         assert!(
             ordinary_lines
                 .iter()
@@ -2176,6 +2332,179 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert_eq!(bottom, vec!["row-18", "row-19"]);
+    }
+
+    #[test]
+    fn compact_reasoning_cache_refreshes_when_adjacent_item_is_added() {
+        let start = std::time::Instant::now();
+        let mut state = TuiState::default();
+        state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Compact);
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-1",
+            "First title\nFirst body",
+            start,
+        )));
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-1",
+            "First title\nFirst body",
+            start + std::time::Duration::from_millis(400),
+        )));
+
+        let theme = Theme::dark();
+        let width = 80;
+        cached_transcript_row_count(&mut state, theme, width);
+        let before = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(before.contains("First title"), "{before}");
+
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-2",
+            "Second title\nSecond body",
+            start + std::time::Duration::from_millis(500),
+        )));
+        cached_transcript_row_count(&mut state, theme, width);
+        let after = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!after.contains("First title"), "{after}");
+        assert!(after.contains("Second title"), "{after}");
+    }
+
+    #[test]
+    fn streaming_reasoning_status_wraps_at_narrow_width() {
+        let mut state = TuiState::default();
+        state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Compact);
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+            "reasoning-1",
+            "检查缓存状态",
+        )));
+
+        for width in [8, 12, 18] {
+            let lines = transcript_lines(&state, Theme::dark(), width);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&line.to_string()) <= width),
+                "width {width}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_display_modes_and_narrow_width_render_cleanly() {
+        let start = std::time::Instant::now();
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-1",
+            "Inspecting cache\nRead the cached document and compare adjacent items.",
+            start,
+        )));
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-1",
+            "Inspecting cache\nRead the cached document and compare adjacent items.",
+            start + std::time::Duration::from_millis(1_250),
+        )));
+
+        for mode in [
+            crate::command::ThoughtsDisplayMode::Compact,
+            crate::command::ThoughtsDisplayMode::Titles,
+            crate::command::ThoughtsDisplayMode::Full,
+        ] {
+            state.set_thoughts_display(mode);
+            let lines = transcript_lines(&state, Theme::dark(), 18);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&line.to_string()) <= 18)
+            );
+            let text = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Inspecting cache"), "{mode:?}: {text}");
+            assert_eq!(
+                text.contains("Read the cached"),
+                mode == crate::command::ThoughtsDisplayMode::Full,
+                "{mode:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_reasoning_titles_are_separated_outside_compact_mode() {
+        let start = std::time::Instant::now();
+        let mut state = TuiState::default();
+        for (index, title) in ["First thought", "Second thought", "Third thought"]
+            .into_iter()
+            .enumerate()
+        {
+            let observed_at = start + std::time::Duration::from_millis(index as u64 * 100);
+            let item_id = format!("reasoning-{index}");
+            state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+                &item_id,
+                title,
+                observed_at,
+            )));
+            state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+                item_id,
+                title,
+                observed_at + std::time::Duration::from_millis(50),
+            )));
+        }
+
+        for mode in [
+            crate::command::ThoughtsDisplayMode::Titles,
+            crate::command::ThoughtsDisplayMode::Full,
+        ] {
+            state.set_thoughts_display(mode);
+            let lines = transcript_lines(&state, Theme::dark(), 80)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            let title_rows = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| line.contains("Thought:").then_some(index))
+                .collect::<Vec<_>>();
+
+            assert_eq!(title_rows.len(), 3, "{mode:?}: {lines:?}");
+            assert!(
+                title_rows
+                    .windows(2)
+                    .all(|rows| lines[rows[0] + 1..rows[1]].iter().any(String::is_empty)),
+                "{mode:?}: {lines:?}"
+            );
+
+            let total_rows = cached_transcript_row_count(&mut state, Theme::dark(), 80);
+            let cached = visible_cached_transcript_lines(
+                &mut state,
+                Theme::dark(),
+                80,
+                u16::try_from(total_rows).expect("test transcript fits in u16 rows"),
+                0,
+            )
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+            assert_eq!(cached, lines, "{mode:?}");
+        }
+
+        state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Compact);
+        let compact = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!compact.contains("First thought"), "{compact}");
+        assert!(!compact.contains("Second thought"), "{compact}");
+        assert!(compact.contains("Third thought"), "{compact}");
     }
 
     #[test]

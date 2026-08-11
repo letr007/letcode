@@ -183,7 +183,7 @@ fn entry_details(
         TranscriptEvent::AssistantMessage { content } => {
             (SessionHistoryEntryKind::Assistant, content.clone(), None)
         }
-        TranscriptEvent::ReasoningMessage { content } => {
+        TranscriptEvent::ReasoningMessage { content, .. } => {
             (SessionHistoryEntryKind::Assistant, content.clone(), None)
         }
         TranscriptEvent::AssistantToolCallBatch { text, .. } => (

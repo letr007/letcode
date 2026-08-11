@@ -58,6 +58,6 @@ pub use terminal::{OwnedTerminal, TerminalGuard, TuiTerminal};
 pub use theme::{Theme, ThemeName};
 #[allow(unused_imports)]
 pub use timeline::{
-    ErrorView, MessageRole, MessageView, PermissionPromptStatus, PermissionView, ReasoningView,
-    Timeline, TimelineItem, ToolExecutionStatus, ToolView,
+    AutoReviewDecisionView, ErrorView, MessageRole, MessageView, PermissionPromptStatus,
+    PermissionView, ReasoningView, Timeline, TimelineItem, ToolExecutionStatus, ToolView,
 };

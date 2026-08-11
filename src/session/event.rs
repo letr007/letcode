@@ -8,6 +8,7 @@ use crate::context_tree::ContextTreeState;
 use crate::context_view::{ContextViewProjection, SummaryArtifact};
 use crate::runtime_context::RuntimeActiveContext;
 use crate::user_content::{UserMessageContent, UserMessageSubmission};
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -240,6 +241,7 @@ impl UserMessageEvent {
 pub struct ReasoningDeltaEvent {
     pub item_id: String,
     pub delta: String,
+    pub observed_at: Instant,
 }
 
 impl ReasoningDeltaEvent {
@@ -247,6 +249,16 @@ impl ReasoningDeltaEvent {
         Self {
             item_id: item_id.into(),
             delta: delta.into(),
+            observed_at: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn at(item_id: impl Into<String>, delta: impl Into<String>, observed_at: Instant) -> Self {
+        Self {
+            item_id: item_id.into(),
+            delta: delta.into(),
+            observed_at,
         }
     }
 }
@@ -255,6 +267,7 @@ impl ReasoningDeltaEvent {
 pub struct ReasoningDoneEvent {
     pub item_id: String,
     pub text: String,
+    pub observed_at: Instant,
 }
 
 impl ReasoningDoneEvent {
@@ -262,6 +275,16 @@ impl ReasoningDoneEvent {
         Self {
             item_id: item_id.into(),
             text: text.into(),
+            observed_at: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn at(item_id: impl Into<String>, text: impl Into<String>, observed_at: Instant) -> Self {
+        Self {
+            item_id: item_id.into(),
+            text: text.into(),
+            observed_at,
         }
     }
 }

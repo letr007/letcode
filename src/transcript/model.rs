@@ -295,6 +295,8 @@ pub enum TranscriptEvent {
     },
     ReasoningMessage {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     AssistantToolCallBatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]

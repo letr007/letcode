@@ -860,6 +860,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
             "CLI does not support /agents yet; use the TUI to select expert models.".into(),
         ),
         CommandIntent::ReasoningShow => ReplCommand::ReasoningShow,
+        CommandIntent::ThoughtsShow | CommandIntent::ThoughtsSet(_) => ReplCommand::Unsupported(
+            "CLI does not support /thoughts; use the TUI to switch thinking display.".into(),
+        ),
         CommandIntent::ResumeShow => ReplCommand::ResumeShow,
         CommandIntent::ToolOutputSet(ToolOutputMode::Toggle)
         | CommandIntent::ToolOutputSet(ToolOutputMode::Expanded)

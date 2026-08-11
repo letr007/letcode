@@ -9,8 +9,8 @@ use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
 use crate::command::{
-    ChildNavigation as SharedChildNavigation, CommandIntent, ThemeCommand, ToolOutputMode,
-    TranscriptScrollbarMode, help_summary, parse_command,
+    ChildNavigation as SharedChildNavigation, CommandIntent, ThemeCommand, ThoughtsDisplayMode,
+    ToolOutputMode, TranscriptScrollbarMode, help_summary, parse_command,
 };
 use crate::mcp;
 use crate::permission::PermissionMode;
@@ -2018,6 +2018,8 @@ impl TuiRuntime {
                 | CommandIntent::ModelShow
                 | CommandIntent::AgentsShow
                 | CommandIntent::ReasoningShow
+                | CommandIntent::ThoughtsShow
+                | CommandIntent::ThoughtsSet(_)
                 | CommandIntent::ContextBrowse
                 | CommandIntent::McpBrowse
                 | CommandIntent::SkillBrowse
@@ -2212,6 +2214,8 @@ impl TuiRuntime {
             CommandIntent::ModelShow => self.show_model_dialog(),
             CommandIntent::AgentsShow => self.show_agents_dialog(),
             CommandIntent::ReasoningShow => self.show_reasoning_dialog(),
+            CommandIntent::ThoughtsShow => self.show_thoughts_dialog(),
+            CommandIntent::ThoughtsSet(mode) => self.handle_thoughts_command(mode),
             CommandIntent::PermissionShow => self.show_permission_dialog(),
             CommandIntent::ToolOutputSet(mode) => self.handle_tool_output_command(mode),
             CommandIntent::Theme(command) => Ok(Some(self.handle_theme_command(command))),
@@ -2381,7 +2385,28 @@ impl TuiRuntime {
             tool_output_expanded: self.state.tool_output_expanded,
             transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
             theme: self.state.theme_id.clone(),
+            thoughts_display: self.state.thoughts_display,
         }
+    }
+
+    fn handle_thoughts_command(
+        &mut self,
+        mode: ThoughtsDisplayMode,
+    ) -> Result<Option<SubmittedCommand>> {
+        self.apply_thoughts_display(mode);
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn apply_thoughts_display(&mut self, mode: ThoughtsDisplayMode) {
+        self.state.set_thoughts_display(mode);
+        let prefs = self.tui_preferences();
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            tracing::warn!(%error, "failed to save TUI preferences");
+        }
+        self.state.show_toast(
+            format!("Thinking display: {}", mode.label()),
+            ToastKind::Info,
+        );
     }
 
     fn handle_theme_command(&mut self, command: ThemeCommand) -> SubmittedCommand {
@@ -2746,6 +2771,38 @@ impl TuiRuntime {
         self.state.open_dialog(dialog);
     }
 
+    fn show_thoughts_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let mut dialog = DialogState::new(
+            DialogKind::ThoughtsPicker,
+            "Thinking display",
+            Some("Select how thinking appears in the timeline".into()),
+            vec![
+                DialogItem::new(
+                    ThoughtsDisplayMode::Compact.as_str(),
+                    "Level 1 · Compact",
+                    Some("Current cycle and latest title".into()),
+                ),
+                DialogItem::new(
+                    ThoughtsDisplayMode::Titles.as_str(),
+                    "Level 2 · Titles",
+                    Some("All titles with elapsed time".into()),
+                ),
+                DialogItem::new(
+                    ThoughtsDisplayMode::Full.as_str(),
+                    "Level 3 · Full",
+                    Some("Titles, elapsed time, and full content".into()),
+                ),
+            ],
+        );
+        dialog.selected = match self.state.thoughts_display {
+            ThoughtsDisplayMode::Compact => 0,
+            ThoughtsDisplayMode::Titles => 1,
+            ThoughtsDisplayMode::Full => 2,
+        };
+        self.state.open_dialog(dialog);
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
     fn show_reasoning_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let efforts = self.active_reasoning_efforts();
         if efforts.is_empty() {
@@ -2980,6 +3037,13 @@ impl TuiRuntime {
                     return Ok(None);
                 }
                 Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
+            }
+            DialogKind::ThoughtsPicker => {
+                self.state.close_dialog();
+                let mode = ThoughtsDisplayMode::parse(&selected.id)
+                    .expect("thinking display picker items should use valid ids");
+                self.apply_thoughts_display(mode);
+                Ok(None)
             }
             DialogKind::ThemePicker => {
                 self.state.close_dialog();
@@ -3479,6 +3543,7 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/child"
             | "/children"
             | "/parent"
+            | "/thoughts"
             | "/tool-output"
             | "/scrollbar"
             | "/theme"
@@ -3832,6 +3897,7 @@ pub async fn run_tui(
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
+    state.set_thoughts_display(preferences.thoughts_display);
     apply_preferences_theme(&mut state, &preferences_dir, &preferences.theme);
     state.set_provider_label(provider_label);
     state.set_fast_mode_enabled(projection.fast_mode_enabled);

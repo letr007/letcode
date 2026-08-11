@@ -9,18 +9,7 @@ use crate::transcript::{TranscriptEvent, TranscriptRecord};
 use crate::user_content::UserMessageSubmission;
 
 pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> Timeline {
-    let legacy_reviewer_child_session_id = records.iter().find_map(|record| match &record.event {
-        TranscriptEvent::PermissionDecision {
-            reviewer: Some(reviewer),
-            reviewer_child_session_id: Some(child_session_id),
-            ..
-        } if reviewer == "auto" && !child_session_id.is_empty() => Some(child_session_id.clone()),
-        _ => None,
-    });
-    let mut projection = TranscriptTimelineProjection {
-        legacy_reviewer_child_session_id,
-        ..TranscriptTimelineProjection::default()
-    };
+    let mut projection = TranscriptTimelineProjection::default();
     for record in records {
         projection.apply_record(record);
     }
@@ -31,7 +20,6 @@ pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> 
 struct TranscriptTimelineProjection {
     timeline: Timeline,
     current_auto_continue: AutoContinueState,
-    legacy_reviewer_child_session_id: Option<String>,
 }
 
 impl TranscriptTimelineProjection {
@@ -54,10 +42,14 @@ impl TranscriptTimelineProjection {
                 self.timeline
                     .push_restored_compaction(event.summary.clone());
             }
-            TranscriptEvent::ReasoningMessage { content } => {
+            TranscriptEvent::ReasoningMessage {
+                content,
+                duration_ms,
+            } => {
                 self.timeline.push_restored_reasoning(
                     format!("restored-reasoning-{}", record.sequence),
                     content.clone(),
+                    *duration_ms,
                 );
             }
             TranscriptEvent::ContextExperimentReturned {
@@ -139,13 +131,16 @@ impl TranscriptTimelineProjection {
                 let restored_reason = reason.clone();
                 let auto_review = matches!(reviewer.as_deref(), Some("auto"));
                 let origin_label = auto_review.then(|| "reviewer".to_string());
-                let reviewer_child_session_id = reviewer_child_session_id.clone().or_else(|| {
-                    auto_review
-                        .then(|| self.legacy_reviewer_child_session_id.clone())
-                        .flatten()
+                let reviewer_child_session_id = reviewer_child_session_id.clone();
+                let call_id = call_id.clone().unwrap_or_else(|| {
+                    if auto_review {
+                        format!("restored-auto-review-{}", record.sequence)
+                    } else {
+                        tool.clone()
+                    }
                 });
                 self.timeline.push_restored_permission_decision(
-                    call_id.clone().unwrap_or_else(|| tool.clone()),
+                    call_id,
                     tool.clone(),
                     format_tool_call(tool, args),
                     Some(args.to_string()),
@@ -280,17 +275,18 @@ mod tests {
             ),
         ]);
 
-        let TimelineItem::AutoReviewAggregate(aggregate) = &timeline.items()[0] else {
-            panic!("expected restored auto-review aggregate");
-        };
-        assert_eq!(aggregate.reviewer_child_session_id, "child-reviewer");
-        assert_eq!(aggregate.decisions.len(), 2);
-        assert_eq!(aggregate.decisions[0].approval, "once");
-        assert_eq!(aggregate.decisions[0].risk.as_deref(), Some("low"));
-        assert_eq!(aggregate.decisions[0].rationale, "safe edit");
-        assert!(aggregate.decisions[0].allowed);
-        assert_eq!(aggregate.decisions[1].approval, "deny");
-        assert!(!aggregate.decisions[1].allowed);
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::AutoReview(first), TimelineItem::AutoReview(second)]
+                if first.call_id == "call-auto"
+                    && first.approval == "once"
+                    && first.risk.as_deref() == Some("low")
+                    && first.rationale == "safe edit"
+                    && first.allowed
+                    && second.call_id == "call-auto-2"
+                    && second.approval == "deny"
+                    && !second.allowed
+        ));
     }
 
     #[test]
@@ -326,12 +322,88 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(timeline.items().len(), 1);
-        let TimelineItem::AutoReviewAggregate(aggregate) = &timeline.items()[0] else {
-            panic!("expected legacy auto-review aggregate");
-        };
-        assert_eq!(aggregate.reviewer_child_session_id, "child-reviewer");
-        assert_eq!(aggregate.decisions.len(), 2);
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::AutoReview(first), TimelineItem::AutoReview(second)]
+                if first.call_id == "legacy-1"
+                    && first.allowed
+                    && second.call_id == "current-2"
+                    && !second.allowed
+        ));
+    }
+
+    #[test]
+    fn restored_legacy_auto_reviews_without_call_ids_keep_event_order() {
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::PermissionDecision {
+                    call_id: None,
+                    tool: "shell__exec".into(),
+                    args: json!({"command": "git status"}),
+                    allowed: true,
+                    reason: Some("safe".into()),
+                    reviewer: Some("auto".into()),
+                    approval: Some("once".into()),
+                    risk: Some("low".into()),
+                    reviewer_child_session_id: None,
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::PermissionDecision {
+                    call_id: None,
+                    tool: "shell__exec".into(),
+                    args: json!({"command": "git diff"}),
+                    allowed: false,
+                    reason: Some("blocked".into()),
+                    reviewer: Some("auto".into()),
+                    approval: Some("deny".into()),
+                    risk: Some("high".into()),
+                    reviewer_child_session_id: None,
+                },
+            ),
+        ]);
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::AutoReview(first), TimelineItem::AutoReview(second)]
+                if first.call_id == "restored-auto-review-1"
+                    && first.allowed
+                    && second.call_id == "restored-auto-review-2"
+                    && !second.allowed
+        ));
+    }
+
+    #[test]
+    fn restored_reasoning_keeps_optional_duration_without_inventing_legacy_time() {
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::ReasoningMessage {
+                    content: "legacy reasoning".into(),
+                    duration_ms: None,
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::ReasoningMessage {
+                    content: "timed reasoning".into(),
+                    duration_ms: Some(1_250),
+                },
+            ),
+        ]);
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Reasoning(legacy), TimelineItem::Reasoning(timed)]
+                if legacy.text == "legacy reasoning"
+                    && legacy.started_at.is_none()
+                    && legacy.duration_ms.is_none()
+                    && timed.text == "timed reasoning"
+                    && timed.started_at.is_none()
+                    && timed.duration_ms == Some(1_250)
+        ));
     }
 
     #[test]

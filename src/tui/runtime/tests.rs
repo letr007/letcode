@@ -746,6 +746,110 @@ fn running_turn_opens_session_setting_dialogs() {
 }
 
 #[test]
+fn thoughts_command_opens_picker_and_persists_selected_mode() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("/thoughts");
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("thoughts picker opens"),
+        None
+    );
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if dialog.kind == DialogKind::ThoughtsPicker
+                && dialog.selected_item().map(|item| item.id.as_str()) == Some("full")
+    ));
+
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("select titles");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("accept thoughts display");
+
+    assert_eq!(
+        runtime.state().thoughts_display,
+        ThoughtsDisplayMode::Titles
+    );
+    assert!(!runtime.state().dialog_is_open());
+    assert_eq!(
+        TuiPreferences::load_from_dir(&runtime.preferences_dir).thoughts_display,
+        ThoughtsDisplayMode::Titles
+    );
+}
+
+#[test]
+fn thoughts_command_is_available_during_active_turn_and_child_view() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("/thoughts compact");
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("active turn accepts local display command"),
+        None
+    );
+    assert_eq!(
+        runtime.state().thoughts_display,
+        ThoughtsDisplayMode::Compact
+    );
+
+    runtime.state_mut().replace_child_timeline_from_records(
+        &[],
+        "parent-session",
+        "child-session",
+        "explorer",
+        0,
+        1,
+        1,
+    );
+    runtime.state_mut().set_input("/thoughts full");
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("child view accepts local display command"),
+        None
+    );
+    assert_eq!(runtime.state().thoughts_display, ThoughtsDisplayMode::Full);
+}
+
+#[test]
+fn thoughts_numeric_alias_persists_and_loads_for_a_new_runtime() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("/thoughts 1");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("numeric thoughts command succeeds");
+    assert_eq!(
+        runtime.state().thoughts_display,
+        ThoughtsDisplayMode::Compact
+    );
+
+    let loaded = TuiPreferences::load_from_dir(&runtime.preferences_dir);
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+    state.set_thoughts_display(loaded.thoughts_display);
+    let restarted = TuiRuntime::new(
+        state,
+        rx,
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        runtime.preferences_dir.clone(),
+    );
+
+    assert_eq!(
+        restarted.state().thoughts_display,
+        ThoughtsDisplayMode::Compact
+    );
+}
+
+#[test]
 fn reasoning_shortcut_waits_for_backend_confirmation() {
     let mut runtime = runtime();
     let previous = runtime.state().reasoning_effort_label.clone();

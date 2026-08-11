@@ -49,6 +49,7 @@ pub fn persist_agent_event(
 ) -> Result<JournalEffect> {
     let effect = match event {
         AgentEvent::TurnStarted(event) => {
+            recorder.clear_reasoning_observations();
             recorder.record_turn_started(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
@@ -60,8 +61,8 @@ pub fn persist_agent_event(
             recorder.record_evidence_record(evidence.clone())?;
             JournalEffect::persisted(ContextProjection::Advance)
         }
-        AgentEvent::ReasoningDone { text, .. } => {
-            recorder.record_reasoning_message(text.clone())?;
+        AgentEvent::ReasoningDone { item_id, text } => {
+            recorder.record_reasoning_message(item_id, text.clone())?;
             JournalEffect::persisted(ContextProjection::Advance)
         }
         AgentEvent::AssistantMessage { content } => {
@@ -143,8 +144,13 @@ pub fn persist_agent_event(
             }
         }
         AgentEvent::TurnFinalized(event) => {
+            recorder.clear_reasoning_observations();
             recorder.record_turn_finalized(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
+        }
+        AgentEvent::ReasoningDelta { item_id, .. } => {
+            recorder.observe_reasoning_delta(item_id);
+            JournalEffect::IGNORED
         }
         AgentEvent::ContextCompactionStarted { .. }
         | AgentEvent::ContextCompactionNoProgress(_)
@@ -154,7 +160,6 @@ pub fn persist_agent_event(
         | AgentEvent::FastModeChanged { .. }
         | AgentEvent::LlmRetryScheduled(_)
         | AgentEvent::LlmRetryStarted(_)
-        | AgentEvent::ReasoningDelta { .. }
         | AgentEvent::ModelStreamIssue { .. }
         | AgentEvent::ToolCallPending { .. }
         | AgentEvent::ToolOutputDelta { .. }
@@ -165,7 +170,7 @@ pub fn persist_agent_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextProjection, persist_agent_event};
+    use super::{ContextProjection, JournalEffect, persist_agent_event};
     use crate::agent::{
         AgentEvent, CompactionBlocker, CompactionNoProgress, CompactionTrigger,
         ContextCompactionEvent, LlmRequestTelemetry, LlmRequestTelemetryPhase,
@@ -253,6 +258,125 @@ mod tests {
             provider_response_id: Some("opaque-response-id".into()),
             error_class: None,
         })
+    }
+
+    #[test]
+    fn terminal_turn_events_clear_unfinished_reasoning_observations() {
+        fn assert_boundary_clears(name: &str, boundary: impl FnOnce(&mut TranscriptRecorder)) {
+            let mut recorder = recorder(name);
+            persist_agent_event(
+                &mut recorder,
+                &AgentEvent::ReasoningDelta {
+                    item_id: "reused-reasoning".into(),
+                    delta: "Draft".into(),
+                },
+            )
+            .expect("observe unfinished reasoning");
+            boundary(&mut recorder);
+            persist_agent_event(
+                &mut recorder,
+                &AgentEvent::ReasoningDone {
+                    item_id: "reused-reasoning".into(),
+                    text: "Recovered".into(),
+                },
+            )
+            .expect("persist later reasoning without a new delta");
+
+            let records = read_records(recorder.path()).expect("read records");
+            assert!(matches!(
+                records.last(),
+                Some(crate::transcript::TranscriptRecord {
+                    event: TranscriptEvent::ReasoningMessage {
+                        content,
+                        duration_ms: None,
+                    },
+                    ..
+                }) if content == "Recovered"
+            ));
+        }
+
+        assert_boundary_clears("reasoning-turn-start-clear", |recorder| {
+            persist_agent_event(
+                recorder,
+                &AgentEvent::TurnStarted(crate::agent::TurnStartedEvent {
+                    turn_id: 2,
+                    intent: "continue".into(),
+                    directive: "continue".into(),
+                    validation_reminder: String::new(),
+                }),
+            )
+            .expect("start next turn");
+        });
+        assert_boundary_clears("reasoning-turn-final-clear", |recorder| {
+            persist_agent_event(
+                recorder,
+                &AgentEvent::TurnFinalized(crate::agent::TurnFinalizedEvent {
+                    turn_id: 1,
+                    outcome: "completed".into(),
+                    tool_call_count: 0,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                }),
+            )
+            .expect("finalize turn");
+        });
+        assert_boundary_clears("reasoning-turn-interrupt-clear", |recorder| {
+            recorder
+                .record_turn_interrupted(Some(1))
+                .expect("interrupt turn");
+        });
+    }
+
+    #[test]
+    fn reasoning_duration_persists_from_first_delta_and_missing_start_stays_unknown() {
+        let mut recorder = recorder("reasoning-duration");
+        let delta = AgentEvent::ReasoningDelta {
+            item_id: "reasoning-1".into(),
+            delta: "Draft".into(),
+        };
+        let done = AgentEvent::ReasoningDone {
+            item_id: "reasoning-1".into(),
+            text: "Final".into(),
+        };
+
+        assert_eq!(
+            persist_agent_event(&mut recorder, &delta).expect("observe reasoning delta"),
+            JournalEffect::IGNORED
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        persist_agent_event(&mut recorder, &done).expect("persist reasoning");
+        persist_agent_event(
+            &mut recorder,
+            &AgentEvent::ReasoningDone {
+                item_id: "reasoning-without-delta".into(),
+                text: "Recovered".into(),
+            },
+        )
+        .expect("persist reasoning without delta");
+
+        let records = read_records(recorder.path()).expect("read records");
+        assert!(matches!(
+            records.as_slice(),
+            [
+                crate::transcript::TranscriptRecord {
+                    event: TranscriptEvent::ReasoningMessage {
+                        content: first,
+                        duration_ms: Some(duration_ms),
+                    },
+                    ..
+                },
+                crate::transcript::TranscriptRecord {
+                    event: TranscriptEvent::ReasoningMessage {
+                        content: second,
+                        duration_ms: None,
+                    },
+                    ..
+                }
+            ] if first == "Final" && *duration_ms >= 1 && second == "Recovered"
+        ));
     }
 
     #[test]

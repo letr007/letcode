@@ -11,6 +11,7 @@ use super::transcript_render::Interaction;
 #[cfg(test)]
 use crate::agent::ConversationMessage;
 use crate::agent::{AutoContinueState, CacheUsageReport};
+use crate::command::ThoughtsDisplayMode;
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
     ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
@@ -280,6 +281,7 @@ pub enum DialogKind {
     ExpertModelPicker(String),
     PermissionPicker,
     ReasoningPicker,
+    ThoughtsPicker,
     ThemePicker,
     SessionPicker,
     HistoryTree,
@@ -968,6 +970,7 @@ pub struct TuiState {
     /// 压缩动画相对于全局 spinner 的起始帧，确保每次都从左→右填充开始。
     pub compaction_animation_start_frame: usize,
     pub reasoning_effort_label: Option<String>,
+    pub thoughts_display: ThoughtsDisplayMode,
     pub permission_mode_label: String,
     pub pending_composer_settings: PendingComposerSettings,
     pub session_id: Option<String>,
@@ -1042,6 +1045,7 @@ impl Default for TuiState {
             compaction_active: false,
             compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
+            thoughts_display: ThoughtsDisplayMode::default(),
             permission_mode_label: "default".into(),
             pending_composer_settings: PendingComposerSettings::default(),
             session_id: None,
@@ -1119,6 +1123,14 @@ impl TuiState {
 
     pub fn set_reasoning_effort_label(&mut self, label: Option<String>) {
         self.reasoning_effort_label = label;
+    }
+
+    pub fn set_thoughts_display(&mut self, mode: ThoughtsDisplayMode) {
+        if self.thoughts_display != mode {
+            self.thoughts_display = mode;
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+        }
     }
 
     pub fn set_pending_model(
@@ -2542,12 +2554,9 @@ impl TuiState {
             Some(TimelineItem::Tool(tool)) => {
                 Some(TranscriptClickTarget::ToolCard(tool.call_id.clone()))
             }
-            Some(TimelineItem::AutoReviewAggregate(aggregate)) => {
-                Some(TranscriptClickTarget::ToolCard(format!(
-                    "auto-review:{}",
-                    aggregate.reviewer_child_session_id
-                )))
-            }
+            Some(TimelineItem::AutoReview(decision)) => Some(TranscriptClickTarget::ToolCard(
+                format!("auto-review:{}", decision.call_id),
+            )),
             _ => None,
         }
     }
@@ -2812,27 +2821,23 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_toggle_key_uses_synthetic_child_session_id() {
+    fn auto_review_toggle_key_uses_call_id() {
         let mut state = TuiState::default();
         assert!(
             !state
                 .tool_output_overrides
-                .contains_key("auto-review:reviewer-child")
+                .contains_key("auto-review:call-review")
         );
 
-        state.toggle_tool_output("auto-review:reviewer-child");
+        state.toggle_tool_output("auto-review:call-review");
         assert_eq!(
-            state
-                .tool_output_overrides
-                .get("auto-review:reviewer-child"),
+            state.tool_output_overrides.get("auto-review:call-review"),
             Some(&true)
         );
 
-        state.toggle_tool_output("auto-review:reviewer-child");
+        state.toggle_tool_output("auto-review:call-review");
         assert_eq!(
-            state
-                .tool_output_overrides
-                .get("auto-review:reviewer-child"),
+            state.tool_output_overrides.get("auto-review:call-review"),
             Some(&false)
         );
     }
@@ -3511,6 +3516,33 @@ mod tests {
                 .map(|toast| (toast.message.as_str(), toast.kind)),
             Some(("parent info", ToastKind::Info))
         );
+    }
+
+    #[test]
+    fn terminal_events_seal_active_reasoning() {
+        for terminal in [
+            SessionEvent::Interrupted,
+            SessionEvent::Done,
+            SessionEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
+        ] {
+            let start = std::time::Instant::now() - std::time::Duration::from_millis(250);
+            let mut state = TuiState::default();
+            state.apply_event(SessionEvent::ReasoningDelta(
+                crate::tui::events::ReasoningDeltaEvent::at("reasoning-1", "working", start),
+            ));
+            state.apply_event(terminal);
+
+            assert!(matches!(
+                state.timeline.items().first(),
+                Some(crate::tui::timeline::TimelineItem::Reasoning(reasoning))
+                    if !reasoning.streaming
+                        && reasoning.started_at.is_none()
+                        && reasoning.duration_ms.is_some()
+            ));
+            let revision = state.timeline.item_revisions()[0];
+            state.apply_event(SessionEvent::Tick);
+            assert_eq!(state.timeline.item_revisions()[0], revision);
+        }
     }
 
     #[test]

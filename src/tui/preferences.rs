@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::command::ThemeName;
+use crate::command::{ThemeName, ThoughtsDisplayMode};
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
 
@@ -19,6 +19,8 @@ pub struct TuiPreferences {
     pub transcript_scrollbar_visible: bool,
     #[serde(default = "default_theme_id")]
     pub theme: String,
+    #[serde(default)]
+    pub thoughts_display: ThoughtsDisplayMode,
 }
 
 impl Default for TuiPreferences {
@@ -27,6 +29,7 @@ impl Default for TuiPreferences {
             tool_output_expanded: false,
             transcript_scrollbar_visible: default_transcript_scrollbar_visible(),
             theme: default_theme_id(),
+            thoughts_display: ThoughtsDisplayMode::default(),
         }
     }
 }
@@ -75,6 +78,7 @@ mod tests {
             tool_output_expanded: true,
             transcript_scrollbar_visible: false,
             theme: "forest".into(),
+            thoughts_display: ThoughtsDisplayMode::Titles,
         };
         prefs.save_to_dir(&base).expect("save preferences");
 
@@ -101,11 +105,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_preferences_default_to_full_thoughts_display() {
+        let loaded: TuiPreferences = serde_json::from_str(
+            r#"{"tool_output_expanded":true,"transcript_scrollbar_visible":false,"theme":"dark"}"#,
+        )
+        .expect("legacy preferences deserialize");
+        assert_eq!(loaded.thoughts_display, ThoughtsDisplayMode::Full);
+    }
+
+    #[test]
     fn custom_theme_id_round_trips() {
         let prefs = TuiPreferences {
             tool_output_expanded: false,
             transcript_scrollbar_visible: true,
             theme: "sunset".into(),
+            thoughts_display: ThoughtsDisplayMode::Compact,
         };
         let json = serde_json::to_string(&prefs).expect("serialize");
         let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");

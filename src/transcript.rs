@@ -262,6 +262,7 @@ pub struct TranscriptRecorder {
     health: RecorderHealth,
     current_context_branch_id: Option<String>,
     context_scope_state: Arc<Mutex<ContextScopeState>>,
+    reasoning_started_at: std::collections::HashMap<String, std::time::Instant>,
 }
 
 impl TranscriptRecorder {
@@ -283,6 +284,7 @@ impl TranscriptRecorder {
             health: RecorderHealth::Healthy,
             current_context_branch_id: None,
             context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
+            reasoning_started_at: std::collections::HashMap::new(),
         })
     }
 
@@ -395,6 +397,7 @@ impl TranscriptRecorder {
             health: RecorderHealth::Healthy,
             current_context_branch_id: None,
             context_scope_state,
+            reasoning_started_at: std::collections::HashMap::new(),
         })
     }
 
@@ -1047,9 +1050,28 @@ impl TranscriptRecorder {
         })
     }
 
-    pub fn record_reasoning_message(&mut self, content: impl Into<String>) -> Result<()> {
+    pub fn observe_reasoning_delta(&mut self, item_id: &str) {
+        self.reasoning_started_at
+            .entry(item_id.to_string())
+            .or_insert_with(std::time::Instant::now);
+    }
+
+    pub fn clear_reasoning_observations(&mut self) {
+        self.reasoning_started_at.clear();
+    }
+
+    pub fn record_reasoning_message(
+        &mut self,
+        item_id: &str,
+        content: impl Into<String>,
+    ) -> Result<()> {
+        let duration_ms = self
+            .reasoning_started_at
+            .remove(item_id)
+            .map(|started_at| u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.append(TranscriptEvent::ReasoningMessage {
             content: content.into(),
+            duration_ms,
         })
     }
 
@@ -1271,6 +1293,7 @@ impl TranscriptRecorder {
     }
 
     pub fn record_turn_interrupted(&mut self, turn_id: Option<u64>) -> Result<()> {
+        self.clear_reasoning_observations();
         self.append(TranscriptEvent::TurnInterrupted { turn_id })
     }
 
@@ -2587,6 +2610,7 @@ fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::ContextExperimentReturned { .. }
             | TranscriptEvent::UserMessage { .. }
             | TranscriptEvent::AssistantMessage { .. }
+            | TranscriptEvent::ReasoningMessage { .. }
             | TranscriptEvent::AssistantToolCallBatch { .. }
             | TranscriptEvent::ToolCallStarted { .. }
             | TranscriptEvent::ToolCallFinished { .. }
