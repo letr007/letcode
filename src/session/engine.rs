@@ -1196,8 +1196,8 @@ fn apply_config_reload(
                 .is_some_and(|catalog| agent.model_catalog() == catalog)
     });
 
-    // Self-writes (model/fast-mode/MCP persist) and duplicate watcher events often
-    // land here with no reloadable runtime delta — stay silent and keep usage anchors.
+    // Global config writes for non-reloadable fields (for example MCP enabled state)
+    // and duplicate watcher events land here with no runtime delta. Stay silent.
     let new_session_default_unchanged =
         *new_session_default_route == next_new_session_default_route;
     if !reload_has_runtime_delta(
@@ -3732,6 +3732,126 @@ mod tests {
     }
 
     #[test]
+    fn non_reloadable_global_config_write_is_silent() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-non-runtime-write-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+            active_provider = "primary"
+
+            [mcp.alpha]
+            type = "local"
+            command = ["alpha"]
+            enabled = true
+
+            [providers.primary]
+            base_url = "https://primary.example.invalid/v1"
+            api_key = "primary-key"
+            protocol = "responses"
+            default_model = "primary-model"
+
+            [providers.primary.models.primary-model]
+            "#,
+        )
+        .expect("write initial config");
+
+        let config = AppConfig::load_from_path(&path).expect("initial config should load");
+        let route = config.active_route();
+        let provider = config
+            .provider_for_route(&route)
+            .expect("active provider is configured");
+        let mut agent = Agent::new(route.build_client(provider), route.model.clone(), 1, 1);
+        agent.set_primary_route(route.clone());
+        agent.set_default_protocol(provider.protocol);
+        agent.set_model_protocols(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+        );
+        agent.set_model_catalog(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+        );
+        agent.set_compaction_config(config.global.compaction.clone());
+        agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
+        agent
+            .set_tool_parallelism(
+                config
+                    .tools
+                    .parallelism
+                    .iter()
+                    .map(|(name, mode)| (name.clone(), *mode)),
+            )
+            .expect("tool parallelism");
+        agent.set_retry_config(
+            provider
+                .retry
+                .clone()
+                .unwrap_or_else(|| config.global.retry.clone()),
+        );
+
+        let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
+        let mut route_api_key_configured = indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = config.providers.clone();
+        let mut global_retry = config.global.retry.clone();
+        let mut provider_api_key_hints = config
+            .providers
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    format!(
+                        "Set providers.{name}.api_key in {} or set {}.",
+                        config.config_path.display(),
+                        crate::config::provider_api_key_env_var(name)
+                    ),
+                )
+            })
+            .collect();
+        let mut new_session_default_route = route;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        crate::config::persist_mcp_server_enabled(&path, "alpha", false)
+            .expect("persist non-reloadable global setting");
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &event_tx,
+        )
+        .expect("non-reloadable config write should be a silent no-op");
+
+        assert!(event_rx.try_recv().is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn reload_keeps_current_route_when_it_leaves_the_catalog() {
         let path = std::env::temp_dir().join(format!(
             "letcode-engine-reload-removed-current-route-{}",
@@ -4037,6 +4157,12 @@ mod tests {
             event_rx.try_recv(),
             Ok(SessionTransportEvent::ModelCatalogUpdated(_))
         ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(SessionTransportEvent::Notice(notice))
+                if notice.message.starts_with("configuration reloaded")
+        ));
+        assert!(event_rx.try_recv().is_err());
 
         let _ = fs::remove_file(path);
     }

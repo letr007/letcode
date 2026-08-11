@@ -79,36 +79,6 @@ pub fn persist_primary_model_route(config_path: &Path, route: &ModelRoute) -> Re
     })
 }
 
-/// Persist Fast Mode in the main configuration without rewriting unrelated
-/// content.
-pub fn persist_fast_mode_enabled(config_path: &Path, enabled: bool) -> Result<()> {
-    persist_config_document(config_path, "Fast Mode state", true, |document| {
-        document["fast_mode"] = value(enabled);
-        Ok(())
-    })
-}
-
-pub(crate) fn validate_fast_mode_update(config_path: &Path, enabled: bool) -> Result<()> {
-    let config_target = fs::canonicalize(config_path)
-        .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
-    let mut config_file = fs::File::open(&config_target)
-        .with_context(|| format!("failed to open config file {}", config_target.display()))?;
-    let mut config_text = String::new();
-    config_file
-        .read_to_string(&mut config_text)
-        .with_context(|| format!("failed to read config file {}", config_target.display()))?;
-    let mut document = config_text
-        .parse::<DocumentMut>()
-        .with_context(|| format!("failed to parse config file {}", config_target.display()))?;
-    document["fast_mode"] = value(enabled);
-    validate_updated_config_document(
-        &config_target,
-        &document.to_string(),
-        "Fast Mode state",
-        true,
-    )
-}
-
 /// Persist one expert's provider-qualified route without rewriting unrelated
 /// configuration content.
 #[allow(dead_code)]
@@ -2460,27 +2430,6 @@ model = "shared"
             "#,
         ));
         AppConfig::load_from_path(&path).expect_err("config should be rejected")
-    }
-
-    #[test]
-    fn loads_new_content_after_atomic_replacement_under_shared_lock() {
-        let path = write_temp_config(
-            r#"
-            fast_mode = false
-
-            [providers.primary]
-            base_url = "https://example.invalid/v1"
-            api_key = "config-key"
-            protocol = "responses"
-
-            [providers.primary.models."gpt-test"]
-            "#,
-        );
-
-        persist_fast_mode_enabled(&path, true).expect("atomic config replacement should succeed");
-        let config = AppConfig::load_from_path(&path).expect("replaced config should load");
-
-        assert!(config.fast_mode_enabled);
     }
 
     fn write_temp_config(contents: &str) -> PathBuf {

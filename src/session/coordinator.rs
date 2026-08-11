@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_toggle_persistence_failure_emits_error_without_state_change() {
+    fn fast_mode_toggle_changes_memory_without_config_write() {
         let transcript = temp_transcript();
         let mut agent = test_agent();
         let fast_mode_path = std::env::temp_dir().join(format!(
@@ -801,9 +801,9 @@ mod tests {
                 .expect("time ok")
                 .as_nanos()
         ));
-        std::fs::write(&fast_mode_path, "not a config file").expect("create blocking file");
-        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_path, false);
-        agent.set_fast_mode(fast_mode);
+        std::fs::write(&fast_mode_path, "not a config file").expect("create config file");
+        let before = std::fs::read_to_string(&fast_mode_path).expect("read config before toggle");
+        agent.set_fast_mode(crate::fast_mode::FastMode::load(&fast_mode_path, false));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         assert_eq!(
@@ -817,13 +817,19 @@ mod tests {
             .expect("toggle dispatch"),
             IdleDispatch::Handled
         );
-        assert!(!agent.fast_mode_enabled());
-        match rx.try_recv().expect("persistence error") {
-            SessionTransportEvent::Error(error) => {
-                assert!(error.message.contains("failed to toggle fast mode"));
-            }
-            other => panic!("expected fast mode error, got {other:?}"),
-        }
+        assert!(agent.fast_mode_enabled());
+        assert_eq!(
+            std::fs::read_to_string(&fast_mode_path).expect("read config after toggle"),
+            before
+        );
+        assert!(matches!(
+            rx.try_recv().expect("toggle event"),
+            SessionTransportEvent::FastModeChanged { enabled: true }
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("toggle notice"),
+            SessionTransportEvent::Notice(_)
+        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -869,10 +875,11 @@ protocol = "responses"
     }
 
     #[test]
-    fn navigation_fast_mode_persistence_failure_prevents_transaction() {
+    fn navigation_fast_mode_auto_disable_is_memory_only() {
         let (transcript, mut agent, fast_mode_path) = history_navigation_with_unsupported_model();
-        std::fs::write(&fast_mode_path, "not a config file").expect("block persistence");
-        let before = {
+        let config_before =
+            std::fs::read_to_string(&fast_mode_path).expect("read config before navigation");
+        let records_before = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read initial records")
         };
@@ -889,23 +896,35 @@ protocol = "responses"
         )
         .expect("dispatch");
 
-        assert_eq!(agent.model(), "gpt-5.5");
-        assert!(agent.fast_mode_enabled());
+        assert_eq!(agent.model(), "claude-4");
+        assert!(!agent.fast_mode_enabled());
         let after = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read final records")
         };
-        assert_eq!(after.len(), before.len());
+        assert!(after.len() > records_before.len());
+        assert_eq!(
+            std::fs::read_to_string(&fast_mode_path).expect("read config after navigation"),
+            config_before
+        );
         assert!(matches!(
-            rx.try_recv().expect("navigation error"),
-            SessionTransportEvent::Error(error) if error.message.contains("failed to navigate session history")
+            rx.try_recv().expect("navigation result"),
+            SessionTransportEvent::FastModeChanged { enabled: false }
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("navigation notice"),
+            SessionTransportEvent::Notice(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("navigation result event"),
+            SessionTransportEvent::SessionResumed { .. }
         ));
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn navigation_commit_failure_keeps_fast_mode_unchanged() {
-        let (transcript, mut agent, _fast_mode_dir) = history_navigation_with_unsupported_model();
+        let (transcript, mut agent, _fast_mode_path) = history_navigation_with_unsupported_model();
         let before = {
             let recorder = transcript.lock().expect("recorder");
             crate::transcript::read_records(recorder.path()).expect("read initial records")

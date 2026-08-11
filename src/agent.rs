@@ -1184,7 +1184,7 @@ impl<C: Config> Agent<C> {
         })
     }
 
-    /// Returns whether request preparation persistently auto-disabled Fast Mode.
+    /// Returns whether request preparation auto-disabled Fast Mode.
     pub(crate) fn prepare_fast_mode_for_request(&mut self) -> Result<bool> {
         self.auto_disable_fast_mode_for_model(&self.model)
     }

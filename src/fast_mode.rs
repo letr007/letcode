@@ -1,10 +1,8 @@
-use anyhow::{Context, Result};
-use std::path::PathBuf;
+use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct FastMode {
-    config_path: PathBuf,
     state: Mutex<bool>,
 }
 
@@ -13,9 +11,8 @@ pub(crate) struct PreparedFastModeDisable {
 }
 
 impl FastMode {
-    pub fn load(config_path: impl Into<PathBuf>, enabled: bool) -> Arc<Self> {
+    pub fn load(_config_path: impl Into<std::path::PathBuf>, enabled: bool) -> Arc<Self> {
         Arc::new(Self {
-            config_path: config_path.into(),
             state: Mutex::new(enabled),
         })
     }
@@ -30,7 +27,7 @@ impl FastMode {
         if enabled && !is_fast_capable_model(model_id) {
             return Ok(FastModeToggle::Unavailable);
         }
-        self.set_enabled_locked(&mut state, enabled)?;
+        *state = enabled;
         Ok(if enabled {
             FastModeToggle::Enabled
         } else {
@@ -41,7 +38,7 @@ impl FastMode {
     pub fn auto_disable_for_model(&self, model_id: &str) -> Result<bool> {
         let mut state = self.state.lock().expect("Fast Mode state poisoned");
         if *state && !is_fast_capable_model(model_id) {
-            self.set_enabled_locked(&mut state, false)?;
+            *state = false;
             return Ok(true);
         }
         Ok(false)
@@ -55,30 +52,15 @@ impl FastMode {
         if !*state || is_fast_capable_model(model_id) {
             return Ok(None);
         }
-        crate::config::validate_fast_mode_update(&self.config_path, false)?;
         Ok(Some(PreparedFastModeDisable {
             mode: Arc::clone(self),
         }))
-    }
-
-    fn set_enabled_locked(&self, current: &mut bool, enabled: bool) -> Result<()> {
-        crate::config::persist_fast_mode_enabled(&self.config_path, enabled).with_context(
-            || {
-                format!(
-                    "failed to persist Fast Mode state in {}",
-                    self.config_path.display()
-                )
-            },
-        )?;
-        *current = enabled;
-        Ok(())
     }
 }
 
 impl PreparedFastModeDisable {
     pub(crate) fn commit(self) -> Result<()> {
         let mut state = self.mode.state.lock().expect("Fast Mode state poisoned");
-        crate::config::persist_fast_mode_enabled(&self.mode.config_path, false)?;
         *state = false;
         Ok(())
     }
@@ -100,6 +82,7 @@ pub fn is_fast_capable_model(model_id: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config(name: &str, fast_mode: Option<bool>) -> PathBuf {
@@ -131,34 +114,32 @@ mod tests {
     }
 
     #[test]
-    fn omitted_fast_mode_defaults_disabled_and_toggle_persists_in_main_config() {
-        let path = temp_config("persist", None);
+    fn omitted_fast_mode_defaults_disabled_and_toggle_does_not_change_config() {
+        let path = temp_config("toggle", None);
+        let before = fs::read_to_string(&path).expect("read config before toggle");
         let mode = FastMode::load(&path, false);
         assert!(!mode.enabled());
         assert_eq!(
             mode.toggle("gpt-5.5").expect("enable fast mode"),
             FastModeToggle::Enabled
         );
-        assert!(
-            crate::config::AppConfig::load_from_path(&path)
-                .expect("reload config state")
-                .fast_mode_enabled
-        );
-        assert!(
-            !path.with_file_name("fast-mode.json").exists(),
-            "Fast Mode must not create a separate state file"
+        assert!(mode.enabled());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read config after toggle"),
+            before
         );
     }
 
     #[test]
-    fn unsupported_model_auto_disables_main_config_state() {
+    fn unsupported_model_auto_disables_without_changing_config() {
         let path = temp_config("auto-disable", Some(true));
+        let before = fs::read_to_string(&path).expect("read config before auto-disable");
         let mode = FastMode::load(&path, true);
         assert!(mode.auto_disable_for_model("claude-4").expect("disable"));
-        assert!(
-            !crate::config::AppConfig::load_from_path(&path)
-                .expect("reload state")
-                .fast_mode_enabled
+        assert!(!mode.enabled());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read config after auto-disable"),
+            before
         );
     }
 }

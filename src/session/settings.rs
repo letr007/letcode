@@ -15,8 +15,8 @@ use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::transcript::TranscriptRecorder;
 
-/// The result of a model apply that could persistently disable Fast Mode before
-/// transcript provenance is recorded.
+/// The result of a model apply that can disable Fast Mode before transcript
+/// provenance is recorded.
 #[derive(Debug)]
 pub struct ModelApplyError {
     error: anyhow::Error,
@@ -209,6 +209,40 @@ protocol = "responses"
     }
 
     #[test]
+    fn reasoning_effort_change_is_session_local() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-session-reasoning-config-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base_dir).expect("create config directory");
+        let config_path = base_dir.join("letcode.toml");
+        std::fs::write(&config_path, "session reasoning sentinel\n").expect("write config");
+        let before = std::fs::read_to_string(&config_path).expect("read config before change");
+        let mut agent = test_agent();
+        agent.set_model_catalog(std::collections::HashMap::from([(
+            "gpt-5.5".into(),
+            crate::request_builder::ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Medium),
+                reasoning_efforts: vec![ModelReasoningEffort::Medium, ModelReasoningEffort::High],
+                ..Default::default()
+            },
+        )]));
+
+        apply_reasoning_effort(&mut agent, ModelReasoningEffort::High)
+            .expect("reasoning effort changes in memory");
+
+        assert_eq!(agent.reasoning_effort(), Some(ModelReasoningEffort::High));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config after change"),
+            before
+        );
+    }
+
+    #[test]
     fn model_route_apply_failure_restores_the_persisted_route() {
         let (_base_dir, transcript, _session_id) = temp_transcript();
         let cloned = Arc::clone(&transcript);
@@ -285,13 +319,31 @@ protocol = "responses"
     }
 
     #[test]
-    fn model_route_fast_mode_failure_prevents_transcript_provenance_and_route_apply() {
+    fn model_route_fast_mode_auto_disable_is_memory_only() {
         let (base_dir, transcript, session_id) = temp_transcript();
         let fast_mode_path = base_dir.join("letcode.toml");
-        std::fs::write(&fast_mode_path, "not a config file").expect("block Fast Mode persistence");
+        std::fs::write(
+            &fast_mode_path,
+            r#"active_provider = "primary"
+
+[providers.primary]
+base_url = "https://primary.invalid/v1"
+api_key = "primary-key"
+protocol = "responses"
+[providers.primary.models."gpt-5.5"]
+"#,
+        )
+        .expect("write Fast Mode config");
+        let before = std::fs::read_to_string(&fast_mode_path).expect("read config before apply");
         let mut agent = test_agent();
         agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
         agent.set_fast_mode(crate::fast_mode::FastMode::load(&fast_mode_path, true));
+        let cloned = Arc::clone(&transcript);
+        let join = std::thread::spawn(move || {
+            let _guard = cloned.lock().expect("lock transcript");
+            panic!("poison transcript mutex for test");
+        });
+        let _ = join.join();
 
         let error = apply_model_route_with(
             &mut agent,
@@ -299,9 +351,14 @@ protocol = "responses"
             ModelRoute::new("expert", "claude-4"),
             prepared_route(ModelRoute::new("expert", "claude-4")),
         )
-        .expect_err("fast mode persistence must fail before transcript provenance");
+        .expect_err("poisoned transcript must prevent route application");
 
-        assert!(!error.fast_mode_auto_disabled());
+        assert!(error.fast_mode_auto_disabled());
+        assert!(!agent.fast_mode_enabled());
+        assert_eq!(
+            std::fs::read_to_string(&fast_mode_path).expect("read config after apply"),
+            before
+        );
         assert_eq!(agent.model(), "gpt-5.5");
         assert_eq!(
             agent.primary_route(),

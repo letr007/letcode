@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_models_reconcile_persisted_fast_mode() {
+    fn restored_models_reconcile_session_fast_mode() {
         for (restored_model, expected_enabled) in [("claude-4", false), ("gpt-5.5-mini", true)] {
             let sessions_dir = temp_dir();
             let mut recorder =
@@ -832,7 +832,7 @@ protocol = "responses"
     }
 
     #[test]
-    fn failed_resume_reports_persisted_fast_mode_auto_disable() {
+    fn failed_resume_reports_session_fast_mode_auto_disable() {
         let sessions_dir = temp_dir();
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
         recorder
@@ -855,7 +855,8 @@ protocol = "responses"
 "#,
         )
         .expect("write Fast Mode config");
-        let fast_mode = crate::fast_mode::FastMode::load(fast_mode_path, true);
+        let before = std::fs::read_to_string(&fast_mode_path).expect("read config before resume");
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_path, true);
         agent.set_fast_mode(fast_mode);
         let live = Arc::new(Mutex::new(
             TranscriptRecorder::create(&sessions_dir).expect("create live transcript"),
@@ -881,6 +882,10 @@ protocol = "responses"
         let error = install_prepared_resume_for_agent(&mut agent, &live, prepared)
             .expect_err("invalid restore should fail");
         assert!(error.fast_mode_auto_disabled);
+        assert_eq!(
+            std::fs::read_to_string(&fast_mode_path).expect("read config after resume"),
+            before
+        );
         assert!(
             std::error::Error::source(&error).is_some(),
             "the wrapped anyhow error must remain in the source chain"
