@@ -107,9 +107,9 @@ fn footer_metadata_spans(state: &TuiState, theme: Theme, max_width: usize) -> Ve
     let git = state
         .git_branch
         .as_deref()
-        .map(|branch| labeled_footer_value_spans("git:", branch, theme, usize::MAX));
+        .map(|branch| labeled_footer_value_spans(" ", branch, theme, usize::MAX));
     let context = (!state.current_context_branch.is_empty()).then(|| {
-        labeled_footer_value_spans("ctx:", &state.current_context_branch, theme, usize::MAX)
+        labeled_footer_value_spans("󰙅 ", &state.current_context_branch, theme, usize::MAX)
     });
 
     match (git, context) {
@@ -776,7 +776,7 @@ mod tests {
             .collect::<String>();
 
         assert!(
-            rendered.starts_with("git:feature/branch · ctx:context-2"),
+            rendered.starts_with(" feature/branch · 󰙅 context-2"),
             "{rendered}"
         );
     }
@@ -792,7 +792,7 @@ mod tests {
         let rendered = line.to_string();
 
         assert!(line.width() <= 18, "{rendered}");
-        assert!(rendered.contains("ctx:root"), "{rendered}");
+        assert!(rendered.contains("󰙅 root"), "{rendered}");
         assert!(rendered.contains('…'), "{rendered}");
     }
 
@@ -825,8 +825,8 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered, expected);
-        assert!(!rendered.contains("git:"), "{rendered}");
-        assert!(!rendered.contains("ctx:"), "{rendered}");
+        assert!(!rendered.contains(" "), "{rendered}");
+        assert!(!rendered.contains("󰙅 "), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");
     }
 
@@ -889,8 +889,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(rendered.starts_with("ctx:root"), "{rendered}");
-        assert!(!rendered.contains("git:"), "{rendered}");
+        assert!(rendered.starts_with("󰙅 root"), "{rendered}");
+        assert!(!rendered.contains(" "), "{rendered}");
     }
 
     #[test]

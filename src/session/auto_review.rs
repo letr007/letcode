@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::agent::{Agent, AgentTemplate, AutoReviewResolution, AutoReviewService};
 use crate::permission::PermissionRequest;
-use crate::session::event::{NoticeEvent, NoticeKind, PermissionResolutionEvent};
+use crate::session::event::PermissionResolutionEvent;
 use crate::session::runner::{
     PermissionResponse, SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
 };
@@ -207,11 +207,6 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
         Box::pin(async move {
             let _review_guard = self.review_gate.lock().await;
 
-            self.emit(SessionTransportEvent::Notice(NoticeEvent::new(
-                format!("Auto-reviewing {}…", request.tool),
-                NoticeKind::Info,
-            )));
-
             let template = AgentTemplate::reviewer();
             let takeover = self
                 .inner
@@ -346,17 +341,6 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
 
             self.record_decision(&request, &parsed, &child_session_id)?;
             self.emit_resolution(&request, &parsed, &child_session_id);
-            self.emit(SessionTransportEvent::Notice(NoticeEvent::new(
-                format!(
-                    "Auto-review {}: {}",
-                    parsed.approval_label(),
-                    one_line(&parsed.rationale, 120)
-                ),
-                match parsed.response {
-                    PermissionResponse::Deny => NoticeKind::RecoverableError,
-                    _ => NoticeKind::Success,
-                },
-            )));
 
             Ok(parsed.into_resolution(child_session_id))
         })
