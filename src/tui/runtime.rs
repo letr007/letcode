@@ -3291,11 +3291,18 @@ impl TuiRuntime {
         if !self.state.selection_in_progress {
             return;
         }
-        self.state.selection_dragged = true;
         self.state.selection_last_mouse = Some((col, row));
         if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
-            if let Some(selection) = &mut self.state.text_selection {
-                selection.end = anchor;
+            let anchor_changed = self
+                .state
+                .text_selection
+                .as_ref()
+                .is_some_and(|selection| selection.end != anchor);
+            if anchor_changed {
+                self.state.selection_dragged = true;
+                if let Some(selection) = &mut self.state.text_selection {
+                    selection.end = anchor;
+                }
             }
         }
     }

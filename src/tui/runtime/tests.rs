@@ -215,6 +215,63 @@ fn render_runtime_transcript(runtime: &mut TuiRuntime) {
 }
 
 #[test]
+fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::PermissionResolved(
+        PermissionResolutionEvent {
+            call_id: "call-review".into(),
+            decision: PermissionDecision::Denied,
+            reason: Some("unsafe command".into()),
+            tool_name: Some("shell__exec".into()),
+            summary: Some("run command".into()),
+            origin_label: Some("reviewer".into()),
+            approval: Some("deny".into()),
+            risk: Some("high".into()),
+            reviewer_child_session_id: Some("reviewer-child".into()),
+        },
+    ));
+    runtime
+        .state_mut()
+        .toggle_tool_output("auto-review:call-review");
+    render_runtime_transcript(&mut runtime);
+
+    let state = runtime.state();
+    let item_row = state.transcript_render_cache.row_starts()[0] + 1;
+    let area = state.last_transcript_area;
+    let visible_item_row =
+        u16::try_from(item_row.saturating_sub(state.last_transcript_scroll_top as usize))
+            .expect("auto-review row fits in terminal coordinates");
+    let row = area.y + visible_item_row;
+    let col = area.x + 3;
+    assert!(row < area.bottom());
+
+    runtime.handle_selection_start(col, row);
+    assert!(runtime.state().selection_in_progress);
+    runtime.handle_selection_drag(col, row);
+    assert!(!runtime.state().selection_dragged);
+    runtime.handle_selection_end(col, row, false);
+
+    assert_eq!(
+        runtime
+            .state()
+            .tool_output_overrides
+            .get("auto-review:call-review"),
+        Some(&false)
+    );
+
+    render_runtime_transcript(&mut runtime);
+    let text = runtime.state().transcript_render_cache.entries()[0]
+        .document
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert!(text.contains(" · expand"));
+    assert!(!text.contains("unsafe command"));
+}
+
+#[test]
 fn model_catalog_update_refreshes_open_picker_and_notifies_once_per_absence() {
     let mut runtime = runtime();
     let mut dialog = DialogState::new(

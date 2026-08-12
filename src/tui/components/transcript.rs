@@ -1303,6 +1303,8 @@ fn build_permission_lines(
     }
 }
 
+const AUTO_REVIEW_INDENT: &str = "  ";
+
 fn build_auto_review_lines(
     out: &mut TimelineDocument,
     decision: &crate::tui::timeline::AutoReviewDecisionView,
@@ -1311,7 +1313,8 @@ fn build_auto_review_lines(
     expanded: bool,
 ) {
     let width = card_content_width(width);
-    if width == 0 {
+    let content_width = width.saturating_sub(display_width(AUTO_REVIEW_INDENT));
+    if content_width == 0 {
         return;
     }
     let status = if decision.allowed {
@@ -1330,9 +1333,12 @@ fn build_auto_review_lines(
         },
     );
     let status_style = auto_review_status_style(decision.allowed, theme);
-    for line in wrap_text_to_width(&title, width) {
+    for line in wrap_text_to_width(&title, content_width) {
         out.push_decoration(
-            Line::from(Span::styled(line, status_style)),
+            Line::from(vec![
+                Span::styled(AUTO_REVIEW_INDENT, status_style),
+                Span::styled(line, status_style),
+            ]),
             Break::HardBreak,
         );
     }
@@ -1342,7 +1348,13 @@ fn build_auto_review_lines(
             "risk {risk} · {} · call {}",
             decision.rationale, decision.call_id,
         );
-        push_auto_review_text(out, &detail, root_dim_style(theme), width, Break::HardBreak);
+        push_auto_review_text(
+            out,
+            &detail,
+            root_dim_style(theme),
+            content_width,
+            Break::HardBreak,
+        );
     }
 }
 
@@ -1365,11 +1377,14 @@ fn push_auto_review_text(
         if chunk.source_start_char < chunk.source_end_char {
             out.push_line(
                 RenderLine {
-                    spans: vec![RenderSpan::source(
-                        chunk.text.clone(),
-                        style,
-                        SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
-                    )],
+                    spans: vec![
+                        RenderSpan::decoration(AUTO_REVIEW_INDENT, style),
+                        RenderSpan::source(
+                            chunk.text.clone(),
+                            style,
+                            SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
+                        ),
+                    ],
                 },
                 if index + 1 < chunks.len() {
                     chunk_boundary(&chunks, index)
@@ -2089,6 +2104,16 @@ mod tests {
         assert!(!collapsed_text.contains("unsafe command"));
         assert!(expanded_text.contains("⛨ Auto-review denied shell__exec · deny · collapse"));
         assert!(expanded_text.contains("risk high · unsafe command · call call-deny"));
+        for document in [&collapsed, &expanded] {
+            assert!(document.lines.iter().all(|line| {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>();
+                text.starts_with("  ") && !text.starts_with("   ")
+            }));
+        }
         assert!(expanded.validate());
 
         let narrow = render_timeline_item_document(
