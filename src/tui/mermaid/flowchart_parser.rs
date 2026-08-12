@@ -2,8 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::tui::math;
-
 use super::flowchart_ir::{
     MermaidDirection, MermaidEdge, MermaidEdgeStyle, MermaidGraph, MermaidLabel, MermaidNode,
     MermaidShape,
@@ -368,18 +366,7 @@ fn parse_pipe_label(segment: &str, base: usize) -> Option<(Option<MermaidLabel>,
 }
 
 fn parse_label(raw: &str) -> Option<(String, bool)> {
-    if !raw.contains("$$") {
-        return Some((raw.to_string(), false));
-    }
-    let body = raw.strip_prefix("$$")?.strip_suffix("$$")?;
-    if body.is_empty() || body.contains("$$") {
-        return None;
-    }
-    let rendered = math::render_text(body, false)?;
-    if rendered.trim().is_empty() || rendered.contains('\n') {
-        return None;
-    }
-    Some((rendered, true))
+    super::render_math_label(raw)
 }
 
 fn insert_node(

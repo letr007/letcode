@@ -311,7 +311,7 @@ fn render_linear_items(
                     MermaidRenderSpan::source(
                         from.label.clone(),
                         MermaidSourceSpan::new(from.start, from.end),
-                        false,
+                        from.atomic,
                     ),
                     MermaidRenderSpan::decoration(if message.dashed {
                         " ╌╌▶ "
@@ -321,13 +321,13 @@ fn render_linear_items(
                     MermaidRenderSpan::source(
                         to.label.clone(),
                         MermaidSourceSpan::new(to.start, to.end),
-                        false,
+                        to.atomic,
                     ),
                     MermaidRenderSpan::decoration("  "),
                     MermaidRenderSpan::source(
                         message.label.text.clone(),
                         MermaidSourceSpan::new(message.label.start, message.label.end),
-                        false,
+                        message.label.atomic,
                     ),
                 ]);
                 lines.push(line);
@@ -339,7 +339,7 @@ fn render_linear_items(
                     MermaidRenderSpan::source(
                         block.label.text.clone(),
                         MermaidSourceSpan::new(block.label.start, block.label.end),
-                        false,
+                        block.label.atomic,
                     ),
                 ]);
                 for (index, branch) in block.branches.iter().enumerate() {
@@ -355,7 +355,7 @@ fn render_linear_items(
                             line.push(MermaidRenderSpan::source(
                                 label.text.clone(),
                                 MermaidSourceSpan::new(label.start, label.end),
-                                false,
+                                label.atomic,
                             ));
                         }
                     }
@@ -473,10 +473,12 @@ fn parse_items<'a>(
             let label_start =
                 line.base + keyword.chars().count() + line.text[keyword.len()..].chars().count()
                     - rest.chars().count();
+            let (text, atomic) = parse_label(rest)?;
             let label = ir::MermaidLabel {
-                text: rest.to_string(),
+                text,
                 start: label_start,
                 end: label_start + rest.chars().count(),
+                atomic,
             };
             *cursor += 1;
             let branches = parse_block(lines, cursor, participants, kind, autonumber)?;
@@ -543,10 +545,12 @@ fn parse_block<'a>(
             None
         } else {
             let start = line.base + "else".chars().count() + leading;
+            let (text, atomic) = parse_label(rest)?;
             Some(ir::MermaidLabel {
-                text: rest.to_string(),
+                text,
                 start,
                 end: start + rest.chars().count(),
+                atomic,
             })
         };
         *cursor += 1;
@@ -576,12 +580,15 @@ fn parse_participant(
         + 1
         + rest[..separator + " as ".len()].chars().count()
         + label_leading;
+    let raw_label_len = label.chars().count();
+    let (label, atomic) = parse_label(label)?;
     participants.insert(
         id.to_string(),
         ir::MermaidNode {
-            label: label.to_string(),
+            label,
             start,
-            end: start + label.chars().count(),
+            end: start + raw_label_len,
+            atomic,
         },
     );
     Some(())
@@ -619,13 +626,15 @@ fn parse_message(
         .take_while(|ch| ch.is_whitespace())
         .count();
     let start = line.base + line.text[..label_byte].chars().count() + label_leading;
+    let (label, atomic) = parse_label(label)?;
     Some(ir::MermaidMessage {
         from: from.to_string(),
         to: to.to_string(),
         label: ir::MermaidLabel {
-            text: label.to_string(),
+            text: label,
             start,
-            end: start + label.chars().count(),
+            end: start + line.text[colon + 1..].trim().chars().count(),
+            atomic,
         },
         dashed: arrow.starts_with("--"),
     })
@@ -660,4 +669,8 @@ fn valid_id(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn parse_label(label: &str) -> Option<(String, bool)> {
+    super::render_math_label(label)
 }

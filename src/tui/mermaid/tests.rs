@@ -137,7 +137,7 @@ mod tests {
     fn flowchart_math_labels_transform_atomically_and_preserve_wrapper_spans() {
         let source = concat!(
             "flowchart TD\n",
-            "A[$$E=mc^2$$] -->|$$\\int_0^1 x^2 dx$$| B[Done]\n",
+            "A[$$E=mc^2$$] -->|integral $$\\int_0^1 x^2 dx$$| B[Done]\n",
         );
         let graph = flowchart_parser::parse(source).unwrap();
         let node = graph.nodes.get("A").unwrap();
@@ -148,7 +148,7 @@ mod tests {
         assert!(label.atomic);
         assert_eq!(
             source_slice(source, label.start, label.end),
-            "$$\\int_0^1 x^2 dx$$"
+            "integral $$\\int_0^1 x^2 dx$$"
         );
         assert!(!label.text.contains('$'));
 
@@ -172,7 +172,7 @@ mod tests {
             assert!(span.atomic);
             let span_source =
                 source_slice(source, span.source.unwrap().start, span.source.unwrap().end);
-            assert!(span_source == "$$E=mc^2$$" || span_source == "$$\\int_0^1 x^2 dx$$");
+            assert!(span_source == "$$E=mc^2$$" || span_source == "integral $$\\int_0^1 x^2 dx$$");
         }
         let ordinary = rendered
             .lines
@@ -195,7 +195,7 @@ mod tests {
     fn flowchart_math_labels_fail_closed_for_malformed_or_multiline_latex() {
         for source in [
             "flowchart TD\nA[$$E=mc^2] --> B[Done]\n",
-            "flowchart TD\nA[foo$$E=mc^2$$] --> B[Done]\n",
+            "flowchart TD\nA[foo$$E=mc^2] --> B[Done]\n",
             r#"flowchart TD
 A[$$\begin{aligned}x\\ny\end{aligned}$$] --> B[Done]
 "#,
@@ -992,6 +992,83 @@ A[$$\not_a_supported_command$$] --> B[Done]
                 .any(|line| line.contains("response") && line.contains('◀')),
             "{text}"
         );
+    }
+
+    #[test]
+    fn sequence_math_labels_render_atomically_with_full_source_spans() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "participant A as $$\\alpha$$\n",
+            "participant B as Beta\n",
+            "A->>B: Solve: $$\\sqrt{2+2}$$\n",
+            "alt $$x^2$$\n",
+            "B-->>A: Answer: $$2$$\n",
+            "else try $$x_1$$ again\n",
+            "B-->>A: plain\n",
+            "end\n",
+        );
+        let rendered = super::super::render(source, 80).unwrap();
+        let transformed = rendered
+            .lines
+            .iter()
+            .flatten()
+            .filter(|span| {
+                span.source.is_some_and(|range| {
+                    source_slice(source, range.start, range.end).contains("$$")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(!transformed.is_empty());
+        assert!(transformed.iter().all(|span| span.atomic));
+        for span in transformed {
+            let range = span.source.unwrap();
+            let original = source_slice(source, range.start, range.end);
+            assert!(original.contains("$$"), "{original:?}");
+            assert!(!span.text.contains('$'), "{:?}", span.text);
+        }
+        let text = facade_text(source, 80);
+        assert!(text.contains('α'), "{text}");
+        assert!(text.contains("Solve: √(2+2)"), "{text}");
+        assert!(text.contains("x²"), "{text}");
+        assert!(text.contains("Answer: 2"), "{text}");
+        assert!(text.contains("try x₁ again"), "{text}");
+
+        let linear_source = concat!(
+            "sequenceDiagram\n",
+            "participant A as A\n",
+            "A->>A: plain\n",
+        );
+        let linear = super::super::render(linear_source, 80).unwrap();
+        let plain = linear
+            .lines
+            .iter()
+            .flatten()
+            .find(|span| span.text == "plain")
+            .unwrap();
+        assert!(!plain.atomic);
+        assert_eq!(
+            source_slice(
+                linear_source,
+                plain.source.unwrap().start,
+                plain.source.unwrap().end,
+            ),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn sequence_math_labels_fail_closed_for_malformed_latex() {
+        for source in [
+            "sequenceDiagram\nparticipant A as $$\\alpha\nparticipant B as B\nA->>B: x\n",
+            "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: empty $$$$\n",
+            "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: $$\\not_a_supported_command$$\n",
+            "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: $$\\begin{aligned}x\\\\y\\end{aligned}$$\n",
+        ] {
+            assert!(
+                super::super::render(source, 80).is_none(),
+                "accepted {source:?}"
+            );
+        }
     }
 
     #[test]

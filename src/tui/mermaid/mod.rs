@@ -30,6 +30,35 @@ fn render_line_count_within_limits(line_count: usize) -> bool {
     line_count <= MAX_RENDER_LINES
 }
 
+fn render_math_label(label: &str) -> Option<(String, bool)> {
+    let mut rendered = String::new();
+    let mut cursor = 0;
+    let mut had_math = false;
+    while let Some(relative_start) = label[cursor..].find("$$") {
+        let start = cursor + relative_start;
+        rendered.push_str(&label[cursor..start]);
+        let content_start = start + 2;
+        let relative_end = label[content_start..].find("$$")?;
+        let end = content_start + relative_end;
+        let source = &label[content_start..end];
+        if source.is_empty() {
+            return None;
+        }
+        let math = crate::tui::math::render_text(source, false)?;
+        if math.trim().is_empty() || math.contains('\n') {
+            return None;
+        }
+        rendered.push_str(&math);
+        had_math = true;
+        cursor = end + 2;
+    }
+    if !had_math {
+        return Some((label.to_string(), false));
+    }
+    rendered.push_str(&label[cursor..]);
+    Some((rendered, true))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MermaidSourceSpan {
     pub(crate) start: usize,
