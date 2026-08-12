@@ -39,6 +39,7 @@ use crate::tui::{
 };
 use async_openai::{Client, config::OpenAIConfig};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{Terminal, backend::TestBackend};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,6 +204,14 @@ fn runtime_with_experts(available_experts: Vec<AvailableExpert>) -> TuiRuntime {
 
 fn runtime() -> TuiRuntime {
     runtime_with_experts(Vec::new())
+}
+
+fn render_runtime_transcript(runtime: &mut TuiRuntime) {
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .expect("render transcript");
 }
 
 #[test]
@@ -6071,7 +6080,427 @@ fn repeated_child_view_projection_does_not_reset_live_child_state() {
     );
     runtime.apply_session_transport_event(event);
 
-    assert!(runtime.state().child_view_has_live_stream());
+    assert!(runtime.state().child_view_has_unpersisted_projection());
+}
+
+#[test]
+fn child_delta_flush_before_parent_view_preserves_child_projection() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut runtime = TuiRuntime::new(
+        TuiState::default(),
+        rx,
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    );
+
+    tx.send(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    })
+    .expect("queue initial child view");
+    runtime.try_drain_session_events();
+
+    tx.send(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: Some("parent-tool".into()),
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("child live delta")),
+    })
+    .expect("queue child delta");
+    tx.send(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    })
+    .expect("queue parent view");
+    runtime.try_drain_session_events();
+
+    tx.send(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    })
+    .expect("queue child view after parent view");
+    runtime.try_drain_session_events();
+    render_runtime_transcript(&mut runtime);
+
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "child live delta"
+    ));
+}
+
+#[test]
+fn child_interrupt_does_not_drop_parent_tool_terminal_state_after_parent_view() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut runtime = TuiRuntime::new(
+        TuiState::default(),
+        rx,
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolStarted(
+        ToolStartedEvent::new("parent-tool", "shell__exec", "run command"),
+    ));
+    tx.send(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    })
+    .expect("queue child view");
+    tx.send(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: Some("parent-tool".into()),
+        event: SessionEvent::Interrupted,
+    })
+    .expect("queue child interrupt");
+    tx.send(SessionTransportEvent::ToolFinished(ToolFinishedEvent::new(
+        "parent-tool",
+        "shell__exec",
+        "command completed",
+        ToolOutcome::Success,
+    )))
+    .expect("queue parent tool finish while child view is active");
+    runtime.try_drain_session_events();
+    render_runtime_transcript(&mut runtime);
+
+    tx.send(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![TranscriptRecord {
+            session_id: "parent-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::ToolCallStarted {
+                call_id: "parent-tool".into(),
+                name: "shell__exec".into(),
+                args: serde_json::json!({ "command": "run command" }),
+            },
+        }],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    })
+    .expect("queue parent view after child interruption and parent finish");
+    runtime.try_drain_session_events();
+    render_runtime_transcript(&mut runtime);
+
+    assert!(matches!(
+        runtime.state().active_timeline().items().iter().find_map(|item| {
+            match item {
+                TimelineItem::Tool(tool) if tool.call_id == "parent-tool" => Some(tool),
+                _ => None,
+            }
+        }),
+        Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Succeeded
+    ));
+}
+
+#[test]
+fn parent_view_navigation_with_live_parent_restores_parent_view() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    });
+    render_runtime_transcript(&mut runtime);
+
+    assert!(!runtime.state().transcript_view.is_child());
+    assert!(
+        runtime
+            .state()
+            .child_timeline_cache_contains("child-session")
+    );
+}
+
+#[test]
+fn background_child_event_updates_cached_child_lifecycle() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "background-child".into(),
+        agent_name: Some("fixer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
+    });
+
+    assert_eq!(runtime.state().phase, AppPhase::Idle);
+    assert_eq!(
+        runtime.state().cached_child_phase("background-child"),
+        Some(AppPhase::Error)
+    );
+}
+
+#[test]
+fn background_child_terminal_preserves_parent_interrupt_confirmation() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("first interrupt hint succeeds"),
+        None
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "background-child".into(),
+        agent_name: Some("fixer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::Done,
+    });
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("child terminal does not reset parent confirmation"),
+        Some(RuntimeCommand::Interrupt)
+    );
+}
+
+#[test]
+fn unseen_child_terminal_then_first_view_loads_snapshot_history() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "background-child".into(),
+        agent_name: Some("fixer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::Done,
+    });
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "background-child".into(),
+        agent_name: "fixer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![TranscriptRecord {
+            session_id: "background-child".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: "persisted child history".into(),
+            },
+        }],
+        runtime_context: event_context("background-child", 1),
+    });
+    render_runtime_transcript(&mut runtime);
+
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "persisted child history"
+    ));
+    assert_eq!(
+        runtime
+            .state()
+            .child_view_metadata()
+            .map(|metadata| metadata.record_count),
+        Some(1)
+    );
+}
+
+#[test]
+fn child_context_update_does_not_block_later_snapshot_growth() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::RuntimeContextUpdated(
+            crate::tui::events::RuntimeContextUpdatedEvent {
+                context: event_context("child-session", 2),
+                disposition: crate::tui::events::RuntimeContextDisposition::Advance,
+            },
+        ),
+    });
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: "snapshot after context update".into(),
+            },
+        }],
+        runtime_context: event_context("child-session", 2),
+    });
+    render_runtime_transcript(&mut runtime);
+
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "snapshot after context update"
+    ));
+}
+
+#[test]
+fn child_terminal_snapshot_refresh_preserves_canonical_projection() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("final live output")),
+    });
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::Done,
+    });
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::SessionStarted {
+                model: "gpt-child".into(),
+            },
+        }],
+        runtime_context: event_context("child-session", 1),
+    });
+    render_runtime_transcript(&mut runtime);
+
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "final live output"
+    ));
+}
+
+#[test]
+fn child_view_snapshot_growth_preserves_unpersisted_live_delta() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut runtime = TuiRuntime::new(
+        TuiState::default(),
+        rx,
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    );
+
+    tx.send(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    })
+    .expect("queue initial child view");
+    tx.send(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("unpersisted live delta")),
+    })
+    .expect("queue child delta");
+    tx.send(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::SessionStarted {
+                model: "gpt-child".into(),
+            },
+        }],
+        runtime_context: event_context("child-session", 1),
+    })
+    .expect("queue growing child snapshot");
+    runtime.try_drain_session_events();
+    render_runtime_transcript(&mut runtime);
+
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "unpersisted live delta"
+    ));
 }
 
 #[test]

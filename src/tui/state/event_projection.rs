@@ -19,31 +19,17 @@ pub(super) struct EventProjection<'a> {
     pub(super) status_spinner_frame: &'a mut usize,
     pub(super) toast: &'a mut Option<ToastState>,
     pub(super) timeline: &'a mut Timeline,
-    pub(super) live_streaming: Option<&'a mut bool>,
     pub(super) accepts_tool_events: bool,
 }
 
 impl<'a> EventProjection<'a> {
-    pub(super) fn with_live_streaming(mut self, live_streaming: &'a mut bool) -> Self {
-        self.live_streaming = Some(live_streaming);
-        self
-    }
-
     pub(super) fn with_tool_event_acceptance(mut self, accepts_tool_events: bool) -> Self {
         self.accepts_tool_events = accepts_tool_events;
         self
     }
 }
 
-pub(super) fn apply_projected_session_event(
-    mut projection: EventProjection<'_>,
-    event: SessionEvent,
-) {
-    let terminal_event = matches!(
-        event,
-        SessionEvent::Interrupted | SessionEvent::Error(_) | SessionEvent::Done
-    );
-
+pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, event: SessionEvent) {
     match event {
         SessionEvent::Tick => {
             *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
@@ -287,10 +273,6 @@ pub(super) fn apply_projected_session_event(
         }
         SessionEvent::PermissionRequested(_) => {}
     }
-
-    if !terminal_event && let Some(live_streaming) = projection.live_streaming.as_deref_mut() {
-        *live_streaming = true;
-    }
 }
 
 pub(super) fn child_event_projection_payload(
@@ -397,8 +379,20 @@ pub(super) fn project_child_timeline_state(
         timeline: Timeline::from_transcript_records(records),
         model: child_transcript_model(records),
         record_count: records.len(),
-        live_streaming: false,
+        snapshot_loaded: true,
+        snapshot_dirty: false,
         context: project_context_pane(records)?,
+        active_session: true,
+        latest_auto_continue: AutoContinueState::default(),
+        latest_todo: None,
+        retry: None,
+        phase: AppPhase::Completed,
+        active_tool_call_id: None,
+        pending_permission: None,
+        model_token_usage: None,
+        compaction_active: false,
+        compaction_animation_start_frame: 0,
+        ignore_late_tool_events: false,
     })
 }
 

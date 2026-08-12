@@ -364,8 +364,64 @@ struct ChildTranscriptState {
     timeline: Timeline,
     model: Option<String>,
     record_count: usize,
-    live_streaming: bool,
+    snapshot_loaded: bool,
+    snapshot_dirty: bool,
     context: ContextPaneState,
+    active_session: bool,
+    latest_auto_continue: AutoContinueState,
+    latest_todo: Option<TodoView>,
+    retry: Option<RetryNoticeState>,
+    phase: AppPhase,
+    active_tool_call_id: Option<String>,
+    pending_permission: Option<PermissionView>,
+    model_token_usage: Option<ModelTokenUsage>,
+    compaction_active: bool,
+    compaction_animation_start_frame: usize,
+    ignore_late_tool_events: bool,
+}
+
+impl ChildTranscriptState {
+    fn empty(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            timeline: Timeline::default(),
+            model: None,
+            record_count: 0,
+            snapshot_loaded: false,
+            snapshot_dirty: false,
+            context: ContextPaneState::default(),
+            active_session: true,
+            latest_auto_continue: AutoContinueState::default(),
+            latest_todo: None,
+            retry: None,
+            phase: AppPhase::Completed,
+            active_tool_call_id: None,
+            pending_permission: None,
+            model_token_usage: None,
+            compaction_active: false,
+            compaction_animation_start_frame: 0,
+            ignore_late_tool_events: false,
+        }
+    }
+
+    fn replace_clean_snapshot(&mut self, records: &[TranscriptRecord], context: ContextPaneState) {
+        self.timeline = Timeline::from_transcript_records(records);
+        self.model = child_transcript_model(records);
+        self.record_count = records.len();
+        self.snapshot_loaded = true;
+        self.snapshot_dirty = false;
+        self.context = context;
+    }
+
+    fn from_snapshot(
+        session_id: impl Into<String>,
+        records: &[TranscriptRecord],
+        context: ContextPaneState,
+    ) -> Self {
+        let mut state = Self::empty(session_id);
+        state.replace_clean_snapshot(records, context);
+        state
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1381,6 +1437,16 @@ impl TuiState {
     }
 
     pub fn push_queued_user_message_preview(&mut self, submission: UserMessageSubmission) {
+        if self.timeline.items().iter().any(|item| {
+            matches!(
+                item,
+                TimelineItem::User(message)
+                    if message.submission_id.as_deref() == Some(submission.id.as_str())
+                        && message.queued
+            )
+        }) {
+            return;
+        }
         self.active_session = true;
         self.timeline
             .push_user_message(UserMessageEvent::queued_submission(submission));
@@ -1845,10 +1911,10 @@ impl TuiState {
             auto_continue: latest_auto_continue.clone(),
         });
 
+        self.cache_active_child_timeline();
         self.active_session = true;
         self.timeline = timeline;
         self.context = context;
-        self.child_timeline = None;
         self.latest_auto_continue = latest_auto_continue;
         self.latest_todo = latest_todo;
         self.retry = None;
@@ -1891,7 +1957,9 @@ impl TuiState {
         total: usize,
         pool_ordinal: u32,
     ) -> Result<()> {
-        let child_state = project_child_timeline_state(records)?;
+        let mut child_state = project_child_timeline_state(records)?;
+        let child_session_id = child_session_id.into();
+        child_state.session_id = child_session_id.clone();
         self.active_session = true;
         self.clear_input();
         self.close_dialog();
@@ -1900,7 +1968,7 @@ impl TuiState {
         self.retry = None;
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
-            child_session_id: child_session_id.into(),
+            child_session_id,
             agent_name: agent_name.into(),
             index,
             total,
@@ -1924,19 +1992,34 @@ impl TuiState {
         runtime_context: RuntimeActiveContext,
     ) -> Result<()> {
         validate_lifecycle_records(records, &runtime_context)?;
+        let parent_session_id = parent_session_id.into();
         let child_session_id = child_session_id.into();
-        if self.child_timeline.as_ref().is_some_and(|active| {
-            active.session_id == child_session_id && active.record_count == records.len()
-        }) {
+        let agent_name = agent_name.into();
+        let mut context = ContextPaneState::default();
+        apply_runtime_context(
+            &mut context,
+            runtime_context,
+            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+        );
+
+        if let Some(active) = self.child_timeline.as_mut()
+            && active.session_id == child_session_id
+        {
+            if active.snapshot_dirty {
+                active.context = context;
+                active.model = child_transcript_model(records);
+            } else {
+                active.replace_clean_snapshot(records, context);
+            }
             self.active_session = true;
             self.clear_input();
             self.close_dialog();
             self.reset_slash_panel();
             self.retry = None;
             self.transcript_view = TranscriptViewState::Child {
-                parent_session_id: parent_session_id.into(),
+                parent_session_id,
                 child_session_id,
-                agent_name: agent_name.into(),
+                agent_name,
                 index,
                 total,
                 pool_ordinal,
@@ -1948,23 +2031,16 @@ impl TuiState {
         }
 
         let child_state = match self.child_timeline_cache.remove(&child_session_id) {
-            Some(cached) if cached.record_count == records.len() => cached,
-            _ => {
-                let mut context = ContextPaneState::default();
-                apply_runtime_context(
-                    &mut context,
-                    runtime_context,
-                    crate::tui::events::RuntimeContextDisposition::ReplaceScope,
-                );
-                ChildTranscriptState {
-                    session_id: child_session_id.clone(),
-                    timeline: Timeline::from_transcript_records(records),
-                    model: child_transcript_model(records),
-                    record_count: records.len(),
-                    live_streaming: false,
-                    context,
+            Some(mut cached) => {
+                if cached.snapshot_dirty {
+                    cached.context = context;
+                    cached.model = child_transcript_model(records);
+                } else {
+                    cached.replace_clean_snapshot(records, context);
                 }
+                cached
             }
+            None => ChildTranscriptState::from_snapshot(child_session_id.clone(), records, context),
         };
 
         if let Some(active_child) = self.child_timeline.take() {
@@ -2038,8 +2114,20 @@ impl TuiState {
             timeline: Timeline::from_transcript_records(records),
             model: child_transcript_model(records),
             record_count: records.len(),
-            live_streaming: false,
+            snapshot_loaded: true,
+            snapshot_dirty: false,
             context,
+            active_session: true,
+            latest_auto_continue: AutoContinueState::default(),
+            latest_todo: None,
+            retry: None,
+            phase: AppPhase::Completed,
+            active_tool_call_id: None,
+            pending_permission: None,
+            model_token_usage: None,
+            compaction_active: false,
+            compaction_animation_start_frame: 0,
+            ignore_late_tool_events: false,
         };
         self.child_timeline = Some(child_state);
         self.ignore_late_tool_events = false;
@@ -2054,11 +2142,28 @@ impl TuiState {
     }
 
     #[cfg(test)]
-    pub fn child_view_has_live_stream(&self) -> bool {
+    pub fn child_view_has_unpersisted_projection(&self) -> bool {
         self.child_timeline
             .as_ref()
-            .map(|child| child.live_streaming)
+            .map(|child| child.snapshot_dirty)
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub fn child_view_phase(&self) -> Option<AppPhase> {
+        self.child_timeline.as_ref().map(|child| child.phase)
+    }
+
+    #[cfg(test)]
+    pub fn cached_child_phase(&self, child_session_id: &str) -> Option<AppPhase> {
+        self.child_timeline_cache
+            .get(child_session_id)
+            .map(|child| child.phase)
+    }
+
+    #[cfg(test)]
+    pub fn child_timeline_cache_contains(&self, child_session_id: &str) -> bool {
+        self.child_timeline_cache.contains_key(child_session_id)
     }
 
     pub fn child_view_metadata(&self) -> Option<ChildViewMetadata> {
@@ -2087,7 +2192,34 @@ impl TuiState {
         })
     }
 
+    pub fn cache_active_child_timeline(&mut self) {
+        if let Some(active_child) = self.child_timeline.take() {
+            self.child_timeline_cache
+                .insert(active_child.session_id.clone(), active_child);
+        }
+    }
+
+    pub fn clear_child_timeline_cache(&mut self) {
+        self.child_timeline_cache.clear();
+    }
+
+    pub fn try_restore_parent_timeline_view_with_runtime_context(
+        &mut self,
+        records: &[TranscriptRecord],
+        runtime_context: RuntimeActiveContext,
+    ) -> Result<()> {
+        validate_lifecycle_records(records, &runtime_context)?;
+        apply_runtime_context(
+            &mut self.context,
+            runtime_context,
+            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+        );
+        self.restore_parent_timeline_view();
+        Ok(())
+    }
+
     pub fn restore_parent_timeline_view(&mut self) {
+        self.cache_active_child_timeline();
         self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
         self.close_dialog();
@@ -2187,64 +2319,47 @@ impl TuiState {
             &event,
         );
 
+        if !self.child_event_targets_loaded_child(child_session_id) {
+            self.child_timeline_cache.insert(
+                child_session_id.to_string(),
+                ChildTranscriptState::empty(child_session_id),
+            );
+        }
+
         if self.apply_child_context_event(child_session_id, &event, viewing_child) {
             return;
         }
 
-        match event {
-            SessionEvent::PermissionRequested(request) => {
-                self.apply_permission_requested_projection(&request);
-                if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
-                    child_timeline.timeline.push_permission_request(request);
-                    child_timeline.live_streaming = true;
-                    self.invalidate_transcript_cache();
-                    self.last_transcript_total_rows = None;
-                }
-            }
-            SessionEvent::PermissionResolved(resolution) => {
-                self.apply_permission_resolved_projection(&resolution);
-                if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
-                    child_timeline.timeline.resolve_permission(resolution);
-                    child_timeline.live_streaming = true;
-                    self.invalidate_transcript_cache();
-                    self.last_transcript_total_rows = None;
-                }
-            }
-            event if viewing_child => {
-                let accepts_tool_events = self.accepts_tool_events();
-                let Some(child_timeline) = self.child_timeline.as_mut() else {
-                    return;
-                };
-                apply_projected_session_event(
-                    EventProjection {
-                        active_session: &mut self.active_session,
-                        latest_auto_continue: &mut self.latest_auto_continue,
-                        latest_todo: &mut self.latest_todo,
-                        retry: &mut self.retry,
-                        phase: &mut self.phase,
-                        active_tool_call_id: &mut self.active_tool_call_id,
-                        pending_permission: &mut self.pending_permission,
-                        model_token_usage: &mut self.model_token_usage,
-                        compaction_active: &mut self.compaction_active,
-                        compaction_animation_start_frame: &mut self
-                            .compaction_animation_start_frame,
-                        ignore_late_tool_events: &mut self.ignore_late_tool_events,
-                        quit_requested: &mut self.quit_requested,
-                        status_spinner_frame: &mut self.status_spinner_frame,
-                        toast: &mut self.toast,
-                        timeline: &mut child_timeline.timeline,
-                        live_streaming: None,
-                        accepts_tool_events: true,
-                    }
-                    .with_live_streaming(&mut child_timeline.live_streaming)
-                    .with_tool_event_acceptance(accepts_tool_events),
-                    event,
-                );
+        let child_toast = {
+            let TuiState {
+                child_timeline,
+                child_timeline_cache,
+                status_spinner_frame,
+                ..
+            } = self;
+            let child = if child_timeline
+                .as_ref()
+                .is_some_and(|child| child.session_id == child_session_id)
+            {
+                child_timeline
+                    .as_mut()
+                    .expect("matching active child timeline exists")
+            } else {
+                child_timeline_cache
+                    .get_mut(child_session_id)
+                    .expect("child timeline cache entry exists")
+            };
+            let mut child_toast = None;
+            apply_event_to_child_transcript(child, event, status_spinner_frame, &mut child_toast);
+            child_toast
+        };
 
-                self.invalidate_transcript_cache();
-                self.last_transcript_total_rows = None;
+        if viewing_child {
+            if child_toast.is_some() {
+                self.toast = child_toast;
             }
-            _ => {}
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
         }
     }
 
@@ -2280,7 +2395,6 @@ impl TuiState {
                 status_spinner_frame: &mut self.status_spinner_frame,
                 toast: &mut self.toast,
                 timeline: &mut self.timeline,
-                live_streaming: None,
                 accepts_tool_events: true,
             }
             .with_tool_event_acceptance(accepts_tool_events),
@@ -2365,10 +2479,19 @@ impl TuiState {
         event: &SessionEvent,
         viewing_child: bool,
     ) -> bool {
-        if !self.child_event_targets_loaded_child(child_session_id) {
-            return false;
-        }
-        let Some(child) = self.child_timeline.as_mut() else {
+        let TuiState {
+            child_timeline,
+            child_timeline_cache,
+            ..
+        } = self;
+        let Some(child) = (if child_timeline
+            .as_ref()
+            .is_some_and(|child| child.session_id == child_session_id)
+        {
+            child_timeline.as_mut()
+        } else {
+            child_timeline_cache.get_mut(child_session_id)
+        }) else {
             return false;
         };
 
@@ -2387,7 +2510,7 @@ impl TuiState {
                 }
                 true
             }
-            SessionEvent::RuntimeContextUpdated(_) => false,
+            SessionEvent::RuntimeContextUpdated(_) => true,
             SessionEvent::ContextTreeUpdated(update) => {
                 child.context.tree = update.tree.clone();
                 true
@@ -2426,35 +2549,27 @@ impl TuiState {
                     },
                 );
             }
-            if detail_closed {
+            if detail_closed && viewing_child {
                 if matches!(
                     self.dialog.as_ref().map(|dialog| &dialog.kind),
                     Some(DialogKind::ContextDetail)
                 ) {
                     self.close_dialog();
                 }
-                if viewing_child {
-                    self.show_toast(
-                        "Context detail closed · Item no longer available",
-                        ToastKind::Info,
-                    );
-                }
+                self.show_toast(
+                    "Context detail closed · Item no longer available",
+                    ToastKind::Info,
+                );
             }
         }
-        handled && viewing_child
+        handled
     }
 
     fn child_event_targets_loaded_child(&self, child_session_id: &str) -> bool {
-        matches!(
-            &self.transcript_view,
-            TranscriptViewState::Child {
-                child_session_id: active_child_session_id,
-                ..
-            } if active_child_session_id == child_session_id
-        ) || self
-            .child_timeline
+        self.child_timeline
             .as_ref()
             .is_some_and(|child| child.session_id == child_session_id)
+            || self.child_timeline_cache.contains_key(child_session_id)
     }
 
     fn apply_permission_resolved_projection(&mut self, resolution: &PermissionResolutionEvent) {
@@ -2704,6 +2819,66 @@ fn child_feedback_message(
     match agent_name.filter(|name| !name.is_empty()) {
         Some(agent_name) => format!("{agent_name} · {child}: {message}"),
         None => format!("{child}: {message}"),
+    }
+}
+
+fn apply_event_to_child_transcript(
+    child: &mut ChildTranscriptState,
+    event: SessionEvent,
+    status_spinner_frame: &mut usize,
+    toast: &mut Option<ToastState>,
+) {
+    let terminal_event = matches!(
+        &event,
+        SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
+    );
+    let timeline_revision = child.timeline.mutation_revision();
+
+    match event {
+        SessionEvent::PermissionRequested(request) => {
+            child.phase = AppPhase::WaitingForPermission;
+            child.active_tool_call_id = Some(request.call_id.clone());
+            child.pending_permission = Some(PermissionView::from_request(request.clone()));
+            child.timeline.push_permission_request(request);
+        }
+        SessionEvent::PermissionResolved(resolution) => {
+            child.phase = AppPhase::Running;
+            child.active_tool_call_id = None;
+            child.pending_permission = None;
+            child.timeline.resolve_permission(resolution);
+        }
+        event => {
+            let accepts_tool_events = !child.ignore_late_tool_events;
+            let mut child_quit_requested = false;
+            apply_projected_session_event(
+                EventProjection {
+                    active_session: &mut child.active_session,
+                    latest_auto_continue: &mut child.latest_auto_continue,
+                    latest_todo: &mut child.latest_todo,
+                    retry: &mut child.retry,
+                    phase: &mut child.phase,
+                    active_tool_call_id: &mut child.active_tool_call_id,
+                    pending_permission: &mut child.pending_permission,
+                    model_token_usage: &mut child.model_token_usage,
+                    compaction_active: &mut child.compaction_active,
+                    compaction_animation_start_frame: &mut child.compaction_animation_start_frame,
+                    ignore_late_tool_events: &mut child.ignore_late_tool_events,
+                    quit_requested: &mut child_quit_requested,
+                    status_spinner_frame,
+                    toast,
+                    timeline: &mut child.timeline,
+                    accepts_tool_events: true,
+                }
+                .with_tool_event_acceptance(accepts_tool_events),
+                event,
+            );
+        }
+    }
+
+    if child.timeline.mutation_revision() != timeline_revision
+        && (child.snapshot_loaded || !terminal_event)
+    {
+        child.snapshot_dirty = true;
     }
 }
 
@@ -3089,8 +3264,10 @@ mod tests {
             )),
         );
 
-        assert_eq!(state.phase, AppPhase::Completed);
+        // Child lifecycle state is local; the parent remains untouched.
+        assert_eq!(state.phase, AppPhase::Idle);
         assert_eq!(state.active_tool_call_id, None);
+        assert_eq!(state.child_view_phase(), Some(AppPhase::Completed));
 
         assert!(matches!(
             state.active_timeline().items().iter().find_map(|item| match item {

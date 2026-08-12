@@ -1188,6 +1188,7 @@ impl TuiRuntime {
                     );
                     return;
                 }
+                self.state.clear_child_timeline_cache();
                 self.session_resume_pending = false;
                 self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
@@ -1232,13 +1233,23 @@ impl TuiRuntime {
                 // projection clears the question dialog, so keep it aside first and
                 // restore it when the in-flight handle is still live.
                 let pending_question = self.state.pending_question.take();
-                if let Err(error) = self
-                    .state
-                    .try_replace_session_timeline_from_records_with_runtime_context(
-                        records,
-                        runtime_context.clone(),
-                    )
-                {
+                let preserve_live_parent = self.session_turn_active
+                    || self.state.phase == super::state::AppPhase::Running
+                    || self.state.active_tool_call_id.is_some();
+                let result = if preserve_live_parent {
+                    self.state
+                        .try_restore_parent_timeline_view_with_runtime_context(
+                            records,
+                            runtime_context.clone(),
+                        )
+                } else {
+                    self.state
+                        .try_replace_session_timeline_from_records_with_runtime_context(
+                            records,
+                            runtime_context.clone(),
+                        )
+                };
+                if let Err(error) = result {
                     self.state.pending_question = pending_question;
                     self.state.show_toast(
                         format!("Context projection failed: {error}"),
@@ -1281,14 +1292,6 @@ impl TuiRuntime {
                 records,
                 runtime_context,
             } => {
-                if self.state.child_view_metadata().is_some_and(|current| {
-                    current.child_session_id == *child_session_id
-                        && current.record_count == records.len()
-                        && current.index == *index
-                        && current.total == *total
-                }) {
-                    return;
-                }
                 if let Err(error) = self
                     .state
                     .try_replace_child_timeline_from_records_with_runtime_context(
@@ -1331,6 +1334,7 @@ impl TuiRuntime {
                     );
                     return;
                 }
+                self.state.clear_child_timeline_cache();
                 self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
                 self.session_title = session_title_from_records(records);
@@ -1397,12 +1401,6 @@ impl TuiRuntime {
                     let _ = self.cancel_pending_question(
                         "question cancelled because the child session stopped",
                     );
-                }
-                if matches!(
-                    event,
-                    SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
-                ) {
-                    self.interrupt_confirmation_pending = false;
                 }
                 self.state.apply_child_session_event_with_agent(
                     child_session_id,
