@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(unused))]
+
 mod agent;
 mod agent_event_journal;
 mod cli;
