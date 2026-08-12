@@ -2418,6 +2418,40 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
 }
 
 #[test]
+fn reasoning_effort_selection_is_scoped_to_each_model() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([
+        (
+            "m1".into(),
+            ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Medium),
+                reasoning_efforts: vec![ModelReasoningEffort::Medium, ModelReasoningEffort::High],
+                ..Default::default()
+            },
+        ),
+        (
+            "m2".into(),
+            ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Low),
+                reasoning_efforts: vec![ModelReasoningEffort::Low, ModelReasoningEffort::High],
+                ..Default::default()
+            },
+        ),
+    ]));
+
+    agent
+        .set_reasoning_effort(ModelReasoningEffort::High)
+        .expect("set first model effort");
+    agent.set_model("m2");
+    assert_eq!(agent.reasoning_effort(), Some(ModelReasoningEffort::Low));
+
+    agent.set_model("m1");
+    assert_eq!(agent.reasoning_effort(), Some(ModelReasoningEffort::High));
+}
+
+#[test]
 fn compatible_chat_delta_reads_native_reasoning_fields() {
     for (field, expected) in [
         ("reasoning_content", "plan"),

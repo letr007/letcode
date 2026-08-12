@@ -138,6 +138,7 @@ pub fn install_prepared_new_session_for_agent<C: Config>(
     agent.prepare_new_session_permission_reset()?;
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)?;
+    agent.clear_session_reasoning_efforts();
     agent.install_new_session_runtime_snapshot(
         protocol_frames,
         runtime_snapshot,

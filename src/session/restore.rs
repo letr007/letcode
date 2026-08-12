@@ -295,6 +295,7 @@ pub fn install_prepared_resume_for_agent<C: Config>(
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
+    agent.clear_session_reasoning_efforts();
     let _ = cleanup_replaced_empty_session(old_path, &new_path);
     Ok(fast_mode_auto_disabled)
 }
@@ -334,6 +335,7 @@ pub fn install_prepared_routed_resume_for_agent(
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
+    agent.clear_session_reasoning_efforts();
     apply_prepared_restored_route(agent, route);
     apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
     agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
@@ -523,8 +525,26 @@ mod tests {
         drop(recorder);
 
         let mut agent = test_agent();
+        agent.set_model("shared");
         agent.set_primary_route(ModelRoute::new("primary", "shared"));
+        agent.set_model_catalog(std::collections::HashMap::from([(
+            "shared".into(),
+            crate::request_builder::ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(crate::request_builder::ModelReasoningEffort::Medium),
+                reasoning_efforts: vec![
+                    crate::request_builder::ModelReasoningEffort::Medium,
+                    crate::request_builder::ModelReasoningEffort::High,
+                ],
+                ..Default::default()
+            },
+        )]));
         let expected_route = ModelRoute::new("expert", "shared");
+        agent.set_primary_route(expected_route.clone());
+        agent
+            .set_reasoning_effort(crate::request_builder::ModelReasoningEffort::High)
+            .expect("set previous session effort for the resumed route");
+        agent.set_primary_route(ModelRoute::new("primary", "shared"));
         let applied_route = Arc::new(Mutex::new(None));
         agent.set_primary_route_factory(Arc::new(RecordingRouteFactory {
             accepted_routes: vec![ModelRoute::new("expert", "shared")],
@@ -543,6 +563,11 @@ mod tests {
             Some(expected_route)
         );
         assert_eq!(agent.model(), "shared");
+        assert_eq!(
+            agent.reasoning_effort(),
+            None,
+            "resuming a different session must not retain the previous session effort"
+        );
         assert!(!fast_mode_auto_disabled);
         assert_eq!(token_usage.output_tokens, 0);
     }

@@ -574,6 +574,7 @@ pub struct Agent<C: Config> {
     default_protocol: ApiProtocol,
     model_protocols: HashMap<String, ApiProtocol>,
     model_catalog: HashMap<String, ModelRequestMetadata>,
+    session_reasoning_efforts: HashMap<String, ModelReasoningEffort>,
     prelude: Vec<PromptMessage>,
     protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
@@ -768,6 +769,7 @@ impl AgentFactory {
             default_protocol,
             model_protocols,
             model_catalog,
+            session_reasoning_efforts: parent.session_reasoning_efforts.clone(),
             prelude,
             protocol_frames: Vec::new(),
             history: Vec::new(),
@@ -1040,6 +1042,7 @@ impl<C: Config> Agent<C> {
             default_protocol: ApiProtocol::Responses,
             model_protocols: HashMap::new(),
             model_catalog: HashMap::new(),
+            session_reasoning_efforts: HashMap::new(),
             prelude: default_agent_prelude(),
             protocol_frames: vec![],
             history: vec![],
@@ -1263,8 +1266,21 @@ impl<C: Config> Agent<C> {
 
     pub(crate) fn active_model_metadata(&self) -> ModelRequestMetadata {
         let mut metadata = self.model_metadata_for(&self.model);
+        if let Some(effort) = self
+            .session_reasoning_efforts
+            .get(&self.active_reasoning_effort_key())
+        {
+            metadata.reasoning_effort = Some(effort.clone());
+        }
         metadata.fast_mode = self.fast_mode_enabled();
         metadata
+    }
+
+    fn active_reasoning_effort_key(&self) -> String {
+        self.primary_route
+            .as_ref()
+            .filter(|route| route.model == self.model)
+            .map_or_else(|| self.model.clone(), ModelRoute::display_name)
     }
 
     fn model_metadata_for(&self, model_id: &str) -> ModelRequestMetadata {
@@ -1344,6 +1360,10 @@ impl<C: Config> Agent<C> {
 
     pub fn reasoning_effort(&self) -> Option<ModelReasoningEffort> {
         self.active_model_metadata().reasoning_effort
+    }
+
+    pub(crate) fn clear_session_reasoning_efforts(&mut self) {
+        self.session_reasoning_efforts.clear();
     }
 
     pub fn session_token_usage(&self) -> Result<TokenUsageEstimate> {
@@ -1451,7 +1471,7 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn set_reasoning_effort(&mut self, effort: ModelReasoningEffort) -> Result<()> {
-        let mut metadata = self.active_model_metadata();
+        let metadata = self.active_model_metadata();
         let selectable = metadata.selectable_reasoning_efforts();
         if selectable.is_empty() {
             bail!(
@@ -1470,9 +1490,8 @@ impl<C: Config> Agent<C> {
                 self.model
             );
         }
-        metadata.reasoning_effort = Some(effort);
-        metadata.fast_mode = false;
-        self.model_catalog.insert(self.model.clone(), metadata);
+        self.session_reasoning_efforts
+            .insert(self.active_reasoning_effort_key(), effort);
         Ok(())
     }
 
@@ -2401,6 +2420,7 @@ impl<C: Config> Agent<C> {
             default_protocol: self.default_protocol,
             model_protocols: self.model_protocols.clone(),
             model_catalog: self.model_catalog.clone(),
+            session_reasoning_efforts: self.session_reasoning_efforts.clone(),
             prelude: vec![PromptMessage::developer(SESSION_TITLE_PRELUDE)],
             protocol_frames: Vec::new(),
             history: Vec::new(),

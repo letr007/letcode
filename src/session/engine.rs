@@ -3437,6 +3437,7 @@ async fn run_engine_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_builder::ModelReasoningEffort;
     use async_openai::{Client, config::OpenAIConfig};
     use std::fs;
     use std::sync::Arc;
@@ -3732,7 +3733,7 @@ mod tests {
     }
 
     #[test]
-    fn non_reloadable_global_config_write_is_silent() {
+    fn config_reload_preserves_session_reasoning_effort() {
         let path = std::env::temp_dir().join(format!(
             "letcode-engine-reload-non-runtime-write-{}",
             SystemTime::now()
@@ -3757,6 +3758,9 @@ mod tests {
             default_model = "primary-model"
 
             [providers.primary.models.primary-model]
+            supports_reasoning = true
+            reasoning_effort = "medium"
+            reasoning_efforts = ["medium", "high"]
             "#,
         )
         .expect("write initial config");
@@ -3783,6 +3787,9 @@ mod tests {
                 .map(|(id, model)| (id.clone(), model.request_metadata()))
                 .collect(),
         );
+        agent
+            .set_reasoning_effort(ModelReasoningEffort::High)
+            .expect("set session reasoning effort");
         agent.set_compaction_config(config.global.compaction.clone());
         agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
         agent
@@ -3845,8 +3852,13 @@ mod tests {
             &mut new_session_default_route,
             &event_tx,
         )
-        .expect("non-reloadable config write should be a silent no-op");
+        .expect("non-reloadable config write should preserve session settings");
 
+        assert_eq!(
+            agent.reasoning_effort(),
+            Some(ModelReasoningEffort::High),
+            "configuration reload must preserve the session reasoning selection"
+        );
         assert!(event_rx.try_recv().is_err());
         let _ = fs::remove_file(path);
     }

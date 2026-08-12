@@ -1271,7 +1271,10 @@ impl TuiRuntime {
                     self.state.phase = super::state::AppPhase::WaitingForPermission;
                 }
                 if let Some(model_id) = model_id {
+                    let reasoning_effort_label = self.state.reasoning_effort_label.clone();
                     self.apply_restored_model(model_id.clone());
+                    self.state
+                        .set_reasoning_effort_label(reasoning_effort_label);
                     self.state.set_provider_label_from_model_route(model_id);
                 }
                 self.state.set_current_context_branch(branch_id.clone());

@@ -237,6 +237,11 @@ protocol = "responses"
 
         assert_eq!(agent.reasoning_effort(), Some(ModelReasoningEffort::High));
         assert_eq!(
+            agent.model_catalog()["gpt-5.5"].reasoning_effort,
+            Some(ModelReasoningEffort::Medium),
+            "session selection must not mutate configured model metadata"
+        );
+        assert_eq!(
             std::fs::read_to_string(&config_path).expect("read config after change"),
             before
         );

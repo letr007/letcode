@@ -1001,6 +1001,28 @@ fn parent_view_refresh_preserves_pending_setting_projection() {
 }
 
 #[test]
+fn parent_view_refresh_preserves_confirmed_reasoning_effort() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_reasoning_effort_label(Some("high".into()));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: Some("gpt-5.5".into()),
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    });
+
+    assert_eq!(
+        runtime.state().reasoning_effort_label.as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
 fn running_turn_blocks_exit_and_quit_commands() {
     for command_text in ["exit", "quit", "/exit", "/quit"] {
         let mut runtime = runtime();
