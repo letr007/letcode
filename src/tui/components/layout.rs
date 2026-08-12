@@ -97,7 +97,8 @@ pub fn child_read_only_composer_height(total_height: u16) -> u16 {
     match total_height {
         0..=2 => 0,
         3..=6 => 1,
-        _ => 4,
+        7 => 4,
+        _ => 5,
     }
 }
 
@@ -321,5 +322,16 @@ mod tests {
         assert_eq!(workspace.height, 6);
         assert_eq!(composer.height, 5);
         assert_eq!(composer.bottom(), footer.y);
+    }
+
+    #[test]
+    fn child_read_only_composer_grows_only_when_a_transcript_row_remains() {
+        let compact = workspace_metrics(Rect::new(0, 0, 80, 7), "", &[], false, false, true, 0);
+        let centered = workspace_metrics(Rect::new(0, 0, 80, 8), "", &[], false, false, true, 0);
+
+        assert_eq!(compact.composer_height, 4);
+        assert_eq!(compact.transcript_viewport_height, 1);
+        assert_eq!(centered.composer_height, 5);
+        assert_eq!(centered.transcript_viewport_height, 1);
     }
 }

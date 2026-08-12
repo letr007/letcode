@@ -416,26 +416,41 @@ fn render_child_read_only_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Re
 fn render_child_read_only_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     let emphasis = surface::SurfaceEmphasis::Notice;
     let bar_style = surface::accent_style(theme, emphasis, surface::SurfaceKind::Root);
-    render_accent_bar(frame, area, bar_style);
+    let symmetric_caps = area.height >= 5;
+    if symmetric_caps {
+        render_child_prompt_top_cap(frame, area, theme, emphasis);
+    } else {
+        render_accent_bar(frame, area, bar_style);
+    }
 
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let surface_y = area.y + u16::from(symmetric_caps);
     let surface_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH,
-        area.y,
+        surface_y,
         area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
-        area.height.saturating_sub(1),
+        area.height
+            .saturating_sub(1)
+            .saturating_sub(u16::from(symmetric_caps)),
     );
     frame.render_widget(Block::new().style(element_style), surface_area);
+    if symmetric_caps {
+        render_accent_bar(
+            frame,
+            Rect::new(area.x, surface_y, area.width, surface_area.height),
+            bar_style,
+        );
+    }
 
     let content_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X,
-        area.y + surface::PROMPT_INNER_PAD_TOP,
+        surface_area.y,
         area.width
             .saturating_sub(surface::ACCENT_BAR_WIDTH)
             .saturating_sub(surface::PROMPT_INNER_PAD_X)
             .saturating_sub(surface::CARD_PAD_RIGHT)
             .max(1),
-        1,
+        surface_area.height,
     );
     let lines = child_read_only_lines(state, theme, content_area.width as usize);
     let line_y = content_area.y + content_area.height / 2;
@@ -468,6 +483,39 @@ fn render_child_read_only_panel(frame: &mut Frame<'_>, state: &TuiState, area: R
     }
 
     render_prompt_cap(frame, area, theme, emphasis);
+}
+
+fn render_child_prompt_top_cap(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    emphasis: surface::SurfaceEmphasis,
+) {
+    let cap_area = Rect::new(area.x, area.y, area.width, 1);
+    frame.render_widget(
+        Block::new().style(surface::surface_style(theme, surface::SurfaceKind::Root)),
+        cap_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            surface::PROMPT_TOP_LEFT_GLYPH,
+            surface::accent_style(theme, emphasis, surface::SurfaceKind::Root),
+        ))),
+        Rect::new(area.x, area.y, 1.min(area.width), 1),
+    );
+
+    let cap_width = area.width.saturating_sub(1);
+    if cap_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                surface::PROMPT_TOP_CAP_GLYPH.repeat(cap_width as usize),
+                Style::default()
+                    .fg(surface::surface_bg(theme, surface::SurfaceKind::Element))
+                    .bg(surface::surface_bg(theme, surface::SurfaceKind::Root)),
+            ))),
+            Rect::new(area.x + 1, area.y, cap_width, 1),
+        );
+    }
 }
 
 fn child_read_only_lines(state: &TuiState, theme: Theme, _width: usize) -> Vec<Line<'static>> {
@@ -1443,6 +1491,37 @@ mod tests {
         assert!(
             !rendered.contains("hidden input should not render"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn child_read_only_panel_centers_status_between_top_and_cap() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+
+        let rows = draw_rows(&mut state, 100, 5);
+
+        assert!(
+            rows[0].contains(surface::PROMPT_TOP_LEFT_GLYPH)
+                || rows[0].contains(surface::PROMPT_TOP_CAP_GLYPH),
+            "{rows:?}"
+        );
+        assert!(!rows[1].contains("explorer"), "{rows:?}");
+        assert!(rows[2].contains("explorer"), "{rows:?}");
+        assert!(rows[2].contains("Parent"), "{rows:?}");
+        assert!(!rows[3].contains("explorer"), "{rows:?}");
+        assert!(
+            rows[4].contains(surface::PROMPT_BOTTOM_LEFT_GLYPH)
+                || rows[4].contains(surface::PROMPT_BOTTOM_CAP_GLYPH),
+            "{rows:?}"
         );
     }
 

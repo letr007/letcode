@@ -9,6 +9,8 @@ pub const TRANSCRIPT_TOP_SPACER: usize = 1;
 
 pub const ACCENT_BAR_WIDTH: u16 = 1;
 pub const ACCENT_BAR_GLYPH: &str = "┃";
+pub const PROMPT_TOP_LEFT_GLYPH: &str = "╻";
+pub const PROMPT_TOP_CAP_GLYPH: &str = "▄";
 pub const PROMPT_BOTTOM_LEFT_GLYPH: &str = "╹";
 pub const PROMPT_BOTTOM_CAP_GLYPH: &str = "▀";
 

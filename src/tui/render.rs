@@ -1270,6 +1270,77 @@ mod tests {
             .collect()
     }
 
+    fn draw_rows(state: &mut TuiState, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal is created");
+
+        terminal
+            .draw(|frame| render(frame, state))
+            .expect("render succeeds");
+
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn child_read_only_status_centers_in_the_cap_excluded_surface() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+
+        let rows = draw_rows(&mut state, 100, 24);
+        let workspace = layout::workspace_area(Rect::new(0, 0, 100, 24));
+        let metrics = layout::workspace_metrics(workspace, "", &[], false, false, true, 0);
+        let [_transcript, _gap, _slash, composer, footer] =
+            layout::split_workspace_layout(workspace, metrics);
+        let surface_center = composer.y + composer.height.saturating_sub(1) / 2;
+        let cap_row = composer.bottom().saturating_sub(1);
+
+        assert_eq!(composer.height, 5);
+        assert_eq!(surface_center.saturating_sub(composer.y), 2);
+        assert_eq!(cap_row.saturating_sub(surface_center), 2);
+        assert!(
+            rows[composer.y as usize].contains(surface::PROMPT_TOP_LEFT_GLYPH)
+                || rows[composer.y as usize].contains(surface::PROMPT_TOP_CAP_GLYPH),
+            "{rows:?}"
+        );
+        assert!(
+            rows[surface_center as usize].contains("explorer"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[..surface_center as usize]
+                .iter()
+                .rev()
+                .take(1)
+                .all(|row| !row.contains("explorer")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows[(surface_center + 1) as usize].contains("explorer"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[cap_row as usize].contains(surface::PROMPT_BOTTOM_LEFT_GLYPH)
+                || rows[cap_row as usize].contains(surface::PROMPT_BOTTOM_CAP_GLYPH),
+            "{rows:?}"
+        );
+        assert_eq!(footer.y, composer.bottom());
+    }
+
     #[test]
     fn notice_geometry_adapts_width_and_height_to_content_and_area() {
         let area = Rect::new(0, 0, 100, 30);
