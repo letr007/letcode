@@ -10,10 +10,11 @@ use tracing::{debug, warn};
 
 use super::{
     COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream,
-    ToolRegistry, required_string, workspace_root,
+    ToolRegistry, optional_u64, required_string, workspace_root,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_COMMAND_TIMEOUT_SECS: u64 = 3_600;
 
 pub(super) fn register(registry: &mut ToolRegistry) {
     registry.register(RunCommandTool);
@@ -38,9 +39,15 @@ impl ToolHandler for RunCommandTool {
                 "command": {
                     "type": "string",
                     "description": "Shell command to run, e.g. cargo check or ls -la"
+                },
+                "timeout_secs": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": MAX_COMMAND_TIMEOUT_SECS,
+                    "description": "Command timeout in seconds. Defaults to 300, maximum 3600"
                 }
             },
-            "required": ["command"],
+            "required": ["command", "timeout_secs"],
             "additionalProperties": false
         })
     }
@@ -56,15 +63,27 @@ impl ToolHandler for RunCommandTool {
         emit: ToolOutputEmitter<'_>,
     ) -> Result<super::ToolResult> {
         let command = required_string(&args, "command")?;
-        run_workspace_shell_command_streaming(command, COMMAND_TIMEOUT_SECS, emit)
+        let timeout_secs = command_timeout_secs(&args)?;
+        run_workspace_shell_command_streaming(command, timeout_secs, emit)
             .await
             .map(|data| super::ToolResult::ok(self.name(), data))
     }
 }
 
+fn command_timeout_secs(args: &Value) -> Result<u64> {
+    let timeout_secs = optional_u64(args, "timeout_secs")?.unwrap_or(COMMAND_TIMEOUT_SECS);
+    if timeout_secs > MAX_COMMAND_TIMEOUT_SECS {
+        return Err(anyhow!(
+            "field 'timeout_secs' must be at most {MAX_COMMAND_TIMEOUT_SECS}"
+        ));
+    }
+    Ok(timeout_secs)
+}
+
 async fn run_command(args: Value) -> Result<Value> {
     let command = required_string(&args, "command")?;
-    run_workspace_shell_command(command, COMMAND_TIMEOUT_SECS).await
+    let timeout_secs = command_timeout_secs(&args)?;
+    run_workspace_shell_command(command, timeout_secs).await
 }
 
 struct CommandOutput {
@@ -517,6 +536,61 @@ mod tests {
             marker.display()
         )
     }
+    #[test]
+    fn command_timeout_uses_default_and_accepts_explicit_value() {
+        assert_eq!(super::command_timeout_secs(&json!({})).unwrap(), 300);
+        assert_eq!(
+            super::command_timeout_secs(&json!({"timeout_secs": null})).unwrap(),
+            300
+        );
+        assert_eq!(
+            super::command_timeout_secs(&json!({"timeout_secs": 900})).unwrap(),
+            900
+        );
+    }
+
+    #[test]
+    fn command_timeout_rejects_invalid_boundaries() {
+        assert!(
+            super::command_timeout_secs(&json!({"timeout_secs": 0}))
+                .unwrap_err()
+                .to_string()
+                .contains("greater than 0")
+        );
+        assert_eq!(
+            super::command_timeout_secs(&json!({"timeout_secs": 3601}))
+                .unwrap_err()
+                .to_string(),
+            "field 'timeout_secs' must be at most 3600"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_shell_command_honors_explicit_timeout() {
+        use super::ToolHandler;
+
+        let mut emit = |_stream, _chunk| Ok(());
+        let result = super::RunCommandTool
+            .execute_streaming(
+                json!({"command": "sleep 2", "timeout_secs": 1}),
+                super::ToolExecutionContext::default(),
+                &mut emit,
+            )
+            .await
+            .expect("shell tool result");
+
+        assert!(result.ok);
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("error"))
+                .and_then(serde_json::Value::as_str),
+            Some("command timed out after 1s")
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_streaming_shell_command_kills_process_group() {
