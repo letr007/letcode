@@ -2332,6 +2332,16 @@ impl TuiState {
                 }
                 return;
             }
+            SessionEvent::RetryScheduled(ref retry) => {
+                let message = format!(
+                    "{} · Retrying in {}s · attempt {} of {}",
+                    retry.error, retry.delay_secs, retry.attempt, retry.max_attempts
+                );
+                self.show_toast(
+                    child_feedback_message(agent_name, child_session_id, &message),
+                    ToastKind::Error,
+                );
+            }
             SessionEvent::ProcessIssue(issue) => {
                 self.show_toast(
                     child_feedback_message(agent_name, child_session_id, &issue.message),
@@ -3690,6 +3700,35 @@ mod tests {
                 "background-child: child recoverable error",
                 ToastKind::Error
             ))
+        );
+
+        state.apply_child_session_event_with_agent(
+            "background-child",
+            Some("explorer"),
+            None,
+            SessionEvent::RetryScheduled(RetryLifecycleEvent {
+                attempt: 2,
+                max_attempts: 3,
+                delay_secs: 4,
+                error: "network request failed".into(),
+            }),
+        );
+        assert_eq!(
+            state
+                .toast()
+                .map(|toast| (toast.message.as_str(), toast.kind)),
+            Some((
+                "explorer · background-child: network request failed · Retrying in 4s · attempt 2 of 3",
+                ToastKind::Error
+            ))
+        );
+        assert_eq!(
+            state
+                .child_timeline_cache
+                .get("background-child")
+                .and_then(|child| child.retry.as_ref())
+                .map(|retry| (retry.attempt, retry.max_attempts, retry.delay_secs)),
+            Some((2, 3, 4))
         );
 
         state.apply_child_session_event_with_agent(
