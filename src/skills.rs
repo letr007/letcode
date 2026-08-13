@@ -120,17 +120,18 @@ pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) ->
             .iter()
             .position(|c| c.contributor_id == contributor_id);
         let parsed = parse_persisted_skill_output(&output_json)?;
-        if parsed.is_none() && is_compaction_pruned_tool_output(&output_json) {
-            if let Some(index) = existing {
-                // Compaction deliberately replaces the source body. Its
-                // detached material is already authoritative, including the
-                // label, payload, and source anchor, so retain it untouched.
-                let contributor = &snapshot.prompt_contributors[index];
-                wanted.insert(contributor_id);
-                wanted_frame_ids.extend(contributor.frame_ids.iter().copied());
-                ordinal = ordinal.saturating_add(1);
-                continue;
-            }
+        if parsed.is_none()
+            && is_compaction_pruned_tool_output(&output_json)
+            && let Some(index) = existing
+        {
+            // Compaction deliberately replaces the source body. Its
+            // detached material is already authoritative, including the
+            // label, payload, and source anchor, so retain it untouched.
+            let contributor = &snapshot.prompt_contributors[index];
+            wanted.insert(contributor_id);
+            wanted_frame_ids.extend(contributor.frame_ids.iter().copied());
+            ordinal = ordinal.saturating_add(1);
+            continue;
         }
         let Some((name, content)) = parsed else {
             continue;
@@ -805,44 +806,33 @@ fn skill_roots(
     let mut roots = Vec::new();
     let mut seen = BTreeSet::new();
 
-    if include_user_roots {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            push_skill_root(
-                &mut roots,
-                &mut seen,
-                home.join(".config").join("opencode").join("skills"),
-                "~/.config/opencode/skills",
-            );
-            push_skill_root(
-                &mut roots,
-                &mut seen,
-                home.join(".agents").join("skills"),
-                "~/.agents/skills",
-            );
-            push_skill_root(
-                &mut roots,
-                &mut seen,
-                home.join(".claude").join("skills"),
-                "~/.claude/skills",
-            );
-        }
+    if include_user_roots && let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            home.join(".config").join("opencode").join("skills"),
+            "~/.config/opencode/skills",
+        );
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            home.join(".agents").join("skills"),
+            "~/.agents/skills",
+        );
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            home.join(".claude").join("skills"),
+            "~/.claude/skills",
+        );
     }
 
-    if !include_user_roots {
-        push_skill_root(
-            &mut roots,
-            &mut seen,
-            config_dir.join("skills"),
-            "letcode config skills",
-        );
-    } else {
-        push_skill_root(
-            &mut roots,
-            &mut seen,
-            config_dir.join("skills"),
-            "letcode config skills",
-        );
-    }
+    push_skill_root(
+        &mut roots,
+        &mut seen,
+        config_dir.join("skills"),
+        "letcode config skills",
+    );
 
     for ancestor in workspace_skill_ancestors(workspace_root).into_iter().rev() {
         push_skill_root(

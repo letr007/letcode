@@ -1172,10 +1172,8 @@ pub(crate) fn one_line_snippet(value: &str, width: usize) -> String {
 
     let wrapped = wrap_text_to_width(&compact, width.max(1));
     let mut first = wrapped.first().cloned().unwrap_or_default();
-    if wrapped.len() > 1 || display_width(&compact) > width.max(1) {
-        if !first.ends_with('…') {
-            first.push('…');
-        }
+    if (wrapped.len() > 1 || display_width(&compact) > width.max(1)) && !first.ends_with('…') {
+        first.push('…');
     }
     first
 }

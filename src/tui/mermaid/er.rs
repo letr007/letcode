@@ -372,9 +372,7 @@ fn parse(source: &str) -> Option<ir::Diagram> {
         }
 
         if trimmed == "}" {
-            if current.take().is_none() {
-                return None;
-            }
+            current.take()?;
         } else if let Some(index) = current {
             if trimmed.contains(['{', '}']) {
                 return None;

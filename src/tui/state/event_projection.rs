@@ -43,7 +43,6 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             } else if projection.toast.as_mut().is_some_and(ToastState::tick) {
                 *projection.toast = None;
             }
-            return;
         }
         SessionEvent::UserMessage(message) => {
             *projection.active_session = true;
@@ -117,10 +116,9 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
         SessionEvent::ToolFinished(tool) => {
             if projection.accepts_tool_events
                 && projection.timeline.push_tool_finished(tool.clone())
+                && projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str())
             {
-                if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
-                    *projection.active_tool_call_id = None;
-                }
+                *projection.active_tool_call_id = None;
             }
         }
         SessionEvent::ToolOutputDelta(delta) => {
@@ -525,9 +523,13 @@ pub(super) fn rebuild_active_context_picker(
     let selected_id = preserve
         .then(|| dialog.selected_item().map(|item| item.id.clone()))
         .flatten();
-    let query = preserve.then(|| dialog.query.clone()).unwrap_or_default();
+    let query = if preserve {
+        dialog.query.clone()
+    } else {
+        Default::default()
+    };
     let detail_focused = preserve && dialog.detail_focused;
-    let detail_scroll = preserve.then_some(dialog.detail_scroll).unwrap_or(0);
+    let detail_scroll = if preserve { dialog.detail_scroll } else { 0 };
     dialog.items = items;
     dialog.query = query;
     dialog.selected = selected_id

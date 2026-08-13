@@ -1470,7 +1470,7 @@ fn shell_card_title(tool: &ToolView, command: Option<&str>) -> String {
     let summary = tool.summary.trim();
     if summary.is_empty() || summary.starts_with("exit ") || summary.starts_with("run ") {
         command
-            .map(|command| sentence_case_command_goal(command))
+            .map(sentence_case_command_goal)
             .unwrap_or_else(|| "Runs command".to_string())
     } else {
         summary.to_string()
@@ -1568,7 +1568,7 @@ fn render_output_section(
     ));
     lines.push(render_card_line(
         &[(
-            format!("{title}"),
+            title.to_string(),
             root_muted_style(theme)
                 .bg(theme.card_bg())
                 .add_modifier(Modifier::BOLD),

@@ -402,19 +402,20 @@ impl SessionEngine {
         // tasks so shutdown cannot enqueue work into a finished session.
         self.reload_watcher.take();
 
-        if let Some(task) = self.engine_task.take() {
-            if let Err(error) = task.await {
-                failure = Some(anyhow!("session engine task failed: {error}"));
-            }
+        if let Some(task) = self.engine_task.take()
+            && let Err(error) = task.await
+        {
+            failure = Some(anyhow!("session engine task failed: {error}"));
         }
         if let Some(task) = self.mcp_discovery_task.take() {
             if !task.is_finished() {
                 task.abort();
             }
-            if let Err(error) = task.await {
-                if !error.is_cancelled() && failure.is_none() {
-                    failure = Some(anyhow!("MCP discovery task failed: {error}"));
-                }
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+                && failure.is_none()
+            {
+                failure = Some(anyhow!("MCP discovery task failed: {error}"));
             }
         }
         if let Some(transcript) = self.transcript.take() {
@@ -426,10 +427,10 @@ impl SessionEngine {
                     .to_path_buf();
                 remove_empty_session_file(path).map(|_| ())
             })();
-            if let Err(error) = cleanup {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
+            if let Err(error) = cleanup
+                && failure.is_none()
+            {
+                failure = Some(error);
             }
         }
 
@@ -1112,16 +1113,16 @@ fn apply_config_reload(
         session_providers
             .entry(route.provider.clone())
             .or_insert_with(|| provider.clone());
-        if let Some(session_provider) = session_providers.get_mut(&route.provider) {
-            if !session_provider.has_model(&route.model) {
-                let model = provider.models.get(&route.model).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "current expert route '{}' is unavailable during configuration reload",
-                        route.display_name()
-                    )
-                })?;
-                session_provider.models.insert(route.model.clone(), model);
-            }
+        if let Some(session_provider) = session_providers.get_mut(&route.provider)
+            && !session_provider.has_model(&route.model)
+        {
+            let model = provider.models.get(&route.model).cloned().ok_or_else(|| {
+                anyhow!(
+                    "current expert route '{}' is unavailable during configuration reload",
+                    route.display_name()
+                )
+            })?;
+            session_provider.models.insert(route.model.clone(), model);
         }
     }
     let expert_factory = crate::subagent::ExpertRouteFactory::new_with_policies(
@@ -1566,7 +1567,7 @@ fn delegated_route_for_takeover(
     let parent_records = parent_transcript
         .lock()
         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))
-        .and_then(|recorder| read_records(recorder.path()).map_err(Into::into))?;
+        .and_then(|recorder| read_records(recorder.path()))?;
     let child = crate::subagent::SubagentPool::child_sessions(sessions_dir, &parent_records)
         .into_iter()
         .find(|child| child.child_session_id == target_child_session_id)
@@ -2491,8 +2492,7 @@ async fn run_engine_loop(
                                 dispatch_result,
                                 Ok(crate::session::IdleDispatch::HistoryNavigated)
                             )
-                        {
-                            if let (Some(factory), Some(routes)) = (
+                            && let (Some(factory), Some(routes)) = (
                                 prepared_history_factory.into_inner(),
                                 prepared_history_routes.into_inner(),
                             ) {
@@ -2500,7 +2500,6 @@ async fn run_engine_loop(
                                 agent.set_subagent_child_factory(Arc::new(factory));
                                 sticky_auto_reviewer.clear_sticky_session();
                             }
-                        }
                         if matches!(command, SessionEngineCommand::ViewParent) {
                             visible_child_session_id = None;
                             visible_child_view_state = None;
@@ -2849,15 +2848,14 @@ async fn run_engine_loop(
                         };
 
                         if interrupted {
-                            if child_started {
-                                if let Err(error) =
+                            if child_started
+                                && let Err(error) =
                                     rehydrate_agent_from_transcript(&mut agent, &transcript)
                                 {
                                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
                                         "failed to restore interrupted session context: {error}"
                                     ))));
                                 }
-                            }
                             send_subagent_interrupted(&session_transport_tx, interrupted_child_session_id);
                         }
                         if shutdown {

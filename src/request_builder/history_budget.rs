@@ -25,15 +25,15 @@ pub(super) fn ensure_protected_context_within_budget(
 }
 
 pub(super) fn validate_model_metadata(model: ModelRequestMetadata) -> Result<()> {
-    if let Some(effective_input_limit_tokens) = model.effective_input_limit_tokens {
-        if effective_input_limit_tokens == 0 {
-            anyhow::bail!("model.effective_input_limit_tokens must be greater than 0");
-        }
+    if let Some(effective_input_limit_tokens) = model.effective_input_limit_tokens
+        && effective_input_limit_tokens == 0
+    {
+        anyhow::bail!("model.effective_input_limit_tokens must be greater than 0");
     }
-    if let Some(max_output_tokens) = model.max_output_tokens {
-        if max_output_tokens > u32::MAX as u64 {
-            anyhow::bail!("model.max_output_tokens must be at most {}", u32::MAX);
-        }
+    if let Some(max_output_tokens) = model.max_output_tokens
+        && max_output_tokens > u32::MAX as u64
+    {
+        anyhow::bail!("model.max_output_tokens must be at most {}", u32::MAX);
     }
     if let Some(temperature) = model.temperature {
         validate_f32_range("model.temperature", temperature, 0.0, 2.0)?;

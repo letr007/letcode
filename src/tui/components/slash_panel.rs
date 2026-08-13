@@ -27,8 +27,7 @@ pub fn slash_panel_row_count(state: &TuiState) -> u16 {
 }
 
 pub fn slash_panel_reserved_height(state: &TuiState) -> u16 {
-    let rows = slash_panel_row_count(state);
-    rows
+    slash_panel_row_count(state)
 }
 
 pub fn render_slash_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {

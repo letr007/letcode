@@ -909,12 +909,10 @@ fn notice_message_lines(
     let mut rows = wrap_text_to_width(message, width);
     let truncated = rows.len() > max_rows;
     rows.truncate(max_rows);
-    if truncated {
-        if let Some(last) = rows.last_mut() {
-            let mut marked = last.clone();
-            marked.push('…');
-            *last = crate::tui::components::tool_card::truncate_display_width(&marked, width);
-        }
+    if truncated && let Some(last) = rows.last_mut() {
+        let mut marked = last.clone();
+        marked.push('…');
+        *last = crate::tui::components::tool_card::truncate_display_width(&marked, width);
     }
 
     rows.into_iter()
@@ -1018,8 +1016,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, the
 
     let prompt_width = content_area
         .width
-        .min(surface::WELCOME_PROMPT_MAX_WIDTH)
-        .max(1);
+        .clamp(1, surface::WELCOME_PROMPT_MAX_WIDTH);
     let prompt_height = layout::composer_height(
         content_area.height,
         &state.input_buffer,

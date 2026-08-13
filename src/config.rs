@@ -22,7 +22,9 @@ use crate::request_builder::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum ApiProtocol {
+    #[default]
     Responses,
     Completions,
 }
@@ -40,12 +42,6 @@ pub struct PromptCacheConfig {
     pub enabled: bool,
     pub retention: Option<PromptCacheRetention>,
     pub namespace: Option<String>,
-}
-
-impl Default for ApiProtocol {
-    fn default() -> Self {
-        Self::Responses
-    }
 }
 
 const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
@@ -363,7 +359,7 @@ fn open_config_lock_file(lock_path: &Path) -> Result<fs::File> {
                 lock_path.display()
             );
         }
-        return Ok(file);
+        Ok(file)
     }
 
     #[cfg(not(unix))]
@@ -716,19 +712,11 @@ pub struct GlobalConfig {
     pub retry: RetryConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompactionConfig {
     /// Tokens to retain at the end of history. When absent, use the selected
     /// model's active input budget.
     pub preserve_recent_tokens: Option<u64>,
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            preserve_recent_tokens: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1116,13 +1104,13 @@ fn normalize_model_config(
         .transpose()?;
 
     let supports_reasoning = raw.supports_reasoning.unwrap_or(true);
-    if let Some(max_output_tokens) = raw.max_output_tokens {
-        if max_output_tokens > u32::MAX as u64 {
-            bail!(
-                "providers.{provider_name}.models.{model_id}.max_output_tokens must be at most {}",
-                u32::MAX
-            );
-        }
+    if let Some(max_output_tokens) = raw.max_output_tokens
+        && max_output_tokens > u32::MAX as u64
+    {
+        bail!(
+            "providers.{provider_name}.models.{model_id}.max_output_tokens must be at most {}",
+            u32::MAX
+        );
     }
     let effective_input_limit_tokens = optional_positive_u64(
         &format!("providers.{provider_name}.models.{model_id}.effective_input_limit_tokens"),

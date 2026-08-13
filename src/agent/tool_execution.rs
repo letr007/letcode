@@ -931,14 +931,14 @@ where
         PermissionDecision::Deny => false,
     };
 
-    if matches!(approval, Some(PermissionApproval::AllowAlways)) {
-        if let Some(resource) = resource {
-            agent
-                .permission_session
-                .lock()
-                .map_err(|_| anyhow::anyhow!("permission session poisoned"))?
-                .grant_if_current_session(permission_generation, resource);
-        }
+    if matches!(approval, Some(PermissionApproval::AllowAlways))
+        && let Some(resource) = resource
+    {
+        agent
+            .permission_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission session poisoned"))?
+            .grant_if_current_session(permission_generation, resource);
     }
 
     if should_execute {
@@ -997,7 +997,8 @@ where
                 if let Some(timeout_secs) = timeout_secs {
                     let timeout_sleep = tokio::time::sleep(Duration::from_secs(timeout_secs));
                     tokio::pin!(timeout_sleep);
-                    let result = loop {
+
+                    loop {
                         tokio::select! {
                             output = &mut output => break Ok(output),
                             Some((stream, chunk)) = delta_rx.recv() => {
@@ -1010,10 +1011,6 @@ where
                             }
                             _ = &mut timeout_sleep => break Err(timeout_secs),
                         }
-                    };
-                    match result {
-                        Ok(output) => Ok(output),
-                        Err(timeout_secs) => Err(timeout_secs),
                     }
                 } else {
                     let output = loop {

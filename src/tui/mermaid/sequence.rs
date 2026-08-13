@@ -60,12 +60,13 @@ fn layout(sequence: &ir::MermaidSequence, width: usize) -> Option<canvas::Mermai
         .iter()
         .map(|(_, participant)| display_width(&participant.label).max(1))
         .collect::<Vec<_>>();
-    let mut centers = vec![(label_widths[0] + 1) / 2 + 1 + number_width];
+    let mut centers = vec![label_widths[0].div_ceil(2) + 1 + number_width];
     for index in 1..participants.len() {
-        let labels_gap = (label_widths[index - 1] + 1) / 2 + (label_widths[index] + 1) / 2 + 4;
+        let labels_gap = label_widths[index - 1].div_ceil(2) + label_widths[index].div_ceil(2) + 4;
         centers.push(centers[index - 1] + (message_width + 6).max(labels_gap).max(12));
     }
-    let mut diagram_width = centers.last().copied()? + (label_widths.last().copied()? + 1) / 2 + 1;
+    let mut diagram_width =
+        centers.last().copied()? + label_widths.last().copied()?.div_ceil(2) + 1;
     diagram_width = diagram_width.max(block_width + 3);
     if diagram_width > width {
         return None;
@@ -490,9 +491,10 @@ fn parse_items<'a>(
         } else if matches!(keyword, "participant" | "actor") && allow_participant {
             parse_participant(line, participants, keyword)?;
             *cursor += 1;
-        } else if matches!(keyword, "participant" | "actor") {
-            return None;
-        } else if matches!(keyword, "loop" | "alt" | "opt" | "else" | "end") {
+        } else if matches!(
+            keyword,
+            "participant" | "actor" | "loop" | "alt" | "opt" | "else" | "end"
+        ) {
             return None;
         } else {
             let message = parse_message(line, participants)?;

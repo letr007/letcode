@@ -878,7 +878,7 @@ fn truncate_bytes(value: &str, max_bytes: usize) -> String {
 }
 
 pub fn estimate_evidence_tokens(text: &str) -> u64 {
-    ((text.len() as u64 + 2) / 3).saturating_add(16)
+    (text.len() as u64).div_ceil(3).saturating_add(16)
 }
 
 pub fn evidence_id_for_sequence(sequence: u64) -> String {

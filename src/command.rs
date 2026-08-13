@@ -75,7 +75,9 @@ impl ThoughtsDisplayMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ThemeName {
+    #[default]
     Dark,
     Rainbow,
 }
@@ -94,12 +96,6 @@ impl ThemeName {
             "rainbow" => Some(Self::Rainbow),
             _ => None,
         }
-    }
-}
-
-impl Default for ThemeName {
-    fn default() -> Self {
-        Self::Dark
     }
 }
 

@@ -42,7 +42,9 @@ pub(crate) struct TranscriptFileFingerprint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum InternalContinuationSource {
+    #[default]
     Legacy,
     AutoContinue,
     StreamRecovery,
@@ -159,12 +161,6 @@ pub(crate) fn render_checkpoint_continuation_v1(event: &LogicalCheckpointEventV1
         "Resume the same user turn from logical checkpoint {}. Treat the retained checkpoint context above as authoritative; retired sources are audit-only and are not directly openable.",
         event.checkpoint_id
     )
-}
-
-impl Default for InternalContinuationSource {
-    fn default() -> Self {
-        Self::Legacy
-    }
 }
 
 #[path = "transcript/transcript_projection.rs"]

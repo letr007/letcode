@@ -270,14 +270,14 @@ pub(crate) fn path_preview(path: &Path) -> String {
     {
         use std::os::unix::ffi::OsStrExt;
         let bytes = path.as_os_str().as_bytes();
-        return format!(
+        format!(
             "{} [raw-bytes:{}]",
             path.display(),
             bytes
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
-        );
+        )
     }
 
     #[cfg(not(unix))]

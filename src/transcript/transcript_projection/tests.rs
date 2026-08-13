@@ -2679,8 +2679,7 @@ fn navigation_restore_validates_root_compaction_on_root_scope() {
     let branch_sequence = 10;
     let branch_id = format!("history-{branch_sequence}");
     let mut candidate = records.clone();
-    let mut sequence = branch_sequence;
-    for event in [
+    for (sequence, event) in (branch_sequence..).zip([
         TranscriptEvent::ContextBranchCreated {
             branch_id: branch_id.clone(),
             parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
@@ -2697,9 +2696,8 @@ fn navigation_restore_validates_root_compaction_on_root_scope() {
             redo_stack: vec![current],
             redo_target_sequence: None,
         },
-    ] {
+    ]) {
         candidate.push(record_at(sequence, event));
-        sequence += 1;
     }
     let restored = project_runtime_restore_snapshot(
         "s".into(),

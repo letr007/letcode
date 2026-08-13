@@ -1528,10 +1528,10 @@ impl<C: Config> Agent<C> {
     ) -> Result<()> {
         let history = messages
             .into_iter()
-            .filter_map(|message| match message.role {
-                ConversationRole::User => Some(HistoryItem::user(message.content)),
-                ConversationRole::Assistant => Some(HistoryItem::assistant(message.content)),
-                ConversationRole::Summary => Some(HistoryItem::context_summary(message.content)),
+            .map(|message| match message.role {
+                ConversationRole::User => HistoryItem::user(message.content),
+                ConversationRole::Assistant => HistoryItem::assistant(message.content),
+                ConversationRole::Summary => HistoryItem::context_summary(message.content),
             })
             .collect();
         self.restore_session_history(history, evidence, max_turn_id)
@@ -2350,10 +2350,10 @@ impl<C: Config> Agent<C> {
                     existing.protocol = Some(frame.item.clone());
                     // Prefer the producer-attached span when a cached frame was
                     // created before provenance was required.
-                    if existing.provenance.source_span.is_none() {
-                        if let Some(provenance) = frame.source_provenance.clone() {
-                            existing.provenance = provenance;
-                        }
+                    if existing.provenance.source_span.is_none()
+                        && let Some(provenance) = frame.source_provenance.clone()
+                    {
+                        existing.provenance = provenance;
                     }
                     existing
                 })
@@ -2568,7 +2568,8 @@ impl<C: Config> Agent<C> {
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
 
         let user_input = user_content.text.clone();
-        let result = match question_handler_guard.agent().active_protocol() {
+
+        match question_handler_guard.agent().active_protocol() {
             ApiProtocol::Responses => {
                 protocol_stream::run_responses_stream_async(
                     question_handler_guard.agent(),
@@ -2591,8 +2592,7 @@ impl<C: Config> Agent<C> {
                 )
                 .await
             }
-        };
-        result
+        }
     }
 
     fn wrap_question_handler<Q, Qfut>(ask_question: Q) -> QuestionCallback
@@ -3835,19 +3835,19 @@ fn shell_command_succeeded(output: &ToolResult) -> bool {
         return true;
     };
 
-    if let Some(status) = data.get("status").and_then(Value::as_i64) {
-        if status != 0 {
-            return false;
-        }
+    if let Some(status) = data.get("status").and_then(Value::as_i64)
+        && status != 0
+    {
+        return false;
     }
 
-    if let Some(success) = data.get("success").and_then(Value::as_bool) {
-        if !success {
-            return false;
-        }
+    if let Some(success) = data.get("success").and_then(Value::as_bool)
+        && !success
+    {
+        return false;
     }
 
-    !data.get("error").is_some()
+    data.get("error").is_none()
 }
 
 fn is_failed_validation_attempt(record: &ToolExecutionRecord) -> bool {
@@ -4114,12 +4114,11 @@ pub(super) fn sync_protocol_frame_provenance_from_snapshot(
         if let (Some(cached), Some(healed)) = (
             frame.source_provenance.as_mut(),
             projected.source_provenance.as_ref(),
-        ) {
-            if cached.source_span.is_none() {
-                cached.source_span = healed.source_span;
-                if cached.source == RuntimeSource::Derived {
-                    cached.source = healed.source;
-                }
+        ) && cached.source_span.is_none()
+        {
+            cached.source_span = healed.source_span;
+            if cached.source == RuntimeSource::Derived {
+                cached.source = healed.source;
             }
         }
     }
@@ -4162,9 +4161,8 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
     }
 }
 
-/// Rebuild active protocol payloads on a snapshot from live history (ordinal
-/// order). History is the sole protocol authority for the open session;
-/// RuntimeSnapshot only mirrors it for legacy consumers.
+// Rebuild helpers treat history as the sole protocol authority for the open
+// session; RuntimeSnapshot only mirrors it for legacy consumers.
 
 /// Copy non-protocol runtime surfaces from `source` onto `target` without
 /// touching active protocol payloads. Used when rebuilding protocol shells.
@@ -4319,7 +4317,7 @@ impl TurnRuntimeState {
 
 /// Ephemeral pressure-compaction state. It is absent from transcript and
 /// snapshot projections, so a restored turn never inherits an attempted prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PressureCompactionState {
     last_attempted_frontier: Option<PressureCompactionFrontier>,
     /// Set after a successful pressure compact in this turn. Soft-watermark
@@ -4334,16 +4332,6 @@ struct PressureCompactionState {
 struct PressureCompactionFrontier {
     frame_count: usize,
     protocol_prefix_digest: String,
-}
-
-impl Default for PressureCompactionState {
-    fn default() -> Self {
-        Self {
-            last_attempted_frontier: None,
-            compacted_this_turn: false,
-            suppressed: false,
-        }
-    }
 }
 
 impl PressureCompactionState {

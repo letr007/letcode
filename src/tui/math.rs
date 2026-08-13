@@ -555,7 +555,7 @@ fn blackboard(ch: char) -> Option<char> {
 }
 
 fn normalize_output(value: String) -> String {
-    let out = value.replace(NAMED_START, "").replace(NAMED_END, "");
+    let out = value.replace([NAMED_START, NAMED_END], "");
     out.lines()
         .map(|line| {
             if line.contains(LAYOUT_START) || line.contains(LAYOUT_END) {
@@ -762,8 +762,7 @@ impl<'a> LatexParser<'a> {
             return String::new();
         }
         let first = self.source[self.position..].chars().next().unwrap();
-        let command;
-        if first.is_ascii_alphabetic() {
+        let command = if first.is_ascii_alphabetic() {
             let start = self.position;
             while self.position < self.source.len()
                 && self.source[self.position..]
@@ -778,11 +777,11 @@ impl<'a> LatexParser<'a> {
                     .unwrap()
                     .len_utf8();
             }
-            command = self.source[start..self.position].to_string();
+            self.source[start..self.position].to_string()
         } else {
             self.position += first.len_utf8();
-            command = first.to_string();
-        }
+            first.to_string()
+        };
         self.bump();
         if command == "\\" {
             if self.position < self.source.len() && self.source[self.position..].starts_with('[') {
@@ -1238,7 +1237,7 @@ impl<'a> LatexParser<'a> {
                 .split("\\\\")
                 .filter(|s| !s.trim().is_empty())
                 .map(|row| {
-                    let row = strip_row_spacing(&row);
+                    let row = strip_row_spacing(row);
                     let row = if matches!(
                         name.as_str(),
                         "alignedat" | "alignedat*" | "alignat" | "alignat*"
@@ -1749,7 +1748,7 @@ pub(crate) fn render_text(source: &str, display: bool) -> Option<String> {
         return None;
     }
     let mut nodes = Vec::new();
-    let parser = LatexParser::new(&source, display, &mut nodes);
+    let parser = LatexParser::new(source, display, &mut nodes);
     let rendered = parser.render()?;
     let rendered = rendered.replace(" eq ", " ≠ ");
     if nodes.is_empty() {
@@ -1816,7 +1815,6 @@ pub(crate) fn render_text(source: &str, display: bool) -> Option<String> {
         .replace("cₙ", " cₙ")
         .replace("₁^∞c", "₁^∞ c")
         .replace("₁^∞cₙ", "₁^∞ cₙ")
-        .replace("∞ cₙ", "∞ cₙ")
         .replace("isin ", "i sin ")
         .replace("∞cₙ", "∞ cₙ")
         .replace("∑ₙ₌₁^∞cₙ", "∑ₙ₌₁^∞ cₙ")

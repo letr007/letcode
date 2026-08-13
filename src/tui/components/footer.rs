@@ -78,9 +78,12 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
         return truncate_spans_display_width(status, max_width);
     }
 
-    let metadata_max_width = max_width.saturating_sub(
-        status_width.saturating_add((status_width > 0).then_some(3).unwrap_or_default()),
-    );
+    let metadata_max_width =
+        max_width.saturating_sub(status_width.saturating_add(if status_width > 0 {
+            3
+        } else {
+            Default::default()
+        }));
     let metadata = footer_metadata_spans(state, theme, metadata_max_width);
 
     let mut spans = metadata;
@@ -749,6 +752,20 @@ fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     phase_indicator_spans(state, theme)
 }
 
+fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
+    footer_scanner_cells(frame, theme)
+        .into_iter()
+        .map(|(glyph, color)| {
+            Span::styled(
+                glyph.to_string(),
+                Style::default()
+                    .fg(color)
+                    .bg(surface::surface_bg(theme, surface::SurfaceKind::Root)),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -983,18 +1000,4 @@ mod tests {
 
         assert!(rendered.contains("~50%"), "{rendered}");
     }
-}
-
-fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
-    footer_scanner_cells(frame, theme)
-        .into_iter()
-        .map(|(glyph, color)| {
-            Span::styled(
-                glyph.to_string(),
-                Style::default()
-                    .fg(color)
-                    .bg(surface::surface_bg(theme, surface::SurfaceKind::Root)),
-            )
-        })
-        .collect()
 }

@@ -930,16 +930,15 @@ impl TuiRuntime {
         let mut suppress_session_event = false;
 
         match &event {
-            SessionTransportEvent::QuestionRequested { request, handle } => {
+            SessionTransportEvent::QuestionRequested { request, handle }
                 if self
                     .begin_pending_question(request.clone(), handle.clone(), None)
-                    .is_err()
-                {
-                    let _ = handle.cancel("another interactive request is already pending");
-                    self.state
-                        .show_toast("Question already pending", ToastKind::Info);
-                    suppress_session_event = true;
-                }
+                    .is_err() =>
+            {
+                let _ = handle.cancel("another interactive request is already pending");
+                self.state
+                    .show_toast("Question already pending", ToastKind::Info);
+                suppress_session_event = true;
             }
             SessionTransportEvent::PermissionRequested { event, handle } => {
                 if self.state.pending_question.is_some() {
@@ -963,20 +962,18 @@ impl TuiRuntime {
                 child_session_id,
                 request,
                 handle,
-            } => {
-                if self
-                    .begin_pending_question(
-                        request.clone(),
-                        handle.clone(),
-                        Some(child_session_id.clone()),
-                    )
-                    .is_err()
-                {
-                    let _ = handle.cancel("another interactive request is already pending");
-                    self.state
-                        .show_toast("Question already pending", ToastKind::Info);
-                    suppress_session_event = true;
-                }
+            } if self
+                .begin_pending_question(
+                    request.clone(),
+                    handle.clone(),
+                    Some(child_session_id.clone()),
+                )
+                .is_err() =>
+            {
+                let _ = handle.cancel("another interactive request is already pending");
+                self.state
+                    .show_toast("Question already pending", ToastKind::Info);
+                suppress_session_event = true;
             }
             SessionTransportEvent::ChildPermissionRequested {
                 child_session_id,
@@ -1007,10 +1004,10 @@ impl TuiRuntime {
                     );
                 }
             }
-            SessionTransportEvent::PermissionResolved(resolution) => {
-                if self.pending_permission_matches_call(&resolution.call_id, None) {
-                    self.permission_lifecycle.clear();
-                }
+            SessionTransportEvent::PermissionResolved(resolution)
+                if self.pending_permission_matches_call(&resolution.call_id, None) =>
+            {
+                self.permission_lifecycle.clear();
             }
             SessionTransportEvent::Done => {
                 self.permission_lifecycle.clear_if_parent();
@@ -1090,10 +1087,10 @@ impl TuiRuntime {
             SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
             }
-            SessionTransportEvent::SessionTitleUpdated { session_id, title } => {
-                if self.state.session_id.as_deref() == Some(session_id) {
-                    self.session_title = Some(title.clone());
-                }
+            SessionTransportEvent::SessionTitleUpdated { session_id, title }
+                if self.state.session_id.as_deref() == Some(session_id) =>
+            {
+                self.session_title = Some(title.clone());
             }
             SessionTransportEvent::Interrupted => {
                 self.permission_lifecycle.clear_if_parent();
@@ -1155,12 +1152,11 @@ impl TuiRuntime {
                     .apply_event(SessionEvent::TokenUsage(token_usage.clone()));
                 suppress_session_event = true;
             }
-            SessionTransportEvent::ToolBatchFinished => {
+            SessionTransportEvent::ToolBatchFinished
                 if !self.queued_prompts.is_empty()
-                    && !self.queued_prompt_lifecycle.has_inflight_handoff()
-                {
-                    self.queued_prompt_lifecycle.mark_dispatch_ready();
-                }
+                    && !self.queued_prompt_lifecycle.has_inflight_handoff() =>
+            {
+                self.queued_prompt_lifecycle.mark_dispatch_ready();
             }
             SessionTransportEvent::SessionResumed {
                 session_id,
@@ -1420,11 +1416,9 @@ impl TuiRuntime {
 
         self.reproject_pending_permission();
 
-        if !suppress_session_event {
-            if let Some(session_event) = event.session_event() {
-                self.state.apply_event(session_event);
-                self.reproject_pending_permission();
-            }
+        if !suppress_session_event && let Some(session_event) = event.session_event() {
+            self.state.apply_event(session_event);
+            self.reproject_pending_permission();
         }
     }
 
@@ -1794,10 +1788,9 @@ impl TuiRuntime {
                     .pending_permission
                     .as_ref()
                     .is_some_and(|permission| permission.can_allow_always)
+                    && let Some(handle) = self.permission_lifecycle.take_handle()
                 {
-                    if let Some(handle) = self.permission_lifecycle.take_handle() {
-                        handle.allow_always()?;
-                    }
+                    handle.allow_always()?;
                 }
                 Ok(None)
             }
@@ -3093,11 +3086,12 @@ impl TuiRuntime {
                     .state
                     .dialog()
                     .is_some_and(|dialog| dialog.detail_focused);
-                if !detail_focused && self.state.active_context_open_detail().is_some() {
-                    if let Some(dialog) = self.state.dialog_mut() {
-                        dialog.detail_focused = true;
-                        dialog.detail_scroll = 0;
-                    }
+                if !detail_focused
+                    && self.state.active_context_open_detail().is_some()
+                    && let Some(dialog) = self.state.dialog_mut()
+                {
+                    dialog.detail_focused = true;
+                    dialog.detail_scroll = 0;
                 }
                 Ok(None)
             }
@@ -3319,10 +3313,10 @@ impl TuiRuntime {
         self.state.selection_dragged = false;
         self.state.selection_last_mouse = None;
         // 抛弃零宽选择（单击未拖动），避免接管 Ctrl+C 复制语义且无视觉反馈
-        if let Some(selection) = &self.state.text_selection {
-            if selection.start == selection.end {
-                self.state.text_selection = None;
-            }
+        if let Some(selection) = &self.state.text_selection
+            && selection.start == selection.end
+        {
+            self.state.text_selection = None;
         }
         if !dragged {
             self.handle_transcript_click(col, row, activate_link);
@@ -3365,10 +3359,10 @@ impl TuiRuntime {
         } else {
             area.bottom().saturating_sub(1)
         };
-        if let Some(anchor) = self.state.map_mouse_to_anchor(clamped_col, clamped_row) {
-            if let Some(selection) = &mut self.state.text_selection {
-                selection.end = anchor;
-            }
+        if let Some(anchor) = self.state.map_mouse_to_anchor(clamped_col, clamped_row)
+            && let Some(selection) = &mut self.state.text_selection
+        {
+            selection.end = anchor;
         }
     }
 
@@ -3497,7 +3491,6 @@ fn next_reasoning_effort(
 fn reasoning_dialog_items(efforts: &[ModelReasoningEffort]) -> Vec<DialogItem> {
     efforts
         .iter()
-        .cloned()
         .map(|effort| {
             let (label, detail) = match effort {
                 ModelReasoningEffort::None => ("Off", "Do not request extra reasoning"),
@@ -3512,7 +3505,7 @@ fn reasoning_dialog_items(efforts: &[ModelReasoningEffort]) -> Vec<DialogItem> {
                 }
             };
             DialogItem::new(
-                reasoning_effort_config_label(&effort),
+                reasoning_effort_config_label(effort),
                 label,
                 Some(detail.into()),
             )

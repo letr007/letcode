@@ -280,7 +280,7 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     for index in 0..item_count {
         let separator_rows = if timeline_item_needs_separator_before(
             index,
-            &state.active_timeline().items(),
+            state.active_timeline().items(),
             state.thoughts_display,
         ) {
             1
@@ -350,7 +350,7 @@ fn visible_cached_transcript_lines(
         let item_count = state.transcript_render_cache.row_counts[index];
         let separator_rows = if timeline_item_needs_separator_before(
             index,
-            &state.active_timeline().items(),
+            state.active_timeline().items(),
             state.thoughts_display,
         ) {
             1
@@ -400,7 +400,7 @@ fn visible_document_lines(
     for (index, entry) in state.transcript_render_cache.entries.iter().enumerate() {
         if timeline_item_needs_separator_before(
             index,
-            &state.active_timeline().items(),
+            state.active_timeline().items(),
             state.thoughts_display,
         ) {
             rows.push(None);

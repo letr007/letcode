@@ -293,10 +293,8 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     // Esc：清除选择（如果有），否则中断执行
-    if matches!(key.code, KeyCode::Esc) {
-        if state.text_selection.is_some() {
-            return InputAction::ClearSelection;
-        }
+    if matches!(key.code, KeyCode::Esc) && state.text_selection.is_some() {
+        return InputAction::ClearSelection;
     }
 
     match key.code {

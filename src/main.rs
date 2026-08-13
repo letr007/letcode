@@ -1,4 +1,14 @@
 #![cfg_attr(test, allow(unused))]
+// These structural lints flag deliberate protocol/event shapes and coordinator
+// APIs. Refactoring them solely for lint thresholds would add indirection across
+// stable boundaries without improving correctness.
+#![allow(
+    clippy::enum_variant_names,
+    clippy::large_enum_variant,
+    clippy::module_inception,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 mod agent;
 mod agent_event_journal;
@@ -610,14 +620,9 @@ mod tests {
         assert_eq!(agent.active_model_metadata().context_window, Some(8_192));
         assert!(!agent.active_model_metadata().supports_tools);
         assert!(!agent.retry_config_for_test().enabled);
-        let records = transcript::read_records(
-            recorder
-                .lock()
-                .expect("transcript recorder")
-                .path()
-                .to_path_buf(),
-        )
-        .expect("read transcript");
+        let records =
+            transcript::read_records(recorder.lock().expect("transcript recorder").path())
+                .expect("read transcript");
         let model_change = serde_json::to_value(
             records
                 .last()

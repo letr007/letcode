@@ -2349,7 +2349,7 @@ fn apply_patch_open_failure(
     }
     let stat = unsafe { stat.assume_init() };
     let regular = (stat.st_mode & libc::S_IFMT) == libc::S_IFREG;
-    if !regular || stat.st_dev as u64 != target.dev || stat.st_ino as u64 != target.ino {
+    if !regular || stat.st_dev as u64 != target.dev || stat.st_ino != target.ino {
         anyhow!(APPLY_PATCH_CHANGED)
     } else {
         apply_patch_io_error(path, action, open_error)

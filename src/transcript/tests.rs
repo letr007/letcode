@@ -1724,7 +1724,7 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
         .append(true)
         .open(&path)
         .expect("open live transcript");
-    file.write_all(final_line[partial_len..].as_bytes())
+    file.write_all(&final_line.as_bytes()[partial_len..])
         .expect("complete final record");
     file.write_all(b"\n").expect("terminate final record");
     file.flush().expect("flush final record");

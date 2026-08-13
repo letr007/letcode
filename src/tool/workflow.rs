@@ -155,6 +155,14 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
+    if args.get("enabled").and_then(Value::as_bool).is_none() {
+        bail!("workflow__auto_continue requires boolean field 'enabled'");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_workflow_todos;
@@ -184,12 +192,4 @@ mod tests {
 
         assert!(validate_workflow_todos(&snapshot).is_ok());
     }
-}
-
-fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
-    if args.get("enabled").and_then(Value::as_bool).is_none() {
-        bail!("workflow__auto_continue requires boolean field 'enabled'");
-    }
-
-    Ok(())
 }

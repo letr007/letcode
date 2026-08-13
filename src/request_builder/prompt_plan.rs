@@ -202,11 +202,11 @@ impl PromptPlanner {
 
         super::validate_model_metadata(input.model.clone())?;
         let context_window = input.model.context_window_tokens();
-        let tools_tokens = input
-            .model
-            .supports_tools
-            .then(|| super::estimate_tools_tokens(input.tools))
-            .unwrap_or(0);
+        let tools_tokens = if input.model.supports_tools {
+            super::estimate_tools_tokens(input.tools)
+        } else {
+            0
+        };
         let input_budget =
             super::effective_input_budget_tokens_for_tool_tokens(input.model.clone(), tools_tokens);
         let protected_start = effective_protected_start_index.min(effective_history.len());
@@ -563,7 +563,7 @@ impl PromptPlan {
     pub(crate) fn stable_prefix_hash(&self) -> Option<&str> {
         self.segments.iter().find_map(|segment| {
             (segment.cache.boundary == Some(PromptCacheBoundaryKind::StablePrefixEnd))
-                .then(|| segment.cache.prefix_hash.as_deref())
+                .then_some(segment.cache.prefix_hash.as_deref())
                 .flatten()
         })
     }
@@ -705,7 +705,7 @@ pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
             })
         });
         let mut classification =
-            classify_history_frame(&frame, index >= current_turn_start, provenance.as_ref());
+            classify_history_frame(frame, index >= current_turn_start, provenance.as_ref());
         if !matches!(
             frame.item,
             ProtocolFrameItem::AssistantToolCalls { .. } | ProtocolFrameItem::ToolOutput { .. }
@@ -1347,11 +1347,11 @@ fn history_item_content(item: &HistoryItem) -> PromptSegmentContent {
 
 fn estimate_prompt_message_tokens(message: &PromptMessage) -> Option<u64> {
     let json_len = serde_json::to_string(message).ok()?.len();
-    Some(((json_len as u64 + 2) / 3).saturating_add(8))
+    Some((json_len as u64).div_ceil(3).saturating_add(8))
 }
 
 fn estimate_text_tokens(text: &str) -> u64 {
-    ((text.len() as u64 + 2) / 3).saturating_add(8)
+    (text.len() as u64).div_ceil(3).saturating_add(8)
 }
 
 fn message_stable_key(message: &PromptMessage) -> String {

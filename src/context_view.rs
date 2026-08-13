@@ -121,19 +121,10 @@ pub(crate) enum ContextViewStatus {
     RemovedFromView,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct ContextViewState {
     block_statuses: BTreeMap<ContextBlockId, ContextViewStatus>,
     open_detail_block_id: Option<ContextBlockId>,
-}
-
-impl Default for ContextViewState {
-    fn default() -> Self {
-        Self {
-            block_statuses: BTreeMap::new(),
-            open_detail_block_id: None,
-        }
-    }
 }
 
 impl ContextViewState {
@@ -333,23 +324,12 @@ pub(crate) struct SummaryArtifact {
     pub created_sequence: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct ContextViewProjection {
     pub blocks: BTreeMap<ContextBlockId, ContextBlock>,
     pub view_state: ContextViewState,
     pub summary_artifacts: Vec<SummaryArtifact>,
     pub compacted_block_ids: BTreeSet<ContextBlockId>,
-}
-
-impl Default for ContextViewProjection {
-    fn default() -> Self {
-        Self {
-            blocks: BTreeMap::new(),
-            view_state: ContextViewState::default(),
-            summary_artifacts: Vec::new(),
-            compacted_block_ids: BTreeSet::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,48 +561,44 @@ pub(crate) fn index_context_blocks(
                     }
                 }
             }
-            TranscriptEvent::AssistantMessage { content } => {
-                if !content.trim().is_empty() {
+            TranscriptEvent::AssistantMessage { content } if !content.trim().is_empty() => {
+                insert_block(
+                    &mut blocks,
+                    block_id(record.sequence, "note"),
+                    ContextBlockKind::Note,
+                    "Session note".into(),
+                    content.clone(),
+                    transcript_source(record.sequence),
+                    Some(record.sequence),
+                    Vec::new(),
+                    None,
+                );
+                for (index, hash) in extract_commit_hashes(content).into_iter().enumerate() {
                     insert_block(
                         &mut blocks,
-                        block_id(record.sequence, "note"),
-                        ContextBlockKind::Note,
-                        "Session note".into(),
-                        content.clone(),
+                        block_id(record.sequence, &format!("commit-{index}")),
+                        ContextBlockKind::CommitHash,
+                        "Commit hash".into(),
+                        hash,
                         transcript_source(record.sequence),
                         Some(record.sequence),
-                        Vec::new(),
+                        vec![ProtectedReason::CommitHash],
                         None,
                     );
-                    for (index, hash) in extract_commit_hashes(content).into_iter().enumerate() {
-                        insert_block(
-                            &mut blocks,
-                            block_id(record.sequence, &format!("commit-{index}")),
-                            ContextBlockKind::CommitHash,
-                            "Commit hash".into(),
-                            hash,
-                            transcript_source(record.sequence),
-                            Some(record.sequence),
-                            vec![ProtectedReason::CommitHash],
-                            None,
-                        );
-                    }
                 }
             }
-            TranscriptEvent::ReasoningMessage { content, .. } => {
-                if !content.trim().is_empty() {
-                    insert_block(
-                        &mut blocks,
-                        block_id(record.sequence, "reasoning-note"),
-                        ContextBlockKind::ReasoningNote,
-                        "Reasoning note".into(),
-                        content.clone(),
-                        transcript_source(record.sequence),
-                        Some(record.sequence),
-                        Vec::new(),
-                        None,
-                    );
-                }
+            TranscriptEvent::ReasoningMessage { content, .. } if !content.trim().is_empty() => {
+                insert_block(
+                    &mut blocks,
+                    block_id(record.sequence, "reasoning-note"),
+                    ContextBlockKind::ReasoningNote,
+                    "Reasoning note".into(),
+                    content.clone(),
+                    transcript_source(record.sequence),
+                    Some(record.sequence),
+                    Vec::new(),
+                    None,
+                );
             }
             TranscriptEvent::Error { message } => {
                 insert_block(

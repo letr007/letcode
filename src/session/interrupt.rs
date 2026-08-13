@@ -46,10 +46,10 @@ pub(crate) fn unfinished_tool_calls_in_active_turn(
                     }
                 }
             }
-            TranscriptEvent::ToolCallStarted { call_id, name, .. } => {
-                if !unfinished.iter().any(|(id, _)| id == call_id) {
-                    unfinished.push((call_id.clone(), name.clone()));
-                }
+            TranscriptEvent::ToolCallStarted { call_id, name, .. }
+                if !unfinished.iter().any(|(id, _)| id == call_id) =>
+            {
+                unfinished.push((call_id.clone(), name.clone()));
             }
             TranscriptEvent::ToolCallFinished { call_id, .. }
             | TranscriptEvent::ToolCallCancelled { call_id, .. } => {
@@ -86,19 +86,17 @@ pub(crate) fn unfinished_subagent_runs_in_active_turn(
                 child_session_id,
                 agent_name,
                 ..
-            } => {
-                if !unfinished
-                    .iter()
-                    .any(|run: &UnfinishedSubagentRun| run.run_id == *run_id)
-                {
-                    unfinished.push(UnfinishedSubagentRun {
-                        run_id: run_id.clone(),
-                        parent_session_id: parent_session_id.clone(),
-                        parent_run_id: parent_run_id.clone(),
-                        child_session_id: child_session_id.clone(),
-                        agent_name: agent_name.clone(),
-                    });
-                }
+            } if !unfinished
+                .iter()
+                .any(|run: &UnfinishedSubagentRun| run.run_id == *run_id) =>
+            {
+                unfinished.push(UnfinishedSubagentRun {
+                    run_id: run_id.clone(),
+                    parent_session_id: parent_session_id.clone(),
+                    parent_run_id: parent_run_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    agent_name: agent_name.clone(),
+                });
             }
             TranscriptEvent::SubagentResult { run_id, .. } => {
                 unfinished.retain(|run| run.run_id != *run_id);

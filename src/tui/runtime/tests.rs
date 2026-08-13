@@ -1425,8 +1425,10 @@ fn failed_candidate_usage_preserves_agent_and_recorder() {
     let model = agent.model().to_string();
     let history = agent.history_for_test().to_vec();
     let runtime_snapshot = agent.runtime_snapshot_for_test().clone();
-    let mut invalid_metadata = crate::request_builder::ModelRequestMetadata::default();
-    invalid_metadata.effective_input_limit_tokens = Some(0);
+    let invalid_metadata = crate::request_builder::ModelRequestMetadata {
+        effective_input_limit_tokens: Some(0),
+        ..Default::default()
+    };
     agent.set_model_catalog(std::collections::HashMap::from([(
         String::from("invalid-model"),
         invalid_metadata,
@@ -2566,7 +2568,7 @@ fn session_transport_events_continue_updating_parent_timeline_while_viewing_chil
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
     assert!(matches!(
-        runtime.state().active_timeline().items().as_ref(),
+        runtime.state().active_timeline().items(),
         [crate::tui::TimelineItem::Assistant(message)] if message.text == "child response"
     ));
     assert!(matches!(

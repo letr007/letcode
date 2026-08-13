@@ -472,7 +472,7 @@ impl PendingQuestionState {
             questions: request
                 .questions
                 .into_iter()
-                .map(|question| PendingQuestionItem::from_spec(question))
+                .map(PendingQuestionItem::from_spec)
                 .collect(),
             active_tab: 0,
             active_row: 0,
@@ -1452,11 +1452,11 @@ impl TuiState {
     }
 
     pub fn open_context_detail(&mut self, target: Option<ContextDetailTarget>) {
-        if self.is_read_only_child_view() {
-            if let Some(child) = self.child_timeline.as_mut() {
-                child.context.open_detail = target;
-                return;
-            }
+        if self.is_read_only_child_view()
+            && let Some(child) = self.child_timeline.as_mut()
+        {
+            child.context.open_detail = target;
+            return;
         }
 
         self.context.open_detail = target;
@@ -2084,9 +2084,9 @@ impl TuiState {
         self.reset_slash_panel();
         self.retry = None;
         self.transcript_view = TranscriptViewState::Child {
-            parent_session_id: parent_session_id.into(),
+            parent_session_id,
             child_session_id,
-            agent_name: agent_name.into(),
+            agent_name,
             index,
             total,
             pool_ordinal,
@@ -2758,9 +2758,7 @@ impl TuiState {
         let item_start_row = cache.row_starts()[item_index];
         let entry = &cache.entries()[item_index];
         let rendered_line_offset = absolute_row.saturating_sub(item_start_row);
-        let Some(line) = entry.document.lines.get(rendered_line_offset) else {
-            return None;
-        };
+        let line = entry.document.lines.get(rendered_line_offset)?;
 
         // Anchors retain visual line/character semantics. Hit testing walks the
         // document's display-cell spans, ignoring chrome until a source-backed span
@@ -3519,14 +3517,15 @@ mod tests {
 
     #[test]
     fn child_view_refresh_preserves_runtime_state_and_updates_record_count() {
-        let mut state = TuiState::default();
-        state.phase = AppPhase::Running;
-        state.active_tool_call_id = Some("call-2".into());
-        state.pending_permission = Some(PermissionView::from_request(PermissionRequestEvent::new(
-            "call-2",
-            "shell__exec",
-            "run cargo test",
-        )));
+        let mut state =
+            TuiState {
+                phase: AppPhase::Running,
+                active_tool_call_id: Some("call-2".into()),
+                pending_permission: Some(PermissionView::from_request(
+                    PermissionRequestEvent::new("call-2", "shell__exec", "run cargo test"),
+                )),
+                ..Default::default()
+            };
         state.replace_child_timeline_from_records(
             &[],
             "parent-session",

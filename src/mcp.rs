@@ -942,13 +942,12 @@ fn parse_sse_event(event_data: &[String], expected_id: Option<u64>) -> Result<Op
     if message.get("id").and_then(Value::as_u64) == Some(expected_id) {
         return Ok(Some(message));
     }
-    if let Some(items) = message.as_array() {
-        if let Some(item) = items
+    if let Some(items) = message.as_array()
+        && let Some(item) = items
             .iter()
             .find(|item| item.get("id").and_then(Value::as_u64) == Some(expected_id))
-        {
-            return Ok(Some(item.clone()));
-        }
+    {
+        return Ok(Some(item.clone()));
     }
     Ok(None)
 }

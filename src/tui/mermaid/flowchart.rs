@@ -206,9 +206,9 @@ fn layout_horizontal(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::M
         .unwrap_or(0);
     let mut starts = Vec::with_capacity(layers.len());
     let mut col = 0;
-    for layer in 0..layers.len() {
+    for (layer, column_width) in column_widths.iter().enumerate().take(layers.len()) {
         starts.push(col);
-        col += column_widths[layer];
+        col += column_width;
         if let Some(gap) = gaps.get(layer) {
             col += gap;
         }
@@ -949,9 +949,7 @@ fn avoid_column(
 fn centered_mermaid_label_col(a: usize, b: usize, width: usize) -> Option<usize> {
     let lo = a.min(b);
     let hi = a.max(b);
-    let Some(interior_start) = lo.checked_add(1) else {
-        return None;
-    };
+    let interior_start = lo.checked_add(1)?;
     let interior = hi.saturating_sub(interior_start);
     if width > interior {
         return None;

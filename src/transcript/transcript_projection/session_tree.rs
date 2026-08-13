@@ -192,7 +192,7 @@ fn entry_details(
             None,
         ),
         TranscriptEvent::ToolCallStarted { name, .. } => {
-            (SessionHistoryEntryKind::Assistant, format!("{name}"), None)
+            (SessionHistoryEntryKind::Assistant, name.to_string(), None)
         }
         TranscriptEvent::ToolCallFinished { name, ok, .. } => (
             SessionHistoryEntryKind::Other,

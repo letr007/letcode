@@ -238,7 +238,7 @@ fn push_card_line(
     let content_width = width.saturating_sub(2).max(1);
     let block = document.add_source(text);
     let chunks = wrap_text_to_width_with_offsets(text, content_width);
-    for (index, chunk) in chunks.iter().enumerate() {
+    for chunk in &chunks {
         let mut spans = vec![
             Span::decoration(surface::ACCENT_BAR_GLYPH, bar_style),
             Span::decoration(" ", text_style),
@@ -254,14 +254,7 @@ fn push_card_line(
         if width > used {
             spans.push(Span::decoration(" ".repeat(width - used), text_style));
         }
-        document.push_line(
-            Line { spans },
-            if index + 1 < chunks.len() {
-                Break::SoftWrap
-            } else {
-                Break::SoftWrap
-            },
-        );
+        document.push_line(Line { spans }, Break::SoftWrap);
     }
 }
 

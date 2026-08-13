@@ -717,8 +717,8 @@ where
                         .await?;
                     }
                     ResponseStreamEvent::ResponseOutputItemAdded(event) => {
-                        if let OutputItem::FunctionCall(call) = event.item {
-                            if emit_tool_call_pending_if_ready(
+                        if let OutputItem::FunctionCall(call) = event.item
+                            && emit_tool_call_pending_if_ready(
                                 &mut emitted_pending_tool_calls,
                                 &call.call_id,
                                 &call.name,
@@ -729,7 +729,6 @@ where
                                 stream_had_side_effect = true;
                                 pending_tool_calls.insert(call.call_id.clone(), call.name.clone());
                             }
-                        }
                     }
                     ResponseStreamEvent::ResponseCompleted(event) => {
                         debug!(
@@ -1473,12 +1472,11 @@ where
                         }
 
                         if let Some(delta) = choice.delta {
-                            if let Some(reasoning_delta) = delta.reasoning_delta() {
-                                if let Some(event) = native_reasoning.push(reasoning_delta) {
+                            if let Some(reasoning_delta) = delta.reasoning_delta()
+                                && let Some(event) = native_reasoning.push(reasoning_delta) {
                                     stream_had_side_effect = true;
                                     on_event(event).await?;
                                 }
-                            }
 
                             if let Some(content_delta) = delta.content {
                                 trace!(delta_len = content_delta.len(), "received chat text delta");
@@ -1508,8 +1506,8 @@ where
                                 for chunk in chunks {
                                     let index = chunk.index as usize;
                                     merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                    if let Some(call) = tool_calls.get(&index) {
-                                        if emit_tool_call_pending_if_ready(
+                                    if let Some(call) = tool_calls.get(&index)
+                                        && emit_tool_call_pending_if_ready(
                                             &mut emitted_pending_tool_calls,
                                             &call.id,
                                             &call.function.name,
@@ -1523,7 +1521,6 @@ where
                                                 call.function.name.clone(),
                                             );
                                         }
-                                    }
                                 }
                             }
                         }
@@ -1623,12 +1620,11 @@ where
                     }
 
                     if let Some(delta) = choice.delta {
-                        if let Some(reasoning_delta) = delta.reasoning_delta() {
-                            if let Some(event) = native_reasoning.push(reasoning_delta) {
+                        if let Some(reasoning_delta) = delta.reasoning_delta()
+                            && let Some(event) = native_reasoning.push(reasoning_delta) {
                                 stream_had_side_effect = true;
                                 on_event(event).await?;
                             }
-                        }
 
                         if let Some(content_delta) = delta.content {
                             trace!(delta_len = content_delta.len(), "received chat text delta");
@@ -1658,8 +1654,8 @@ where
                             for chunk in chunks {
                                 let index = chunk.index as usize;
                                 merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                if let Some(call) = tool_calls.get(&index) {
-                                    if emit_tool_call_pending_if_ready(
+                                if let Some(call) = tool_calls.get(&index)
+                                    && emit_tool_call_pending_if_ready(
                                         &mut emitted_pending_tool_calls,
                                         &call.id,
                                         &call.function.name,
@@ -1671,7 +1667,6 @@ where
                                         pending_tool_calls
                                             .insert(call.id.clone(), call.function.name.clone());
                                     }
-                                }
                             }
                         }
                     }
@@ -2073,11 +2068,11 @@ where
                 let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
                     .context("failed to deserialize oneshot chat completion delta")?;
                 for choice in response.choices {
-                    if let Some(delta) = choice.delta.and_then(|delta| delta.content) {
-                        if !delta.is_empty() {
-                            on_delta(&delta).await?;
-                            text.push_str(&delta);
-                        }
+                    if let Some(delta) = choice.delta.and_then(|delta| delta.content)
+                        && !delta.is_empty()
+                    {
+                        on_delta(&delta).await?;
+                        text.push_str(&delta);
                     }
                 }
             }
@@ -2089,11 +2084,11 @@ where
             let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
                 .context("failed to deserialize oneshot chat completion trailer")?;
             for choice in response.choices {
-                if let Some(delta) = choice.delta.and_then(|delta| delta.content) {
-                    if !delta.is_empty() {
-                        on_delta(&delta).await?;
-                        text.push_str(&delta);
-                    }
+                if let Some(delta) = choice.delta.and_then(|delta| delta.content)
+                    && !delta.is_empty()
+                {
+                    on_delta(&delta).await?;
+                    text.push_str(&delta);
                 }
             }
         }
@@ -2158,11 +2153,9 @@ where
                 }
             };
             match event {
-                ResponseStreamEvent::ResponseOutputTextDelta(event) => {
-                    if !event.delta.is_empty() {
-                        on_delta(&event.delta).await?;
-                        text.push_str(&event.delta);
-                    }
+                ResponseStreamEvent::ResponseOutputTextDelta(event) if !event.delta.is_empty() => {
+                    on_delta(&event.delta).await?;
+                    text.push_str(&event.delta);
                 }
                 ResponseStreamEvent::ResponseFailed(event) => {
                     bail!(
@@ -2184,13 +2177,12 @@ where
                 }
                 ResponseStreamEvent::ResponseCompleted(event) => {
                     // Test mocks and some providers only emit the completed payload.
-                    if text.is_empty() {
-                        if let Some(completed) = event.response.output_text() {
-                            if !completed.is_empty() {
-                                on_delta(&completed).await?;
-                                text.push_str(&completed);
-                            }
-                        }
+                    if text.is_empty()
+                        && let Some(completed) = event.response.output_text()
+                        && !completed.is_empty()
+                    {
+                        on_delta(&completed).await?;
+                        text.push_str(&completed);
                     }
                     break;
                 }

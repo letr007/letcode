@@ -257,24 +257,22 @@ impl ActiveRunGuard {
     }
 
     fn clear_cancel(&self) {
-        if let Ok(mut map) = self.active_by_agent.lock() {
-            if let Some(slot) = map.get_mut(&self.agent_name) {
-                if slot.run_id == self.run_id {
-                    slot.cancel.take();
-                }
-            }
+        if let Ok(mut map) = self.active_by_agent.lock()
+            && let Some(slot) = map.get_mut(&self.agent_name)
+            && slot.run_id == self.run_id
+        {
+            slot.cancel.take();
         }
     }
 }
 
 impl Drop for ActiveRunGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.active_by_agent.lock() {
-            if let Some(slot) = map.get(&self.agent_name) {
-                if slot.run_id == self.run_id {
-                    map.remove(&self.agent_name);
-                }
-            }
+        if let Ok(mut map) = self.active_by_agent.lock()
+            && let Some(slot) = map.get(&self.agent_name)
+            && slot.run_id == self.run_id
+        {
+            map.remove(&self.agent_name);
         }
     }
 }
@@ -845,12 +843,9 @@ impl SubagentPool {
             }
         })();
 
-        let (run_id, child_session_id, pool_ordinal, child_transcript, child_agent) = match setup {
-            Ok(values) => values,
-            Err(error) => return Err(error),
-        };
+        let (run_id, child_session_id, pool_ordinal, child_transcript, child_agent) = setup?;
 
-        if let Err(error) = record_parent_started(
+        record_parent_started(
             &parent_transcript,
             &run_id,
             &parent_session_id,
@@ -859,9 +854,7 @@ impl SubagentPool {
             &template.name,
             &task,
             pool_ordinal,
-        ) {
-            return Err(error);
-        }
+        )?;
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let summary = ChildSessionSummary {
@@ -916,13 +909,13 @@ impl SubagentPool {
     }
 
     fn busy_error_message_for(&self, agent_name: &str) -> String {
-        if let Ok(map) = self.active_by_agent.lock() {
-            if let Some(slot) = map.get(agent_name) {
-                return format!(
-                    "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel (run_id={}, child_session_id={}, pool_ordinal={})",
-                    slot.run_id, slot.child.child_session_id, slot.child.pool_ordinal
-                );
-            }
+        if let Ok(map) = self.active_by_agent.lock()
+            && let Some(slot) = map.get(agent_name)
+        {
+            return format!(
+                "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel (run_id={}, child_session_id={}, pool_ordinal={})",
+                slot.run_id, slot.child.child_session_id, slot.child.pool_ordinal
+            );
         }
         format!(
             "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel"

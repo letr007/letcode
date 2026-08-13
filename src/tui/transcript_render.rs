@@ -325,9 +325,7 @@ impl<S> Document<S> {
                 .breaks
                 .last()
                 .is_some_and(|boundary| *boundary != Break::End)
-            || self.breaks[..self.breaks.len().saturating_sub(1)]
-                .iter()
-                .any(|boundary| *boundary == Break::End)
+            || self.breaks[..self.breaks.len().saturating_sub(1)].contains(&Break::End)
         {
             return false;
         }

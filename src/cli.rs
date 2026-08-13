@@ -682,41 +682,31 @@ fn present_transport_event(
                 println!("started new session {session_id}");
             }
         }
-        SessionTransportEvent::PermissionRequested { event, handle } => {
-            if interactive {
-                respond_permission(&event, &handle)?;
-            }
-            // Non-interactive: drop handle → runner fails with sender dropped.
+        SessionTransportEvent::PermissionRequested { event, handle } if interactive => {
+            respond_permission(&event, &handle)?;
         }
-        SessionTransportEvent::ChildPermissionRequested { event, handle, .. } => {
-            if interactive {
-                respond_permission(&event, &handle)?;
-            }
+        // Non-interactive: drop handle → runner fails with sender dropped.
+        SessionTransportEvent::ChildPermissionRequested { event, handle, .. } if interactive => {
+            respond_permission(&event, &handle)?;
         }
-        SessionTransportEvent::QuestionRequested { request, handle } => {
-            if interactive {
-                match ask_questions_in_terminal(&request) {
-                    Ok(response) => handle.answer(response)?,
-                    Err(error) => {
-                        let _ = handle.cancel(format!("{error:#}"));
-                        return Err(error);
-                    }
+        SessionTransportEvent::QuestionRequested { request, handle } if interactive => {
+            match ask_questions_in_terminal(&request) {
+                Ok(response) => handle.answer(response)?,
+                Err(error) => {
+                    let _ = handle.cancel(format!("{error:#}"));
+                    return Err(error);
                 }
             }
         }
         SessionTransportEvent::ChildQuestionRequested {
             request, handle, ..
-        } => {
-            if interactive {
-                match ask_questions_in_terminal(&request) {
-                    Ok(response) => handle.answer(response)?,
-                    Err(error) => {
-                        let _ = handle.cancel(format!("{error:#}"));
-                        return Err(error);
-                    }
-                }
+        } if interactive => match ask_questions_in_terminal(&request) {
+            Ok(response) => handle.answer(response)?,
+            Err(error) => {
+                let _ = handle.cancel(format!("{error:#}"));
+                return Err(error);
             }
-        }
+        },
         _ => {}
     }
     Ok(marker)

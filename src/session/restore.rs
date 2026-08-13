@@ -195,12 +195,12 @@ impl<C: Config> PreparedRestoredRoute<C> {
     }
 }
 
-pub(crate) fn prepare_restored_model_route<C: Config>(
+pub(crate) fn prepare_restored_model_route<C>(
     agent: &Agent<C>,
     latest_model: Option<&str>,
 ) -> Result<Option<PreparedRestoredRoute<C>>>
 where
-    C: Clone,
+    C: Config + Clone,
 {
     let Some(model) = latest_model else {
         return Ok(None);

@@ -420,21 +420,19 @@ pub(crate) fn validate_context_compaction_event_in_scope(
     // recorded. A record with neither is modern, including full compactions
     // whose `first_kept_entry_id` is `None`.
     let is_legacy = event.tail_start_index.is_some() || event.checkpoint.is_some();
-    if !is_legacy {
-        if let Some(first_kept_entry_id) = event.first_kept_entry_id.as_deref() {
-            ensure!(
-                !first_kept_entry_id.trim().is_empty(),
-                "modern context compaction first_kept_entry_id must not be empty"
-            );
-            let history = restore_history_projection(scope.selected_history_records());
-            ensure!(
-                history
-                    .iter()
-                    .any(|entry| entry.stable_key == first_kept_entry_id),
-                "context compaction first_kept_entry_id '{}' is absent from the pre-compaction projection",
-                first_kept_entry_id
-            );
-        }
+    if !is_legacy && let Some(first_kept_entry_id) = event.first_kept_entry_id.as_deref() {
+        ensure!(
+            !first_kept_entry_id.trim().is_empty(),
+            "modern context compaction first_kept_entry_id must not be empty"
+        );
+        let history = restore_history_projection(scope.selected_history_records());
+        ensure!(
+            history
+                .iter()
+                .any(|entry| entry.stable_key == first_kept_entry_id),
+            "context compaction first_kept_entry_id '{}' is absent from the pre-compaction projection",
+            first_kept_entry_id
+        );
     }
 
     Ok(())

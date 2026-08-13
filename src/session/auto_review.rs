@@ -81,7 +81,7 @@ impl StickyAutoReviewer {
         let recorded_route = takeover_child_session_id
             .map(|child_session_id| -> Result<_> {
                 let records = read_records_allow_partial_tail(
-                    &crate::transcript::child_sessions_dir(&self.sessions_dir)
+                    crate::transcript::child_sessions_dir(&self.sessions_dir)
                         .join(format!("{child_session_id}.jsonl")),
                 )?;
                 let route = crate::transcript::restore_latest_model(&records).ok_or_else(|| {

@@ -487,9 +487,7 @@ impl RunnerSubagentDelegate {
             .transcript
             .lock()
             .map_err(|_| anyhow!("transcript recorder poisoned"))
-            .and_then(|recorder| {
-                crate::transcript::read_records(recorder.path()).map_err(Into::into)
-            })?;
+            .and_then(|recorder| crate::transcript::read_records(recorder.path()))?;
         let child = SubagentPool::child_sessions(&self.sessions_dir, &parent_records)
             .into_iter()
             .find(|child| child.child_session_id == target_child_session_id)

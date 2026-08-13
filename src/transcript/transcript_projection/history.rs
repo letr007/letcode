@@ -68,7 +68,7 @@ pub(super) fn restore_history_projection(
     let mut history: Vec<HistoryProjectionEntry> = Vec::new();
     let mut active_turn_id = None;
     let mut active_segment_id = None;
-    for (_index, record) in records.iter().enumerate() {
+    for record in records.iter() {
         match &record.event {
             TranscriptEvent::TurnStarted(event) => {
                 // Recorders historically append the user frame before the start
@@ -149,8 +149,8 @@ pub(super) fn restore_history_projection(
                     compacted.push(HistoryProjectionEntry {
                         item: HistoryItem::internal_continuation(checkpoint.continuation.clone()),
                         source_spans: continuation_source,
-                        turn_id: preserved_user_index.and_then(|_| active_turn_id),
-                        segment_id: preserved_user_index.and_then(|_| active_segment_id),
+                        turn_id: preserved_user_index.and(active_turn_id),
+                        segment_id: preserved_user_index.and(active_segment_id),
                         origin: HistoryProjectionOrigin::CompactionContinuation,
                         stable_key: format!("compaction:{}:continuation", record.sequence),
                     });
@@ -307,7 +307,7 @@ pub(super) fn checkpoint_spans_from_history(
     let mut merged: Vec<LogicalCheckpointSourceSpanV1> = Vec::new();
     for span in spans {
         if let Some(last) = merged.last_mut()
-            && span.start_sequence <= last.end_sequence.checked_add(1).unwrap_or(u64::MAX)
+            && span.start_sequence <= last.end_sequence.saturating_add(1)
         {
             last.end_sequence = last.end_sequence.max(span.end_sequence);
         } else {

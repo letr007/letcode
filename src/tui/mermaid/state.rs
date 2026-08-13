@@ -916,9 +916,7 @@ fn parse(source: &str) -> Option<ir::Diagram> {
         }
 
         if trimmed == "}" {
-            if stack.pop().is_none() {
-                return None;
-            }
+            stack.pop()?;
             items.push(ir::Item::Close(stack.len()));
         } else if let Some(rest) = trimmed.strip_prefix("state ") {
             let declaration = parse_state_declaration(rest)?;

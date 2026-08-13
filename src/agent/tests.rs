@@ -1967,7 +1967,7 @@ impl SubagentDelegate<OpenAIConfig> for PollCountingSubagentDelegate {
         Box::pin(async move {
             polls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::ok(
-                &format!("agent__{agent_name}"),
+                format!("agent__{agent_name}"),
                 json!({"ok": true}),
             ))
         })
@@ -1993,7 +1993,7 @@ impl SubagentDelegate<OpenAIConfig> for OverlapSubagentDelegate {
                 .await
                 .expect("barrier task joins");
             Ok(ToolResult::ok(
-                &format!("agent__{agent_name}"),
+                format!("agent__{agent_name}"),
                 json!({"ok": true}),
             ))
         })
@@ -2396,7 +2396,7 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         context_view: None,
     })
     .expect("request builds");
-    assert_eq!(b1.budget.context_window_tokens, 2048.max(1024));
+    assert_eq!(b1.budget.context_window_tokens, 2048);
 
     // Switch model and build again.
     agent.set_model("m2");
@@ -2544,8 +2544,10 @@ fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
         .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
         .expect("restore old session");
     agent.prepare_turn_prelude("active turn");
-    let mut invalid_metadata = ModelRequestMetadata::default();
-    invalid_metadata.effective_input_limit_tokens = Some(0);
+    let invalid_metadata = ModelRequestMetadata {
+        effective_input_limit_tokens: Some(0),
+        ..Default::default()
+    };
     agent.set_model_catalog(HashMap::from([(
         String::from("invalid-model"),
         invalid_metadata,

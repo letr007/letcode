@@ -322,7 +322,8 @@ where
 {
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
-    let result = async {
+
+    async {
         // Build one durable compaction event. Tail pruning is part of the
         // append-only projection, never an unjournaled live mutation.
         let prepared_result = match prepare_compaction(agent, trigger, on_event).await {
@@ -386,8 +387,7 @@ where
             }
         }
     }
-    .await;
-    result
+    .await
 }
 
 async fn attempt_compaction<C>(
@@ -398,7 +398,7 @@ async fn attempt_compaction<C>(
 where
     C: Config + Clone,
 {
-    let result = async {
+    async {
         let prepared = match prepare_compaction(agent, trigger, on_event).await? {
             Ok(prepared) => prepared,
             Err(no_progress) => {
@@ -414,8 +414,7 @@ where
             retained_items: agent.history.len(),
         })
     }
-    .await;
-    result
+    .await
 }
 
 fn diagnostic_labels(blockers: &[CompactionBlocker]) -> String {

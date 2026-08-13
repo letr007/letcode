@@ -115,7 +115,7 @@ impl ModelRequestMetadata {
     }
 
     pub fn allows_reasoning_effort(&self, effort: &ModelReasoningEffort) -> bool {
-        self.selectable_reasoning_efforts().contains(&effort)
+        self.selectable_reasoning_efforts().contains(effort)
     }
 }
 
@@ -586,8 +586,10 @@ fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUni
             .segments
             .iter()
             .flat_map(|segment| {
-                std::iter::repeat(prompt_segment_category(segment))
-                    .take(provider_serialization::prompt_segment_to_response_inputs(segment).len())
+                std::iter::repeat_n(
+                    prompt_segment_category(segment),
+                    provider_serialization::prompt_segment_to_response_inputs(segment).len(),
+                )
             })
             .collect(),
         BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => build
@@ -1223,7 +1225,7 @@ pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        let text_tokens = ((compact_text.len() as u64 + 2) / 3).saturating_add(8);
+        let text_tokens = (compact_text.len() as u64).div_ceil(3).saturating_add(8);
         let visual_tokens = images
             .iter()
             .map(crate::user_content::UserImageAttachment::visual_token_charge)
@@ -1241,7 +1243,7 @@ pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
         let json_len = serde_json::to_string(&compact_item)
             .map(|serialized| serialized.len())
             .unwrap_or(0);
-        let text_tokens = ((json_len as u64 + 2) / 3).saturating_add(8);
+        let text_tokens = (json_len as u64).div_ceil(3).saturating_add(8);
         let visual_tokens = content
             .attachments
             .iter()
@@ -1251,7 +1253,7 @@ pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
     }
 
     let json_len = serde_json::to_string(item).map(|s| s.len()).unwrap_or(0);
-    ((json_len as u64 + 2) / 3).saturating_add(8)
+    (json_len as u64).div_ceil(3).saturating_add(8)
 }
 
 pub(crate) fn estimate_history_tokens(items: &[HistoryItem]) -> u64 {
@@ -1263,7 +1265,7 @@ fn estimate_prelude_tokens(items: &[PromptMessage]) -> u64 {
         .iter()
         .map(|item| {
             let json_len = serde_json::to_string(item).map(|s| s.len()).unwrap_or(0);
-            ((json_len as u64 + 2) / 3).saturating_add(8)
+            (json_len as u64).div_ceil(3).saturating_add(8)
         })
         .sum()
 }
@@ -1273,7 +1275,7 @@ fn estimate_tools_tokens(tools: &[ToolSpec]) -> u64 {
         return 0;
     }
     let json_len = serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0);
-    ((json_len as u64 + 2) / 3).saturating_add(16)
+    (json_len as u64).div_ceil(3).saturating_add(16)
 }
 
 #[cfg(test)]
