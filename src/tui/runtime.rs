@@ -1233,6 +1233,7 @@ impl TuiRuntime {
                 // projection clears the question dialog, so keep it aside first and
                 // restore it when the in-flight handle is still live.
                 let pending_question = self.state.pending_question.take();
+                let parent_token_usage = self.state.model_token_usage.clone();
                 let preserve_live_parent = self.session_turn_active
                     || self.state.phase == super::state::AppPhase::Running
                     || self.state.active_tool_call_id.is_some();
@@ -1280,6 +1281,8 @@ impl TuiRuntime {
                 self.state.set_current_context_branch(branch_id.clone());
                 if let Some(token_usage) = token_usage {
                     self.state.set_token_usage(token_usage.clone().into());
+                } else if let Some(parent_token_usage) = parent_token_usage {
+                    self.state.set_token_usage(parent_token_usage);
                 }
             }
             SessionTransportEvent::ContextBranchChanged { branch_id } => {

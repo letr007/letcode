@@ -1058,6 +1058,41 @@ fn parent_view_refresh_preserves_pending_setting_projection() {
 }
 
 #[test]
+fn parent_view_refresh_without_usage_preserves_known_parent_usage() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_token_usage(TokenUsageEvent::with_breakdown(700, 1_000, 600, 100, 0).into());
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    });
+
+    assert_eq!(
+        runtime
+            .state()
+            .active_model_token_usage()
+            .map(|usage| (usage.used_tokens, usage.context_window_tokens)),
+        Some((700, 1_000))
+    );
+}
+
+#[test]
 fn parent_view_refresh_preserves_confirmed_reasoning_effort() {
     let mut runtime = runtime();
     runtime

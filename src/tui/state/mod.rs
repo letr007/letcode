@@ -1327,6 +1327,36 @@ impl TuiState {
         }
     }
 
+    pub fn active_model_token_usage(&self) -> Option<&ModelTokenUsage> {
+        if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .and_then(|state| state.model_token_usage.as_ref())
+        } else {
+            self.model_token_usage.as_ref()
+        }
+    }
+
+    pub fn active_compaction_animation_start_frame(&self) -> Option<usize> {
+        let (active, start_frame) = if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .map(|state| {
+                    (
+                        state.compaction_active,
+                        state.compaction_animation_start_frame,
+                    )
+                })
+                .unwrap_or((false, 0))
+        } else {
+            (
+                self.compaction_active,
+                self.compaction_animation_start_frame,
+            )
+        };
+        active.then_some(start_frame)
+    }
+
     pub fn active_context(&self) -> &ContextPaneState {
         if self.is_read_only_child_view() {
             self.child_timeline

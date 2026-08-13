@@ -64,13 +64,11 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
         return Vec::new();
     }
 
-    let status = if state.compaction_active {
+    let status = if let Some(start_frame) = state.active_compaction_animation_start_frame() {
         // 压缩中：指示条转为开火车式往返扫描，隐藏过期的 token 数字。
-        let animation_frame = state
-            .status_spinner_frame
-            .wrapping_sub(state.compaction_animation_start_frame);
+        let animation_frame = state.status_spinner_frame.wrapping_sub(start_frame);
         compaction_indicator_spans(animation_frame, theme)
-    } else if let Some(usage) = &state.model_token_usage {
+    } else if let Some(usage) = state.active_model_token_usage() {
         token_budget_spans(usage, theme)
     } else {
         Vec::new()
@@ -828,6 +826,44 @@ mod tests {
         assert!(!rendered.contains(" "), "{rendered}");
         assert!(!rendered.contains("󰙅 "), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_uses_token_usage_from_active_child_view() {
+        let mut state = TuiState::default();
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
+            used_tokens: 100,
+            context_window_tokens: 1_000,
+            input_tokens: 100,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cache_report: None,
+        });
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        state.apply_child_session_event(
+            "child-session",
+            crate::tui::SessionEvent::TokenUsage(crate::session::TokenUsageEvent::with_breakdown(
+                700, 1_000, 600, 100, 0,
+            )),
+        );
+
+        let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("↑600"), "{rendered}");
+        assert!(rendered.contains("↓100"), "{rendered}");
+        assert!(rendered.contains("~70%"), "{rendered}");
+        assert!(!rendered.contains("~10%"), "{rendered}");
     }
 
     #[test]
