@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-13
+
+### Added
+
+- `shell__exec` 支持按调用设置 1–3600 秒超时，未指定时继续使用 300 秒默认值
+
+### Fixed
+
+- 父会话视图展示后台子代理的重试原因、等待时间与尝试次数
+- Footer 的 token 使用量和压缩状态跟随当前父/子会话视图，切回父视图时保留已知用量
+
 ## [0.3.0] - 2026-08-12
 
 ### Added
@@ -72,7 +83,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/letr007/letcode/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/letr007/letcode/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/letr007/letcode/releases/tag/v0.2.0
 [0.1.0]: https://github.com/letr007/letcode/releases/tag/v0.1.0
