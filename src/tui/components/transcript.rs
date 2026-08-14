@@ -662,25 +662,26 @@ fn try_render_reviewer_view_item(
     theme: Theme,
     width: usize,
 ) -> Option<Document<Style>> {
-    match item {
+    let document = match item {
         TimelineItem::User(message) => {
             let card = reviewer_cards::parse_review_request(message_text(message))?;
-            Some(reviewer_cards::render_review_request_card_document(
+            reviewer_cards::render_review_request_card_document(
                 &card,
                 theme,
                 card_content_width(width),
-            ))
+            )
         }
         TimelineItem::Assistant(message) => {
             let card = reviewer_cards::parse_review_decision(message_text(message))?;
-            Some(reviewer_cards::render_review_decision_card_document(
+            reviewer_cards::render_review_decision_card_document(
                 &card,
                 theme,
                 card_content_width(width),
-            ))
+            )
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(pad_card_document(document, width))
 }
 
 fn render_timeline_item_document(
@@ -719,14 +720,15 @@ fn build_compaction_block_lines(
     theme: Theme,
     width: usize,
 ) {
-    let width = card_content_width(width);
     if width == 0 {
         return;
     }
     push_drawn_horizontal_rule(out, theme, width);
 
     if !summary.is_empty() {
-        build_assistant_message_lines(out, summary, streaming, theme, width);
+        let start = out.document.lines.len();
+        build_assistant_message_lines(out, summary, streaming, theme, card_content_width(width));
+        pad_card_lines(&mut out.document, start, width);
     }
 
     if !streaming {
@@ -736,6 +738,26 @@ fn build_compaction_block_lines(
 
 fn card_content_width(width: usize) -> usize {
     width.saturating_sub(surface::CARD_PAD_RIGHT as usize)
+}
+
+fn pad_card_document(mut document: Document<Style>, width: usize) -> Document<Style> {
+    pad_card_lines(&mut document, 0, width);
+    document
+}
+
+fn pad_card_lines(document: &mut Document<Style>, start: usize, width: usize) {
+    for line in document.lines.iter_mut().skip(start) {
+        let used = line
+            .spans
+            .iter()
+            .map(|span| display_width(&span.text))
+            .sum::<usize>();
+        if width > used {
+            let style = line.spans.last().map(|span| span.style).unwrap_or_default();
+            line.spans
+                .push(RenderSpan::decoration(" ".repeat(width - used), style));
+        }
+    }
 }
 
 /// Full-width drawn divider (box-drawing line), not a character label string.
@@ -1221,13 +1243,14 @@ fn build_assistant_message_lines(
     }
 
     if let Some(result) = try_parse_structured_subagent_result(text) {
-        out.document.append(
+        out.document.append(pad_card_document(
             structured_subagent::render_structured_subagent_result_document(
                 &result,
                 theme,
                 card_content_width(width),
             ),
-        );
+            width,
+        ));
         return;
     }
 
@@ -1249,8 +1272,8 @@ fn build_assistant_message_lines(
     out.document.append(document);
 }
 
-fn append_component_document(out: &mut TimelineDocument, document: Document<Style>) {
-    out.document.append(document);
+fn append_card_document(out: &mut TimelineDocument, document: Document<Style>, width: usize) {
+    out.document.append(pad_card_document(document, width));
 }
 
 fn build_tool_lines(
@@ -1261,7 +1284,7 @@ fn build_tool_lines(
     frame: usize,
     expanded_output: bool,
 ) {
-    append_component_document(
+    append_card_document(
         out,
         tool_card::render_tool_card_document(
             tool,
@@ -1270,6 +1293,7 @@ fn build_tool_lines(
             frame,
             expanded_output,
         ),
+        width,
     );
 }
 
@@ -1279,9 +1303,10 @@ fn build_todo_card(
     theme: Theme,
     width: usize,
 ) {
-    append_component_document(
+    append_card_document(
         out,
         todo_card::render_todo_card_document(todo, theme, card_content_width(width)),
+        width,
     );
 }
 
@@ -1292,13 +1317,14 @@ fn build_permission_lines(
     width: usize,
 ) {
     if permission.status != PermissionPromptStatus::Pending {
-        append_component_document(
+        append_card_document(
             out,
             tool_card::render_permission_card_document(
                 permission,
                 theme,
                 card_content_width(width),
             ),
+            width,
         );
     }
 }
@@ -1312,11 +1338,13 @@ fn build_auto_review_lines(
     width: usize,
     expanded: bool,
 ) {
+    let card_width = width;
     let width = card_content_width(width);
     let content_width = width.saturating_sub(display_width(AUTO_REVIEW_INDENT));
     if content_width == 0 {
         return;
     }
+    let start = out.document.lines.len();
     let status = if decision.allowed {
         "approved"
     } else {
@@ -1356,6 +1384,7 @@ fn build_auto_review_lines(
             Break::HardBreak,
         );
     }
+    pad_card_lines(&mut out.document, start, card_width);
 }
 
 fn auto_review_status_style(allowed: bool, theme: Theme) -> Style {
@@ -1397,10 +1426,12 @@ fn push_auto_review_text(
 }
 
 fn build_error_lines(out: &mut TimelineDocument, error: &ErrorView, theme: Theme, width: usize) {
+    let card_width = width;
     let width = card_content_width(width);
     if width == 0 {
         return;
     }
+    let start = out.document.lines.len();
     let bar = card_bar_style(theme.error, theme.root_bg);
     let fill = ratatui::style::Style::default().bg(theme.elevated_bg);
     push_error_decoration(out, width, bar, fill);
@@ -1420,6 +1451,7 @@ fn build_error_lines(out: &mut TimelineDocument, error: &ErrorView, theme: Theme
         push_error_content(out, details, elevated_error_detail_style(theme), bar, width);
     }
     push_error_decoration(out, width, bar, fill);
+    pad_card_lines(&mut out.document, start, card_width);
 }
 
 fn push_error_decoration(
@@ -2135,7 +2167,7 @@ mod tests {
                         .iter()
                         .map(|span| span.text.as_str())
                         .collect::<String>(),
-                ) <= 24usize.saturating_sub(crate::tui::surface::CARD_PAD_RIGHT as usize)
+                ) == 24
             }),
             "{narrow:?}"
         );
@@ -2200,7 +2232,6 @@ mod tests {
             }),
         ];
 
-        let max_card_width = width.saturating_sub(crate::tui::surface::CARD_PAD_RIGHT as usize);
         for item in cards {
             let lines =
                 ratatui::text::Text::from(crate::tui::transcript_ratatui::document_to_ratatui(
@@ -2216,10 +2247,11 @@ mod tests {
                     ),
                 ));
             assert!(
-                lines.lines.iter().all(|line| {
-                    crate::tui::measure::display_width(&line.to_string()) <= max_card_width
-                }),
-                "card exceeded {max_card_width}: {lines:?}"
+                lines
+                    .lines
+                    .iter()
+                    .all(|line| { crate::tui::measure::display_width(&line.to_string()) == width }),
+                "card did not fill width {width}: {lines:?}"
             );
         }
 
@@ -2276,8 +2308,7 @@ mod tests {
             assert!(
                 crate::tui::transcript_ratatui::document_to_ratatui(&document)
                     .iter()
-                    .all(|line| crate::tui::measure::display_width(&line.to_string())
-                        <= max_card_width)
+                    .all(|line| crate::tui::measure::display_width(&line.to_string()) == width)
             );
         }
     }
@@ -2317,7 +2348,7 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
-        let rule = "─".repeat(80 - crate::tui::surface::CARD_PAD_RIGHT as usize);
+        let rule = "─".repeat(80);
         assert_eq!(
             nonempty_lines.iter().filter(|line| **line == rule).count(),
             2,
@@ -2898,7 +2929,7 @@ mod tests {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::CompactionStarted);
 
-        let rule = "─".repeat(80 - crate::tui::surface::CARD_PAD_RIGHT as usize);
+        let rule = "─".repeat(80);
         let started = transcript_lines(&state, Theme::dark(), 80)
             .into_iter()
             .map(|line| line.to_string())
