@@ -1523,12 +1523,12 @@ fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Se
 
         for line in find.lines() {
             diff.push('-');
-            diff.push_str(line);
+            diff.push_str(&terminal_safe_text(line));
             diff.push('\n');
         }
         for line in replace.lines() {
             diff.push('+');
-            diff.push_str(line);
+            diff.push_str(&terminal_safe_text(line));
             diff.push('\n');
         }
     }
@@ -1539,7 +1539,7 @@ fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Se
         let paths = edits
             .iter()
             .filter_map(|edit| edit.get("path").and_then(serde_json::Value::as_str))
-            .map(ToOwned::to_owned)
+            .map(terminal_safe_text)
             .collect::<Vec<_>>();
         render_diff_block(
             diff_card_header_title("Patch", &paths),
@@ -1895,6 +1895,13 @@ fn render_tail_limited_text_lines(
         ));
     }
     lines
+}
+
+fn terminal_safe_text(text: &str) -> String {
+    ansi_sgr_segments(text, Style::default())
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
 }
 
 /// Split shell/tool output into styled segments for TUI cells.
@@ -3416,6 +3423,51 @@ mod tests {
             lines
                 .iter()
                 .all(|line| display_width(&line.to_string()) <= 40),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn patch_diff_sanitizes_terminal_controls_in_side_by_side_layout() {
+        let tool = ToolView {
+            call_id: "call-safe-edit".into(),
+            name: "edit__apply_patch".into(),
+            summary: "patched".into(),
+            arguments: Some(
+                json!({
+                    "edits": [{
+                        "path": "src/\u{1b}[2Kmain.rs",
+                        "find": "\told value\u{1b}[2K",
+                        "replace": "\tnew value\u{1b}]8;;https://example.test\u{07}",
+                        "replace_all": false
+                    }]
+                })
+                .to_string(),
+            ),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let width = 100;
+        let lines = render_tool_card_lines(&tool, Theme::dark(), width);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains(DIFF_SIDE_BY_SIDE_SEPARATOR), "{rendered}");
+        assert!(rendered.contains("old value"), "{rendered}");
+        assert!(rendered.contains("new value"), "{rendered}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.to_string().chars().any(char::is_control)),
+            "control leaked into patch card: {rendered:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= width),
             "{rendered}"
         );
     }
