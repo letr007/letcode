@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, ThemeCommand, ThoughtsDisplayMode,
@@ -72,8 +73,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
-const ASSISTANT_DELTA_BUFFER_MAX_BYTES: usize = 1024;
-const ASSISTANT_DELTA_BUFFER_MAX_WAIT: Duration = Duration::from_millis(50);
+const ASSISTANT_TYPEWRITER_INITIAL_RATE: f64 = 60.0;
+const ASSISTANT_TYPEWRITER_MIN_RATE: f64 = 24.0;
+const ASSISTANT_TYPEWRITER_MAX_RATE: f64 = 360.0;
+const ASSISTANT_TYPEWRITER_RATE_SMOOTHING: f64 = 0.2;
+const ASSISTANT_TYPEWRITER_CATCHUP_WINDOW: Duration = Duration::from_millis(132);
 const TERMINAL_TITLE_APP_NAME: &str = "LetCode";
 const TERMINAL_TITLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 3;
@@ -241,11 +245,129 @@ struct AssistantDeltaStream {
 }
 
 #[derive(Debug)]
-struct AssistantDeltaBuffer {
+struct AssistantTypewriter {
     stream: AssistantDeltaStream,
     agent_name: Option<String>,
-    delta: String,
-    started_at: Instant,
+    pending: String,
+    display_budget: f64,
+    graphemes_per_second: f64,
+    last_delta_at: Option<Instant>,
+    last_frame_at: Instant,
+}
+
+impl AssistantTypewriter {
+    fn new(stream: AssistantDeltaStream, agent_name: Option<String>, now: Instant) -> Self {
+        Self {
+            stream,
+            agent_name,
+            pending: String::new(),
+            display_budget: 0.0,
+            graphemes_per_second: ASSISTANT_TYPEWRITER_INITIAL_RATE,
+            last_delta_at: None,
+            last_frame_at: now,
+        }
+    }
+
+    fn push(&mut self, delta: &str, now: Instant) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.pending.is_empty() {
+            self.display_budget = 0.0;
+            self.last_frame_at = now;
+        }
+        self.pending.push_str(delta);
+        let grapheme_count = UnicodeSegmentation::graphemes(delta, true).count();
+        if grapheme_count == 0 {
+            return;
+        }
+        if let Some(last_delta_at) = self.last_delta_at {
+            let elapsed = now.saturating_duration_since(last_delta_at);
+            if !elapsed.is_zero() {
+                let sample_rate = grapheme_count as f64 / elapsed.as_secs_f64();
+                let sample_rate =
+                    sample_rate.clamp(ASSISTANT_TYPEWRITER_MIN_RATE, ASSISTANT_TYPEWRITER_MAX_RATE);
+                self.graphemes_per_second = self.graphemes_per_second
+                    * (1.0 - ASSISTANT_TYPEWRITER_RATE_SMOOTHING)
+                    + sample_rate * ASSISTANT_TYPEWRITER_RATE_SMOOTHING;
+            }
+        }
+        self.last_delta_at = Some(now);
+    }
+
+    fn take_frame(&mut self, now: Instant, catch_up: bool) -> String {
+        let elapsed = now.saturating_duration_since(self.last_frame_at);
+        self.last_frame_at = now;
+
+        let pending_graphemes = self.pending_graphemes();
+        if pending_graphemes == 0 {
+            self.display_budget = 0.0;
+            return String::new();
+        }
+        self.display_budget += self.graphemes_per_second * elapsed.as_secs_f64();
+        if catch_up {
+            let catchup_rate =
+                pending_graphemes as f64 / ASSISTANT_TYPEWRITER_CATCHUP_WINDOW.as_secs_f64();
+            let frame_rate = self
+                .graphemes_per_second
+                .max(catchup_rate)
+                .min(ASSISTANT_TYPEWRITER_MAX_RATE);
+            self.display_budget += (frame_rate - self.graphemes_per_second) * elapsed.as_secs_f64();
+        }
+
+        let count = self.display_budget.floor() as usize;
+        if count == 0 {
+            return String::new();
+        }
+        let count = count.min(pending_graphemes);
+        let released = take_grapheme_prefix(&mut self.pending, count);
+        self.display_budget -=
+            UnicodeSegmentation::graphemes(released.as_str(), true).count() as f64;
+        released
+    }
+
+    fn pending_graphemes(&self) -> usize {
+        UnicodeSegmentation::graphemes(self.pending.as_str(), true).count()
+    }
+}
+
+fn take_grapheme_prefix(text: &mut String, count: usize) -> String {
+    if count == 0 || text.is_empty() {
+        return String::new();
+    }
+    let mut split_at = UnicodeSegmentation::grapheme_indices(text.as_str(), true)
+        .nth(count)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    while split_at < text.len() {
+        let mut remainder = text[split_at..].chars();
+        let Some(character) = remainder.next() else {
+            break;
+        };
+        let continuation = is_grapheme_continuation(character)
+            || character == '\u{200d}' && remainder.next().is_some();
+        if !continuation {
+            break;
+        }
+        split_at += character.len_utf8();
+        if character == '\u{200d}'
+            && let Some(joined) = text[split_at..].chars().next()
+        {
+            split_at += joined.len_utf8();
+        }
+    }
+    let tail = text.split_off(split_at);
+    std::mem::replace(text, tail)
+}
+
+fn is_grapheme_continuation(character: char) -> bool {
+    matches!(character, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+        || ('\u{0300}'..='\u{036f}').contains(&character)
+        || ('\u{1ab0}'..='\u{1aff}').contains(&character)
+        || ('\u{1dc0}'..='\u{1dff}').contains(&character)
+        || ('\u{20d0}'..='\u{20ff}').contains(&character)
+        || ('\u{fe20}'..='\u{fe2f}').contains(&character)
+        || ('\u{1f3fb}'..='\u{1f3ff}').contains(&character)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,7 +559,8 @@ pub struct TuiRuntime {
     next_git_branch_refresh: Instant,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
-    assistant_delta_buffer: Option<AssistantDeltaBuffer>,
+    assistant_typewriter: Option<AssistantTypewriter>,
+    deferred_session_events: VecDeque<SessionTransportEvent>,
     session_title: Option<String>,
     spinner_frame: usize,
     theme_preview_original: Option<(String, Option<Theme>)>,
@@ -476,7 +599,8 @@ impl TuiRuntime {
             next_git_branch_refresh: Instant::now(),
             sessions_dir,
             preferences_dir,
-            assistant_delta_buffer: None,
+            assistant_typewriter: None,
+            deferred_session_events: VecDeque::new(),
             session_title: None,
             spinner_frame: 0,
             theme_preview_original: None,
@@ -769,7 +893,7 @@ impl TuiRuntime {
         // unbounded stream of model deltas must not prevent a confirmed Esc
         // from reaching the session engine.
         const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
-        self.flush_assistant_delta_buffer_if_due();
+        self.advance_assistant_typewriter(Instant::now());
         self.poll_session_list();
         self.poll_git_branch();
         for _ in 0..MAX_SESSION_EVENTS_PER_FRAME {
@@ -845,7 +969,7 @@ impl TuiRuntime {
     }
 
     fn handle_session_event_stream_closed(&mut self) {
-        self.flush_assistant_delta_buffer();
+        self.flush_assistant_typewriter();
         if self.has_active_or_pending_session_turn() || self.session_resume_pending {
             self.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
                 "TUI session event stream closed unexpectedly",
@@ -855,74 +979,93 @@ impl TuiRuntime {
     }
 
     fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
-        if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
-            self.buffer_assistant_delta(stream, agent_name, delta);
-        } else {
-            self.flush_assistant_delta_buffer();
-            self.apply_session_transport_event(event);
-        }
-    }
-
-    fn buffer_assistant_delta(
-        &mut self,
-        stream: AssistantDeltaStream,
-        agent_name: Option<String>,
-        delta: String,
-    ) {
-        if self
-            .assistant_delta_buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.stream != stream)
-        {
-            self.flush_assistant_delta_buffer();
-        }
-
-        let buffer = self
-            .assistant_delta_buffer
-            .get_or_insert_with(|| AssistantDeltaBuffer {
-                stream,
-                agent_name,
-                delta: String::new(),
-                started_at: Instant::now(),
-            });
-        buffer.delta.push_str(&delta);
-
-        if let Some(last_newline) = buffer.delta.rfind('\n') {
-            let tail = buffer.delta.split_off(last_newline + 1);
-            let committed = std::mem::replace(&mut buffer.delta, tail);
-            let event = assistant_delta_event(&buffer.stream, &buffer.agent_name, committed);
-            buffer.started_at = Instant::now();
-            self.apply_session_transport_event(event);
-        }
-
-        if self
-            .assistant_delta_buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.delta.len() >= ASSISTANT_DELTA_BUFFER_MAX_BYTES)
-        {
-            self.flush_assistant_delta_buffer();
-        }
-    }
-
-    fn flush_assistant_delta_buffer_if_due(&mut self) {
-        if self.assistant_delta_buffer.as_ref().is_some_and(|buffer| {
-            !buffer.delta.is_empty()
-                && buffer.started_at.elapsed() >= ASSISTANT_DELTA_BUFFER_MAX_WAIT
-        }) {
-            self.flush_assistant_delta_buffer();
-        }
-    }
-
-    fn flush_assistant_delta_buffer(&mut self) {
-        let Some(buffer) = self.assistant_delta_buffer.take() else {
+        if !self.deferred_session_events.is_empty() {
+            self.deferred_session_events.push_back(event);
             return;
-        };
-        if !buffer.delta.is_empty() {
+        }
+
+        if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
+            if self
+                .assistant_typewriter
+                .as_ref()
+                .is_some_and(|typewriter| typewriter.stream != stream)
+            {
+                self.flush_assistant_typewriter();
+            }
+            let now = Instant::now();
+            let typewriter = self
+                .assistant_typewriter
+                .get_or_insert_with(|| AssistantTypewriter::new(stream, agent_name, now));
+            typewriter.push(&delta, now);
+            return;
+        }
+
+        if self.assistant_typewriter.is_some() || !self.deferred_session_events.is_empty() {
+            self.deferred_session_events.push_back(event);
+        } else {
+            self.apply_session_transport_event(event);
+        }
+    }
+
+    #[cfg(test)]
+    fn advance_assistant_typewriter_by(&mut self, elapsed: Duration) {
+        let now = self
+            .assistant_typewriter
+            .as_ref()
+            .map(|typewriter| typewriter.last_frame_at + elapsed)
+            .unwrap_or_else(Instant::now);
+        self.advance_assistant_typewriter(now);
+    }
+
+    fn advance_assistant_typewriter(&mut self, now: Instant) {
+        let catch_up = !self.deferred_session_events.is_empty();
+        let event = self.assistant_typewriter.as_mut().and_then(|typewriter| {
+            let delta = typewriter.take_frame(now, catch_up);
+            (!delta.is_empty())
+                .then(|| assistant_delta_event(&typewriter.stream, &typewriter.agent_name, delta))
+        });
+        if let Some(event) = event {
+            self.apply_session_transport_event(event);
+        }
+        if catch_up
+            && self
+                .assistant_typewriter
+                .as_ref()
+                .is_some_and(|typewriter| typewriter.pending.is_empty())
+        {
+            self.assistant_typewriter = None;
+            self.apply_deferred_session_events();
+        }
+    }
+
+    fn apply_deferred_session_events(&mut self) {
+        while self.assistant_typewriter.is_none() {
+            let Some(event) = self.deferred_session_events.pop_front() else {
+                break;
+            };
+            if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
+                let now = Instant::now();
+                let mut typewriter = AssistantTypewriter::new(stream, agent_name, now);
+                typewriter.push(&delta, now);
+                self.assistant_typewriter = Some(typewriter);
+                break;
+            }
+            self.apply_session_transport_event(event);
+        }
+    }
+
+    fn flush_assistant_typewriter(&mut self) {
+        if let Some(typewriter) = self.assistant_typewriter.take()
+            && !typewriter.pending.is_empty()
+        {
             self.apply_session_transport_event(assistant_delta_event(
-                &buffer.stream,
-                &buffer.agent_name,
-                buffer.delta,
+                &typewriter.stream,
+                &typewriter.agent_name,
+                typewriter.pending,
             ));
+        }
+        while let Some(event) = self.deferred_session_events.pop_front() {
+            self.apply_session_transport_event(event);
         }
     }
 

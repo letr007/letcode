@@ -6200,6 +6200,225 @@ fn repeated_child_view_projection_does_not_reset_live_child_state() {
 }
 
 #[test]
+fn assistant_typewriter_reveals_text_across_frames() {
+    let mut runtime = runtime();
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("abcdefghijklmnopqrst"),
+    ));
+
+    assert!(runtime.state().timeline.items().is_empty());
+    runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
+    let first = match runtime.state().timeline.items().last() {
+        Some(TimelineItem::Assistant(message)) => message.text.clone(),
+        other => panic!("expected assistant message, got {other:?}"),
+    };
+    assert!(!first.is_empty());
+    assert!(first.len() < 20, "first frame revealed {first:?}");
+
+    runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
+    let second = match runtime.state().timeline.items().last() {
+        Some(TimelineItem::Assistant(message)) => message.text.clone(),
+        other => panic!("expected assistant message, got {other:?}"),
+    };
+    assert!(second.len() > first.len());
+    assert!(second.len() < 20, "second frame revealed {second:?}");
+}
+
+#[test]
+fn assistant_typewriter_preserves_grapheme_clusters_split_across_deltas() {
+    let now = Instant::now();
+    let stream = AssistantDeltaStream {
+        child_session_id: None,
+        parent_tool_call_id: None,
+        message_id: None,
+    };
+    let mut typewriter = AssistantTypewriter::new(stream, None, now);
+    typewriter.push("e", now);
+    typewriter.push("\u{301}x", now + Duration::from_millis(5));
+
+    assert_eq!(
+        typewriter.take_frame(now + Duration::from_millis(10), false),
+        "e\u{301}"
+    );
+    assert_eq!(typewriter.pending, "x");
+}
+
+#[test]
+fn assistant_typewriter_preserves_zwj_sequence_split_across_deltas() {
+    let now = Instant::now();
+    let stream = AssistantDeltaStream {
+        child_session_id: None,
+        parent_tool_call_id: None,
+        message_id: None,
+    };
+    let mut typewriter = AssistantTypewriter::new(stream, None, now);
+    typewriter.push("👩", now);
+    typewriter.push("‍💻x", now + Duration::from_millis(5));
+
+    assert_eq!(
+        typewriter.take_frame(now + Duration::from_millis(10), false),
+        "👩‍💻"
+    );
+    assert_eq!(typewriter.pending, "x");
+}
+
+#[test]
+fn assistant_typewriter_preserves_grapheme_clusters() {
+    let mut runtime = runtime();
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("👨‍👩‍👧‍👦e\u{301}x"),
+    ));
+
+    runtime.advance_assistant_typewriter_by(Duration::from_millis(17));
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "👨‍👩‍👧‍👦"
+    ));
+
+    runtime.advance_assistant_typewriter_by(Duration::from_millis(17));
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "👨‍👩‍👧‍👦e\u{301}"
+    ));
+}
+
+#[test]
+fn assistant_typewriter_does_not_bank_budget_between_deltas() {
+    let now = Instant::now();
+    let stream = AssistantDeltaStream {
+        child_session_id: None,
+        parent_tool_call_id: None,
+        message_id: None,
+    };
+    let mut typewriter = AssistantTypewriter::new(stream, None, now);
+    typewriter.push("ab", now);
+    assert_eq!(
+        typewriter.take_frame(now + Duration::from_millis(100), false),
+        "ab"
+    );
+    assert!(typewriter.pending.is_empty());
+
+    assert_eq!(
+        typewriter.take_frame(now + Duration::from_millis(600), false),
+        ""
+    );
+    typewriter.push("cd", now + Duration::from_millis(600));
+    assert_eq!(
+        typewriter.take_frame(now + Duration::from_millis(610), false),
+        ""
+    );
+    assert_eq!(typewriter.pending, "cd");
+}
+
+#[test]
+fn assistant_typewriter_keeps_live_stream_state_between_deltas() {
+    let mut runtime = runtime();
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("ab"),
+    ));
+    runtime.advance_assistant_typewriter_by(Duration::from_millis(100));
+
+    assert!(runtime.assistant_typewriter.is_some());
+    runtime.advance_assistant_typewriter_by(Duration::from_millis(500));
+    let before = match runtime.state().timeline.items().last() {
+        Some(TimelineItem::Assistant(message)) => message.text.clone(),
+        other => panic!("expected assistant message, got {other:?}"),
+    };
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("cd"),
+    ));
+    runtime.advance_assistant_typewriter_by(Duration::from_millis(10));
+
+    let after = match runtime.state().timeline.items().last() {
+        Some(TimelineItem::Assistant(message)) => message.text.as_str(),
+        other => panic!("expected assistant message, got {other:?}"),
+    };
+    let pending = runtime
+        .assistant_typewriter
+        .as_ref()
+        .map(|typewriter| typewriter.pending.as_str())
+        .expect("typewriter remains active");
+    assert_eq!(format!("{after}{pending}"), "abcd");
+    assert!(
+        after.len() <= before.len() + 1,
+        "released {after:?} after {before:?}"
+    );
+}
+
+#[test]
+fn assistant_done_waits_for_typewriter_to_drain() {
+    let mut runtime = runtime();
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("smooth output"),
+    ));
+    runtime
+        .consume_session_transport_event(SessionTransportEvent::AssistantDone { message_id: None });
+
+    assert!(runtime.state().timeline.items().is_empty());
+    assert_eq!(runtime.deferred_session_events.len(), 1);
+
+    for _ in 0..8 {
+        runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
+    }
+
+    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.deferred_session_events.is_empty());
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::Assistant(message))
+            if message.text == "smooth output" && !message.streaming
+    ));
+}
+
+#[test]
+fn deferred_events_keep_later_deltas_behind_the_barrier() {
+    let mut runtime = runtime();
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("before"),
+    ));
+    runtime
+        .consume_session_transport_event(SessionTransportEvent::AssistantDone { message_id: None });
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("after"),
+    ));
+
+    runtime.flush_assistant_typewriter();
+
+    assert_eq!(runtime.state().timeline.items().len(), 2);
+    assert!(matches!(
+        &runtime.state().timeline.items()[0],
+        TimelineItem::Assistant(message) if message.text == "before" && !message.streaming
+    ));
+    assert!(matches!(
+        &runtime.state().timeline.items()[1],
+        TimelineItem::Assistant(message) if message.text == "after" && message.streaming
+    ));
+}
+
+#[test]
+fn assistant_typewriter_tracks_delta_arrival_rate() {
+    let now = Instant::now();
+    let mut typewriter = AssistantTypewriter::new(
+        AssistantDeltaStream {
+            child_session_id: None,
+            parent_tool_call_id: None,
+            message_id: None,
+        },
+        None,
+        now,
+    );
+    typewriter.push("a", now);
+    typewriter.push("abcdefghij", now + Duration::from_millis(20));
+
+    assert!(
+        typewriter.graphemes_per_second > ASSISTANT_TYPEWRITER_INITIAL_RATE,
+        "rate = {}",
+        typewriter.graphemes_per_second
+    );
+    assert!(typewriter.graphemes_per_second <= ASSISTANT_TYPEWRITER_MAX_RATE);
+}
+
+#[test]
 fn child_delta_flush_before_parent_view_preserves_child_projection() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut runtime = TuiRuntime::new(
@@ -6241,6 +6460,7 @@ fn child_delta_flush_before_parent_view_preserves_child_projection() {
     })
     .expect("queue parent view");
     runtime.try_drain_session_events();
+    runtime.flush_assistant_typewriter();
 
     tx.send(SessionTransportEvent::ChildSessionViewed {
         parent_session_id: "parent-session".into(),
@@ -6611,6 +6831,7 @@ fn child_view_snapshot_growth_preserves_unpersisted_live_delta() {
     })
     .expect("queue growing child snapshot");
     runtime.try_drain_session_events();
+    runtime.flush_assistant_typewriter();
     render_runtime_transcript(&mut runtime);
 
     assert!(matches!(
