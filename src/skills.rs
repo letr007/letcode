@@ -23,7 +23,19 @@ const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_RESOURCE_BYTES: u64 = MAX_SKILL_MD_BYTES;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const BUILTIN_SKILL_LOCATION: &str = "<built-in>";
-const CUSTOMIZE_LETCODE_SKILL_CONTENT: &str = include_str!("../skills/customize-letcode/SKILL.md");
+const BUILTIN_SKILL_CONTENTS: [(&str, &str); 5] = [
+    (
+        "customize-letcode",
+        include_str!("../skills/customize-letcode/SKILL.md"),
+    ),
+    ("git", include_str!("../skills/git/SKILL.md")),
+    (
+        "verification-planning",
+        include_str!("../skills/verification-planning/SKILL.md"),
+    ),
+    ("worktrees", include_str!("../skills/worktrees/SKILL.md")),
+    ("simplify", include_str!("../skills/simplify/SKILL.md")),
+];
 
 /// Extract persisted successful skill material without consulting the registry.
 /// `None` means this was not a successful `skill` result.
@@ -260,8 +272,8 @@ impl SkillRegistry {
     }
 
     fn load_from_roots(roots: Vec<(PathBuf, String)>) -> Result<Self> {
-        // Built-in first so a same-named disk skill can override it.
-        let mut entries = vec![builtin_customize_letcode_skill()];
+        // Built-ins first so same-named disk skills can override them.
+        let mut entries = builtin_skills();
         for (root, location) in roots {
             entries.extend(discover_skill_entries(&root, &location)?);
         }
@@ -913,20 +925,29 @@ fn list_relative_resource_files(base_dir: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-fn builtin_customize_letcode_skill() -> SkillEntry {
-    let parsed = parse_skill_markdown(CUSTOMIZE_LETCODE_SKILL_CONTENT)
-        .expect("built-in customize-letcode skill must parse");
-    debug_assert_eq!(parsed.name, "customize-letcode");
-    let base_dir = PathBuf::from(format!("{BUILTIN_SKILL_LOCATION}/{}", parsed.name));
-    SkillEntry {
-        name: parsed.name,
-        description: parsed.description,
-        body: parsed.body,
-        content: CUSTOMIZE_LETCODE_SKILL_CONTENT.to_string(),
-        location: BUILTIN_SKILL_LOCATION.to_string(),
-        path: base_dir.join(SKILL_FILE_NAME),
-        base_dir,
-    }
+fn builtin_skills() -> Vec<SkillEntry> {
+    BUILTIN_SKILL_CONTENTS
+        .into_iter()
+        .map(|(expected_name, content)| {
+            let parsed = parse_skill_markdown(content).unwrap_or_else(|error| {
+                panic!("built-in {expected_name} skill must parse: {error}")
+            });
+            assert_eq!(
+                parsed.name, expected_name,
+                "built-in skill name must match its registration"
+            );
+            let base_dir = PathBuf::from(format!("{BUILTIN_SKILL_LOCATION}/{}", parsed.name));
+            SkillEntry {
+                name: parsed.name,
+                description: parsed.description,
+                body: parsed.body,
+                content: content.to_string(),
+                location: BUILTIN_SKILL_LOCATION.to_string(),
+                path: base_dir.join(SKILL_FILE_NAME),
+                base_dir,
+            }
+        })
+        .collect()
 }
 
 fn collect_relative_files(
@@ -1415,10 +1436,41 @@ mod tests {
             load_test_registry(&temp.path().join("config"), temp.path()).expect("registry loads");
         let cards = registry.cards();
 
-        assert!(cards.iter().any(|card| card.name == "customize-letcode"));
+        for name in [
+            "customize-letcode",
+            "git",
+            "verification-planning",
+            "worktrees",
+            "simplify",
+        ] {
+            let card = cards
+                .iter()
+                .find(|card| card.name == name)
+                .unwrap_or_else(|| panic!("missing built-in skill {name}"));
+            assert_eq!(card.location, BUILTIN_SKILL_LOCATION);
+        }
         assert!(cards.iter().any(|card| card.name == "rust-audit"));
         assert!(cards.iter().any(|card| card.location == ".letcode/skills"));
-        assert_eq!(cards.len(), 3);
+        assert_eq!(cards.len(), 7);
+    }
+
+    #[test]
+    fn disk_skill_overrides_same_named_builtin() {
+        let temp = TempDir::new();
+        write_skill(
+            temp.path(),
+            "config/skills",
+            "git",
+            "---\nname: git\ndescription: Local Git workflow\n---\n# Local Git\n",
+        );
+
+        let registry =
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry loads");
+        let git = registry.get("git").expect("git skill");
+
+        assert_eq!(git.location, "letcode config skills");
+        assert_eq!(git.description, "Local Git workflow");
+        assert_eq!(git.body, "# Local Git");
     }
 
     #[test]
