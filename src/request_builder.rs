@@ -50,6 +50,28 @@ use prompt_plan::{PromptPlanBuildInput, build_prompt_plan};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRequestStrategy {
+    OpenAiCompatible,
+    DeepSeekV4,
+}
+
+impl ProviderRequestStrategy {
+    pub(crate) fn from_provider_and_model(provider: Option<&str>, model_id: &str) -> Self {
+        let provider = provider.unwrap_or_default().to_ascii_lowercase();
+        let model = model_id.to_ascii_lowercase();
+        if (provider == "deepseek" && model.contains("v4")) || model.contains("deepseek-v4") {
+            Self::DeepSeekV4
+        } else {
+            Self::OpenAiCompatible
+        }
+    }
+
+    pub(crate) fn is_deepseek_v4(self) -> bool {
+        matches!(self, Self::DeepSeekV4)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelRequestMetadata {
     pub context_window: Option<u64>,
@@ -268,6 +290,7 @@ impl PromptMessage {
 #[derive(Debug, Clone)]
 pub struct RequestBuilderInput<'a> {
     pub protocol: ApiProtocol,
+    pub provider: Option<&'a str>,
     pub model_id: &'a str,
     pub model: ModelRequestMetadata,
     pub prelude: &'a [PromptMessage],
@@ -331,6 +354,7 @@ pub(crate) struct TestRequestBuilderInput<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedPromptRequestInput<'a> {
     pub protocol: ApiProtocol,
+    pub strategy: ProviderRequestStrategy,
     pub model_id: &'a str,
     pub model: ModelRequestMetadata,
     pub tools: &'a [ToolSpec],
@@ -414,6 +438,7 @@ pub enum BuiltRequest {
 
 #[derive(Debug, Clone)]
 pub struct BuildResult {
+    pub strategy: ProviderRequestStrategy,
     pub request: BuiltRequest,
     pub budget: BudgetReport,
     #[allow(dead_code)]
@@ -547,13 +572,16 @@ fn provider_request_without_units(build: &BuildResult) -> (Value, Value) {
 /// message for every segment.
 pub(crate) fn provider_unit_count_for_segment_prefix(
     plan: &PromptPlan,
+    strategy: ProviderRequestStrategy,
     segment_count: usize,
 ) -> usize {
     let segments = &plan.segments[..segment_count.min(plan.segments.len())];
     match plan.protocol {
         ApiProtocol::Responses => segments
             .iter()
-            .map(|segment| provider_serialization::prompt_segment_to_response_inputs(segment).len())
+            .map(|segment| {
+                provider_serialization::prompt_segment_to_response_inputs(segment, strategy).len()
+            })
             .sum(),
         ApiProtocol::Completions => segments.len(),
     }
@@ -562,7 +590,8 @@ pub(crate) fn provider_unit_count_for_segment_prefix(
 /// Identity of an exclusive plan prefix in its final provider-shaped form.
 pub(crate) fn provider_unit_prefix_digest(build: &BuildResult, segment_count: usize) -> String {
     let (_, items) = provider_request_without_units(build);
-    let unit_count = provider_unit_count_for_segment_prefix(&build.prompt_plan, segment_count);
+    let unit_count =
+        provider_unit_count_for_segment_prefix(&build.prompt_plan, build.strategy, segment_count);
     let items = items
         .as_array()
         .expect("provider units serialize as an array");
@@ -588,7 +617,11 @@ fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUni
             .flat_map(|segment| {
                 std::iter::repeat_n(
                     prompt_segment_category(segment),
-                    provider_serialization::prompt_segment_to_response_inputs(segment).len(),
+                    provider_serialization::prompt_segment_to_response_inputs(
+                        segment,
+                        build.strategy,
+                    )
+                    .len(),
                 )
             })
             .collect(),
@@ -724,6 +757,7 @@ fn build_request_with_frozen_and_policy(
     let prompt_plan = prompt_plan::canonicalize_prompt_plan(prompt_plan);
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         protocol: input.protocol,
+        strategy: ProviderRequestStrategy::from_provider_and_model(input.provider, input.model_id),
         model_id: input.model_id,
         model: input.model,
         tools: input.tools,
@@ -772,6 +806,7 @@ pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<B
     }
     build_request(RequestBuilderInput {
         protocol: input.protocol,
+        provider: None,
         model_id: input.model_id,
         model: input.model,
         prelude: &prelude,
@@ -816,6 +851,7 @@ pub(crate) fn build_request_from_selected_prompt(
     let request = match input.protocol {
         ApiProtocol::Responses => {
             let request = build_responses_request(
+                input.strategy,
                 input.model_id,
                 input.model.clone(),
                 &input.prompt_plan,
@@ -853,6 +889,7 @@ pub(crate) fn build_request_from_selected_prompt(
         }
         ApiProtocol::Completions => {
             let request = build_completions_request(
+                input.strategy,
                 input.model_id,
                 input.model.clone(),
                 &input.prompt_plan,
@@ -867,11 +904,12 @@ pub(crate) fn build_request_from_selected_prompt(
                     }
                 )
             });
-            if input
-                .model
-                .reasoning_effort
-                .as_ref()
-                .is_some_and(ModelReasoningEffort::requires_compatible_request)
+            if input.strategy.is_deepseek_v4()
+                || input
+                    .model
+                    .reasoning_effort
+                    .as_ref()
+                    .is_some_and(ModelReasoningEffort::requires_compatible_request)
                 || needs_reasoning_content
             {
                 let mut request = serde_json::to_value(request)
@@ -884,10 +922,18 @@ pub(crate) fn build_request_from_selected_prompt(
                 {
                     request["reasoning_effort"] = Value::String(effort.as_str().into());
                 }
-                provider_serialization::apply_chat_reasoning_content(
-                    &mut request,
-                    &input.prompt_plan,
-                );
+                if input.strategy.is_deepseek_v4() {
+                    provider_serialization::apply_deepseek_chat_compat(
+                        &mut request,
+                        &input.model,
+                        &input.prompt_plan,
+                    );
+                } else {
+                    provider_serialization::apply_chat_reasoning_content(
+                        &mut request,
+                        &input.prompt_plan,
+                    );
+                }
                 BuiltRequest::CompletionsCompatible(request)
             } else {
                 BuiltRequest::Completions(request)
@@ -896,6 +942,7 @@ pub(crate) fn build_request_from_selected_prompt(
     };
 
     let cache = prompt_cache_report(
+        input.strategy,
         input.protocol,
         input.model_id,
         &input.model.prompt_cache,
@@ -905,6 +952,7 @@ pub(crate) fn build_request_from_selected_prompt(
         input.model.parallel_tool_calls,
     );
     Ok(BuildResult {
+        strategy: input.strategy,
         request,
         budget: input.budget,
         prompt_plan: input.prompt_plan,
@@ -925,6 +973,7 @@ pub(crate) fn rebuild_request_from_plan(
     let model_id = prompt_plan.model_id.clone();
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         protocol: prompt_plan.protocol,
+        strategy: previous.strategy,
         model_id: &model_id,
         model,
         tools,
@@ -1036,12 +1085,13 @@ fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
 }
 
 fn build_responses_request(
+    strategy: ProviderRequestStrategy,
     model_id: &str,
     model: ModelRequestMetadata,
     prompt_plan: &PromptPlan,
     tools: &[ToolSpec],
 ) -> CreateResponse {
-    provider_serialization::build_responses_request(model_id, model, prompt_plan, tools)
+    provider_serialization::build_responses_request(strategy, model_id, model, prompt_plan, tools)
 }
 
 struct CacheRequestFields {
@@ -1050,6 +1100,7 @@ struct CacheRequestFields {
 }
 
 fn cache_request_fields(
+    strategy: ProviderRequestStrategy,
     protocol: ApiProtocol,
     model_id: &str,
     config: &PromptCacheConfig,
@@ -1059,6 +1110,7 @@ fn cache_request_fields(
     parallel_tool_calls: bool,
 ) -> CacheRequestFields {
     prompt_cache::cache_request_fields(
+        strategy,
         protocol,
         model_id,
         config,
@@ -1070,6 +1122,7 @@ fn cache_request_fields(
 }
 
 fn prompt_cache_report(
+    strategy: ProviderRequestStrategy,
     protocol: ApiProtocol,
     model_id: &str,
     config: &PromptCacheConfig,
@@ -1079,6 +1132,7 @@ fn prompt_cache_report(
     parallel_tool_calls: bool,
 ) -> PromptCacheReport {
     prompt_cache::prompt_cache_report(
+        strategy,
         protocol,
         model_id,
         config,
@@ -1093,6 +1147,7 @@ fn prompt_cache_report(
 /// protocol conversion helpers used to construct the final request.
 #[cfg(test)]
 pub(crate) fn canonical_cache_input(
+    strategy: ProviderRequestStrategy,
     namespace: &str,
     protocol: ApiProtocol,
     model_id: &str,
@@ -1102,6 +1157,7 @@ pub(crate) fn canonical_cache_input(
     parallel_tool_calls: bool,
 ) -> Value {
     prompt_cache::canonical_cache_input(
+        strategy,
         namespace,
         protocol,
         model_id,
@@ -1201,12 +1257,13 @@ fn validate_prompt_plan_protocol(protocol: ApiProtocol, prompt_plan: &PromptPlan
 }
 
 fn build_completions_request(
+    strategy: ProviderRequestStrategy,
     model_id: &str,
     model: ModelRequestMetadata,
     prompt_plan: &PromptPlan,
     tools: &[ToolSpec],
 ) -> Result<CreateChatCompletionRequest> {
-    provider_serialization::build_completions_request(model_id, model, prompt_plan, tools)
+    provider_serialization::build_completions_request(strategy, model_id, model, prompt_plan, tools)
 }
 
 pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {

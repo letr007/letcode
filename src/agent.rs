@@ -901,6 +901,10 @@ impl<C: Config> Agent<C> {
         let built = build_request_with_policy(
             RequestBuilderInput {
                 protocol,
+                provider: self
+                    .primary_route
+                    .as_ref()
+                    .map(|route| route.provider.as_str()),
                 model_id: &self.model,
                 model: model.clone(),
                 prelude: turn_prelude,
@@ -1385,6 +1389,10 @@ impl<C: Config> Agent<C> {
         let build = build_request_with_policy(
             RequestBuilderInput {
                 protocol: self.protocol_for_model(model_id),
+                provider: self
+                    .primary_route
+                    .as_ref()
+                    .map(|route| route.provider.as_str()),
                 model_id,
                 model,
                 prelude: &[],
@@ -2712,6 +2720,7 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn append_assistant_tool_calls(
         &mut self,
         turn_text: &str,
@@ -2728,9 +2737,7 @@ impl<C: Config> Agent<C> {
     ) -> Result<()> {
         self.append_history_item(HistoryItem::AssistantToolCalls {
             text: (!turn_text.is_empty()).then(|| turn_text.to_string()),
-            reasoning_content: reasoning_content
-                .filter(|reasoning_content| !reasoning_content.is_empty())
-                .map(ToString::to_string),
+            reasoning_content: reasoning_content.map(ToString::to_string),
             calls: tool_calls.to_vec(),
         })
         .map_err(|error| anyhow!("assistant tool calls should remain protocol-compatible: {error}"))

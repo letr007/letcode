@@ -16,9 +16,10 @@ use async_openai::types::responses::{
     FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, InputContent,
     InputImageContent, InputItem, InputMessage, InputRole, InputTextContent, Item, MessageItem,
     MessageType, OutputStatus, PromptCacheRetention as OpenAiPromptCacheRetention, Reasoning,
-    ReasoningEffort as OpenAiReasoningEffort, ReasoningSummary as ResponseReasoningSummary,
-    ResponseTextParam, Role, ServiceTier as ResponseServiceTier, TextResponseFormatConfiguration,
-    Tool, Verbosity as ResponseVerbosity,
+    ReasoningEffort as OpenAiReasoningEffort, ReasoningItem, ReasoningItemContent,
+    ReasoningSummary as ResponseReasoningSummary, ReasoningTextContent, ResponseTextParam, Role,
+    ServiceTier as ResponseServiceTier, TextResponseFormatConfiguration, Tool,
+    Verbosity as ResponseVerbosity,
 };
 
 use crate::config::{ApiProtocol, PromptCacheRetention};
@@ -27,10 +28,11 @@ use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePa
 use super::prompt_plan::{PromptPlan, PromptSegment, PromptSegmentContent, PromptSegmentRole};
 use super::{
     ModelReasoningEffort, ModelReasoningSummary, ModelRequestMetadata, ModelTextVerbosity,
-    PromptMessage, PromptRole, ToolSpec, cache_request_fields,
+    PromptMessage, PromptRole, ProviderRequestStrategy, ToolSpec, cache_request_fields,
 };
 
 pub(super) fn build_responses_request(
+    strategy: ProviderRequestStrategy,
     model_id: &str,
     model: ModelRequestMetadata,
     prompt_plan: &PromptPlan,
@@ -39,9 +41,10 @@ pub(super) fn build_responses_request(
     let input = prompt_plan
         .segments
         .iter()
-        .flat_map(prompt_segment_to_response_inputs)
+        .flat_map(|segment| prompt_segment_to_response_inputs(segment, strategy))
         .collect::<Vec<_>>();
     let cache = cache_request_fields(
+        strategy,
         ApiProtocol::Responses,
         model_id,
         &model.prompt_cache,
@@ -102,7 +105,10 @@ fn response_text(model: ModelRequestMetadata) -> Option<ResponseTextParam> {
     })
 }
 
-pub(super) fn prompt_segment_to_response_inputs(segment: &PromptSegment) -> Vec<InputItem> {
+pub(super) fn prompt_segment_to_response_inputs(
+    segment: &PromptSegment,
+    strategy: ProviderRequestStrategy,
+) -> Vec<InputItem> {
     match (&segment.role, &segment.content) {
         (PromptSegmentRole::System, PromptSegmentContent::Text { text }) => {
             vec![response_text_message(Role::System, text.clone())]
@@ -121,29 +127,39 @@ pub(super) fn prompt_segment_to_response_inputs(segment: &PromptSegment) -> Vec<
         }
         (
             PromptSegmentRole::Assistant,
-            PromptSegmentContent::AssistantToolCalls { text, calls, .. },
+            PromptSegmentContent::AssistantToolCalls {
+                text,
+                reasoning_content,
+                calls,
+            },
         ) => {
-            let mut input = text
-                .clone()
-                .filter(|text| !text.is_empty())
-                .map(|text| vec![response_text_message(Role::Assistant, text)])
-                .unwrap_or_default();
-            input.extend(
-                calls
-                    .iter()
-                    .cloned()
-                    .map(|call| {
-                        InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                            arguments: call.arguments_json,
-                            call_id: call.call_id,
-                            namespace: None,
-                            name: call.name,
-                            id: None,
-                            status: None::<OutputStatus>,
-                        }))
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let mut input = Vec::new();
+            if strategy.is_deepseek_v4() {
+                input.push(InputItem::Item(Item::Reasoning(ReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: Some(vec![ReasoningItemContent::ReasoningText(
+                        ReasoningTextContent {
+                            text: reasoning_content.clone().unwrap_or_default(),
+                        },
+                    )]),
+                    encrypted_content: None,
+                    status: None,
+                })));
+            }
+            if let Some(text) = text.clone().filter(|text| !text.is_empty()) {
+                input.push(response_text_message(Role::Assistant, text));
+            }
+            input.extend(calls.iter().cloned().map(|call| {
+                InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                    arguments: call.arguments_json,
+                    call_id: call.call_id,
+                    namespace: None,
+                    name: call.name,
+                    id: None,
+                    status: None::<OutputStatus>,
+                }))
+            }));
             input
         }
         (
@@ -304,16 +320,91 @@ pub(super) fn apply_chat_reasoning_content(
         .expect("chat completion request has messages");
     for (message, segment) in messages.iter_mut().zip(&prompt_plan.segments) {
         if let PromptSegmentContent::AssistantToolCalls {
-            reasoning_content: Some(reasoning_content),
-            ..
+            reasoning_content, ..
         } = &segment.content
         {
-            message["reasoning_content"] = serde_json::Value::String(reasoning_content.clone());
+            message["reasoning_content"] =
+                serde_json::Value::String(reasoning_content.clone().unwrap_or_default());
         }
     }
 }
 
+fn deepseek_reasoning_effort(value: &ModelReasoningEffort) -> Option<String> {
+    match value {
+        ModelReasoningEffort::None => None,
+        ModelReasoningEffort::Minimal | ModelReasoningEffort::Low => Some("low".into()),
+        ModelReasoningEffort::Medium | ModelReasoningEffort::High | ModelReasoningEffort::Xhigh => {
+            Some("high".into())
+        }
+        ModelReasoningEffort::Max => Some("max".into()),
+        ModelReasoningEffort::Custom(value) => Some(value.clone()),
+    }
+}
+
+fn normalize_deepseek_chat_message_roles(request: &mut serde_json::Value) {
+    if let Some(messages) = request["messages"].as_array_mut() {
+        for message in messages {
+            if message["role"] == "developer" {
+                message["role"] = serde_json::Value::String("system".into());
+            }
+        }
+    }
+}
+
+pub(super) fn apply_deepseek_chat_compat(
+    request: &mut serde_json::Value,
+    model: &ModelRequestMetadata,
+    prompt_plan: &PromptPlan,
+) {
+    normalize_deepseek_chat_message_roles(request);
+
+    if let Some(max_tokens) = request.get("max_completion_tokens").cloned() {
+        request["max_tokens"] = max_tokens;
+        request
+            .as_object_mut()
+            .expect("chat request is an object")
+            .remove("max_completion_tokens");
+    }
+
+    request
+        .as_object_mut()
+        .expect("chat request is an object")
+        .remove("verbosity");
+    request
+        .as_object_mut()
+        .expect("chat request is an object")
+        .remove("prompt_cache_key");
+    request
+        .as_object_mut()
+        .expect("chat request is an object")
+        .remove("service_tier");
+
+    if model.supports_reasoning {
+        match model.reasoning_effort.as_ref() {
+            Some(ModelReasoningEffort::None) => {
+                request["thinking"] = serde_json::json!({"type": "disabled"});
+                request
+                    .as_object_mut()
+                    .expect("chat request is an object")
+                    .remove("reasoning_effort");
+            }
+            Some(effort) => {
+                request["thinking"] = serde_json::json!({"type": "enabled"});
+                request["reasoning_effort"] = serde_json::Value::String(
+                    deepseek_reasoning_effort(effort).unwrap_or_else(|| "high".into()),
+                );
+            }
+            None => {
+                request["thinking"] = serde_json::json!({"type": "enabled"});
+            }
+        }
+    }
+
+    apply_chat_reasoning_content(request, prompt_plan);
+}
+
 pub(super) fn build_completions_request(
+    strategy: ProviderRequestStrategy,
     model_id: &str,
     model: ModelRequestMetadata,
     prompt_plan: &PromptPlan,
@@ -335,6 +426,7 @@ pub(super) fn build_completions_request(
         .map(prompt_segment_to_chat_message)
         .collect::<Vec<_>>();
     let cache = cache_request_fields(
+        strategy,
         ApiProtocol::Completions,
         model_id,
         &model.prompt_cache,

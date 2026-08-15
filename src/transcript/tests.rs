@@ -1705,6 +1705,7 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
         assert!(
             build_request(RequestBuilderInput {
                 protocol,
+                provider: None,
                 model_id: "gpt-test",
                 model: model.clone(),
                 prelude: &[],
@@ -1750,6 +1751,7 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
     for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
         build_request(RequestBuilderInput {
             protocol,
+            provider: None,
             model_id: "gpt-test",
             model: model.clone(),
             prelude: &[],

@@ -6,6 +6,7 @@ use super::prompt_plan::{PromptPlan, PromptSegment};
 use super::{CacheRequestFields, PromptCacheReport, ToolSpec, provider_serialization, sha256_hex};
 
 pub(super) fn cache_request_fields(
+    strategy: super::ProviderRequestStrategy,
     protocol: ApiProtocol,
     model_id: &str,
     config: &PromptCacheConfig,
@@ -25,6 +26,7 @@ pub(super) fn cache_request_fields(
         .as_deref()
         .expect("enabled prompt cache has normalized namespace");
     let key = routing_key(
+        strategy,
         namespace,
         protocol,
         model_id,
@@ -41,6 +43,7 @@ pub(super) fn cache_request_fields(
 }
 
 pub(super) fn prompt_cache_report(
+    strategy: super::ProviderRequestStrategy,
     protocol: ApiProtocol,
     model_id: &str,
     config: &PromptCacheConfig,
@@ -62,6 +65,7 @@ pub(super) fn prompt_cache_report(
         .as_deref()
         .expect("enabled prompt cache has normalized namespace");
     let canonical_input = canonical_cache_input(
+        strategy,
         namespace,
         protocol,
         model_id,
@@ -88,6 +92,7 @@ pub(super) fn prompt_cache_report(
 }
 
 fn routing_key(
+    strategy: super::ProviderRequestStrategy,
     namespace: &str,
     protocol: ApiProtocol,
     model_id: &str,
@@ -96,6 +101,7 @@ fn routing_key(
     parallel_tool_calls: bool,
 ) -> String {
     let canonical_input = canonical_cache_input(
+        strategy,
         namespace,
         protocol,
         model_id,
@@ -108,6 +114,7 @@ fn routing_key(
 }
 
 pub(super) fn canonical_cache_input(
+    strategy: super::ProviderRequestStrategy,
     namespace: &str,
     protocol: ApiProtocol,
     model_id: &str,
@@ -121,7 +128,9 @@ pub(super) fn canonical_cache_input(
             serde_json::to_value(
                 prefix
                     .iter()
-                    .flat_map(provider_serialization::prompt_segment_to_response_inputs)
+                    .flat_map(|segment| {
+                        provider_serialization::prompt_segment_to_response_inputs(segment, strategy)
+                    })
                     .collect::<Vec<_>>(),
             )
             .expect("response input is serializable"),
