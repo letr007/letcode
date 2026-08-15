@@ -511,7 +511,13 @@ where
         };
 
         let mut attempt = 1;
-        let (response, mut turn_text, completed_reasoning_ids, prepared_telemetry) = 'retry_response_stream: loop {
+        let (
+            response,
+            mut turn_text,
+            completed_reasoning_ids,
+            streamed_reasoning,
+            prepared_telemetry,
+        ) = 'retry_response_stream: loop {
             let mut prepared_telemetry = llm_request_telemetry(
                 &logical_request_id, turn_id, iteration, attempt, &agent.model,
                 ApiProtocol::Responses, &build, tool_call_count, tool_definitions.len(), logical_observation,
@@ -591,6 +597,7 @@ where
 
             let mut completed_response: Option<Response> = None;
             let mut completed_reasoning_ids = HashSet::new();
+            let mut streamed_reasoning = BTreeMap::<String, String>::new();
             let mut emitted_pending_tool_calls = HashSet::new();
             let mut pending_tool_calls = BTreeMap::new();
             let mut turn_text = String::new();
@@ -701,6 +708,10 @@ where
                     }
                     ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
                         stream_had_side_effect = true;
+                        streamed_reasoning
+                            .entry(event.item_id.clone())
+                            .or_default()
+                            .push_str(&event.delta);
                         on_event(AgentEvent::ReasoningDelta {
                             item_id: event.item_id,
                             delta: event.delta,
@@ -710,6 +721,7 @@ where
                     ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => {
                         stream_had_side_effect = true;
                         completed_reasoning_ids.insert(event.item_id.clone());
+                        streamed_reasoning.insert(event.item_id.clone(), event.text.clone());
                         on_event(AgentEvent::ReasoningDone {
                             item_id: event.item_id,
                             text: event.text,
@@ -718,6 +730,10 @@ where
                     }
                     ResponseStreamEvent::ResponseReasoningTextDelta(event) => {
                         stream_had_side_effect = true;
+                        streamed_reasoning
+                            .entry(event.item_id.clone())
+                            .or_default()
+                            .push_str(&event.delta);
                         on_event(AgentEvent::ReasoningDelta {
                             item_id: event.item_id,
                             delta: event.delta,
@@ -727,6 +743,7 @@ where
                     ResponseStreamEvent::ResponseReasoningTextDone(event) => {
                         stream_had_side_effect = true;
                         completed_reasoning_ids.insert(event.item_id.clone());
+                        streamed_reasoning.insert(event.item_id.clone(), event.text.clone());
                         on_event(AgentEvent::ReasoningDone {
                             item_id: event.item_id,
                             text: event.text,
@@ -976,7 +993,13 @@ where
                     return Err(anyhow!("stream ended without response.completed"));
                 }
             };
-            break 'retry_response_stream (response, turn_text, completed_reasoning_ids, prepared_telemetry);
+            break 'retry_response_stream (
+                response,
+                turn_text,
+                completed_reasoning_ids,
+                streamed_reasoning,
+                prepared_telemetry,
+            );
         };
 
         for (index, item) in response.output.iter().enumerate() {
@@ -989,7 +1012,9 @@ where
                     continue;
                 }
 
-                let text = response_reasoning_text(item).unwrap_or_else(|| reasoning_summary_text(item));
+                let text = response_reasoning_text(item)
+                    .or_else(|| streamed_reasoning.get(&item_id).cloned())
+                    .unwrap_or_else(|| reasoning_summary_text(item));
                 if !text.is_empty() {
                     on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
                 }
@@ -1087,13 +1112,7 @@ where
         );
         drop(iteration_span);
 
-        let reasoning_content = response
-            .output
-            .iter()
-            .filter_map(response_reasoning_text)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let reasoning_content = (!reasoning_content.is_empty()).then_some(reasoning_content);
+        let reasoning_content = response_reasoning_content(&response, &streamed_reasoning);
         agent.append_assistant_tool_calls_with_reasoning_content(
             &turn_text,
             reasoning_content.as_deref(),
@@ -1104,7 +1123,7 @@ where
         }
         on_event(AgentEvent::AssistantToolCallBatch {
             text: (!turn_text.is_empty()).then(|| turn_text.clone()),
-            reasoning_content: None,
+            reasoning_content: reasoning_content.clone(),
             calls: tool_calls.clone(),
         })
         .await?;
@@ -2515,6 +2534,38 @@ fn response_reasoning_text(item: &OutputItem) -> Option<String> {
         })
         .collect::<String>();
     (!text.is_empty()).then_some(text)
+}
+
+fn response_reasoning_content(
+    response: &Response,
+    streamed_reasoning: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut content = Vec::new();
+    let mut represented_ids = HashSet::new();
+
+    for item in &response.output {
+        let OutputItem::Reasoning(reasoning) = item else {
+            continue;
+        };
+        let item_id = reasoning.id.as_deref();
+        let text = response_reasoning_text(item)
+            .or_else(|| item_id.and_then(|id| streamed_reasoning.get(id).cloned()));
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            if let Some(item_id) = item_id {
+                represented_ids.insert(item_id.to_string());
+            }
+            content.push(text);
+        }
+    }
+
+    content.extend(
+        streamed_reasoning
+            .iter()
+            .filter(|(item_id, text)| !represented_ids.contains(*item_id) && !text.is_empty())
+            .map(|(_, text)| text.clone()),
+    );
+
+    (!content.is_empty()).then(|| content.join("\n\n"))
 }
 
 fn provider_response_terminal_error(prefix: &str, response: &Response) -> String {

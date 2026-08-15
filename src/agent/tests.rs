@@ -674,6 +674,50 @@ fn responses_tool_batch_sse(calls: Vec<serde_json::Value>) -> &'static str {
     sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
 }
 
+fn responses_reasoning_tool_batch_sse(
+    reasoning_text: &str,
+    call: serde_json::Value,
+) -> &'static str {
+    let reasoning_delta = json!({
+        "type": "response.reasoning_text.delta",
+        "sequence_number": 1,
+        "item_id": "reasoning-1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": reasoning_text,
+    });
+    let reasoning_done = json!({
+        "type": "response.reasoning_text.done",
+        "sequence_number": 2,
+        "item_id": "reasoning-1",
+        "output_index": 0,
+        "content_index": 0,
+        "text": reasoning_text,
+    });
+    let response = json!({
+        "type": "response.completed", "sequence_number": 3,
+        "response": {
+            "id": "r-reasoning-tools", "object": "response", "created_at": 1,
+            "status": "completed", "background": false, "error": null,
+            "incomplete_details": null, "instructions": null, "max_output_tokens": null,
+            "model": "m1", "output": [call], "parallel_tool_calls": true,
+            "previous_response_id": null, "reasoning": {}, "store": true,
+            "temperature": 1, "text": {"format": {"type": "text"}},
+            "tool_choice": "auto", "tools": [], "top_p": 1,
+            "truncation": "disabled",
+            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
+            "user": null, "metadata": {}
+        }
+    });
+    let reasoning_delta =
+        serde_json::to_string(&reasoning_delta).expect("reasoning delta serializes");
+    let reasoning_done = serde_json::to_string(&reasoning_done).expect("reasoning done serializes");
+    let response = serde_json::to_string(&response).expect("response serializes");
+    sse_response(format!(
+        "data: {reasoning_delta}\n\ndata: {reasoning_done}\n\ndata: {response}\n\ndata: [DONE]\n\n"
+    ))
+}
+
 fn chat_tool_batch_sse(name: &str, call_id: &str, arguments: String) -> &'static str {
     let reasoning_content = "inspect ";
     let reasoning = "then call";
@@ -920,6 +964,165 @@ async fn chat_tool_calls_round_trip_reasoning_content_in_follow_up_request() {
         .expect("chat stream completes");
 
     assert_eq!(result, "done");
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_tool_calls_preserve_reasoning_in_live_event_and_follow_up_request() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("server has address")
+    );
+    let server = tokio::spawn(async move {
+        let (mut first_socket, _) = listener
+            .accept()
+            .await
+            .expect("server accepts first request");
+        let _ = read_complete_http_request(&mut first_socket).await;
+        first_socket
+            .write_all(
+                responses_reasoning_tool_batch_sse(
+                    "inspect the requested file",
+                    json!({
+                        "type": "function_call", "id": "fc-reasoning", "call_id": "call-reasoning",
+                        "name": "workflow__todos", "arguments": r#"{"items":[]}"#,
+                        "status": "completed"
+                    }),
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("server writes first response");
+        first_socket
+            .shutdown()
+            .await
+            .expect("server closes first response");
+
+        let (mut second_socket, _) = listener
+            .accept()
+            .await
+            .expect("server accepts second request");
+        let second_request = read_complete_http_request(&mut second_socket).await;
+        let body_start = second_request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request has headers")
+            + 4;
+        let body: serde_json::Value =
+            serde_json::from_slice(&second_request[body_start..]).expect("request body is JSON");
+        let input = body["input"]
+            .as_array()
+            .expect("responses request has input");
+        let reasoning_index = input
+            .iter()
+            .position(|item| item["type"] == "reasoning")
+            .expect("follow-up request preserves reasoning input");
+        assert_eq!(
+            input[reasoning_index]["content"][0]["text"],
+            "inspect the requested file"
+        );
+        let tool_call_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .expect("follow-up request preserves function call");
+        assert!(reasoning_index < tool_call_index);
+        second_socket
+            .write_all(responses_final_sse("done").as_bytes())
+            .await
+            .expect("server writes second response");
+        second_socket
+            .shutdown()
+            .await
+            .expect("server closes second response");
+    });
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "deepseek-v4-flash", 2, 1);
+    let reasoning_batches = Arc::new(Mutex::new(Vec::new()));
+    let observed_batches = reasoning_batches.clone();
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            move |event| {
+                if let AgentEvent::AssistantToolCallBatch {
+                    reasoning_content, ..
+                } = event
+                {
+                    observed_batches
+                        .lock()
+                        .expect("reasoning batch lock")
+                        .push(reasoning_content);
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("responses stream completes");
+
+    assert_eq!(result, "done");
+    assert_eq!(
+        Arc::try_unwrap(reasoning_batches)
+            .expect("all event callbacks have completed")
+            .into_inner()
+            .expect("reasoning batch lock is not poisoned"),
+        vec![Some("inspect the requested file".into())]
+    );
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_completed_finalizes_with_unfinished_todos_when_auto_continue_is_disabled() {
+    let todo_response = responses_tool_batch_sse(vec![json!({
+        "type": "function_call", "id": "fc-todo-pending", "call_id": "call-todo-pending",
+        "name": "workflow__todos",
+        "arguments": r#"{"items":[{"id":"pending","content":"remain pending","status":"pending"}]}"#,
+        "status": "completed"
+    })]);
+    let (base_url, request_count, server) =
+        spawn_chat_completion_server(vec![todo_response, responses_final_sse("done")]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 2, 1);
+    let mut internal_continuations = 0;
+    let mut scheduled_continuations = 0;
+    let mut finalized_outcomes = Vec::new();
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                match event {
+                    AgentEvent::InternalContinuation { .. } => internal_continuations += 1,
+                    AgentEvent::AutoContinuationScheduled { .. } => scheduled_continuations += 1,
+                    AgentEvent::TurnFinalized(event) => finalized_outcomes.push(event.outcome),
+                    _ => {}
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("completed response should finalize normally");
+
+    assert_eq!(result, "done");
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(internal_continuations, 0);
+    assert_eq!(scheduled_continuations, 0);
+    assert_eq!(finalized_outcomes, vec!["completed"]);
+    assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
     server.await.expect("server task should finish");
 }
 
@@ -3164,6 +3367,70 @@ async fn responses_stream_exhausts_semantic_recovery_budget_across_iterations() 
 }
 
 #[tokio::test]
+async fn responses_stream_preserves_recovery_state_when_iteration_budget_is_exhausted() {
+    let interrupted = sse_response(
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\ndata: {malformed}\n\n"
+            .into(),
+    );
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![interrupted]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 1, 4);
+    let mut issues = 0;
+    let mut recovery_continuations = 0;
+    let mut assistant_messages = Vec::new();
+    let mut deltas = Vec::new();
+
+    let error = agent
+        .run_stream_async(
+            "hello",
+            |delta| {
+                deltas.push(delta.to_string());
+                std::future::ready(Ok(()))
+            },
+            |event| {
+                match event {
+                    AgentEvent::AssistantMessage { content } => assistant_messages.push(content),
+                    AgentEvent::ModelStreamIssue { .. } => issues += 1,
+                    AgentEvent::InternalContinuation { .. } => recovery_continuations += 1,
+                    _ => {}
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("the next model request should be rejected by the existing iteration gate");
+
+    assert!(
+        error
+            .to_string()
+            .contains("stopped: too many agent iterations (max 1)")
+    );
+    assert_eq!(deltas, vec!["partial"]);
+    assert_eq!(assistant_messages, vec!["partial"]);
+    assert_eq!(issues, 1);
+    assert_eq!(recovery_continuations, 1);
+    assert!(
+        agent
+            .history_for_test()
+            .iter()
+            .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "partial"))
+    );
+    assert!(
+        agent
+            .history_for_test()
+            .iter()
+            .any(|item| matches!(item, HistoryItem::InternalContinuation { .. }))
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
 async fn compatible_chat_stream_retries_read_error_before_visible_output() {
     let body = r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
 
@@ -3234,6 +3501,70 @@ data: [DONE]
     );
     assert_request_telemetry_is_terminal_once(&audit_telemetry);
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn compatible_chat_stream_preserves_recovery_state_when_iteration_budget_is_exhausted() {
+    let interrupted = sse_response(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\ndata: {malformed}\n\n"
+            .into(),
+    );
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![interrupted]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 1, 4);
+    let mut issues = 0;
+    let mut recovery_continuations = 0;
+    let mut assistant_messages = Vec::new();
+    let mut deltas = Vec::new();
+
+    let error = agent
+        .run_oai_comp_stream_async(
+            "hello",
+            |delta| {
+                deltas.push(delta.to_string());
+                std::future::ready(Ok(()))
+            },
+            |event| {
+                match event {
+                    AgentEvent::AssistantMessage { content } => assistant_messages.push(content),
+                    AgentEvent::ModelStreamIssue { .. } => issues += 1,
+                    AgentEvent::InternalContinuation { .. } => recovery_continuations += 1,
+                    _ => {}
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("the next model request should be rejected by the existing iteration gate");
+
+    assert!(
+        error
+            .to_string()
+            .contains("stopped: too many agent iterations (max 1)")
+    );
+    assert_eq!(deltas, vec!["partial"]);
+    assert_eq!(assistant_messages, vec!["partial"]);
+    assert_eq!(issues, 1);
+    assert_eq!(recovery_continuations, 1);
+    assert!(
+        agent
+            .history_for_test()
+            .iter()
+            .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "partial"))
+    );
+    assert!(
+        agent
+            .history_for_test()
+            .iter()
+            .any(|item| matches!(item, HistoryItem::InternalContinuation { .. }))
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
     server.await.expect("server task should finish");
 }
 
