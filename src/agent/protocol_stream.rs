@@ -716,6 +716,23 @@ where
                         })
                         .await?;
                     }
+                    ResponseStreamEvent::ResponseReasoningTextDelta(event) => {
+                        stream_had_side_effect = true;
+                        on_event(AgentEvent::ReasoningDelta {
+                            item_id: event.item_id,
+                            delta: event.delta,
+                        })
+                        .await?;
+                    }
+                    ResponseStreamEvent::ResponseReasoningTextDone(event) => {
+                        stream_had_side_effect = true;
+                        completed_reasoning_ids.insert(event.item_id.clone());
+                        on_event(AgentEvent::ReasoningDone {
+                            item_id: event.item_id,
+                            text: event.text,
+                        })
+                        .await?;
+                    }
                     ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                         if let OutputItem::FunctionCall(call) = event.item
                             && emit_tool_call_pending_if_ready(
@@ -972,7 +989,7 @@ where
                     continue;
                 }
 
-                let text = reasoning_summary_text(item);
+                let text = response_reasoning_text(item).unwrap_or_else(|| reasoning_summary_text(item));
                 if !text.is_empty() {
                     on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
                 }
@@ -1070,7 +1087,18 @@ where
         );
         drop(iteration_span);
 
-        agent.append_assistant_tool_calls(&turn_text, &tool_calls)?;
+        let reasoning_content = response
+            .output
+            .iter()
+            .filter_map(response_reasoning_text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let reasoning_content = (!reasoning_content.is_empty()).then_some(reasoning_content);
+        agent.append_assistant_tool_calls_with_reasoning_content(
+            &turn_text,
+            reasoning_content.as_deref(),
+            &tool_calls,
+        )?;
         if let Some(usage) = response_usage {
             agent.install_provider_usage_anchor(usage);
         }
@@ -1987,6 +2015,7 @@ where
     let build = build_request_with_policy(
         RequestBuilderInput {
             protocol,
+            provider: None,
             model_id,
             model: model.clone(),
             prelude,
@@ -2470,6 +2499,22 @@ fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
         }
     }
     events
+}
+
+fn response_reasoning_text(item: &OutputItem) -> Option<String> {
+    let OutputItem::Reasoning(reasoning) = item else {
+        return None;
+    };
+    let content = reasoning.content.as_ref()?;
+    let text = content
+        .iter()
+        .map(|part| match part {
+            async_openai::types::responses::ReasoningItemContent::ReasoningText(content) => {
+                content.text.clone()
+            }
+        })
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
 }
 
 fn provider_response_terminal_error(prefix: &str, response: &Response) -> String {

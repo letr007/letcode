@@ -63,6 +63,15 @@ fn metadata_with_effective_input_limit(
     }
 }
 
+fn deepseek_metadata() -> ModelRequestMetadata {
+    ModelRequestMetadata {
+        supports_reasoning: true,
+        reasoning_effort: Some(ModelReasoningEffort::High),
+        max_output_tokens: Some(32_768),
+        ..metadata(384_000)
+    }
+}
+
 fn evidence(id: &str, summary: &str, path: &str, sequence: u64) -> EvidenceRecord {
     EvidenceRecord {
         id: id.to_string(),
@@ -263,6 +272,113 @@ fn assert_json_f64_close(value: &serde_json::Value, expected: f64) {
         (actual - expected).abs() < 0.000_001,
         "{actual} != {expected}"
     );
+}
+
+#[test]
+fn deepseek_chat_compat_uses_legacy_roles_and_tokens_and_thinking() {
+    let history = vec![HistoryItem::user("current")];
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Completions,
+        model_id: "deepseek-v4-flash",
+        model: deepseek_metadata(),
+        prelude: &[PromptMessage::developer("developer instructions")],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("deepseek chat request builds");
+    let request = request_value(&result);
+    assert_eq!(request["messages"][0]["role"], "system");
+    assert_eq!(request["max_tokens"], 32_768);
+    assert!(request.get("max_completion_tokens").is_none());
+    assert_eq!(request["thinking"]["type"], "enabled");
+    assert_eq!(request["reasoning_effort"], "high");
+}
+
+#[test]
+fn deepseek_chat_compat_preserves_empty_reasoning_content_for_tool_turns() {
+    let history = vec![
+        HistoryItem::AssistantToolCalls {
+            text: None,
+            reasoning_content: None,
+            calls: vec![HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "read_file".into(),
+                arguments_json: "{}".into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-1".into(),
+            output_json: "ok".into(),
+            images: Vec::new(),
+        },
+        HistoryItem::user("continue"),
+    ];
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Completions,
+        model_id: "deepseek-v4-flash",
+        model: deepseek_metadata(),
+        prelude: &[],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("deepseek tool replay builds");
+    let request = request_value(&result);
+    let assistant = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant tool message");
+    assert_eq!(assistant["reasoning_content"], "");
+}
+
+#[test]
+fn deepseek_responses_replays_reasoning_before_tool_call() {
+    let history = vec![
+        HistoryItem::AssistantToolCalls {
+            text: Some("I will inspect it".into()),
+            reasoning_content: Some("inspect the file".into()),
+            calls: vec![HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "read_file".into(),
+                arguments_json: "{}".into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-1".into(),
+            output_json: "ok".into(),
+            images: Vec::new(),
+        },
+        HistoryItem::user("continue"),
+    ];
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Responses,
+        model_id: "deepseek-v4-flash",
+        model: deepseek_metadata(),
+        prelude: &[],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("deepseek responses replay builds");
+    let request = request_value(&result);
+    let input = request["input"].as_array().expect("responses input");
+    assert!(input.iter().any(|item| {
+        item["type"] == "reasoning"
+            && item["content"][0]["type"] == "reasoning_text"
+            && item["content"][0]["text"] == "inspect the file"
+    }));
 }
 
 #[test]
@@ -1051,6 +1167,7 @@ fn canonical_first_exposure_representation_is_pressure_invariant_and_impossible_
                 let result = build_request_with_policy(
                     RequestBuilderInput {
                         protocol,
+                        provider: None,
                         model_id: "gpt-test",
                         model: model.clone(),
                         prelude: &[],
@@ -1145,6 +1262,7 @@ fn canonical_first_exposure_representation_is_pressure_invariant_and_impossible_
     let error = build_request_with_policy(
         RequestBuilderInput {
             protocol: ApiProtocol::Responses,
+            provider: None,
             model,
             model_id: "gpt-test",
             prelude: &[],
