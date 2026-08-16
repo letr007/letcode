@@ -102,6 +102,8 @@ pub(crate) enum SessionEngineCommand {
     ResumeSession(String),
     NewSession,
     ToggleMcpServer(String),
+    /// Query-only: report the anchored bootstrap experiment status.
+    AnchoredShow,
     #[cfg(test)]
     InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
 }
@@ -138,6 +140,7 @@ impl SessionEngineCommand {
                 model_id,
             },
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
+            SessionCommand::AnchoredShow => Self::AnchoredShow,
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
             SessionCommand::NewSession => Self::NewSession,
@@ -509,6 +512,7 @@ fn session_engine_command_as_session_command(
         SessionEngineCommand::SetPermissionMode(mode) => {
             Some(crate::session::SessionCommand::SetPermissionMode(*mode))
         }
+        SessionEngineCommand::AnchoredShow => Some(crate::session::SessionCommand::AnchoredShow),
         SessionEngineCommand::ToggleFastMode => {
             Some(crate::session::SessionCommand::ToggleFastMode)
         }
@@ -584,6 +588,7 @@ fn session_engine_command_as_idle_session_command(
         | crate::session::SessionCommand::ResumeSession(_)
         | crate::session::SessionCommand::NewSession
         | crate::session::SessionCommand::ToggleMcpServer(_)
+        | crate::session::SessionCommand::AnchoredShow
         | crate::session::SessionCommand::Interrupt => None,
     }
 }
@@ -660,6 +665,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         | SessionEngineCommand::ViewChild { .. }
         | SessionEngineCommand::ViewParent
         | SessionEngineCommand::ToggleFastMode
+        | SessionEngineCommand::AnchoredShow
         | SessionEngineCommand::ResumeSession(_)
         | SessionEngineCommand::NewSession
         | SessionEngineCommand::ToggleMcpServer(_) => None,
@@ -2864,6 +2870,12 @@ async fn run_engine_loop(
                             break;
                         }
                         flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+                        continue;
+                    }
+                    SessionEngineCommand::AnchoredShow => {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                            NoticeEvent::info(agent.anchored_status()),
+                        ));
                         continue;
                     }
                     SessionEngineCommand::Compact => {

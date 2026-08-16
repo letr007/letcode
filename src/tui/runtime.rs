@@ -2032,6 +2032,7 @@ impl TuiRuntime {
             crate::session::SessionCommand::SetExpertModel { .. }
             | crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
+            | crate::session::SessionCommand::AnchoredShow
             | crate::session::SessionCommand::SubmitPrompt(_)
             | crate::session::SessionCommand::DelegateSubagent { .. }
             | crate::session::SessionCommand::Compact
@@ -2079,6 +2080,7 @@ impl TuiRuntime {
             | crate::session::SessionCommand::NavigateHistory { .. }
             | crate::session::SessionCommand::ViewChild { .. }
             | crate::session::SessionCommand::ViewParent
+            | crate::session::SessionCommand::AnchoredShow
             | crate::session::SessionCommand::ResumeSession(_)
             | crate::session::SessionCommand::NewSession
             | crate::session::SessionCommand::Interrupt => {}
@@ -2378,7 +2380,8 @@ impl TuiRuntime {
             | CommandIntent::Resume(_)
             | CommandIntent::NewSession
             | CommandIntent::Child(_)
-            | CommandIntent::Parent => unreachable!(
+            | CommandIntent::Parent
+            | CommandIntent::AnchoredShow => unreachable!(
                 "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
             ),
         }
@@ -2463,6 +2466,9 @@ impl TuiRuntime {
             }
             SessionCommand::ToggleMcpServer(server_name) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleMcpServer(server_name),
+            ))),
+            SessionCommand::AnchoredShow => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::AnchoredShow,
             ))),
             SessionCommand::Interrupt => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Interrupt)))

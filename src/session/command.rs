@@ -42,6 +42,8 @@ pub enum SessionCommand {
     },
     ViewParent,
     SetPermissionMode(PermissionMode),
+    /// Query-only: report the anchored bootstrap experiment status as a notice.
+    AnchoredShow,
     SetModel(String),
     SetExpertModel {
         agent_name: String,
@@ -60,6 +62,7 @@ impl SessionCommand {
         match self {
             Self::SubmitPrompt(_) => ActiveTurnCommandDisposition::QueuePrompt,
             Self::ViewChild { .. } | Self::ViewParent => ActiveTurnCommandDisposition::Immediate,
+            Self::AnchoredShow => ActiveTurnCommandDisposition::Immediate,
             Self::SetPermissionMode(_)
             | Self::SetModel(_)
             | Self::SetExpertModel { .. }
@@ -113,6 +116,7 @@ impl SessionCommand {
             }),
             CommandIntent::Parent => Some(Self::ViewParent),
             CommandIntent::PermissionSet(mode) => Some(Self::SetPermissionMode(mode)),
+            CommandIntent::AnchoredShow => Some(Self::AnchoredShow),
             CommandIntent::ModelSet(model) => Some(Self::SetModel(model)),
             CommandIntent::FastToggle => Some(Self::ToggleFastMode),
             CommandIntent::ReasoningSet(effort) => Some(Self::SetReasoningEffort(effort)),

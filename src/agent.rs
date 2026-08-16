@@ -80,7 +80,9 @@ mod workflow_state;
 
 pub(crate) use auto_review::{AutoReviewResolution, AutoReviewService};
 
-use crate::anchored_bootstrap::{AnchoredBootstrap, AnchoredPhase};
+use crate::anchored_bootstrap::{
+    ALIAS_BASH, ALIAS_STR_REPLACE_EDITOR, AnchoredBootstrap, AnchoredPhase,
+};
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
 pub(crate) use catalog::{
     SUBAGENT_CATALOG, agent_name_for_subagent_tool, is_subagent_tool_name,
@@ -1181,6 +1183,38 @@ impl<C: Config> Agent<C> {
     /// Enable the anchored bootstrap experiment. Fails fast when the alias
     /// tools or any compaction tool do not exist in the registry — a
     /// composition drift must be visible at startup, not per request.
+    /// Human-readable status of the anchored bootstrap experiment for the
+    /// `/anchored` slash command: enablement, whitelist match, current phase,
+    /// and the phase's catalog shape.
+    pub(crate) fn anchored_status(&self) -> String {
+        let Some(anchored) = &self.anchored else {
+            return "anchored bootstrap: disabled".to_string();
+        };
+        let base = format!(
+            "anchored bootstrap: enabled (models: {})",
+            anchored.models().join(", ")
+        );
+        if !anchored.enabled_for(&self.model) {
+            return format!("{base} | model '{}' not on whitelist", self.model);
+        }
+        let phase = anchored.phase(&self.history);
+        let catalog = match phase {
+            AnchoredPhase::Bootstrap => format!("{ALIAS_BASH}, {ALIAS_STR_REPLACE_EDITOR}"),
+            AnchoredPhase::Promoted => "full catalog".to_string(),
+            AnchoredPhase::CompactedFallback => format!(
+                "{}, {} + {}",
+                ALIAS_BASH,
+                ALIAS_STR_REPLACE_EDITOR,
+                anchored.compaction_tools().join(", ")
+            ),
+        };
+        format!(
+            "{base} | {} matched | phase: {} | catalog: {catalog}",
+            self.model,
+            phase.as_str()
+        )
+    }
+
     pub fn set_anchored(&mut self, anchored: Option<AnchoredBootstrap>) -> Result<()> {
         if let Some(anchored) = &anchored {
             let available: std::collections::BTreeSet<String> = self

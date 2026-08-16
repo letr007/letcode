@@ -40,6 +40,16 @@ pub enum AnchoredPhase {
     CompactedFallback,
 }
 
+impl AnchoredPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Promoted => "promoted",
+            Self::CompactedFallback => "compacted-fallback",
+        }
+    }
+}
+
 /// Per-agent experiment state. Constructed only when the experiment is enabled;
 /// every pipeline hook gates on [`AnchoredBootstrap::enabled_for`] so switching
 /// models off the whitelist naturally bypasses the experiment.
@@ -67,6 +77,11 @@ impl AnchoredBootstrap {
     /// Core work set exposed after a compaction (alias pair always present).
     pub(crate) fn compaction_tools(&self) -> &[String] {
         &self.config.compaction_tools
+    }
+
+    /// Whitelisted model IDs.
+    pub(crate) fn models(&self) -> &[String] {
+        &self.config.models
     }
 
     fn has_signal(&self, history: &[HistoryItem]) -> bool {
