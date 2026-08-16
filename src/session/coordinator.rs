@@ -252,7 +252,7 @@ impl SessionCoordinator {
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
             | SessionCommand::ToggleMcpServer(_)
-            | SessionCommand::AnchoredShow
+            | SessionCommand::AnchoredToggle
             | SessionCommand::Interrupt => Ok(IdleDispatch::NotIdle),
         }
     }
@@ -748,7 +748,7 @@ impl SessionCoordinator {
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
             | SessionCommand::ToggleMcpServer(_)
-            | SessionCommand::AnchoredShow
+            | SessionCommand::AnchoredToggle
             | SessionCommand::Interrupt => CommandOwnership::FrontendHosted,
         }
     }

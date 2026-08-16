@@ -180,6 +180,9 @@ pub(crate) enum SessionTransportEvent {
     FastModeChanged {
         enabled: bool,
     },
+    AnchoredChanged {
+        active: bool,
+    },
     ModelChanged {
         model_id: String,
     },
@@ -340,6 +343,7 @@ impl SessionTransportEvent {
             Self::RetryScheduled(event) => Some(SessionEvent::RetryScheduled(event.clone())),
             Self::RetryStarted(event) => Some(SessionEvent::RetryStarted(event.clone())),
             Self::FastModeChanged { .. }
+            | Self::AnchoredChanged { .. }
             | Self::ModelChanged { .. }
             | Self::ExpertModelChanged { .. }
             | Self::PermissionModeChanged { .. }

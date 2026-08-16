@@ -1020,6 +1020,8 @@ pub struct TuiState {
     pub model_id: String,
     pub model_label: String,
     pub fast_mode_enabled: bool,
+    /// Anchored bootstrap experiment active for the current session (composer badge).
+    pub anchored_active: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
     /// 上下文压缩进行中：footer 指示条改用开火车式往返扫描，隐藏过期的 token 数字。
     pub compaction_active: bool,
@@ -1097,6 +1099,7 @@ impl Default for TuiState {
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             fast_mode_enabled: false,
+            anchored_active: false,
             model_token_usage: None,
             compaction_active: false,
             compaction_animation_start_frame: 0,
@@ -1163,6 +1166,10 @@ impl TuiState {
 
     pub fn set_fast_mode_enabled(&mut self, enabled: bool) {
         self.fast_mode_enabled = enabled;
+    }
+
+    pub fn set_anchored_active(&mut self, active: bool) {
+        self.anchored_active = active;
     }
 
     pub fn set_model_context_window(&mut self, context_window_tokens: Option<u64>) {

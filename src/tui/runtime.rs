@@ -1186,6 +1186,9 @@ impl TuiRuntime {
             SessionTransportEvent::FastModeChanged { enabled } => {
                 self.state.set_fast_mode_enabled(*enabled);
             }
+            SessionTransportEvent::AnchoredChanged { active } => {
+                self.state.set_anchored_active(*active);
+            }
             SessionTransportEvent::ModelChanged { model_id } => {
                 self.apply_restored_model(model_id.clone());
                 self.state.set_provider_label_from_model_route(model_id);
@@ -2032,7 +2035,7 @@ impl TuiRuntime {
             crate::session::SessionCommand::SetExpertModel { .. }
             | crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
-            | crate::session::SessionCommand::AnchoredShow
+            | crate::session::SessionCommand::AnchoredToggle
             | crate::session::SessionCommand::SubmitPrompt(_)
             | crate::session::SessionCommand::DelegateSubagent { .. }
             | crate::session::SessionCommand::Compact
@@ -2080,7 +2083,7 @@ impl TuiRuntime {
             | crate::session::SessionCommand::NavigateHistory { .. }
             | crate::session::SessionCommand::ViewChild { .. }
             | crate::session::SessionCommand::ViewParent
-            | crate::session::SessionCommand::AnchoredShow
+            | crate::session::SessionCommand::AnchoredToggle
             | crate::session::SessionCommand::ResumeSession(_)
             | crate::session::SessionCommand::NewSession
             | crate::session::SessionCommand::Interrupt => {}
@@ -2381,7 +2384,7 @@ impl TuiRuntime {
             | CommandIntent::NewSession
             | CommandIntent::Child(_)
             | CommandIntent::Parent
-            | CommandIntent::AnchoredShow => unreachable!(
+            | CommandIntent::AnchoredToggle => unreachable!(
                 "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
             ),
         }
@@ -2467,8 +2470,8 @@ impl TuiRuntime {
             SessionCommand::ToggleMcpServer(server_name) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleMcpServer(server_name),
             ))),
-            SessionCommand::AnchoredShow => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::AnchoredShow,
+            SessionCommand::AnchoredToggle => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::AnchoredToggle,
             ))),
             SessionCommand::Interrupt => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Interrupt)))

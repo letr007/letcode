@@ -79,11 +79,6 @@ impl AnchoredBootstrap {
         &self.config.compaction_tools
     }
 
-    /// Whitelisted model IDs.
-    pub(crate) fn models(&self) -> &[String] {
-        &self.config.models
-    }
-
     fn has_signal(&self, history: &[HistoryItem]) -> bool {
         let mode = self.config.promote_on;
         history.iter().any(|item| match (mode, item) {

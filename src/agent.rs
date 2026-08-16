@@ -80,9 +80,7 @@ mod workflow_state;
 
 pub(crate) use auto_review::{AutoReviewResolution, AutoReviewService};
 
-use crate::anchored_bootstrap::{
-    ALIAS_BASH, ALIAS_STR_REPLACE_EDITOR, AnchoredBootstrap, AnchoredPhase,
-};
+use crate::anchored_bootstrap::{AnchoredBootstrap, AnchoredPhase};
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
 pub(crate) use catalog::{
     SUBAGENT_CATALOG, agent_name_for_subagent_tool, is_subagent_tool_name,
@@ -611,6 +609,9 @@ pub struct Agent<C: Config> {
     fast_mode: Option<Arc<crate::fast_mode::FastMode>>,
     /// Anchored bootstrap experiment state; None = experiment not enabled.
     anchored: Option<AnchoredBootstrap>,
+    /// Session-level runtime switch (default on). The `/anchored` command
+    /// flips it; the experiment only applies while it is on.
+    anchored_override: bool,
     /// Phase bound once per turn by the prelude hook, so the tool catalog and
     /// alias resolution stay stable across iterations of one request.
     anchored_request_phase: Option<AnchoredPhase>,
@@ -820,6 +821,7 @@ impl AgentFactory {
             // Subagents always run with the full catalog and regular context;
             // the anchored bootstrap wraps only the primary session.
             anchored: None,
+            anchored_override: true,
             anchored_request_phase: None,
         }
     }
@@ -1088,6 +1090,7 @@ impl<C: Config> Agent<C> {
             pressure_compaction_suppressed: false,
             fast_mode: None,
             anchored: None,
+            anchored_override: true,
             anchored_request_phase: None,
         }
     }
@@ -1186,33 +1189,44 @@ impl<C: Config> Agent<C> {
     /// Human-readable status of the anchored bootstrap experiment for the
     /// `/anchored` slash command: enablement, whitelist match, current phase,
     /// and the phase's catalog shape.
+    /// Whether the anchored bootstrap experiment currently applies to this
+    /// session: enabled by config, model on the whitelist, and the runtime
+    /// switch is on.
+    pub(crate) fn anchored_active(&self) -> bool {
+        self.anchored_override
+            && self
+                .anchored
+                .as_ref()
+                .is_some_and(|anchored| anchored.enabled_for(&self.model))
+    }
+
+    /// Flip the runtime switch. Mirrors Fast Mode semantics: on a model outside
+    /// the whitelist (or when the experiment is not configured) the switch is
+    /// left untouched and reported as unavailable — the experiment simply does
+    /// not apply to this model, which is the expected state, not an error.
+    pub(crate) fn toggle_anchored(&mut self) -> String {
+        let Some(anchored) = &self.anchored else {
+            return "anchored: unavailable".to_string();
+        };
+        if !anchored.enabled_for(&self.model) {
+            return "anchored: unavailable for current model".to_string();
+        }
+        self.anchored_override = !self.anchored_override;
+        self.anchored_status()
+    }
+
+    /// Concise status line for the `/anchored` slash command toast.
     pub(crate) fn anchored_status(&self) -> String {
         let Some(anchored) = &self.anchored else {
-            return "anchored bootstrap: disabled".to_string();
+            return "anchored: unavailable".to_string();
         };
-        let base = format!(
-            "anchored bootstrap: enabled (models: {})",
-            anchored.models().join(", ")
-        );
         if !anchored.enabled_for(&self.model) {
-            return format!("{base} | model '{}' not on whitelist", self.model);
+            return "anchored: unavailable for current model".to_string();
         }
-        let phase = anchored.phase(&self.history);
-        let catalog = match phase {
-            AnchoredPhase::Bootstrap => format!("{ALIAS_BASH}, {ALIAS_STR_REPLACE_EDITOR}"),
-            AnchoredPhase::Promoted => "full catalog".to_string(),
-            AnchoredPhase::CompactedFallback => format!(
-                "{}, {} + {}",
-                ALIAS_BASH,
-                ALIAS_STR_REPLACE_EDITOR,
-                anchored.compaction_tools().join(", ")
-            ),
-        };
-        format!(
-            "{base} | {} matched | phase: {} | catalog: {catalog}",
-            self.model,
-            phase.as_str()
-        )
+        if !self.anchored_override {
+            return "anchored: off".to_string();
+        }
+        format!("anchored: on ({})", anchored.phase(&self.history).as_str())
     }
 
     pub fn set_anchored(&mut self, anchored: Option<AnchoredBootstrap>) -> Result<()> {
@@ -1253,6 +1267,7 @@ impl<C: Config> Agent<C> {
     pub(crate) fn resolve_tool_alias(&self, name: &str) -> String {
         if let Some(anchored) = &self.anchored
             && anchored.enabled_for(&self.model)
+            && self.anchored_override
             && matches!(
                 self.anchored_request_phase,
                 Some(AnchoredPhase::Bootstrap) | Some(AnchoredPhase::CompactedFallback)
@@ -2560,6 +2575,7 @@ impl<C: Config> Agent<C> {
             fast_mode: None,
             // Summary agents never run the anchored bootstrap.
             anchored: None,
+            anchored_override: true,
             anchored_request_phase: None,
         }
     }
@@ -2812,6 +2828,7 @@ impl<C: Config> Agent<C> {
         );
         if let Some(anchored) = &self.anchored
             && anchored.enabled_for(model_id)
+            && self.anchored_override
         {
             let phase = if model_id == self.model {
                 self.anchored_request_phase
@@ -3284,6 +3301,7 @@ impl<C: Config> Agent<C> {
         // the same value so one request never mixes phases.
         if let Some(anchored) = &self.anchored
             && anchored.enabled_for(&self.model)
+            && self.anchored_override
         {
             let phase = anchored.phase(&self.history);
             self.anchored_request_phase = Some(phase);

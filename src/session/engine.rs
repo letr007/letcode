@@ -102,8 +102,8 @@ pub(crate) enum SessionEngineCommand {
     ResumeSession(String),
     NewSession,
     ToggleMcpServer(String),
-    /// Query-only: report the anchored bootstrap experiment status.
-    AnchoredShow,
+    /// Toggle the anchored bootstrap experiment for this session.
+    AnchoredToggle,
     #[cfg(test)]
     InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
 }
@@ -140,7 +140,7 @@ impl SessionEngineCommand {
                 model_id,
             },
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
-            SessionCommand::AnchoredShow => Self::AnchoredShow,
+            SessionCommand::AnchoredToggle => Self::AnchoredToggle,
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
             SessionCommand::NewSession => Self::NewSession,
@@ -512,7 +512,9 @@ fn session_engine_command_as_session_command(
         SessionEngineCommand::SetPermissionMode(mode) => {
             Some(crate::session::SessionCommand::SetPermissionMode(*mode))
         }
-        SessionEngineCommand::AnchoredShow => Some(crate::session::SessionCommand::AnchoredShow),
+        SessionEngineCommand::AnchoredToggle => {
+            Some(crate::session::SessionCommand::AnchoredToggle)
+        }
         SessionEngineCommand::ToggleFastMode => {
             Some(crate::session::SessionCommand::ToggleFastMode)
         }
@@ -588,7 +590,7 @@ fn session_engine_command_as_idle_session_command(
         | crate::session::SessionCommand::ResumeSession(_)
         | crate::session::SessionCommand::NewSession
         | crate::session::SessionCommand::ToggleMcpServer(_)
-        | crate::session::SessionCommand::AnchoredShow
+        | crate::session::SessionCommand::AnchoredToggle
         | crate::session::SessionCommand::Interrupt => None,
     }
 }
@@ -665,7 +667,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         | SessionEngineCommand::ViewChild { .. }
         | SessionEngineCommand::ViewParent
         | SessionEngineCommand::ToggleFastMode
-        | SessionEngineCommand::AnchoredShow
+        | SessionEngineCommand::AnchoredToggle
         | SessionEngineCommand::ResumeSession(_)
         | SessionEngineCommand::NewSession
         | SessionEngineCommand::ToggleMcpServer(_) => None,
@@ -2369,6 +2371,9 @@ async fn run_engine_loop(
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                                 model_id: model_id.clone(),
                             });
+                            let _ = session_transport_tx.send(SessionTransportEvent::AnchoredChanged {
+                                active: agent.anchored_active(),
+                            });
                             let route_api_keys = route_api_key_configured
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
@@ -2872,9 +2877,19 @@ async fn run_engine_loop(
                         flush_parked_commands(&mut deferred_commands, &mut parked_commands);
                         continue;
                     }
-                    SessionEngineCommand::AnchoredShow => {
+                    SessionEngineCommand::AnchoredToggle => {
+                        let before = agent.anchored_active();
+                        let notice = agent.toggle_anchored();
+                        let after = agent.anchored_active();
+                        // Only broadcast the badge change when the toggle actually
+                        // flipped; on an off-whitelist/unconfigured session the
+                        // notice alone explains the state.
+                        if before != after {
+                            let _ = session_transport_tx
+                                .send(SessionTransportEvent::AnchoredChanged { active: after });
+                        }
                         let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                            NoticeEvent::info(agent.anchored_status()),
+                            NoticeEvent::info(notice),
                         ));
                         continue;
                     }
@@ -3195,6 +3210,9 @@ async fn run_engine_loop(
                         let _ = session_transport_tx.send(started_event);
                         let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                             model_id: new_session_model_id,
+                        });
+                        let _ = session_transport_tx.send(SessionTransportEvent::AnchoredChanged {
+                            active: agent.anchored_active(),
                         });
                         continue;
                     }
