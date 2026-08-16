@@ -12,6 +12,7 @@
 
 mod agent;
 mod agent_event_journal;
+mod anchored_bootstrap;
 mod cli;
 mod code_analysis;
 mod command;
@@ -41,6 +42,7 @@ mod tui;
 mod user_content;
 
 use agent::{Agent, ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
+use anchored_bootstrap::AnchoredBootstrap;
 use anyhow::{Result, anyhow, bail};
 use async_openai::config::OpenAIConfig;
 use config::AppConfig;
@@ -124,6 +126,9 @@ async fn main() -> Result<()> {
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
+    agent.set_anchored(AnchoredBootstrap::from_config(
+        &config.experiments.anchored_bootstrap,
+    ))?;
     agent.set_fast_mode(FastMode::load(
         &config.config_path,
         config.fast_mode_enabled,

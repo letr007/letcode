@@ -80,6 +80,7 @@ mod workflow_state;
 
 pub(crate) use auto_review::{AutoReviewResolution, AutoReviewService};
 
+use crate::anchored_bootstrap::{AnchoredBootstrap, AnchoredPhase};
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
 pub(crate) use catalog::{
     SUBAGENT_CATALOG, agent_name_for_subagent_tool, is_subagent_tool_name,
@@ -606,6 +607,11 @@ pub struct Agent<C: Config> {
     // outlives their turn initialization, which replaces `TurnRuntimeState`.
     pressure_compaction_suppressed: bool,
     fast_mode: Option<Arc<crate::fast_mode::FastMode>>,
+    /// Anchored bootstrap experiment state; None = experiment not enabled.
+    anchored: Option<AnchoredBootstrap>,
+    /// Phase bound once per turn by the prelude hook, so the tool catalog and
+    /// alias resolution stay stable across iterations of one request.
+    anchored_request_phase: Option<AnchoredPhase>,
 }
 
 impl AgentFactory {
@@ -809,6 +815,10 @@ impl AgentFactory {
             provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
             fast_mode: parent.fast_mode.clone(),
+            // Subagents always run with the full catalog and regular context;
+            // the anchored bootstrap wraps only the primary session.
+            anchored: None,
+            anchored_request_phase: None,
         }
     }
 }
@@ -1075,6 +1085,8 @@ impl<C: Config> Agent<C> {
             provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
             fast_mode: None,
+            anchored: None,
+            anchored_request_phase: None,
         }
     }
 
@@ -1164,6 +1176,57 @@ impl<C: Config> Agent<C> {
 
     pub fn set_fast_mode(&mut self, fast_mode: Arc<crate::fast_mode::FastMode>) {
         self.fast_mode = Some(fast_mode);
+    }
+
+    /// Enable the anchored bootstrap experiment. Fails fast when the alias
+    /// tools or any compaction tool do not exist in the registry — a
+    /// composition drift must be visible at startup, not per request.
+    pub fn set_anchored(&mut self, anchored: Option<AnchoredBootstrap>) -> Result<()> {
+        if let Some(anchored) = &anchored {
+            let available: std::collections::BTreeSet<String> = self
+                .tools
+                .specs()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            for required in [
+                tool_names::TOOL_SHELL_EXEC,
+                tool_names::TOOL_EDIT_APPLY_PATCH,
+            ] {
+                if !available.contains(required) {
+                    bail!(
+                        "anchored_bootstrap: required tool '{required}' is not registered; the alias pair cannot be assembled"
+                    );
+                }
+            }
+            for tool in anchored.compaction_tools() {
+                if !available.contains(tool) {
+                    bail!(
+                        "anchored_bootstrap: compaction_tools entry '{tool}' is not a registered tool"
+                    );
+                }
+            }
+        }
+        self.anchored = anchored;
+        Ok(())
+    }
+
+    /// Resolve an anchored-bootstrap alias tool name (bash / str_replace_editor)
+    /// to the real registry name. Only aliases produced by a non-promoted
+    /// request are resolved — a promoted request's catalog has no alias names,
+    /// and a same-named MCP tool must never be hijacked. The phase is the one
+    /// bound once per turn by the prelude hook.
+    pub(crate) fn resolve_tool_alias(&self, name: &str) -> String {
+        if let Some(anchored) = &self.anchored
+            && anchored.enabled_for(&self.model)
+            && matches!(
+                self.anchored_request_phase,
+                Some(AnchoredPhase::Bootstrap) | Some(AnchoredPhase::CompactedFallback)
+            )
+        {
+            return anchored.resolve_tool_name(name);
+        }
+        name.to_string()
     }
 
     pub fn fast_mode(&self) -> Option<&Arc<crate::fast_mode::FastMode>> {
@@ -1382,9 +1445,12 @@ impl<C: Config> Agent<C> {
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<TokenUsageEstimate> {
         let model = self.model_metadata_for(model_id);
+        // Build the catalog for the CANDIDATE model: the anchored bootstrap
+        // whitelist may include or exclude it independently of the active model.
+        let tools = self.tool_definitions_for(model_id);
         let policy = ProtectedContextPolicy::from_configured_reserve(
             None,
-            effective_input_budget_tokens(model.clone(), &self.tool_definitions()),
+            effective_input_budget_tokens(model.clone(), &tools),
         );
         let build = build_request_with_policy(
             RequestBuilderInput {
@@ -1397,7 +1463,7 @@ impl<C: Config> Agent<C> {
                 model,
                 prelude: &[],
                 snapshot: runtime_snapshot,
-                tools: &self.tool_definitions(),
+                tools: &tools,
             },
             None,
             Some(policy),
@@ -2458,6 +2524,9 @@ impl<C: Config> Agent<C> {
             provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
             fast_mode: None,
+            // Summary agents never run the anchored bootstrap.
+            anchored: None,
+            anchored_request_phase: None,
         }
     }
 
@@ -2689,6 +2758,14 @@ impl<C: Config> Agent<C> {
     }
 
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
+        self.tool_definitions_for(&self.model)
+    }
+
+    /// Build the catalog for a specific model id. The primary request path
+    /// (tool_definitions) uses the phase bound once per turn by the prelude
+    /// hook, so the catalog stays stable across iterations of one request;
+    /// estimation paths recompute the phase for the candidate model.
+    fn tool_definitions_for(&self, model_id: &str) -> Vec<crate::request_builder::ToolSpec> {
         let mut specs = self.tools.specs();
         // ToolRegistry retains a pair of legacy subagent handlers for validation and
         // scope compatibility. Catalog tools are advertised only when their delegate
@@ -2699,6 +2776,17 @@ impl<C: Config> Agent<C> {
                 .into_iter()
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
+        if let Some(anchored) = &self.anchored
+            && anchored.enabled_for(model_id)
+        {
+            let phase = if model_id == self.model {
+                self.anchored_request_phase
+                    .unwrap_or_else(|| anchored.phase(&self.history))
+            } else {
+                anchored.phase(&self.history)
+            };
+            specs = anchored.tool_catalog(&phase, specs);
+        }
         specs
     }
 
@@ -3154,6 +3242,27 @@ impl<C: Config> Agent<C> {
             self.turn.pressure_compaction.suppress();
         }
         self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
+
+        // Anchored bootstrap hook: runs BEFORE the current user message is
+        // appended to history (protocol_stream calls this first), so the first
+        // request sees the Bootstrap phase with an empty history. The phase is
+        // bound once per turn here; the tool catalog and alias resolution read
+        // the same value so one request never mixes phases.
+        if let Some(anchored) = &self.anchored
+            && anchored.enabled_for(&self.model)
+        {
+            let phase = anchored.phase(&self.history);
+            self.anchored_request_phase = Some(phase);
+            return Ok(anchored.prelude(
+                &phase,
+                &self.prelude,
+                Some(runtime_context_message()),
+                self.skill_prelude_message(),
+                turn.developer_context_message(),
+                &manual_skill_material,
+                self.unreconciled_subagent_context_message(),
+            ));
+        }
 
         let mut turn_prelude = self.prelude.clone();
         turn_prelude.push(runtime_context_message());

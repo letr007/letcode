@@ -423,6 +423,7 @@ pub struct AppConfig {
     pub agents: AgentsConfig,
     pub permissions: PermissionsConfig,
     pub tools: ToolsConfig,
+    pub experiments: ExperimentsConfig,
     pub mcp: IndexMap<String, McpServerConfig>,
     pub providers: IndexMap<String, ProviderConfig>,
 }
@@ -527,6 +528,7 @@ impl AppConfig {
             mode: raw.permissions.unwrap_or_default().mode.unwrap_or_default(),
         };
         let tools = build_tools_config(raw.tools.unwrap_or_default())?;
+        let experiments = build_experiments_config(raw.experiments.unwrap_or_default())?;
         let agents =
             build_agents_config(raw.agents.unwrap_or_default(), &active_provider, &providers)?;
         let mcp = raw
@@ -544,6 +546,7 @@ impl AppConfig {
             agents,
             permissions,
             tools,
+            experiments,
             mcp,
             providers,
         })
@@ -752,6 +755,38 @@ pub struct ToolsConfig {
     pub parallelism: IndexMap<String, crate::tool::ToolParallelism>,
 }
 
+/// Anchored-bootstrap experiment settings. Defaults keep the experiment
+/// disabled; nothing in the agent pipeline consults it unless enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExperimentsConfig {
+    pub anchored_bootstrap: AnchoredBootstrapConfig,
+}
+
+/// Promotion signal semantics for the anchored bootstrap experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromoteOn {
+    /// First durable `tool/call` OR first `assistant/message`, whichever first.
+    #[default]
+    Either,
+    /// Only a durable tool call promotes the session.
+    ToolCall,
+    /// Only a durable assistant message promotes the session.
+    AssistantMessage,
+}
+
+/// Two-phase "anchored bootstrap" experiment: the first model request sees a
+/// Minimal-aligned tool pair (alias names) and no injected context; after the
+/// first durable promotion signal the session restores the full catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnchoredBootstrapConfig {
+    pub enabled: bool,
+    /// Model IDs this experiment applies to (empty when disabled).
+    pub models: Vec<String>,
+    pub promote_on: PromoteOn,
+    /// Core work set exposed after a compaction, before re-promotion.
+    pub compaction_tools: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
     pub enabled: bool,
@@ -861,6 +896,8 @@ struct RawAppConfig {
     #[serde(default)]
     tools: Option<RawToolsConfig>,
     #[serde(default)]
+    experiments: Option<RawExperimentsConfig>,
+    #[serde(default)]
     mcp: IndexMap<String, RawMcpServerConfig>,
     #[serde(default)]
     providers: IndexMap<String, RawProviderConfig>,
@@ -927,6 +964,21 @@ struct RawPermissionsConfig {
 struct RawToolsConfig {
     #[serde(default)]
     parallelism: IndexMap<String, crate::tool::ToolParallelism>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExperimentsConfig {
+    anchored_bootstrap: Option<RawAnchoredBootstrapConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAnchoredBootstrapConfig {
+    enabled: Option<bool>,
+    models: Option<Vec<String>>,
+    promote_on: Option<String>,
+    compaction_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1251,6 +1303,59 @@ fn build_tools_config(raw: RawToolsConfig) -> Result<ToolsConfig> {
         })
         .collect::<Result<IndexMap<_, _>>>()?;
     Ok(ToolsConfig { parallelism })
+}
+
+fn build_experiments_config(raw: RawExperimentsConfig) -> Result<ExperimentsConfig> {
+    let Some(raw_anchored) = raw.anchored_bootstrap else {
+        return Ok(ExperimentsConfig::default());
+    };
+    if !raw_anchored.enabled.unwrap_or(false) {
+        return Ok(ExperimentsConfig::default());
+    }
+
+    let models = raw_anchored
+        .models
+        .ok_or_else(|| anyhow!("experiments.anchored_bootstrap.models is required when enabled"))?;
+    if models.is_empty() {
+        bail!("experiments.anchored_bootstrap.models cannot be empty when enabled");
+    }
+    for (index, model) in models.iter().enumerate() {
+        required_non_empty(
+            &format!("experiments.anchored_bootstrap.models[{index}]"),
+            model.clone(),
+        )?;
+    }
+
+    let promote_on = match raw_anchored.promote_on.as_deref() {
+        None | Some("either") => PromoteOn::Either,
+        Some("tool-call") => PromoteOn::ToolCall,
+        Some("assistant-message") => PromoteOn::AssistantMessage,
+        Some(other) => bail!(
+            "experiments.anchored_bootstrap.promote_on must be one of \"either\", \"tool-call\", \"assistant-message\"; got {other:?}"
+        ),
+    };
+
+    let compaction_tools = raw_anchored.compaction_tools.ok_or_else(|| {
+        anyhow!("experiments.anchored_bootstrap.compaction_tools is required when enabled")
+    })?;
+    if compaction_tools.is_empty() {
+        bail!("experiments.anchored_bootstrap.compaction_tools cannot be empty when enabled");
+    }
+    for (index, tool) in compaction_tools.iter().enumerate() {
+        required_non_empty(
+            &format!("experiments.anchored_bootstrap.compaction_tools[{index}]"),
+            tool.clone(),
+        )?;
+    }
+
+    Ok(ExperimentsConfig {
+        anchored_bootstrap: AnchoredBootstrapConfig {
+            enabled: true,
+            models,
+            promote_on,
+            compaction_tools,
+        },
+    })
 }
 
 fn build_mcp_server_config(

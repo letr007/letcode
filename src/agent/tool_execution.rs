@@ -22,6 +22,15 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
+    // Anchored bootstrap alias resolution: the model may have called an alias
+    // name (bash / str_replace_editor). Resolve once here so permissions,
+    // execution, and records all use the real tool name.
+    let resolved_call = {
+        let mut resolved = call.clone();
+        resolved.name = agent.resolve_tool_alias(&call.name);
+        resolved
+    };
+    let call = &resolved_call;
     let span = langfuse_trace::tool_span(
         agent.turn.turn_id,
         &call.name,
@@ -62,6 +71,13 @@ where
 {
     let mut prepared = Vec::with_capacity(calls.len());
     for call in calls {
+        // Resolve anchored-bootstrap aliases so preflight checks run against
+        // the real tool name (permissions, parallelism, scope).
+        let call = {
+            let mut resolved = call.clone();
+            resolved.name = agent.resolve_tool_alias(&call.name);
+            resolved
+        };
         let args = serde_json::from_str::<Value>(&call.arguments_json)
             .map_err(|error| anyhow::anyhow!("parallel tool preflight changed: {error}"))?;
         let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
