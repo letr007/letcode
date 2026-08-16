@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -4126,6 +4126,12 @@ pub async fn run_tui(
             if event::poll(TUI_FRAME_POLL_INTERVAL)? {
                 match event::read()? {
                     Event::Key(key) => {
+                        // Windows 的 ReadConsoleInput 会同时上报 key-down/key-up
+                        // 记录，crossterm 把它们都转换为 KeyEvent；只处理 Press
+                        // 否则每个按键会被插入多次（如 `s` 变成 `sss`）。
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
                         let action = map_key_event(runtime.state(), key);
                         if let Some(command) = runtime.handle_input_action(action)? {
                             command_dispatch::dispatch_command(
