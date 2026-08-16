@@ -3,6 +3,9 @@ use std::io::{self, Stdout};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+#[cfg(not(windows))]
+use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
@@ -16,6 +19,7 @@ pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 const RAW_MODE_BIT: u8 = 0b001;
 const ALT_SCREEN_BIT: u8 = 0b010;
 const MOUSE_CAPTURE_BIT: u8 = 0b100;
+#[cfg(not(windows))]
 const KEYBOARD_ENHANCEMENT_BIT: u8 = 0b1000;
 const BRACKETED_PASTE_BIT: u8 = 0b1_0000;
 
@@ -39,11 +43,17 @@ impl TerminalGuard {
         crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
         guard.init_bits |= ALT_SCREEN_BIT;
 
-        crossterm::execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-        guard.init_bits |= KEYBOARD_ENHANCEMENT_BIT;
+        // kitty 键盘渐进增强协议（CSI > ... u）在 Windows 上不受 crossterm 0.28
+        // 的 legacy Windows API 支持，启用会直接返回 Unsupported 错误，因此仅在
+        // 非 Windows 平台启用。
+        #[cfg(not(windows))]
+        {
+            crossterm::execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            guard.init_bits |= KEYBOARD_ENHANCEMENT_BIT;
+        }
 
         crossterm::execute!(io::stdout(), EnableMouseCapture)?;
         guard.init_bits |= MOUSE_CAPTURE_BIT;
@@ -77,6 +87,7 @@ impl Drop for TerminalGuard {
             let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         }
 
+        #[cfg(not(windows))]
         if self.init_bits & KEYBOARD_ENHANCEMENT_BIT != 0 {
             let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
