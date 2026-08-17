@@ -4649,12 +4649,10 @@ impl WorkflowTurnState {
                 "本回合为只读。不要修改文件，也不要运行非只读命令。".to_string()
             }
             ExecutionDirective::PlanOnly => {
-                "本回合仅做规划。只产出分析与计划。不要修改文件，也不要运行非只读命令。"
-                    .to_string()
+                "本回合仅做规划。只产出分析与计划。不要修改文件，也不要运行非只读命令。".to_string()
             }
             ExecutionDirective::AnalyzeOnly => {
-                "本回合仅做分析。只检查与解释。不要修改文件，也不要运行非只读命令。"
-                    .to_string()
+                "本回合仅做分析。只检查与解释。不要修改文件，也不要运行非只读命令。".to_string()
             }
             ExecutionDirective::DoNotEdit => {
                 "本回合有明确的禁止编辑指令。不要修改文件，也不要运行非只读命令。".to_string()
