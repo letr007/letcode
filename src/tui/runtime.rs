@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -61,6 +61,8 @@ mod session_cleanup;
 mod session_command_adapter;
 #[path = "runtime/session_dialog.rs"]
 mod session_dialog;
+#[path = "runtime/terminal_event_reader.rs"]
+mod terminal_event_reader;
 use history_tree_dialog::history_tree_dialog_items;
 use lifecycle::{active_turn_state, has_active_or_pending_session_turn};
 use permission_lifecycle::PermissionLifecycleController;
@@ -69,6 +71,7 @@ use session_dialog::session_dialog_item;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use terminal_event_reader::TerminalEventReader;
 
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
@@ -979,6 +982,12 @@ impl TuiRuntime {
     }
 
     fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
+        if session_event_preempts_typewriter(&event) {
+            self.flush_assistant_typewriter();
+            self.apply_session_transport_event(event);
+            return;
+        }
+
         if !self.deferred_session_events.is_empty() {
             self.deferred_session_events.push_back(event);
             return;
@@ -4030,6 +4039,58 @@ fn apply_preferences_theme(state: &mut TuiState, preferences_dir: &Path, theme_i
     }
 }
 
+fn session_event_preempts_typewriter(event: &SessionTransportEvent) -> bool {
+    matches!(
+        event,
+        SessionTransportEvent::Interrupted
+            | SessionTransportEvent::Error(_)
+            | SessionTransportEvent::PermissionRequested { .. }
+            | SessionTransportEvent::QuestionRequested { .. }
+            | SessionTransportEvent::ChildPermissionRequested { .. }
+            | SessionTransportEvent::ChildQuestionRequested { .. }
+            | SessionTransportEvent::ChildSessionViewed { .. }
+            | SessionTransportEvent::ParentSessionViewed { .. }
+    )
+}
+
+fn handle_terminal_event(
+    runtime: &mut TuiRuntime,
+    event: Event,
+    ingress: &crate::session::SessionEngineIngress,
+) -> Result<()> {
+    let (action, allow_submit_family) = match event {
+        Event::Key(key) => {
+            // Windows ReadConsoleInput reports key-down and key-up separately.
+            if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+            (map_key_event(runtime.state(), key), true)
+        }
+        Event::Mouse(mouse) => (map_mouse_event(runtime.state(), mouse), false),
+        Event::Paste(text) => (map_paste_event(runtime.state(), text), false),
+        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => return Ok(()),
+    };
+
+    if let Some(command) = runtime.handle_input_action(action)? {
+        command_dispatch::dispatch_command(runtime, command, ingress, allow_submit_family);
+    }
+    Ok(())
+}
+
+fn drain_terminal_events(
+    runtime: &mut TuiRuntime,
+    reader: &TerminalEventReader,
+    ingress: &crate::session::SessionEngineIngress,
+) -> Result<()> {
+    while let Some(event) = reader.try_recv()? {
+        handle_terminal_event(runtime, event, ingress)?;
+        if runtime.state().quit_requested {
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_tui(
     mut engine: SessionEngine,
     projection: crate::session::SessionEngineProjection,
@@ -4092,6 +4153,7 @@ pub async fn run_tui(
         let mut terminal = OwnedTerminal::new()?;
         runtime.update_terminal_title(&mut terminal)?;
         let mut drawer = TerminalDrawer::new(&mut terminal);
+        let terminal_events = TerminalEventReader::spawn();
 
         if let Some(session_id) = resume_session_id {
             runtime.session_resume_pending = true;
@@ -4107,13 +4169,9 @@ pub async fn run_tui(
         }
 
         loop {
-            runtime.try_drain_session_events();
-            if let Some(command) = runtime.take_next_queued_prompt_command() {
-                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-            }
-            drawer.set_title(&runtime.terminal_title())?;
-            runtime.draw(&mut drawer)?;
-
+            // Input is collected independently from rendering. Consume everything
+            // already captured before ordinary session projection work.
+            drain_terminal_events(&mut runtime, &terminal_events, &ingress)?;
             if runtime.state().quit_requested {
                 if let Some(session_id) = runtime.state().session_id.as_deref() {
                     exit_epilogue = Some(super::render::format_exit_epilogue(
@@ -4123,52 +4181,22 @@ pub async fn run_tui(
                 }
                 break;
             }
-            if event::poll(TUI_FRAME_POLL_INTERVAL)? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        // Windows 的 ReadConsoleInput 会同时上报 key-down/key-up
-                        // 记录，crossterm 把它们都转换为 KeyEvent；只处理 Press
-                        // 否则每个按键会被插入多次（如 `s` 变成 `sss`）。
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-                        let action = map_key_event(runtime.state(), key);
-                        if let Some(command) = runtime.handle_input_action(action)? {
-                            command_dispatch::dispatch_command(
-                                &mut runtime,
-                                command,
-                                &ingress,
-                                true,
-                            );
-                        }
-                    }
-                    Event::Mouse(mouse) => {
-                        let action = map_mouse_event(runtime.state(), mouse);
-                        if let Some(command) = runtime.handle_input_action(action)? {
-                            command_dispatch::dispatch_command(
-                                &mut runtime,
-                                command,
-                                &ingress,
-                                false,
-                            );
-                        }
-                    }
-                    Event::Paste(text) => {
-                        let action = map_paste_event(runtime.state(), text);
-                        if let Some(command) = runtime.handle_input_action(action)? {
-                            command_dispatch::dispatch_command(
-                                &mut runtime,
-                                command,
-                                &ingress,
-                                false,
-                            );
-                        }
-                    }
-                    Event::Resize(_, _) => {}
-                    _ => {}
+
+            runtime.try_drain_session_events();
+            if let Some(command) = runtime.take_next_queued_prompt_command() {
+                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+            }
+            drawer.set_title(&runtime.terminal_title())?;
+            runtime.draw(&mut drawer)?;
+
+            match terminal_events.recv_timeout(TUI_FRAME_POLL_INTERVAL)? {
+                Some(event) => {
+                    handle_terminal_event(&mut runtime, event, &ingress)?;
+                    drain_terminal_events(&mut runtime, &terminal_events, &ingress)?;
                 }
-            } else {
-                let _ = runtime.handle_input_action(InputAction::Tick)?;
+                None => {
+                    let _ = runtime.handle_input_action(InputAction::Tick)?;
+                }
             }
         }
         Ok(())

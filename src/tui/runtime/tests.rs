@@ -6371,6 +6371,80 @@ fn assistant_done_waits_for_typewriter_to_drain() {
 }
 
 #[test]
+fn interrupted_preempts_pending_typewriter_output() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("pending output"),
+    ));
+
+    runtime.consume_session_transport_event(SessionTransportEvent::Interrupted);
+
+    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.deferred_session_events.is_empty());
+    assert!(!runtime.session_turn_active);
+    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::Assistant(message)) if message.text == "pending output"
+    ));
+}
+
+#[test]
+fn child_view_preempts_pending_typewriter_output() {
+    let mut runtime = runtime();
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("parent pending output"),
+    ));
+
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.deferred_session_events.is_empty());
+    assert!(runtime.state().is_read_only_child_view());
+    assert_eq!(
+        runtime
+            .state()
+            .child_view_metadata()
+            .map(|metadata| metadata.child_session_id),
+        Some("child-session".into())
+    );
+}
+
+#[tokio::test]
+async fn terminal_event_handler_preserves_double_escape_interrupt_fifo() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    let (mut engine, ingress, _egress) = crate::session::SessionEngine::new();
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+    handle_terminal_event(&mut runtime, Event::Key(escape), &ingress)
+        .expect("first escape is handled");
+    assert!(matches!(
+        engine.try_recv_control(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    handle_terminal_event(&mut runtime, Event::Key(escape), &ingress)
+        .expect("second escape is handled");
+    assert!(matches!(
+        engine.recv_control().await,
+        Some(SessionEngineControl::Interrupt)
+    ));
+}
+
+#[test]
 fn deferred_events_keep_later_deltas_behind_the_barrier() {
     let mut runtime = runtime();
     runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
