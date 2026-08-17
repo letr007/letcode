@@ -2845,14 +2845,24 @@ impl TuiState {
         self.on_timeline_changed();
     }
 
-    pub(crate) fn matches_presented_frame(&self, rendered: &Self) -> bool {
+    /// Same timeline (regardless of mutation revision). Used to sync render-only
+    /// geometry like scroll bounds/area — these derive from the same content and
+    /// accepting the freshest shown frame is always safe, even while it is still
+    /// streaming. Business state is never copied here.
+    pub(crate) fn same_timeline_as(&self, rendered: &Self) -> bool {
         self.active_timeline().cache_id() == rendered.active_timeline().cache_id()
+    }
+
+    /// Strict match used to refuse mouse-selection on a frame whose content does
+    /// not reflect the live timeline (timeline replaced or further mutated).
+    pub(crate) fn matches_presented_frame(&self, rendered: &Self) -> bool {
+        self.same_timeline_as(rendered)
             && self.active_timeline().mutation_revision()
                 == rendered.active_timeline().mutation_revision()
     }
 
     pub(crate) fn apply_presented_frame(&mut self, rendered: &Self) -> bool {
-        if !self.matches_presented_frame(rendered) {
+        if !self.same_timeline_as(rendered) {
             return false;
         }
         self.transcript_render_cache = rendered.transcript_render_cache.clone();
@@ -3453,6 +3463,28 @@ mod tests {
         state.scroll_transcript_down(10);
         assert_eq!(state.transcript_scroll_offset(), 0);
         assert!(state.auto_scroll);
+    }
+
+    #[test]
+    fn render_geometry_syncs_across_streaming_mutations_on_same_timeline() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("one")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("two")));
+
+        // A render frame of the same timeline, produced before the live panel
+        // streamed one more item (same cache_id, later mutation_revision).
+        let mut rendered = state.clone();
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("three")));
+        rendered.last_transcript_area = ratatui::layout::Rect::new(0, 0, 80, 20);
+        rendered.last_transcript_total_rows = Some(50);
+        rendered.last_transcript_scroll_top = 30;
+
+        assert!(state.same_timeline_as(&rendered));
+        assert!(!state.matches_presented_frame(&rendered));
+        assert!(state.apply_presented_frame(&rendered));
+        assert_eq!(state.last_transcript_total_rows, Some(50));
+        assert_eq!(state.last_transcript_area.height, 20);
+        assert_eq!(state.last_transcript_scroll_top, 30);
     }
 
     #[test]
