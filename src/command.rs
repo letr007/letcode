@@ -474,7 +474,7 @@ pub fn command_metadata() -> &'static [CommandMetadata] {
     COMMANDS
 }
 
-pub fn help_summary() -> String {
+pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
     let commands = [
         "/help",
         "/exit",
@@ -502,9 +502,12 @@ pub fn help_summary() -> String {
         "/parent",
     ]
     .join(", ");
-    format!(
-        "Commands: {commands} · Delegation: {}",
-        delegation_help_summary()
+    translator.t_fmt(
+        "help.summary",
+        &[
+            ("commands", &commands),
+            ("delegation", &delegation_help_summary()),
+        ],
     )
 }
 

@@ -1028,17 +1028,25 @@ impl TuiRuntime {
             Ok(Ok(sessions)) => {
                 self.session_list_rx = None;
                 if sessions.is_empty() {
-                    self.push_command_notice("No previous sessions found");
+                    self.push_command_notice(self.state.t("runtime.no_sessions_found"));
                     return;
                 }
                 let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
-                let dialog = DialogState::new(DialogKind::SessionPicker, "Sessions", None, items);
+                let dialog = DialogState::new(
+                    DialogKind::SessionPicker,
+                    self.state.t("ui.sessions_section"),
+                    None,
+                    items,
+                );
                 self.state.open_dialog(dialog);
             }
             Ok(Err(error)) => {
                 self.session_list_rx = None;
                 self.state.show_toast(
-                    format!("Failed to list sessions: {error}"),
+                    self.state.t_fmt(
+                        "runtime.failed_list_sessions",
+                        &[("error", &error.to_string())],
+                    ),
                     ToastKind::Error,
                 );
             }
@@ -2472,7 +2480,7 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::Help => {
-                self.push_command_notice(help_summary());
+                self.push_command_notice(help_summary(&self.state.translator()));
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::ModelShow => self.show_model_dialog(),
@@ -2847,27 +2855,31 @@ impl TuiRuntime {
 
     fn show_permission_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let items = vec![
-            DialogItem::new("safe", "Safe", Some("Ask before all tools".into())),
+            DialogItem::new(
+                "safe",
+                self.state.t("permission.mode_safe"),
+                Some(self.state.t("permission.desc_safe")),
+            ),
             DialogItem::new(
                 "default",
-                "Default",
-                Some("Allow read/preview, ask for risky tools".into()),
+                self.state.t("permission.mode_default"),
+                Some(self.state.t("permission.desc_default")),
             ),
             DialogItem::new(
                 "auto",
-                "Auto",
-                Some("Same Ask set as Default; reviewer expert approves".into()),
+                self.state.t("permission.mode_auto"),
+                Some(self.state.t("permission.desc_auto")),
             ),
             DialogItem::new(
                 "yolo",
-                "YOLO",
-                Some("Allow write and command tools without asking".into()),
+                self.state.t("permission.mode_yolo"),
+                Some(self.state.t("permission.desc_yolo")),
             ),
         ];
         let mut dialog = DialogState::new(
             DialogKind::PermissionPicker,
-            "Permission mode",
-            Some("Select how much freedom the agent has when using tools".into()),
+            self.state.t("permission.title"),
+            Some(self.state.t("permission.subtitle")),
             items,
         );
         dialog.selected = match self
@@ -2975,11 +2987,16 @@ impl TuiRuntime {
             .iter()
             .map(|expert| {
                 DialogItem::new(expert.agent_name.clone(), expert.agent_name.clone(), None)
-                    .with_section("Experts")
+                    .with_section(self.state.t("ui.experts"))
                     .with_right_detail(expert.route_id.clone())
             })
             .collect();
-        let mut dialog = DialogState::new(DialogKind::AgentPicker, "Expert models", None, items);
+        let mut dialog = DialogState::new(
+            DialogKind::AgentPicker,
+            self.state.t("ui.expert_models"),
+            None,
+            items,
+        );
         dialog.query = query;
         if let Some(agent_name) = selected_agent
             && let Some(index) = dialog.items.iter().position(|item| item.id == agent_name)
@@ -3059,9 +3076,9 @@ impl TuiRuntime {
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.push_command_notice(format!(
-                "Unknown model: {}. Available models: {available}",
-                model_id
+            self.push_command_notice(self.state.t_fmt(
+                "runtime.unknown_model",
+                &[("model", &model_id), ("available", &available)],
             ));
             return Ok(Some(SubmittedCommand::LocalOnly));
         };
@@ -3090,7 +3107,7 @@ impl TuiRuntime {
 
     fn open_history_tree_dialog(&mut self, entries: &[transcript_projection::SessionHistoryEntry]) {
         if entries.is_empty() {
-            self.push_command_notice("No transcript entries found");
+            self.push_command_notice(self.state.t("runtime.no_transcript_entries"));
             return;
         }
 
@@ -3139,7 +3156,7 @@ impl TuiRuntime {
     fn show_reasoning_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let efforts = self.active_reasoning_efforts();
         if efforts.is_empty() {
-            self.push_command_notice("The selected model does not support configurable reasoning");
+            self.push_command_notice(self.state.t("runtime.no_configurable_reasoning"));
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
         let mut dialog = DialogState::new(
@@ -3160,7 +3177,12 @@ impl TuiRuntime {
             self.push_command_notice(self.state.t("runtime.no_context_details"));
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
-        let mut dialog = DialogState::new(DialogKind::ContextPicker, "Context", None, items);
+        let mut dialog = DialogState::new(
+            DialogKind::ContextPicker,
+            self.state.t("runtime.context"),
+            None,
+            items,
+        );
         select_active_context_item(
             &mut dialog,
             self.state.active_context().open_detail.as_ref(),
@@ -3226,7 +3248,7 @@ impl TuiRuntime {
     fn show_skill_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         self.state.open_dialog(DialogState::new(
             DialogKind::SkillPicker,
-            "Local Skills",
+            self.state.t("ui.skills_title"),
             None,
             skill_dialog_items(&self.state.skill_cards),
         ));
@@ -3535,7 +3557,7 @@ impl TuiRuntime {
     fn cycle_reasoning_effort_command(&mut self) -> Option<RuntimeCommand> {
         let efforts = self.active_reasoning_efforts();
         let Some(next) = next_reasoning_effort(&efforts, self.current_reasoning_effort()) else {
-            self.push_command_notice("The selected model does not support configurable reasoning");
+            self.push_command_notice(self.state.t("runtime.no_configurable_reasoning"));
             return None;
         };
         Some(RuntimeCommand::SetReasoningEffort(next))

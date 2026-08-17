@@ -263,7 +263,7 @@ fn render_picker_body(
                         theme,
                         item,
                         selected,
-                        Some(mcp_status_color(item, theme)),
+                        Some(mcp_status_color(item, theme, state.language())),
                     ),
                     DialogKind::PermissionPicker => render_permission_row(
                         frame,
@@ -273,13 +273,21 @@ fn render_picker_body(
                         selected,
                         item.id == state.permission_mode_label,
                     ),
-                    DialogKind::ThemePicker | DialogKind::LanguagePicker => render_permission_row(
+                    DialogKind::ThemePicker => render_permission_row(
                         frame,
                         row,
                         theme,
                         item,
                         selected,
                         item.id == state.theme_id,
+                    ),
+                    DialogKind::LanguagePicker => render_permission_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        item.id == state.language().id(),
                     ),
                     DialogKind::ReasoningPicker => render_reasoning_row(
                         frame,
@@ -463,7 +471,7 @@ fn render_context_preview(
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "No detail available",
+            state.t("ui.no_detail"),
             muted_style(theme),
         )));
     }
@@ -750,10 +758,15 @@ fn render_session_row(
     }
 }
 
-fn mcp_status_color(item: &DialogItem, theme: Theme) -> ratatui::style::Color {
+fn mcp_status_color(
+    item: &DialogItem,
+    theme: Theme,
+    language: crate::tui::i18n::Language,
+) -> ratatui::style::Color {
+    let translator = crate::tui::i18n::Translator::new(language);
     match item.right_detail.as_deref() {
-        Some(status) if status.contains("Online") => theme.success,
-        Some(status) if status.contains("Offline") => theme.error,
+        Some(status) if status.contains(&translator.t("status.online")) => theme.success,
+        Some(status) if status.contains(&translator.t("status.offline")) => theme.error,
         _ => theme.muted_text,
     }
 }
@@ -841,5 +854,38 @@ mod tests {
         assert!(!rendered.contains("private.example"));
         assert!(rendered.contains("No tools discovered for this server"));
         assert!(rendered.contains("Esc back"));
+    }
+
+    #[test]
+    fn zh_cn_language_picker_marks_current_language() {
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 100, 30);
+        let dialog = DialogState::new(
+            DialogKind::LanguagePicker,
+            "选择语言",
+            None,
+            vec![
+                DialogItem::new("en", "English", None),
+                DialogItem::new("zh-CN", "简体中文", None),
+            ],
+        );
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_picker(frame, &mut state, area, theme, &dialog))
+            .expect("draw");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("English"), "{rendered}");
+        assert!(rendered.contains("● 简"), "{rendered}");
     }
 }

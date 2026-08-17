@@ -1171,6 +1171,7 @@ impl TuiState {
         self.language = language;
     }
 
+    #[cfg(test)]
     pub fn effective_language(&self) -> crate::tui::i18n::Language {
         self.language()
     }

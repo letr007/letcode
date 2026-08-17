@@ -196,7 +196,12 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect,
     let inline = composer_inline_lines(state, area.width.saturating_sub(2) as usize, theme)
         .into_iter()
         .next()
-        .unwrap_or_else(|| Line::from(Span::styled("message…", element_style)));
+        .unwrap_or_else(|| {
+            Line::from(Span::styled(
+                state.t("ui.message_placeholder"),
+                element_style,
+            ))
+        });
     let mut spans = vec![
         Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
         Span::styled(" ", element_style),
@@ -603,7 +608,7 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
         surface::muted_style(theme, surface::SurfaceKind::Element).add_modifier(Modifier::ITALIC);
     if state.input_buffer.is_empty() && state.composer_tokens.is_empty() {
         return vec![Line::from(Span::styled(
-            "message letcode…",
+            state.t("ui.message_placeholder"),
             placeholder_style,
         ))];
     }
@@ -1177,15 +1182,15 @@ fn approval_action_label(
     translator: &crate::tui::i18n::Translator,
 ) -> String {
     let key = match permission.tool_name.as_str() {
-        "shell__exec" => "Run command",
-        "fs__read" => "Read file",
-        "fs__write" => "Write file",
-        "fs__append" => "Append file",
-        "fs__mkdir" => "Create directory",
-        "search__rg" => "Search text",
-        "web__fetch" => "Fetch URL",
-        "code__ast_search" => "Search code",
-        "edit__apply_patch" => "Apply patch",
+        "shell__exec" => "permission.run_command",
+        "fs__read" => "permission.read_file",
+        "fs__write" => "permission.write_file",
+        "fs__append" => "permission.append_file",
+        "fs__mkdir" => "permission.create_directory",
+        "search__rg" => "permission.search_text",
+        "web__fetch" => "permission.fetch_url",
+        "code__ast_search" => "permission.search_code",
+        "edit__apply_patch" => "permission.apply_patch",
         _ => "permission.approve_tool",
     };
     translator.t(key)
@@ -1263,6 +1268,9 @@ mod tests {
     }
 
     fn draw_to_string(state: &mut TuiState, width: u16, height: u16) -> String {
+        if state.language.is_none() {
+            state.set_language(Some(crate::tui::i18n::Language::En));
+        }
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -1283,6 +1291,9 @@ mod tests {
     }
 
     fn draw_rows(state: &mut TuiState, width: u16, height: u16) -> Vec<String> {
+        if state.language.is_none() {
+            state.set_language(Some(crate::tui::i18n::Language::En));
+        }
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
 

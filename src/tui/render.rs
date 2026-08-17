@@ -1134,7 +1134,10 @@ fn render_dashboard_hint(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
             dashboard_hint_style(theme),
         ),
         Span::styled("/help", dashboard_hint_key_style(theme)),
-        Span::styled(state.t("ui.commands"), dashboard_hint_style(theme)),
+        Span::styled(
+            format!(" {}", state.t("ui.commands")),
+            dashboard_hint_style(theme),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(line)
