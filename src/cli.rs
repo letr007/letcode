@@ -267,8 +267,13 @@ pub async fn run_repl(
                 )
                 .await?;
             }
-            ReplCommand::Invalid(message) => {
-                println!("{message}");
+            ReplCommand::Invalid(error) => {
+                println!(
+                    "{}",
+                    error.render(&crate::tui::i18n::Translator::new(
+                        crate::tui::i18n::Language::En,
+                    ))
+                );
             }
             ReplCommand::NewSession => {
                 submit_and_wait(
@@ -815,7 +820,7 @@ enum ReplCommand {
     ReasoningSet(ModelReasoningEffort),
     Compact,
     ShowHistoryTree,
-    Invalid(String),
+    Invalid(crate::command::CommandParseError),
     NewSession,
     Unsupported(String),
     Prompt(String),
@@ -834,7 +839,7 @@ fn parse_repl_command(input: &str) -> ReplCommand {
 
     let intent = match parse_command(trimmed) {
         Ok(intent) => intent,
-        Err(error) => return ReplCommand::Invalid(error.message().to_string()),
+        Err(error) => return ReplCommand::Invalid(error),
     };
 
     if let Some(session_command) = SessionCommand::from_command_intent(intent.clone()) {
@@ -872,6 +877,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::McpBrowse | CommandIntent::SkillBrowse => {
             ReplCommand::Unsupported("CLI does not support this panel; use the TUI.".into())
         }
+        CommandIntent::Language(_) => ReplCommand::Unsupported(
+            "Unsupported: /language and /lang are available only in the TUI.".into(),
+        ),
         CommandIntent::Prompt(_)
         | CommandIntent::Delegate { .. }
         | CommandIntent::PermissionSet(_)
@@ -990,7 +998,12 @@ fn print_repl_help() {
         .iter()
         .filter(|command| command.visible_in_help)
     {
-        println!("  {:<24} {}", command.usage, command.description);
+        println!(
+            "  {:<24} {}",
+            command.usage,
+            crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En)
+                .t(command.description_key)
+        );
     }
     println!("  /sessions                list sessions");
 }

@@ -813,21 +813,21 @@ impl TuiRuntime {
             if let Some(question) = self.state.pending_question.as_mut() {
                 question.focus_tab(tab_index);
             }
-            self.state
-                .show_toast("Answer every question before confirming", ToastKind::Info);
+            self.state.show_toast(
+                self.state.t("runtime.answer_all_questions"),
+                ToastKind::Info,
+            );
             return Ok(());
         }
 
         let Some(question) = self.state.pending_question.as_ref() else {
             self.state
-                .show_toast("No question pending", ToastKind::Info);
+                .show_toast(self.state.t("runtime.no_question_pending"), ToastKind::Info);
             return Ok(());
         };
         if question.has_invalid_single_response() {
-            self.state.show_toast(
-                "Single-select questions accept only one answer",
-                ToastKind::Info,
-            );
+            self.state
+                .show_toast(self.state.t("runtime.single_select_only"), ToastKind::Info);
             return Ok(());
         }
 
@@ -1045,8 +1045,10 @@ impl TuiRuntime {
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 self.session_list_rx = None;
-                self.state
-                    .show_toast("Session list worker stopped", ToastKind::Error);
+                self.state.show_toast(
+                    self.state.t("runtime.session_list_worker_stopped"),
+                    ToastKind::Error,
+                );
             }
         }
     }
@@ -1168,15 +1170,19 @@ impl TuiRuntime {
                     .is_err() =>
             {
                 let _ = handle.cancel("another interactive request is already pending");
-                self.state
-                    .show_toast("Question already pending", ToastKind::Info);
+                self.state.show_toast(
+                    self.state.t("runtime.question_already_pending"),
+                    ToastKind::Info,
+                );
                 suppress_session_event = true;
             }
             SessionTransportEvent::PermissionRequested { event, handle } => {
                 if self.state.pending_question.is_some() {
                     let _ = handle.deny();
-                    self.state
-                        .show_toast("Question already pending", ToastKind::Info);
+                    self.state.show_toast(
+                        self.state.t("runtime.question_already_pending"),
+                        ToastKind::Info,
+                    );
                     suppress_session_event = true;
                 } else if let Err(handle) = self
                     .permission_lifecycle
@@ -1184,7 +1190,7 @@ impl TuiRuntime {
                 {
                     let _ = handle.deny();
                     self.state
-                        .show_toast("Permission already pending", ToastKind::Info);
+                        .show_toast(self.state.t("runtime.permission_pending"), ToastKind::Info);
                     suppress_session_event = true;
                 } else {
                     self.state.toast = None;
@@ -1203,8 +1209,10 @@ impl TuiRuntime {
                 .is_err() =>
             {
                 let _ = handle.cancel("another interactive request is already pending");
-                self.state
-                    .show_toast("Question already pending", ToastKind::Info);
+                self.state.show_toast(
+                    self.state.t("runtime.question_already_pending"),
+                    ToastKind::Info,
+                );
                 suppress_session_event = true;
             }
             SessionTransportEvent::ChildPermissionRequested {
@@ -1216,8 +1224,10 @@ impl TuiRuntime {
             } => {
                 if self.state.pending_question.is_some() {
                     let _ = handle.deny();
-                    self.state
-                        .show_toast("Question already pending", ToastKind::Info);
+                    self.state.show_toast(
+                        self.state.t("runtime.question_already_pending"),
+                        ToastKind::Info,
+                    );
                 } else if let Err(handle) = self.permission_lifecycle.begin_child(
                     child_session_id.clone(),
                     event.clone(),
@@ -1225,7 +1235,7 @@ impl TuiRuntime {
                 ) {
                     let _ = handle.deny();
                     self.state
-                        .show_toast("Permission already pending", ToastKind::Info);
+                        .show_toast(self.state.t("runtime.permission_pending"), ToastKind::Info);
                 } else {
                     self.state.toast = None;
                     self.state.apply_child_session_event_with_agent(
@@ -1282,7 +1292,7 @@ impl TuiRuntime {
                 self.apply_restored_model(model_id.clone());
                 self.state.set_provider_label_from_model_route(model_id);
                 self.state.clear_pending_model_if(model_id);
-                self.show_toast("Model updated", ToastKind::Success);
+                self.show_toast(self.state.t("runtime.model_updated"), ToastKind::Success);
             }
             SessionTransportEvent::ExpertModelChanged {
                 agent_name,
@@ -1295,7 +1305,11 @@ impl TuiRuntime {
                 {
                     expert.route_id = model_id.clone();
                 }
-                self.show_toast(format!("{agent_name} model updated"), ToastKind::Success);
+                self.show_toast(
+                    self.state
+                        .t_fmt("runtime.agent_model_updated", &[("agent", agent_name)]),
+                    ToastKind::Success,
+                );
             }
             SessionTransportEvent::PermissionModeChanged { mode } => {
                 self.state.set_permission_mode_label(mode.clone());
@@ -1309,7 +1323,10 @@ impl TuiRuntime {
                 let label = reasoning_effort_status_label(Some(effort.clone()));
                 self.state.set_reasoning_effort_label(Some(label.clone()));
                 self.state.clear_pending_reasoning_effort_if(&label);
-                self.show_toast("Reasoning effort updated", ToastKind::Success);
+                self.show_toast(
+                    self.state.t("runtime.reasoning_updated"),
+                    ToastKind::Success,
+                );
             }
             SessionTransportEvent::SettingChangeFailed { command } => {
                 self.clear_failed_pending_setting(command);
@@ -1414,7 +1431,10 @@ impl TuiRuntime {
                 {
                     self.session_resume_pending = false;
                     self.state.show_toast(
-                        format!("Context projection failed: {error}"),
+                        self.state.t_fmt(
+                            "runtime.context_projection_failed",
+                            &[("error", &error.to_string())],
+                        ),
                         ToastKind::Error,
                     );
                     return;
@@ -1447,7 +1467,8 @@ impl TuiRuntime {
                 if let Some(token_usage) = token_usage {
                     self.state.set_token_usage(token_usage.clone().into());
                 }
-                self.state.show_toast("Session resumed", ToastKind::Info);
+                self.state
+                    .show_toast(self.state.t("runtime.session_resumed"), ToastKind::Info);
             }
             SessionTransportEvent::ParentSessionViewed {
                 session_id,
@@ -1484,7 +1505,10 @@ impl TuiRuntime {
                 if let Err(error) = result {
                     self.state.pending_question = pending_question;
                     self.state.show_toast(
-                        format!("Context projection failed: {error}"),
+                        self.state.t_fmt(
+                            "runtime.context_projection_failed",
+                            &[("error", &error.to_string())],
+                        ),
                         ToastKind::Error,
                     );
                     return;
@@ -1543,7 +1567,10 @@ impl TuiRuntime {
                     )
                 {
                     self.state.show_toast(
-                        format!("Context projection failed: {error}"),
+                        self.state.t_fmt(
+                            "runtime.context_projection_failed",
+                            &[("error", &error.to_string())],
+                        ),
                         ToastKind::Error,
                     );
                     return;
@@ -1566,7 +1593,10 @@ impl TuiRuntime {
                     )
                 {
                     self.state.show_toast(
-                        format!("Context projection failed: {error}"),
+                        self.state.t_fmt(
+                            "runtime.context_projection_failed",
+                            &[("error", &error.to_string())],
+                        ),
                         ToastKind::Error,
                     );
                     return;
@@ -1592,7 +1622,7 @@ impl TuiRuntime {
                 self.state
                     .set_current_context_branch(crate::transcript::ROOT_CONTEXT_BRANCH_ID);
                 self.state
-                    .show_toast("New session started", ToastKind::Info);
+                    .show_toast(self.state.t("runtime.new_session_started"), ToastKind::Info);
             }
             SessionTransportEvent::McpToolsDiscovered(servers) => {
                 self.state.set_mcp_servers(servers.clone());
@@ -2203,7 +2233,7 @@ impl TuiRuntime {
             if current != selected.command {
                 if !self.state.composer_tokens.is_empty() {
                     self.state
-                        .show_toast("Remove attachments before running command", ToastKind::Info);
+                        .show_toast(self.state.t("runtime.remove_attachments"), ToastKind::Info);
                     return Ok(None);
                 }
                 self.state.set_input(selected.insert_text);
@@ -2228,7 +2258,7 @@ impl TuiRuntime {
             && !matches!(&parsed_command, Ok(CommandIntent::Prompt(_)))
         {
             self.state
-                .show_toast("Remove attachments before running command", ToastKind::Info);
+                .show_toast(self.state.t("runtime.remove_attachments"), ToastKind::Info);
             return Ok(None);
         }
         self.reset_history_navigation();
@@ -2270,7 +2300,8 @@ impl TuiRuntime {
                 | None
                     if active_turn_local_rejected || !active_turn_local_command_allowed =>
                 {
-                    self.state.show_toast("Turn still running", ToastKind::Info);
+                    self.state
+                        .show_toast(self.state.t("runtime.turn_running"), ToastKind::Info);
                     return Ok(None);
                 }
                 Some(crate::session::ActiveTurnCommandDisposition::QueuePrompt)
@@ -2403,12 +2434,13 @@ impl TuiRuntime {
         if !self.interrupt_confirmation_pending {
             self.interrupt_confirmation_pending = true;
             self.state
-                .show_toast("Press Esc again to interrupt", ToastKind::Info);
+                .show_toast(self.state.t("runtime.press_esc_again"), ToastKind::Info);
             return Ok(None);
         }
 
         self.interrupt_confirmation_pending = false;
-        self.state.show_toast("Interrupting", ToastKind::Info);
+        self.state
+            .show_toast(self.state.t("runtime.interrupting"), ToastKind::Info);
         Ok(Some(RuntimeCommand::Interrupt))
     }
 
@@ -2419,7 +2451,8 @@ impl TuiRuntime {
         let intent = match parsed {
             Ok(intent) => intent,
             Err(error) => {
-                self.push_command_notice(error.message());
+                let translator = self.state.translator();
+                self.push_command_notice(error.render(&translator));
                 return Ok(Some(SubmittedCommand::LocalOnly));
             }
         };
@@ -2432,6 +2465,7 @@ impl TuiRuntime {
         }
 
         match intent {
+            CommandIntent::Language(value) => self.handle_language_command(value),
             CommandIntent::Prompt(_) => Ok(None),
             CommandIntent::Exit => {
                 self.state.apply_event(SessionEvent::Quit);
@@ -2506,7 +2540,8 @@ impl TuiRuntime {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
                 self.session_turn_active = true;
-                self.state.show_toast("Compacting context", ToastKind::Info);
+                self.state
+                    .show_toast(self.state.t("runtime.compacting_context"), ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
             SessionCommand::ShowHistoryTree => Ok(Some(SubmittedCommand::Runtime(
@@ -2519,7 +2554,8 @@ impl TuiRuntime {
             )),
             SessionCommand::ResumeSession(session_id) => {
                 self.session_resume_pending = true;
-                self.state.show_toast("Resuming session", ToastKind::Info);
+                self.state
+                    .show_toast(self.state.t("runtime.resuming_session"), ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(
                     RuntimeCommand::ResumeSession(session_id),
                 )))
@@ -2564,6 +2600,46 @@ impl TuiRuntime {
         }
     }
 
+    fn handle_language_command(
+        &mut self,
+        value: Option<String>,
+    ) -> Result<Option<SubmittedCommand>> {
+        let language = match value.as_deref() {
+            Some(value) => crate::tui::i18n::Language::parse(value)
+                .ok_or_else(|| anyhow!("Unsupported language"))
+                .map(Some)?,
+            None => None,
+        };
+        if let Some(language) = language {
+            self.state.set_language(Some(language));
+            self.tui_preferences()
+                .save_to_dir(&self.preferences_dir)
+                .map_err(|error| anyhow!("failed to save language preference: {error}"))?;
+            self.state.show_toast(
+                self.state
+                    .t_fmt("language.changed", &[("language", language.endonym())]),
+                ToastKind::Info,
+            );
+        } else {
+            let items = [
+                DialogItem::new("en", "English", None),
+                DialogItem::new("zh-CN", "简体中文", None),
+            ];
+            let mut dialog = DialogState::new(
+                DialogKind::LanguagePicker,
+                self.state.t("language.select"),
+                None,
+                items.into_iter().collect(),
+            );
+            dialog.selected = match self.state.language() {
+                crate::tui::i18n::Language::En => 0,
+                crate::tui::i18n::Language::ZhCn => 1,
+            };
+            self.state.open_dialog(dialog);
+        }
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
     fn handle_tool_output_command(
         &mut self,
         mode: ToolOutputMode,
@@ -2584,12 +2660,12 @@ impl TuiRuntime {
         let prefs = self.tui_preferences();
         if let Err(_error) = prefs.save_to_dir(&self.preferences_dir) {
             self.state
-                .show_toast("Tool output mode changed", ToastKind::Info);
+                .show_toast(self.state.t("runtime.tool_output_changed"), ToastKind::Info);
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
 
         self.state
-            .show_toast("Tool output mode changed", ToastKind::Info);
+            .show_toast(self.state.t("runtime.tool_output_changed"), ToastKind::Info);
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -2605,12 +2681,16 @@ impl TuiRuntime {
         self.state.set_transcript_scrollbar_visible(visible);
         let prefs = self.tui_preferences();
         if let Err(_error) = prefs.save_to_dir(&self.preferences_dir) {
-            self.state
-                .show_toast("Transcript scrollbar", ToastKind::Info);
+            self.state.show_toast(
+                self.state.t("runtime.transcript_scrollbar"),
+                ToastKind::Info,
+            );
             return SubmittedCommand::LocalOnly;
         }
-        self.state
-            .show_toast("Transcript scrollbar", ToastKind::Info);
+        self.state.show_toast(
+            self.state.t("runtime.transcript_scrollbar"),
+            ToastKind::Info,
+        );
         SubmittedCommand::LocalOnly
     }
 
@@ -2620,6 +2700,10 @@ impl TuiRuntime {
             transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
             theme: self.state.theme_id.clone(),
             thoughts_display: self.state.thoughts_display,
+            language: self
+                .state
+                .language
+                .map(|language| language.id().to_string()),
         }
     }
 
@@ -2638,7 +2722,8 @@ impl TuiRuntime {
             tracing::warn!(%error, "failed to save TUI preferences");
         }
         self.state.show_toast(
-            format!("Thinking display: {}", mode.label()),
+            self.state
+                .t_fmt("runtime.thinking_display", &[("mode", mode.label())]),
             ToastKind::Info,
         );
     }
@@ -2671,8 +2756,8 @@ impl TuiRuntime {
         }
         let mut dialog = DialogState::new(
             DialogKind::ThemePicker,
-            "Select theme",
-            Some("Choose the TUI color palette".into()),
+            self.state.t("runtime.select_theme"),
+            Some(self.state.t("runtime.choose_palette")),
             items,
         );
         dialog.selected = dialog
@@ -2692,17 +2777,23 @@ impl TuiRuntime {
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
             tracing::warn!(%error, "failed to save TUI preferences");
             self.state
-                .show_toast("Theme changed; preference not saved", ToastKind::Info);
+                .show_toast(self.state.t("runtime.theme_not_saved"), ToastKind::Info);
         } else {
-            self.state
-                .show_toast(format!("Theme: {}", self.state.theme_id), ToastKind::Info);
+            self.state.show_toast(
+                self.state
+                    .t_fmt("runtime.theme_changed", &[("theme", &self.state.theme_id)]),
+                ToastKind::Info,
+            );
         }
     }
 
     fn activate_theme(&mut self, theme_id: &str) -> bool {
         let Some(id) = normalize_theme_id(theme_id) else {
-            self.state
-                .show_toast(format!("Invalid theme id: {theme_id}"), ToastKind::Error);
+            self.state.show_toast(
+                self.state
+                    .t_fmt("runtime.invalid_theme", &[("theme", theme_id)]),
+                ToastKind::Error,
+            );
             return false;
         };
         if let Some(builtin) = ThemeName::parse(&id) {
@@ -2717,8 +2808,11 @@ impl TuiRuntime {
             }
             Err(error) => {
                 tracing::warn!(%error, theme = %id, "failed to load custom theme");
-                self.state
-                    .show_toast(format!("Failed to load theme '{id}'"), ToastKind::Error);
+                self.state.show_toast(
+                    self.state
+                        .t_fmt("runtime.load_theme_failed", &[("theme", &id)]),
+                    ToastKind::Error,
+                );
                 false
             }
         }
@@ -2846,7 +2940,12 @@ impl TuiRuntime {
 
     fn show_model_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let items = self.model_dialog_items();
-        let mut dialog = DialogState::new(DialogKind::ModelPicker, "Select model", None, items);
+        let mut dialog = DialogState::new(
+            DialogKind::ModelPicker,
+            self.state.t("runtime.select_model"),
+            None,
+            items,
+        );
         let selected_model_id = self
             .state
             .pending_composer_settings
@@ -2910,7 +3009,7 @@ impl TuiRuntime {
             .unwrap_or_else(|| self.state.model_id.clone());
         let mut dialog = DialogState::new(
             DialogKind::ExpertModelPicker(agent_name),
-            "Select expert model",
+            self.state.t("runtime.select_expert_model"),
             None,
             self.model_dialog_items(),
         );
@@ -2997,8 +3096,8 @@ impl TuiRuntime {
 
         let mut dialog = DialogState::new(
             DialogKind::HistoryTree,
-            "Session history",
-            Some("Select an entry".into()),
+            self.state.t("runtime.session_history"),
+            Some(self.state.t("runtime.select_entry")),
             history_tree_dialog_items(entries),
         );
         dialog.selected = dialog.items.len().saturating_sub(1);
@@ -3008,8 +3107,8 @@ impl TuiRuntime {
     fn show_thoughts_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let mut dialog = DialogState::new(
             DialogKind::ThoughtsPicker,
-            "Thinking display",
-            Some("Select how thinking appears in the timeline".into()),
+            self.state.t("runtime.thinking_display_title"),
+            Some(self.state.t("runtime.thinking_display_description")),
             vec![
                 DialogItem::new(
                     ThoughtsDisplayMode::Compact.as_str(),
@@ -3046,7 +3145,7 @@ impl TuiRuntime {
         let mut dialog = DialogState::new(
             DialogKind::ReasoningPicker,
             "Reasoning effort",
-            Some("Select how much reasoning the model should use".into()),
+            Some(self.state.t("runtime.reasoning_description")),
             reasoning_dialog_items(&efforts),
         );
         dialog.selected =
@@ -3058,7 +3157,7 @@ impl TuiRuntime {
     fn show_context_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let items = super::state::context_dialog_items(self.state.active_context());
         if items.is_empty() {
-            self.push_command_notice("No context details found");
+            self.push_command_notice(self.state.t("runtime.no_context_details"));
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
         let mut dialog = DialogState::new(DialogKind::ContextPicker, "Context", None, items);
@@ -3080,9 +3179,13 @@ impl TuiRuntime {
         let description = mcp_discovery_description(self.state.mcp_discovery);
         let mut dialog = DialogState::new(
             DialogKind::McpPicker,
-            "MCP Servers",
+            self.state.t("runtime.mcp_servers"),
             description,
-            mcp_dialog_items(&self.state.mcp_servers, &self.state.mcp_updating),
+            mcp_dialog_items(
+                &self.state.mcp_servers,
+                &self.state.mcp_updating,
+                self.state.language(),
+            ),
         );
         dialog.query = query;
         if let Some(server_name) = selected_server
@@ -3094,7 +3197,11 @@ impl TuiRuntime {
     }
 
     fn refresh_open_mcp_dialog(&mut self) {
-        let items = mcp_dialog_items(&self.state.mcp_servers, &self.state.mcp_updating);
+        let items = mcp_dialog_items(
+            &self.state.mcp_servers,
+            &self.state.mcp_updating,
+            self.state.language(),
+        );
         let description = mcp_discovery_description(self.state.mcp_discovery);
         let Some(dialog) = self
             .state
@@ -3147,7 +3254,8 @@ impl TuiRuntime {
         let description = self.mcp_tools_dialog_description(&server_name);
         let mut dialog = DialogState::new(
             DialogKind::McpToolsPicker,
-            format!("MCP Tools · {server_name}"),
+            self.state
+                .t_fmt("runtime.mcp_tools", &[("server", &server_name)]),
             description,
             mcp_tool_dialog_items(&tools),
         );
@@ -3163,11 +3271,11 @@ impl TuiRuntime {
             .iter()
             .find(|server| server.name == server_name)
             .map(|server| match &server.status {
-                mcp::McpServerStatus::Disabled => "Disabled · cached tools are not callable".into(),
-                mcp::McpServerStatus::Online { tool_count } => {
-                    format!("Online · {tool_count} tools available")
-                }
-                mcp::McpServerStatus::Offline { .. } => "Offline".into(),
+                mcp::McpServerStatus::Disabled => self.state.t("runtime.mcp_disabled"),
+                mcp::McpServerStatus::Online { tool_count } => self
+                    .state
+                    .t_fmt("runtime.mcp_online", &[("count", &tool_count.to_string())]),
+                mcp::McpServerStatus::Offline { .. } => self.state.t("runtime.mcp_offline"),
             })
     }
 
@@ -3206,7 +3314,10 @@ impl TuiRuntime {
             return Ok(None);
         };
         if self.state.mcp_updating.contains(&server_name) {
-            self.show_toast("MCP server update is still in progress", ToastKind::Error);
+            self.show_toast(
+                self.state.t("runtime.mcp_update_progress"),
+                ToastKind::Error,
+            );
             return Ok(None);
         }
         if !self.has_active_or_pending_session_turn() {
@@ -3332,6 +3443,16 @@ impl TuiRuntime {
                 }
                 Ok(None)
             }
+            DialogKind::LanguagePicker => {
+                let language = match selected.id.as_str() {
+                    "zh-CN" => crate::tui::i18n::Language::ZhCn,
+                    _ => crate::tui::i18n::Language::En,
+                };
+                self.state.set_language(Some(language));
+                self.tui_preferences().save_to_dir(&self.preferences_dir)?;
+                self.state.close_dialog();
+                Ok(None)
+            }
             DialogKind::SkillPicker => {
                 let attached = self.state.add_composer_skill(selected.id);
                 self.state.close_dialog();
@@ -3379,7 +3500,7 @@ impl TuiRuntime {
         let Some(target) = parse_context_dialog_target(&selected_id) else {
             self.state.open_context_detail(None);
             self.notify_context_dialog_issue(
-                "Context item unavailable",
+                &self.state.t("runtime.context_item_unavailable"),
                 "Refresh context and try again",
             );
             return;
@@ -3388,7 +3509,7 @@ impl TuiRuntime {
         if !context_detail_available(self.state.active_context(), &target) {
             self.state.open_context_detail(None);
             self.notify_context_dialog_issue(
-                "Context item unavailable",
+                &self.state.t("runtime.context_item_unavailable"),
                 "Refresh context and try again",
             );
             return;
@@ -3491,7 +3612,11 @@ impl TuiRuntime {
         match self.state.transcript_click_target(col, row) {
             Some(TranscriptClickTarget::OpenUrl(url)) if activate_link => {
                 if let Err(error) = super::transcript_ratatui::open_hyperlink_url(&url) {
-                    self.show_toast(format!("Failed to open link: {error}"), ToastKind::Error);
+                    self.show_toast(
+                        self.state
+                            .t_fmt("runtime.failed_open_link", &[("error", &error.to_string())]),
+                        ToastKind::Error,
+                    );
                 }
             }
             Some(TranscriptClickTarget::OpenUrl(_)) => {}
@@ -3614,13 +3739,16 @@ impl TuiRuntime {
         match Clipboard::new() {
             Ok(mut clipboard) => {
                 if clipboard.set_text(text).is_err() {
-                    self.show_toast("Couldn’t copy to clipboard", ToastKind::Error);
+                    self.show_toast(self.state.t("runtime.copy_failed"), ToastKind::Error);
                 } else {
-                    self.show_toast("Copied to clipboard", ToastKind::Success);
+                    self.show_toast(self.state.t("runtime.copied_clipboard"), ToastKind::Success);
                 }
             }
             Err(_) => {
-                self.show_toast("Clipboard unavailable", ToastKind::Error);
+                self.show_toast(
+                    self.state.t("runtime.clipboard_unavailable"),
+                    ToastKind::Error,
+                );
             }
         }
 
@@ -3670,7 +3798,7 @@ impl TuiRuntime {
                             data_url,
                         });
                         self.reset_history_navigation();
-                        self.show_toast("Image added", ToastKind::Success);
+                        self.show_toast(self.state.t("runtime.image_added"), ToastKind::Success);
                     }
                     ClipboardPasteChoice::Text => {
                         let action = map_paste_event(
@@ -3680,12 +3808,15 @@ impl TuiRuntime {
                         let _ = self.handle_input_action(action)?;
                     }
                     ClipboardPasteChoice::None => {
-                        self.show_toast("Couldn’t paste from clipboard", ToastKind::Error);
+                        self.show_toast(self.state.t("runtime.paste_failed"), ToastKind::Error);
                     }
                 }
             }
             Err(_) => {
-                self.show_toast("Clipboard unavailable", ToastKind::Error);
+                self.show_toast(
+                    self.state.t("runtime.clipboard_unavailable"),
+                    ToastKind::Error,
+                );
             }
         }
 
@@ -4203,6 +4334,7 @@ pub async fn run_tui(
     state.session_id = Some(projection.session_id);
     state.set_skill_cards(skill_cards);
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
+    state.set_language(preferences.explicit_language());
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
     state.set_thoughts_display(preferences.thoughts_display);
@@ -4221,7 +4353,8 @@ pub async fn run_tui(
         )));
     }
     if !projection.api_key_configured {
-        state.show_toast("Missing API key", ToastKind::Info);
+        let message = state.t("runtime.missing_api_key");
+        state.show_toast(message, ToastKind::Info);
     }
     if let Some(toast) = startup_toast {
         state.show_toast(toast.message, toast.kind);
@@ -4248,9 +4381,8 @@ pub async fn run_tui(
 
         if let Some(session_id) = resume_session_id {
             runtime.session_resume_pending = true;
-            runtime
-                .state
-                .show_toast("Resuming session", ToastKind::Info);
+            let message = runtime.state.t("runtime.resuming_session");
+            runtime.state.show_toast(message, ToastKind::Info);
             command_dispatch::dispatch_command(
                 &mut runtime,
                 RuntimeCommand::ResumeSession(session_id),

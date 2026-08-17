@@ -1,25 +1,30 @@
 use crate::{
     mcp::{McpServerCatalogEntry, McpServerStatus},
     skills::SkillCard,
-    tui::state::DialogItem,
+    tui::{i18n::Language, state::DialogItem},
 };
 
 pub fn mcp_dialog_items(
     servers: &[McpServerCatalogEntry],
     updating: &std::collections::HashSet<String>,
+    language: Language,
 ) -> Vec<DialogItem> {
+    let translator = crate::tui::i18n::Translator::new(language);
     servers
         .iter()
         .map(|server| {
             let status = if updating.contains(&server.name) {
-                "◌ Updating".into()
+                format!("◌ {}", translator.t("status.updating"))
             } else {
                 match &server.status {
-                    McpServerStatus::Disabled => "○ Disabled".into(),
-                    McpServerStatus::Online { tool_count } => {
-                        format!("● Online · {tool_count} tools")
+                    McpServerStatus::Disabled => format!("○ {}", translator.t("status.disabled")),
+                    McpServerStatus::Online { tool_count } => translator.t_fmt(
+                        "status.mcp_online_tools",
+                        &[("count", &tool_count.to_string())],
+                    ),
+                    McpServerStatus::Offline { .. } => {
+                        format!("● {}", translator.t("status.offline"))
                     }
-                    McpServerStatus::Offline { .. } => "● Offline".into(),
                 }
             };
             DialogItem::new(server.name.clone(), server.name.clone(), None)
@@ -61,10 +66,28 @@ mod tests {
                 status: McpServerStatus::Online { tool_count: 2 },
             }],
             &std::collections::HashSet::new(),
+            Language::En,
         );
 
         assert_eq!(items[0].label, "docs");
         assert_eq!(items[0].right_detail.as_deref(), Some("● Online · 2 tools"));
+    }
+
+    #[test]
+    fn maps_language_picker_entries_with_endonyms_and_current_ids() {
+        let items = [
+            DialogItem::new("en", "English", None),
+            DialogItem::new("zh-CN", "简体中文", None),
+        ];
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["en", "zh-CN"]
+        );
+        assert_eq!(items[0].label, "English");
+        assert_eq!(items[1].label, "简体中文");
     }
 
     #[test]

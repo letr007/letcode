@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::{
+    measure::display_width,
     state::{DialogItem, DialogKind, DialogState, TuiState},
     theme::Theme,
 };
@@ -59,6 +60,7 @@ pub fn render_picker(
                 frame,
                 Rect::new(inner.x, search_y, inner.width, 1),
                 theme,
+                state,
                 dialog,
             );
         }
@@ -71,6 +73,7 @@ pub fn render_picker(
                 frame,
                 Rect::new(inner.x, search_y, inner.width, 1),
                 theme,
+                state,
                 dialog,
             );
         }
@@ -110,7 +113,7 @@ pub fn render_picker(
             dialog.kind,
             DialogKind::McpPicker | DialogKind::McpToolsPicker
         ) {
-            render_mcp_picker_footer(frame, footer_area, theme, dialog.kind.clone());
+            render_mcp_picker_footer(frame, footer_area, theme, state, dialog.kind.clone());
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
@@ -181,9 +184,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {
     );
 }
 
-fn render_search(frame: &mut Frame<'_>, area: Rect, theme: Theme, dialog: &DialogState) {
+fn render_search(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+    dialog: &DialogState,
+) {
     let text = if dialog.query.is_empty() {
-        Span::styled("Search", muted_style(theme))
+        Span::styled(state.t("ui.search"), muted_style(theme))
     } else {
         Span::styled(dialog.query.clone(), item_style(theme))
     };
@@ -264,7 +273,7 @@ fn render_picker_body(
                         selected,
                         item.id == state.permission_mode_label,
                     ),
-                    DialogKind::ThemePicker => render_permission_row(
+                    DialogKind::ThemePicker | DialogKind::LanguagePicker => render_permission_row(
                         frame,
                         row,
                         theme,
@@ -302,22 +311,25 @@ fn render_picker_body(
 
     if !rendered_any && y < area.bottom() {
         let empty_label = match dialog.kind {
-            DialogKind::SessionPicker => "No sessions found",
-            DialogKind::HistoryTree => "No history entries found",
-            DialogKind::ContextPicker => "No context items found",
+            DialogKind::LanguagePicker => state.t("language.no_match"),
+            DialogKind::SessionPicker => state.t("dialog.no_sessions"),
+            DialogKind::HistoryTree => state.t("dialog.no_history"),
+            DialogKind::ContextPicker => state.t("dialog.no_context"),
             DialogKind::McpPicker => dialog
                 .description
-                .as_deref()
-                .unwrap_or("No MCP tools discovered"),
-            DialogKind::McpToolsPicker => "No tools discovered for this server",
-            DialogKind::SkillPicker => "No local skills found",
-            DialogKind::PermissionPicker => "No permission modes found",
-            DialogKind::ThemePicker => "No themes found",
-            DialogKind::ReasoningPicker => "No reasoning efforts found",
-            DialogKind::ThoughtsPicker => "No thinking display modes found",
-            DialogKind::AgentPicker => "No experts found",
-            DialogKind::ExpertModelPicker(_) | DialogKind::ModelPicker => "No models found",
-            _ => "No items found",
+                .clone()
+                .unwrap_or_else(|| state.t("dialog.no_mcp_tools")),
+            DialogKind::McpToolsPicker => state.t("dialog.no_server_tools"),
+            DialogKind::SkillPicker => state.t("dialog.no_skills"),
+            DialogKind::PermissionPicker => state.t("dialog.no_permission_modes"),
+            DialogKind::ThemePicker => state.t("dialog.no_themes"),
+            DialogKind::ReasoningPicker => state.t("dialog.no_reasoning"),
+            DialogKind::ThoughtsPicker => state.t("dialog.no_thoughts"),
+            DialogKind::AgentPicker => state.t("dialog.no_experts"),
+            DialogKind::ExpertModelPicker(_) | DialogKind::ModelPicker => {
+                state.t("dialog.no_models")
+            }
+            _ => state.t("dialog.no_items"),
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(empty_label, muted_style(theme))))
@@ -327,21 +339,27 @@ fn render_picker_body(
     }
 }
 
-fn render_mcp_picker_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme, kind: DialogKind) {
+fn render_mcp_picker_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+    kind: DialogKind,
+) {
     let spans = match kind {
         DialogKind::McpPicker => vec![
             Span::styled("Space", accent_style(theme)),
-            Span::styled(" toggle", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.toggle")), muted_style(theme)),
             Span::styled("  ·  ", muted_style(theme)),
             Span::styled("Enter", accent_style(theme)),
-            Span::styled(" tools", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.tools")), muted_style(theme)),
             Span::styled("  ·  ", muted_style(theme)),
             Span::styled("Esc", accent_style(theme)),
-            Span::styled(" close", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.close")), muted_style(theme)),
         ],
         DialogKind::McpToolsPicker => vec![
             Span::styled("Esc", accent_style(theme)),
-            Span::styled(" back", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.back")), muted_style(theme)),
         ],
         _ => unreachable!("MCP picker footer only renders MCP picker kinds"),
     };
@@ -688,7 +706,7 @@ fn render_session_row(
     let right_width = item
         .right_detail
         .as_ref()
-        .map(|detail| detail.chars().count() as u16)
+        .map(|detail| display_width(detail) as u16)
         .unwrap_or(0)
         .min(content.width);
     let left_width = content.width.saturating_sub(right_width.saturating_add(2));
@@ -803,6 +821,7 @@ mod tests {
             Vec::new(),
         );
         let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("terminal");
 

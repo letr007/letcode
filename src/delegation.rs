@@ -3,7 +3,7 @@ pub struct DelegationMetadata {
     pub agent_name: &'static str,
     pub command: &'static str,
     pub insert_text: &'static str,
-    pub description: &'static str,
+    pub description_key: &'static str,
     pub usage: &'static str,
 }
 
@@ -12,42 +12,42 @@ pub const DELEGATION_EXPERTS: &[DelegationMetadata] = &[
         agent_name: "explorer",
         command: "@explorer",
         insert_text: "@explorer ",
-        description: "Delegate a read-only exploration task",
+        description_key: "expert.explorer",
         usage: "@explorer <task>",
     },
     DelegationMetadata {
         agent_name: "fixer",
         command: "@fixer",
         insert_text: "@fixer ",
-        description: "Delegate an implementation or repair task",
+        description_key: "expert.fixer",
         usage: "@fixer <task>",
     },
     DelegationMetadata {
         agent_name: "oracle",
         command: "@oracle",
         insert_text: "@oracle ",
-        description: "Delegate a review or audit task",
+        description_key: "expert.oracle",
         usage: "@oracle <task>",
     },
     DelegationMetadata {
         agent_name: "designer",
         command: "@designer",
         insert_text: "@designer ",
-        description: "Delegate UX or design-oriented work",
+        description_key: "expert.designer",
         usage: "@designer <task>",
     },
     DelegationMetadata {
         agent_name: "librarian",
         command: "@librarian",
         insert_text: "@librarian ",
-        description: "Delegate documentation or reference gathering",
+        description_key: "expert.librarian",
         usage: "@librarian <task>",
     },
     DelegationMetadata {
         agent_name: "general",
         command: "@general",
         insert_text: "@general ",
-        description: "Delegate general-purpose task execution",
+        description_key: "expert.general",
         usage: "@general <task>",
     },
 ];
@@ -90,6 +90,8 @@ pub fn delegation_usage_list() -> String {
     format!("@<{experts}> <task>")
 }
 
+#[allow(dead_code)]
+#[cfg(test)]
 pub fn unknown_expert_error(agent_name: &str) -> String {
     let mut experts = DELEGATION_EXPERTS
         .iter()

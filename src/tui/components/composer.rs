@@ -158,10 +158,11 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, 
     }
 
     if let Some(permission) = &state.pending_permission {
+        let translator = state.translator();
         if area.height < 3 || area.width < 16 {
-            render_pending_approval_tiny(frame, permission, area, theme);
+            render_pending_approval_tiny(frame, permission, area, theme, &translator);
         } else {
-            render_pending_approval_panel(frame, permission, area, theme);
+            render_pending_approval_panel(frame, permission, area, theme, &translator);
         }
         return;
     }
@@ -342,6 +343,7 @@ fn render_pending_approval_tiny(
     permission: &PermissionView,
     area: Rect,
     theme: Theme,
+    translator: &crate::tui::i18n::Translator,
 ) {
     let bar_style = surface::accent_style(
         theme,
@@ -355,7 +357,7 @@ fn render_pending_approval_tiny(
         Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
         Span::styled(" ", element_style),
         Span::styled(
-            compact_permission_summary(permission, area.width as usize),
+            compact_permission_summary(permission, area.width as usize, translator),
             element_style,
         ),
     ]);
@@ -367,6 +369,7 @@ fn render_pending_approval_panel(
     permission: &PermissionView,
     area: Rect,
     theme: Theme,
+    translator: &crate::tui::i18n::Translator,
 ) {
     let Some(shell) =
         render_connected_prompt_shell(frame, area, theme, surface::SurfaceEmphasis::Approval, 1)
@@ -375,13 +378,24 @@ fn render_pending_approval_panel(
     };
 
     let pending_style = surface::surface_style(theme, surface::SurfaceKind::Element);
-    let heading = approval_heading_line(permission, theme, shell.content_area.width as usize);
-    let summary = approval_primary_line(permission, theme, shell.content_area.width as usize);
+    let heading = approval_heading_line(
+        permission,
+        theme,
+        shell.content_area.width as usize,
+        translator,
+    );
+    let summary = approval_primary_line(
+        permission,
+        theme,
+        shell.content_area.width as usize,
+        translator,
+    );
     let mut lines = vec![heading, summary];
     lines.extend(approval_detail_lines(
         permission,
         theme,
         shell.content_area.width as usize,
+        translator,
     ));
 
     frame.render_widget(
@@ -392,7 +406,13 @@ fn render_pending_approval_panel(
     );
 
     if let Some(footer_area) = shell.footer_area {
-        render_pending_approval_footer(frame, footer_area, permission.can_allow_always, theme);
+        render_pending_approval_footer(
+            frame,
+            footer_area,
+            permission.can_allow_always,
+            theme,
+            translator,
+        );
     }
 }
 
@@ -821,9 +841,9 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
     let dim = surface::muted_style(theme, surface::SurfaceKind::Element);
 
     let mode = if state.pending_permission.is_some() {
-        "approval pending"
+        state.t("permission.pending")
     } else {
-        "prompt"
+        state.t("ui.prompt")
     };
 
     let (model_label, model_style) = state
@@ -947,45 +967,56 @@ pub(crate) fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style)
     frame.render_widget(Paragraph::new(Text::from(lines)).style(style), bar_area);
 }
 
-fn compact_permission_summary(permission: &PermissionView, width: usize) -> String {
+fn compact_permission_summary(
+    permission: &PermissionView,
+    width: usize,
+    translator: &crate::tui::i18n::Translator,
+) -> String {
     one_line_snippet(
-        &approval_primary_text(permission),
+        &approval_primary_text(permission, translator),
         width.saturating_sub(2).max(1),
     )
 }
 
-fn approval_primary_line(permission: &PermissionView, theme: Theme, width: usize) -> Line<'static> {
-    let label = approval_action_label(permission);
-    let label_width = display_width(label);
+fn approval_primary_line(
+    permission: &PermissionView,
+    theme: Theme,
+    width: usize,
+    translator: &crate::tui::i18n::Translator,
+) -> Line<'static> {
+    let label = approval_action_label(permission, translator);
+    let label_width = display_width(&label);
     let subject = one_line_snippet(
         &approval_subject(permission),
         width.saturating_sub(label_width + 3).max(1),
     );
 
     Line::from(vec![
-        Span::styled(label.to_string(), theme.approval_style()),
+        Span::styled(label, theme.approval_style()),
         Span::styled(" · ", muted_pending(theme)),
         Span::styled(subject, inline_pending(theme)),
     ])
 }
 
-fn approval_heading_line(permission: &PermissionView, theme: Theme, width: usize) -> Line<'static> {
-    let title = approval_action_label(permission);
+fn approval_heading_line(
+    permission: &PermissionView,
+    theme: Theme,
+    width: usize,
+    translator: &crate::tui::i18n::Translator,
+) -> Line<'static> {
+    let title = approval_action_label(permission, translator);
     let origin = permission
         .origin_label
         .as_deref()
         .unwrap_or("needs approval");
     let detail = one_line_snippet(
         origin,
-        width.saturating_sub(display_width(title) + 4).max(1),
+        width.saturating_sub(display_width(&title) + 4).max(1),
     );
 
     Line::from(vec![
         Span::styled("⚠ ", theme.approval_style().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            title.to_string(),
-            theme.approval_style().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title, theme.approval_style().add_modifier(Modifier::BOLD)),
         Span::styled("  ", muted_pending(theme)),
         Span::styled(detail, muted_pending(theme)),
     ])
@@ -995,28 +1026,32 @@ fn approval_detail_lines(
     permission: &PermissionView,
     theme: Theme,
     width: usize,
+    translator: &crate::tui::i18n::Translator,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     if let Some(arguments) = permission.arguments.as_deref() {
-        lines.push(section_heading("Patterns", theme));
+        lines.push(section_heading(&translator.t("permission.patterns"), theme));
         lines.push(section_value(one_line_snippet(arguments, width), theme));
     }
 
     if let Some(rationale) = permission.rationale.as_deref() {
-        lines.push(section_heading("Values", theme));
+        lines.push(section_heading(&translator.t("permission.values"), theme));
         lines.push(section_value(one_line_snippet(rationale, width), theme));
     }
 
     if permission.can_allow_always
         && let Some(scope) = permission.grant_summary.as_deref()
     {
-        lines.push(section_heading("Session scope", theme));
+        lines.push(section_heading(
+            &translator.t("permission.session_scope"),
+            theme,
+        ));
         lines.push(section_value(one_line_snippet(scope, width), theme));
     }
 
     if lines.is_empty() {
-        lines.push(section_heading("Summary", theme));
+        lines.push(section_heading(&translator.t("permission.summary"), theme));
         lines.push(section_value(
             one_line_snippet(&permission.summary, width),
             theme,
@@ -1042,6 +1077,7 @@ fn render_pending_approval_footer(
     area: Rect,
     can_allow_always: bool,
     theme: Theme,
+    translator: &crate::tui::i18n::Translator,
 ) {
     if area.is_empty() {
         return;
@@ -1075,33 +1111,45 @@ fn render_pending_approval_footer(
         }
     };
 
-    let mut left_spans = vec![chip("Allow once", true)];
+    let mut left_spans = vec![chip(&translator.t("permission.allow_once"), true)];
     if can_allow_always {
         left_spans.push(Span::styled(" ", inline_pending(theme)));
-        left_spans.push(chip("Allow always", false));
+        left_spans.push(chip(&translator.t("permission.allow_always"), false));
     }
     left_spans.push(Span::styled(" ", inline_pending(theme)));
-    left_spans.push(chip("Reject", false));
+    left_spans.push(chip(&translator.t("permission.reject"), false));
     let left = Line::from(left_spans);
     frame.render_widget(Paragraph::new(left).style(inline_pending(theme)), left_area);
 
     if right_area.width > 0 {
         let mut hint_spans = vec![
             Span::styled("y/o", muted_pending(theme).add_modifier(Modifier::BOLD)),
-            Span::styled(" once  ", muted_pending(theme)),
+            Span::styled(
+                format!(" {}  ", translator.t("ui.once")),
+                muted_pending(theme),
+            ),
         ];
         if can_allow_always {
             hint_spans.push(Span::styled(
                 "a",
                 muted_pending(theme).add_modifier(Modifier::BOLD),
             ));
-            hint_spans.push(Span::styled(" always  ", muted_pending(theme)));
+            hint_spans.push(Span::styled(
+                format!(" {}  ", translator.t("ui.always")),
+                muted_pending(theme),
+            ));
         }
         hint_spans.extend([
             Span::styled("n/d", muted_pending(theme).add_modifier(Modifier::BOLD)),
-            Span::styled(" reject  ", muted_pending(theme)),
+            Span::styled(
+                format!(" {}  ", translator.t("ui.reject")),
+                muted_pending(theme),
+            ),
             Span::styled("esc", muted_pending(theme).add_modifier(Modifier::BOLD)),
-            Span::styled(" interrupt", muted_pending(theme)),
+            Span::styled(
+                format!(" {}", translator.t("ui.interrupt")),
+                muted_pending(theme),
+            ),
         ]);
         let hints = Line::from(hint_spans);
         frame.render_widget(
@@ -1113,16 +1161,22 @@ fn render_pending_approval_footer(
     }
 }
 
-fn approval_primary_text(permission: &PermissionView) -> String {
+fn approval_primary_text(
+    permission: &PermissionView,
+    translator: &crate::tui::i18n::Translator,
+) -> String {
     format!(
         "{} · {}",
-        approval_action_label(permission),
+        approval_action_label(permission, translator),
         approval_subject(permission)
     )
 }
 
-fn approval_action_label(permission: &PermissionView) -> &'static str {
-    match permission.tool_name.as_str() {
+fn approval_action_label(
+    permission: &PermissionView,
+    translator: &crate::tui::i18n::Translator,
+) -> String {
+    let key = match permission.tool_name.as_str() {
         "shell__exec" => "Run command",
         "fs__read" => "Read file",
         "fs__write" => "Write file",
@@ -1132,8 +1186,9 @@ fn approval_action_label(permission: &PermissionView) -> &'static str {
         "web__fetch" => "Fetch URL",
         "code__ast_search" => "Search code",
         "edit__apply_patch" => "Apply patch",
-        _ => "Approve tool",
-    }
+        _ => "permission.approve_tool",
+    };
+    translator.t(key)
 }
 
 fn approval_subject(permission: &PermissionView) -> String {
@@ -1397,11 +1452,13 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("Allow once") || rendered.contains("allow once"),
+            rendered.contains('允')
+                || rendered.contains("Allow once")
+                || rendered.contains("allow once"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("Reject") || rendered.contains("reject"),
+            rendered.contains('拒') || rendered.contains("Reject") || rendered.contains("reject"),
             "{rendered}"
         );
         assert!(!rendered.contains("message letcode"), "{rendered}");
@@ -1419,11 +1476,26 @@ mod tests {
 
         let rendered = draw_to_string(&mut state, 100, 10);
 
-        assert!(rendered.contains("Patterns"), "{rendered}");
-        assert!(rendered.contains("Values"), "{rendered}");
-        assert!(rendered.contains("Allow once"), "{rendered}");
-        assert!(rendered.contains("Reject"), "{rendered}");
-        assert!(!rendered.contains("Allow always"), "{rendered}");
+        assert!(
+            rendered.contains('模') || rendered.contains("Patterns"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains('参') || rendered.contains("Values"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains('允') || rendered.contains("Allow once"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains('拒') || rendered.contains("Reject"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains('始') || rendered.contains("Allow always"),
+            "{rendered}"
+        );
         assert!(rendered.contains("y/o"), "{rendered}");
         assert!(rendered.contains("n/d"), "{rendered}");
         assert!(rendered.contains("esc"), "{rendered}");

@@ -181,10 +181,11 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
     }
 
     if question.is_confirm_tab() {
-        let body_lines = confirm_body_lines(&question, theme);
+        let translator = state.translator();
+        let body_lines = confirm_body_lines(&question, theme, &translator);
         let tab_height = tab_rows.min(inner.height as usize) as u16;
         let body_height = inner.height.saturating_sub(tab_height).saturating_sub(1);
-        let body_rows = confirm_body_row_count(&question, inner.width.max(1) as usize);
+        let body_rows = confirm_body_row_count(&question, inner.width.max(1) as usize, &translator);
         let scroll_max = body_rows.saturating_sub(body_height as usize);
         if let Some(question) = state.pending_question.as_mut() {
             question.set_confirm_scroll_max(scroll_max);
@@ -331,7 +332,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
         }
     }
 
-    let footer_detail = question_enter_detail(&question);
+    let footer_detail = translate_question_detail(state, question_enter_detail(&question));
     if !is_confirm {
         frame.render_widget(
             Paragraph::new(lines)
@@ -350,7 +351,10 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" scroll  ", Style::default().fg(theme.muted_text)),
+                Span::styled(
+                    format!(" {}  ", state.t("ui.scroll")),
+                    Style::default().fg(theme.muted_text),
+                ),
             ]
         } else if question.editing_custom {
             vec![
@@ -370,7 +374,10 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" select  ", Style::default().fg(theme.muted_text)),
+                Span::styled(
+                    format!(" {}  ", state.t("ui.select")),
+                    Style::default().fg(theme.muted_text),
+                ),
             ]
         };
         footer.extend([
@@ -396,9 +403,9 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
             ),
             Span::styled(
                 if question.editing_custom {
-                    " cancel edit"
+                    format!(" {}", state.t("ui.cancel_edit"))
                 } else {
-                    " dismiss"
+                    format!(" {}", state.t("ui.dismiss"))
                 },
                 Style::default().fg(theme.muted_text),
             ),
@@ -494,10 +501,11 @@ fn question_tab_row_count(
 fn confirm_body_lines(
     question: &crate::tui::state::PendingQuestionState,
     theme: Theme,
+    translator: &crate::tui::i18n::Translator,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
-            "Confirm",
+            translator.t("question.confirm"),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
         Line::default(),
@@ -510,7 +518,7 @@ fn confirm_body_lines(
         let answers = item.answers();
         if answers.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  (not answered)",
+                translator.t("ui.not_answered"),
                 Style::default()
                     .fg(theme.error)
                     .add_modifier(Modifier::BOLD),
@@ -530,14 +538,15 @@ fn confirm_body_lines(
 fn confirm_body_row_count(
     question: &crate::tui::state::PendingQuestionState,
     width: usize,
+    translator: &crate::tui::i18n::Translator,
 ) -> usize {
     let width = width.max(1);
-    let mut rows = wrapped_row_count("Confirm", width) + 1;
+    let mut rows = wrapped_row_count(&translator.t("question.confirm"), width) + 1;
     for (index, item) in question.questions.iter().enumerate() {
         rows += wrapped_row_count(&format!("{}. {}", index + 1, item.header), width);
         let answers = item.answers();
         if answers.is_empty() {
-            rows += wrapped_row_count("  (not answered)", width);
+            rows += wrapped_row_count(&translator.t("ui.not_answered"), width);
         } else {
             rows += answers
                 .iter()
@@ -611,6 +620,25 @@ fn question_enter_detail(question: &crate::tui::state::PendingQuestionState) -> 
     }
 }
 
+fn translate_question_detail(state: &TuiState, detail: &str) -> String {
+    let key = match detail {
+        "submit" => "ui.submit",
+        "submit answer" => "ui.submit_answer",
+        "save answer" => "ui.save_answer",
+        "go to unanswered" => "ui.go_to_unanswered",
+        "close edit" => "ui.close_edit",
+        "next question" => "ui.next_question",
+        "review answers" => "ui.review_answers",
+        "type answer" => "ui.type_answer",
+        "toggle" => "ui.toggle",
+        "choose & submit" => "ui.choose_submit",
+        "choose & next" => "ui.choose_next",
+        "choose & review" => "ui.choose_review",
+        _ => return detail.to_string(),
+    };
+    state.t(key)
+}
+
 fn question_full_row_count(
     question: &crate::tui::state::PendingQuestionState,
     width: usize,
@@ -620,7 +648,11 @@ fn question_full_row_count(
     if question.is_confirm_tab() {
         return question_tab_row_count(question, width)
             + 1
-            + confirm_body_row_count(question, width);
+            + confirm_body_row_count(
+                question,
+                width,
+                &crate::tui::state::TuiState::default().translator(),
+            );
     }
     let Some(current) = question.current_question() else {
         return 0;
@@ -1097,9 +1129,12 @@ fn render_dashboard_hint(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
 
     let line = Line::from(vec![
         Span::styled("/resume", dashboard_hint_key_style(theme)),
-        Span::styled(" sessions   ", dashboard_hint_style(theme)),
+        Span::styled(
+            format!(" {}   ", state.t("ui.sessions")),
+            dashboard_hint_style(theme),
+        ),
         Span::styled("/help", dashboard_hint_key_style(theme)),
-        Span::styled(" commands", dashboard_hint_style(theme)),
+        Span::styled(state.t("ui.commands"), dashboard_hint_style(theme)),
     ]);
     frame.render_widget(
         Paragraph::new(line)
@@ -1251,6 +1286,9 @@ mod tests {
     }
 
     fn draw_to_string(state: &mut TuiState, width: u16, height: u16) -> String {
+        if state.language.is_none() {
+            state.set_language(Some(crate::tui::i18n::Language::En));
+        }
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal is created");
 
@@ -1373,6 +1411,17 @@ mod tests {
     }
 
     #[test]
+    fn zh_cn_narrow_rendering_stays_within_terminal_bounds() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+        state.mark_session_active();
+        state.show_toast("中文提示：请继续操作", ToastKind::Info);
+        let rows = draw_rows(&mut state, 40, 12);
+        assert_eq!(rows.len(), 12);
+        assert!(rows.iter().all(|row| !row.is_empty()));
+    }
+
+    #[test]
     fn notice_geometry_handles_narrow_terminals_and_wide_characters() {
         let narrow = notice_geometry(Rect::new(0, 0, 16, 10), "hello world");
         let wide = notice_geometry(Rect::new(0, 0, 40, 20), "你好世界");
@@ -1413,7 +1462,7 @@ mod tests {
             rendered.contains("█    █▀▀█ ▀█▀▀") || rendered.contains("LETCODE"),
             "{rendered}"
         );
-        assert!(rendered.contains("/resume sessions"), "{rendered}");
+        assert!(rendered.contains("/resume"), "{rendered}");
 
         let tiny = draw_to_string(&mut state, 10, 2);
         assert!(!tiny.is_empty());

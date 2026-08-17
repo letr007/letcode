@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::tui::{
     components::picker,
+    measure::{display_width, wrapped_row_count},
     state::{DialogItem, DialogKind, DialogState, TuiState},
     theme::Theme,
 };
@@ -35,6 +36,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             | DialogKind::McpPicker
             | DialogKind::McpToolsPicker
             | DialogKind::SkillPicker
+            | DialogKind::LanguagePicker
     ) {
         picker::render_picker(frame, state, area, theme, &dialog);
         return;
@@ -75,18 +77,18 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
     let footer = if matches!(dialog.kind, DialogKind::ContextDetail) {
         Line::from(vec![
             Span::styled("Esc", accent_style(theme)),
-            Span::styled(" close", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.close")), muted_style(theme)),
         ])
     } else {
         Line::from(vec![
             Span::styled("↑/↓", accent_style(theme)),
-            Span::styled(" navigate", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.navigate")), muted_style(theme)),
             Span::styled("  •  ", muted_style(theme)),
             Span::styled("Enter", accent_style(theme)),
-            Span::styled(" confirm", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.confirm")), muted_style(theme)),
             Span::styled("  •  ", muted_style(theme)),
             Span::styled("Esc", accent_style(theme)),
-            Span::styled(" cancel", muted_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.cancel")), muted_style(theme)),
         ])
     };
     lines.push(footer);
@@ -113,7 +115,7 @@ fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
                 .map(|detail| format!("{} · {detail}", item.label))
                 .unwrap_or_else(|| item.label.clone());
             text.lines()
-                .map(|line| (line.chars().count().saturating_add(67) / 68).max(1))
+                .map(|line| wrapped_row_count(line, 68).max(1))
                 .sum::<usize>() as u16
         })
         .sum::<u16>();
@@ -131,22 +133,22 @@ fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
 }
 
 fn dialog_width(dialog: &DialogState) -> u16 {
-    let title_width = dialog.title.chars().count();
+    let title_width = display_width(&dialog.title);
     let description_width = dialog
         .description
         .as_ref()
-        .map(|text| text.chars().count())
+        .map(|text| display_width(text))
         .unwrap_or(0);
     let item_width = dialog.items.iter().map(item_width).max().unwrap_or(0) + 6;
     title_width.max(description_width).max(item_width) as u16
 }
 
 fn item_width(item: &DialogItem) -> usize {
-    item.label.chars().count()
+    display_width(&item.label)
         + item
             .detail
             .as_ref()
-            .map(|detail| detail.chars().count() + 3)
+            .map(|detail| display_width(detail) + 3)
             .unwrap_or(0)
 }
 

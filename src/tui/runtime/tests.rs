@@ -2078,7 +2078,7 @@ fn parent_view_navigation_projection_failure_restores_pending_question() {
     assert!(runtime.pending_question_handle.is_some());
     assert!(matches!(
         runtime.state().toast(),
-        Some(toast) if toast.message.contains("Context projection failed") && toast.kind == ToastKind::Error
+        Some(toast) if (toast.message.contains("Context projection failed") || toast.message.contains("上下文投影失败")) && toast.kind == ToastKind::Error
     ));
 }
 
@@ -2847,7 +2847,9 @@ fn session_resume_projection_failure_clears_pending_and_reports_error() {
 
     assert!(!runtime.session_resume_pending);
     assert!(runtime.state().toast.as_ref().is_some_and(|toast| {
-        toast.kind == ToastKind::Error && toast.message.starts_with("Context projection failed:")
+        toast.kind == ToastKind::Error
+            && (toast.message.starts_with("Context projection failed:")
+                || toast.message.starts_with("上下文投影失败："))
     }));
 }
 

@@ -5,7 +5,7 @@ use crate::delegation::DELEGATION_EXPERTS;
 pub struct SlashCommandEntry {
     pub command: &'static str,
     pub insert_text: &'static str,
-    pub description: &'static str,
+    pub description_key: &'static str,
 }
 
 pub const MAX_VISIBLE_SLASH_COMMANDS: usize = 5;
@@ -17,7 +17,7 @@ pub fn slash_commands() -> Vec<SlashCommandEntry> {
         .map(|command| SlashCommandEntry {
             command: command.name,
             insert_text: command.insert_text,
-            description: command.description,
+            description_key: command.description_key,
         })
         .collect()
 }
@@ -65,7 +65,7 @@ pub fn matching_expert_commands(input: &str) -> Vec<SlashCommandEntry> {
         .map(|expert| SlashCommandEntry {
             command: expert.command,
             insert_text: expert.insert_text,
-            description: expert.description,
+            description_key: expert.description_key,
         })
         .filter(|entry| entry.command.starts_with(query.as_str()))
         .collect()

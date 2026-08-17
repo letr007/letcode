@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::command::{ThemeName, ThoughtsDisplayMode};
+use crate::tui::i18n::Language;
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
 
@@ -21,6 +22,8 @@ pub struct TuiPreferences {
     pub theme: String,
     #[serde(default)]
     pub thoughts_display: ThoughtsDisplayMode,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl Default for TuiPreferences {
@@ -30,6 +33,7 @@ impl Default for TuiPreferences {
             transcript_scrollbar_visible: default_transcript_scrollbar_visible(),
             theme: default_theme_id(),
             thoughts_display: ThoughtsDisplayMode::default(),
+            language: None,
         }
     }
 }
@@ -45,6 +49,22 @@ impl TuiPreferences {
             .ok()
             .and_then(|text| serde_json::from_str::<Self>(&text).ok())
             .unwrap_or_default()
+    }
+
+    pub fn explicit_language(&self) -> Option<Language> {
+        match self.language.as_deref() {
+            None => None,
+            Some(value) => match Language::parse(value) {
+                Some(language) => Some(language),
+                None => {
+                    tracing::warn!(
+                        value,
+                        "unsupported persisted TUI language; using system locale"
+                    );
+                    None
+                }
+            },
+        }
     }
 
     pub fn save_to_dir(&self, config_dir: &Path) -> anyhow::Result<()> {
@@ -79,6 +99,7 @@ mod tests {
             transcript_scrollbar_visible: false,
             theme: "forest".into(),
             thoughts_display: ThoughtsDisplayMode::Titles,
+            language: Some("zh-CN".into()),
         };
         prefs.save_to_dir(&base).expect("save preferences");
 
@@ -105,6 +126,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_persisted_language_falls_back_to_system_locale() {
+        let prefs: TuiPreferences = serde_json::from_str(
+            r#"{"tool_output_expanded":false,"transcript_scrollbar_visible":true,"theme":"dark","language":"fr"}"#,
+        )
+        .expect("invalid language preference deserializes");
+        assert_eq!(prefs.explicit_language(), None);
+    }
+
+    #[test]
     fn legacy_preferences_default_to_full_thoughts_display() {
         let loaded: TuiPreferences = serde_json::from_str(
             r#"{"tool_output_expanded":true,"transcript_scrollbar_visible":false,"theme":"dark"}"#,
@@ -120,6 +150,7 @@ mod tests {
             transcript_scrollbar_visible: true,
             theme: "sunset".into(),
             thoughts_display: ThoughtsDisplayMode::Compact,
+            language: None,
         };
         let json = serde_json::to_string(&prefs).expect("serialize");
         let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");

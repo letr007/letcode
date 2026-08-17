@@ -89,6 +89,7 @@ impl SessionCommand {
         use crate::user_content::UserMessageSubmission;
 
         match intent {
+            CommandIntent::Language(_) => None,
             CommandIntent::Prompt(text) => {
                 // Stable FE→BE shape: id + content (text/attachments live on content).
                 let id = format!(

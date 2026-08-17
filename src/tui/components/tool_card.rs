@@ -251,11 +251,15 @@ pub fn render_permission_card_document(
         return document;
     }
 
-    let status = status_label(match permission.status {
-        PermissionPromptStatus::Pending => ToolCardStatus::Pending,
-        PermissionPromptStatus::Approved => ToolCardStatus::Approved,
-        PermissionPromptStatus::Denied => ToolCardStatus::Denied,
-    });
+    let translator = crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En);
+    let status = status_label(
+        match permission.status {
+            PermissionPromptStatus::Pending => ToolCardStatus::Pending,
+            PermissionPromptStatus::Approved => ToolCardStatus::Approved,
+            PermissionPromptStatus::Denied => ToolCardStatus::Denied,
+        },
+        &translator,
+    );
     let status_style = root_status_style(permission_accent(permission.status, theme), theme);
     let text_style = root_text_style(theme);
     let muted_style = root_muted_style(theme);
@@ -862,11 +866,13 @@ fn render_subagent_lines(
         .cloned()
         .and_then(|value| serde_json::from_value::<StructuredSubagentResult>(value).ok())
         .filter(|result| !result.malformed);
+    let localized_status = crate::tui::state::TuiState::default().translator();
     let status = data
         .as_ref()
         .and_then(|data| data.get("status").and_then(serde_json::Value::as_str))
         .or_else(|| structured.as_ref().map(|result| result.status.as_str()))
-        .unwrap_or_else(|| subagent_status_label(tool.status));
+        .map(str::to_owned)
+        .unwrap_or_else(|| subagent_status_label(tool.status, &localized_status));
     let child_id = data
         .as_ref()
         .and_then(|data| data.get("child_session_id"))
@@ -928,10 +934,13 @@ fn render_subagent_lines(
         format!(
             "{} {}",
             PROCESS_FRAMES[frame % PROCESS_FRAMES.len()],
-            status_label(map_tool_status(tool.status))
+            status_label(
+                map_tool_status(tool.status),
+                &crate::tui::state::TuiState::default().translator()
+            )
         )
     } else {
-        status.to_string()
+        status
     };
     let status_color = match tool.status {
         ToolExecutionStatus::Pending => theme.warning,
@@ -1144,14 +1153,17 @@ fn subagent_name_from_tool(name: &str) -> &str {
     agent_name_for_subagent_tool(name).expect("tool card received unknown subagent tool")
 }
 
-fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
-    match status {
-        ToolExecutionStatus::Pending => "preparing",
-        ToolExecutionStatus::Running => "running",
-        ToolExecutionStatus::Cancelled => "cancelled",
-        ToolExecutionStatus::Succeeded => "completed",
-        ToolExecutionStatus::Failed => "failed",
-    }
+fn subagent_status_label(
+    status: ToolExecutionStatus,
+    translator: &crate::tui::i18n::Translator,
+) -> String {
+    translator.t(match status {
+        ToolExecutionStatus::Pending => "status.preparing",
+        ToolExecutionStatus::Running => "status.running",
+        ToolExecutionStatus::Cancelled => "status.cancelled",
+        ToolExecutionStatus::Succeeded => "status.completed",
+        ToolExecutionStatus::Failed => "status.failed",
+    })
 }
 
 fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str> {
@@ -2747,16 +2759,16 @@ fn permission_accent(status: PermissionPromptStatus, theme: Theme) -> ratatui::s
     }
 }
 
-fn status_label(status: ToolCardStatus) -> &'static str {
-    match status {
-        ToolCardStatus::Pending => "pending",
-        ToolCardStatus::Approved => "approved",
-        ToolCardStatus::Running => "running",
-        ToolCardStatus::Cancelled => "cancelled",
-        ToolCardStatus::Succeeded => "succeeded",
-        ToolCardStatus::Failed => "failed",
-        ToolCardStatus::Denied => "denied",
-    }
+fn status_label(status: ToolCardStatus, translator: &crate::tui::i18n::Translator) -> String {
+    translator.t(match status {
+        ToolCardStatus::Pending => "status.pending",
+        ToolCardStatus::Approved => "status.approved",
+        ToolCardStatus::Running => "status.running",
+        ToolCardStatus::Cancelled => "status.cancelled",
+        ToolCardStatus::Succeeded => "status.succeeded",
+        ToolCardStatus::Failed => "status.failed",
+        ToolCardStatus::Denied => "status.denied",
+    })
 }
 
 fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
@@ -3304,7 +3316,8 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let rendered = lines[0].to_string();
         assert!(
-            rendered.contains("pending shell__exec echo ok"),
+            (rendered.contains("待处理") || rendered.contains("pending"))
+                && rendered.contains("shell__exec echo ok"),
             "{rendered}"
         );
     }
@@ -3554,9 +3567,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(p.contains("pending"), "{p}");
-        assert!(a.contains("approved"), "{a}");
-        assert!(d.contains("denied"), "{d}");
+        assert!(p.contains("待处理") || p.contains("pending"), "{p}");
+        assert!(a.contains("已批准") || a.contains("approved"), "{a}");
+        assert!(d.contains("已拒绝") || d.contains("denied"), "{d}");
 
         assert!(p.contains("shell__exec"), "{p}");
         assert!(p.contains("rm -rf /"), "{p}");

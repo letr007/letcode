@@ -55,7 +55,7 @@ pub fn render_slash_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
     if matches.is_empty() {
         let line = Line::from(vec![
             Span::styled("  ", row_padding_style(theme, false)),
-            Span::styled("No matching commands", description_style(theme, false)),
+            Span::styled(state.t("parse.no_match"), description_style(theme, false)),
         ]);
         frame.render_widget(Paragraph::new(line).style(surface_style), panel_area);
         return;
@@ -107,7 +107,7 @@ pub fn render_slash_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
             .saturating_sub(display_width(entry.command) as u16)
             .saturating_sub(spacer_width as u16)
             .max(1) as usize;
-        let description = one_line_snippet(entry.description, description_width);
+        let description = one_line_snippet(&state.t(entry.description_key), description_width);
 
         let line = Line::from(vec![
             Span::styled(

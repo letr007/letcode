@@ -83,7 +83,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
-            Some("Turn still running")
+            Some("回合仍在运行")
         );
     }
 
@@ -109,7 +109,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
-            Some("Change queued for after the current turn")
+            Some("更改已排队，将在当前回合后生效")
         );
         assert_eq!(
             runtime.state().pending_composer_settings.model,

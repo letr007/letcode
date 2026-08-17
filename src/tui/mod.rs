@@ -15,6 +15,7 @@
 pub mod catalog;
 pub mod components;
 pub mod events;
+pub mod i18n;
 pub mod input;
 pub mod markdown;
 pub(crate) mod math;

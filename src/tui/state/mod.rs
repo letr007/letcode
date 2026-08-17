@@ -283,6 +283,7 @@ pub enum DialogKind {
     ReasoningPicker,
     ThoughtsPicker,
     ThemePicker,
+    LanguagePicker,
     SessionPicker,
     HistoryTree,
     ContextPicker,
@@ -1025,6 +1026,7 @@ pub struct TuiState {
     pub model_id: String,
     pub model_label: String,
     pub fast_mode_enabled: bool,
+    pub language: Option<crate::tui::i18n::Language>,
     /// Anchored bootstrap experiment active for the current session (composer badge).
     pub anchored_active: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
@@ -1104,6 +1106,7 @@ impl Default for TuiState {
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             fast_mode_enabled: false,
+            language: None,
             anchored_active: false,
             model_token_usage: None,
             compaction_active: false,
@@ -1162,6 +1165,31 @@ impl TuiState {
             permission_mode_label: permission_mode_label.into(),
             ..Self::default()
         }
+    }
+
+    pub fn set_language(&mut self, language: Option<crate::tui::i18n::Language>) {
+        self.language = language;
+    }
+
+    pub fn effective_language(&self) -> crate::tui::i18n::Language {
+        self.language()
+    }
+
+    pub fn language(&self) -> crate::tui::i18n::Language {
+        self.language
+            .unwrap_or_else(crate::tui::i18n::system_language)
+    }
+
+    pub fn translator(&self) -> crate::tui::i18n::Translator {
+        crate::tui::i18n::Translator::new(self.language())
+    }
+
+    pub fn t(&self, key: &str) -> String {
+        self.translator().t(key)
+    }
+
+    pub fn t_fmt(&self, key: &str, args: &[(&str, &str)]) -> String {
+        self.translator().t_fmt(key, args)
     }
 
     pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
@@ -3009,6 +3037,22 @@ mod tests {
         NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent, RetryLifecycleEvent,
         SessionEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
     };
+
+    #[test]
+    fn explicit_and_system_following_language_resolution_are_distinct() {
+        let mut state = TuiState::default();
+        assert_eq!(
+            state.effective_language(),
+            crate::tui::i18n::system_language()
+        );
+        state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+        assert_eq!(state.effective_language(), crate::tui::i18n::Language::ZhCn);
+        state.set_language(None);
+        assert_eq!(
+            state.effective_language(),
+            crate::tui::i18n::system_language()
+        );
+    }
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
         PendingQuestionState::new(QuestionRequest { questions }, None)

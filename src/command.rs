@@ -1,6 +1,4 @@
-use crate::delegation::{
-    delegation_help_summary, delegation_usage_list, find_expert, unknown_expert_error,
-};
+use crate::delegation::{delegation_help_summary, delegation_usage_list, find_expert};
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use serde::{Deserialize, Serialize};
@@ -9,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct CommandMetadata {
     pub name: &'static str,
     pub insert_text: &'static str,
-    pub description: &'static str,
+    pub description_key: &'static str,
     pub usage: &'static str,
     pub visible_in_slash: bool,
     pub visible_in_help: bool,
@@ -108,6 +106,7 @@ pub enum ThemeCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandIntent {
     Prompt(String),
+    Language(Option<String>),
     Delegate { agent_name: String, task: String },
     Help,
     Exit,
@@ -141,18 +140,60 @@ pub enum CommandIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandParseError {
-    message: String,
+    key: String,
+    args: Vec<(String, String)>,
 }
 
 impl CommandParseError {
     fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if let Some(command) = message
+            .strip_prefix("Unknown command: ")
+            .and_then(|value| value.strip_suffix(". Type /help for available local commands."))
+        {
+            return Self::unknown_command(command);
+        }
+        if let Some(usage) = message.strip_prefix("Usage: ") {
+            return Self::usage(usage);
+        }
+        Self::with_args("parse.literal", [("message", message.as_str())])
+    }
+
+    fn unknown_command(command: &str) -> Self {
+        Self::with_args("parse.unknown_command", [("command", command)])
+    }
+
+    fn usage(usage: &str) -> Self {
+        Self::with_args("parse.usage", [("usage", usage)])
+    }
+
+    fn with_args<const N: usize>(key: &str, args: [(&str, &str); N]) -> Self {
         Self {
-            message: message.into(),
+            key: key.to_string(),
+            args: args
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
         }
     }
 
-    pub fn message(&self) -> &str {
-        &self.message
+    #[cfg(test)]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[cfg(test)]
+    pub fn args(&self) -> &[(String, String)] {
+        &self.args
+    }
+
+    pub fn render(&self, translator: &crate::tui::i18n::Translator) -> String {
+        let args = self
+            .args
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        translator.t_fmt(&self.key, &args)
     }
 }
 
@@ -160,7 +201,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/help",
         insert_text: "/help",
-        description: "Show available local commands",
+        description_key: "command.help",
         usage: "/help",
         visible_in_slash: true,
         visible_in_help: true,
@@ -169,7 +210,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/?",
         insert_text: "/?",
-        description: "Show available local commands",
+        description_key: "command.help",
         usage: "/?",
         visible_in_slash: false,
         visible_in_help: true,
@@ -178,7 +219,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/exit",
         insert_text: "/exit",
-        description: "Exit the current session",
+        description_key: "command.exit",
         usage: "/exit",
         visible_in_slash: true,
         visible_in_help: true,
@@ -187,7 +228,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/quit",
         insert_text: "/quit",
-        description: "Exit the current session",
+        description_key: "command.exit",
         usage: "/quit",
         visible_in_slash: true,
         visible_in_help: true,
@@ -196,7 +237,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/permission",
         insert_text: "/permission ",
-        description: "Show or switch permission mode",
+        description_key: "command.permission",
         usage: "/permission <safe|default|auto|yolo>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -205,8 +246,26 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/perm",
         insert_text: "/perm ",
-        description: "Alias for /permission",
+        description_key: "command.permission",
         usage: "/perm <safe|default|auto|yolo>",
+        visible_in_slash: false,
+        visible_in_help: true,
+        visible_in_summary: false,
+    },
+    CommandMetadata {
+        name: "/language",
+        insert_text: "/language ",
+        description_key: "command.language",
+        usage: "/language [en|zh-CN]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/lang",
+        insert_text: "/lang ",
+        description_key: "command.language",
+        usage: "/lang [en|zh-CN]",
         visible_in_slash: false,
         visible_in_help: true,
         visible_in_summary: false,
@@ -214,7 +273,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/model",
         insert_text: "/model ",
-        description: "Show or switch the active model",
+        description_key: "command.model",
         usage: "/model <id>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -223,7 +282,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/anchored",
         insert_text: "/anchored",
-        description: "Toggle anchored bootstrap experiment",
+        description_key: "command.anchored",
         usage: "/anchored",
         visible_in_slash: true,
         visible_in_help: true,
@@ -232,7 +291,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/agents",
         insert_text: "/agents",
-        description: "Configure expert models",
+        description_key: "command.agents",
         usage: "/agents",
         visible_in_slash: true,
         visible_in_help: true,
@@ -241,7 +300,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/fast",
         insert_text: "/fast",
-        description: "Toggle Fast Mode",
+        description_key: "command.fast",
         usage: "/fast",
         visible_in_slash: true,
         visible_in_help: true,
@@ -250,7 +309,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/reasoning",
         insert_text: "/reasoning ",
-        description: "Show or switch reasoning effort",
+        description_key: "command.reasoning",
         usage: "/reasoning <off|none|minimal|low|medium|high|xhigh>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -259,7 +318,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/think",
         insert_text: "/think ",
-        description: "Alias for /reasoning",
+        description_key: "command.reasoning",
         usage: "/think <off|none|minimal|low|medium|high|xhigh>",
         visible_in_slash: false,
         visible_in_help: true,
@@ -268,7 +327,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/thoughts",
         insert_text: "/thoughts",
-        description: "Show or switch thinking display",
+        description_key: "command.thoughts",
         usage: "/thoughts <compact|titles|full>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -277,7 +336,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/tool-output",
         insert_text: "/tool-output ",
-        description: "Toggle tool output display mode",
+        description_key: "command.tool_output",
         usage: "/tool-output <on|off|expanded|truncated|full|compact>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -286,7 +345,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/scrollbar",
         insert_text: "/scrollbar ",
-        description: "Show or hide transcript scrollbar",
+        description_key: "command.scrollbar",
         usage: "/scrollbar [on|off]",
         visible_in_slash: true,
         visible_in_help: true,
@@ -295,7 +354,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/theme",
         insert_text: "/theme ",
-        description: "Show or switch the TUI theme",
+        description_key: "command.theme",
         usage: "/theme [dark|rainbow|<themes/*.toml>]",
         visible_in_slash: true,
         visible_in_help: true,
@@ -304,7 +363,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/compact",
         insert_text: "/compact",
-        description: "Compact current session context",
+        description_key: "command.compact",
         usage: "/compact",
         visible_in_slash: true,
         visible_in_help: true,
@@ -313,7 +372,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/tree",
         insert_text: "/tree",
-        description: "Browse session history",
+        description_key: "command.tree",
         usage: "/tree",
         visible_in_slash: true,
         visible_in_help: true,
@@ -322,7 +381,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/undo",
         insert_text: "/undo",
-        description: "Move to the previous completed turn",
+        description_key: "command.undo",
         usage: "/undo",
         visible_in_slash: true,
         visible_in_help: true,
@@ -331,7 +390,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/redo",
         insert_text: "/redo",
-        description: "Move to the next undone turn",
+        description_key: "command.redo",
         usage: "/redo",
         visible_in_slash: true,
         visible_in_help: true,
@@ -340,7 +399,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/resume",
         insert_text: "/resume ",
-        description: "Resume a previous session",
+        description_key: "command.resume",
         usage: "/resume <session_id>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -349,7 +408,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/new",
         insert_text: "/new",
-        description: "Start a new session",
+        description_key: "command.new",
         usage: "/new",
         visible_in_slash: true,
         visible_in_help: true,
@@ -358,7 +417,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/context",
         insert_text: "/context",
-        description: "Browse context details",
+        description_key: "command.context",
         usage: "/context",
         visible_in_slash: true,
         visible_in_help: true,
@@ -367,7 +426,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/mcp",
         insert_text: "/mcp",
-        description: "Browse MCP tools",
+        description_key: "command.mcp",
         usage: "/mcp",
         visible_in_slash: true,
         visible_in_help: true,
@@ -376,7 +435,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/skill",
         insert_text: "/skill",
-        description: "Browse local skills",
+        description_key: "command.skill",
         usage: "/skill",
         visible_in_slash: true,
         visible_in_help: true,
@@ -385,7 +444,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/child",
         insert_text: "/child",
-        description: "View child subagent transcript",
+        description_key: "command.child",
         usage: "/child <first|next|prev>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -394,7 +453,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/children",
         insert_text: "/children",
-        description: "View child subagent transcripts",
+        description_key: "command.children",
         usage: "/children <first|next|prev>",
         visible_in_slash: true,
         visible_in_help: true,
@@ -403,7 +462,7 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/parent",
         insert_text: "/parent",
-        description: "Return to parent transcript",
+        description_key: "command.parent",
         usage: "/parent",
         visible_in_slash: true,
         visible_in_help: true,
@@ -479,14 +538,12 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
     let name = name.to_ascii_lowercase();
 
     if parts[0] != name {
-        return Err(CommandParseError::new(format!(
-            "Unknown command: {}. Type /help for available local commands.",
-            parts[0]
-        )));
+        return Err(CommandParseError::unknown_command(parts[0]));
     }
 
     match name.as_str() {
         "/help" | "/?" => expect_no_extra_args(&parts, name.as_str(), CommandIntent::Help),
+        "/language" | "/lang" => parse_language(&parts),
         "/exit" | "/quit" => expect_no_extra_args(&parts, name.as_str(), CommandIntent::Exit),
         "/permission" | "/perm" => parse_permission(&parts),
         "/model" => parse_model(&parts),
@@ -509,10 +566,18 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/skill" => expect_no_extra_args(&parts, "/skill", CommandIntent::SkillBrowse),
         "/child" | "/children" => parse_child_navigation(&parts),
         "/parent" => expect_no_extra_args(&parts, "/parent", CommandIntent::Parent),
-        _ => Err(CommandParseError::new(format!(
-            "Unknown command: {}. Type /help for available local commands.",
-            parts[0]
-        ))),
+        _ => Err(CommandParseError::unknown_command(parts[0])),
+    }
+}
+
+fn parse_language(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/language"] | ["/lang"] => Ok(CommandIntent::Language(None)),
+        ["/language", value] | ["/lang", value] => {
+            Ok(CommandIntent::Language(Some((*value).to_string())))
+        }
+        [name, ..] => Err(CommandParseError::usage(&format!("{name} [en|zh-CN]"))),
+        _ => unreachable!(),
     }
 }
 
@@ -524,7 +589,7 @@ fn expect_no_extra_args(
     if parts.len() == 1 {
         Ok(intent)
     } else {
-        Err(CommandParseError::new(format!("Usage: {usage}")))
+        Err(CommandParseError::usage(usage))
     }
 }
 
@@ -533,10 +598,10 @@ fn parse_permission(parts: &[&str]) -> Result<CommandIntent, CommandParseError> 
         ["/permission"] | ["/perm"] => Ok(CommandIntent::PermissionShow),
         ["/permission", mode] | ["/perm", mode] => match parse_permission_mode(mode) {
             Some(mode) => Ok(CommandIntent::PermissionSet(mode)),
-            None => Err(CommandParseError::new(format!(
-                "Unknown permission mode: {}. Use safe, default, auto, or yolo.",
-                mode
-            ))),
+            None => Err(CommandParseError::with_args(
+                "parse.unknown_permission_mode",
+                [("mode", mode)],
+            )),
         },
         ["/permission", ..] => Err(CommandParseError::new(
             "Usage: /permission <safe|default|auto|yolo>",
@@ -562,10 +627,10 @@ fn parse_reasoning(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/reasoning"] | ["/think"] => Ok(CommandIntent::ReasoningShow),
         ["/reasoning", value] | ["/think", value] => match parse_reasoning_effort(value) {
             Some(effort) => Ok(CommandIntent::ReasoningSet(effort)),
-            None => Err(CommandParseError::new(format!(
-                "Unknown reasoning effort: {}. Use off, none, minimal, low, medium, high, xhigh, or max.",
-                value.trim()
-            ))),
+            None => Err(CommandParseError::with_args(
+                "parse.unknown_reasoning_effort",
+                [("value", value.trim())],
+            )),
         },
         ["/reasoning", ..] => Err(CommandParseError::new(
             "Usage: /reasoning <off|none|minimal|low|medium|high|xhigh|max>",
@@ -582,9 +647,7 @@ fn parse_thoughts(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/thoughts"] => Ok(CommandIntent::ThoughtsShow),
         ["/thoughts", value] => match ThoughtsDisplayMode::parse(value) {
             Some(mode) => Ok(CommandIntent::ThoughtsSet(mode)),
-            None => Err(CommandParseError::new(
-                "Unknown thinking display. Use compact, titles, full, 1, 2, or 3.",
-            )),
+            None => Err(CommandParseError::with_args("parse.unknown_thoughts", [])),
         },
         ["/thoughts", ..] => Err(CommandParseError::new(
             "Usage: /thoughts <compact|titles|full>",
@@ -598,8 +661,9 @@ fn parse_tool_output(parts: &[&str]) -> Result<CommandIntent, CommandParseError>
         ["/tool-output"] => Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle)),
         ["/tool-output", value] => match parse_tool_output_mode(value) {
             Some(mode) => Ok(CommandIntent::ToolOutputSet(mode)),
-            None => Err(CommandParseError::new(
-                "Unknown tool output mode. Use on, off, expanded, truncated, full, or compact.",
+            None => Err(CommandParseError::with_args(
+                "parse.unknown_tool_output",
+                [],
             )),
         },
         ["/tool-output", ..] => Err(CommandParseError::new(
@@ -616,9 +680,7 @@ fn parse_transcript_scrollbar(parts: &[&str]) -> Result<CommandIntent, CommandPa
         )),
         ["/scrollbar", value] => match parse_transcript_scrollbar_mode(value) {
             Some(mode) => Ok(CommandIntent::TranscriptScrollbarSet(mode)),
-            None => Err(CommandParseError::new(
-                "Unknown scrollbar mode. Use on, off, show, hide, visible, or hidden.",
-            )),
+            None => Err(CommandParseError::with_args("parse.unknown_scrollbar", [])),
         },
         ["/scrollbar", ..] => Err(CommandParseError::new("Usage: /scrollbar [on|off]")),
         _ => unreachable!(),
@@ -630,9 +692,7 @@ fn parse_theme(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/theme"] => Ok(CommandIntent::Theme(ThemeCommand::Show)),
         ["/theme", value] => match normalize_theme_command_id(value) {
             Some(theme) => Ok(CommandIntent::Theme(ThemeCommand::Set(theme))),
-            None => Err(CommandParseError::new(
-                "Unknown theme. Use dark, rainbow, or a themes/*.toml id (ocean, forest, rose, tokyonight, …).",
-            )),
+            None => Err(CommandParseError::with_args("parse.unknown_theme", [])),
         },
         ["/theme", ..] => Err(CommandParseError::new(
             "Usage: /theme <dark|rainbow|<themes/*.toml>>",
@@ -690,7 +750,10 @@ fn parse_delegate_command(input: &str) -> Result<CommandIntent, CommandParseErro
     }
 
     let Some(expert) = find_expert(agent_name) else {
-        return Err(CommandParseError::new(unknown_expert_error(agent_name)));
+        return Err(CommandParseError::with_args(
+            "parse.unknown_expert",
+            [("value", agent_name)],
+        ));
     };
 
     if task.is_empty() {
@@ -710,9 +773,10 @@ fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseE
             "first" => Ok(CommandIntent::Child(ChildNavigation::First)),
             "next" => Ok(CommandIntent::Child(ChildNavigation::Next)),
             "prev" | "previous" => Ok(CommandIntent::Child(ChildNavigation::Prev)),
-            other => Err(CommandParseError::new(format!(
-                "Unknown child navigation: {other}. Use first, next, or prev."
-            ))),
+            other => Err(CommandParseError::with_args(
+                "parse.unknown_child_navigation",
+                [("value", other)],
+            )),
         },
         ["/child", ..] => Err(CommandParseError::new("Usage: /child <first|next|prev>")),
         ["/children", ..] => Err(CommandParseError::new("Usage: /children <first|next|prev>")),
@@ -774,6 +838,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renders_structured_parse_errors_for_each_language() {
+        let error = CommandParseError::unknown_command("/bogus");
+        assert_eq!(error.key(), "parse.unknown_command");
+        assert_eq!(error.args(), [("command".into(), "/bogus".into())]);
+        assert_eq!(
+            error.render(&crate::tui::i18n::Translator::new(
+                crate::tui::i18n::Language::En,
+            )),
+            "Unknown command: /bogus. Type /help for available local commands."
+        );
+        assert_eq!(
+            error.render(&crate::tui::i18n::Translator::new(
+                crate::tui::i18n::Language::ZhCn,
+            )),
+            "未知命令：/bogus。输入 /help 查看可用的本地命令。"
+        );
+    }
+
+    #[test]
+    fn parses_language_aliases_and_values() {
+        assert_eq!(
+            parse_command("/language"),
+            Ok(CommandIntent::Language(None))
+        );
+        assert_eq!(parse_command("/lang"), Ok(CommandIntent::Language(None)));
+        assert_eq!(
+            parse_command("/language zh-CN"),
+            Ok(CommandIntent::Language(Some("zh-CN".into())))
+        );
+        assert_eq!(
+            parse_command("/lang en"),
+            Ok(CommandIntent::Language(Some("en".into())))
+        );
+        assert_eq!(
+            parse_command("/lang en zh-CN"),
+            Err(CommandParseError::usage("/lang [en|zh-CN]"))
+        );
+    }
+
+    #[test]
     fn rejects_unknown_and_invalid_commands_locally() {
         assert_eq!(
             parse_command("/bogus"),
@@ -809,15 +913,11 @@ mod tests {
         }
         assert_eq!(
             parse_command("/scrollbar maybe"),
-            Err(CommandParseError::new(
-                "Unknown scrollbar mode. Use on, off, show, hide, visible, or hidden."
-            ))
+            Err(CommandParseError::with_args("parse.unknown_scrollbar", []))
         );
         assert_eq!(
             parse_command("/theme bad!id"),
-            Err(CommandParseError::new(
-                "Unknown theme. Use dark, rainbow, or a themes/*.toml id (ocean, forest, rose, tokyonight, …)."
-            ))
+            Err(CommandParseError::with_args("parse.unknown_theme", []))
         );
         assert_eq!(
             parse_command("/theme tokyonight"),
@@ -833,8 +933,9 @@ mod tests {
         );
         assert_eq!(
             parse_command("@unknown foo"),
-            Err(CommandParseError::new(
-                "Unknown expert: @unknown. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
+            Err(CommandParseError::with_args(
+                "parse.unknown_expert",
+                [("value", "unknown")]
             ))
         );
         assert_eq!(
@@ -851,14 +952,16 @@ mod tests {
         );
         assert_eq!(
             parse_command("/child sideways"),
-            Err(CommandParseError::new(
-                "Unknown child navigation: sideways. Use first, next, or prev."
+            Err(CommandParseError::with_args(
+                "parse.unknown_child_navigation",
+                [("value", "sideways")]
             ))
         );
         assert_eq!(
             parse_command("/reasoning absurd"),
-            Err(CommandParseError::new(
-                "Unknown reasoning effort: absurd. Use off, none, minimal, low, medium, high, xhigh, or max."
+            Err(CommandParseError::with_args(
+                "parse.unknown_reasoning_effort",
+                [("value", "absurd")]
             ))
         );
         assert_eq!(parse_command("/thoughts"), Ok(CommandIntent::ThoughtsShow));
@@ -872,9 +975,7 @@ mod tests {
         );
         assert_eq!(
             parse_command("/thoughts verbose"),
-            Err(CommandParseError::new(
-                "Unknown thinking display. Use compact, titles, full, 1, 2, or 3."
-            ))
+            Err(CommandParseError::with_args("parse.unknown_thoughts", []))
         );
     }
 }

@@ -53,8 +53,8 @@ impl<'a> TuiSessionCommandAdapter<'a> {
                 ActiveTurnCommandDisposition::Reject
             );
         if rejected {
-            self.runtime
-                .show_toast("Turn still running", ToastKind::Info);
+            let message = self.runtime.state().t("runtime.turn_running");
+            self.runtime.show_toast(message, ToastKind::Info);
             return Ok(());
         }
         if self.ingress.submit(command.clone()).is_err() {
@@ -65,8 +65,8 @@ impl<'a> TuiSessionCommandAdapter<'a> {
         }
         if deferred {
             self.runtime.project_deferred_setting(&command);
-            self.runtime
-                .show_toast("Change queued for after the current turn", ToastKind::Info);
+            let message = self.runtime.state().t("runtime.change_queued");
+            self.runtime.show_toast(message, ToastKind::Info);
         }
         Ok(())
     }
