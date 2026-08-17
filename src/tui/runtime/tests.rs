@@ -6421,6 +6421,74 @@ fn child_view_preempts_pending_typewriter_output() {
     );
 }
 
+#[test]
+fn stale_presented_frame_is_not_applied_after_timeline_replacement() {
+    let mut state = TuiState::default();
+    state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("old")));
+    let mut rendered = state.clone();
+    rendered.last_transcript_area = ratatui::layout::Rect::new(1, 2, 30, 12);
+
+    state.timeline = crate::tui::timeline::Timeline::new();
+    state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("new")));
+    state.last_transcript_area = ratatui::layout::Rect::default();
+    let _ = state.apply_presented_frame(&rendered);
+
+    assert_eq!(state.last_transcript_area, ratatui::layout::Rect::default());
+}
+
+struct BlockingTestDrawer {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl RuntimeDrawer for BlockingTestDrawer {
+    fn draw(&mut self, _state: &mut TuiState) -> std::io::Result<()> {
+        let _ = self.started.send(());
+        self.release
+            .recv()
+            .map_err(|_| std::io::Error::other("test render release dropped"))
+    }
+}
+
+#[tokio::test]
+async fn double_escape_dispatches_while_render_is_blocked() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    let presented_state = runtime.state().clone();
+    let (mut engine, ingress, _egress) = crate::session::SessionEngine::new();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut renderer = AsyncRenderWorker::spawn(BlockingTestDrawer {
+        started: started_tx,
+        release: release_rx,
+    });
+    renderer
+        .submit("test".into(), runtime.state().clone())
+        .expect("submit blocking render");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("render starts");
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
+        .expect("first escape is handled");
+    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
+        .expect("second escape is handled");
+
+    assert!(matches!(
+        engine.recv_control().await,
+        Some(SessionEngineControl::Interrupt)
+    ));
+    release_tx.send(()).expect("release render");
+    assert!(
+        renderer
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive render result")
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn terminal_event_handler_preserves_double_escape_interrupt_fifo() {
     let mut runtime = runtime();
@@ -6429,19 +6497,42 @@ async fn terminal_event_handler_preserves_double_escape_interrupt_fifo() {
     let (mut engine, ingress, _egress) = crate::session::SessionEngine::new();
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
-    handle_terminal_event(&mut runtime, Event::Key(escape), &ingress)
+    let presented_state = runtime.state().clone();
+    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
         .expect("first escape is handled");
     assert!(matches!(
         engine.try_recv_control(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
 
-    handle_terminal_event(&mut runtime, Event::Key(escape), &ingress)
+    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
         .expect("second escape is handled");
     assert!(matches!(
         engine.recv_control().await,
         Some(SessionEngineControl::Interrupt)
     ));
+}
+
+#[test]
+fn render_feedback_does_not_overwrite_newer_business_state() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("newer input");
+    runtime.state_mut().phase = AppPhase::Running;
+    let mut rendered = runtime.state().clone();
+    rendered.set_input("stale input");
+    rendered.phase = AppPhase::Idle;
+    rendered.last_transcript_area = ratatui::layout::Rect::new(1, 2, 30, 12);
+    rendered.last_transcript_scroll_top = 4;
+
+    runtime.state_mut().apply_render_feedback(&rendered);
+
+    assert_eq!(runtime.state().input_buffer, "newer input");
+    assert_eq!(runtime.state().phase, AppPhase::Running);
+    assert_eq!(
+        runtime.state().last_transcript_area,
+        rendered.last_transcript_area
+    );
+    assert_eq!(runtime.state().last_transcript_scroll_top, 4);
 }
 
 #[test]

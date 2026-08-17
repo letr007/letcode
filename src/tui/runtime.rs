@@ -534,7 +534,91 @@ struct ComposerDraft {
 }
 
 pub trait RuntimeDrawer {
+    fn set_title(&mut self, _title: &str) -> io::Result<()> {
+        Ok(())
+    }
+
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
+}
+
+trait RenderWorker {
+    fn submit(&mut self, title: String, state: TuiState) -> io::Result<()>;
+    fn try_recv(&mut self) -> io::Result<Option<TuiState>>;
+    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<TuiState>>;
+}
+
+struct AsyncRenderWorker {
+    request_tx: std::sync::mpsc::Sender<(String, TuiState)>,
+    result_rx: std::sync::mpsc::Receiver<io::Result<TuiState>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncRenderWorker {
+    fn spawn<D>(mut drawer: D) -> Self
+    where
+        D: RuntimeDrawer + Send + 'static,
+    {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<(String, TuiState)>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while let Ok((title, mut state)) = request_rx.recv() {
+                let result = drawer
+                    .set_title(&title)
+                    .and_then(|()| drawer.draw(&mut state))
+                    .map(|()| state);
+                let failed = result.is_err();
+                if result_tx.send(result).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            request_tx,
+            result_rx,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl RenderWorker for AsyncRenderWorker {
+    fn submit(&mut self, title: String, state: TuiState) -> io::Result<()> {
+        self.request_tx.send((title, state)).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "terminal render worker stopped")
+        })
+    }
+
+    fn try_recv(&mut self) -> io::Result<Option<TuiState>> {
+        match self.result_rx.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal render worker stopped",
+            )),
+        }
+    }
+
+    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<TuiState>> {
+        match self.result_rx.recv_timeout(timeout) {
+            Ok(result) => result.map(Some),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal render worker stopped",
+            )),
+        }
+    }
+}
+
+impl Drop for AsyncRenderWorker {
+    fn drop(&mut self) {
+        let (replacement, _) = std::sync::mpsc::channel();
+        let request_tx = std::mem::replace(&mut self.request_tx, replacement);
+        drop(request_tx);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub struct TuiRuntime {
@@ -636,10 +720,6 @@ impl TuiRuntime {
             self.has_active_or_pending_session_turn()
                 .then_some(self.spinner_frame / TERMINAL_TITLE_TICKS_PER_FRAME),
         )
-    }
-
-    fn update_terminal_title(&self, terminal: &mut OwnedTerminal) -> io::Result<()> {
-        terminal.set_title(&self.terminal_title())
     }
 
     fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
@@ -2016,10 +2096,6 @@ impl TuiRuntime {
             | InputAction::MoveCursorEnd
             | InputAction::NoOp => Ok(None),
         }
-    }
-
-    pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
-        drawer.draw(&mut self.state)
     }
 
     pub(super) fn clear_mcp_server_updating(&mut self, server_name: &str) {
@@ -4055,9 +4131,11 @@ fn session_event_preempts_typewriter(event: &SessionTransportEvent) -> bool {
 
 fn handle_terminal_event(
     runtime: &mut TuiRuntime,
+    presented_state: &TuiState,
     event: Event,
     ingress: &crate::session::SessionEngineIngress,
 ) -> Result<()> {
+    let _ = runtime.state.apply_presented_frame(presented_state);
     let (action, allow_submit_family) = match event {
         Event::Key(key) => {
             // Windows ReadConsoleInput reports key-down and key-up separately.
@@ -4066,7 +4144,19 @@ fn handle_terminal_event(
             }
             (map_key_event(runtime.state(), key), true)
         }
-        Event::Mouse(mouse) => (map_mouse_event(runtime.state(), mouse), false),
+        Event::Mouse(mouse) => {
+            let action = map_mouse_event(presented_state, mouse);
+            if matches!(
+                action,
+                InputAction::MouseSelectionStart(..)
+                    | InputAction::MouseSelectionDrag(..)
+                    | InputAction::MouseSelectionEnd(..)
+            ) && !runtime.state().matches_presented_frame(presented_state)
+            {
+                return Ok(());
+            }
+            (action, false)
+        }
         Event::Paste(text) => (map_paste_event(runtime.state(), text), false),
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => return Ok(()),
     };
@@ -4079,11 +4169,12 @@ fn handle_terminal_event(
 
 fn drain_terminal_events(
     runtime: &mut TuiRuntime,
+    presented_state: &TuiState,
     reader: &TerminalEventReader,
     ingress: &crate::session::SessionEngineIngress,
 ) -> Result<()> {
     while let Some(event) = reader.try_recv()? {
-        handle_terminal_event(runtime, event, ingress)?;
+        handle_terminal_event(runtime, presented_state, event, ingress)?;
         if runtime.state().quit_requested {
             break;
         }
@@ -4150,10 +4241,10 @@ pub async fn run_tui(
         );
         runtime.set_workspace_dir(workspace_dir);
         runtime.session_title = projection.session_title;
-        let mut terminal = OwnedTerminal::new()?;
-        runtime.update_terminal_title(&mut terminal)?;
-        let mut drawer = TerminalDrawer::new(&mut terminal);
+        let mut renderer = AsyncRenderWorker::spawn(TerminalDrawer::new(OwnedTerminal::new()?));
         let terminal_events = TerminalEventReader::spawn();
+        let mut presented_state = runtime.state().clone();
+        let mut render_in_flight = false;
 
         if let Some(session_id) = resume_session_id {
             runtime.session_resume_pending = true;
@@ -4169,9 +4260,15 @@ pub async fn run_tui(
         }
 
         loop {
-            // Input is collected independently from rendering. Consume everything
-            // already captured before ordinary session projection work.
-            drain_terminal_events(&mut runtime, &terminal_events, &ingress)?;
+            if let Some(rendered) = renderer.try_recv()? {
+                runtime.state.apply_render_feedback(&rendered);
+                presented_state = rendered;
+                render_in_flight = false;
+            }
+
+            // Input is collected independently and always handled before ordinary
+            // session projection. Mouse coordinates use the last presented frame.
+            drain_terminal_events(&mut runtime, &presented_state, &terminal_events, &ingress)?;
             if runtime.state().quit_requested {
                 if let Some(session_id) = runtime.state().session_id.as_deref() {
                     exit_epilogue = Some(super::render::format_exit_epilogue(
@@ -4186,18 +4283,29 @@ pub async fn run_tui(
             if let Some(command) = runtime.take_next_queued_prompt_command() {
                 command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
             }
-            drawer.set_title(&runtime.terminal_title())?;
-            runtime.draw(&mut drawer)?;
+            if !render_in_flight {
+                renderer.submit(runtime.terminal_title(), runtime.state().clone())?;
+                render_in_flight = true;
+            }
 
             match terminal_events.recv_timeout(TUI_FRAME_POLL_INTERVAL)? {
                 Some(event) => {
-                    handle_terminal_event(&mut runtime, event, &ingress)?;
-                    drain_terminal_events(&mut runtime, &terminal_events, &ingress)?;
+                    handle_terminal_event(&mut runtime, &presented_state, event, &ingress)?;
+                    drain_terminal_events(
+                        &mut runtime,
+                        &presented_state,
+                        &terminal_events,
+                        &ingress,
+                    )?;
                 }
                 None => {
                     let _ = runtime.handle_input_action(InputAction::Tick)?;
                 }
             }
+        }
+
+        if render_in_flight && let Some(rendered) = renderer.recv_timeout(Duration::from_secs(1))? {
+            runtime.state.apply_render_feedback(&rendered);
         }
         Ok(())
     }
@@ -4214,13 +4322,13 @@ pub async fn run_tui(
     tui_result.and(shutdown_result).and(join_result)
 }
 
-struct TerminalDrawer<'a> {
-    terminal: &'a mut OwnedTerminal,
+struct TerminalDrawer {
+    terminal: OwnedTerminal,
     applied_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
 }
 
-impl<'a> TerminalDrawer<'a> {
-    fn new(terminal: &'a mut OwnedTerminal) -> Self {
+impl TerminalDrawer {
+    fn new(terminal: OwnedTerminal) -> Self {
         Self {
             terminal,
             applied_hyperlink_cells: Vec::new(),
@@ -4232,7 +4340,11 @@ impl<'a> TerminalDrawer<'a> {
     }
 }
 
-impl RuntimeDrawer for TerminalDrawer<'_> {
+impl RuntimeDrawer for TerminalDrawer {
+    fn set_title(&mut self, title: &str) -> io::Result<()> {
+        TerminalDrawer::set_title(self, title)
+    }
+
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
         // Ratatui keeps the hardware cursor hidden for frames without a requested
         // cursor. Avoid per-frame cursor moves here: some CJK IMEs follow the VT

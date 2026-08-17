@@ -579,6 +579,11 @@ impl PendingQuestionState {
         self.confirm_scroll = self.confirm_scroll.min(max_scroll);
     }
 
+    pub(crate) fn sync_rendered_confirm_scroll(&mut self, rendered: &Self) {
+        self.confirm_scroll_max = rendered.confirm_scroll_max;
+        self.confirm_scroll = self.confirm_scroll.min(self.confirm_scroll_max);
+    }
+
     #[cfg(test)]
     pub fn confirm_scroll_max(&self) -> usize {
         self.confirm_scroll_max
@@ -2809,6 +2814,59 @@ impl TuiState {
     pub fn invalidate_transcript_cache(&mut self) {
         self.transcript_render_cache.clear();
         self.on_timeline_changed();
+    }
+
+    pub(crate) fn matches_presented_frame(&self, rendered: &Self) -> bool {
+        self.active_timeline().cache_id() == rendered.active_timeline().cache_id()
+            && self.active_timeline().mutation_revision()
+                == rendered.active_timeline().mutation_revision()
+    }
+
+    pub(crate) fn apply_presented_frame(&mut self, rendered: &Self) -> bool {
+        if !self.matches_presented_frame(rendered) {
+            return false;
+        }
+        self.transcript_render_cache = rendered.transcript_render_cache.clone();
+        self.frame_hyperlink_cells = rendered.frame_hyperlink_cells.clone();
+        self.last_transcript_total_rows = rendered.last_transcript_total_rows;
+        self.last_transcript_area = rendered.last_transcript_area;
+        self.last_transcript_scroll_top = rendered.last_transcript_scroll_top;
+        true
+    }
+
+    pub(crate) fn apply_render_feedback(&mut self, rendered: &Self) {
+        if !self.apply_presented_frame(rendered) {
+            return;
+        }
+
+        if self.auto_scroll {
+            self.transcript_scroll = rendered.transcript_scroll;
+            self.auto_scroll = rendered.auto_scroll;
+        } else if let Some(total_rows) = self.last_transcript_total_rows {
+            self.transcript_scroll = self.transcript_scroll.min(measure::max_scroll(
+                total_rows,
+                self.last_transcript_area.height,
+            ));
+            self.auto_scroll = self.transcript_scroll == 0;
+        }
+
+        if let (Some(question), Some(rendered_question)) = (
+            self.pending_question.as_mut(),
+            rendered.pending_question.as_ref(),
+        ) && question.questions == rendered_question.questions
+            && question.active_tab == rendered_question.active_tab
+        {
+            question.sync_rendered_confirm_scroll(rendered_question);
+        }
+
+        if let (Some(dialog), Some(rendered_dialog)) =
+            (self.dialog.as_mut(), rendered.dialog.as_ref())
+            && dialog.kind == rendered_dialog.kind
+            && dialog.kind == DialogKind::ContextPicker
+        {
+            dialog.detail_scroll_max = rendered_dialog.detail_scroll_max;
+            dialog.detail_scroll = dialog.detail_scroll.min(dialog.detail_scroll_max);
+        }
     }
 }
 
