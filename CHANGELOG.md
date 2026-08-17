@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- TUI 支持 `en` / `zh-CN` 国际化，可通过 `/language`（`/lang`）切换；未显式选择时跟随系统 locale，显式语言保存到 `tui-preferences.json` 的 `language` 字段。
+
 ## [0.4.0] - 2026-08-13
 
 ### Added

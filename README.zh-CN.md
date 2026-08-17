@@ -42,6 +42,8 @@ cargo run -- --cli
 
 CLI 模式也可以通过 `cli` 或 `repl` 选择。TUI 可以通过 `--tui` 或 `tui` 显式选择。
 
+TUI 支持 English（`en`）和简体中文（`zh-CN`）。运行时可使用 `/language` 或别名 `/lang` 切换语言。未显式选择时，TUI 跟随系统 locale，将 `zh*` 映射为 `zh-CN`，不支持的 locale 回退到 English。显式选择会保存到 `tui-preferences.json` 的 `language` 字段。
+
 ## 配置
 
 `letcode` 从以下路径加载配置：
