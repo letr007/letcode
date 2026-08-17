@@ -2562,7 +2562,7 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
     catalog.insert(
         "m1".to_string(),
         ModelRequestMetadata {
-            context_window: Some(2048),
+            context_window: Some(4096),
             max_output_tokens: Some(256),
             supports_tools: true,
             supports_reasoning: false,
@@ -2599,7 +2599,7 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         context_view: None,
     })
     .expect("request builds");
-    assert_eq!(b1.budget.context_window_tokens, 2048);
+    assert_eq!(b1.budget.context_window_tokens, 4096);
 
     // Switch model and build again.
     agent.set_model("m2");
