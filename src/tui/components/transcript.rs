@@ -1,3 +1,11 @@
+//! Render the active `Timeline` into the terminal frame.
+//!
+//! The terminal-facing transcript component: takes the already model-ized
+//! `Timeline` plus markdown/theme, and draws the transcript viewport to the
+//! `Frame`. Layout primitives come from `transcript_render` via the
+//! `transcript_ratatui` bridge; the model itself comes from
+//! `transcript_read_model`.
+
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},

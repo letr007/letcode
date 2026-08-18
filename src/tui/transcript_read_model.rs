@@ -1,3 +1,10 @@
+//! Rebuild a `Timeline` model from persisted transcript records.
+//!
+//! The read side of the transcript pipeline: `TranscriptRecord`s written to disk
+//! become a renderable `Timeline`. Backend-agnostic and independent of the
+//! terminal rendering layers (`transcript_render` / `transcript_ratatui` /
+//! `components::transcript`).
+
 use super::events::{
     AutoContinueChangedEvent, ErrorEvent, TodoSnapshotEvent, ToolFinishedEvent, ToolOutcome,
     ToolStartedEvent, UserMessageEvent,

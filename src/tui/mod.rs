@@ -33,6 +33,12 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_file;
 pub mod timeline;
+
+// Transcript rendering pipeline (four files, clear layering):
+//   transcript_read_model: TranscriptRecord (disk) -> Timeline model
+//   transcript_render:     renderer-neutral layout primitives (no backend)
+//   transcript_ratatui:    renderer-neutral primitives -> ratatui bridge
+//   components::transcript: Timeline -> terminal Frame (final draw)
 pub mod transcript_ratatui;
 pub(crate) mod transcript_read_model;
 pub mod transcript_render;

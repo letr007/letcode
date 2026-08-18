@@ -299,6 +299,48 @@ fn deepseek_chat_compat_uses_legacy_roles_and_tokens_and_thinking() {
 }
 
 #[test]
+fn deepseek_completions_preserves_skill_material_across_developer_messages() {
+    let history = vec![HistoryItem::user("current")];
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Completions,
+        model_id: "deepseek-v4-flash",
+        model: deepseek_metadata(),
+        prelude: &[
+            PromptMessage::developer("## persona stable instructions"),
+            PromptMessage::developer_with_origin(
+                "可用本地 skills：- ctf-web — 用于 web 攻防",
+                PromptMessageOrigin::SkillCatalog,
+            ),
+            PromptMessage::developer_with_origin(
+                "---\nname: ctf-web\ndescription: web\n---\n# SKILL BODY MAGIC",
+                PromptMessageOrigin::SkillMaterial,
+            ),
+        ],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("deepseek chat request builds");
+    let request = request_value(&result);
+    let messages = request["messages"].as_array().expect("messages array");
+    let system_texts: Vec<String> = messages
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .filter_map(|message| message["content"].as_str().map(String::from))
+        .collect::<Vec<_>>();
+    assert_eq!(system_texts.len(), 3, "all developer preludes become system: {messages:?}");
+    assert!(
+        system_texts.iter().any(|text| text.contains("SKILL BODY MAGIC")),
+        "skill material must be preserved in the request: {system_texts:?}"
+    );
+    assert!(system_texts.iter().any(|text| text.contains("persona stable instructions")));
+    assert!(system_texts.iter().any(|text| text.contains("ctf-web")));
+}
+
+#[test]
 fn deepseek_chat_compat_preserves_empty_reasoning_content_for_tool_turns() {
     let history = vec![
         HistoryItem::AssistantToolCalls {
