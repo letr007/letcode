@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use super::{TranscriptEvent, TranscriptFileFingerprint, TranscriptRecord};
+use super::model::{TranscriptEvent, TranscriptFileFingerprint, TranscriptRecord};
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 

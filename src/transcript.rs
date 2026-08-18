@@ -38,12 +38,7 @@ mod model;
 mod session_index;
 
 pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranscriptFileFingerprint {
-    content_len: usize,
-    content_digest: String,
-}
+pub(crate) use model::TranscriptFileFingerprint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -10,12 +10,11 @@ use crate::agent::{Agent, AgentEvent, SubagentDelegate};
 use crate::agent_event_journal::{persist_agent_event, ContextProjection, JournalEffect};
 use crate::permission::PermissionApproval;
 use crate::subagent::SubagentPool;
+use crate::subagent_events::SubagentEventSender;
 use crate::transcript::{
     read_records, transcript_has_session_title, transcript_has_user_message, TranscriptRecorder,
 };
-use crate::user_content::UserMessageSubmission;
-#[cfg(test)]
-use crate::user_content::UserMessageContent;
+use crate::user_content::{UserMessageContent, UserMessageSubmission};
 
 #[path = "events.rs"]
 mod events;
@@ -24,7 +23,6 @@ mod formatting;
 #[path = "subagent_delegate.rs"]
 mod subagent_delegate;
 
-pub(crate) use events::subagent_event_sender;
 
 use events::SessionTransportEventMode;
 pub(crate) use events::{
@@ -1272,4 +1270,60 @@ mod tests {
             TranscriptRecorder::create(&base_dir).expect("transcript created"),
         ))
     }
+}
+
+pub(crate) fn subagent_event_sender(
+    event_tx: SessionTransportEventSender,
+) -> SubagentEventSender<async_openai::config::OpenAIConfig> {
+    let status_tx = event_tx.clone();
+    let error_tx = event_tx.clone();
+    SubagentEventSender::new(
+        Arc::new(move |message| {
+            status_tx
+                .send(SessionTransportEvent::Notice(NoticeEvent::info(message)))
+                .map_err(|_| anyhow!("runner event channel closed"))
+        }),
+        Arc::new(move |message| {
+            error_tx
+                .send(SessionTransportEvent::Error(ErrorEvent::new(message)))
+                .map_err(|_| anyhow!("runner event channel closed"))
+        }),
+        Arc::new(
+            move |agent,
+                  prompt,
+                  transcript,
+                  child_session_id,
+                  permission_origin,
+                  parent_tool_call_id| {
+                let runner: AgentRunner<async_openai::config::OpenAIConfig> =
+                    if let Some(permission_origin) = permission_origin {
+                        AgentRunner::child_streaming_with_permission_passthrough(
+                            transcript,
+                            event_tx.clone(),
+                            child_session_id,
+                            permission_origin,
+                            parent_tool_call_id,
+                        )
+                    } else {
+                        AgentRunner::child_streaming_with_transcript(
+                            transcript,
+                            event_tx.clone(),
+                            child_session_id,
+                        )
+                    };
+                Box::pin(async move {
+                    let mut agent = agent;
+                    runner
+                        .run_prompt(
+                            &mut agent,
+                            UserMessageSubmission::new(
+                                "child-stream-prompt",
+                                UserMessageContent::new(prompt, Vec::new()),
+                            ),
+                        )
+                        .await
+                })
+            },
+        ),
+    )
 }

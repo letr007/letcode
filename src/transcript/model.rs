@@ -395,3 +395,9 @@ pub enum TranscriptEvent {
     #[serde(other)]
     Unknown,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptFileFingerprint {
+    pub(crate) content_len: usize,
+    pub(crate) content_digest: String,
+}

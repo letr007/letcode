@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 #[cfg(unix)]
@@ -11,9 +11,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use super::{
-    AppConfig, CONFIG_WRITE_SEQUENCE, McpServerConfig, ModelRoute, RawAppConfig,
-    RawMcpServerConfig, build_mcp_server_config,
+    AppConfig, McpServerConfig, ModelRoute, RawAppConfig, RawMcpServerConfig,
+    build_mcp_server_config,
 };
+
+static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Persist the selected primary route without rewriting unrelated configuration
 /// content.

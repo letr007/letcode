@@ -12,7 +12,8 @@ use crate::subagent::{SubagentFailureKind, SubagentPool, SubagentStatus};
 use crate::tool::ToolResult;
 use crate::transcript::TranscriptRecorder;
 
-use super::events::{subagent_event_sender, SessionTransportEventSender};
+use super::events::SessionTransportEventSender;
+use super::subagent_event_sender;
 use super::formatting::compact_subagent_summary;
 
 pub(super) struct RunnerSubagentDelegate {

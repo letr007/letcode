@@ -4,16 +4,14 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use super::AgentRunner;
 use crate::agent::{ConversationMessage, LlmRetryLifecycle};
 use crate::permission::PermissionRequest;
 use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
-use crate::subagent_events::SubagentEventSender;
+use crate::user_content::UserMessageSubmission;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
 use crate::transcript::{read_records, TranscriptRecord, TranscriptRecorder};
-use crate::user_content::{UserMessageContent, UserMessageSubmission};
 
 use crate::session::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
@@ -425,62 +423,6 @@ impl SessionTransportEvent {
             Self::Done => Some(SessionEvent::Done),
         }
     }
-}
-
-pub(crate) fn subagent_event_sender(
-    event_tx: SessionTransportEventSender,
-) -> SubagentEventSender<async_openai::config::OpenAIConfig> {
-    let status_tx = event_tx.clone();
-    let error_tx = event_tx.clone();
-    SubagentEventSender::new(
-        Arc::new(move |message| {
-            status_tx
-                .send(SessionTransportEvent::Notice(NoticeEvent::info(message)))
-                .map_err(|_| anyhow!("runner event channel closed"))
-        }),
-        Arc::new(move |message| {
-            error_tx
-                .send(SessionTransportEvent::Error(ErrorEvent::new(message)))
-                .map_err(|_| anyhow!("runner event channel closed"))
-        }),
-        Arc::new(
-            move |agent,
-                  prompt,
-                  transcript,
-                  child_session_id,
-                  permission_origin,
-                  parent_tool_call_id| {
-                let runner: AgentRunner<async_openai::config::OpenAIConfig> =
-                    if let Some(permission_origin) = permission_origin {
-                        AgentRunner::child_streaming_with_permission_passthrough(
-                            transcript,
-                            event_tx.clone(),
-                            child_session_id,
-                            permission_origin,
-                            parent_tool_call_id,
-                        )
-                    } else {
-                        AgentRunner::child_streaming_with_transcript(
-                            transcript,
-                            event_tx.clone(),
-                            child_session_id,
-                        )
-                    };
-                Box::pin(async move {
-                    let mut agent = agent;
-                    runner
-                        .run_prompt(
-                            &mut agent,
-                            UserMessageSubmission::new(
-                                "child-stream-prompt",
-                                UserMessageContent::new(prompt, Vec::new()),
-                            ),
-                        )
-                        .await
-                })
-            },
-        ),
-    )
 }
 
 pub(super) fn wrap_child_session_transport_event(

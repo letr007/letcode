@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -43,8 +42,6 @@ const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
 const MAX_RETRY_ATTEMPTS: usize = 50;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
-static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 mod persistence;
 
 // Kept re-exported for API compatibility; persist_mcp_server_enabled is the
