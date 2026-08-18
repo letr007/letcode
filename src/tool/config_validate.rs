@@ -2,7 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{ToolHandler, ToolParallelism, ToolRegistry, optional_string};
+use super::args::optional_string;
+use super::{ToolHandler, ToolParallelism, ToolRegistry};
 use crate::config::{self, validate_config_file};
 use crate::permission::ToolPermissionClass;
 use crate::tool_names;

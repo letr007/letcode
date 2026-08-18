@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, path_preview};
 use crate::request_builder::ToolSpec;
 use crate::tool_names;
+use args::{optional_usize, required_string};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +28,7 @@ pub enum ToolParallelism {
     Exclusive,
 }
 
+mod args;
 mod code_analysis;
 mod command;
 mod config_validate;
@@ -2482,26 +2484,6 @@ fn bound_display(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
-}
-
-fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing or invalid string argument: {key}"))
-}
-
-fn optional_string<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(Value::as_str)
-}
-
-fn optional_bool(args: &Value, key: &str) -> Option<bool> {
-    args.get(key).and_then(Value::as_bool)
-}
-
-fn optional_usize(args: &Value, key: &str) -> Option<usize> {
-    args.get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn workspace_root() -> Result<PathBuf> {
