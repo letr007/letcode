@@ -1,3 +1,6 @@
+use super::assistant::{
+    ASSISTANT_TYPEWRITER_INITIAL_RATE, ASSISTANT_TYPEWRITER_MAX_RATE, AssistantDeltaStream,
+};
 use super::*;
 use crate::agent::{Agent, SubagentInvocation};
 use crate::agent::{
