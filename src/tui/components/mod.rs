@@ -4,6 +4,7 @@ pub mod footer;
 pub mod layout;
 pub mod picker;
 pub mod reviewer_cards;
+pub mod semantic_spans;
 pub mod slash_panel;
 pub mod structured_subagent;
 pub mod todo_card;
