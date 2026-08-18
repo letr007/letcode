@@ -456,6 +456,80 @@ pub struct PendingQuestionItem {
     pub custom_edit_cursor: usize,
 }
 
+impl PendingQuestionItem {
+    /// Insert `text` at the custom-edit cursor (grapheme boundary is caller's
+    /// responsibility; the insert is byte-based at the clamped cursor).
+    pub(super) fn insert_custom_edit(&mut self, text: &str) {
+        self.custom_edit_cursor = self.custom_edit_cursor.min(self.custom_edit_text.len());
+        self.custom_edit_text
+            .insert_str(self.custom_edit_cursor, text);
+        self.custom_edit_cursor += text.len();
+    }
+
+    /// Delete the character just before the cursor.
+    pub(super) fn backspace_custom_edit(&mut self) {
+        if self.custom_edit_cursor == 0 {
+            return;
+        }
+        let previous = self.custom_edit_text[..self.custom_edit_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.custom_edit_text
+            .drain(previous..self.custom_edit_cursor);
+        self.custom_edit_cursor = previous;
+    }
+
+    /// Delete the character after the cursor.
+    pub(super) fn delete_custom_edit(&mut self) {
+        if self.custom_edit_cursor >= self.custom_edit_text.len() {
+            return;
+        }
+        let next = self.custom_edit_text[self.custom_edit_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.custom_edit_cursor + index)
+            .unwrap_or(self.custom_edit_text.len());
+        self.custom_edit_text
+            .drain(self.custom_edit_cursor..next);
+    }
+
+    /// Move the cursor one character left.
+    pub(super) fn move_custom_cursor_left(&mut self) {
+        if self.custom_edit_cursor == 0 {
+            return;
+        }
+        self.custom_edit_cursor = self.custom_edit_text[..self.custom_edit_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    /// Move the cursor one character right.
+    pub(super) fn move_custom_cursor_right(&mut self) {
+        if self.custom_edit_cursor >= self.custom_edit_text.len() {
+            return;
+        }
+        self.custom_edit_cursor = self.custom_edit_text[self.custom_edit_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.custom_edit_cursor + index)
+            .unwrap_or(self.custom_edit_text.len());
+    }
+
+    /// Move the cursor to the start.
+    pub(super) fn move_custom_cursor_home(&mut self) {
+        self.custom_edit_cursor = 0;
+    }
+
+    /// Move the cursor to the end.
+    pub(super) fn move_custom_cursor_end(&mut self) {
+        self.custom_edit_cursor = self.custom_edit_text.len();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingQuestionState {
     pub questions: Vec<PendingQuestionItem>,
@@ -2995,6 +3069,68 @@ mod tests {
             state.effective_language(),
             crate::tui::i18n::system_language()
         );
+    }
+
+    fn custom_edit_item(initial: &str) -> PendingQuestionItem {
+        PendingQuestionItem {
+            question: "q".into(),
+            header: "h".into(),
+            options: Vec::new(),
+            multiple: false,
+            selected_labels: Vec::new(),
+            custom_text: String::new(),
+            custom_cursor: 0,
+            custom_edit_text: initial.into(),
+            custom_edit_cursor: initial.len(),
+        }
+    }
+
+    #[test]
+    fn custom_edit_insert_backspace_delete_keep_unicode_intact() {
+        let mut item = custom_edit_item("猫😺a");
+        item.move_custom_cursor_left();
+        item.move_custom_cursor_left();
+        item.insert_custom_edit("喵");
+        assert_eq!(item.custom_edit_text, "猫喵😺a");
+
+        item.backspace_custom_edit();
+        assert_eq!(item.custom_edit_text, "猫😺a");
+
+        item.move_custom_cursor_home();
+        item.delete_custom_edit();
+        assert_eq!(item.custom_edit_text, "😺a");
+
+        item.move_custom_cursor_end();
+        item.insert_custom_edit("！");
+        assert_eq!(item.custom_edit_text, "😺a！");
+    }
+
+    #[test]
+    fn custom_edit_cursor_never_lands_inside_a_multibyte_char() {
+        let mut item = custom_edit_item("😺😺");
+        item.move_custom_cursor_left();
+        // Cursor points at a char boundary; left again hits the first char.
+        assert_eq!(item.custom_edit_cursor, "😺".len());
+        item.move_custom_cursor_left();
+        assert_eq!(item.custom_edit_cursor, 0);
+        // Left at the start is a no-op.
+        item.move_custom_cursor_left();
+        assert_eq!(item.custom_edit_cursor, 0);
+
+        item.move_custom_cursor_end();
+        item.move_custom_cursor_right();
+        assert_eq!(item.custom_edit_cursor, item.custom_edit_text.len());
+    }
+
+    #[test]
+    fn custom_edit_backspace_and_delete_at_boundaries_are_noops() {
+        let mut item = custom_edit_item("ab");
+        item.move_custom_cursor_home();
+        item.backspace_custom_edit();
+        assert_eq!(item.custom_edit_text, "ab");
+        item.move_custom_cursor_end();
+        item.delete_custom_edit();
+        assert_eq!(item.custom_edit_text, "ab");
     }
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {

@@ -736,105 +736,59 @@ impl TuiRuntime {
     }
 
     fn insert_pending_question_text(&mut self, text: &str) {
-        let Some(question) = self
+        if let Some(question) = self
             .state
             .pending_question
             .as_mut()
             .filter(|question| question.editing_custom)
             .and_then(PendingQuestionState::current_question_mut)
-        else {
-            return;
-        };
-        question.custom_edit_cursor = question
-            .custom_edit_cursor
-            .min(question.custom_edit_text.len());
-        question
-            .custom_edit_text
-            .insert_str(question.custom_edit_cursor, text);
-        question.custom_edit_cursor += text.len();
+        {
+            question.insert_custom_edit(text);
+        }
     }
 
     fn backspace_pending_question_text(&mut self) {
-        let Some(question) = self
+        if let Some(question) = self
             .state
             .pending_question
             .as_mut()
             .and_then(PendingQuestionState::current_question_mut)
-        else {
-            return;
-        };
-        if question.custom_edit_cursor == 0 {
-            return;
+        {
+            question.backspace_custom_edit();
         }
-        let previous = question.custom_edit_text[..question.custom_edit_cursor]
-            .char_indices()
-            .last()
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-        question
-            .custom_edit_text
-            .drain(previous..question.custom_edit_cursor);
-        question.custom_edit_cursor = previous;
     }
 
     fn delete_pending_question_text(&mut self) {
-        let Some(question) = self
+        if let Some(question) = self
             .state
             .pending_question
             .as_mut()
             .and_then(PendingQuestionState::current_question_mut)
-        else {
-            return;
-        };
-        if question.custom_edit_cursor >= question.custom_edit_text.len() {
-            return;
+        {
+            question.delete_custom_edit();
         }
-        let next = question.custom_edit_text[question.custom_edit_cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| question.custom_edit_cursor + index)
-            .unwrap_or(question.custom_edit_text.len());
-        question
-            .custom_edit_text
-            .drain(question.custom_edit_cursor..next);
     }
 
     fn move_pending_question_cursor_left(&mut self) {
-        let Some(question) = self
+        if let Some(question) = self
             .state
             .pending_question
             .as_mut()
             .and_then(PendingQuestionState::current_question_mut)
-        else {
-            return;
-        };
-        if question.custom_edit_cursor == 0 {
-            return;
+        {
+            question.move_custom_cursor_left();
         }
-        question.custom_edit_cursor = question.custom_edit_text[..question.custom_edit_cursor]
-            .char_indices()
-            .last()
-            .map(|(index, _)| index)
-            .unwrap_or(0);
     }
 
     fn move_pending_question_cursor_right(&mut self) {
-        let Some(question) = self
+        if let Some(question) = self
             .state
             .pending_question
             .as_mut()
             .and_then(PendingQuestionState::current_question_mut)
-        else {
-            return;
-        };
-        if question.custom_edit_cursor >= question.custom_edit_text.len() {
-            return;
+        {
+            question.move_custom_cursor_right();
         }
-        question.custom_edit_cursor = question.custom_edit_text[question.custom_edit_cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| question.custom_edit_cursor + index)
-            .unwrap_or(question.custom_edit_text.len());
     }
 
     fn move_pending_question_cursor_home(&mut self) {
@@ -844,7 +798,7 @@ impl TuiRuntime {
             .as_mut()
             .and_then(PendingQuestionState::current_question_mut)
         {
-            question.custom_edit_cursor = 0;
+            question.move_custom_cursor_home();
         }
     }
 
@@ -855,7 +809,7 @@ impl TuiRuntime {
             .as_mut()
             .and_then(PendingQuestionState::current_question_mut)
         {
-            question.custom_edit_cursor = question.custom_edit_text.len();
+            question.move_custom_cursor_end();
         }
     }
 
