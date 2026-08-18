@@ -3,9 +3,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::args::{optional_bool, optional_string, optional_usize};
-use super::{
-    COMMAND_TIMEOUT_SECS, ToolHandler, ToolParallelism, ToolRegistry, safe_relative_path_arg,
-};
+use super::paths::safe_relative_path_arg;
+use super::{COMMAND_TIMEOUT_SECS, ToolHandler, ToolParallelism, ToolRegistry};
 
 pub(super) fn register(registry: &mut ToolRegistry) {
     registry.register(GitStatusTool);

@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,6 +19,11 @@ use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, 
 use crate::request_builder::ToolSpec;
 use crate::tool_names;
 use args::{optional_usize, required_string};
+use paths::{
+    display_workspace_relative, ensure_inside_workspace, existing_workspace_path,
+    join_workspace_path, new_workspace_path, outside_existing_workspace_path,
+    outside_new_workspace_path, workspace_root,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +40,7 @@ mod fold_artifact;
 pub(crate) use fold_artifact::is_trusted_artifact_path;
 mod git;
 mod memory;
+mod paths;
 mod question;
 mod registry;
 mod search;
@@ -2486,98 +2491,6 @@ fn bound_display(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn workspace_root() -> Result<PathBuf> {
-    std::env::current_dir()?
-        .canonicalize()
-        .context("failed to canonicalize current workspace")
-}
-
-fn outside_existing_workspace_path(path: &str) -> Option<String> {
-    let root = workspace_root().ok()?;
-    let candidate = join_workspace_path(&root, path);
-
-    if let Ok(canonical) = candidate.canonicalize() {
-        return outside_workspace_label(&root, &canonical);
-    }
-
-    syntactic_outside_workspace_label(&root, path, &candidate)
-}
-
-fn outside_new_workspace_path(path: &str) -> Option<String> {
-    let root = workspace_root().ok()?;
-    let candidate = join_workspace_path(&root, path);
-
-    if let Some(canonical_ancestor) = canonical_existing_ancestor(&candidate)
-        && let Some(label) = outside_workspace_label(&root, &canonical_ancestor)
-    {
-        return Some(label);
-    }
-
-    syntactic_outside_workspace_label(&root, path, &candidate)
-}
-
-fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if let Ok(canonical) = candidate.canonicalize() {
-            return Some(canonical);
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
-fn outside_workspace_label(root: &Path, path: &Path) -> Option<String> {
-    (!path.starts_with(root)).then(|| path.display().to_string())
-}
-
-fn syntactic_outside_workspace_label(
-    root: &Path,
-    raw_path: &str,
-    candidate: &Path,
-) -> Option<String> {
-    let raw_path = Path::new(raw_path);
-    if raw_path.is_absolute() {
-        return outside_workspace_label(root, raw_path);
-    }
-
-    if relative_path_escapes_workspace(raw_path) {
-        return Some(candidate.display().to_string());
-    }
-
-    None
-}
-
-fn relative_path_escapes_workspace(path: &Path) -> bool {
-    let mut depth = 0usize;
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => depth = depth.saturating_add(1),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if depth == 0 {
-                    return true;
-                }
-                depth -= 1;
-            }
-            Component::RootDir | Component::Prefix(_) => return true,
-        }
-    }
-    false
-}
-
-fn existing_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
-    let root = workspace_root()?;
-    let candidate = join_workspace_path(&root, path);
-    let canonical = candidate
-        .canonicalize()
-        .with_context(|| format!("path does not exist: {}", candidate.display()))?;
-    if !context.allow_outside_workspace {
-        ensure_inside_workspace(&root, &canonical)?;
-    }
-    Ok(canonical)
-}
-
 pub(crate) fn prepare_writable_leaf(path: &str) -> Result<PreparedWritableLeaf> {
     prepare_writable_leaf_platform(path)
 }
@@ -2740,82 +2653,6 @@ async fn secure_write_writable_leaf(
     _append: bool,
 ) -> Result<()> {
     bail!("secure writable leaf authorization is unsupported on this platform")
-}
-
-fn new_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
-    let root = workspace_root()?;
-    if context.allow_outside_workspace {
-        if Path::new(path).as_os_str().is_empty() {
-            bail!("path cannot be empty");
-        }
-        let candidate = join_workspace_path(&root, path);
-        return Ok(candidate);
-    }
-    let relative = safe_relative_path_arg(path)?;
-    let candidate = root.join(relative);
-    if let Some(canonical_ancestor) = canonical_existing_ancestor(&candidate) {
-        ensure_inside_workspace(&root, &canonical_ancestor)?;
-    }
-    Ok(candidate)
-}
-
-fn safe_relative_path_arg(path: &str) -> Result<String> {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        bail!("absolute paths are not allowed here: {}", path.display());
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("parent traversal is not allowed: {}", path.display());
-            }
-        }
-    }
-
-    if normalized.as_os_str().is_empty() {
-        bail!("path cannot be empty");
-    }
-
-    Ok(normalized.to_string_lossy().to_string())
-}
-
-fn join_workspace_path(root: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
-fn ensure_inside_workspace(root: &Path, path: &Path) -> Result<()> {
-    if !path.starts_with(root) {
-        bail!(
-            "path is outside workspace: {} (workspace: {})",
-            path.display(),
-            root.display()
-        );
-    }
-    Ok(())
-}
-
-fn display_workspace_relative(path: &Path) -> Result<String> {
-    let root = workspace_root()?;
-    let absolute = if path.exists() {
-        path.canonicalize()?
-    } else {
-        path.to_path_buf()
-    };
-
-    Ok(absolute
-        .strip_prefix(root)
-        .unwrap_or(&absolute)
-        .to_string_lossy()
-        .to_string())
 }
 
 #[cfg(test)]
