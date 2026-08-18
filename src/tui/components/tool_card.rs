@@ -431,9 +431,9 @@ fn tool_trace_segments(tool: &ToolView, style: Style) -> Vec<SemanticSpan<Style>
             let path = value_str(args, "path").unwrap_or(".");
             let mut segments = vec![
                 SemanticSpan::decoration("Search ", style),
-                SemanticSpan::source(pattern, style),
+                SemanticSpan::source(terminal_safe_text(pattern), style),
                 SemanticSpan::decoration(" in ", style),
-                SemanticSpan::source_with_join(path, style, CopyJoin::Space),
+                SemanticSpan::source_with_join(terminal_safe_text(path), style, CopyJoin::Space),
             ];
             // After completion, surface a compact result detail such as
             // "42 matches · 3 files · folded" in the same bracketed style as
@@ -458,7 +458,7 @@ fn tool_trace_segments(tool: &ToolView, style: Style) -> Vec<SemanticSpan<Style>
 fn trace_action_and_value(action: &str, value: &str, style: Style) -> Vec<SemanticSpan<Style>> {
     vec![
         SemanticSpan::decoration(action, style),
-        SemanticSpan::source(value, style),
+        SemanticSpan::source(terminal_safe_text(value), style),
     ]
 }
 
@@ -1632,6 +1632,8 @@ fn render_diff_block(
         return Vec::new();
     }
 
+    // Title carries user-controlled paths/labels; keep it display-safe too.
+    let title = terminal_safe_text(&title);
     let mut lines = Vec::new();
     let header = if truncated
         .and_then(serde_json::Value::as_bool)
@@ -1821,6 +1823,9 @@ fn render_diff_side(
     let content_style = diff_line_style(content, theme);
     let pad_style = Style::default().bg(content_style.bg.unwrap_or(theme.card_bg()));
     let (marker, body, marker_style) = diff_marker_and_body(content, theme);
+    // Strip control/ANSI from the diff body before it reaches display cells; the
+    // on-disk content itself stays untouched — filtering is presentation-only.
+    let body = terminal_safe_text(&body);
     let clipped_notice = content == "… output clipped in TUI";
     let marker_span = if clipped_notice {
         SemanticSpan::decoration(marker, marker_style)
@@ -2317,6 +2322,9 @@ fn render_diff_card_body_line(
     let pad_style = Style::default().bg(bg);
     let gutter_pad_style = Style::default().bg(theme.card_bg());
     let (marker, body, marker_style) = diff_marker_and_body(content, theme);
+    // Strip control/ANSI from the diff body before it reaches display cells; the
+    // on-disk content itself stays untouched — filtering is presentation-only.
+    let body = terminal_safe_text(&body);
     let clipped_notice = content == "… output clipped in TUI";
     let marker_span = if clipped_notice {
         SemanticSpan::decoration(marker, marker_style)
@@ -3487,6 +3495,51 @@ mod tests {
                 .all(|line| !line.to_string().chars().any(char::is_control)),
             "control leaked into patch card: {rendered:?}"
         );
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= width),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn write_diff_sanitizes_terminal_controls_across_layouts() {
+        // fs__write renders its full content as a diff (render_write_diff_lines);
+        // the body previously bypassed ansi_sgr_segments and could tear the TUI
+        // when the written text carried ANSI/control characters. The on-disk
+        // content is untouched — filtering is presentation-only.
+        let tool = ToolView {
+            call_id: "call-safe-write".into(),
+            name: "fs__write".into(),
+            summary: "wrote file".into(),
+            arguments: Some(
+                json!({
+                    "path": "notes/\u{1b}[2Kreadme.txt",
+                    "content": "line one\n\tline two\u{1b}[2K\ncolor\u{1b}[31m red\u{1b}[0m\n"
+                })
+                .to_string(),
+            ),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let width = 100;
+        let lines = render_tool_card_lines(&tool, Theme::dark(), width);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.to_string().chars().any(char::is_control)),
+            "control leaked into write card: {rendered:?}"
+        );
+        assert!(rendered.contains("line one"), "{rendered}");
+        assert!(rendered.contains("line two"), "{rendered}");
+        assert!(rendered.contains("red"), "{rendered}");
         assert!(
             lines
                 .iter()
