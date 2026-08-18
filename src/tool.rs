@@ -744,7 +744,12 @@ pub trait ToolHandler: Send + Sync {
         let parameters = self.parameters();
         let strict = self.strict();
         if strict {
-            debug_assert_strict_tool_parameters(self.name(), &parameters);
+            let missing = strict_parameter_violations(&parameters).unwrap_or_default();
+            debug_assert!(
+                missing.is_empty(),
+                "strict tool schema for '{}' is missing required entries for properties: {missing:?}",
+                self.name()
+            );
         }
         ToolSpec {
             name: self.name().to_string(),
@@ -757,10 +762,9 @@ pub trait ToolHandler: Send + Sync {
 
 /// OpenAI structured/strict function tools reject schemas where `required` omits
 /// any key from `properties` (optional fields must still be listed and allow null).
-fn debug_assert_strict_tool_parameters(tool_name: &str, parameters: &Value) {
-    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
-        return;
-    };
+/// Returns `None` when the schema has no `properties` object (nothing to verify).
+fn strict_parameter_violations(parameters: &Value) -> Option<Vec<String>> {
+    let properties = parameters.get("properties").and_then(Value::as_object)?;
     let required = parameters
         .get("required")
         .and_then(Value::as_array)
@@ -771,36 +775,19 @@ fn debug_assert_strict_tool_parameters(tool_name: &str, parameters: &Value) {
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let missing = properties
-        .keys()
-        .filter(|key| !required.contains(key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    debug_assert!(
-        missing.is_empty(),
-        "strict tool schema for '{tool_name}' is missing required entries for properties: {missing:?}"
-    );
+    Some(
+        properties
+            .keys()
+            .filter(|key| !required.contains(key.as_str()))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 fn assert_strict_tool_parameters(tool_name: &str, parameters: &Value) {
-    let properties = parameters
-        .get("properties")
-        .and_then(Value::as_object)
+    let missing = strict_parameter_violations(parameters)
         .unwrap_or_else(|| panic!("{tool_name}: parameters.properties must be an object"));
-    let required = parameters
-        .get("required")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("{tool_name}: parameters.required must be an array"));
-    let required = required
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<BTreeSet<_>>();
-    let missing = properties
-        .keys()
-        .filter(|key| !required.contains(key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
         "{tool_name}: strict schema required must include every properties key; missing {missing:?}"
