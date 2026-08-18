@@ -21,9 +21,9 @@ use crate::tool_names;
 use apply_patch::apply_patch;
 use args::{optional_usize, required_string};
 use paths::{
-    display_workspace_relative, ensure_inside_workspace, existing_workspace_path,
-    join_workspace_path, new_workspace_path, outside_existing_workspace_path,
-    outside_new_workspace_path, workspace_root,
+    canonical_destination_path, canonical_existing_path, display_workspace_relative,
+    ensure_inside_workspace, existing_workspace_path, join_workspace_path, new_workspace_path,
+    outside_existing_workspace_path, outside_new_workspace_path, workspace_root,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -1138,22 +1138,6 @@ pub fn permission_resource_for_tool(name: &str, args: &Value) -> Option<Permissi
             value: canonical_json(args),
         }),
     }
-}
-
-fn canonical_existing_path(path: &str) -> Option<PathBuf> {
-    join_workspace_path(&workspace_root().ok()?, path)
-        .canonicalize()
-        .ok()
-}
-
-fn canonical_destination_path(path: &str) -> Option<PathBuf> {
-    let root = workspace_root().ok()?;
-    let candidate = join_workspace_path(&root, path);
-    if let Ok(path) = candidate.canonicalize() {
-        return Some(path);
-    }
-    let parent = candidate.parent()?.canonicalize().ok()?;
-    Some(parent.join(candidate.file_name()?))
 }
 
 fn canonical_json(value: &Value) -> String {

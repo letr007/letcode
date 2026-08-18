@@ -176,3 +176,19 @@ pub(crate) fn display_workspace_relative(path: &Path) -> Result<String> {
         .to_string_lossy()
         .to_string())
 }
+
+pub(crate) fn canonical_existing_path(path: &str) -> Option<PathBuf> {
+    join_workspace_path(&workspace_root().ok()?, path)
+        .canonicalize()
+        .ok()
+}
+
+pub(crate) fn canonical_destination_path(path: &str) -> Option<PathBuf> {
+    let root = workspace_root().ok()?;
+    let candidate = join_workspace_path(&root, path);
+    if let Ok(path) = candidate.canonicalize() {
+        return Some(path);
+    }
+    let parent = candidate.parent()?.canonicalize().ok()?;
+    Some(parent.join(candidate.file_name()?))
+}
