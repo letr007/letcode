@@ -77,6 +77,32 @@ impl BranchPoller {
     }
 }
 
+/// Resolve the current git branch, falling back to a short commit hash.
+pub(crate) fn read_git_branch(workspace_dir: &Path) -> Option<String> {
+    let branch = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(workspace_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty());
+    if branch.is_some() {
+        return branch;
+    }
+
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(workspace_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| format!("detached@{}", commit.trim()))
+        .filter(|commit| !commit.ends_with('@'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,30 +158,4 @@ mod tests {
         poller.poll(&mut state);
         assert_eq!(state.git_branch, None);
     }
-}
-
-/// Resolve the current git branch, falling back to a short commit hash.
-pub(crate) fn read_git_branch(workspace_dir: &Path) -> Option<String> {
-    let branch = Command::new("git")
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .current_dir(workspace_dir)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|branch| branch.trim().to_string())
-        .filter(|branch| !branch.is_empty());
-    if branch.is_some() {
-        return branch;
-    }
-
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(workspace_dir)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|commit| format!("detached@{}", commit.trim()))
-        .filter(|commit| !commit.ends_with('@'))
 }

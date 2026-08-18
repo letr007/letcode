@@ -491,8 +491,7 @@ impl PendingQuestionItem {
             .nth(1)
             .map(|(index, _)| self.custom_edit_cursor + index)
             .unwrap_or(self.custom_edit_text.len());
-        self.custom_edit_text
-            .drain(self.custom_edit_cursor..next);
+        self.custom_edit_text.drain(self.custom_edit_cursor..next);
     }
 
     /// Move the cursor one character left.

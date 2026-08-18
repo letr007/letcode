@@ -23,7 +23,6 @@ use crate::transcript::{
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
-use branch_poller::BranchPoller;
 use super::events::{ErrorEvent, SessionEvent};
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
@@ -44,14 +43,15 @@ use super::theme_file::{
 use crate::session::RunnerPermissionRequest;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogUpdatedEvent};
 use crate::session::{RunnerQuestionRequest, SessionEngine, SessionTransportEvent};
+use branch_poller::BranchPoller;
+#[path = "runtime/branch_poller.rs"]
+mod branch_poller;
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/history_tree_dialog.rs"]
 mod history_tree_dialog;
 #[path = "runtime/lifecycle.rs"]
 mod lifecycle;
-#[path = "runtime/branch_poller.rs"]
-mod branch_poller;
 #[path = "runtime/permission_lifecycle.rs"]
 mod permission_lifecycle;
 #[path = "runtime/queued_prompt.rs"]
@@ -812,7 +812,10 @@ impl TuiRuntime {
             question.move_custom_cursor_end();
         }
     }
+}
 
+// ── 会话事件归约与后台轮询 ─────────────────────
+impl TuiRuntime {
     pub fn try_drain_session_events(&mut self) {
         // Leave time in every frame for terminal input. In particular, an
         // unbounded stream of model deltas must not prevent a confirmed Esc
@@ -1505,7 +1508,10 @@ impl TuiRuntime {
             self.reproject_pending_permission();
         }
     }
+}
 
+// ── 输入、命令分派与主题 ────────────────────────
+impl TuiRuntime {
     fn reproject_pending_permission(&mut self) {
         self.state
             .set_pending_permission_projection(self.permission_lifecycle.projection());
@@ -2667,7 +2673,10 @@ impl TuiRuntime {
         self.state.close_dialog();
         true
     }
+}
 
+// ── 对话框分派、模型与选择 ─────────────────────
+impl TuiRuntime {
     fn show_permission_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let items = vec![
             DialogItem::new(
@@ -4278,8 +4287,8 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 
 #[cfg(test)]
 mod git_branch_tests {
-    use super::branch_poller::read_git_branch;
     use super::TuiRuntime;
+    use super::branch_poller::read_git_branch;
     use crate::tui::TuiState;
     use std::path::Path;
     use std::process::Command;
