@@ -6,6 +6,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 
 use super::semantic_spans::*;
+pub use super::semantic_spans::ToolCardStatus;
 pub(crate) use super::semantic_spans::truncate_display_width;
 use super::{diff_render::*, question_card::*, shell_output::*, subagent_card::*};
 use crate::tui::{
