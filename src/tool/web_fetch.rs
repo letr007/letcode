@@ -9,17 +9,14 @@ use reqwest::header::{CONTENT_TYPE, LOCATION};
 use serde_json::{Value, json};
 use tokio::net::lookup_host;
 
+use super::fold_artifact::{
+    FETCH_ARTIFACT_DIR, FOLD_PREVIEW_CHARS, FOLD_THRESHOLD_BYTES, fold_preview, write_artifact,
+};
 use super::{ToolHandler, ToolParallelism, ToolRegistry};
 use crate::tool_names;
 
 const MAX_URL_CHARS: usize = 8_192;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-/// Bodies larger than this are folded to a local artifact instead of being
-/// returned inline. The result carries a short preview plus `local_path` so the
-/// model can retrieve or search the full body with search__rg / fs__read.
-const FOLD_THRESHOLD_BYTES: usize = 64 * 1024;
-/// Number of characters kept inline when a body is folded.
-const FOLD_PREVIEW_CHARS: usize = 8 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -169,7 +166,7 @@ async fn fetch_public_url_inner(raw_url: &str) -> Result<Value> {
         if folded {
             // Keep the full body addressable without bloating the context:
             // return a preview plus a local artifact the model can search.
-            let local_path = write_fetch_artifact(&body).await?;
+            let local_path = write_artifact(FETCH_ARTIFACT_DIR, &body, "txt").await?;
             output["content"] = json!(fold_preview(&content, FOLD_PREVIEW_CHARS));
             output["folded"] = json!(true);
             output["local_path"] = json!(local_path);
@@ -348,39 +345,6 @@ fn content_for_output(body: &[u8]) -> (String, bool) {
         json_bytes += escaped_bytes;
     }
     (output, false)
-}
-
-fn fold_preview(content: &str, max_chars: usize) -> String {
-    content.chars().take(max_chars).collect()
-}
-
-/// Deterministic artifact name derived from the body content. Identical bodies
-/// reuse the same file, so repeated fetches do not accumulate duplicates.
-///
-/// FNV-1a is used instead of std's DefaultHasher because the latter's internal
-/// algorithm is not stable across rustc releases, which would silently break
-/// cross-version deduplication.
-fn artifact_file_name(body: &[u8]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &byte in body {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{hash:016x}.txt")
-}
-
-async fn write_fetch_artifact(body: &[u8]) -> Result<String> {
-    let dir = std::env::temp_dir().join("letcode-fetch");
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .with_context(|| format!("failed to create web__fetch artifact dir {}", dir.display()))?;
-    let path = dir.join(artifact_file_name(body));
-    tokio::fs::write(&path, body)
-        .await
-        .with_context(|| format!("failed to write web__fetch artifact {}", path.display()))?;
-    Ok(path.to_string_lossy().to_string())
 }
 
 async fn read_limited_body(response: &mut reqwest::Response) -> Result<(Vec<u8>, bool)> {

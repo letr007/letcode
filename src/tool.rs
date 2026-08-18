@@ -30,6 +30,8 @@ pub enum ToolParallelism {
 mod code_analysis;
 mod command;
 mod config_validate;
+mod fold_artifact;
+pub(crate) use fold_artifact::is_trusted_artifact_path;
 mod git;
 mod memory;
 mod question;

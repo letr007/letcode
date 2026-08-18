@@ -887,6 +887,16 @@ where
                 .or_else(|| crate::tool::permission_resource_for_tool(&call.name, &args)),
         )
     };
+    // Reads of letcode's own fold-artifact dirs (folded tool output) are trusted
+    // read-only access: they reach workspace-external temp paths but should not
+    // prompt. Anything else external still needs approval.
+    let needs_external_approval = external_workspace_access.as_ref().is_some_and(|access| {
+        !access.paths.is_empty()
+            && !access
+                .paths
+                .iter()
+                .all(|path| crate::tool::is_trusted_artifact_path(std::path::Path::new(path)))
+    });
     let (mode, permission_generation, permission_decision, grant_allowed) = {
         let state = agent
             .permission_session
@@ -898,7 +908,7 @@ where
             &args,
             permission_class,
             directive,
-            external_workspace_access.is_some(),
+            needs_external_approval,
             crate::permission::is_internal_tool(&call.name),
         )
     };

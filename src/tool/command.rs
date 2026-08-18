@@ -1,13 +1,18 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::io::Write;
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
+use super::fold_artifact::{
+    COMMAND_ARTIFACT_DIR, FOLD_PREVIEW_CHARS, FOLD_THRESHOLD_BYTES, fold_preview, write_artifact,
+};
 use super::{
     COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream,
     ToolRegistry, optional_u64, required_string, workspace_root,
@@ -304,25 +309,18 @@ async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result
             .context("command stderr reader failed")??,
     };
 
-    let stdout = truncate_utf8(
-        &String::from_utf8_lossy(&output.stdout),
-        MAX_COMMAND_OUTPUT_BYTES,
-    );
-    let stderr = truncate_utf8(
-        &String::from_utf8_lossy(&output.stderr),
-        MAX_COMMAND_OUTPUT_BYTES,
-    );
-
-    Ok(json!({
+    let stdout = fold_bytes_output(&output.stdout, "out").await;
+    let stderr = fold_bytes_output(&output.stderr, "err").await;
+    let mut data = json!({
         "command": command,
         "shell": shell,
         "status": output.status.code(),
         "success": output.status.success(),
-        "stdout": stdout.text,
-        "stdout_truncated": stdout.truncated,
-        "stderr": stderr.text,
-        "stderr_truncated": stderr.truncated,
-    }))
+    });
+    let fields = data.as_object_mut().expect("command output object");
+    add_stream_fields(fields, "stdout", &stdout);
+    add_stream_fields(fields, "stderr", &stderr);
+    Ok(data)
 }
 
 async fn run_workspace_shell_command_streaming(
@@ -391,7 +389,10 @@ async fn run_workspace_shell_command_streaming(
         emit(stream, chunk)?;
     }
 
-    let mut data = json!({ "command": command, "shell": shell, "status": status.code(), "success": status.success() && !timed_out, "stdout": stdout.text, "stdout_truncated": stdout.truncated, "stderr": stderr.text, "stderr_truncated": stderr.truncated });
+    let mut data = json!({ "command": command, "shell": shell, "status": status.code(), "success": status.success() && !timed_out });
+    let fields = data.as_object_mut().expect("command output object");
+    add_stream_fields(fields, "stdout", &stdout.output);
+    add_stream_fields(fields, "stderr", &stderr.output);
     if timed_out {
         data["error"] = Value::String(format!("command timed out after {timeout_secs}s"));
     }
@@ -423,31 +424,168 @@ async fn read_command_stream<R>(
     }
 }
 
-struct StreamAccumulator {
+/// Inline presentation of one command output stream (stdout or stderr).
+struct StreamOutput {
+    /// Full text while small enough; a short preview once folded.
     text: String,
+    /// Inline text is incomplete (folded or truncation fallback).
     truncated: bool,
+    /// Full output was persisted to a local artifact.
+    folded: bool,
+    local_path: Option<String>,
 }
+
+/// Where streaming output is currently being accumulated.
+enum StreamSink {
+    /// Buffering inline until the fold threshold is crossed.
+    Buffering,
+    /// Folded: full output is streamed to a local artifact, inline keeps a preview.
+    Writing(std::fs::File),
+    /// Artifact writing failed; fall back to the legacy inline truncation.
+    Truncating,
+}
+
+struct StreamAccumulator {
+    output: StreamOutput,
+    sink: StreamSink,
+}
+
 impl StreamAccumulator {
     fn new() -> Self {
         Self {
-            text: String::new(),
-            truncated: false,
+            output: StreamOutput {
+                text: String::new(),
+                truncated: false,
+                folded: false,
+                local_path: None,
+            },
+            sink: StreamSink::Buffering,
         }
     }
+
     fn push(&mut self, chunk: &str) {
-        if self.text.len() >= MAX_COMMAND_OUTPUT_BYTES {
-            self.truncated = true;
-            return;
-        }
-        self.text.push_str(chunk);
-        if self.text.len() > MAX_COMMAND_OUTPUT_BYTES {
-            self.truncated = true;
-            self.text.truncate(MAX_COMMAND_OUTPUT_BYTES);
-            while !self.text.is_char_boundary(self.text.len()) {
-                self.text.pop();
+        match &mut self.sink {
+            StreamSink::Writing(file) => {
+                if let Err(error) = file.write_all(chunk.as_bytes()) {
+                    warn!(
+                        error = %error,
+                        "failed to write folded command artifact; truncating inline instead"
+                    );
+                    self.sink = StreamSink::Truncating;
+                }
+            }
+            StreamSink::Truncating => self.push_truncating(chunk),
+            StreamSink::Buffering => {
+                self.output.text.push_str(chunk);
+                if self.output.text.len() > FOLD_THRESHOLD_BYTES {
+                    self.start_fold();
+                }
             }
         }
     }
+
+    fn push_truncating(&mut self, chunk: &str) {
+        if self.output.text.len() >= MAX_COMMAND_OUTPUT_BYTES {
+            self.output.truncated = true;
+            return;
+        }
+        self.output.text.push_str(chunk);
+        if self.output.text.len() > MAX_COMMAND_OUTPUT_BYTES {
+            self.output.truncated = true;
+            self.output.text.truncate(MAX_COMMAND_OUTPUT_BYTES);
+            while !self.output.text.is_char_boundary(self.output.text.len()) {
+                self.output.text.pop();
+            }
+        }
+    }
+
+    /// Fold the buffered text to a local artifact, keeping only a preview inline.
+    fn start_fold(&mut self) {
+        let (file, path) = match open_stream_artifact("out") {
+            Ok(ok) => ok,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to open command artifact; truncating inline instead"
+                );
+                self.sink = StreamSink::Truncating;
+                return;
+            }
+        };
+        let mut file = file;
+        if let Err(error) = file.write_all(self.output.text.as_bytes()) {
+            warn!(
+                error = %error,
+                "failed to seed command artifact; truncating inline instead"
+            );
+            self.sink = StreamSink::Truncating;
+            return;
+        }
+        self.output.text = fold_preview(&self.output.text, FOLD_PREVIEW_CHARS);
+        self.output.truncated = true;
+        self.output.folded = true;
+        self.output.local_path = Some(path);
+        self.sink = StreamSink::Writing(file);
+    }
+}
+
+/// Fold output that was fully captured in memory (non-streaming path). Persists
+/// the whole body to a content-addressed artifact when it crosses the threshold.
+async fn fold_bytes_output(bytes: &[u8], ext: &str) -> StreamOutput {
+    let lost = String::from_utf8_lossy(bytes);
+    if bytes.len() <= FOLD_THRESHOLD_BYTES {
+        return StreamOutput {
+            text: lost.into_owned(),
+            truncated: false,
+            folded: false,
+            local_path: None,
+        };
+    }
+    match write_artifact(COMMAND_ARTIFACT_DIR, bytes, ext).await {
+        Ok(path) => StreamOutput {
+            text: fold_preview(&lost, FOLD_PREVIEW_CHARS),
+            truncated: true,
+            folded: true,
+            local_path: Some(path),
+        },
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to fold large command output; truncating inline instead"
+            );
+            let truncated = truncate_utf8(&lost, MAX_COMMAND_OUTPUT_BYTES);
+            StreamOutput {
+                text: truncated.text,
+                truncated: true,
+                folded: false,
+                local_path: None,
+            }
+        }
+    }
+}
+
+fn add_stream_fields(map: &mut serde_json::Map<String, Value>, label: &str, stream: &StreamOutput) {
+    map.insert(format!("{label}"), json!(stream.text));
+    map.insert(format!("{label}_truncated"), json!(stream.truncated));
+    if stream.folded {
+        map.insert(format!("{label}_folded"), json!(true));
+        map.insert(format!("{label}_local_path"), json!(stream.local_path));
+    }
+}
+
+fn open_stream_artifact(ext: &str) -> Result<(std::fs::File, String)> {
+    let dir = std::env::temp_dir().join(COMMAND_ARTIFACT_DIR);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create command artifact dir {}", dir.display()))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time")?
+        .as_nanos();
+    let name = format!("stream-{}-{}.{}", std::process::id(), nanos, ext);
+    let path = dir.join(name);
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to create command artifact {}", path.display()))?;
+    Ok((file, path.to_string_lossy().to_string()))
 }
 
 fn shell_invocation() -> (&'static str, &'static str) {
@@ -613,5 +751,93 @@ mod tests {
         std::fs::write(&release, "go").expect("release side effect");
         assert_file_does_not_appear(&marker).await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fold_bytes_output_persists_large_bodies_and_keeps_preview() {
+        let big = vec![b'x'; 70 * 1024];
+        let output = super::fold_bytes_output(&big, "out").await;
+        assert!(output.folded);
+        assert!(output.truncated);
+        let path = output.local_path.expect("local path");
+        assert!(path.ends_with(".out"));
+        let on_disk = tokio::fs::read(&path).await.expect("read artifact");
+        assert_eq!(on_disk, big);
+        assert_eq!(output.text.len(), 8 * 1024);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn fold_bytes_output_leaves_small_bodies_inline() {
+        let output = super::fold_bytes_output(b"hello world", "out").await;
+        assert!(!output.folded);
+        assert!(!output.truncated);
+        assert!(output.local_path.is_none());
+        assert_eq!(output.text, "hello world");
+    }
+
+    #[test]
+    fn stream_accumulator_folds_after_threshold() {
+        let mut acc = super::StreamAccumulator::new();
+        let chunk = "x".repeat(16 * 1024);
+        for _ in 0..5 {
+            acc.push(&chunk);
+        }
+        assert!(acc.output.folded);
+        assert!(acc.output.truncated);
+        assert!(acc.output.local_path.is_some());
+        assert_eq!(acc.output.text.len(), 8 * 1024);
+        acc.push(&"y".repeat(1000));
+        assert_eq!(acc.output.text.len(), 8 * 1024, "preview stays capped");
+        let path = acc.output.local_path.clone().unwrap();
+        let on_disk = std::fs::read(&path).expect("read artifact");
+        assert_eq!(on_disk.len(), 5 * 16 * 1024 + 1000);
+        assert!(on_disk[..5 * 16 * 1024].iter().all(|&b| b == b'x'));
+        assert!(on_disk[5 * 16 * 1024..].iter().all(|&b| b == b'y'));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_shell_command_folds_large_output() {
+        use super::ToolHandler;
+
+        let mut emit = |_stream, _chunk| Ok(());
+        let result = super::RunCommandTool
+            .execute_streaming(
+                json!({"command": "yes x | head -c 70000", "timeout_secs": 30}),
+                super::ToolExecutionContext::default(),
+                &mut emit,
+            )
+            .await
+            .expect("shell tool result");
+
+        assert!(result.ok);
+        let data = result.data.as_ref().expect("data");
+        assert_eq!(
+            data.get("status").and_then(serde_json::Value::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            data.get("stdout_folded")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("stdout_truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let path = data
+            .get("stdout_local_path")
+            .and_then(serde_json::Value::as_str)
+            .expect("local path");
+        let on_disk = tokio::fs::read(path).await.expect("read artifact");
+        assert_eq!(on_disk.len(), 70000);
+        assert!(
+            on_disk.iter().all(|&b| b == b'x' || b == b'\n'),
+            "yes emits x per line"
+        );
+        let _ = tokio::fs::remove_file(path).await;
     }
 }

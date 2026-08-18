@@ -787,6 +787,43 @@ mod tests {
     }
 
     #[test]
+    fn trusted_reads_do_not_escalate_to_ask_but_other_external_reads_do() {
+        // Default mode: reads inside the workspace, or at trusted fold-artifact
+        // paths (which the agent folds into external=false before this call),
+        // stay on the read-only default Allow and do not prompt.
+        let state = PermissionSessionState::default();
+        assert_eq!(
+            state
+                .approval_snapshot(
+                    None,
+                    "fs__read",
+                    &json!({"path": "/tmp/letcode-command/x.out"}),
+                    ToolPermissionClass::Read,
+                    ExecutionDirective::None,
+                    false,
+                    false,
+                )
+                .2,
+            PermissionDecision::Allow,
+        );
+        // Any genuinely external (untrusted) read still escalates to Ask.
+        assert_eq!(
+            state
+                .approval_snapshot(
+                    None,
+                    "fs__read",
+                    &json!({"path": "/tmp/other.txt"}),
+                    ToolPermissionClass::Read,
+                    ExecutionDirective::None,
+                    true,
+                    false,
+                )
+                .2,
+            PermissionDecision::Ask,
+        );
+    }
+
+    #[test]
     fn auto_mode_ignores_session_grants() {
         let resource = PermissionResource::Exact {
             tool: "shell__exec".into(),
