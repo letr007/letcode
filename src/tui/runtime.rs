@@ -15,10 +15,7 @@ use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::skills::SkillCard;
-use crate::transcript::{
-    SessionSummary, TranscriptEvent, TranscriptRecord, list_sessions, read_records,
-    transcript_projection,
-};
+use crate::transcript::{SessionSummary, list_sessions, read_records, transcript_projection};
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
@@ -30,8 +27,8 @@ use super::preferences::TuiPreferences;
 use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
-    ContextDetailTarget, DialogItem, DialogKind, DialogState, McpDiscoveryState,
-    PendingQuestionState, QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
+    ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
+    QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
@@ -51,6 +48,13 @@ mod branch_poller;
 #[path = "runtime/model_catalog.rs"]
 mod model_catalog;
 pub(crate) use model_catalog::{AvailableExpert, AvailableModel};
+#[path = "runtime/support.rs"]
+mod support;
+use support::{
+    ClipboardPasteChoice, ClipboardPasteContext, TERMINAL_TITLE_TICKS_PER_FRAME,
+    choose_clipboard_paste, format_terminal_title, mcp_discovery_description, next_attachment_id,
+    next_submission_id, session_title_from_records,
+};
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/history_tree_dialog.rs"]
@@ -75,90 +79,10 @@ use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
 use session_dialog::session_dialog_item;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
-const TERMINAL_TITLE_APP_NAME: &str = "LetCode";
-const TERMINAL_TITLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 3;
-const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
-const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
-static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn mcp_discovery_description(discovery: McpDiscoveryState) -> Option<String> {
-    match discovery {
-        McpDiscoveryState::Loading => Some(MCP_DISCOVERY_LOADING_DESCRIPTION.into()),
-        McpDiscoveryState::Ready => None,
-        McpDiscoveryState::Unavailable => Some(MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION.into()),
-    }
-}
-
-fn next_submission_id() -> String {
-    format!(
-        "user-submission-{}",
-        NEXT_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn next_attachment_id() -> String {
-    format!(
-        "user-attachment-{}",
-        NEXT_ATTACHMENT_ID.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClipboardPasteContext {
-    Composer,
-    Dialog,
-    Question,
-    Permission,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClipboardPasteChoice {
-    Image,
-    Text,
-    None,
-}
-
-fn choose_clipboard_paste(
-    context: ClipboardPasteContext,
-    has_text: bool,
-    has_image: bool,
-) -> ClipboardPasteChoice {
-    if matches!(context, ClipboardPasteContext::Composer) && has_image {
-        ClipboardPasteChoice::Image
-    } else if has_text {
-        ClipboardPasteChoice::Text
-    } else {
-        ClipboardPasteChoice::None
-    }
-}
-
-fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {
-    records.iter().rev().find_map(|record| match &record.event {
-        TranscriptEvent::SessionTitle { title } => Some(title.clone()),
-        _ => None,
-    })
-}
-
-fn format_terminal_title(session_title: Option<&str>, spinner_frame: Option<usize>) -> String {
-    let title = match session_title.filter(|title| !title.trim().is_empty()) {
-        Some(title) => format!("{TERMINAL_TITLE_APP_NAME} | {title}"),
-        None => TERMINAL_TITLE_APP_NAME.to_string(),
-    };
-    match spinner_frame {
-        Some(frame) => format!(
-            "{} {title}",
-            TERMINAL_TITLE_SPINNER[frame % TERMINAL_TITLE_SPINNER.len()]
-        ),
-        None => title,
-    }
-}
 
 /// Compatibility alias: session commands are owned by the backend boundary.
 pub type RuntimeCommand = crate::session::SessionCommand;
