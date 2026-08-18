@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -24,6 +23,7 @@ use crate::transcript::{
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
+use branch_poller::BranchPoller;
 use super::events::{ErrorEvent, SessionEvent};
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
@@ -50,6 +50,8 @@ mod command_dispatch;
 mod history_tree_dialog;
 #[path = "runtime/lifecycle.rs"]
 mod lifecycle;
+#[path = "runtime/branch_poller.rs"]
+mod branch_poller;
 #[path = "runtime/permission_lifecycle.rs"]
 mod permission_lifecycle;
 #[path = "runtime/queued_prompt.rs"]
@@ -83,7 +85,6 @@ const TERMINAL_TITLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '
 const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 3;
 const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
 const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
-const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -100,31 +101,6 @@ fn next_submission_id() -> String {
         "user-submission-{}",
         NEXT_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-fn read_git_branch(workspace_dir: &Path) -> Option<String> {
-    let branch = Command::new("git")
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .current_dir(workspace_dir)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|branch| branch.trim().to_string())
-        .filter(|branch| !branch.is_empty());
-    if branch.is_some() {
-        return branch;
-    }
-
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(workspace_dir)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|commit| format!("detached@{}", commit.trim()))
-        .filter(|commit| !commit.ends_with('@'))
 }
 
 fn next_attachment_id() -> String {
@@ -554,9 +530,7 @@ pub struct TuiRuntime {
     available_models: Vec<AvailableModel>,
     available_experts: Vec<AvailableExpert>,
     model_absence_notified_for: Option<String>,
-    workspace_dir: Option<PathBuf>,
-    git_branch_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
-    next_git_branch_refresh: Instant,
+    branch_poller: BranchPoller,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
     assistant_typewriter: Option<AssistantTypewriter>,
@@ -594,9 +568,7 @@ impl TuiRuntime {
             available_models,
             available_experts,
             model_absence_notified_for: None,
-            workspace_dir: None,
-            git_branch_rx: None,
-            next_git_branch_refresh: Instant::now(),
+            branch_poller: BranchPoller::new(),
             sessions_dir,
             preferences_dir,
             assistant_typewriter: None,
@@ -608,8 +580,7 @@ impl TuiRuntime {
     }
 
     pub fn set_workspace_dir(&mut self, workspace_dir: PathBuf) {
-        self.workspace_dir = Some(workspace_dir);
-        self.next_git_branch_refresh = Instant::now();
+        self.branch_poller.set_workspace_dir(workspace_dir);
         self.poll_git_branch();
     }
 
@@ -909,32 +880,7 @@ impl TuiRuntime {
     }
 
     fn poll_git_branch(&mut self) {
-        if let Some(rx) = self.git_branch_rx.as_mut() {
-            match rx.try_recv() {
-                Ok(branch) => {
-                    self.git_branch_rx = None;
-                    self.state.set_git_branch(branch);
-                    self.next_git_branch_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.git_branch_rx = None;
-                    self.state.set_git_branch(None);
-                    self.next_git_branch_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => return,
-            }
-        }
-        if self.git_branch_rx.is_some() || Instant::now() < self.next_git_branch_refresh {
-            return;
-        }
-        let Some(workspace_dir) = self.workspace_dir.clone() else {
-            return;
-        };
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.git_branch_rx = Some(rx);
-        std::thread::spawn(move || {
-            let _ = tx.send(read_git_branch(&workspace_dir));
-        });
+        self.branch_poller.poll(&mut self.state);
     }
 
     fn poll_session_list(&mut self) {
@@ -4378,7 +4324,8 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 
 #[cfg(test)]
 mod git_branch_tests {
-    use super::{TuiRuntime, read_git_branch};
+    use super::branch_poller::read_git_branch;
+    use super::TuiRuntime;
     use crate::tui::TuiState;
     use std::path::Path;
     use std::process::Command;
@@ -4422,9 +4369,7 @@ mod git_branch_tests {
     }
 
     fn deliver_branch_refresh(runtime: &mut TuiRuntime, branch: Option<String>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(branch).expect("queue branch refresh");
-        runtime.git_branch_rx = Some(rx);
+        runtime.branch_poller.enqueue_for_test(branch);
         runtime.poll_git_branch();
     }
 
