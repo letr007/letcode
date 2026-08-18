@@ -3,7 +3,6 @@
 use ratatui::style::{Modifier, Style};
 
 use super::semantic_spans::*;
-use super::shell_output::shell_card_content_width;
 use crate::tui::{
     measure::display_width,
     theme::Theme,

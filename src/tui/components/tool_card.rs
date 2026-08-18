@@ -18,16 +18,6 @@ use crate::tui::{
     transcript_render::{Break, CopyJoin, Document, SemanticLine, SemanticSpan},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCardStatus {
-    Pending,
-    Approved,
-    Running,
-    Cancelled,
-    Succeeded,
-    Failed,
-    Denied,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCardDetails {
@@ -699,34 +689,12 @@ fn sentence_case_tool_name(name: &str) -> String {
     format!("{}{}", first.to_uppercase(), chars.as_str())
 }
 
-pub(super) fn map_tool_status(status: ToolExecutionStatus) -> ToolCardStatus {
-    match status {
-        ToolExecutionStatus::Pending => ToolCardStatus::Pending,
-        ToolExecutionStatus::Running => ToolCardStatus::Running,
-        ToolExecutionStatus::Cancelled => ToolCardStatus::Cancelled,
-        ToolExecutionStatus::Succeeded => ToolCardStatus::Succeeded,
-        ToolExecutionStatus::Failed => ToolCardStatus::Failed,
-    }
-}
-
 fn permission_accent(status: PermissionPromptStatus, theme: Theme) -> ratatui::style::Color {
     match status {
         PermissionPromptStatus::Pending => theme.approval,
         PermissionPromptStatus::Approved => theme.success,
         PermissionPromptStatus::Denied => theme.error,
     }
-}
-
-pub(super) fn status_label(status: ToolCardStatus, translator: &crate::tui::i18n::Translator) -> String {
-    translator.t(match status {
-        ToolCardStatus::Pending => "status.pending",
-        ToolCardStatus::Approved => "status.approved",
-        ToolCardStatus::Running => "status.running",
-        ToolCardStatus::Cancelled => "status.cancelled",
-        ToolCardStatus::Succeeded => "status.succeeded",
-        ToolCardStatus::Failed => "status.failed",
-        ToolCardStatus::Denied => "status.denied",
-    })
 }
 
 fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
@@ -756,12 +724,6 @@ fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::
     ratatui::style::Style::default().fg(color).bg(theme.root_bg)
 }
 
-pub(super) fn root_status_style(color: ratatui::style::Color, theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(color)
-        .bg(theme.root_bg)
-        .add_modifier(ratatui::style::Modifier::BOLD)
-}
 
 #[cfg(test)]
 mod tests {

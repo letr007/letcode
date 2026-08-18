@@ -4,7 +4,6 @@ use ratatui::style::{Modifier, Style};
 use serde_json::Value;
 
 use super::semantic_spans::*;
-use super::shell_output::shell_card_content_width;
 use crate::tui::{
     measure::wrap_text_to_width,
     theme::Theme,

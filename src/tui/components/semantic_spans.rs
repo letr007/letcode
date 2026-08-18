@@ -8,7 +8,7 @@ use crate::tui::{
     surface,
     measure::display_width,
     theme::Theme,
-    timeline::ToolView,
+    timeline::{ToolExecutionStatus, ToolView},
     transcript_render::{Break, SemanticLine, SemanticSpan},
 };
 
@@ -611,3 +611,53 @@ pub(super) fn render_card_line_with_guide(
 
     SemanticLine { spans, boundary }
 }
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCardStatus {
+    Pending,
+    Approved,
+    Running,
+    Cancelled,
+    Succeeded,
+    Failed,
+    Denied,
+}
+
+pub(super) fn map_tool_status(status: ToolExecutionStatus) -> ToolCardStatus {
+    match status {
+        ToolExecutionStatus::Pending => ToolCardStatus::Pending,
+        ToolExecutionStatus::Running => ToolCardStatus::Running,
+        ToolExecutionStatus::Cancelled => ToolCardStatus::Cancelled,
+        ToolExecutionStatus::Succeeded => ToolCardStatus::Succeeded,
+        ToolExecutionStatus::Failed => ToolCardStatus::Failed,
+    }
+}
+
+pub(super) fn status_label(status: ToolCardStatus, translator: &crate::tui::i18n::Translator) -> String {
+    translator.t(match status {
+        ToolCardStatus::Pending => "status.pending",
+        ToolCardStatus::Approved => "status.approved",
+        ToolCardStatus::Running => "status.running",
+        ToolCardStatus::Cancelled => "status.cancelled",
+        ToolCardStatus::Succeeded => "status.succeeded",
+        ToolCardStatus::Failed => "status.failed",
+        ToolCardStatus::Denied => "status.denied",
+    })
+}
+
+pub(super) fn root_status_style(color: ratatui::style::Color, theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(color)
+        .bg(theme.root_bg)
+        .add_modifier(ratatui::style::Modifier::BOLD)
+}
+
+pub(super) const PROCESS_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub(super) fn shell_card_content_width(width: usize) -> usize {
+    width
+        .saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2)
+        .max(1)
+}
+

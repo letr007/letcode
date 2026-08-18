@@ -4,13 +4,11 @@ use ratatui::style::{Modifier, Style};
 
 use super::semantic_spans::*;
 use crate::tui::{
-    measure::{display_width, wrap_text_to_width},
+    measure::wrap_text_to_width,
     theme::Theme,
     timeline::ToolView,
     transcript_render::{Break, SemanticLine, SemanticSpan},
 };
-
-pub(super) const PROCESS_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub(super) fn render_shell_output_lines(
     tool: &ToolView,
@@ -245,12 +243,6 @@ pub(super) fn sentence_case_command_goal(command: &str) -> String {
         "git" if command.contains("diff") => "Shows current diff".to_string(),
         _ => format!("Runs {first}"),
     }
-}
-
-pub(super) fn shell_card_content_width(width: usize) -> usize {
-    width
-        .saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2)
-        .max(1)
 }
 
 pub(super) fn shell_card_title_style(theme: Theme) -> Style {

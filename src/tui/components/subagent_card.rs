@@ -3,8 +3,6 @@
 use ratatui::style::{Modifier, Style};
 
 use super::semantic_spans::*;
-use super::shell_output::PROCESS_FRAMES;
-use super::tool_card::{map_tool_status, root_status_style, status_label};
 use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
 use crate::subagent::StructuredSubagentResult;
 use crate::tui::{
