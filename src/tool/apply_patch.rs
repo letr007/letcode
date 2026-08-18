@@ -10,13 +10,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::permission::{PermissionResource, path_preview};
 
 use super::args::required_string;
 use super::paths::{join_workspace_path, workspace_root};
-use super::{ExternalWorkspaceAccess, ToolExecutionContext};
+use super::{
+    ExternalWorkspaceAccess, ToolExecutionContext, ToolHandler, ToolRegistry,
+};
 
 /// An opaque, authorization-time binding for an ApplyPatch batch.
 #[derive(Clone)]
@@ -616,3 +619,69 @@ fn bound_display(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+struct ApplyPatchTool;
+
+#[async_trait]
+impl ToolHandler for ApplyPatchTool {
+    fn name(&self) -> &'static str {
+        "edit__apply_patch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Apply exact-match text replacements to existing UTF-8 files under the workspace. Each edit must provide the exact old text in `find` and replacement text in `replace`. By default use replace_all=false so the tool fails unless `find` matches exactly once. All edits are first validated against staged in-memory content before any file is written. After validation, files are written individually and non-transactionally, so I/O, timeout, cancellation, or process failure can leave previously written files changed. This is intended for precise, low-ambiguity code edits."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "description": "Exact-match replacement edits. All edits are validated against staged in-memory content before any file is written. After validation, files are written individually and non-transactionally, so I/O, timeout, cancellation, or process failure can leave previously written files changed",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Existing UTF-8 file path relative to the current workspace"
+                            },
+                            "find": {
+                                "type": "string",
+                                "description": "Exact old text to replace. Include enough surrounding context to make it unique. Must not be empty"
+                            },
+                            "replace": {
+                                "type": "string",
+                                "description": "New text that replaces `find`"
+                            },
+                            "replace_all": {
+                                "type": "boolean",
+                                "description": "If false, fail unless `find` occurs exactly once. If true, replace every occurrence but still fail if there are zero matches"
+                            }
+                        },
+                        "required": ["path", "find", "replace", "replace_all"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["edits"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        apply_patch(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        apply_patch(args, context).await
+    }
+}
+
+
+pub(super) fn register(registry: &mut ToolRegistry) {
+    registry.register(ApplyPatchTool);
+}
