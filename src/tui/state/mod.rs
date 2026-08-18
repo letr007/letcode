@@ -1,4 +1,3 @@
-use super::components::transcript::TranscriptRenderCache;
 use super::events::{
     AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
     PermissionResolutionEvent, SessionEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
@@ -7,7 +6,6 @@ use super::measure;
 use super::slash;
 use super::theme::{Theme, ThemeName};
 use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TimelineItem, TodoView};
-use super::transcript_render::Interaction;
 #[cfg(test)]
 use crate::agent::ConversationMessage;
 use crate::agent::{AutoContinueState, CacheUsageReport};
@@ -580,11 +578,6 @@ impl PendingQuestionState {
         self.confirm_scroll = self.confirm_scroll.min(max_scroll);
     }
 
-    pub(crate) fn sync_rendered_confirm_scroll(&mut self, rendered: &Self) {
-        self.confirm_scroll_max = rendered.confirm_scroll_max;
-        self.confirm_scroll = self.confirm_scroll.min(self.confirm_scroll_max);
-    }
-
     #[cfg(test)]
     pub fn confirm_scroll_max(&self) -> usize {
         self.confirm_scroll_max
@@ -1055,9 +1048,6 @@ pub struct TuiState {
     pub tool_output_overrides: HashMap<String, bool>,
     pub theme_id: String,
     pub custom_theme: Option<Theme>,
-    pub transcript_render_cache: TranscriptRenderCache,
-    pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
-    last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub toast: Option<ToastState>,
     pub quit_requested: bool,
@@ -1068,12 +1058,6 @@ pub struct TuiState {
     pub selection_in_progress: bool,
     /// The current press has emitted a drag event and must not trigger a click action.
     pub selection_dragged: bool,
-    /// 最后渲染的 transcript 文本区域（content_area，不含 scrollbar 列，用于鼠标坐标映射）
-    pub last_transcript_area: ratatui::layout::Rect,
-    /// 最后渲染时已解析为 top-relative 的滚动顶部偏移（0 = 全文第一行可见）
-    /// `transcript_scroll` 是 bottom-relative，选择锚点/高亮必须用 top-relative，否则
-    /// 底部 auto-scroll 时会把点击映射到全文顶部不可见区域。
-    pub last_transcript_scroll_top: u16,
     /// 拖拽选择期间最后一次鼠标位置，用于边缘自动滚动
     pub selection_last_mouse: Option<(u16, u16)>,
 }
@@ -1132,9 +1116,6 @@ impl Default for TuiState {
             tool_output_overrides: HashMap::new(),
             theme_id: ThemeName::default().as_str().to_string(),
             custom_theme: None,
-            transcript_render_cache: TranscriptRenderCache::default(),
-            frame_hyperlink_cells: Vec::new(),
-            last_transcript_total_rows: None,
             status_spinner_frame: 0,
             toast: None,
             quit_requested: false,
@@ -1142,8 +1123,6 @@ impl Default for TuiState {
             text_selection: None,
             selection_in_progress: false,
             selection_dragged: false,
-            last_transcript_area: ratatui::layout::Rect::default(),
-            last_transcript_scroll_top: 0,
             selection_last_mouse: None,
         }
     }
@@ -1225,8 +1204,7 @@ impl TuiState {
     pub fn set_thoughts_display(&mut self, mode: ThoughtsDisplayMode) {
         if self.thoughts_display != mode {
             self.thoughts_display = mode;
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
         }
     }
 
@@ -1309,16 +1287,14 @@ impl TuiState {
         if self.theme_id != theme_id || self.custom_theme != custom_theme {
             self.theme_id = theme_id;
             self.custom_theme = custom_theme;
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
         }
     }
 
     pub fn set_tool_output_expanded(&mut self, expanded: bool) {
         if self.tool_output_expanded != expanded {
             self.tool_output_expanded = expanded;
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
         }
     }
 
@@ -1330,15 +1306,13 @@ impl TuiState {
             .unwrap_or(self.tool_output_expanded);
         self.tool_output_overrides
             .insert(call_id.to_string(), expanded);
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
     }
 
     pub fn set_transcript_scrollbar_visible(&mut self, visible: bool) {
         if self.transcript_scrollbar_visible != visible {
             self.transcript_scrollbar_visible = visible;
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
         }
     }
 
@@ -1855,12 +1829,6 @@ impl TuiState {
 
     pub fn scroll_transcript_up(&mut self, rows: u16) {
         self.transcript_scroll = self.transcript_scroll.saturating_add(rows);
-        if let Some(total_rows) = self.last_transcript_total_rows {
-            self.transcript_scroll = self.transcript_scroll.min(measure::max_scroll(
-                total_rows,
-                self.last_transcript_area.height,
-            ));
-        }
         self.auto_scroll = self.transcript_scroll == 0;
     }
 
@@ -1874,9 +1842,20 @@ impl TuiState {
         self.auto_scroll = true;
     }
 
-    pub fn sync_transcript_viewport_rows(&mut self, total_rows: usize) {
+    pub(crate) fn sync_transcript_viewport_rows(
+        &mut self,
+        total_rows: usize,
+        previous_total_rows: Option<usize>,
+        viewport_height: u16,
+    ) {
         if !self.auto_scroll
-            && let Some(previous_total_rows) = self.last_transcript_total_rows
+            && let Some(previous_total_rows) = previous_total_rows
+            && previous_total_rows <= viewport_height as usize
+        {
+            self.transcript_scroll = 0;
+            self.auto_scroll = true;
+        } else if !self.auto_scroll
+            && let Some(previous_total_rows) = previous_total_rows
             && total_rows > previous_total_rows
         {
             let delta = total_rows.saturating_sub(previous_total_rows);
@@ -1884,10 +1863,9 @@ impl TuiState {
             self.transcript_scroll = self.transcript_scroll.saturating_add(delta);
         }
 
-        let max_scroll = measure::max_scroll(total_rows, self.last_transcript_area.height);
+        let max_scroll = measure::max_scroll(total_rows, viewport_height);
         self.transcript_scroll = self.transcript_scroll.min(max_scroll);
         self.auto_scroll = self.transcript_scroll == 0;
-        self.last_transcript_total_rows = Some(total_rows);
     }
 
     pub fn set_permission_mode_label(&mut self, label: impl Into<String>) {
@@ -2046,8 +2024,7 @@ impl TuiState {
             pool_ordinal,
         };
         self.scroll_transcript_to_bottom();
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
         Ok(())
     }
 
@@ -2096,8 +2073,7 @@ impl TuiState {
                 pool_ordinal,
             };
             self.scroll_transcript_to_bottom();
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
             return Ok(());
         }
 
@@ -2133,8 +2109,7 @@ impl TuiState {
             pool_ordinal,
         };
         self.scroll_transcript_to_bottom();
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
         Ok(())
     }
 
@@ -2155,8 +2130,7 @@ impl TuiState {
 
         self.child_timeline = Some(project_child_timeline_state(records)?);
         self.ignore_late_tool_events = false;
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
         self.reproject_pending_permission();
         Ok(())
     }
@@ -2202,8 +2176,7 @@ impl TuiState {
         };
         self.child_timeline = Some(child_state);
         self.ignore_late_tool_events = false;
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
         self.reproject_pending_permission();
         rebuild_active_context_picker(
             self,
@@ -2296,8 +2269,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
         self.reproject_pending_permission();
     }
 
@@ -2312,8 +2284,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
+        self.on_timeline_changed();
     }
 
     fn accepts_tool_events(&self) -> bool {
@@ -2439,8 +2410,7 @@ impl TuiState {
             if child_toast.is_some() {
                 self.toast = child_toast;
             }
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
         }
     }
 
@@ -2693,219 +2663,14 @@ impl TuiState {
             &status,
             &summary,
         ) {
-            self.invalidate_transcript_cache();
-            self.last_transcript_total_rows = None;
+            self.on_timeline_changed();
         }
-    }
-
-    /// 将终端坐标映射到选择锚点
-    ///
-    /// 使用渲染时存的 `last_transcript_area`（content_area，不含 scrollbar 列）
-    /// 与 `last_transcript_scroll_top`（已解析为 top-relative 偏移）。这两者都来自
-    /// 渲染阶段，保证点击坐标和高亮坐标系完全一致。
-    pub fn transcript_click_target(
-        &self,
-        terminal_col: u16,
-        terminal_row: u16,
-    ) -> Option<TranscriptClickTarget> {
-        let area = self.last_transcript_area;
-        if terminal_col < area.left()
-            || terminal_col >= area.right()
-            || terminal_row < area.top()
-            || terminal_row >= area.bottom()
-            || area.width == 0
-            || area.height == 0
-        {
-            return None;
-        }
-
-        let absolute_row =
-            (terminal_row - area.y) as usize + self.last_transcript_scroll_top as usize;
-        let cache = &self.transcript_render_cache;
-        let item_index = match cache.row_starts().binary_search(&absolute_row) {
-            Ok(index) => index,
-            Err(index) => index.saturating_sub(1),
-        };
-        let entry = cache.entries().get(item_index)?;
-        let rendered_line_offset =
-            absolute_row.saturating_sub(*cache.row_starts().get(item_index)?);
-        let line = entry.document.lines.get(rendered_line_offset)?;
-        let local_col = terminal_col - area.x;
-        let mut visual_col = 0u16;
-        for span in &line.spans {
-            let span_width = crate::tui::measure::display_width(&span.text) as u16;
-            if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
-                if let Some(Interaction::OpenUrl(url)) = &span.interaction {
-                    // Mouse capture owns the click; return the URL so the runtime
-                    // can open it. Unsafe targets stay inert and still block tool-card toggles.
-                    return crate::tui::transcript_ratatui::safe_hyperlink_url(url)
-                        .then(|| TranscriptClickTarget::OpenUrl(url.clone()));
-                }
-                break;
-            }
-            visual_col = visual_col.saturating_add(span_width);
-        }
-
-        match self.active_timeline().items().get(item_index) {
-            Some(TimelineItem::Tool(tool)) => {
-                Some(TranscriptClickTarget::ToolCard(tool.call_id.clone()))
-            }
-            Some(TimelineItem::AutoReview(decision)) => Some(TranscriptClickTarget::ToolCard(
-                format!("auto-review:{}", decision.call_id),
-            )),
-            _ => None,
-        }
-    }
-
-    pub fn map_mouse_to_anchor(
-        &self,
-        terminal_col: u16,
-        terminal_row: u16,
-    ) -> Option<SelectionAnchor> {
-        let area = self.last_transcript_area;
-
-        // 1. 命中检测：必须在 content_area 内，否则不映射
-        if terminal_col < area.left()
-            || terminal_col >= area.right()
-            || terminal_row < area.top()
-            || terminal_row >= area.bottom()
-            || area.width == 0
-            || area.height == 0
-        {
-            return None;
-        }
-
-        // 2. Terminal row → Viewport row → Absolute row（top-relative）
-        let viewport_row = terminal_row - area.y;
-        let absolute_row = viewport_row as usize + self.last_transcript_scroll_top as usize;
-
-        // 3. 找到对应的 TimelineItem（二分查找）
-        let cache = &self.transcript_render_cache;
-        if cache.row_starts().is_empty() {
-            return None;
-        }
-
-        // 顶部 spacer / separator 不可映射：absolute_row 必须落在某个 item 内
-        let item_index = match cache.row_starts().binary_search(&absolute_row) {
-            Ok(idx) => idx,
-            Err(idx) => idx.saturating_sub(1),
-        };
-
-        if item_index >= cache.entries().len() {
-            return None;
-        }
-
-        // 4. 计算 Item 内的行偏移；超出该 item 范围（落在 separator/spacer）则放弃
-        let item_start_row = cache.row_starts()[item_index];
-        let entry = &cache.entries()[item_index];
-        let rendered_line_offset = absolute_row.saturating_sub(item_start_row);
-        let line = entry.document.lines.get(rendered_line_offset)?;
-
-        // Anchors retain visual line/character semantics. Hit testing walks the
-        // document's display-cell spans, ignoring chrome until a source-backed span
-        // is hit; this handles CJK/wide characters without treating border/padding
-        // as selectable text. Anchors are the leading boundary of a grapheme so a
-        // forward or reverse release can expand to include both endpoint graphemes.
-        let local_col = terminal_col - area.x;
-        let mut visual_col = 0u16;
-        let mut visual_char = 0usize;
-        for span in &line.spans {
-            let span_width = crate::tui::measure::display_width(&span.text) as u16;
-            let span_chars = span.text.chars().count();
-            if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
-                let range = span.source?;
-                let within =
-                    column_to_char_offset(&span.text, local_col - visual_col).min(span_chars);
-                let _source = entry.document.source_blocks.get(range.block_index)?;
-                return Some(SelectionAnchor {
-                    item_index,
-                    rendered_line_offset,
-                    char_offset: visual_char + within,
-                });
-            }
-            visual_col = visual_col.saturating_add(span_width);
-            visual_char += span_chars;
-        }
-        None
     }
 
     /// Timeline 更新时调用，清除选择状态
-    pub fn on_timeline_changed(&mut self) {
+    pub(crate) fn on_timeline_changed(&mut self) {
         self.text_selection = None;
         self.selection_in_progress = false;
-    }
-
-    /// 使 transcript 渲染缓存失效，并同步清除基于该缓存的选择锚点
-    ///
-    /// 缓存的 `row_starts` / `entries` 一旦被清空，`TextSelection` 中的
-    /// `item_index` / `rendered_line_offset` 即指向不存在的位置，必须一并清除，
-    /// 否则会高亮或复制到错位的内容。
-    pub fn invalidate_transcript_cache(&mut self) {
-        self.transcript_render_cache.clear();
-        self.on_timeline_changed();
-    }
-
-    /// Same timeline (regardless of mutation revision). Used to sync render-only
-    /// geometry like scroll bounds/area — these derive from the same content and
-    /// accepting the freshest shown frame is always safe, even while it is still
-    /// streaming. Business state is never copied here.
-    pub(crate) fn same_timeline_as(&self, rendered: &Self) -> bool {
-        self.active_timeline().cache_id() == rendered.active_timeline().cache_id()
-    }
-
-    /// Strict match used to refuse mouse-selection on a frame whose content does
-    /// not reflect the live timeline (timeline replaced or further mutated).
-    pub(crate) fn matches_presented_frame(&self, rendered: &Self) -> bool {
-        self.same_timeline_as(rendered)
-            && self.active_timeline().mutation_revision()
-                == rendered.active_timeline().mutation_revision()
-    }
-
-    pub(crate) fn apply_presented_frame(&mut self, rendered: &Self) -> bool {
-        if !self.same_timeline_as(rendered) {
-            return false;
-        }
-        self.transcript_render_cache = rendered.transcript_render_cache.clone();
-        self.frame_hyperlink_cells = rendered.frame_hyperlink_cells.clone();
-        self.last_transcript_total_rows = rendered.last_transcript_total_rows;
-        self.last_transcript_area = rendered.last_transcript_area;
-        self.last_transcript_scroll_top = rendered.last_transcript_scroll_top;
-        true
-    }
-
-    pub(crate) fn apply_render_feedback(&mut self, rendered: &Self) {
-        if !self.apply_presented_frame(rendered) {
-            return;
-        }
-
-        if self.auto_scroll {
-            self.transcript_scroll = rendered.transcript_scroll;
-            self.auto_scroll = rendered.auto_scroll;
-        } else if let Some(total_rows) = self.last_transcript_total_rows {
-            self.transcript_scroll = self.transcript_scroll.min(measure::max_scroll(
-                total_rows,
-                self.last_transcript_area.height,
-            ));
-            self.auto_scroll = self.transcript_scroll == 0;
-        }
-
-        if let (Some(question), Some(rendered_question)) = (
-            self.pending_question.as_mut(),
-            rendered.pending_question.as_ref(),
-        ) && question.questions == rendered_question.questions
-            && question.active_tab == rendered_question.active_tab
-        {
-            question.sync_rendered_confirm_scroll(rendered_question);
-        }
-
-        if let (Some(dialog), Some(rendered_dialog)) =
-            (self.dialog.as_mut(), rendered.dialog.as_ref())
-            && dialog.kind == rendered_dialog.kind
-            && dialog.kind == DialogKind::ContextPicker
-        {
-            dialog.detail_scroll_max = rendered_dialog.detail_scroll_max;
-            dialog.detail_scroll = dialog.detail_scroll.min(dialog.detail_scroll_max);
-        }
     }
 }
 
@@ -2927,25 +2692,6 @@ fn validate_lifecycle_records(
         );
     }
     Ok(())
-}
-
-/// Convert a display-cell coordinate into the leading Unicode-scalar offset of
-/// the hit extended grapheme cluster. Selection extraction expands endpoint
-/// boundaries, so both forward and reverse gestures include the hit graphemes.
-fn column_to_char_offset(text: &str, target_col: u16) -> usize {
-    use unicode_segmentation::UnicodeSegmentation;
-
-    let mut width = 0usize;
-    let mut offset = 0usize;
-    for grapheme in text.graphemes(true) {
-        let grapheme_width = crate::tui::measure::display_width(grapheme);
-        if width + grapheme_width > target_col as usize {
-            return offset;
-        }
-        width += grapheme_width;
-        offset += grapheme.chars().count();
-    }
-    offset
 }
 
 mod event_projection;
@@ -3466,28 +3212,6 @@ mod tests {
     }
 
     #[test]
-    fn render_geometry_syncs_across_streaming_mutations_on_same_timeline() {
-        let mut state = TuiState::default();
-        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("one")));
-        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("two")));
-
-        // A render frame of the same timeline, produced before the live panel
-        // streamed one more item (same cache_id, later mutation_revision).
-        let mut rendered = state.clone();
-        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("three")));
-        rendered.last_transcript_area = ratatui::layout::Rect::new(0, 0, 80, 20);
-        rendered.last_transcript_total_rows = Some(50);
-        rendered.last_transcript_scroll_top = 30;
-
-        assert!(state.same_timeline_as(&rendered));
-        assert!(!state.matches_presented_frame(&rendered));
-        assert!(state.apply_presented_frame(&rendered));
-        assert_eq!(state.last_transcript_total_rows, Some(50));
-        assert_eq!(state.last_transcript_area.height, 20);
-        assert_eq!(state.last_transcript_scroll_top, 30);
-    }
-
-    #[test]
     fn transcript_append_preserves_manual_scroll_offset() {
         let mut state = TuiState::default();
         state.scroll_transcript_up(4);
@@ -3502,11 +3226,10 @@ mod tests {
     #[test]
     fn scroll_up_while_transcript_fits_viewport_keeps_auto_scroll() {
         let mut state = TuiState::default();
-        state.last_transcript_area.height = 10;
-        state.sync_transcript_viewport_rows(3);
+        state.sync_transcript_viewport_rows(3, None, 10);
 
         state.scroll_transcript_up(1);
-        state.sync_transcript_viewport_rows(12);
+        state.sync_transcript_viewport_rows(12, Some(3), 10);
 
         assert_eq!(state.transcript_scroll_offset(), 0);
         assert!(state.auto_scroll);
@@ -3515,14 +3238,12 @@ mod tests {
     #[test]
     fn sync_transcript_viewport_rows_clamps_invalid_offset_and_restores_auto_scroll() {
         let mut state = TuiState::default();
-        state.last_transcript_area.height = 5;
-        state.sync_transcript_viewport_rows(10);
+        state.sync_transcript_viewport_rows(10, None, 5);
         state.scroll_transcript_up(4);
         assert_eq!(state.transcript_scroll_offset(), 4);
         assert!(!state.auto_scroll);
 
-        state.last_transcript_area.height = 10;
-        state.sync_transcript_viewport_rows(10);
+        state.sync_transcript_viewport_rows(10, Some(10), 10);
 
         assert_eq!(state.transcript_scroll_offset(), 0);
         assert!(state.auto_scroll);

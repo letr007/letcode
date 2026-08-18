@@ -31,6 +31,7 @@ use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
 };
 use crate::tui::events::NoticeEvent;
+use crate::tui::presentation::TuiPresentationState;
 use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_empty_session};
 use crate::tui::{
     AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
@@ -209,9 +210,15 @@ fn runtime() -> TuiRuntime {
 fn render_runtime_transcript(runtime: &mut TuiRuntime) {
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).expect("create test terminal");
+    let mut presentation = TuiPresentationState::default();
     terminal
-        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .draw(|frame| {
+            let state = runtime.state_mut();
+            crate::tui::render::render(frame, state, &mut presentation)
+        })
         .expect("render transcript");
+    runtime.presented_state = runtime.state().clone();
+    runtime.presented_presentation = presentation;
 }
 
 #[test]
@@ -235,12 +242,16 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
         .toggle_tool_output("auto-review:call-review");
     render_runtime_transcript(&mut runtime);
 
-    let state = runtime.state();
-    let item_row = state.transcript_render_cache.row_starts()[0] + 1;
-    let area = state.last_transcript_area;
-    let visible_item_row =
-        u16::try_from(item_row.saturating_sub(state.last_transcript_scroll_top as usize))
-            .expect("auto-review row fits in terminal coordinates");
+    let item_row = runtime
+        .presented_presentation
+        .transcript_render_cache
+        .row_starts()[0]
+        + 1;
+    let area = runtime.presented_presentation.last_transcript_area;
+    let visible_item_row = u16::try_from(
+        item_row.saturating_sub(runtime.presented_presentation.last_transcript_scroll_top as usize),
+    )
+    .expect("auto-review row fits in terminal coordinates");
     let row = area.y + visible_item_row;
     let col = area.x + 3;
     assert!(row < area.bottom());
@@ -260,7 +271,10 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
     );
 
     render_runtime_transcript(&mut runtime);
-    let text = runtime.state().transcript_render_cache.entries()[0]
+    let text = runtime
+        .presented_presentation
+        .transcript_render_cache
+        .entries()[0]
         .document
         .lines
         .iter()
@@ -6423,28 +6437,17 @@ fn child_view_preempts_pending_typewriter_output() {
     );
 }
 
-#[test]
-fn stale_presented_frame_is_not_applied_after_timeline_replacement() {
-    let mut state = TuiState::default();
-    state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("old")));
-    let mut rendered = state.clone();
-    rendered.last_transcript_area = ratatui::layout::Rect::new(1, 2, 30, 12);
-
-    state.timeline = crate::tui::timeline::Timeline::new();
-    state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("new")));
-    state.last_transcript_area = ratatui::layout::Rect::default();
-    let _ = state.apply_presented_frame(&rendered);
-
-    assert_eq!(state.last_transcript_area, ratatui::layout::Rect::default());
-}
-
 struct BlockingTestDrawer {
     started: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
 impl RuntimeDrawer for BlockingTestDrawer {
-    fn draw(&mut self, _state: &mut TuiState) -> std::io::Result<()> {
+    fn draw(
+        &mut self,
+        _state: &mut TuiState,
+        _presentation: &mut TuiPresentationState,
+    ) -> std::io::Result<()> {
         let _ = self.started.send(());
         self.release
             .recv()
@@ -6513,28 +6516,6 @@ async fn terminal_event_handler_preserves_double_escape_interrupt_fifo() {
         engine.recv_control().await,
         Some(SessionEngineControl::Interrupt)
     ));
-}
-
-#[test]
-fn render_feedback_does_not_overwrite_newer_business_state() {
-    let mut runtime = runtime();
-    runtime.state_mut().set_input("newer input");
-    runtime.state_mut().phase = AppPhase::Running;
-    let mut rendered = runtime.state().clone();
-    rendered.set_input("stale input");
-    rendered.phase = AppPhase::Idle;
-    rendered.last_transcript_area = ratatui::layout::Rect::new(1, 2, 30, 12);
-    rendered.last_transcript_scroll_top = 4;
-
-    runtime.state_mut().apply_render_feedback(&rendered);
-
-    assert_eq!(runtime.state().input_buffer, "newer input");
-    assert_eq!(runtime.state().phase, AppPhase::Running);
-    assert_eq!(
-        runtime.state().last_transcript_area,
-        rendered.last_transcript_area
-    );
-    assert_eq!(runtime.state().last_transcript_scroll_top, 4);
 }
 
 #[test]

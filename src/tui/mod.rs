@@ -46,7 +46,7 @@ pub use events::{
 #[allow(unused_imports)]
 pub use input::{InputAction, apply_edit_action, map_key_event};
 #[allow(unused_imports)]
-pub use presentation::{PresentationPolicy, ToolPresentation};
+pub use presentation::{PresentationPolicy, ToolPresentation, TuiPresentationState};
 #[allow(unused_imports)]
 pub use render::render;
 #[allow(unused_imports)]

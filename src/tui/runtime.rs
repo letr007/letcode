@@ -29,6 +29,7 @@ use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
 };
 use super::preferences::TuiPreferences;
+use super::presentation::TuiPresentationState;
 use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
@@ -538,18 +539,28 @@ pub trait RuntimeDrawer {
         Ok(())
     }
 
-    fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
+    fn draw(
+        &mut self,
+        state: &mut TuiState,
+        presentation: &mut TuiPresentationState,
+    ) -> io::Result<()>;
+}
+
+struct RenderedFrame {
+    state: TuiState,
+    presentation: TuiPresentationState,
 }
 
 trait RenderWorker {
     fn submit(&mut self, title: String, state: TuiState) -> io::Result<()>;
-    fn try_recv(&mut self) -> io::Result<Option<TuiState>>;
-    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<TuiState>>;
+    fn try_recv(&mut self) -> io::Result<Option<RenderedFrame>>;
+    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<RenderedFrame>>;
 }
 
 struct AsyncRenderWorker {
     request_tx: std::sync::mpsc::Sender<(String, TuiState)>,
-    result_rx: std::sync::mpsc::Receiver<io::Result<TuiState>>,
+    result_rx: std::sync::mpsc::Receiver<io::Result<RenderedFrame>>,
+
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -562,10 +573,14 @@ impl AsyncRenderWorker {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             while let Ok((title, mut state)) = request_rx.recv() {
+                let mut presentation = TuiPresentationState::default();
                 let result = drawer
                     .set_title(&title)
-                    .and_then(|()| drawer.draw(&mut state))
-                    .map(|()| state);
+                    .and_then(|()| drawer.draw(&mut state, &mut presentation))
+                    .map(|()| RenderedFrame {
+                        state,
+                        presentation,
+                    });
                 let failed = result.is_err();
                 if result_tx.send(result).is_err() || failed {
                     break;
@@ -587,7 +602,7 @@ impl RenderWorker for AsyncRenderWorker {
         })
     }
 
-    fn try_recv(&mut self) -> io::Result<Option<TuiState>> {
+    fn try_recv(&mut self) -> io::Result<Option<RenderedFrame>> {
         match self.result_rx.try_recv() {
             Ok(result) => result.map(Some),
             Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
@@ -598,7 +613,7 @@ impl RenderWorker for AsyncRenderWorker {
         }
     }
 
-    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<TuiState>> {
+    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<RenderedFrame>> {
         match self.result_rx.recv_timeout(timeout) {
             Ok(result) => result.map(Some),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
@@ -623,6 +638,8 @@ impl Drop for AsyncRenderWorker {
 
 pub struct TuiRuntime {
     state: TuiState,
+    presented_state: TuiState,
+    presented_presentation: TuiPresentationState,
     session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
     permission_lifecycle: PermissionLifecycleController,
     pending_question_handle: Option<RunnerQuestionRequest>,
@@ -663,6 +680,8 @@ impl TuiRuntime {
         preferences_dir: PathBuf,
     ) -> Self {
         Self {
+            presented_state: state.clone(),
+            presented_presentation: TuiPresentationState::default(),
             state,
             session_transport_rx,
             permission_lifecycle: PermissionLifecycleController::default(),
@@ -3631,7 +3650,10 @@ impl TuiRuntime {
     }
 
     fn handle_transcript_click(&mut self, col: u16, row: u16, activate_link: bool) {
-        match self.state.transcript_click_target(col, row) {
+        match self
+            .presented_presentation
+            .transcript_click_target(&self.presented_state, col, row)
+        {
             Some(TranscriptClickTarget::OpenUrl(url)) if activate_link => {
                 if let Err(error) = super::transcript_ratatui::open_hyperlink_url(&url) {
                     self.show_toast(
@@ -3651,7 +3673,7 @@ impl TuiRuntime {
 
     fn handle_selection_start(&mut self, col: u16, row: u16) {
         // 落在 transcript 内容区外不开始选择；点击空白/spacer 也返回 None
-        if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
+        if let Some(anchor) = self.presented_presentation.map_mouse_to_anchor(col, row) {
             self.state.text_selection = Some(super::state::TextSelection {
                 start: anchor.clone(),
                 end: anchor,
@@ -3673,7 +3695,7 @@ impl TuiRuntime {
             return;
         }
         self.state.selection_last_mouse = Some((col, row));
-        if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
+        if let Some(anchor) = self.presented_presentation.map_mouse_to_anchor(col, row) {
             let anchor_changed = self
                 .state
                 .text_selection
@@ -3716,7 +3738,7 @@ impl TuiRuntime {
         let Some((col, row)) = self.state.selection_last_mouse else {
             return;
         };
-        let area = self.state.last_transcript_area;
+        let area = self.presented_presentation.last_transcript_area;
         if area.height == 0 {
             return;
         }
@@ -3743,7 +3765,9 @@ impl TuiRuntime {
         } else {
             area.bottom().saturating_sub(1)
         };
-        if let Some(anchor) = self.state.map_mouse_to_anchor(clamped_col, clamped_row)
+        if let Some(anchor) = self
+            .presented_presentation
+            .map_mouse_to_anchor(clamped_col, clamped_row)
             && let Some(selection) = &mut self.state.text_selection
         {
             selection.end = anchor;
@@ -3753,7 +3777,10 @@ impl TuiRuntime {
     fn handle_copy_selection(&mut self) -> Result<()> {
         use arboard::Clipboard;
 
-        let text = crate::tui::selection::extract_selected_text(&self.state);
+        let text = crate::tui::selection::extract_selected_text_with_cache(
+            &self.state,
+            &self.presented_presentation.transcript_render_cache,
+        );
         if text.is_empty() {
             return Ok(());
         }
@@ -4288,7 +4315,6 @@ fn handle_terminal_event(
     event: Event,
     ingress: &crate::session::SessionEngineIngress,
 ) -> Result<()> {
-    let _ = runtime.state.apply_presented_frame(presented_state);
     let (action, allow_submit_family) = match event {
         Event::Key(key) => {
             // Windows ReadConsoleInput reports key-down and key-up separately.
@@ -4299,15 +4325,6 @@ fn handle_terminal_event(
         }
         Event::Mouse(mouse) => {
             let action = map_mouse_event(presented_state, mouse);
-            if matches!(
-                action,
-                InputAction::MouseSelectionStart(..)
-                    | InputAction::MouseSelectionDrag(..)
-                    | InputAction::MouseSelectionEnd(..)
-            ) && !runtime.state().matches_presented_frame(presented_state)
-            {
-                return Ok(());
-            }
             (action, false)
         }
         Event::Paste(text) => (map_paste_event(runtime.state(), text), false),
@@ -4398,7 +4415,6 @@ pub async fn run_tui(
         runtime.session_title = projection.session_title;
         let mut renderer = AsyncRenderWorker::spawn(TerminalDrawer::new(OwnedTerminal::new()?));
         let terminal_events = TerminalEventReader::spawn();
-        let mut presented_state = runtime.state().clone();
         let mut render_in_flight = false;
 
         if let Some(session_id) = resume_session_id {
@@ -4415,13 +4431,14 @@ pub async fn run_tui(
 
         loop {
             if let Some(rendered) = renderer.try_recv()? {
-                runtime.state.apply_render_feedback(&rendered);
-                presented_state = rendered;
+                runtime.presented_state = rendered.state;
+                runtime.presented_presentation = rendered.presentation;
                 render_in_flight = false;
             }
 
             // Input is collected independently and always handled before ordinary
             // session projection. Mouse coordinates use the last presented frame.
+            let presented_state = runtime.presented_state.clone();
             drain_terminal_events(&mut runtime, &presented_state, &terminal_events, &ingress)?;
             if runtime.state().quit_requested {
                 if let Some(session_id) = runtime.state().session_id.as_deref() {
@@ -4444,6 +4461,7 @@ pub async fn run_tui(
 
             match terminal_events.recv_timeout(TUI_FRAME_POLL_INTERVAL)? {
                 Some(event) => {
+                    let presented_state = runtime.presented_state.clone();
                     handle_terminal_event(&mut runtime, &presented_state, event, &ingress)?;
                     drain_terminal_events(
                         &mut runtime,
@@ -4458,8 +4476,8 @@ pub async fn run_tui(
             }
         }
 
-        if render_in_flight && let Some(rendered) = renderer.recv_timeout(Duration::from_secs(1))? {
-            runtime.state.apply_render_feedback(&rendered);
+        if render_in_flight {
+            let _ = renderer.recv_timeout(Duration::from_secs(1))?;
         }
         Ok(())
     }
@@ -4499,16 +4517,20 @@ impl RuntimeDrawer for TerminalDrawer {
         TerminalDrawer::set_title(self, title)
     }
 
-    fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
+    fn draw(
+        &mut self,
+        state: &mut TuiState,
+        presentation: &mut TuiPresentationState,
+    ) -> io::Result<()> {
         // Ratatui keeps the hardware cursor hidden for frames without a requested
         // cursor. Avoid per-frame cursor moves here: some CJK IMEs follow the VT
         // cursor even while hidden, which made their candidate window jitter.
         let terminal = self.terminal.terminal_mut();
-        let completed = terminal.draw(|frame| render::render(frame, state))?;
+        let completed = terminal.draw(|frame| render::render(frame, state, presentation))?;
         let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
             completed.buffer,
             &self.applied_hyperlink_cells,
-            &state.frame_hyperlink_cells,
+            &presentation.frame_hyperlink_cells,
         );
         super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
         self.applied_hyperlink_cells = overlay.applied;

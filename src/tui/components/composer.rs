@@ -152,7 +152,7 @@ fn composer_scroll_row(metrics: ComposerMetrics, visible_rows: u16) -> usize {
         .saturating_sub(visible_rows.saturating_sub(1))
 }
 
-pub fn render_composer(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
     }
@@ -184,7 +184,7 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, 
     render_composer_panel(frame, state, area, theme);
 }
 
-fn render_composer_tiny(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
     } else {
@@ -215,7 +215,7 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect,
     }
 }
 
-fn render_composer_panel(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     // Accent bar at the left edge.
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
@@ -714,12 +714,7 @@ fn tiny_composer_cursor_area(state: &TuiState, area: Rect) -> Option<Rect> {
     Some(Rect::new(desired_x.min(max_x), area.y, 1, 1))
 }
 
-fn render_tiny_composer_cursor(
-    frame: &mut Frame<'_>,
-    state: &mut TuiState,
-    area: Rect,
-    theme: Theme,
-) {
+fn render_tiny_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     if let Some(cursor_area) = tiny_composer_cursor_area(state, area) {
         render_composer_cursor_block(
             frame,
@@ -733,7 +728,7 @@ fn render_tiny_composer_cursor(
 
 fn render_panel_composer_cursor(
     frame: &mut Frame<'_>,
-    state: &mut TuiState,
+    state: &TuiState,
     metrics: ComposerMetrics,
     scroll_row: usize,
     textarea_area: Rect,
@@ -752,7 +747,7 @@ fn render_panel_composer_cursor(
 
 fn render_composer_cursor_block(
     frame: &mut Frame<'_>,
-    _state: &mut TuiState,
+    _state: &TuiState,
     cursor_area: Rect,
     theme: Theme,
     pulse: ComposerCursorPulse,
@@ -1443,7 +1438,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, 2, 1);
-                render_composer(frame, &mut state, area, Theme::dark());
+                render_composer(frame, &state, area, Theme::dark());
             })
             .expect("draw");
     }
@@ -1643,7 +1638,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
-                render_composer(frame, &mut state, Rect::new(0, 0, 100, 8), Theme::dark());
+                render_composer(frame, &state, Rect::new(0, 0, 100, 8), Theme::dark());
             })
             .expect("draw");
 

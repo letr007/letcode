@@ -9,6 +9,7 @@ use ratatui::{
 use super::{
     components::{composer, dialog, footer, layout, slash_panel, transcript},
     measure::{display_width, wrap_text_to_width, wrapped_row_count},
+    presentation::TuiPresentationState,
     state::{ToastKind, TuiState},
     surface,
     theme::Theme,
@@ -65,8 +66,12 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 ///
 /// Rendering may refresh viewport bookkeeping, but it never invokes tools, resolves permissions,
 /// persists transcripts, or mutates runtime/business state.
-pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
-    state.frame_hyperlink_cells.clear();
+pub fn render(
+    frame: &mut Frame<'_>,
+    state: &mut TuiState,
+    presentation: &mut TuiPresentationState,
+) {
+    presentation.frame_hyperlink_cells.clear();
     let theme = state.theme();
     let area = frame.area();
 
@@ -90,7 +95,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     if state.show_dashboard() {
         render_dashboard(frame, state, workspace, theme);
-        render_transcript_toast(frame, state, workspace, theme);
+        render_transcript_toast(frame, state, presentation, workspace, theme);
         dialog::render_dialog(frame, state, area, theme);
         render_pending_question(frame, state, area, theme);
         return;
@@ -128,9 +133,15 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     if state.active_timeline().items().is_empty() {
         render_welcome(frame, transcript_area, theme);
     } else {
-        transcript::render_transcript(frame, state, transcript_area, state.transcript_theme());
+        transcript::render_transcript(
+            frame,
+            state,
+            presentation,
+            transcript_area,
+            state.transcript_theme(),
+        );
     }
-    render_transcript_toast(frame, state, transcript_area, theme);
+    render_transcript_toast(frame, state, presentation, transcript_area, theme);
 
     slash_panel::render_slash_panel(frame, state, slash_panel_area, theme);
     if state.pending_question.is_some() {
@@ -952,17 +963,24 @@ fn notice_message_lines(
         .collect()
 }
 
-fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+fn render_transcript_toast(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    presentation: &TuiPresentationState,
+    area: Rect,
+    theme: Theme,
+) {
     let Some(toast) = state.toast() else {
         return;
     };
 
-    let area =
-        if !state.active_timeline().items().is_empty() && state.last_transcript_area.height > 0 {
-            state.last_transcript_area
-        } else {
-            area
-        };
+    let area = if !state.active_timeline().items().is_empty()
+        && presentation.last_transcript_area.height > 0
+    {
+        presentation.last_transcript_area
+    } else {
+        area
+    };
 
     if area.width < 12 || area.height < 4 {
         return;
@@ -1295,8 +1313,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal is created");
 
+        let mut presentation = TuiPresentationState::default();
         terminal
-            .draw(|frame| render(frame, state))
+            .draw(|frame| render(frame, state, &mut presentation))
             .expect("render succeeds");
 
         terminal
@@ -1312,8 +1331,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal is created");
 
+        let mut presentation = TuiPresentationState::default();
         terminal
-            .draw(|frame| render(frame, state))
+            .draw(|frame| render(frame, state, &mut presentation))
             .expect("render succeeds");
 
         let buffer = terminal.backend().buffer();

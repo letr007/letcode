@@ -33,13 +33,23 @@ struct AtomicSourceSliceKey {
 /// - 视觉 soft-wrap 不会泄漏成真实换行；
 /// - card 边框、padding、badge、separator 等装饰字符不会进剪贴板；
 /// - 同一 source block 的多条渲染行会合并为一次切片，自然保留原文中的 `\n`。
-pub fn extract_selected_text(state: &TuiState) -> String {
+#[cfg(test)]
+pub fn extract_selected_text(
+    state: &TuiState,
+    presentation: &crate::tui::presentation::TuiPresentationState,
+) -> String {
+    extract_selected_text_with_cache(state, &presentation.transcript_render_cache)
+}
+
+pub fn extract_selected_text_with_cache(
+    state: &TuiState,
+    cache: &crate::tui::components::transcript::TranscriptRenderCache,
+) -> String {
     let Some(selection) = &state.text_selection else {
         return String::new();
     };
 
     let (start, end) = selection.normalize();
-    let cache = &state.transcript_render_cache;
     let mut result = String::new();
     let mut pending_newlines = 0usize;
     let mut previous: Option<SourceSliceAcc> = None;
@@ -259,6 +269,7 @@ mod tests {
         };
 
         let mut state = TuiState::default();
+        let mut presentation = crate::tui::presentation::TuiPresentationState::default();
         let mut document = Document::<ratatui::style::Style>::default();
         let first = document.add_source("first");
         let second = document.add_source("second");
@@ -282,7 +293,7 @@ mod tests {
             },
             Break::End,
         );
-        state
+        presentation
             .transcript_render_cache
             .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                 revision: None,
@@ -301,7 +312,10 @@ mod tests {
             },
         });
 
-        assert_eq!(extract_selected_text(&state), "first\nsecond");
+        assert_eq!(
+            extract_selected_text(&state, &presentation),
+            "first\nsecond"
+        );
     }
 
     #[test]
@@ -312,6 +326,7 @@ mod tests {
         };
 
         let mut state = TuiState::default();
+        let mut presentation = crate::tui::presentation::TuiPresentationState::default();
         let mut document = Document::<ratatui::style::Style>::default();
         let source = "graph TD\nA[Start]\nB[Finish]";
         let block = document.add_source(source);
@@ -336,7 +351,7 @@ mod tests {
             },
             Break::End,
         );
-        state
+        presentation
             .transcript_render_cache
             .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                 revision: None,
@@ -355,7 +370,7 @@ mod tests {
             },
         });
 
-        assert_eq!(extract_selected_text(&state), source);
+        assert_eq!(extract_selected_text(&state, &presentation), source);
     }
 
     #[test]
@@ -415,7 +430,8 @@ mod tests {
 
         for (start, end) in [(0, line_end), (line_end, 0)] {
             let mut state = TuiState::default();
-            state
+            let mut presentation = crate::tui::presentation::TuiPresentationState::default();
+            presentation
                 .transcript_render_cache
                 .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                     revision: None,
@@ -434,11 +450,12 @@ mod tests {
                 },
             });
 
-            assert_eq!(extract_selected_text(&state), expected);
+            assert_eq!(extract_selected_text(&state, &presentation), expected);
         }
 
         let mut state = TuiState::default();
-        state
+        let mut presentation = crate::tui::presentation::TuiPresentationState::default();
+        presentation
             .transcript_render_cache
             .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                 revision: None,
@@ -456,7 +473,7 @@ mod tests {
                 char_offset: 7,
             },
         });
-        assert_eq!(extract_selected_text(&state), r"\alpha^2");
+        assert_eq!(extract_selected_text(&state, &presentation), r"\alpha^2");
     }
 
     #[test]
@@ -467,6 +484,7 @@ mod tests {
         };
 
         let mut state = TuiState::default();
+        let mut presentation = crate::tui::presentation::TuiPresentationState::default();
         let mut document = Document::<ratatui::style::Style>::default();
         let block = document.add_source("你好 world");
         document.push_line(
@@ -488,7 +506,7 @@ mod tests {
             },
             Break::End,
         );
-        state
+        presentation
             .transcript_render_cache
             .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                 revision: None,
@@ -507,7 +525,7 @@ mod tests {
             },
         });
 
-        assert_eq!(extract_selected_text(&state), "你好 world");
+        assert_eq!(extract_selected_text(&state, &presentation), "你好 world");
     }
 
     #[test]
@@ -518,6 +536,7 @@ mod tests {
         };
 
         let mut state = TuiState::default();
+        let mut presentation = crate::tui::presentation::TuiPresentationState::default();
         let mut document = Document::<ratatui::style::Style>::default();
         let block = document.add_source("repeat repeat");
         document.push_line(
@@ -540,7 +559,7 @@ mod tests {
             },
             Break::End,
         );
-        state
+        presentation
             .transcript_render_cache
             .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                 revision: None,
@@ -559,7 +578,10 @@ mod tests {
             },
         });
 
-        assert_eq!(extract_selected_text(&state), "repeat repeat");
+        assert_eq!(
+            extract_selected_text(&state, &presentation),
+            "repeat repeat"
+        );
     }
 
     #[test]
@@ -584,7 +606,8 @@ mod tests {
 
         for (start, end, expected) in [(0, 1, "a你"), (1, 0, "a你")] {
             let mut state = TuiState::default();
-            state
+            let mut presentation = crate::tui::presentation::TuiPresentationState::default();
+            presentation
                 .transcript_render_cache
                 .set_entries_for_test(vec![TranscriptRenderCacheEntry {
                     revision: None,
@@ -602,7 +625,7 @@ mod tests {
                     char_offset: end,
                 },
             });
-            assert_eq!(extract_selected_text(&state), expected);
+            assert_eq!(extract_selected_text(&state, &presentation), expected);
         }
     }
 }

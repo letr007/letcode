@@ -1,4 +1,154 @@
+use super::components::transcript::TranscriptRenderCache;
+use super::state::{SelectionAnchor, TranscriptClickTarget, TuiState};
+use super::timeline::TimelineItem;
+use super::transcript_render::Interaction;
 use crate::agent::is_subagent_tool_name;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TuiPresentationState {
+    pub transcript_render_cache: TranscriptRenderCache,
+    pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
+    pub last_transcript_total_rows: Option<usize>,
+    pub last_transcript_area: ratatui::layout::Rect,
+    pub last_transcript_scroll_top: u16,
+}
+
+impl TuiPresentationState {
+    /// 将终端坐标映射到 transcript 的点击目标。
+    pub fn transcript_click_target(
+        &self,
+        state: &TuiState,
+        terminal_col: u16,
+        terminal_row: u16,
+    ) -> Option<TranscriptClickTarget> {
+        let area = self.last_transcript_area;
+        if terminal_col < area.left()
+            || terminal_col >= area.right()
+            || terminal_row < area.top()
+            || terminal_row >= area.bottom()
+            || area.width == 0
+            || area.height == 0
+        {
+            return None;
+        }
+
+        let absolute_row =
+            (terminal_row - area.y) as usize + self.last_transcript_scroll_top as usize;
+        let item_index = match self
+            .transcript_render_cache
+            .row_starts()
+            .binary_search(&absolute_row)
+        {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        let entry = self.transcript_render_cache.entries().get(item_index)?;
+        let rendered_line_offset = absolute_row
+            .saturating_sub(*self.transcript_render_cache.row_starts().get(item_index)?);
+        let line = entry.document.lines.get(rendered_line_offset)?;
+        let local_col = terminal_col - area.x;
+        let mut visual_col = 0u16;
+        for span in &line.spans {
+            let span_width = crate::tui::measure::display_width(&span.text) as u16;
+            if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
+                if let Some(Interaction::OpenUrl(url)) = &span.interaction {
+                    return crate::tui::transcript_ratatui::safe_hyperlink_url(url)
+                        .then(|| TranscriptClickTarget::OpenUrl(url.clone()));
+                }
+                break;
+            }
+            visual_col = visual_col.saturating_add(span_width);
+        }
+
+        match state.active_timeline().items().get(item_index) {
+            Some(TimelineItem::Tool(tool)) => {
+                Some(TranscriptClickTarget::ToolCard(tool.call_id.clone()))
+            }
+            Some(TimelineItem::AutoReview(decision)) => Some(TranscriptClickTarget::ToolCard(
+                format!("auto-review:{}", decision.call_id),
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn map_mouse_to_anchor(
+        &self,
+        terminal_col: u16,
+        terminal_row: u16,
+    ) -> Option<SelectionAnchor> {
+        let area = self.last_transcript_area;
+        if terminal_col < area.left()
+            || terminal_col >= area.right()
+            || terminal_row < area.top()
+            || terminal_row >= area.bottom()
+            || area.width == 0
+            || area.height == 0
+        {
+            return None;
+        }
+
+        let viewport_row = terminal_row - area.y;
+        let absolute_row = viewport_row as usize + self.last_transcript_scroll_top as usize;
+        let cache = &self.transcript_render_cache;
+        if cache.row_starts().is_empty() {
+            return None;
+        }
+
+        let item_index = match cache.row_starts().binary_search(&absolute_row) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        if item_index >= cache.entries().len() {
+            return None;
+        }
+
+        let item_start_row = cache.row_starts()[item_index];
+        let entry = &cache.entries()[item_index];
+        let rendered_line_offset = absolute_row.saturating_sub(item_start_row);
+        let line = entry.document.lines.get(rendered_line_offset)?;
+
+        let local_col = terminal_col - area.x;
+        let mut visual_col = 0u16;
+        let mut visual_char = 0usize;
+        for span in &line.spans {
+            let span_width = crate::tui::measure::display_width(&span.text) as u16;
+            let span_chars = span.text.chars().count();
+            if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
+                let range = span.source?;
+                let within =
+                    column_to_char_offset(&span.text, local_col - visual_col).min(span_chars);
+                let _source = entry.document.source_blocks.get(range.block_index)?;
+                return Some(SelectionAnchor {
+                    item_index,
+                    rendered_line_offset,
+                    char_offset: visual_char + within,
+                });
+            }
+            visual_col = visual_col.saturating_add(span_width);
+            visual_char += span_chars;
+        }
+        None
+    }
+}
+
+/// Convert a display-cell coordinate into the leading Unicode-scalar offset of
+/// the hit extended grapheme cluster. Selection extraction expands endpoint
+/// boundaries, so both forward and reverse gestures include the hit graphemes.
+fn column_to_char_offset(text: &str, target_col: u16) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut width = 0usize;
+    let mut offset = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = crate::tui::measure::display_width(grapheme);
+        if width + grapheme_width > target_col as usize {
+            return offset;
+        }
+        width += grapheme_width;
+        offset += grapheme.chars().count();
+    }
+    offset
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPresentation {
     Hidden,
