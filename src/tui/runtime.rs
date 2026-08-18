@@ -40,7 +40,7 @@ use super::theme_file::{
 };
 #[cfg(test)]
 use crate::session::RunnerPermissionRequest;
-use crate::session::runner::{ModelCatalogEntry, ModelCatalogUpdatedEvent};
+use crate::session::runner::ModelCatalogUpdatedEvent;
 use crate::session::{RunnerQuestionRequest, SessionEngine, SessionTransportEvent};
 use assistant::{AssistantTypewriter, assistant_delta_event, assistant_delta_parts};
 #[path = "runtime/assistant.rs"]
@@ -48,6 +48,9 @@ mod assistant;
 use branch_poller::BranchPoller;
 #[path = "runtime/branch_poller.rs"]
 mod branch_poller;
+#[path = "runtime/model_catalog.rs"]
+mod model_catalog;
+pub(crate) use model_catalog::{AvailableExpert, AvailableModel};
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/history_tree_dialog.rs"]
@@ -155,112 +158,6 @@ fn format_terminal_title(session_title: Option<&str>, spinner_frame: Option<usiz
         ),
         None => title,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AvailableModel {
-    pub id: String,
-    pub label: String,
-    pub provider: String,
-    pub context_window_tokens: Option<u64>,
-    pub reasoning_effort: Option<ModelReasoningEffort>,
-    pub reasoning_efforts: Vec<ModelReasoningEffort>,
-}
-
-impl AvailableModel {
-    fn from_catalog_entry(entry: &ModelCatalogEntry) -> Self {
-        Self {
-            id: entry.id.clone(),
-            label: entry.label.clone(),
-            provider: entry.provider.clone(),
-            context_window_tokens: entry.context_window_tokens,
-            reasoning_effort: entry
-                .reasoning
-                .effort
-                .as_deref()
-                .map(parse_catalog_reasoning_effort),
-            reasoning_efforts: entry
-                .reasoning
-                .efforts
-                .iter()
-                .map(|effort| parse_catalog_reasoning_effort(effort))
-                .collect(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
-        let id = id.into();
-        Self {
-            provider: model_provider(&id),
-            id,
-            label: label.into(),
-            context_window_tokens: None,
-            reasoning_effort: None,
-            reasoning_efforts: Vec::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn with_context_window(
-        id: impl Into<String>,
-        label: impl Into<String>,
-        context_window_tokens: Option<u64>,
-    ) -> Self {
-        let id = id.into();
-        Self {
-            provider: model_provider(&id),
-            id,
-            label: label.into(),
-            context_window_tokens,
-            reasoning_effort: None,
-            reasoning_efforts: Vec::new(),
-        }
-    }
-
-    pub fn with_context_window_and_reasoning(
-        id: impl Into<String>,
-        label: impl Into<String>,
-        context_window_tokens: Option<u64>,
-        reasoning_effort: Option<ModelReasoningEffort>,
-        reasoning_efforts: Vec<ModelReasoningEffort>,
-    ) -> Self {
-        let id = id.into();
-        Self {
-            provider: model_provider(&id),
-            id,
-            label: label.into(),
-            context_window_tokens,
-            reasoning_effort,
-            reasoning_efforts,
-        }
-    }
-}
-
-fn parse_catalog_reasoning_effort(value: &str) -> ModelReasoningEffort {
-    match value {
-        "none" => ModelReasoningEffort::None,
-        "minimal" => ModelReasoningEffort::Minimal,
-        "low" => ModelReasoningEffort::Low,
-        "medium" => ModelReasoningEffort::Medium,
-        "high" => ModelReasoningEffort::High,
-        "xhigh" => ModelReasoningEffort::Xhigh,
-        "max" => ModelReasoningEffort::Max,
-        other => ModelReasoningEffort::Custom(other.to_string()),
-    }
-}
-
-fn model_provider(model_id: &str) -> String {
-    model_id
-        .split_once('/')
-        .map(|(provider, _)| provider.to_string())
-        .unwrap_or_default()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AvailableExpert {
-    pub agent_name: String,
-    pub route_id: String,
 }
 
 /// Compatibility alias: session commands are owned by the backend boundary.
