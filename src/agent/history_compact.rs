@@ -1,5 +1,6 @@
 use crate::protocol_frames::{
-    ProtocolTranscript, ToolCallGroupStatus, analyze_history_items, canonical_compaction_boundary,
+    ProtocolTranscript, ToolCallGroupStatus, analyze_history_items,
+    canonical_compaction_boundary_with_transcript,
 };
 use crate::request_builder::{HistoryItem, estimate_history_item_tokens};
 use anyhow::{Result, bail};
@@ -68,7 +69,7 @@ pub(crate) fn plan_turn_cut_with_transcript(
     if requested_boundary <= base_start {
         return Ok(None);
     }
-    let mut cut_end = canonical_compaction_boundary(history, requested_boundary)?;
+    let mut cut_end = canonical_compaction_boundary_with_transcript(transcript, requested_boundary)?;
     if let Some(first_incomplete) = transcript
         .tool_call_groups
         .iter()

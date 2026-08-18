@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::runtime_context::{RuntimeFrameId, RuntimeFrameProvenance};
-use crate::user_content::UserMessageContent;
+use crate::user_content::{UserMessageContent, UserMessagePart};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -342,9 +342,19 @@ pub(crate) fn canonical_compaction_boundary(
     requested_boundary: usize,
 ) -> Result<usize> {
     let transcript = analyze_history_items(history, None)?;
-    let mut boundary = requested_boundary.min(history.len());
+    canonical_compaction_boundary_with_transcript(&transcript, requested_boundary)
+}
 
-    for group in transcript.tool_call_groups {
+/// Like [`canonical_compaction_boundary`], but reuses an already-computed
+/// transcript. The boundary only depends on tool-call group span indexes, so it
+/// is safe to reuse a transcript produced with any turn cursor — avoiding a
+/// second full pass that deep-clones every history item into a ProtocolFrame.
+pub(crate) fn canonical_compaction_boundary_with_transcript(
+    transcript: &ProtocolTranscript,
+    requested_boundary: usize,
+) -> Result<usize> {
+    let mut boundary = requested_boundary.min(transcript.frames.len());
+    for group in &transcript.tool_call_groups {
         let group_end = group
             .tool_output_indexes
             .last()
@@ -356,6 +366,119 @@ pub(crate) fn canonical_compaction_boundary(
         }
     }
     Ok(boundary)
+}
+
+/// Cap on the characters of a single string field folded into an identity
+/// fingerprint. Enough to stay content-sensitive for real payloads while keeping
+/// cost bounded instead of O(raw payload size).
+const IDENTITY_FIELD_PREFIX_CHARS: usize = 128;
+
+impl ProtocolFrame {
+    /// Bounded, deterministic integrity fingerprint of one frame. Large string
+    /// fields (tool outputs, arguments, text, image data URLs) are covered by
+    /// byte length + a bounded prefix instead of being fully serialized, so cost
+    /// is O(fields + capped prefixes) rather than O(raw payload size). Used only
+    /// for process-local consistency comparisons (pressure frontier / usage
+    /// anchor), never persisted.
+    pub(crate) fn bounded_identity_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(192);
+        match &self.runtime_frame_id {
+            Some(id) => {
+                buf.push(1);
+                buf.extend_from_slice(&serde_json::to_vec(id).unwrap_or_default());
+            }
+            None => buf.push(0),
+        }
+        buf.extend_from_slice(&(self.history_index as u64).to_le_bytes());
+        self.item.write_bounded(&mut buf);
+        buf
+    }
+}
+
+impl ProtocolItem {
+    /// Field tag + byte length + capped prefix, streamed in a stable order.
+    fn write_bounded(&self, out: &mut Vec<u8>) {
+        macro_rules! field {
+            ($tag:expr, $s:expr) => {{
+                let bytes = $s.as_bytes();
+                out.push($tag);
+                out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                let cap = bytes.len().min(IDENTITY_FIELD_PREFIX_CHARS);
+                out.extend_from_slice(&bytes[..cap]);
+            }};
+        }
+        match self {
+            ProtocolItem::ContextSummary { text } => {
+                out.push(0x00);
+                field!(0x01, text);
+            }
+            ProtocolItem::UserMessage { content } => {
+                out.push(0x01);
+                field!(0x02, &content.text);
+                out.push(0x0a);
+                out.extend_from_slice(&(content.attachments.len() as u64).to_le_bytes());
+                out.push(0x0b);
+                out.extend_from_slice(&(content.selected_skills.len() as u64).to_le_bytes());
+                for skill in &content.selected_skills {
+                    field!(0x0c, skill);
+                }
+                for part in &content.parts {
+                    match part {
+                        UserMessagePart::Text { text } => field!(0x0d, text),
+                        UserMessagePart::Image { attachment } => {
+                            let placeholder = attachment.prompt_plan_placeholder();
+                            field!(0x0e, &placeholder);
+                        }
+                    }
+                }
+            }
+            ProtocolItem::InternalContinuation { text } => {
+                out.push(0x02);
+                field!(0x01, text);
+            }
+            ProtocolItem::AssistantText { text } => {
+                out.push(0x03);
+                field!(0x01, text);
+            }
+            ProtocolItem::AssistantToolCalls {
+                text,
+                reasoning_content,
+                calls,
+            } => {
+                out.push(0x04);
+                match text {
+                    Some(text) => field!(0x01, text),
+                    None => out.push(0x00),
+                }
+                match reasoning_content {
+                    Some(text) => field!(0x02, text),
+                    None => out.push(0x00),
+                }
+                out.push(0x0f);
+                out.extend_from_slice(&(calls.len() as u64).to_le_bytes());
+                for call in calls {
+                    field!(0x10, &call.call_id);
+                    field!(0x11, &call.name);
+                    field!(0x12, &call.arguments_json);
+                }
+            }
+            ProtocolItem::ToolOutput {
+                call_id,
+                output_json,
+                images,
+            } => {
+                out.push(0x05);
+                field!(0x13, call_id);
+                field!(0x14, output_json);
+                out.push(0x15);
+                out.extend_from_slice(&(images.len() as u64).to_le_bytes());
+                for image in images {
+                    let placeholder = image.prompt_plan_placeholder();
+                    field!(0x16, &placeholder);
+                }
+            }
+        }
+    }
 }
 
 fn ensure_unique_call_ids(history_index: usize, calls: &[ProtocolToolCall]) -> Result<()> {

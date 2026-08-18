@@ -214,14 +214,17 @@ enum ActiveEpochTransition {
 }
 
 fn protocol_prefix_digest(frames: &[crate::protocol_frames::ProtocolFrame]) -> String {
-    let mut bytes = Vec::new();
+    // 逐帧折叠成有界指纹串再统一哈希：不再对每帧 item 做大 JSON 全量序列化，也不把
+    // 所有帧的序列化累积成一个大 Vec（1M 上下文下这是同步内存/CPU 洪水）。digest 仅供
+    // 进程内前后一致性比较（压力 frontier / usage anchor），不落盘；有界指纹保留
+    // 字段集合与有序边界，压缩后必变、未变 reload 必稳定。
+    let mut fingerprints = Vec::with_capacity(frames.len().saturating_mul(64));
     for frame in frames {
-        let encoded = serde_json::to_vec(&(frame.runtime_frame_id, &frame.item))
-            .expect("protocol frame identity serializes");
-        bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&encoded);
+        let identity = frame.bounded_identity_bytes();
+        fingerprints.extend_from_slice(&(identity.len() as u64).to_le_bytes());
+        fingerprints.extend_from_slice(crate::request_builder::sha256_hex(&identity).as_bytes());
     }
-    crate::request_builder::sha256_hex(&bytes)
+    crate::request_builder::sha256_hex(&fingerprints)
 }
 
 fn normalize_prompt_plan(plan: &mut crate::request_builder::prompt_plan::PromptPlan) {

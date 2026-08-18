@@ -786,12 +786,33 @@ pub(super) fn render_bounded_compaction_history(
     )
 }
 
+/// Cap on the raw JSON bytes we're willing to parse while summarizing a single
+/// tool output. Outputs (read / grep / bash) can be many MB, but the compaction
+/// prompt only ever surfaces the leading part — everything past this prefix is
+/// guaranteed to be dropped by `COMPACTION_TOOL_OUTPUT_CHAR_CAP` anyway. Parse a
+/// bounded prefix instead of the whole payload, matching how Pi / OpenCode trim
+/// tool results before serializing them for the summarization request.
+const TOOL_OUTPUT_PARSE_PREFIX_CAP: usize = 8 * 1024;
+
+/// Take up to `max_chars` characters without scanning past the cap
+/// (O(max_chars), not O(len)); truncation always lands on a char boundary.
+fn bounded_take_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &text[..byte_idx],
+        None => text,
+    }
+}
+
 fn render_tool_output_for_compaction(output_json: &str) -> String {
-    let rendered = serde_json::from_str::<Value>(output_json)
+    // 有界解析：只解析前 TOOL_OUTPUT_PARSE_PREFIX_CAP 字符，之后的内容必会被
+    // COMPACTION_TOOL_OUTPUT_CHAR_CAP 截掉，无需为整个大 JSON 付出 O(原始体积) 的
+    // 解析/序列化成本（对齐 Pi/OpenCode 先裁剪再处理的模式）。
+    let bounded = bounded_take_chars(output_json, TOOL_OUTPUT_PARSE_PREFIX_CAP);
+    let rendered = serde_json::from_str::<Value>(bounded)
         .ok()
         .map(sanitize_tool_output_value_for_compaction)
         .and_then(|value| serde_json::to_string(&value).ok())
-        .unwrap_or_else(|| output_json.to_string());
+        .unwrap_or_else(|| bounded.to_string());
     truncate_for_compaction(
         &rendered,
         COMPACTION_TOOL_OUTPUT_CHAR_CAP,
@@ -1096,5 +1117,30 @@ mod transaction_tests {
         let todos = latest_todos_from_history(&history).expect("todos restored");
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].id, "a");
+    }
+
+    #[test]
+    fn bounded_take_chars_stops_at_cap_on_char_boundary() {
+        let short = "abc";
+        assert_eq!(bounded_take_chars(short, 5), short);
+        assert_eq!(bounded_take_chars(short, 3), short);
+
+        // 3 字节的雪花字符，截断必须落在 char 边界（O(cap)，不整串扫描）。
+        let long = "ab☃cdef";
+        assert_eq!(bounded_take_chars(long, 3), "ab☃");
+        assert_eq!(bounded_take_chars(long, 4), "ab☃c");
+        assert_eq!(bounded_take_chars(long, 100), long);
+    }
+
+    #[test]
+    fn render_tool_output_large_json_is_bounded_to_cap_with_marker() {
+        // 大 JSON：远超解析前缀，但最终仍被压缩到 ~2000 字符并带截断标记。
+        let big_field = "line ".repeat(TOOL_OUTPUT_PARSE_PREFIX_CAP);
+        let output = serde_json::json!({ "content": big_field }).to_string();
+        assert!(output.chars().count() > TOOL_OUTPUT_PARSE_PREFIX_CAP);
+
+        let rendered = render_tool_output_for_compaction(&output);
+        assert!(rendered.chars().count() <= COMPACTION_TOOL_OUTPUT_CHAR_CAP);
+        assert!(rendered.contains(COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER));
     }
 }

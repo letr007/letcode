@@ -2103,6 +2103,35 @@ fn large_tool_output_json(field: &str) -> String {
     json!({field: "line ".repeat((COMPACTION_TOOL_OUTPUT_CHAR_CAP + 500) / 5)}).to_string()
 }
 
+#[test]
+fn protocol_prefix_digest_is_stable_for_identical_frames_and_sensitive_to_change() {
+    let item = |text: &str| crate::protocol_frames::ProtocolItem::context_summary(text.to_string());
+    let frames = |texts: &[&str]| {
+        texts
+            .iter()
+            .map(|&t| crate::protocol_frames::ProtocolFrame::derived(item(t)))
+            .collect::<Vec<_>>()
+    };
+    let d1 = protocol_prefix_digest(&frames(&["alpha", "beta"]));
+    let d2 = protocol_prefix_digest(&frames(&["alpha", "beta"]));
+    let d3 = protocol_prefix_digest(&frames(&["alpha", "gamma"]));
+    assert_eq!(d1, d2, "identical history must produce a stable digest");
+    assert_ne!(d1, d3, "content change must change the digest");
+}
+
+#[test]
+fn protocol_prefix_digest_is_length_sensitive_for_large_tool_output() {
+    // 工具输出远超 128 字符的有界前缀，长度不同必须仍能区分（不能退化为前缀-only）。
+    let mk = |n: usize| {
+        crate::protocol_frames::ProtocolFrame::derived(crate::protocol_frames::ProtocolItem::ToolOutput {
+            call_id: "c1".into(),
+            output_json: "x".repeat(n),
+            images: Vec::new(),
+        })
+    };
+    assert_ne!(protocol_prefix_digest(&[mk(200)]), protocol_prefix_digest(&[mk(300)]));
+}
+
 struct StaticSubagentDelegate {
     result: ToolResult,
 }
