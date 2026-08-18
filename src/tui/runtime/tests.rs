@@ -31,7 +31,6 @@ use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
 };
 use crate::tui::events::NoticeEvent;
-use crate::tui::presentation::TuiPresentationState;
 use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_empty_session};
 use crate::tui::{
     AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
@@ -210,15 +209,9 @@ fn runtime() -> TuiRuntime {
 fn render_runtime_transcript(runtime: &mut TuiRuntime) {
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).expect("create test terminal");
-    let mut presentation = TuiPresentationState::default();
     terminal
-        .draw(|frame| {
-            let state = runtime.state_mut();
-            crate::tui::render::render(frame, state, &mut presentation)
-        })
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
         .expect("render transcript");
-    runtime.presented_state = runtime.state().clone();
-    runtime.presented_presentation = presentation;
 }
 
 #[test]
@@ -242,16 +235,12 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
         .toggle_tool_output("auto-review:call-review");
     render_runtime_transcript(&mut runtime);
 
-    let item_row = runtime
-        .presented_presentation
-        .transcript_render_cache
-        .row_starts()[0]
-        + 1;
-    let area = runtime.presented_presentation.last_transcript_area;
-    let visible_item_row = u16::try_from(
-        item_row.saturating_sub(runtime.presented_presentation.last_transcript_scroll_top as usize),
-    )
-    .expect("auto-review row fits in terminal coordinates");
+    let state = runtime.state();
+    let item_row = state.transcript_render_cache.row_starts()[0] + 1;
+    let area = state.last_transcript_area;
+    let visible_item_row =
+        u16::try_from(item_row.saturating_sub(state.last_transcript_scroll_top as usize))
+            .expect("auto-review row fits in terminal coordinates");
     let row = area.y + visible_item_row;
     let col = area.x + 3;
     assert!(row < area.bottom());
@@ -271,10 +260,7 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
     );
 
     render_runtime_transcript(&mut runtime);
-    let text = runtime
-        .presented_presentation
-        .transcript_render_cache
-        .entries()[0]
+    let text = runtime.state().transcript_render_cache.entries()[0]
         .document
         .lines
         .iter()
@@ -6383,138 +6369,6 @@ fn assistant_done_waits_for_typewriter_to_drain() {
         runtime.state().timeline.items().last(),
         Some(TimelineItem::Assistant(message))
             if message.text == "smooth output" && !message.streaming
-    ));
-}
-
-#[test]
-fn interrupted_preempts_pending_typewriter_output() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
-        AssistantDeltaEvent::new("pending output"),
-    ));
-
-    runtime.consume_session_transport_event(SessionTransportEvent::Interrupted);
-
-    assert!(runtime.assistant_typewriter.is_none());
-    assert!(runtime.deferred_session_events.is_empty());
-    assert!(!runtime.session_turn_active);
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
-    assert!(matches!(
-        runtime.state().timeline.items().last(),
-        Some(TimelineItem::Assistant(message)) if message.text == "pending output"
-    ));
-}
-
-#[test]
-fn child_view_preempts_pending_typewriter_output() {
-    let mut runtime = runtime();
-    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
-        AssistantDeltaEvent::new("parent pending output"),
-    ));
-
-    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionViewed {
-        parent_session_id: "parent-session".into(),
-        child_session_id: "child-session".into(),
-        agent_name: "explorer".into(),
-        index: 0,
-        total: 1,
-        pool_ordinal: 1,
-        records: vec![],
-        runtime_context: event_context("child-session", 1),
-    });
-
-    assert!(runtime.assistant_typewriter.is_none());
-    assert!(runtime.deferred_session_events.is_empty());
-    assert!(runtime.state().is_read_only_child_view());
-    assert_eq!(
-        runtime
-            .state()
-            .child_view_metadata()
-            .map(|metadata| metadata.child_session_id),
-        Some("child-session".into())
-    );
-}
-
-struct BlockingTestDrawer {
-    started: std::sync::mpsc::Sender<()>,
-    release: std::sync::mpsc::Receiver<()>,
-}
-
-impl RuntimeDrawer for BlockingTestDrawer {
-    fn draw(
-        &mut self,
-        _state: &mut TuiState,
-        _presentation: &mut TuiPresentationState,
-    ) -> std::io::Result<()> {
-        let _ = self.started.send(());
-        self.release
-            .recv()
-            .map_err(|_| std::io::Error::other("test render release dropped"))
-    }
-}
-
-#[tokio::test]
-async fn double_escape_dispatches_while_render_is_blocked() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    let presented_state = runtime.state().clone();
-    let (mut engine, ingress, _egress) = crate::session::SessionEngine::new();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let mut renderer = AsyncRenderWorker::spawn(BlockingTestDrawer {
-        started: started_tx,
-        release: release_rx,
-    });
-    renderer
-        .submit("test".into(), runtime.state().clone())
-        .expect("submit blocking render");
-    started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("render starts");
-    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-
-    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
-        .expect("first escape is handled");
-    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
-        .expect("second escape is handled");
-
-    assert!(matches!(
-        engine.recv_control().await,
-        Some(SessionEngineControl::Interrupt)
-    ));
-    release_tx.send(()).expect("release render");
-    assert!(
-        renderer
-            .recv_timeout(Duration::from_secs(1))
-            .expect("receive render result")
-            .is_some()
-    );
-}
-
-#[tokio::test]
-async fn terminal_event_handler_preserves_double_escape_interrupt_fifo() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    let (mut engine, ingress, _egress) = crate::session::SessionEngine::new();
-    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-
-    let presented_state = runtime.state().clone();
-    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
-        .expect("first escape is handled");
-    assert!(matches!(
-        engine.try_recv_control(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-
-    handle_terminal_event(&mut runtime, &presented_state, Event::Key(escape), &ingress)
-        .expect("second escape is handled");
-    assert!(matches!(
-        engine.recv_control().await,
-        Some(SessionEngineControl::Interrupt)
     ));
 }
 

@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -29,7 +29,6 @@ use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
 };
 use super::preferences::TuiPreferences;
-use super::presentation::TuiPresentationState;
 use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
@@ -62,8 +61,6 @@ mod session_cleanup;
 mod session_command_adapter;
 #[path = "runtime/session_dialog.rs"]
 mod session_dialog;
-#[path = "runtime/terminal_event_reader.rs"]
-mod terminal_event_reader;
 use history_tree_dialog::history_tree_dialog_items;
 use lifecycle::{active_turn_state, has_active_or_pending_session_turn};
 use permission_lifecycle::PermissionLifecycleController;
@@ -72,7 +69,6 @@ use session_dialog::session_dialog_item;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use terminal_event_reader::TerminalEventReader;
 
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
@@ -535,111 +531,11 @@ struct ComposerDraft {
 }
 
 pub trait RuntimeDrawer {
-    fn set_title(&mut self, _title: &str) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn draw(
-        &mut self,
-        state: &mut TuiState,
-        presentation: &mut TuiPresentationState,
-    ) -> io::Result<()>;
-}
-
-struct RenderedFrame {
-    state: TuiState,
-    presentation: TuiPresentationState,
-}
-
-trait RenderWorker {
-    fn submit(&mut self, title: String, state: TuiState) -> io::Result<()>;
-    fn try_recv(&mut self) -> io::Result<Option<RenderedFrame>>;
-    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<RenderedFrame>>;
-}
-
-struct AsyncRenderWorker {
-    request_tx: std::sync::mpsc::Sender<(String, TuiState)>,
-    result_rx: std::sync::mpsc::Receiver<io::Result<RenderedFrame>>,
-
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl AsyncRenderWorker {
-    fn spawn<D>(mut drawer: D) -> Self
-    where
-        D: RuntimeDrawer + Send + 'static,
-    {
-        let (request_tx, request_rx) = std::sync::mpsc::channel::<(String, TuiState)>();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            while let Ok((title, mut state)) = request_rx.recv() {
-                let mut presentation = TuiPresentationState::default();
-                let result = drawer
-                    .set_title(&title)
-                    .and_then(|()| drawer.draw(&mut state, &mut presentation))
-                    .map(|()| RenderedFrame {
-                        state,
-                        presentation,
-                    });
-                let failed = result.is_err();
-                if result_tx.send(result).is_err() || failed {
-                    break;
-                }
-            }
-        });
-        Self {
-            request_tx,
-            result_rx,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl RenderWorker for AsyncRenderWorker {
-    fn submit(&mut self, title: String, state: TuiState) -> io::Result<()> {
-        self.request_tx.send((title, state)).map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "terminal render worker stopped")
-        })
-    }
-
-    fn try_recv(&mut self) -> io::Result<Option<RenderedFrame>> {
-        match self.result_rx.try_recv() {
-            Ok(result) => result.map(Some),
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "terminal render worker stopped",
-            )),
-        }
-    }
-
-    fn recv_timeout(&mut self, timeout: Duration) -> io::Result<Option<RenderedFrame>> {
-        match self.result_rx.recv_timeout(timeout) {
-            Ok(result) => result.map(Some),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "terminal render worker stopped",
-            )),
-        }
-    }
-}
-
-impl Drop for AsyncRenderWorker {
-    fn drop(&mut self) {
-        let (replacement, _) = std::sync::mpsc::channel();
-        let request_tx = std::mem::replace(&mut self.request_tx, replacement);
-        drop(request_tx);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
+    fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
 }
 
 pub struct TuiRuntime {
     state: TuiState,
-    presented_state: TuiState,
-    presented_presentation: TuiPresentationState,
     session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
     permission_lifecycle: PermissionLifecycleController,
     pending_question_handle: Option<RunnerQuestionRequest>,
@@ -680,8 +576,6 @@ impl TuiRuntime {
         preferences_dir: PathBuf,
     ) -> Self {
         Self {
-            presented_state: state.clone(),
-            presented_presentation: TuiPresentationState::default(),
             state,
             session_transport_rx,
             permission_lifecycle: PermissionLifecycleController::default(),
@@ -739,6 +633,10 @@ impl TuiRuntime {
             self.has_active_or_pending_session_turn()
                 .then_some(self.spinner_frame / TERMINAL_TITLE_TICKS_PER_FRAME),
         )
+    }
+
+    fn update_terminal_title(&self, terminal: &mut OwnedTerminal) -> io::Result<()> {
+        terminal.set_title(&self.terminal_title())
     }
 
     fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
@@ -1091,12 +989,6 @@ impl TuiRuntime {
     }
 
     fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
-        if session_event_preempts_typewriter(&event) {
-            self.flush_assistant_typewriter();
-            self.apply_session_transport_event(event);
-            return;
-        }
-
         if !self.deferred_session_events.is_empty() {
             self.deferred_session_events.push_back(event);
             return;
@@ -2153,6 +2045,10 @@ impl TuiRuntime {
             | InputAction::MoveCursorEnd
             | InputAction::NoOp => Ok(None),
         }
+    }
+
+    pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
+        drawer.draw(&mut self.state)
     }
 
     pub(super) fn clear_mcp_server_updating(&mut self, server_name: &str) {
@@ -3650,10 +3546,7 @@ impl TuiRuntime {
     }
 
     fn handle_transcript_click(&mut self, col: u16, row: u16, activate_link: bool) {
-        match self
-            .presented_presentation
-            .transcript_click_target(&self.presented_state, col, row)
-        {
+        match self.state.transcript_click_target(col, row) {
             Some(TranscriptClickTarget::OpenUrl(url)) if activate_link => {
                 if let Err(error) = super::transcript_ratatui::open_hyperlink_url(&url) {
                     self.show_toast(
@@ -3673,7 +3566,7 @@ impl TuiRuntime {
 
     fn handle_selection_start(&mut self, col: u16, row: u16) {
         // 落在 transcript 内容区外不开始选择；点击空白/spacer 也返回 None
-        if let Some(anchor) = self.presented_presentation.map_mouse_to_anchor(col, row) {
+        if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
             self.state.text_selection = Some(super::state::TextSelection {
                 start: anchor.clone(),
                 end: anchor,
@@ -3695,7 +3588,7 @@ impl TuiRuntime {
             return;
         }
         self.state.selection_last_mouse = Some((col, row));
-        if let Some(anchor) = self.presented_presentation.map_mouse_to_anchor(col, row) {
+        if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
             let anchor_changed = self
                 .state
                 .text_selection
@@ -3738,7 +3631,7 @@ impl TuiRuntime {
         let Some((col, row)) = self.state.selection_last_mouse else {
             return;
         };
-        let area = self.presented_presentation.last_transcript_area;
+        let area = self.state.last_transcript_area;
         if area.height == 0 {
             return;
         }
@@ -3765,9 +3658,7 @@ impl TuiRuntime {
         } else {
             area.bottom().saturating_sub(1)
         };
-        if let Some(anchor) = self
-            .presented_presentation
-            .map_mouse_to_anchor(clamped_col, clamped_row)
+        if let Some(anchor) = self.state.map_mouse_to_anchor(clamped_col, clamped_row)
             && let Some(selection) = &mut self.state.text_selection
         {
             selection.end = anchor;
@@ -3777,10 +3668,7 @@ impl TuiRuntime {
     fn handle_copy_selection(&mut self) -> Result<()> {
         use arboard::Clipboard;
 
-        let text = crate::tui::selection::extract_selected_text_with_cache(
-            &self.state,
-            &self.presented_presentation.transcript_render_cache,
-        );
+        let text = crate::tui::selection::extract_selected_text(&self.state);
         if text.is_empty() {
             return Ok(());
         }
@@ -4295,63 +4183,6 @@ fn apply_preferences_theme(state: &mut TuiState, preferences_dir: &Path, theme_i
     }
 }
 
-fn session_event_preempts_typewriter(event: &SessionTransportEvent) -> bool {
-    matches!(
-        event,
-        SessionTransportEvent::Interrupted
-            | SessionTransportEvent::Error(_)
-            | SessionTransportEvent::PermissionRequested { .. }
-            | SessionTransportEvent::QuestionRequested { .. }
-            | SessionTransportEvent::ChildPermissionRequested { .. }
-            | SessionTransportEvent::ChildQuestionRequested { .. }
-            | SessionTransportEvent::ChildSessionViewed { .. }
-            | SessionTransportEvent::ParentSessionViewed { .. }
-    )
-}
-
-fn handle_terminal_event(
-    runtime: &mut TuiRuntime,
-    presented_state: &TuiState,
-    event: Event,
-    ingress: &crate::session::SessionEngineIngress,
-) -> Result<()> {
-    let (action, allow_submit_family) = match event {
-        Event::Key(key) => {
-            // Windows ReadConsoleInput reports key-down and key-up separately.
-            if key.kind != KeyEventKind::Press {
-                return Ok(());
-            }
-            (map_key_event(runtime.state(), key), true)
-        }
-        Event::Mouse(mouse) => {
-            let action = map_mouse_event(presented_state, mouse);
-            (action, false)
-        }
-        Event::Paste(text) => (map_paste_event(runtime.state(), text), false),
-        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => return Ok(()),
-    };
-
-    if let Some(command) = runtime.handle_input_action(action)? {
-        command_dispatch::dispatch_command(runtime, command, ingress, allow_submit_family);
-    }
-    Ok(())
-}
-
-fn drain_terminal_events(
-    runtime: &mut TuiRuntime,
-    presented_state: &TuiState,
-    reader: &TerminalEventReader,
-    ingress: &crate::session::SessionEngineIngress,
-) -> Result<()> {
-    while let Some(event) = reader.try_recv()? {
-        handle_terminal_event(runtime, presented_state, event, ingress)?;
-        if runtime.state().quit_requested {
-            break;
-        }
-    }
-    Ok(())
-}
-
 pub async fn run_tui(
     mut engine: SessionEngine,
     projection: crate::session::SessionEngineProjection,
@@ -4413,9 +4244,9 @@ pub async fn run_tui(
         );
         runtime.set_workspace_dir(workspace_dir);
         runtime.session_title = projection.session_title;
-        let mut renderer = AsyncRenderWorker::spawn(TerminalDrawer::new(OwnedTerminal::new()?));
-        let terminal_events = TerminalEventReader::spawn();
-        let mut render_in_flight = false;
+        let mut terminal = OwnedTerminal::new()?;
+        runtime.update_terminal_title(&mut terminal)?;
+        let mut drawer = TerminalDrawer::new(&mut terminal);
 
         if let Some(session_id) = resume_session_id {
             runtime.session_resume_pending = true;
@@ -4430,16 +4261,13 @@ pub async fn run_tui(
         }
 
         loop {
-            if let Some(rendered) = renderer.try_recv()? {
-                runtime.presented_state = rendered.state;
-                runtime.presented_presentation = rendered.presentation;
-                render_in_flight = false;
+            runtime.try_drain_session_events();
+            if let Some(command) = runtime.take_next_queued_prompt_command() {
+                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
             }
+            drawer.set_title(&runtime.terminal_title())?;
+            runtime.draw(&mut drawer)?;
 
-            // Input is collected independently and always handled before ordinary
-            // session projection. Mouse coordinates use the last presented frame.
-            let presented_state = runtime.presented_state.clone();
-            drain_terminal_events(&mut runtime, &presented_state, &terminal_events, &ingress)?;
             if runtime.state().quit_requested {
                 if let Some(session_id) = runtime.state().session_id.as_deref() {
                     exit_epilogue = Some(super::render::format_exit_epilogue(
@@ -4449,35 +4277,53 @@ pub async fn run_tui(
                 }
                 break;
             }
-
-            runtime.try_drain_session_events();
-            if let Some(command) = runtime.take_next_queued_prompt_command() {
-                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-            }
-            if !render_in_flight {
-                renderer.submit(runtime.terminal_title(), runtime.state().clone())?;
-                render_in_flight = true;
-            }
-
-            match terminal_events.recv_timeout(TUI_FRAME_POLL_INTERVAL)? {
-                Some(event) => {
-                    let presented_state = runtime.presented_state.clone();
-                    handle_terminal_event(&mut runtime, &presented_state, event, &ingress)?;
-                    drain_terminal_events(
-                        &mut runtime,
-                        &presented_state,
-                        &terminal_events,
-                        &ingress,
-                    )?;
+            if event::poll(TUI_FRAME_POLL_INTERVAL)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        // Windows 的 ReadConsoleInput 会同时上报 key-down/key-up
+                        // 记录，crossterm 把它们都转换为 KeyEvent；只处理 Press
+                        // 否则每个按键会被插入多次（如 `s` 变成 `sss`）。
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        let action = map_key_event(runtime.state(), key);
+                        if let Some(command) = runtime.handle_input_action(action)? {
+                            command_dispatch::dispatch_command(
+                                &mut runtime,
+                                command,
+                                &ingress,
+                                true,
+                            );
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        let action = map_mouse_event(runtime.state(), mouse);
+                        if let Some(command) = runtime.handle_input_action(action)? {
+                            command_dispatch::dispatch_command(
+                                &mut runtime,
+                                command,
+                                &ingress,
+                                false,
+                            );
+                        }
+                    }
+                    Event::Paste(text) => {
+                        let action = map_paste_event(runtime.state(), text);
+                        if let Some(command) = runtime.handle_input_action(action)? {
+                            command_dispatch::dispatch_command(
+                                &mut runtime,
+                                command,
+                                &ingress,
+                                false,
+                            );
+                        }
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
                 }
-                None => {
-                    let _ = runtime.handle_input_action(InputAction::Tick)?;
-                }
+            } else {
+                let _ = runtime.handle_input_action(InputAction::Tick)?;
             }
-        }
-
-        if render_in_flight {
-            let _ = renderer.recv_timeout(Duration::from_secs(1))?;
         }
         Ok(())
     }
@@ -4494,13 +4340,13 @@ pub async fn run_tui(
     tui_result.and(shutdown_result).and(join_result)
 }
 
-struct TerminalDrawer {
-    terminal: OwnedTerminal,
+struct TerminalDrawer<'a> {
+    terminal: &'a mut OwnedTerminal,
     applied_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
 }
 
-impl TerminalDrawer {
-    fn new(terminal: OwnedTerminal) -> Self {
+impl<'a> TerminalDrawer<'a> {
+    fn new(terminal: &'a mut OwnedTerminal) -> Self {
         Self {
             terminal,
             applied_hyperlink_cells: Vec::new(),
@@ -4512,25 +4358,17 @@ impl TerminalDrawer {
     }
 }
 
-impl RuntimeDrawer for TerminalDrawer {
-    fn set_title(&mut self, title: &str) -> io::Result<()> {
-        TerminalDrawer::set_title(self, title)
-    }
-
-    fn draw(
-        &mut self,
-        state: &mut TuiState,
-        presentation: &mut TuiPresentationState,
-    ) -> io::Result<()> {
+impl RuntimeDrawer for TerminalDrawer<'_> {
+    fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
         // Ratatui keeps the hardware cursor hidden for frames without a requested
         // cursor. Avoid per-frame cursor moves here: some CJK IMEs follow the VT
         // cursor even while hidden, which made their candidate window jitter.
         let terminal = self.terminal.terminal_mut();
-        let completed = terminal.draw(|frame| render::render(frame, state, presentation))?;
+        let completed = terminal.draw(|frame| render::render(frame, state))?;
         let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
             completed.buffer,
             &self.applied_hyperlink_cells,
-            &presentation.frame_hyperlink_cells,
+            &state.frame_hyperlink_cells,
         );
         super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
         self.applied_hyperlink_cells = overlay.applied;

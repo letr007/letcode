@@ -26,7 +26,6 @@ use crate::tui::{
 };
 use crate::user_content::UserImageAttachment;
 
-use super::super::presentation::TuiPresentationState;
 use super::super::state::TuiState;
 use super::{
     composer::one_line_snippet, reviewer_cards, structured_subagent, todo_card, tool_card,
@@ -47,6 +46,29 @@ pub struct TranscriptRenderCache {
 }
 
 impl TranscriptRenderCache {
+    pub fn clear(&mut self) {
+        self.width = None;
+        self.theme = None;
+        self.timeline_cache_id = None;
+        self.row_metadata_revision = None;
+        self.total_rows = None;
+        self.entries.clear();
+        self.row_starts.clear();
+        self.row_counts.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.width.is_none()
+            && self.theme.is_none()
+            && self.timeline_cache_id.is_none()
+            && self.row_metadata_revision.is_none()
+            && self.total_rows.is_none()
+            && self.entries.is_empty()
+            && self.row_starts.is_empty()
+            && self.row_counts.is_empty()
+    }
+
     pub(crate) fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) {
         if self.width != Some(width)
             || self.theme != Some(theme)
@@ -104,13 +126,7 @@ pub struct TranscriptRenderCacheEntry {
     pub document: Document<Style>,
 }
 
-pub fn render_transcript(
-    frame: &mut Frame<'_>,
-    state: &mut TuiState,
-    presentation: &mut TuiPresentationState,
-    area: Rect,
-    theme: Theme,
-) {
+pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
     }
@@ -131,13 +147,11 @@ pub fn render_transcript(
 
     // 存储实际文本渲染区域（不含 scrollbar 列）与解析后的 top-relative 滚动偏移，
     // 供鼠标坐标映射与选择高亮使用——三者必须共用同一坐标系。
-    presentation.last_transcript_area = content_area;
+    state.last_transcript_area = content_area;
 
     let width = content_area.width.max(1) as usize;
-    let total_rows = cached_transcript_row_count(state, presentation, theme, width);
-    let previous_total_rows = presentation.last_transcript_total_rows;
-    state.sync_transcript_viewport_rows(total_rows, previous_total_rows, content_area.height);
-    presentation.last_transcript_total_rows = Some(total_rows);
+    let total_rows = cached_transcript_row_count(state, theme, width);
+    state.sync_transcript_viewport_rows(total_rows);
     let visible_rows = content_area.height;
     let scroll = crate::tui::measure::resolved_scroll_offset(
         total_rows,
@@ -145,15 +159,14 @@ pub fn render_transcript(
         state.transcript_scroll,
         state.auto_scroll,
     );
-    presentation.last_transcript_scroll_top = scroll;
+    state.last_transcript_scroll_top = scroll;
 
-    let visible_lines =
-        visible_cached_transcript_lines(state, presentation, theme, width, visible_rows, scroll);
+    let visible_lines = visible_cached_transcript_lines(state, theme, width, visible_rows, scroll);
     let paragraph = Paragraph::new(Text::from(visible_lines)).style(theme.app_style());
 
     frame.render_widget(paragraph, content_area);
-    let visible_lines = visible_document_lines(state, presentation, visible_rows, scroll);
-    presentation.frame_hyperlink_cells = transcript_ratatui::collect_hyperlink_cells(
+    let visible_lines = visible_document_lines(state, visible_rows, scroll);
+    state.frame_hyperlink_cells = transcript_ratatui::collect_hyperlink_cells(
         frame.buffer_mut(),
         content_area,
         &visible_lines,
@@ -227,12 +240,7 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
     lines
 }
 
-fn cached_transcript_row_count(
-    state: &TuiState,
-    presentation: &mut TuiPresentationState,
-    theme: Theme,
-    width: usize,
-) -> usize {
+fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize) -> usize {
     let item_count = state.active_timeline().items().len();
     if item_count == 0 {
         return 0;
@@ -241,12 +249,12 @@ fn cached_transcript_row_count(
     let timeline = state.active_timeline();
     let timeline_cache_id = timeline.cache_id();
     let mutation_revision = timeline.mutation_revision();
-    presentation
+    state
         .transcript_render_cache
         .prepare(width, theme, timeline_cache_id);
 
-    if presentation.transcript_render_cache.row_metadata_revision == Some(mutation_revision) {
-        return presentation
+    if state.transcript_render_cache.row_metadata_revision == Some(mutation_revision) {
+        return state
             .transcript_render_cache
             .total_rows
             .expect("current transcript row metadata has a total row count");
@@ -254,10 +262,10 @@ fn cached_transcript_row_count(
 
     #[cfg(test)]
     {
-        presentation.transcript_render_cache.row_count_rebuilds += 1;
+        state.transcript_render_cache.row_count_rebuilds += 1;
     }
 
-    presentation
+    state
         .transcript_render_cache
         .entries
         .resize_with(item_count, || TranscriptRenderCacheEntry {
@@ -266,8 +274,8 @@ fn cached_transcript_row_count(
         });
 
     let mut rows = surface::TRANSCRIPT_TOP_SPACER;
-    presentation.transcript_render_cache.row_starts.clear();
-    presentation.transcript_render_cache.row_counts.clear();
+    state.transcript_render_cache.row_starts.clear();
+    state.transcript_render_cache.row_counts.clear();
 
     for index in 0..item_count {
         let separator_rows = if timeline_item_needs_separator_before(
@@ -280,35 +288,28 @@ fn cached_transcript_row_count(
             0
         };
         rows = rows.saturating_add(separator_rows);
-        presentation.transcript_render_cache.row_starts.push(rows);
-        let line_count = cached_item_line_count(state, presentation, index, theme, width);
-        presentation
-            .transcript_render_cache
-            .row_counts
-            .push(line_count);
+        state.transcript_render_cache.row_starts.push(rows);
+        let line_count = cached_item_line_count(state, index, theme, width);
+        state.transcript_render_cache.row_counts.push(line_count);
         rows = rows.saturating_add(line_count);
     }
 
-    presentation
-        .transcript_render_cache
-        .entries
-        .truncate(item_count);
-    presentation
+    state.transcript_render_cache.entries.truncate(item_count);
+    state
         .transcript_render_cache
         .row_starts
         .truncate(item_count);
-    presentation
+    state
         .transcript_render_cache
         .row_counts
         .truncate(item_count);
-    presentation.transcript_render_cache.row_metadata_revision = Some(mutation_revision);
-    presentation.transcript_render_cache.total_rows = Some(rows);
+    state.transcript_render_cache.row_metadata_revision = Some(mutation_revision);
+    state.transcript_render_cache.total_rows = Some(rows);
     rows
 }
 
 fn visible_cached_transcript_lines(
-    state: &TuiState,
-    presentation: &mut TuiPresentationState,
+    state: &mut TuiState,
     theme: Theme,
     width: usize,
     visible_rows: u16,
@@ -319,11 +320,11 @@ fn visible_cached_transcript_lines(
         return Vec::new();
     }
 
-    presentation
+    state
         .transcript_render_cache
         .prepare(width, theme, state.active_timeline().cache_id());
-    if !transcript_row_metadata_is_current(presentation, state) {
-        cached_transcript_row_count(state, presentation, theme, width);
+    if !transcript_row_metadata_is_current(state) {
+        cached_transcript_row_count(state, theme, width);
     }
 
     let start = top_scroll as usize;
@@ -338,15 +339,15 @@ fn visible_cached_transcript_lines(
     }
 
     let item_count = state.active_timeline().items().len();
-    let first_item = presentation
+    let first_item = state
         .transcript_render_cache
         .row_starts
         .partition_point(|row_start| *row_start < start)
         .saturating_sub(1);
 
     for index in first_item..item_count {
-        let item_start = presentation.transcript_render_cache.row_starts[index];
-        let item_count = presentation.transcript_render_cache.row_counts[index];
+        let item_start = state.transcript_render_cache.row_starts[index];
+        let item_count = state.transcript_render_cache.row_counts[index];
         let separator_rows = if timeline_item_needs_separator_before(
             index,
             state.active_timeline().items(),
@@ -373,7 +374,7 @@ fn visible_cached_transcript_lines(
 
         let line_start = start.saturating_sub(item_start).min(item_count);
         let line_end = end.saturating_sub(item_start).min(item_count);
-        let lines = cached_item_lines(state, presentation, index, theme, width);
+        let lines = cached_item_lines(state, index, theme, width);
         for line in &lines[line_start..line_end] {
             visible.push(line.clone());
             if visible.len() >= visible_rows {
@@ -384,25 +385,19 @@ fn visible_cached_transcript_lines(
 
     // 应用选择高亮
     if let Some(selection) = &state.text_selection {
-        apply_selection_highlight(&mut visible, selection, presentation, theme, top_scroll);
+        apply_selection_highlight(&mut visible, selection, state, theme, top_scroll);
     }
 
     visible
 }
 
-fn visible_document_lines<'a>(
-    state: &'a TuiState,
-    presentation: &'a TuiPresentationState,
+fn visible_document_lines(
+    state: &TuiState,
     visible_rows: u16,
     top_scroll: u16,
-) -> Vec<Option<&'a RenderLine<Style>>> {
+) -> Vec<Option<&RenderLine<Style>>> {
     let mut rows = vec![None; surface::TRANSCRIPT_TOP_SPACER];
-    for (index, entry) in presentation
-        .transcript_render_cache
-        .entries
-        .iter()
-        .enumerate()
-    {
+    for (index, entry) in state.transcript_render_cache.entries.iter().enumerate() {
         if timeline_item_needs_separator_before(
             index,
             state.active_timeline().items(),
@@ -417,13 +412,10 @@ fn visible_document_lines<'a>(
     rows.drain(start..end).collect()
 }
 
-fn transcript_row_metadata_is_current(
-    presentation: &TuiPresentationState,
-    state: &TuiState,
-) -> bool {
+fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
     let timeline = state.active_timeline();
-    presentation.transcript_render_cache.row_metadata_revision == Some(timeline.mutation_revision())
-        && presentation.transcript_render_cache.total_rows.is_some()
+    state.transcript_render_cache.row_metadata_revision == Some(timeline.mutation_revision())
+        && state.transcript_render_cache.total_rows.is_some()
 }
 
 fn timeline_item_needs_separator_before(
@@ -457,42 +449,27 @@ fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool 
         .unwrap_or(state.tool_output_expanded)
 }
 
-fn cached_item_line_count(
-    state: &TuiState,
-    presentation: &mut TuiPresentationState,
-    index: usize,
-    theme: Theme,
-    width: usize,
-) -> usize {
-    refresh_cached_item_document(state, presentation, index, theme, width);
-    presentation.transcript_render_cache.entries[index]
+fn cached_item_line_count(state: &mut TuiState, index: usize, theme: Theme, width: usize) -> usize {
+    refresh_cached_item_document(state, index, theme, width);
+    state.transcript_render_cache.entries[index]
         .document
         .lines
         .len()
 }
 
 fn cached_item_lines(
-    state: &TuiState,
-    presentation: &mut TuiPresentationState,
+    state: &mut TuiState,
     index: usize,
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    refresh_cached_item_document(state, presentation, index, theme, width);
-    transcript_ratatui::document_to_ratatui(
-        &presentation.transcript_render_cache.entries[index].document,
-    )
+    refresh_cached_item_document(state, index, theme, width);
+    transcript_ratatui::document_to_ratatui(&state.transcript_render_cache.entries[index].document)
 }
 
-fn refresh_cached_item_document(
-    state: &TuiState,
-    presentation: &mut TuiPresentationState,
-    index: usize,
-    theme: Theme,
-    width: usize,
-) {
-    if presentation.transcript_render_cache.entries.len() <= index {
-        presentation
+fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme, width: usize) {
+    if state.transcript_render_cache.entries.len() <= index {
+        state
             .transcript_render_cache
             .entries
             .resize_with(index + 1, || TranscriptRenderCacheEntry {
@@ -514,7 +491,7 @@ fn refresh_cached_item_document(
         &state.active_timeline().items()[index],
         TimelineItem::Reasoning(reasoning) if reasoning.streaming
     );
-    if presentation.transcript_render_cache.entries[index].revision == revision && !live {
+    if state.transcript_render_cache.entries[index].revision == revision && !live {
         return;
     }
 
@@ -532,7 +509,7 @@ fn refresh_cached_item_document(
         state.thoughts_display,
         next_reasoning,
     );
-    let entry = &mut presentation.transcript_render_cache.entries[index];
+    let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;
     entry.document = document;
 }
@@ -1773,14 +1750,14 @@ fn reasoning_text_style(theme: Theme) -> ratatui::style::Style {
 fn apply_selection_highlight(
     lines: &mut [Line<'static>],
     selection: &crate::tui::state::TextSelection,
-    presentation: &TuiPresentationState,
+    state: &crate::tui::state::TuiState,
     theme: Theme,
     scroll_offset: u16,
 ) {
     use ratatui::style::Style;
 
     let (start, end) = selection.normalize();
-    let cache = &presentation.transcript_render_cache;
+    let cache = &state.transcript_render_cache;
 
     // 计算选择范围的绝对行号
     if start.item_index >= cache.row_starts().len() || end.item_index >= cache.row_starts().len() {
@@ -1938,7 +1915,6 @@ mod tests {
             UserMessageEvent,
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             measure::display_width,
-            presentation::TuiPresentationState,
             state::{ContextDetailTarget, TuiState},
             theme::{Theme, ThemeName},
             timeline::{
@@ -2418,7 +2394,6 @@ mod tests {
     fn compact_reasoning_cache_refreshes_when_adjacent_item_is_added() {
         let start = std::time::Instant::now();
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Compact);
         state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
             "reasoning-1",
@@ -2433,8 +2408,8 @@ mod tests {
 
         let theme = Theme::dark();
         let width = 80;
-        cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let before = visible_cached_transcript_lines(&state, &mut presentation, theme, width, 8, 0)
+        cached_transcript_row_count(&mut state, theme, width);
+        let before = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -2446,8 +2421,8 @@ mod tests {
             "Second title\nSecond body",
             start + std::time::Duration::from_millis(500),
         )));
-        cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let after = visible_cached_transcript_lines(&state, &mut presentation, theme, width, 8, 0)
+        cached_transcript_row_count(&mut state, theme, width);
+        let after = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -2522,7 +2497,6 @@ mod tests {
     fn consecutive_reasoning_titles_are_separated_outside_compact_mode() {
         let start = std::time::Instant::now();
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         for (index, title) in ["First thought", "Second thought", "Third thought"]
             .into_iter()
             .enumerate()
@@ -2564,11 +2538,9 @@ mod tests {
                 "{mode:?}: {lines:?}"
             );
 
-            let total_rows =
-                cached_transcript_row_count(&state, &mut presentation, Theme::dark(), 80);
+            let total_rows = cached_transcript_row_count(&mut state, Theme::dark(), 80);
             let cached = visible_cached_transcript_lines(
-                &state,
-                &mut presentation,
+                &mut state,
                 Theme::dark(),
                 80,
                 u16::try_from(total_rows).expect("test transcript fits in u16 rows"),
@@ -2594,7 +2566,6 @@ mod tests {
     #[test]
     fn cached_visible_transcript_matches_full_transcript_window() {
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("seed")));
         for index in 0..30 {
             state
@@ -2609,12 +2580,11 @@ mod tests {
         let theme = Theme::dark();
         let width = 72;
         let full = transcript_lines(&state, theme, width);
-        let total_rows = cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let visible =
-            visible_cached_transcript_lines(&state, &mut presentation, theme, width, 9, 12)
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>();
+        let total_rows = cached_transcript_row_count(&mut state, theme, width);
+        let visible = visible_cached_transcript_lines(&mut state, theme, width, 9, 12)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
         let expected = visible_transcript_lines(&full, 9, 12)
             .into_iter()
             .map(|line| line.to_string())
@@ -2627,45 +2597,40 @@ mod tests {
     #[test]
     fn cached_row_count_uses_stable_timeline_fast_path() {
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("first")));
         state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("second")));
 
         let theme = Theme::dark();
         let width = 80;
-        let expected_rows = cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let rebuilds = presentation.transcript_render_cache.row_count_rebuilds;
+        let expected_rows = cached_transcript_row_count(&mut state, theme, width);
+        let rebuilds = state.transcript_render_cache.row_count_rebuilds;
 
         assert_eq!(
-            cached_transcript_row_count(&state, &mut presentation, theme, width),
+            cached_transcript_row_count(&mut state, theme, width),
             expected_rows
         );
-        assert_eq!(
-            presentation.transcript_render_cache.row_count_rebuilds,
-            rebuilds
-        );
+        assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
     }
 
     #[test]
     fn cached_row_count_refreshes_after_timeline_mutation() {
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             "first",
         )));
 
         let theme = Theme::dark();
         let width = 80;
-        let before_rows = cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let before_rebuilds = presentation.transcript_render_cache.row_count_rebuilds;
+        let before_rows = cached_transcript_row_count(&mut state, theme, width);
+        let before_rebuilds = state.transcript_render_cache.row_count_rebuilds;
 
         state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             " second",
         )));
 
-        let after_rows = cached_transcript_row_count(&state, &mut presentation, theme, width);
+        let after_rows = cached_transcript_row_count(&mut state, theme, width);
         assert_eq!(
-            presentation.transcript_render_cache.row_count_rebuilds,
+            state.transcript_render_cache.row_count_rebuilds,
             before_rebuilds + 1
         );
         assert!(after_rows >= before_rows);
@@ -2675,28 +2640,26 @@ mod tests {
     #[test]
     fn transcript_cache_invalidates_streaming_assistant_item() {
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             "first",
         )));
 
         let theme = Theme::dark();
         let width = 80;
-        let before_rows = cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let before_revision = presentation.transcript_render_cache.entries[0].revision;
+        let before_rows = cached_transcript_row_count(&mut state, theme, width);
+        let before_revision = state.transcript_render_cache.entries[0].revision;
 
         state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             " second",
         )));
 
-        let after_rows = cached_transcript_row_count(&state, &mut presentation, theme, width);
-        let after_revision = presentation.transcript_render_cache.entries[0].revision;
-        let visible =
-            visible_cached_transcript_lines(&state, &mut presentation, theme, width, 8, 0)
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
+        let after_rows = cached_transcript_row_count(&mut state, theme, width);
+        let after_revision = state.transcript_render_cache.entries[0].revision;
+        let visible = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert_eq!(before_rows, after_rows);
         assert_ne!(before_revision, after_revision);
@@ -2706,16 +2669,15 @@ mod tests {
     #[test]
     fn transcript_cache_is_namespaced_by_timeline_replacement() {
         let mut state = TuiState::default();
-        let mut presentation = TuiPresentationState::default();
         state
             .timeline
             .push_assistant_delta(AssistantDeltaEvent::new("old timeline"));
         let theme = Theme::dark();
         let width = 80;
 
-        cached_transcript_row_count(&state, &mut presentation, theme, width);
+        cached_transcript_row_count(&mut state, theme, width);
         assert!(
-            visible_cached_transcript_lines(&state, &mut presentation, theme, width, 8, 0)
+            visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
                 .into_iter()
                 .any(|line| line.to_string().contains("old timeline"))
         );
@@ -2725,12 +2687,11 @@ mod tests {
             .timeline
             .push_assistant_delta(AssistantDeltaEvent::new("new timeline"));
 
-        let visible =
-            visible_cached_transcript_lines(&state, &mut presentation, theme, width, 8, 0)
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
+        let visible = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(visible.contains("new timeline"), "{visible}");
         assert!(!visible.contains("old timeline"), "{visible}");
@@ -2750,7 +2711,7 @@ mod tests {
         }
 
         let before_lines = transcript_lines(&state, theme, width);
-        state.sync_transcript_viewport_rows(before_lines.len(), None, viewport_rows);
+        state.sync_transcript_viewport_rows(before_lines.len());
         let target_top = 6usize;
         let before_max_scroll = crate::tui::measure::max_scroll(before_lines.len(), viewport_rows);
         state.transcript_scroll = before_max_scroll.saturating_sub(target_top as u16);
@@ -2773,11 +2734,7 @@ mod tests {
         )));
 
         let after_lines = transcript_lines(&state, theme, width);
-        state.sync_transcript_viewport_rows(
-            after_lines.len(),
-            Some(before_lines.len()),
-            viewport_rows,
-        );
+        state.sync_transcript_viewport_rows(after_lines.len());
         let after_top = crate::tui::measure::resolved_scroll_offset(
             after_lines.len(),
             viewport_rows,
@@ -3074,13 +3031,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, 40, 8);
-                render_transcript(
-                    frame,
-                    &mut state,
-                    &mut TuiPresentationState::default(),
-                    area,
-                    Theme::dark(),
-                );
+                render_transcript(frame, &mut state, area, Theme::dark());
             })
             .expect("draw");
 
