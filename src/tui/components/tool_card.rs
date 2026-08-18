@@ -429,12 +429,22 @@ fn tool_trace_segments(tool: &ToolView, style: Style) -> Vec<SemanticSpan<Style>
         "search__rg" => {
             let pattern = value_str(args, "pattern").unwrap_or("pattern");
             let path = value_str(args, "path").unwrap_or(".");
-            vec![
+            let mut segments = vec![
                 SemanticSpan::decoration("Search ", style),
                 SemanticSpan::source(pattern, style),
                 SemanticSpan::decoration(" in ", style),
                 SemanticSpan::source_with_join(path, style, CopyJoin::Space),
-            ]
+            ];
+            // After completion, surface a compact result detail such as
+            // "42 matches · 3 files · folded" in the same bracketed style as
+            // fs__read's offset/limit.
+            if tool.status == ToolExecutionStatus::Succeeded && !tool.summary.is_empty() {
+                segments.push(SemanticSpan::decoration(
+                    format!(" [{}]", tool.summary),
+                    style,
+                ));
+            }
+            segments
         }
         "web__fetch" => trace_action_and_value(
             "Fetch ",

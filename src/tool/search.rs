@@ -1,12 +1,19 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::fold_artifact::{SEARCH_ARTIFACT_DIR, write_artifact};
 use super::{
     COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry,
     display_workspace_relative, existing_workspace_path, optional_bool, optional_string,
     optional_usize, required_string,
 };
+
+const SEARCH_FOLD_THRESHOLD_BYTES: usize = 32 * 1024;
+const SEARCH_PREVIEW_MATCHES: usize = 5;
+const SEARCH_TEXT_PREVIEW_CHARS: usize = 120;
 
 pub(super) fn register(registry: &mut ToolRegistry) {
     registry.register(RgTool);
@@ -173,13 +180,132 @@ async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
         }));
     }
 
-    Ok(json!({
+    let mut data = json!({
         "pattern": pattern,
         "path": display_workspace_relative(&path)?,
-        "matches": matches,
-        "truncated": truncated,
         "status": output.get("status").cloned().unwrap_or(Value::Null),
         "success": output.get("success").cloned().unwrap_or(Value::Bool(false)),
         "stderr": output.get("stderr").cloned().unwrap_or(Value::String(String::new())),
-    }))
+    });
+    let payload = present_search_matches(matches, truncated).await?;
+    for (key, value) in payload {
+        data[key] = value;
+    }
+    Ok(data)
+}
+
+fn match_line_text(m: &Value) -> String {
+    let path = m.get("path").and_then(Value::as_str).unwrap_or("?");
+    let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+    let column = m.get("column").and_then(Value::as_u64).unwrap_or(0);
+    let text = m.get("text").and_then(Value::as_str).unwrap_or("");
+    format!("{path}:{line}:{column}: {text}")
+}
+
+fn truncate_match_text(mut m: Value) -> Value {
+    if let Some(text) = m.get("text").and_then(Value::as_str) {
+        let preview: String = text.chars().take(SEARCH_TEXT_PREVIEW_CHARS).collect();
+        if preview.chars().count() < text.chars().count() {
+            m["text"] = json!(preview);
+            m["text_truncated"] = json!(true);
+        }
+    }
+    m
+}
+
+/// Decide how the matched results are surfaced. Small result sets are returned
+/// inline in full; large ones are folded to a local artifact with a short
+/// preview plus `local_path`, so the model can decide whether and where to read
+/// the full list on demand.
+async fn present_search_matches(
+    matches: Vec<Value>,
+    outer_truncated: bool,
+) -> Result<serde_json::Map<String, Value>> {
+    let total_matches = matches.len();
+    let files: HashSet<&str> = matches
+        .iter()
+        .filter_map(|m| m.get("path").and_then(Value::as_str))
+        .collect();
+    let mut map = serde_json::Map::new();
+    map.insert("total_matches".into(), json!(total_matches));
+    map.insert("files".into(), json!(files.len()));
+
+    if matches.is_empty() {
+        map.insert("matches".into(), json!([]));
+        map.insert("truncated".into(), json!(outer_truncated));
+        return Ok(map);
+    }
+
+    let inline_size = serde_json::to_string(&matches)?.len();
+    if inline_size > SEARCH_FOLD_THRESHOLD_BYTES {
+        let body = matches
+            .iter()
+            .map(match_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let local_path = write_artifact(SEARCH_ARTIFACT_DIR, body.as_bytes(), "txt").await?;
+        let preview = matches
+            .iter()
+            .take(SEARCH_PREVIEW_MATCHES)
+            .cloned()
+            .map(truncate_match_text)
+            .collect::<Vec<_>>();
+        map.insert("matches".into(), json!(preview));
+        map.insert("folded".into(), json!(true));
+        map.insert("local_path".into(), json!(local_path));
+        map.insert("truncated".into(), json!(true));
+    } else {
+        map.insert("matches".into(), json!(matches));
+        map.insert("truncated".into(), json!(outer_truncated));
+    }
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn match_item(path: &str, line: u64, text: &str) -> Value {
+        json!({"path": path, "line": line, "column": 1, "text": text})
+    }
+
+    #[tokio::test]
+    async fn large_result_set_folds_to_artifact_with_preview() {
+        let matches = (0..200)
+            .map(|i| match_item("src/a.rs", i as u64 + 1, &"x".repeat(300)))
+            .collect::<Vec<_>>();
+        let map = present_search_matches(matches, false).await.unwrap();
+        assert_eq!(map.get("folded").and_then(Value::as_bool), Some(true));
+        assert_eq!(map.get("truncated").and_then(Value::as_bool), Some(true));
+        assert_eq!(map.get("total_matches").and_then(Value::as_u64), Some(200));
+        assert_eq!(map.get("files").and_then(Value::as_u64), Some(1));
+        let preview = map.get("matches").and_then(Value::as_array).unwrap();
+        assert_eq!(preview.len(), super::SEARCH_PREVIEW_MATCHES);
+        assert!(
+            preview
+                .iter()
+                .all(|m| m.get("text_truncated") == Some(&json!(true))),
+            "long lines in preview are truncated"
+        );
+        let path = map.get("local_path").and_then(Value::as_str).unwrap();
+        let on_disk = std::fs::read(path).unwrap();
+        assert_eq!(on_disk.split(|&b| b == b'\n').count(), 200);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn small_result_set_stays_inline() {
+        let matches = vec![
+            match_item("src/a.rs", 1, "hello"),
+            match_item("src/b.rs", 2, "world"),
+        ];
+        let map = present_search_matches(matches, false).await.unwrap();
+        assert_eq!(map.get("folded"), None);
+        assert_eq!(map.get("local_path"), None);
+        assert_eq!(map.get("truncated").and_then(Value::as_bool), Some(false));
+        assert_eq!(map.get("files").and_then(Value::as_u64), Some(2));
+        let matches = map.get("matches").and_then(Value::as_array).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|m| m.get("text_truncated").is_none()));
+    }
 }

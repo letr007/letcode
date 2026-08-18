@@ -2103,7 +2103,7 @@ fn output_summary(output: &ToolResult) -> Option<String> {
         tool_names::TOOL_FS_WRITE => summarize_bytes(data, "bytes_written", "wrote"),
         tool_names::TOOL_FS_APPEND => summarize_bytes(data, "bytes_appended", "appended"),
         tool_names::TOOL_FS_MKDIR => summarize_path_action(data, "created"),
-        tool_names::TOOL_SEARCH_RG => summarize_array_count(data, "matches", "matches"),
+        tool_names::TOOL_SEARCH_RG => summarize_search(data),
         tool_names::TOOL_WEB_FETCH => summarize_web_fetch(data),
         tool_names::TOOL_SHELL_EXEC
         | tool_names::TOOL_GIT_STATUS
@@ -2209,6 +2209,31 @@ fn summarize_echo(data: &Value) -> String {
     format!("returned {chars} chars")
 }
 
+fn summarize_search(data: &Value) -> String {
+    // Prefer the explicit aggregate; fall back to the inline array length for
+    // older/legacy payloads that predate `total_matches`.
+    let total = data
+        .get("total_matches")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            data.get("matches")
+                .and_then(Value::as_array)
+                .map(|matches| matches.len() as u64)
+        })
+        .unwrap_or(0);
+    let files = data.get("files").and_then(Value::as_u64).unwrap_or(0);
+    let mut parts = vec![format!("{total} matches")];
+    if files > 0 {
+        parts.push(format!("{files} files"));
+    }
+    let text = parts.join(" · ");
+    if data.get("folded").and_then(Value::as_bool).unwrap_or(false) {
+        format!("{text} · folded")
+    } else {
+        text
+    }
+}
+
 fn summarize_array_count(data: &Value, key: &str, label: &str) -> String {
     let count = data
         .get(key)
@@ -2301,12 +2326,20 @@ fn summarize_command(data: &Value) -> String {
     let stderr = output_line_count(data, "stderr", "stderr_truncated");
     let mut parts = vec![status];
     if let Some(stdout) = stdout {
-        parts.push(format!("stdout {stdout}"));
+        parts.push(format!("stdout {stdout}{}", folded_suffix(data, "stdout")));
     }
     if let Some(stderr) = stderr {
-        parts.push(format!("stderr {stderr}"));
+        parts.push(format!("stderr {stderr}{}", folded_suffix(data, "stderr")));
     }
     parts.join(" · ")
+}
+
+fn folded_suffix(data: &Value, label: &str) -> &'static str {
+    let folded = data
+        .get(format!("{label}_folded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if folded { " · folded" } else { "" }
 }
 
 fn output_line_count(data: &Value, key: &str, truncated_key: &str) -> Option<String> {
@@ -2363,6 +2396,26 @@ mod tests {
     use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn summarize_search_uses_aggregate_and_marks_folded() {
+        assert_eq!(
+            summarize_search(&json!({
+                "matches": [],
+                "total_matches": 843,
+                "files": 12,
+                "folded": true,
+            })),
+            "843 matches · 12 files · folded"
+        );
+        // Legacy payloads without aggregates fall back to the inline array.
+        assert_eq!(
+            summarize_search(&json!({
+                "matches": [{"path": "a"}, {"path": "b"}],
+            })),
+            "2 matches"
+        );
+    }
 
     #[tokio::test]
     async fn permission_request_handle_delivers_approval() {
