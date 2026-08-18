@@ -14,9 +14,10 @@ use super::fold_artifact::{
     COMMAND_ARTIFACT_DIR, FOLD_PREVIEW_CHARS, FOLD_THRESHOLD_BYTES, fold_preview, write_artifact,
 };
 use super::args::required_string;
+use super::delegation::optional_u64;
 use super::{
     COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream,
-    ToolRegistry, optional_u64, workspace_root,
+    ToolRegistry, workspace_root,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
