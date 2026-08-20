@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- TUI 启动后在后台检查稳定版更新；发现新版本时通过现有 info toast 提示运行 `letcode update`，网络失败不影响启动。
+
+### Changed
+
+- 自更新命令改用结构化终端流程，精确匹配平台资产，并在替换二进制前校验 GitHub Release 提供的 SHA-256 digest。
+
 ## [0.5.2] - 2026-08-20
 
 ### Fixed

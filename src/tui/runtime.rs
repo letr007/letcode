@@ -156,6 +156,8 @@ pub struct TuiRuntime {
     session_resume_pending: bool,
     /// Background `/resume` directory scan; polled each frame so the UI never blocks.
     session_list_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<SessionSummary>>>>,
+    /// One-shot background release check. Failures are logged and never interrupt the TUI.
+    update_check_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Option<String>>>>,
     current_turn_output_tokens: u64,
     history_selection: Option<usize>,
     history_draft: Option<ComposerDraft>,
@@ -194,6 +196,7 @@ impl TuiRuntime {
             session_turn_active: false,
             session_resume_pending: false,
             session_list_rx: None,
+            update_check_rx: None,
             current_turn_output_tokens: 0,
             history_selection: None,
             history_draft: None,
@@ -214,6 +217,16 @@ impl TuiRuntime {
     pub fn set_workspace_dir(&mut self, workspace_dir: PathBuf) {
         self.branch_poller.set_workspace_dir(workspace_dir);
         self.poll_git_branch();
+    }
+
+    fn start_update_check(&mut self) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.update_check_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::updater::available_update()
+                .map(|update| update.map(|update| update.latest_version));
+            let _ = tx.send(result);
+        });
     }
 
     pub fn state(&self) -> &TuiState {
@@ -461,6 +474,7 @@ impl TuiRuntime {
         const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
         self.advance_assistant_typewriter(Instant::now());
         self.poll_session_list();
+        self.poll_update_check();
         self.poll_git_branch();
         for _ in 0..MAX_SESSION_EVENTS_PER_FRAME {
             match self.session_transport_rx.try_recv() {
@@ -476,6 +490,28 @@ impl TuiRuntime {
 
     fn poll_git_branch(&mut self) {
         self.branch_poller.poll(&mut self.state);
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = self.update_check_rx.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(Some(version))) => {
+                self.update_check_rx = None;
+                let message = self
+                    .state
+                    .t_fmt("runtime.update_available", &[("version", version.as_str())]);
+                self.state.show_toast(message, ToastKind::Info);
+            }
+            Ok(Ok(None)) => self.update_check_rx = None,
+            Ok(Err(error)) => {
+                self.update_check_rx = None;
+                tracing::debug!(%error, "background update check failed");
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => self.update_check_rx = None,
+        }
     }
 
     fn poll_session_list(&mut self) {
@@ -3884,6 +3920,7 @@ pub async fn run_tui(
             preferences_dir,
         );
         runtime.set_workspace_dir(workspace_dir);
+        runtime.start_update_check();
         runtime.session_title = projection.session_title;
         let mut terminal = OwnedTerminal::new()?;
         runtime.update_terminal_title(&mut terminal)?;
@@ -4022,6 +4059,7 @@ mod git_branch_tests {
     use super::TuiRuntime;
     use super::branch_poller::read_git_branch;
     use crate::tui::TuiState;
+    use crate::tui::state::ToastKind;
     use std::path::Path;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4083,6 +4121,40 @@ mod git_branch_tests {
 
         deliver_branch_refresh(&mut runtime, None);
         assert_eq!(runtime.state().git_branch, None);
+    }
+
+    #[test]
+    fn update_check_result_shows_localized_info_toast_once() {
+        let mut runtime = runtime();
+        let (tx, rx) = mpsc::unbounded_channel();
+        runtime.update_check_rx = Some(rx);
+        tx.send(Ok(Some("0.5.3".into())))
+            .expect("update check result should send");
+
+        runtime.poll_update_check();
+
+        let toast = runtime
+            .state()
+            .toast()
+            .expect("update toast should be shown");
+        assert_eq!(toast.kind, ToastKind::Info);
+        assert!(toast.message.contains("0.5.3"));
+        assert!(toast.message.contains("letcode update"));
+        assert!(runtime.update_check_rx.is_none());
+    }
+
+    #[test]
+    fn failed_update_check_is_silent() {
+        let mut runtime = runtime();
+        let (tx, rx) = mpsc::unbounded_channel();
+        runtime.update_check_rx = Some(rx);
+        tx.send(Err(anyhow::anyhow!("offline")))
+            .expect("update check error should send");
+
+        runtime.poll_update_check();
+
+        assert!(runtime.state().toast().is_none());
+        assert!(runtime.update_check_rx.is_none());
     }
 
     #[test]
