@@ -81,9 +81,10 @@ mod tests {
             engine.try_recv_control(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+        let expected = runtime.state().t("runtime.turn_running");
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
-            Some("回合仍在运行")
+            Some(expected.as_str())
         );
     }
 
@@ -107,9 +108,10 @@ mod tests {
                 crate::session::engine::SessionEngineCommand::SetModel(model)
             )) if model == "provider/model"
         ));
+        let expected = runtime.state().t("runtime.change_queued");
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
-            Some("更改已排队，将在当前回合后生效")
+            Some(expected.as_str())
         );
         assert_eq!(
             runtime.state().pending_composer_settings.model,
