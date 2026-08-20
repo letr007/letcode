@@ -28,9 +28,7 @@ struct PreparedCompaction {
 }
 
 struct PreparedLocalCompaction {
-    history: Vec<HistoryItem>,
     current_turn_start_index: Option<usize>,
-    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
 }
 
@@ -108,15 +106,17 @@ where
     // Reload already analyzed with turn_start=None for install safety; this
     // pass uses the live turn cursor so incomplete tool groups are respected.
     agent.runtime_snapshot.validate_references()?;
+    let live_history = agent.active_history_items();
+    let live_protocol_frames = agent.active_protocol_frames();
 
-    if agent.history.is_empty() {
+    if live_history.is_empty() {
         return Ok(Err(CompactionNoProgress {
             trigger,
             blockers: vec![CompactionBlocker::NoHistoricalItems],
         }));
     }
     let history_transcript =
-        analyze_history_items(&agent.history, agent.turn.current_turn_start_index)?;
+        analyze_history_items(&live_history, agent.turn.current_turn_start_index)?;
     let preserve_recent_tokens = match trigger {
         CompactionTrigger::Manual => 0,
         CompactionTrigger::RequestPressure => agent
@@ -130,7 +130,7 @@ where
             }),
     };
     let Some(cut) = super::history_compact::plan_turn_cut_with_transcript(
-        &agent.history,
+        &live_history,
         agent.turn.current_turn_start_index,
         preserve_recent_tokens,
         &history_transcript,
@@ -156,8 +156,7 @@ where
     )?;
 
     if agent.runtime_snapshot_provider.is_some() {
-        let first_kept_entry_id = agent
-            .protocol_frames
+        let first_kept_entry_id = live_protocol_frames
             .get(cut.cut_end)
             .map(|frame| {
                 frame
@@ -181,7 +180,7 @@ where
     // TranscriptRecorder rejects this shape, so it cannot enter production.
     let event = ContextCompactionEvent::succeeded(summary.clone(), cut.cut_end);
     let history =
-        super::history_compact::compose_with_summary(&summary, &agent.history, cut.cut_end)?;
+        super::history_compact::compose_with_summary(&summary, &live_history, cut.cut_end)?;
     let current_turn_start_index = agent
         .turn
         .current_turn_start_index
@@ -191,8 +190,8 @@ where
     let protocol_frames = compacted_protocol_frames(agent, &transcript.frames, &cut)?;
     let mut runtime_snapshot = agent.rebuilt_runtime_snapshot_from_protocol_frames(
         &protocol_frames,
-        agent.protocol_frames.len(),
-        &agent.history,
+        live_protocol_frames.len(),
+        &live_history,
     )?;
     merge_non_protocol_runtime_metadata(&mut runtime_snapshot, &agent.runtime_snapshot);
     rebind_active_protocol_from_history(&mut runtime_snapshot, &history)?;
@@ -211,10 +210,8 @@ where
     Ok(Ok(PreparedCompaction {
         event,
         local_state: Some(PreparedLocalCompaction {
-            history,
             current_turn_start_index,
-            protocol_frames: runtime_snapshot.active_protocol_frames(),
-            runtime_snapshot,
+            runtime_snapshot: runtime_snapshot.clone(),
         }),
     }))
 }
@@ -224,19 +221,21 @@ fn compacted_protocol_frames<C: Config>(
     candidate_frames: &[crate::protocol_frames::ProtocolFrame],
     cut: &super::history_compact::TurnCut,
 ) -> Result<Vec<crate::protocol_frames::ProtocolFrame>> {
+    let live_frames = agent.active_protocol_frames();
+    let live_history = agent.active_history_items();
     anyhow::ensure!(
-        agent.protocol_frames.len() == agent.history.len(),
+        live_frames.len() == live_history.len(),
         "cannot compact protocol identity: cached frames {} vs history {}",
-        agent.protocol_frames.len(),
-        agent.history.len()
+        live_frames.len(),
+        live_history.len()
     );
 
     let mut frames = candidate_frames.to_vec();
     let mut candidate_index = 1usize; // The compacted summary always gets a new identity.
-    for old_index in cut.cut_end..agent.protocol_frames.len() {
+    for old_index in cut.cut_end..live_frames.len() {
         inherit_protocol_identity(
             frames.get_mut(candidate_index),
-            agent.protocol_frames.get(old_index),
+            live_frames.get(old_index),
         )?;
         candidate_index += 1;
     }
@@ -265,9 +264,7 @@ fn install_prepared_compaction<C: Config + Clone>(
     agent: &mut Agent<C>,
     prepared: PreparedLocalCompaction,
 ) {
-    agent.history = prepared.history;
     agent.turn.current_turn_start_index = prepared.current_turn_start_index;
-    agent.protocol_frames = prepared.protocol_frames;
     agent.runtime_snapshot = prepared.runtime_snapshot;
     agent.clear_active_epoch();
     agent.clear_provider_usage_anchor();
@@ -304,7 +301,7 @@ fn pressure_successor_request<C: Config + Clone>(
         protected_start_index: agent
             .turn
             .current_turn_start_index
-            .unwrap_or(agent.history.len()),
+            .unwrap_or(agent.active_history_items().len()),
         build: epoch_preview.build.clone(),
         epoch_preview,
     })
@@ -411,7 +408,7 @@ where
         // then reload their canonical projection before reporting retention.
         commit_prepared_compaction(agent, prepared, on_event).await?;
         Ok(CompactionAttemptOutcome::Compacted {
-            retained_items: agent.history.len(),
+            retained_items: agent.active_history_items().len(),
         })
     }
     .await
@@ -438,7 +435,6 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    agent.refresh_runtime_snapshot_from_provider()?;
     if agent.prepare_fast_mode_for_request()? {
         on_event(AgentEvent::FastModeChanged { enabled: false }).await?;
     }
@@ -522,7 +518,7 @@ where
 fn sync_compaction_workflow_authority<C: Config>(agent: &mut Agent<C>) {
     // Transcript-projected history is authoritative after reload; drop stale
     // live turn counters and rebuild todos from the durable tool trail.
-    agent.turn.workflow.todos = latest_todos_from_history(&agent.history).unwrap_or_default();
+    agent.turn.workflow.todos = latest_todos_from_history(&agent.active_history_items()).unwrap_or_default();
     agent.turn.counters.validation_effects = 0;
     agent.turn.counters.failed_validation_effects = 0;
     agent.turn.counters.child_validation_effects = 0;
@@ -966,8 +962,8 @@ mod transaction_tests {
         let mut runtime_snapshot = agent
             .rebuilt_runtime_snapshot_from_protocol_frames(
                 &transcript.frames,
-                agent.protocol_frames.len(),
-                &agent.history,
+                agent.active_protocol_frames().len(),
+                &agent.active_history_items(),
             )
             .expect("candidate snapshot");
         merge_non_protocol_runtime_metadata(&mut runtime_snapshot, &agent.runtime_snapshot);
@@ -976,13 +972,10 @@ mod transaction_tests {
         runtime_snapshot
             .heal_references()
             .expect("candidate references");
-        let protocol_frames = runtime_snapshot.active_protocol_frames();
         PreparedCompaction {
             event: ContextCompactionEvent::succeeded_at("summary", Some("raw:2".into())),
             local_state: Some(PreparedLocalCompaction {
-                history,
                 current_turn_start_index: None,
-                protocol_frames,
                 runtime_snapshot,
             }),
         }
@@ -991,8 +984,8 @@ mod transaction_tests {
     #[tokio::test]
     async fn rejected_durable_compaction_does_not_change_live_history() {
         let mut agent = test_agent();
-        agent.history = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
-        let original = agent.history.clone();
+        let original = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
+        agent.replace_history(original.clone()).expect("seed history");
         let candidate = prepared(
             &agent,
             vec![
@@ -1010,13 +1003,15 @@ mod transaction_tests {
                 .await
                 .is_err()
         );
-        assert_eq!(agent.history, original);
+        assert_eq!(agent.history_for_test(), original);
     }
 
     #[tokio::test]
     async fn acknowledged_provider_compaction_reloads_the_canonical_projection() {
         let mut agent = test_agent();
-        agent.history = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
+        agent
+            .replace_history(vec![HistoryItem::user("old"), HistoryItem::assistant("reply")])
+            .expect("seed history");
         let expected = vec![HistoryItem::context_summary("persisted summary")];
         let mut projected = RuntimeSnapshot::new("main");
         projected.frames = protocol_frames_with_spans(&expected)
@@ -1050,13 +1045,15 @@ mod transaction_tests {
             .await
             .expect("durable acknowledgement reloads provider projection");
 
-        assert_eq!(agent.history, expected);
+        assert_eq!(agent.history_for_test(), expected);
     }
 
     #[tokio::test]
     async fn acknowledged_durable_compaction_installs_exact_candidate() {
         let mut agent = test_agent();
-        agent.history = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
+        agent
+            .replace_history(vec![HistoryItem::user("old"), HistoryItem::assistant("reply")])
+            .expect("seed history");
         let expected = vec![
             HistoryItem::context_summary("summary"),
             HistoryItem::assistant("reply"),
@@ -1077,7 +1074,7 @@ mod transaction_tests {
             .expect("durable acknowledgement installs candidate");
 
         assert!(acknowledged.load(Ordering::SeqCst));
-        assert_eq!(agent.history, expected);
+        assert_eq!(agent.history_for_test(), expected);
     }
 
     #[test]

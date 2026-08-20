@@ -649,7 +649,7 @@ where
     let mut recorder = transcript
         .lock()
         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
+    agent.restore_runtime_snapshot(snapshot.snapshot)?;
     agent.restore_turn_sequence(max_turn_id);
     sync_recorder_branch(&mut recorder, &branch_id);
     Ok(())
@@ -1905,7 +1905,7 @@ async fn run_engine_loop(
                         let resumed_event_branch_id = prepared.snapshot.branch_id.clone();
                         let resumed_event_messages =
                             crate::session::restore::restored_messages_from_protocol_frames(
-                                &prepared.snapshot.protocol_frames,
+                                &prepared.snapshot.snapshot.active_protocol_frames(),
                             );
                         let resumed_event_records = prepared.snapshot.records.clone();
                         let resumed_event_evidence_count = prepared.snapshot.snapshot.evidence.len();

@@ -131,16 +131,13 @@ pub fn install_prepared_new_session_for_agent<C: Config>(
     prepared: PreparedNewSession,
 ) -> Result<()> {
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
-    let (protocol_frames, runtime_snapshot) = agent.validate_runtime_snapshot_restore(
-        prepared.snapshot.protocol_frames,
-        prepared.snapshot.snapshot,
-    )?;
+    let runtime_snapshot =
+        agent.validate_runtime_snapshot_restore(prepared.snapshot.snapshot)?;
     agent.prepare_new_session_permission_reset()?;
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)?;
     agent.clear_session_reasoning_efforts();
     agent.install_new_session_runtime_snapshot(
-        protocol_frames,
         runtime_snapshot,
         prepared.snapshot.max_turn_id,
     );

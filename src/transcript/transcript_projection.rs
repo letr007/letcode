@@ -127,6 +127,7 @@ pub(crate) struct RuntimeRestoreSnapshot {
     #[allow(dead_code)] // Retained as part of the durable navigation cursor.
     pub leaf_sequence: u64,
     pub records: Vec<TranscriptRecord>,
+    #[allow(dead_code)] // Retained for serde-compatible runtime restore snapshots.
     pub protocol_frames: Vec<ProtocolFrame>,
     pub snapshot: RuntimeSnapshot,
     pub latest_model: Option<String>,

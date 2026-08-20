@@ -188,19 +188,18 @@ fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
 
 fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent<OpenAIConfig> {
     let mut agent = test_agent();
-    agent.history = history;
-    agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &agent.history);
+    agent.set_history_for_test(history.clone());
+    agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &history);
     agent.runtime_snapshot.current_turn_id = Some(1);
-    agent.protocol_frames = agent.runtime_snapshot.active_protocol_frames();
     agent.turn.turn_id = 1;
     agent
 }
 
 fn replace_active_epoch_history(agent: &mut Agent<OpenAIConfig>, history: Vec<HistoryItem>) {
-    agent.history = history;
-    agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &agent.history);
+    // Deliberately permissive: the owner may install protocol-invalid history
+    // (e.g. an orphan tool output) so later preview paths can reject it.
+    agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &history);
     agent.runtime_snapshot.current_turn_id = Some(agent.turn.turn_id);
-    agent.protocol_frames = agent.runtime_snapshot.active_protocol_frames();
 }
 
 fn active_epoch_tools() -> Vec<crate::request_builder::ToolSpec> {
@@ -315,12 +314,23 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
             .expect("cold preview");
         agent.commit_active_epoch(preview);
         let before = agent.active_epoch.clone();
-        if mutation == "mutated" {
-            agent.protocol_frames[0].item = ProtocolFrameItem::UserMessage {
-                content: crate::user_content::UserMessageContent::new("changed", Vec::new()),
-            };
-        } else {
-            agent.protocol_frames.clear();
+        // The epoch warm path reads protocol frames from the runtime snapshot
+        // (single source of truth), not the legacy cache. Simulate a non-append
+        // change by mutating the snapshot's active protocol stream directly.
+        for frame in agent.runtime_snapshot.frames.iter_mut() {
+            if frame.visibility == FrameVisibility::Active && frame.protocol.is_some() {
+                if mutation == "mutated" {
+                    frame.protocol = Some(ProtocolFrameItem::UserMessage {
+                        content: crate::user_content::UserMessageContent::new(
+                            "changed",
+                            Vec::new(),
+                        ),
+                    });
+                } else {
+                    frame.protocol = None;
+                }
+                break;
+            }
         }
         assert!(
             agent
@@ -352,7 +362,7 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
             .expect("cold preview");
         agent.commit_active_epoch(preview);
         let before = agent.active_epoch.clone();
-        let mut history = agent.history.clone();
+        let mut history = agent.history_for_test();
         history.push(item);
         replace_active_epoch_history(&mut agent, history);
         assert!(
@@ -426,7 +436,7 @@ fn active_epoch_resets_at_lifecycle_boundaries() {
         ActiveEpochTransition::Cold
     ));
 
-    let frames = agent.protocol_frames.clone();
+    let frames = agent.protocol_frames_for_test();
     let snapshot = agent.runtime_snapshot.clone();
     agent.commit_active_epoch(
         agent
@@ -434,7 +444,7 @@ fn active_epoch_resets_at_lifecycle_boundaries() {
             .expect("preview before restore"),
     );
     agent
-        .restore_runtime_snapshot(frames, snapshot)
+        .restore_runtime_snapshot(snapshot)
         .expect("restore succeeds");
     assert!(agent.active_epoch.is_none());
     assert!(matches!(
@@ -531,7 +541,7 @@ fn evidence_has_one_runtime_snapshot_authority_and_failed_candidates_are_atomic(
     ]);
     assert!(
         agent
-            .restore_runtime_snapshot(Vec::new(), invalid_restore)
+            .restore_runtime_snapshot(invalid_restore)
             .is_err()
     );
     assert_eq!(agent.runtime_snapshot.evidence, before);
@@ -1354,14 +1364,14 @@ async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() 
     .await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
     agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
-    let protected_start = agent.history.len();
+    let protected_start = agent.history_for_test().len();
     let prelude = agent.prepare_turn_prelude("current user");
     agent.turn.current_turn_start_index = Some(protected_start);
     agent
         .append_history_item(HistoryItem::user("current user"))
         .expect("stream path appends the current message");
-    let history = agent.history.clone();
-    let frames = agent.protocol_frames.clone();
+    let history = agent.history_for_test();
+    let frames = agent.protocol_frames_for_test();
     let snapshot = agent.runtime_snapshot.clone();
     let active_epoch = agent.active_epoch.clone();
     let start = agent.turn.current_turn_start_index;
@@ -1393,8 +1403,8 @@ async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() 
             .to_string()
             .contains("durable compaction callback failed")
     );
-    assert_eq!(agent.history, history);
-    assert_eq!(agent.protocol_frames, frames);
+    assert_eq!(agent.history_for_test(), history);
+    assert_eq!(agent.protocol_frames_for_test(), frames);
     assert_eq!(agent.runtime_snapshot, snapshot);
     assert_eq!(agent.active_epoch, active_epoch);
     assert_eq!(agent.turn.current_turn_start_index, start);
@@ -1427,9 +1437,7 @@ async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() 
     assert!(same_frontier.to_string().contains("already attempted"));
 
     let changed = HistoryItem::user("current user with changed frame identity");
-    agent.history[protected_start] = changed.clone();
     let changed_item = protocol_frame_item_from_history_item(&changed);
-    agent.protocol_frames[protected_start].item = changed_item.clone();
     agent.runtime_snapshot.frames[protected_start].protocol = Some(changed_item);
     let mut changed_frontier_callback = |_| std::future::ready(Ok(()));
     protocol_stream::prepare_canonical_protocol_stream_request_for_test(
@@ -1449,7 +1457,7 @@ async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() 
 #[tokio::test]
 async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback() {
     let mut agent = phase2_pressure_agent("http://127.0.0.1:1".into(), ApiProtocol::Responses);
-    let protected_start = agent.history.len();
+    let protected_start = agent.history_for_test().len();
     let prelude = agent.prepare_turn_prelude("current user");
     agent.turn.current_turn_start_index = Some(protected_start);
     agent
@@ -1466,7 +1474,7 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
             }],
         })
         .expect("incomplete current tool group is representable");
-    let history = agent.history.clone();
+    let history = agent.history_for_test();
     let mut events = Vec::new();
     let mut protected = protected_start;
     let tools = agent.tool_definitions();
@@ -1489,7 +1497,7 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
         error.to_string().contains("dangling assistant tool calls"),
         "unexpected pressure rejection: {error:#}"
     );
-    assert_eq!(agent.history, history, "group remains intact");
+    assert_eq!(agent.history_for_test(), history, "group remains intact");
     assert_eq!(
         events
             .iter()
@@ -1506,7 +1514,7 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
     )])
     .await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
-    let protected_start = agent.history.len();
+    let protected_start = agent.history_for_test().len();
     let prelude = agent.prepare_turn_prelude("oversized current user");
     agent.turn.current_turn_start_index = Some(protected_start);
     agent
@@ -1540,10 +1548,10 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
         "durably committed compaction remains installed even when the protected current message still exceeds budget"
     );
     assert!(matches!(
-        agent.history.first(),
+        agent.history_for_test().first(),
         Some(HistoryItem::ContextSummary { .. })
     ));
-    assert_eq!(agent.history.len(), 2);
+    assert_eq!(agent.history_for_test().len(), 2);
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
@@ -1767,8 +1775,8 @@ async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
     .expect("parallel reads should overlap")
     .expect("batch executes");
 
-    let outputs = agent
-        .history
+    let history = agent.history_for_test();
+    let outputs = history
         .iter()
         .filter_map(|item| match item {
             HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
@@ -2060,7 +2068,7 @@ fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
     let mut agent = test_agent();
     agent.register_tool(ReplayGuardTool(executions.clone()));
     agent
-        .restore_runtime_snapshot(projected.protocol_frames, projected.snapshot)
+        .restore_runtime_snapshot(projected.snapshot)
         .expect("restore persisted output");
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
@@ -2085,7 +2093,7 @@ fn evidence_ids_remain_unique_after_restoring_older_evidence_snapshot() {
     assert_ne!(first.id, second.id);
 
     agent
-        .restore_session_history(agent.history.clone(), older_snapshot, agent.next_turn_id)
+        .restore_session_history(agent.history_for_test(), older_snapshot, agent.next_turn_id)
         .expect("restore older evidence snapshot");
 
     let third = agent
@@ -2286,8 +2294,8 @@ async fn contiguous_different_role_subagents_overlap_and_reconcile_in_model_orde
         *started.lock().expect("started lock"),
         vec!["explorer", "fixer"]
     );
-    let outputs = agent
-        .history
+    let history = agent.history_for_test();
+    let outputs = history
         .iter()
         .filter_map(|item| match item {
             HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
@@ -2320,8 +2328,8 @@ async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
         .await
         .expect("calls execute");
 
-    let outputs = agent
-        .history
+    let history = agent.history_for_test();
+    let outputs = history
         .iter()
         .filter_map(|item| match item {
             HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
@@ -2481,7 +2489,7 @@ async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() 
 
     assert!(error.to_string().contains("agent__explore cancelled"));
     assert!(matches!(
-        agent.history.last(),
+        agent.history_for_test().last(),
         Some(HistoryItem::ToolOutput {
             call_id,
             output_json,
@@ -2723,7 +2731,7 @@ fn protocol_frames_remain_authoritative_for_history_cache() {
         .expect("tool output append succeeds");
 
     assert_eq!(
-        crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
+        crate::protocol_frames::history_items_from_frames(&agent.protocol_frames_for_test()),
         agent.history_for_test()
     );
     assert_eq!(
@@ -2792,6 +2800,69 @@ fn session_state_consistency_restore_three_way() {
     assert_three_way_protocol_consistency(&agent);
 }
 
+#[test]
+fn restore_rejects_snapshot_with_protocol_invalid_internal_stream() {
+    // RuntimeSnapshot is the single source of truth: restore must validate the
+    // snapshot's own active protocol stream, not some external frame list. A
+    // snapshot carrying an orphan tool output must be rejected outright.
+    let mut agent = test_agent();
+    let mut snapshot = RuntimeSnapshot::new("main");
+    snapshot.frames = runtime_frames_for_history(&[HistoryItem::ToolOutput {
+        call_id: "orphan".into(),
+        output_json: "{}".into(),
+        images: Vec::new(),
+    }]);
+    assert!(
+        agent.restore_runtime_snapshot(snapshot).is_err(),
+        "restore must reject a snapshot whose own active stream is invalid"
+    );
+}
+
+#[test]
+fn resume_clears_proc_local_identity_and_observation_state() {
+    let tools = active_epoch_tools();
+    let seed = || {
+        let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+        let preview = agent
+            .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .expect("cold preview");
+        agent.commit_active_epoch(preview.clone());
+        agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
+        agent.commit_final_logical_request(&preview.build);
+        agent
+    };
+
+    let mut agent = seed();
+    assert!(agent.active_epoch.is_some());
+    assert!(agent.provider_usage_anchor_for_test().is_some());
+    assert!(agent.has_set_logical_request_observation_for_test());
+
+    agent
+        .restore_session_history(vec![HistoryItem::user("seeded")], Vec::new(), 4)
+        .expect("restore session history");
+    assert!(agent.active_epoch.is_none(), "resume wipes active epoch");
+    assert!(
+        agent.provider_usage_anchor_for_test().is_none(),
+        "resume wipes provider usage anchor"
+    );
+    assert!(
+        !agent.has_set_logical_request_observation_for_test(),
+        "resume wipes logical request observation"
+    );
+
+    let mut agent = seed();
+    agent.reset_for_new_session();
+    assert!(agent.active_epoch.is_none(), "reset wipes active epoch");
+    assert!(
+        agent.provider_usage_anchor_for_test().is_none(),
+        "reset wipes provider usage anchor"
+    );
+    assert!(
+        !agent.has_set_logical_request_observation_for_test(),
+        "reset wipes logical request observation"
+    );
+}
+
 #[tokio::test]
 async fn session_state_consistency_after_manual_compaction_three_way() {
     let checkpoint = valid_checkpoint("continue validating the active request");
@@ -2816,7 +2887,7 @@ async fn session_state_consistency_after_manual_compaction_three_way() {
             HistoryItem::assistant("active work"),
         ])
         .expect("history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
     agent.turn.turn_id = 10;
     agent.turn.current_turn_start_index = Some(2);
     agent.runtime_snapshot.current_turn_id = Some(10);
@@ -2894,7 +2965,7 @@ fn session_state_consistency_journal_resume_three_way() {
 
     let mut agent = test_agent();
     agent
-        .restore_runtime_snapshot(projected.protocol_frames, projected.snapshot)
+        .restore_runtime_snapshot(projected.snapshot)
         .expect("restore runtime snapshot");
     assert_three_way_protocol_consistency(&agent);
 
@@ -2908,8 +2979,8 @@ fn append_history_item_is_atomic_when_protocol_validation_fails() {
         .append_history_item(HistoryItem::user("hello"))
         .expect("user append succeeds");
 
-    let history_before = agent.history.clone();
-    let frames_before = agent.protocol_frames.clone();
+    let history_before = agent.history_for_test();
+    let frames_before = agent.protocol_frames_for_test();
     let snapshot_before = agent.runtime_snapshot.clone();
 
     let error = agent
@@ -2921,8 +2992,8 @@ fn append_history_item_is_atomic_when_protocol_validation_fails() {
         .expect_err("orphan tool output must fail");
 
     assert!(error.to_string().contains("orphan tool output"));
-    assert_eq!(agent.history, history_before);
-    assert_eq!(agent.protocol_frames, frames_before);
+    assert_eq!(agent.history_for_test(), history_before);
+    assert_eq!(agent.protocol_frames_for_test(), frames_before);
     assert_eq!(agent.runtime_snapshot, snapshot_before);
 }
 
@@ -2958,8 +3029,8 @@ fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
         &[HistoryItem::user("target session")],
     );
     let model = agent.model.clone();
-    let history = agent.history.clone();
-    let protocol_frames = agent.protocol_frames.clone();
+    let history = agent.history_for_test();
+    let protocol_frames = agent.protocol_frames_for_test();
     let runtime_snapshot = agent.runtime_snapshot.clone();
     let turn_id = agent.current_turn_id();
     let next_turn_id = agent.next_turn_id;
@@ -2974,8 +3045,8 @@ fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
             .contains("effective_input_limit_tokens must be greater than 0")
     );
     assert_eq!(agent.model, model);
-    assert_eq!(agent.history, history);
-    assert_eq!(agent.protocol_frames, protocol_frames);
+    assert_eq!(agent.history_for_test(), history);
+    assert_eq!(agent.protocol_frames_for_test(), protocol_frames);
     assert_eq!(agent.runtime_snapshot, runtime_snapshot);
     assert_eq!(agent.current_turn_id(), turn_id);
     assert_eq!(agent.next_turn_id, next_turn_id);
@@ -3008,7 +3079,7 @@ fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
     }]);
 
     agent
-        .restore_runtime_snapshot(frames.clone(), snapshot.clone())
+        .restore_runtime_snapshot(snapshot.clone())
         .expect("restore runtime snapshot");
 
     assert_eq!(
@@ -3036,10 +3107,7 @@ fn new_session_reset_discards_restored_runtime_metadata() {
         .with_current_turn_id(7);
     snapshot.frames = runtime_frames_for_history(&history);
     agent
-        .restore_runtime_snapshot(
-            crate::protocol_frames::history_items_to_frames(&history),
-            snapshot,
-        )
+        .restore_runtime_snapshot(snapshot)
         .expect("restore runtime snapshot");
 
     agent.reset_for_new_session();
@@ -3091,7 +3159,7 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
             },
         ])
         .expect("active incomplete history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
     agent.turn.turn_id = 9;
     agent.turn.current_turn_start_index = Some(2);
     agent.runtime_snapshot.current_turn_id = Some(9);
@@ -3165,7 +3233,7 @@ async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_
             HistoryItem::assistant("active work"),
         ])
         .expect("history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
     agent.turn.turn_id = 10;
     agent.turn.current_turn_start_index = Some(2);
     agent.runtime_snapshot.current_turn_id = Some(10);
@@ -3219,7 +3287,7 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
     agent
         .replace_history(history.clone())
         .expect("active incomplete history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
     agent.turn.turn_id = 4;
     agent.turn.current_turn_start_index = Some(2);
     agent.runtime_snapshot.current_turn_id = Some(4);
@@ -3271,7 +3339,7 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
             HistoryItem::assistant("current answer"),
         ])
         .expect("history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
     agent.turn.current_turn_start_index = Some(2);
 
     let outcome = agent
@@ -3303,7 +3371,7 @@ async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
             HistoryItem::assistant("reply"),
         ])
         .expect("history replace succeeds");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
     let mut events = Vec::new();
 
     let error = agent
@@ -3416,7 +3484,7 @@ fn render_compaction_prompt_applies_total_history_cap() {
 #[tokio::test]
 async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
     let mut agent = test_agent();
-    agent.history = vec![HistoryItem::user("EXTERNAL-TRANSCRIPT-CONTENT")];
+    agent.set_history_for_test(vec![HistoryItem::user("EXTERNAL-TRANSCRIPT-CONTENT")]);
     agent.runtime_snapshot = runtime_snapshot_for_history(
         ROOT_CONTEXT_BRANCH_ID,
         &[HistoryItem::user("INSTALLED-RUNTIME-SNAPSHOT-CONTENT")],
@@ -3903,7 +3971,7 @@ data: [DONE]
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert!(
         agent
-            .history
+            .history_for_test()
             .iter()
             .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "partial"))
     );
@@ -3989,7 +4057,7 @@ data: [DONE]
     assert!(started_calls.is_empty());
     assert!(finished_calls.is_empty());
     assert_eq!(stream_issues, vec!["Model stream interrupted"]);
-    assert!(!agent.history.iter().any(|item| matches!(
+    assert!(!agent.history_for_test().iter().any(|item| matches!(
         item,
         HistoryItem::AssistantToolCalls { calls, .. }
             if calls.iter().any(|call| call.call_id == "call-interrupted")
@@ -4059,7 +4127,7 @@ data: [DONE]
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(
             !agent
-                .history
+                .history_for_test()
                 .iter()
                 .any(|item| matches!(item, HistoryItem::AssistantText { .. }))
         );
@@ -5543,7 +5611,7 @@ async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
 
     assert_eq!(human_approvals, 0);
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert!(agent.history.iter().any(|item| matches!(
+    assert!(agent.history_for_test().iter().any(|item| matches!(
         item,
         HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
     )));

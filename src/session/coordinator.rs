@@ -510,10 +510,9 @@ impl SessionCoordinator {
             let runtime_context =
                 crate::runtime_context::RuntimeActiveContext::try_from(&snapshot.snapshot)?;
             prepare_history(&snapshot)?;
-            let (protocol_frames, runtime_snapshot) = agent.validate_runtime_snapshot_restore(
-                snapshot.protocol_frames.clone(),
-                snapshot.snapshot.clone(),
-            )?;
+            let runtime_snapshot =
+                agent.validate_runtime_snapshot_restore(snapshot.snapshot.clone())?;
+            let protocol_frames = runtime_snapshot.active_protocol_frames();
             let route = prepare_restored_model_route(agent, snapshot.latest_model.as_deref())?;
             let fast_mode_model = route
                 .as_ref()
@@ -580,7 +579,7 @@ impl SessionCoordinator {
             )) => {
                 apply_prepared_restored_route(agent, route);
                 apply_restored_permission_mode(agent, snapshot.latest_permission_mode.as_deref());
-                agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
+                agent.install_validated_runtime_snapshot(runtime_snapshot);
                 agent.restore_turn_sequence(snapshot.max_turn_id);
                 if fast_mode_auto_disabled {
                     Self::emit_fast_mode_auto_disabled(event_tx);
@@ -590,7 +589,7 @@ impl SessionCoordinator {
                 let _ = event_tx.send(SessionTransportEvent::SessionResumed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
-                    messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
+                    messages: restored_messages_from_protocol_frames(&protocol_frames),
                     records: snapshot.records,
                     evidence_count: 0,
                     model_id: Some(agent.route_display_name()),

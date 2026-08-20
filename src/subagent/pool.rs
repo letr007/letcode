@@ -417,11 +417,8 @@ impl SubagentPool {
                     &[],
                 )?;
                 child_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
-                let (protocol_frames, runtime_snapshot) = child_agent
-                    .validate_runtime_snapshot_restore(
-                        snapshot.protocol_frames,
-                        snapshot.snapshot,
-                    )?;
+                let runtime_snapshot = child_agent
+                    .validate_runtime_snapshot_restore(snapshot.snapshot)?;
 
                 child_recorder.record_subagent_lifecycle(
                     run_id.clone(),
@@ -442,7 +439,7 @@ impl SubagentPool {
                     pool_ordinal,
                 )?;
 
-                child_agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
+                child_agent.install_validated_runtime_snapshot(runtime_snapshot);
                 child_agent.restore_turn_sequence(snapshot.max_turn_id);
 
                 Ok((

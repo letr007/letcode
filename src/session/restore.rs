@@ -158,7 +158,6 @@ pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
     prepared: &PreparedResume,
 ) -> Result<()> {
     agent.restore_new_session_runtime_snapshot(
-        prepared.snapshot.protocol_frames.clone(),
         prepared.snapshot.snapshot.clone(),
         prepared.snapshot.max_turn_id,
     )?;
@@ -317,11 +316,8 @@ pub fn install_prepared_routed_resume_for_agent(
             .map_err(|error| ResumeInstallError::new(error, false))?;
     let prepared_scope = prepare_context_scope(&prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, false))?;
-    let (protocol_frames, runtime_snapshot) = agent
-        .validate_runtime_snapshot_restore(
-            prepared.snapshot.protocol_frames.clone(),
-            prepared.snapshot.snapshot.clone(),
-        )
+    let runtime_snapshot = agent
+        .validate_runtime_snapshot_restore(prepared.snapshot.snapshot.clone())
         .map_err(|error| ResumeInstallError::new(error, false))?;
     let prepared_fast_mode_disable = agent
         .prepare_fast_mode_auto_disable(target_model)
@@ -338,7 +334,7 @@ pub fn install_prepared_routed_resume_for_agent(
     agent.clear_session_reasoning_efforts();
     apply_prepared_restored_route(agent, route);
     apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
-    agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
+    agent.install_validated_runtime_snapshot(runtime_snapshot);
     agent.restore_turn_sequence(prepared.snapshot.max_turn_id);
     apply_prepared_context_scope(agent, prepared_scope);
     let _ = cleanup_replaced_empty_session(old_path, &new_path);

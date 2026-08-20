@@ -1357,7 +1357,7 @@ fn interrupt_rehydrates_agent_from_transcript() {
     rehydrate_agent_from_transcript(&mut agent, &transcript).expect("rehydrate agent");
 
     assert!(matches!(
-        agent.history_for_test(),
+        &agent.history_for_test()[..],
         [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
             if content.text == "unfinished" && assistant_text.is_empty()
     ));
@@ -1390,7 +1390,7 @@ fn resumed_session_usage_uses_target_agent_and_drops_response_accounting() {
             .expect("prepare target usage");
 
     old_agent
-        .restore_new_session_runtime_snapshot(target_frames, target_snapshot.clone(), 2)
+        .restore_new_session_runtime_snapshot(target_snapshot.clone(), 2)
         .expect("install target session");
     old_agent.set_model("target-model");
     let resumed_usage =

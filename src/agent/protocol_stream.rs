@@ -373,9 +373,10 @@ where
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
 {
+    let frames = agent.active_protocol_frames();
     let frontier = PressureCompactionFrontier {
-        frame_count: agent.protocol_frames.len(),
-        protocol_prefix_digest: protocol_prefix_digest(&agent.protocol_frames),
+        frame_count: frames.len(),
+        protocol_prefix_digest: protocol_prefix_digest(&frames),
     };
     agent.turn.pressure_compaction.mark_attempted(frontier)?;
     // Consume the frontier before every fallible validation or selection step.
@@ -414,7 +415,7 @@ where
 {
     let turn_prelude =
         agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
-    let mut protected_start_index = agent.history.len();
+    let mut protected_start_index = agent.active_history_items().len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
     if let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content)) {
@@ -429,7 +430,7 @@ where
     .await;
     debug!(
         user_input_len = user_input.len(),
-        history_len = agent.history.len(),
+        history_len = agent.active_history_items().len(),
         "user message added to history"
     );
 
@@ -441,7 +442,7 @@ where
         agent.max_iterations,
         agent.max_tool_calls,
         user_input.chars().count(),
-        agent.history.len(),
+        agent.active_history_items().len(),
     );
     let mut final_text = String::new();
     let mut tool_call_count = 0;
@@ -463,7 +464,7 @@ where
         debug!(
             iteration,
             model = %agent.model,
-            history_len = agent.history.len(),
+            history_len = agent.active_history_items().len(),
             tool_call_count,
             max_tool_calls = agent.max_tool_calls,
             "creating streamed response"
@@ -1096,7 +1097,7 @@ where
 
             info!(
                 output_chars = final_text.chars().count(),
-                history_len = agent.history.len(),
+                history_len = agent.active_history_items().len(),
                 "final answer completed"
             );
 
@@ -1132,7 +1133,7 @@ where
             iteration,
             tool_calls = tool_calls.len(),
             tool_call_count,
-            history_len = agent.history.len(),
+            history_len = agent.active_history_items().len(),
             "response tool calls appended to history"
         );
 
@@ -1158,7 +1159,7 @@ where
         &result,
         tool_call_count,
         continuation_count,
-        agent.history.len(),
+        agent.active_history_items().len(),
     );
     agent.turn.pressure_compaction.reset_for_turn_end();
     result
@@ -1183,7 +1184,7 @@ where
 {
     let turn_prelude =
         agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
-    let mut protected_start_index = agent.history.len();
+    let mut protected_start_index = agent.active_history_items().len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
     if let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content)) {
@@ -1198,7 +1199,7 @@ where
     .await;
     debug!(
         user_input_len = user_input.len(),
-        history_len = agent.history.len(),
+        history_len = agent.active_history_items().len(),
         "user message added to history"
     );
 
@@ -1210,7 +1211,7 @@ where
         agent.max_iterations,
         agent.max_tool_calls,
         user_input.chars().count(),
-        agent.history.len(),
+        agent.active_history_items().len(),
     );
     let mut final_text = String::new();
     let mut tool_call_count = 0;
@@ -1232,7 +1233,7 @@ where
         debug!(
             iteration,
             model = %agent.model,
-            history_len = agent.history.len(),
+            history_len = agent.active_history_items().len(),
             tool_call_count,
             max_tool_calls = agent.max_tool_calls,
             "creating streamed chat completion"
@@ -1875,7 +1876,7 @@ where
 
                 info!(
                     output_chars = final_text.chars().count(),
-                    history_len = agent.history.len(),
+                    history_len = agent.active_history_items().len(),
                     "final chat completion answer completed"
                 );
 
@@ -1977,7 +1978,7 @@ where
         &result,
         tool_call_count,
         continuation_count,
-        agent.history.len(),
+        agent.active_history_items().len(),
     );
     agent.turn.pressure_compaction.reset_for_turn_end();
     result

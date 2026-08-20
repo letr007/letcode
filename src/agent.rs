@@ -583,8 +583,6 @@ pub struct Agent<C: Config> {
     model_catalog: HashMap<String, ModelRequestMetadata>,
     session_reasoning_efforts: HashMap<String, ModelReasoningEffort>,
     prelude: Vec<PromptMessage>,
-    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
-    history: Vec<HistoryItem>,
     runtime_snapshot: RuntimeSnapshot,
     tools: ToolRegistry,
     skill_registry: Option<Arc<SkillRegistry>>,
@@ -786,8 +784,6 @@ impl AgentFactory {
             model_catalog,
             session_reasoning_efforts: parent.session_reasoning_efforts.clone(),
             prelude,
-            protocol_frames: Vec::new(),
-            history: Vec::new(),
             runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&model),
             tools: parent.tools.scoped(template.tool_scope).without_tools(&[
                 tool_names::TOOL_MEMORY_RECALL,
@@ -855,22 +851,30 @@ impl<C: Config> Agent<C> {
         self.provider_usage_anchor = None;
     }
 
-    fn clear_invalid_provider_usage_anchor(&mut self) {
-        let valid = self.provider_usage_anchor.as_ref().is_some_and(|anchor| {
-            self.protocol_frames.len() >= anchor.protocol_frontier_count
-                && protocol_prefix_digest(&self.protocol_frames[..anchor.protocol_frontier_count])
-                    == anchor.protocol_prefix_digest
-        });
-        if !valid {
-            self.clear_provider_usage_anchor();
-        }
+    /// Proc-local state (process identities, baselines, cache-prefix adjacency)
+    /// must not bleed into a resumed read-model. Resume clears it wholesale.
+    fn clear_resume_proc_local(&mut self) {
+        self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
+        self.logical_request_observations = LogicalRequestObservationTracker::default();
+    }
+
+    /// Active protocol frames projected from the runtime snapshot (single source
+    /// of truth). Consumers must read protocol history here, not keep a mirror.
+    pub(super) fn active_protocol_frames(&self) -> Vec<crate::protocol_frames::ProtocolFrame> {
+        self.runtime_snapshot.active_protocol_frames()
+    }
+
+    pub(super) fn active_history_items(&self) -> Vec<HistoryItem> {
+        crate::protocol_frames::history_items_from_frames(&self.active_protocol_frames())
     }
 
     fn install_provider_usage_anchor(&mut self, usage: TokenUsageEstimate) {
+        let frames = self.active_protocol_frames();
         self.provider_usage_anchor = Some(ProviderUsageAnchor {
             usage,
-            protocol_frontier_count: self.protocol_frames.len(),
-            protocol_prefix_digest: protocol_prefix_digest(&self.protocol_frames),
+            protocol_frontier_count: frames.len(),
+            protocol_prefix_digest: protocol_prefix_digest(&frames),
         });
     }
 
@@ -878,14 +882,15 @@ impl<C: Config> Agent<C> {
     /// that provider response. A stale frontier deliberately fails open.
     pub(super) fn projected_token_usage(&self) -> Option<TokenUsageEstimate> {
         let anchor = self.provider_usage_anchor.as_ref()?;
-        if self.protocol_frames.len() < anchor.protocol_frontier_count
-            || protocol_prefix_digest(&self.protocol_frames[..anchor.protocol_frontier_count])
+        let frames = self.active_protocol_frames();
+        if frames.len() < anchor.protocol_frontier_count
+            || protocol_prefix_digest(&frames[..anchor.protocol_frontier_count])
                 != anchor.protocol_prefix_digest
         {
             return None;
         }
 
-        let trailing_tokens = self.protocol_frames[anchor.protocol_frontier_count..]
+        let trailing_tokens = frames[anchor.protocol_frontier_count..]
             .iter()
             .map(|frame| estimate_trailing_history_item_tokens(&frame.to_history_item()))
             .sum::<u64>();
@@ -906,7 +911,9 @@ impl<C: Config> Agent<C> {
         turn_prelude: &[PromptMessage],
         tools: &[crate::request_builder::ToolSpec],
     ) -> Result<ActiveEpochPreview> {
-        crate::protocol_frames::validate_history_items_complete(&self.history, None)?;
+        let history = self.active_history_items();
+        let frames = self.active_protocol_frames();
+        crate::protocol_frames::validate_history_items_complete(&history, None)?;
         let model = self.active_model_metadata();
         let frozen = self.turn.frozen_evidence.as_ref().map(|evidence| {
             crate::request_builder::FrozenEvidence {
@@ -954,15 +961,15 @@ impl<C: Config> Agent<C> {
         } else {
             let previous = self.active_epoch.as_ref().expect("warm epoch exists");
             ensure!(
-                self.protocol_frames.len() >= previous.protocol_frontier_count,
+                frames.len() >= previous.protocol_frontier_count,
                 "active epoch protocol prefix was truncated"
             );
             ensure!(
-                protocol_prefix_digest(&self.protocol_frames[..previous.protocol_frontier_count])
+                protocol_prefix_digest(&frames[..previous.protocol_frontier_count])
                     == previous.protocol_prefix_digest,
                 "active epoch protocol prefix was mutated or reordered"
             );
-            let suffix = &self.protocol_frames[previous.protocol_frontier_count..];
+            let suffix = &frames[previous.protocol_frontier_count..];
             crate::protocol_frames::validate_history_items_complete(
                 &crate::protocol_frames::history_items_from_frames(suffix),
                 None,
@@ -1036,8 +1043,8 @@ impl<C: Config> Agent<C> {
                 kernel_identity,
                 envelope_identity,
                 committed_plan,
-                protocol_frontier_count: self.protocol_frames.len(),
-                protocol_prefix_digest: protocol_prefix_digest(&self.protocol_frames),
+                protocol_frontier_count: frames.len(),
+                protocol_prefix_digest: protocol_prefix_digest(&frames),
                 observation,
             },
             #[cfg(test)]
@@ -1068,8 +1075,6 @@ impl<C: Config> Agent<C> {
             model_catalog: HashMap::new(),
             session_reasoning_efforts: HashMap::new(),
             prelude: default_agent_prelude(),
-            protocol_frames: vec![],
-            history: vec![],
             runtime_snapshot: Self::fresh_runtime_snapshot(&model),
             tools: ToolRegistry::default_tools(),
             skill_registry: None,
@@ -1232,7 +1237,10 @@ impl<C: Config> Agent<C> {
         if !self.anchored_override {
             return "anchored: off".to_string();
         }
-        format!("anchored: on ({})", anchored.phase(&self.history).as_str())
+        format!(
+            "anchored: on ({})",
+            anchored.phase(&self.active_history_items()).as_str()
+        )
     }
 
     pub fn set_anchored(&mut self, anchored: Option<AnchoredBootstrap>) -> Result<()> {
@@ -1626,18 +1634,19 @@ impl<C: Config> Agent<C> {
 
     #[allow(dead_code)]
     pub fn restore_transcript_messages(&mut self, messages: Vec<ConversationMessage>) {
-        self.history = messages
+        let history = messages
             .into_iter()
             .map(|message| match message.role {
                 ConversationRole::User => HistoryItem::user(message.content),
                 ConversationRole::Assistant => HistoryItem::assistant(message.content),
                 ConversationRole::Summary => HistoryItem::context_summary(message.content),
             })
-            .collect();
-        self.rebuild_protocol_state_from_history()
-            .expect("restored transcript messages should remain protocol-compatible");
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+            .collect::<Vec<_>>();
+        let frames = crate::protocol_frames::history_items_to_frames(&history);
+        self.runtime_snapshot =
+            self.rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
+                .expect("restored transcript messages should remain protocol-compatible");
+        self.clear_resume_proc_local();
     }
 
     #[allow(dead_code)]
@@ -1676,24 +1685,15 @@ impl<C: Config> Agent<C> {
         Self::validate_evidence_ids(&evidence)?;
 
         let transcript = crate::protocol_frames::analyze_history_items(&history, None)?;
-        let mut runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
-            &transcript.frames,
-            self.protocol_frames.len(),
-            &self.history,
-        )?;
+        let mut runtime_snapshot =
+            self.rebuilt_runtime_snapshot_from_protocol_frames(&transcript.frames, 0, &[])?;
         runtime_snapshot.current_turn_id = Some(max_turn_id);
         runtime_snapshot.set_evidence(evidence);
-        let protocol_frames = runtime_snapshot.active_protocol_frames();
-        let candidate_history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
-        crate::protocol_frames::analyze_history_items(&candidate_history, None)?;
 
-        self.protocol_frames = protocol_frames;
-        self.history = candidate_history;
         self.runtime_snapshot = runtime_snapshot;
         self.next_turn_id = max_turn_id;
         self.turn = TurnRuntimeState::default();
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+        self.clear_resume_proc_local();
         Ok(())
     }
 
@@ -1702,13 +1702,10 @@ impl<C: Config> Agent<C> {
     /// this deliberately does not preserve runtime snapshot metadata.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset_for_new_session(&mut self) {
-        self.protocol_frames.clear();
-        self.history.clear();
         self.runtime_snapshot = Self::fresh_runtime_snapshot(&self.model);
         self.turn = TurnRuntimeState::default();
         self.next_turn_id = 0;
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+        self.clear_resume_proc_local();
         if let Ok(mut permissions) = self.permission_session.lock() {
             permissions.clear_grants();
         }
@@ -1718,49 +1715,41 @@ impl<C: Config> Agent<C> {
     ///
     /// Callers that commit durable state must perform this validation before the
     /// commit, then use [`Self::install_validated_runtime_snapshot`] afterwards.
+    /// RuntimeSnapshot is the single source of truth: validate its own active
+    /// protocol stream, not some external frame list that the caller might
+    /// hand in but never install.
     pub fn validate_runtime_snapshot_restore(
         &self,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         mut runtime_snapshot: RuntimeSnapshot,
-    ) -> Result<(Vec<crate::protocol_frames::ProtocolFrame>, RuntimeSnapshot)> {
+    ) -> Result<RuntimeSnapshot> {
         reconcile_loaded_skill_material(&mut runtime_snapshot)?;
         Self::validate_evidence_ids(&runtime_snapshot.evidence)?;
 
-        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        let frames = runtime_snapshot.active_protocol_frames();
+        let history = crate::protocol_frames::history_items_from_frames(&frames);
         crate::protocol_frames::analyze_history_items(&history, None)?;
-        let protocol_frames = runtime_snapshot.active_protocol_frames();
         if runtime_snapshot.latest_model.is_none() {
             runtime_snapshot.latest_model = Some(self.model.clone());
         }
-        Ok((protocol_frames, runtime_snapshot))
+        Ok(runtime_snapshot)
     }
 
     /// Install a package previously accepted by
     /// [`Self::validate_runtime_snapshot_restore`]. This mutation is infallible.
     pub fn install_validated_runtime_snapshot(
         &mut self,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         runtime_snapshot: RuntimeSnapshot,
     ) {
-        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
         self.turn = TurnRuntimeState::default();
-        self.protocol_frames = protocol_frames;
-        self.history = history;
         self.runtime_snapshot = runtime_snapshot;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+        self.clear_resume_proc_local();
     }
 
-    pub fn restore_runtime_snapshot(
-        &mut self,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
-        runtime_snapshot: RuntimeSnapshot,
-    ) -> Result<()> {
-        let (protocol_frames, runtime_snapshot) =
-            self.validate_runtime_snapshot_restore(protocol_frames, runtime_snapshot)?;
-        self.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
+    pub fn restore_runtime_snapshot(&mut self, runtime_snapshot: RuntimeSnapshot) -> Result<()> {
+        let runtime_snapshot = self.validate_runtime_snapshot_restore(runtime_snapshot)?;
+        self.install_validated_runtime_snapshot(runtime_snapshot);
         Ok(())
     }
 
@@ -1773,14 +1762,12 @@ impl<C: Config> Agent<C> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn restore_new_session_runtime_snapshot(
         &mut self,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         runtime_snapshot: RuntimeSnapshot,
         max_turn_id: u64,
     ) -> Result<()> {
-        let (protocol_frames, runtime_snapshot) =
-            self.validate_runtime_snapshot_restore(protocol_frames, runtime_snapshot)?;
+        let runtime_snapshot = self.validate_runtime_snapshot_restore(runtime_snapshot)?;
         self.prepare_new_session_permission_reset()?;
-        self.install_new_session_runtime_snapshot(protocol_frames, runtime_snapshot, max_turn_id);
+        self.install_new_session_runtime_snapshot(runtime_snapshot, max_turn_id);
         Ok(())
     }
 
@@ -1795,11 +1782,10 @@ impl<C: Config> Agent<C> {
 
     pub(crate) fn install_new_session_runtime_snapshot(
         &mut self,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         runtime_snapshot: RuntimeSnapshot,
         max_turn_id: u64,
     ) {
-        self.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
+        self.install_validated_runtime_snapshot(runtime_snapshot);
         self.permission_session
             .lock()
             .expect("permission session was validated before new-session install")
@@ -1828,18 +1814,23 @@ impl<C: Config> Agent<C> {
     }
 
     #[cfg(test)]
+    pub(crate) fn has_set_logical_request_observation_for_test(&self) -> bool {
+        self.logical_request_observations.previous.is_some()
+    }
+
+    #[cfg(test)]
     pub(crate) fn runtime_snapshot_for_test(&self) -> &RuntimeSnapshot {
         &self.runtime_snapshot
     }
 
     #[cfg(test)]
-    pub(crate) fn history_for_test(&self) -> &[HistoryItem] {
-        &self.history
+    pub(crate) fn history_for_test(&self) -> Vec<HistoryItem> {
+        self.active_history_items()
     }
 
     #[cfg(test)]
-    pub(crate) fn protocol_frames_for_test(&self) -> &[crate::protocol_frames::ProtocolFrame] {
-        &self.protocol_frames
+    pub(crate) fn protocol_frames_for_test(&self) -> Vec<crate::protocol_frames::ProtocolFrame> {
+        self.active_protocol_frames()
     }
 
     #[allow(dead_code)]
@@ -1980,155 +1971,13 @@ impl<C: Config> Agent<C> {
         });
         let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
 
-        self.protocol_frames = protocol_frames;
-        self.history = history;
         self.runtime_snapshot = snapshot;
         self.turn.current_turn_start_index = current_turn_start_index;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+        self.clear_resume_proc_local();
         Ok(())
     }
 
-    pub(super) fn refresh_runtime_snapshot_from_provider(&mut self) -> Result<()> {
-        let Some(provider) = &self.runtime_snapshot_provider else {
-            return Ok(());
-        };
-        let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
-        Self::validate_evidence_ids(&projected.evidence)?;
-
-        // Roles after refresh:
-        // - transcript projection: non-protocol surfaces + transcript provenance/spans
-        // - history: sole live protocol *payload* authority
-        // - runtime_snapshot: meta from transcript + protocol mirror of history
-        //
-        // First-exposure admission keys folded aggregates by journal sequence on
-        // the tool-output frame. Live frames often carry agent-local sequence
-        // numbers; if we keep those spans while adopting projected context_view
-        // (journal sequences), oversized tool results fail admission. Prefer
-        // projected structure/provenance, then rebind payloads from history.
-        let live_protocol = self.runtime_snapshot.active_protocol_frames();
-        let projected_protocol = projected.active_protocol_frames();
-        if projected_protocol.len() == self.history.len()
-            && projected_protocol.len() == live_protocol.len()
-            && !live_protocol.is_empty()
-        {
-            let provider_id_remap = projected_protocol
-                .iter()
-                .zip(&live_protocol)
-                .filter_map(|(provider_frame, live_frame)| {
-                    Some((
-                        provider_frame.runtime_frame_id?,
-                        live_frame.runtime_frame_id?,
-                    ))
-                })
-                .collect::<HashMap<_, _>>();
-            if provider_id_remap.len() == live_protocol.len() {
-                remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
-            }
-
-            // Preserve live-only non-protocol frames (no protocol payload).
-            let mut seen = projected
-                .frames
-                .iter()
-                .map(|frame| frame.id)
-                .collect::<HashSet<_>>();
-            for frame in &self.runtime_snapshot.frames {
-                if frame.protocol.is_none() && seen.insert(frame.id) {
-                    projected.frames.push(frame.clone());
-                }
-            }
-            if projected.child_sessions.is_empty() {
-                projected.child_sessions = self.runtime_snapshot.child_sessions.clone();
-            }
-            if projected.prompt_contributors.is_empty() {
-                projected.prompt_contributors = self.runtime_snapshot.prompt_contributors.clone();
-            }
-            // Keep any live retirement bookkeeping that the projection has not
-            // yet observed (e.g. compact installed before journal callback).
-            projected.compaction.retired_source_spans.extend(
-                self.runtime_snapshot
-                    .compaction
-                    .retired_source_spans
-                    .iter()
-                    .copied(),
-            );
-            projected.compaction.retired_source_spans = merge_runtime_source_spans(
-                projected.compaction.retired_source_spans.iter().copied(),
-            );
-            projected.compaction.compacted_frame_ids.extend(
-                self.runtime_snapshot
-                    .compaction
-                    .compacted_frame_ids
-                    .iter()
-                    .copied(),
-            );
-            projected.compaction.compacted_frame_ids.sort();
-            projected.compaction.compacted_frame_ids.dedup();
-            // Carry live turn protection into the refreshed snapshot.
-            projected.compaction.explicit_protected_frame_ids = self
-                .runtime_snapshot
-                .compaction
-                .explicit_protected_frame_ids
-                .clone();
-            projected.recompute_protected_frame_ids();
-
-            rebind_active_protocol_from_history(&mut projected, &self.history)?;
-            reconcile_loaded_skill_material(&mut projected)?;
-            projected.heal_references()?;
-            self.runtime_snapshot = projected;
-            self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-            self.clear_invalid_provider_usage_anchor();
-            return Ok(());
-        }
-
-        // Length mismatch: keep live protocol structure; adopt projected meta only.
-        let mut next = self.runtime_snapshot.clone();
-        next.context_view = projected.context_view.clone();
-        next.context_tree = projected.context_tree.clone();
-        next.evidence = projected.evidence.clone();
-        next.active_context = projected.active_context.clone();
-        next.child_sessions = if projected.child_sessions.is_empty() {
-            next.child_sessions
-        } else {
-            projected.child_sessions
-        };
-        next.prompt_contributors = if projected.prompt_contributors.is_empty() {
-            next.prompt_contributors
-        } else {
-            projected.prompt_contributors
-        };
-        next.leaf_sequence = projected.leaf_sequence.or(next.leaf_sequence);
-        next.latest_model = projected.latest_model.clone().or(next.latest_model.clone());
-        next.session_id = projected.session_id.clone().or(next.session_id.clone());
-        next.compaction
-            .retired_source_spans
-            .extend(projected.compaction.retired_source_spans.iter().copied());
-        next.compaction.retired_source_spans =
-            merge_runtime_source_spans(next.compaction.retired_source_spans.iter().copied());
-        next.compaction
-            .compacted_frame_ids
-            .extend(projected.compaction.compacted_frame_ids.iter().copied());
-        next.compaction.compacted_frame_ids.sort();
-        next.compaction.compacted_frame_ids.dedup();
-        let mut seen = next
-            .frames
-            .iter()
-            .map(|frame| frame.id)
-            .collect::<HashSet<_>>();
-        for frame in &projected.frames {
-            if frame.protocol.is_none() && seen.insert(frame.id) {
-                next.frames.push(frame.clone());
-            }
-        }
-        next.recompute_protected_frame_ids();
-        reconcile_loaded_skill_material(&mut next)?;
-        next.heal_references()?;
-        self.runtime_snapshot = next;
-        self.publish_history_to_protocol_mirrors()?;
-        self.clear_invalid_provider_usage_anchor();
-        Ok(())
-    }
 
     /// Replace the active runtime with the provider's canonical projection.
     /// Unlike refresh, a context scope transition must not retain frames,
@@ -2151,23 +2000,29 @@ impl<C: Config> Agent<C> {
         let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
 
         self.turn = TurnRuntimeState::default();
-        self.protocol_frames = protocol_frames;
-        self.history = history;
         self.runtime_snapshot = snapshot;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+        self.clear_resume_proc_local();
         Ok(())
     }
 
     #[cfg(test)]
     pub(super) fn history_items(&self) -> Vec<HistoryItem> {
-        crate::protocol_frames::history_items_from_frames(&self.protocol_frames)
+        self.active_history_items()
+    }
+
+    /// Test-only seed that installs a history as the live snapshot authority.
+    #[cfg(test)]
+    pub(crate) fn set_history_for_test(&mut self, history: Vec<HistoryItem>) {
+        let frames = crate::protocol_frames::history_items_to_frames(&history);
+        self.runtime_snapshot = self
+            .rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
+            .expect("test-seeded history is protocol compatible");
     }
 
     pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
-        // History is the protocol authority. Mirrors (protocol_frames + snapshot
-        // protocol payloads) are updated from this write, never the reverse.
+        // RuntimeSnapshot is the single source of truth. Append via a derived
+        // ProtocolFrame and rebuild the snapshot, preserving frame identity.
         let mut frame = crate::protocol_frames::ProtocolFrame::derived(
             protocol_frame_item_from_history_item(&item),
         );
@@ -2175,195 +2030,54 @@ impl<C: Config> Agent<C> {
             &frame.item,
             next_protocol_source_sequence(self),
         ));
-        self.append_protocol_frame_with_history_item(frame, item)
+        self.append_protocol_frame_to_snapshot(frame, item)
     }
 
     #[cfg(test)]
     pub(super) fn replace_history(&mut self, history: Vec<HistoryItem>) -> Result<()> {
-        let old_history = self.history.clone();
-        let transcript = crate::protocol_frames::analyze_history_items(
+        crate::protocol_frames::analyze_history_items(
             &history,
             self.turn.current_turn_start_index,
         )?;
-        let previous_protocol_frame_count = self.protocol_frames.len();
-        let protocol_frames = transcript.frames;
-        let runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
-            &protocol_frames,
-            previous_protocol_frame_count,
-            &old_history,
-        )?;
-        self.history = history;
-        self.protocol_frames = protocol_frames;
-        self.runtime_snapshot = runtime_snapshot;
-        sync_protocol_frame_provenance_from_snapshot(
-            &mut self.protocol_frames,
-            &self.runtime_snapshot,
-        );
-        self.clear_active_epoch();
-        self.clear_provider_usage_anchor();
+        let frames = crate::protocol_frames::history_items_to_frames(&history);
+        self.runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])?;
+        self.clear_resume_proc_local();
         Ok(())
     }
 
-    /// Publish live `history` into the two protocol mirrors:
-    /// `protocol_frames` (cache) and `runtime_snapshot` (protocol payload only).
-    /// Non-protocol snapshot metadata is preserved. This is the only forward
-    /// direction: history → mirrors. Provider refresh must not reverse it.
-    pub(super) fn publish_history_to_protocol_mirrors(&mut self) -> Result<()> {
-        crate::protocol_frames::analyze_history_items(
-            &self.history,
-            self.turn.current_turn_start_index,
-        )?;
-
-        // Primary path: snapshot structure is already correct (compact install,
-        // prune, refresh). Only rewrite active protocol payloads from history
-        // and refresh the protocol_frames cache. Never rebuild frame shells here
-        // when active length already matches — rebuild resurrects retired frames.
-        if self.runtime_snapshot.active_protocol_frames().len() == self.history.len() {
-            rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
-            self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-            self.runtime_snapshot.heal_references()?;
-            return Ok(());
-        }
-
-        // Structural rebuild for paths that changed history length without a
-        // pre-built snapshot (e.g. replace_history helpers that call publish).
-        let previous_count = self.protocol_frames.len();
-        let old_history_for_identity =
-            crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
-        let transcript = crate::protocol_frames::analyze_history_items(
-            &self.history,
-            self.turn.current_turn_start_index,
-        )?;
-        self.protocol_frames = transcript.frames;
-        let mut merged = self.rebuilt_runtime_snapshot_from_protocol_frames(
-            &self.protocol_frames,
-            previous_count,
-            &old_history_for_identity,
-        )?;
-        merge_non_protocol_runtime_metadata(&mut merged, &self.runtime_snapshot);
-        rebind_active_protocol_from_history(&mut merged, &self.history)?;
-        self.runtime_snapshot = merged;
-        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        self.runtime_snapshot.heal_references()?;
-        Ok(())
-    }
-
-    /// Seed protocol mirrors from a snapshot that was constructed as the
-    /// protocol source (tests / restore helpers). Prefer
-    /// `publish_history_to_protocol_mirrors` for normal live paths.
+    /// Snapshot is authoritative; just validate the active stream and heal.
     #[cfg(test)]
     pub(super) fn adopt_snapshot_as_history_seed(&mut self) -> Result<()> {
-        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
         crate::protocol_frames::analyze_history_items(
-            &self.history,
+            &self.active_history_items(),
             self.turn.current_turn_start_index,
         )?;
-        // Snapshot already holds structure; rebind payloads from the seeded history.
-        rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
-        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
         self.runtime_snapshot.heal_references()?;
         self.clear_provider_usage_anchor();
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(super) fn append_protocol_frame(
-        &mut self,
-        frame: crate::protocol_frames::ProtocolFrame,
-    ) -> Result<()> {
-        let item = frame.to_history_item();
-        self.append_protocol_frame_with_history_item(frame, item)
-    }
-
-    fn append_protocol_frame_with_history_item(
+    /// Append a derived protocol frame directly into the runtime snapshot (the
+    /// single source of truth). Validates the candidate stream, then rebuilds the
+    /// snapshot while preserving frame identity/provenance.
+    fn append_protocol_frame_to_snapshot(
         &mut self,
         mut frame: crate::protocol_frames::ProtocolFrame,
         item: HistoryItem,
     ) -> Result<()> {
         self.ensure_protocol_frame_append_allowed(&frame.item)?;
-        // Keep payload identity with the history item being installed.
-        frame.item = protocol_frame_item_from_history_item(&item);
-        frame.history_index = self.history.len();
-
-        let mut candidate_history = self.history.clone();
-        candidate_history.push(item);
+        let mut active = self.runtime_snapshot.active_protocol_frames();
+        let mut candidate_history = crate::protocol_frames::history_items_from_frames(&active);
+        candidate_history.push(item.clone());
         crate::protocol_frames::analyze_history_items(
             &candidate_history,
             self.turn.current_turn_start_index,
         )?;
-
-        let mut candidate_frames = self.protocol_frames.clone();
-        candidate_frames.push(frame);
-        self.validate_protocol_frames_candidate(&candidate_frames)?;
-
-        let previous_history = std::mem::replace(&mut self.history, candidate_history);
-        let previous_frames = std::mem::replace(&mut self.protocol_frames, candidate_frames);
-        let previous_snapshot = self.runtime_snapshot.clone();
-        if let Err(error) = self.mirror_protocol_after_history_append(previous_frames.len()) {
-            self.history = previous_history;
-            self.protocol_frames = previous_frames;
-            self.runtime_snapshot = previous_snapshot;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// After history+protocol_frames grew by one (or more) items, rebuild the
-    /// runtime protocol mirror while preserving durable frame identity.
-    fn mirror_protocol_after_history_append(
-        &mut self,
-        previous_protocol_frame_count: usize,
-    ) -> Result<()> {
-        let old_history_for_identity = if previous_protocol_frame_count == 0 {
-            Vec::new()
-        } else {
-            self.history
-                .iter()
-                .take(previous_protocol_frame_count.min(self.history.len().saturating_sub(1)))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        // Use full previous history when we only appended one item.
-        let old_history = if self.history.len() == previous_protocol_frame_count + 1 {
-            self.history[..previous_protocol_frame_count].to_vec()
-        } else {
-            old_history_for_identity
-        };
-        let mut snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
-            &self.protocol_frames,
-            previous_protocol_frame_count,
-            &old_history,
-        )?;
-        rebind_active_protocol_from_history(&mut snapshot, &self.history)?;
-        merge_non_protocol_runtime_metadata(&mut snapshot, &self.runtime_snapshot);
-        snapshot.heal_references()?;
-        self.runtime_snapshot = snapshot;
-        sync_protocol_frame_provenance_from_snapshot(
-            &mut self.protocol_frames,
-            &self.runtime_snapshot,
-        );
-        // Align cache ids/payloads with the rebound snapshot active stream.
-        let active = self.runtime_snapshot.active_protocol_frames();
-        ensure!(
-            active.len() == self.history.len(),
-            "mirrored protocol length {} does not match history {}",
-            active.len(),
-            self.history.len()
-        );
-        self.protocol_frames = active;
-        Ok(())
-    }
-
-    fn validate_protocol_frames_candidate(
-        &self,
-        frames: &[crate::protocol_frames::ProtocolFrame],
-    ) -> Result<()> {
-        let history = crate::protocol_frames::history_items_from_frames(frames);
-        crate::protocol_frames::analyze_history_items(
-            &history,
-            self.turn.current_turn_start_index,
-        )?;
+        frame.item = protocol_frame_item_from_history_item(&item);
+        frame.history_index = active.len();
+        active.push(frame);
+        self.runtime_snapshot =
+            self.rebuilt_runtime_snapshot_from_protocol_frames(&active, 0, &[])?;
         Ok(())
     }
 
@@ -2372,7 +2086,7 @@ impl<C: Config> Agent<C> {
         next_item: &crate::protocol_frames::ProtocolFrameItem,
     ) -> Result<()> {
         let transcript = crate::protocol_frames::analyze_history_items(
-            &self.history,
+            &self.active_history_items(),
             self.turn.current_turn_start_index,
         )?;
         if transcript.has_incomplete_tool_call_groups()
@@ -2386,40 +2100,6 @@ impl<C: Config> Agent<C> {
                 next_item
             );
         }
-        Ok(())
-    }
-
-    fn rebuild_protocol_state_from_history(&mut self) -> Result<()> {
-        let transcript = crate::protocol_frames::analyze_history_items(
-            &self.history,
-            self.turn.current_turn_start_index,
-        )?;
-        let previous_protocol_frame_count = self.protocol_frames.len();
-        self.protocol_frames = transcript.frames;
-        self.refresh_history_cache_from_protocol_frames(previous_protocol_frame_count)?;
-        self.validate_protocol_frames()?;
-        self.clear_provider_usage_anchor();
-        Ok(())
-    }
-
-    fn refresh_history_cache_from_protocol_frames(
-        &mut self,
-        previous_protocol_frame_count: usize,
-    ) -> Result<()> {
-        // Compatibility entry: protocol_frames already updated; history must match.
-        // Prefer history authority when lengths already agree; otherwise adopt
-        // frames into history once (structural repair) then mirror.
-        if self.history.len() != self.protocol_frames.len() {
-            self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
-        }
-        self.mirror_protocol_after_history_append(previous_protocol_frame_count)
-    }
-
-    fn validate_protocol_frames(&self) -> Result<()> {
-        crate::protocol_frames::analyze_history_items(
-            &self.history,
-            self.turn.current_turn_start_index,
-        )?;
         Ok(())
     }
 
@@ -2551,8 +2231,6 @@ impl<C: Config> Agent<C> {
             model_catalog: self.model_catalog.clone(),
             session_reasoning_efforts: self.session_reasoning_efforts.clone(),
             prelude: vec![PromptMessage::developer(SESSION_TITLE_PRELUDE)],
-            protocol_frames: Vec::new(),
-            history: Vec::new(),
             runtime_snapshot: Self::fresh_runtime_snapshot(&self.model),
             tools: ToolRegistry::new(),
             skill_registry: None,
@@ -2838,9 +2516,9 @@ impl<C: Config> Agent<C> {
         {
             let phase = if model_id == self.model {
                 self.anchored_request_phase
-                    .unwrap_or_else(|| anchored.phase(&self.history))
+                    .unwrap_or_else(|| anchored.phase(&self.active_history_items()))
             } else {
-                anchored.phase(&self.history)
+                anchored.phase(&self.active_history_items())
             };
             specs = anchored.tool_catalog(&phase, specs);
         }
@@ -3179,7 +2857,7 @@ impl<C: Config> Agent<C> {
         }
 
         debug!(
-            history_len = self.history.len(),
+            history_len = self.active_history_items().len(),
             "tool output appended to history"
         );
 
@@ -3309,7 +2987,7 @@ impl<C: Config> Agent<C> {
             && anchored.enabled_for(&self.model)
             && self.anchored_override
         {
-            let phase = anchored.phase(&self.history);
+            let phase = anchored.phase(&self.active_history_items());
             self.anchored_request_phase = Some(phase);
             return Ok(anchored.prelude(
                 &phase,
@@ -3565,9 +3243,9 @@ impl<C: Config> Agent<C> {
         self.turn.current_turn_start_index = None;
         self.runtime_snapshot.current_turn_id = None;
         self.runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
-            &self.protocol_frames,
-            self.protocol_frames.len(),
-            &self.history,
+            &self.active_protocol_frames(),
+            self.active_protocol_frames().len(),
+            &self.active_history_items(),
         )?;
         self.runtime_snapshot.current_turn_id = None;
         self.clear_active_epoch();
@@ -4251,7 +3929,7 @@ fn next_protocol_source_sequence<C: Config>(agent: &Agent<C>) -> u64 {
         .frames
         .iter()
         .filter_map(|frame| frame.provenance.source_span.map(|span| span.end_sequence))
-        .chain(agent.protocol_frames.iter().filter_map(|frame| {
+        .chain(agent.active_protocol_frames().iter().filter_map(|frame| {
             frame
                 .source_provenance
                 .as_ref()
@@ -4270,34 +3948,6 @@ fn next_protocol_source_sequence<C: Config>(agent: &Agent<C>) -> u64 {
 /// Synthetic spans are only assigned when producers left `None`. They never
 /// overwrite an existing transcript coordinate. ContextSummary anchors may remain
 /// spannable-optional because they are selection base markers, not retired bodies.
-pub(super) fn sync_protocol_frame_provenance_from_snapshot(
-    protocol_frames: &mut [crate::protocol_frames::ProtocolFrame],
-    snapshot: &RuntimeSnapshot,
-) {
-    for (frame, projected) in protocol_frames
-        .iter_mut()
-        .zip(snapshot.active_protocol_frames())
-    {
-        if frame.runtime_frame_id.is_none() {
-            frame.runtime_frame_id = projected.runtime_frame_id;
-        }
-        if frame.source_provenance.is_none() {
-            frame.source_provenance = projected.source_provenance.clone();
-            continue;
-        }
-        if let (Some(cached), Some(healed)) = (
-            frame.source_provenance.as_mut(),
-            projected.source_provenance.as_ref(),
-        ) && cached.source_span.is_none()
-        {
-            cached.source_span = healed.source_span;
-            if cached.source == RuntimeSource::Derived {
-                cached.source = healed.source;
-            }
-        }
-    }
-}
-
 pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot) {
     let mut high = snapshot
         .frames
@@ -4399,58 +4049,6 @@ pub(super) fn rebind_active_protocol_from_history(
         }
     }
     Ok(())
-}
-
-fn remap_runtime_snapshot_frame_ids(
-    snapshot: &mut RuntimeSnapshot,
-    remap: &HashMap<crate::runtime_context::RuntimeFrameId, crate::runtime_context::RuntimeFrameId>,
-) {
-    for frame in &mut snapshot.frames {
-        if let Some(id) = remap.get(&frame.id) {
-            frame.id = *id;
-        }
-    }
-    for id in snapshot
-        .compaction
-        .protected_frame_ids
-        .iter_mut()
-        .chain(snapshot.compaction.explicit_protected_frame_ids.iter_mut())
-        .chain(snapshot.compaction.turn_protected_frame_ids.iter_mut())
-        .chain(snapshot.compaction.compacted_frame_ids.iter_mut())
-        .chain(
-            snapshot
-                .prompt_contributors
-                .iter_mut()
-                .flat_map(|contributor| {
-                    contributor
-                        .frame_ids
-                        .iter_mut()
-                        .chain(contributor.source_frame_ids.iter_mut())
-                }),
-        )
-    {
-        if let Some(mapped) = remap.get(id) {
-            *id = *mapped;
-        }
-    }
-}
-
-fn merge_runtime_source_spans(
-    spans: impl IntoIterator<Item = crate::runtime_context::SourceSpan>,
-) -> Vec<crate::runtime_context::SourceSpan> {
-    let mut spans = spans.into_iter().collect::<Vec<_>>();
-    spans.sort();
-    let mut merged: Vec<crate::runtime_context::SourceSpan> = Vec::new();
-    for span in spans {
-        if let Some(last) = merged.last_mut()
-            && span.start_sequence <= last.end_sequence.saturating_add(1)
-        {
-            last.end_sequence = last.end_sequence.max(span.end_sequence);
-        } else {
-            merged.push(span);
-        }
-    }
-    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
