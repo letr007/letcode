@@ -114,6 +114,8 @@ pub fn render_picker(
             DialogKind::McpPicker | DialogKind::McpToolsPicker
         ) {
             render_mcp_picker_footer(frame, footer_area, theme, state, dialog.kind.clone());
+        } else if matches!(dialog.kind, DialogKind::ExpertModelPicker(_)) {
+            render_expert_model_picker_footer(frame, footer_area, theme, state);
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
@@ -248,7 +250,7 @@ fn render_picker_body(
                         render_session_row(frame, row, theme, item, selected, None)
                     }
                     DialogKind::ExpertModelPicker(_) => {
-                        render_model_row(frame, row, theme, item, selected, false)
+                        render_model_row(frame, row, theme, item, selected, item.checked)
                     }
                     DialogKind::SessionPicker
                     | DialogKind::HistoryTree
@@ -345,6 +347,28 @@ fn render_picker_body(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+fn render_expert_model_picker_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+) {
+    let spans = vec![
+        Span::styled("Space", accent_style(theme)),
+        Span::styled(format!(" {}", state.t("ui.toggle")), muted_style(theme)),
+        Span::styled("  ·  ", muted_style(theme)),
+        Span::styled("Enter", accent_style(theme)),
+        Span::styled(format!(" {}", state.t("ui.confirm")), muted_style(theme)),
+        Span::styled("  ·  ", muted_style(theme)),
+        Span::styled("Esc", accent_style(theme)),
+        Span::styled(format!(" {}", state.t("ui.back")), muted_style(theme)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
+        area,
+    );
 }
 
 fn render_mcp_picker_footer(
@@ -642,7 +666,13 @@ fn render_model_row(
         return;
     }
 
-    let marker = if current { "● " } else { "  " };
+    let marker = if current {
+        "● "
+    } else if item.checked {
+        "✓ "
+    } else {
+        "  "
+    };
     let mut spans = vec![Span::styled(marker, row_style)];
     spans.push(Span::styled(item.label.clone(), row_style));
 

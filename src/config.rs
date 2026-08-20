@@ -49,7 +49,8 @@ mod persistence;
 use persistence::acquire_config_read_lock;
 #[allow(unused_imports)]
 pub use persistence::{
-    persist_expert_model_route, persist_mcp_server_enabled, persist_primary_model_route,
+    persist_expert_allowed_models, persist_expert_model_route, persist_mcp_server_enabled,
+    persist_primary_model_route,
 };
 
 #[allow(dead_code)]
@@ -1824,6 +1825,15 @@ model = "shared"
             .expect("persist primary route");
         persist_expert_model_route(&path, "explorer", &ModelRoute::new("primary", "shared"))
             .expect("persist expert route");
+        persist_expert_allowed_models(
+            &path,
+            "explorer",
+            &[
+                ModelRoute::new("primary", "old"),
+                ModelRoute::new("expert", "shared"),
+            ],
+        )
+        .expect("persist expert allowed models");
 
         let written = fs::read_to_string(&path).expect("read updated config");
         assert!(written.contains("# keep this comment"));
@@ -1834,6 +1844,16 @@ model = "shared"
         assert_eq!(
             config.model_route_for("explorer"),
             Some(&ModelRoute::new("primary", "shared"))
+        );
+        assert_eq!(
+            config.agents.allowed_models_for("explorer"),
+            Some(
+                [
+                    ModelRoute::new("primary", "old"),
+                    ModelRoute::new("expert", "shared"),
+                ]
+                .as_slice()
+            )
         );
     }
 

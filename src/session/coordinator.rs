@@ -181,9 +181,9 @@ impl SessionCoordinator {
                 }
                 Ok(IdleDispatch::Handled)
             }
-            SessionCommand::SetModel(_) | SessionCommand::SetExpertModel { .. } => {
-                Ok(IdleDispatch::NotIdle)
-            }
+            SessionCommand::SetModel(_)
+            | SessionCommand::SetExpertModel { .. }
+            | SessionCommand::SetExpertAllowedModels { .. } => Ok(IdleDispatch::NotIdle),
             SessionCommand::ToggleFastMode => {
                 let Some(fast_mode) = agent.fast_mode() else {
                     let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
@@ -744,6 +744,7 @@ impl SessionCoordinator {
             | SessionCommand::Compact
             | SessionCommand::SetModel(_)
             | SessionCommand::SetExpertModel { .. }
+            | SessionCommand::SetExpertAllowedModels { .. }
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
             | SessionCommand::ToggleMcpServer(_)

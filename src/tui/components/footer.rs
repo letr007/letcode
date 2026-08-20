@@ -262,7 +262,7 @@ fn token_budget_spans(
     if let Some(cache_hit_percent) = cache_hit_percent {
         spans.push(Span::styled(" ", footer_dim_style(theme)));
         spans.push(Span::styled(
-            format!("{cache_hit_percent}%"),
+            format!("{cache_hit_percent:.2}%"),
             token_budget_cache_text_style(theme),
         ));
     }
@@ -278,16 +278,12 @@ fn token_budget_spans(
     spans
 }
 
-fn token_budget_cache_hit_percent(input_tokens: u64, cached_input_tokens: u64) -> Option<u64> {
+fn token_budget_cache_hit_percent(input_tokens: u64, cached_input_tokens: u64) -> Option<f64> {
     if input_tokens == 0 || cached_input_tokens == 0 {
         return None;
     }
 
-    Some(
-        (((cached_input_tokens.min(input_tokens) as f64 / input_tokens as f64) * 100.0).round()
-            as u64)
-            .min(100),
-    )
+    Some((cached_input_tokens.min(input_tokens) as f64 / input_tokens as f64) * 100.0)
 }
 
 fn token_budget_used_percent(context_window_tokens: u64, used_tokens: u64) -> u64 {
@@ -978,8 +974,31 @@ mod tests {
 
     #[test]
     fn token_budget_cache_hit_percent_uses_cached_over_input_tokens() {
-        assert_eq!(token_budget_cache_hit_percent(40_000, 20_000), Some(50));
-        assert_eq!(token_budget_cache_hit_percent(40_000, 80_000), Some(100));
+        assert_eq!(token_budget_cache_hit_percent(40_000, 20_000), Some(50.0));
+        assert_eq!(token_budget_cache_hit_percent(40_000, 80_000), Some(100.0));
+        assert_eq!(
+            token_budget_cache_hit_percent(3, 1),
+            Some(33.33333333333333)
+        );
+    }
+
+    #[test]
+    fn token_budget_cache_hit_percent_renders_two_decimal_places() {
+        let usage = crate::tui::state::ModelTokenUsage {
+            used_tokens: 3,
+            context_window_tokens: 10,
+            input_tokens: 3,
+            output_tokens: 0,
+            cached_tokens: 1,
+            cache_report: None,
+        };
+
+        let rendered = token_budget_spans(&usage, crate::tui::Theme::dark())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("33.33%"), "{rendered}");
     }
 
     #[test]

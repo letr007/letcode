@@ -218,6 +218,38 @@ fn render_runtime_transcript(runtime: &mut TuiRuntime) {
 }
 
 #[test]
+fn pending_question_terminal_title_uses_question_marker_before_session_title() {
+    let mut runtime = runtime();
+    runtime.session_title = Some("Review plan".into());
+    runtime.session_turn_active = true;
+    let (tx, _rx) = oneshot::channel();
+    runtime
+        .begin_pending_question(
+            sample_question_request(false),
+            RunnerQuestionRequest::new(tx),
+            None,
+        )
+        .expect("question starts");
+
+    assert_eq!(runtime.terminal_title(), "? LetCode | Review plan");
+}
+
+#[test]
+fn permission_prompt_keeps_the_active_terminal_spinner() {
+    let mut runtime = runtime();
+    runtime.session_title = Some("Review plan".into());
+    runtime.session_turn_active = true;
+    runtime.spinner_frame = 0;
+    runtime.state_mut().pending_permission = Some(crate::tui::PermissionView::from_request(
+        PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+    ));
+
+    let title = runtime.terminal_title();
+    assert!(title.ends_with("LetCode | Review plan"), "{title}");
+    assert!(!title.starts_with('?'), "{title}");
+}
+
+#[test]
 fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::PermissionResolved(
@@ -403,6 +435,72 @@ fn model_catalog_update_refreshes_open_picker_and_notifies_once_per_absence() {
         },
     ));
     assert!(runtime.state().toast().is_some());
+}
+
+#[test]
+fn model_catalog_update_preserves_expert_allowlist_checks() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "gpt-5.5".into(),
+        allowed_models: vec!["gpt-5.5".into()],
+    }]);
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expert picker opens");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(
+        ModelCatalogUpdatedEvent {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-5.5".into(),
+                label: "GPT-5.5 refreshed".into(),
+                provider: "openai".into(),
+                context_window_tokens: None,
+                reasoning: ModelCatalogReasoning {
+                    effort: None,
+                    efforts: Vec::new(),
+                },
+            }],
+        },
+    ));
+
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if matches!(dialog.kind, DialogKind::ExpertModelPicker(_))
+                && dialog.items.first().is_some_and(|item| item.checked)
+    ));
+}
+
+#[test]
+fn expert_allowlist_event_syncs_the_open_picker() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "gpt-5.5".into(),
+        allowed_models: Vec::new(),
+    }]);
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expert picker opens");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ExpertAllowedModelsChanged {
+        agent_name: "explorer".into(),
+        model_ids: vec!["gpt-5.5".into()],
+    });
+
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if matches!(dialog.kind, DialogKind::ExpertModelPicker(_))
+                && dialog.items.first().is_some_and(|item| item.checked)
+    ));
 }
 
 #[test]
@@ -794,6 +892,88 @@ fn child_interrupted_event_updates_child_view_without_touching_parent() {
         runtime.state().toast().map(|toast| toast.message.as_str()),
         Some("Interrupted by user")
     );
+}
+
+#[test]
+fn agent_model_picker_multiselect_confirms_and_returns_to_agent_picker() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "gpt-5.5".into(),
+        allowed_models: vec!["gpt-5.5".into()],
+    }]);
+    runtime.state_mut().set_input("/agents");
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("agents picker opens"),
+        None
+    );
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog) if dialog.kind == DialogKind::AgentPicker
+    ));
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expert model picker opens");
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if matches!(dialog.kind, DialogKind::ExpertModelPicker(ref name) if name == "explorer")
+                && dialog.items.first().is_some_and(|item| item.checked)
+    ));
+
+    runtime
+        .handle_input_action(InputAction::DialogToggle)
+        .expect("toggle allowed model");
+    let command = runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("confirm allowed models");
+
+    assert_eq!(
+        command,
+        Some(RuntimeCommand::SetExpertAllowedModels {
+            agent_name: "explorer".into(),
+            model_ids: Vec::new(),
+        })
+    );
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if dialog.kind == DialogKind::AgentPicker
+                && dialog.selected_item().map(|item| item.id.as_str()) == Some("explorer")
+    ));
+}
+
+#[test]
+fn agent_model_picker_escape_discards_changes_and_returns_to_agent_picker() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "gpt-5.5".into(),
+        allowed_models: vec!["gpt-5.5".into()],
+    }]);
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expert model picker opens");
+    runtime
+        .handle_input_action(InputAction::DialogToggle)
+        .expect("toggle draft");
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("return to agents picker");
+
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if dialog.kind == DialogKind::AgentPicker
+                && dialog.selected_item().map(|item| item.id.as_str()) == Some("explorer")
+    ));
+    assert_eq!(runtime.available_experts[0].allowed_models, vec!["gpt-5.5"]);
 }
 
 #[test]
@@ -2929,10 +3109,12 @@ fn session_resume_expert_snapshot_clears_previous_session_route() {
         AvailableExpert {
             agent_name: "explorer".into(),
             route_id: "p/previous".into(),
+            allowed_models: Vec::new(),
         },
         AvailableExpert {
             agent_name: "reviewer".into(),
             route_id: "p/previous-reviewer".into(),
+            allowed_models: Vec::new(),
         },
     ]);
 
@@ -2957,6 +3139,7 @@ fn session_started_event_uses_complete_expert_snapshot() {
     let mut runtime = runtime_with_experts(vec![AvailableExpert {
         agent_name: "explorer".into(),
         route_id: "p/previous".into(),
+        allowed_models: Vec::new(),
     }]);
 
     runtime.apply_session_transport_event(SessionTransportEvent::SessionStarted {
@@ -5386,6 +5569,20 @@ fn deferred_settings_use_last_write_wins_per_category() {
     );
     enqueue_deferred_command(
         &mut commands,
+        SessionEngineCommand::SetExpertAllowedModels {
+            agent_name: "explorer".into(),
+            model_ids: vec!["allowed-first".into()],
+        },
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetExpertAllowedModels {
+            agent_name: "explorer".into(),
+            model_ids: vec!["allowed-last".into()],
+        },
+    );
+    enqueue_deferred_command(
+        &mut commands,
         SessionEngineCommand::SetExpertModel {
             agent_name: "reviewer".into(),
             model_id: "reviewer-only".into(),
@@ -5408,6 +5605,11 @@ fn deferred_settings_use_last_write_wins_per_category() {
     assert!(matches!(
         commands.pop_front(),
         Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetExpertAllowedModels { agent_name, model_ids })
+            if agent_name == "explorer" && model_ids == vec!["allowed-last"]
     ));
     assert!(matches!(
         commands.pop_front(),

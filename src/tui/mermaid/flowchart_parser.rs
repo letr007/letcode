@@ -43,6 +43,10 @@ pub(crate) fn parse(source: &str) -> Option<MermaidGraph> {
                 && (trimmed == "subgraph" || trimmed[8..].starts_with(char::is_whitespace))
             {
                 subgraph_depth += 1;
+            } else if subgraph_depth > 0 && trimmed.starts_with("direction ") {
+                parse_local_direction(trimmed)?;
+                // Local subgraph direction is accepted even though the terminal layout
+                // currently uses the parent graph direction for the flattened topology.
             } else {
                 let base_line = line_offset + leading;
                 let mut segment_start = 0usize;
@@ -81,7 +85,6 @@ pub(crate) fn parse(source: &str) -> Option<MermaidGraph> {
         || edges
             .iter()
             .any(|edge| !nodes.contains_key(&edge.from) || !nodes.contains_key(&edge.to))
-        || has_cycle(&nodes, &edges)
     {
         return None;
     }
@@ -238,11 +241,7 @@ fn parse_endpoint_prefix(
             return Some((id.to_string(), node, true, rest, rest_base));
         }
     }
-    let id_end = trimmed
-        .char_indices()
-        .find(|(_, ch)| ch.is_whitespace() || *ch == '&' || *ch == '-' || *ch == '=')
-        .map(|(idx, _)| idx)
-        .unwrap_or(trimmed.len());
+    let id_end = bare_id_end(trimmed);
     let id = &trimmed[..id_end];
     if !valid_id(id) {
         return None;
@@ -382,40 +381,32 @@ fn insert_node(
     }
     Some(())
 }
+fn parse_local_direction(line: &str) -> Option<MermaidDirection> {
+    match line.strip_prefix("direction ")?.trim() {
+        "TD" | "TB" => Some(MermaidDirection::Td),
+        "BT" => Some(MermaidDirection::Bu),
+        "LR" => Some(MermaidDirection::Lr),
+        "RL" => Some(MermaidDirection::Rl),
+        _ => None,
+    }
+}
+
+fn bare_id_end(value: &str) -> usize {
+    for (index, ch) in value.char_indices() {
+        if ch.is_whitespace() || ch == '&' {
+            return index;
+        }
+        let rest = &value[index..];
+        if rest.starts_with("--") || rest.starts_with("-.") || rest.starts_with("==") {
+            return index;
+        }
+    }
+    value.len()
+}
+
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-fn has_cycle(nodes: &HashMap<String, MermaidNode>, edges: &[MermaidEdge]) -> bool {
-    fn visit(
-        id: &str,
-        nodes: &HashMap<String, MermaidNode>,
-        edges: &[MermaidEdge],
-        active: &mut Vec<String>,
-        done: &mut Vec<String>,
-    ) -> bool {
-        if active.iter().any(|item| item == id) {
-            return true;
-        }
-        if done.iter().any(|item| item == id) {
-            return false;
-        }
-        active.push(id.to_string());
-        for edge in edges.iter().filter(|edge| edge.from == id) {
-            if visit(&edge.to, nodes, edges, active, done) {
-                return true;
-            }
-        }
-        active.pop();
-        done.push(id.to_string());
-        let _ = nodes;
-        false
-    }
-    let mut active = Vec::new();
-    let mut done = Vec::new();
-    nodes
-        .keys()
-        .any(|id| visit(id, nodes, edges, &mut active, &mut done))
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }

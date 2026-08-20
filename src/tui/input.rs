@@ -228,6 +228,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                 matches!(
                     dialog.kind,
                     DialogKind::ModelPicker
+                        | DialogKind::ExpertModelPicker(_)
                         | DialogKind::SessionPicker
                         | DialogKind::HistoryTree
                         | DialogKind::ContextPicker
@@ -244,9 +245,12 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                 KeyCode::Down => InputAction::DialogNext,
                 KeyCode::Enter => InputAction::DialogAccept,
                 KeyCode::Char(' ')
-                    if state
-                        .dialog()
-                        .is_some_and(|dialog| dialog.kind == DialogKind::McpPicker) =>
+                    if state.dialog().is_some_and(|dialog| {
+                        matches!(
+                            dialog.kind,
+                            DialogKind::McpPicker | DialogKind::ExpertModelPicker(_)
+                        )
+                    }) =>
                 {
                     InputAction::DialogToggle
                 }
@@ -366,6 +370,7 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
                 matches!(
                     dialog.kind,
                     DialogKind::ModelPicker
+                        | DialogKind::ExpertModelPicker(_)
                         | DialogKind::SessionPicker
                         | DialogKind::HistoryTree
                         | DialogKind::ContextPicker
@@ -658,6 +663,34 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)
             ),
             InputAction::PasteFromClipboard
+        );
+    }
+
+    #[test]
+    fn expert_model_picker_uses_space_to_toggle_and_enter_or_escape_to_navigate() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::ExpertModelPicker("explorer".into()),
+            "Expert models",
+            None,
+            vec![crate::tui::state::DialogItem::new(
+                "provider/model",
+                "Model",
+                None,
+            )],
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char(' '))),
+            InputAction::DialogToggle
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::DialogAccept
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Esc)),
+            InputAction::DialogCancel
         );
     }
 

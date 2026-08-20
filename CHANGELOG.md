@@ -7,9 +7,45 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-20
+
 ### Added
 
-- TUI 支持 `en` / `zh-CN` 国际化，可通过 `/language`（`/lang`）切换；未显式选择时跟随系统 locale，显式语言保存到 `tui-preferences.json` 的 `language` 字段。
+- 新增内置工程工作流 skills：`git`、`simplify`、`verification-planning` 和 `worktrees`，覆盖仓库操作、行为保持的代码简化、验证路径设计与隔离工作树管理。
+- 新增 DeepSeek V4 请求策略，兼容 reasoning 内容、工具调用回放和流式恢复状态。
+- 新增可选的 Anchored Bootstrap 实验：对配置白名单内的模型先以最小工具和提示启动，再按持久化信号恢复完整工具目录；可通过 `/anchored` 在会话内切换，并在 composer 显示启用状态。
+- TUI 支持 `en` / `zh-CN` 国际化，可通过 `/language`（`/lang`）切换；未显式选择时跟随系统 locale，显式语言保存到 `tui-preferences.json`。
+- 大体积 `shell__exec` 输出会写入可信临时 artifact，仅内联有界预览和 `local_path`；`fs__read` / `search__rg` 可按需读取完整内容。
+- 大体积 `search__rg` 结果会折叠为包含真实文件数、匹配数、预览和 `local_path` 的摘要，避免向模型上下文注入完整结果集。
+- `/agents` 专家模型二级菜单支持多选：使用 `Space` 选中或取消模型，`Enter` 保存到 `agents.<expert>.allowed_models`，`Esc` 放弃修改并返回专家列表。
+
+### Changed
+
+- Agent 会话内存状态统一以 `RuntimeSnapshot` 为单一事实来源，移除 history、protocol frames 等镜像状态及请求前重复投影，恢复、压缩和协议流均读取同一快照。
+- 会话、transcript、subagent、tool、配置持久化和 TUI 渲染代码拆分为职责更清晰的模块，收紧模块边界并保留原有 API 兼容入口。
+- Assistant 流式输出改为平滑的 typewriter 投影，并同步渲染几何信息，减少文本跳动并确保流式期间仍可滚动到 transcript 底部。
+- TUI 输入与绘制职责解耦后恢复同步终端绘制路径，避免渲染任务并发修改终端状态；Git 分支轮询、模型目录和运行时辅助逻辑改为独立组件。
+- 工程任务默认提示优先使用原生 LaTeX 与 Mermaid 渲染，并合并统一的工程工作流约束。
+- 上下文压缩改用有界工具输出前缀、复用 transcript 分析结果和有界协议指纹，避免超大上下文下的全量序列化停顿。
+- Mermaid 代码块仅在匹配的 fenced code 围栏闭合后渲染，避免流式输出期间反复解析和图表高度抖动；成功结果按源码和宽度使用有界缓存。
+- Mermaid flowchart 扩展支持嵌套 `subgraph`、子图内方向声明、循环关系和带连字符的节点 ID；无法使用二维布局的循环图自动使用线性布局。
+- Footer 缓存命中率提高到小数点后两位。
+- `question` 工具等待用户回答时，终端标题使用 `?` 状态标记并保留当前会话标题。
+
+### Fixed
+
+- 修复 DeepSeek V4 流式响应中 reasoning 内容、工具回放和恢复状态丢失，避免恢复后重复执行或协议状态不一致。
+- 修复 Assistant 流式渲染不平滑、卡片宽度变化和 transcript 底部不可达的问题。
+- 修复补丁、文件写入 diff、搜索摘要和工具 trace 中 ANSI/控制字符破坏 TUI 布局的问题；磁盘原始内容保持不变。
+- Windows 不再启用不受支持的 kitty keyboard enhancement；TUI 仅处理 key press 事件，避免按键重复输入。
+- TUI 的权限、帮助、picker、composer 等界面文案完整接入国际化，语言切换后保持一致。
+- 专家可选模型变更会同步当前运行时和已打开的选择器；配置热重载后不再出现勾选状态过期。
+- 修改 reviewer 可选模型后会清理 sticky reviewer 会话，确保后续审批使用最新模型策略。
+- Mermaid 围栏闭合检测绑定 Markdown parser 的源码范围，避免引用、嵌套列表和缩进代码造成错误的提前渲染。
+
+### Security
+
+- letcode 自身生成的折叠 artifact 目录仅获得受限的只读信任；其他外部路径仍遵循原有权限审批规则。
 
 ## [0.4.0] - 2026-08-13
 
@@ -87,7 +123,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/letr007/letcode/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/letr007/letcode/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/letr007/letcode/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/letr007/letcode/releases/tag/v0.2.0

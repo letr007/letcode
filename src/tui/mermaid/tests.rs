@@ -2,9 +2,11 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::MermaidRender;
     use super::super::flowchart::{mermaid_crossings, mermaid_layers};
-    use super::super::{MermaidSourceSpan, flowchart, flowchart_ir as ir, flowchart_parser};
+    use super::super::{
+        MermaidRender, MermaidSourceSpan, flowchart, flowchart_ir as ir, flowchart_parser,
+        render_cache, render_uncached,
+    };
 
     fn source_slice(source: &str, start: usize, end: usize) -> String {
         source.chars().skip(start).take(end - start).collect()
@@ -37,6 +39,31 @@ mod tests {
             .map(|line| line.into_iter().map(|span| span.text).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn render_cache_reuses_completed_diagrams_by_source_and_width() {
+        let source = "flowchart TD\nA[Start] --> B[End]\n";
+        let expected = render_uncached(source, 80).expect("render diagram");
+        render_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(source, 80, expected.clone());
+
+        assert_eq!(
+            render_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(source, 80),
+            Some(expected)
+        );
+        assert!(
+            render_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(source, 79)
+                .is_none()
+        );
     }
 
     #[test]
@@ -429,6 +456,46 @@ A[$$\not_a_supported_command$$] --> B[Done]
             let rendered = super::super::render(source, 80).unwrap();
             assert_spans_exact(source, &rendered);
         }
+    }
+
+    #[test]
+    fn parser_rejects_unknown_subgraph_direction() {
+        let source = "flowchart TD\nsubgraph A\ndirection SIDEWAYS\nA --> B\nend\n";
+        assert!(flowchart_parser::parse(source).is_none());
+    }
+
+    #[test]
+    fn parser_accepts_nested_subgraphs_local_directions_cycles_and_hyphenated_ids() {
+        let source = concat!(
+            "flowchart TD\n",
+            "subgraph TOP[Platform]\n",
+            "direction LR\n",
+            "subgraph API[API Layer]\n",
+            "direction TB\n",
+            "api-gateway[Gateway] --> worker-1[Worker]\n",
+            "end\n",
+            "worker-1 --> api-gateway\n",
+            "end\n",
+        );
+        let graph = flowchart_parser::parse(source).expect("supported flowchart syntax");
+        assert!(graph.nodes.contains_key("api-gateway"));
+        assert!(graph.nodes.contains_key("worker-1"));
+        assert_eq!(graph.edges.len(), 2);
+
+        let rendered = super::super::render(source, 80).expect("cycle uses linear fallback");
+        assert_spans_exact(source, &rendered);
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Gateway"), "{text}");
+        assert!(text.contains("Worker"), "{text}");
     }
 
     #[test]

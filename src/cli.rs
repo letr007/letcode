@@ -915,7 +915,8 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
             "CLI does not support /anchored yet; use the TUI to toggle the experiment.".into(),
         ),
         SessionCommand::SetModel(model_id) => ReplCommand::ModelSet(model_id),
-        SessionCommand::SetExpertModel { .. } => ReplCommand::Unsupported(
+        SessionCommand::SetExpertModel { .. }
+        | SessionCommand::SetExpertAllowedModels { .. } => ReplCommand::Unsupported(
             "CLI does not support expert model selection yet; use the TUI.".into(),
         ),
         SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,

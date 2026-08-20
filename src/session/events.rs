@@ -177,6 +177,10 @@ pub(crate) enum SessionTransportEvent {
         agent_name: String,
         model_id: String,
     },
+    ExpertAllowedModelsChanged {
+        agent_name: String,
+        model_ids: Vec<String>,
+    },
     PermissionModeChanged {
         mode: String,
     },
@@ -333,6 +337,7 @@ impl SessionTransportEvent {
             | Self::AnchoredChanged { .. }
             | Self::ModelChanged { .. }
             | Self::ExpertModelChanged { .. }
+            | Self::ExpertAllowedModelsChanged { .. }
             | Self::PermissionModeChanged { .. }
             | Self::ReasoningEffortChanged { .. }
             | Self::ModelCatalogUpdated(_)
@@ -517,6 +522,7 @@ pub(super) fn wrap_child_session_transport_event(
         SessionTransportEvent::FastModeChanged { .. }
         | SessionTransportEvent::ModelChanged { .. }
         | SessionTransportEvent::ExpertModelChanged { .. }
+        | SessionTransportEvent::ExpertAllowedModelsChanged { .. }
         | SessionTransportEvent::PermissionModeChanged { .. }
         | SessionTransportEvent::ReasoningEffortChanged { .. }
         | SessionTransportEvent::SettingChangeFailed { .. } => event,

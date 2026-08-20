@@ -231,11 +231,17 @@ impl TuiRuntime {
     }
 
     fn terminal_title(&self) -> String {
-        format_terminal_title(
+        let question_pending = self.state.pending_question.is_some();
+        let title = format_terminal_title(
             self.session_title.as_deref(),
-            self.has_active_or_pending_session_turn()
+            (!question_pending && self.has_active_or_pending_session_turn())
                 .then_some(self.spinner_frame / TERMINAL_TITLE_TICKS_PER_FRAME),
-        )
+        );
+        if question_pending {
+            format!("? {title}")
+        } else {
+            title
+        }
     }
 
     fn update_terminal_title(&self, terminal: &mut OwnedTerminal) -> io::Result<()> {
@@ -762,6 +768,35 @@ impl TuiRuntime {
                 self.show_toast(
                     self.state
                         .t_fmt("runtime.agent_model_updated", &[("agent", agent_name)]),
+                    ToastKind::Success,
+                );
+            }
+            SessionTransportEvent::ExpertAllowedModelsChanged {
+                agent_name,
+                model_ids,
+            } => {
+                if let Some(expert) = self
+                    .available_experts
+                    .iter_mut()
+                    .find(|expert| expert.agent_name == *agent_name)
+                {
+                    expert.allowed_models = model_ids.clone();
+                }
+                if let Some(dialog) = self.state.dialog_mut().filter(|dialog| {
+                    matches!(
+                        &dialog.kind,
+                        DialogKind::ExpertModelPicker(open_agent) if open_agent == agent_name
+                    )
+                }) {
+                    for item in &mut dialog.items {
+                        item.checked = model_ids.contains(&item.id);
+                    }
+                }
+                self.show_toast(
+                    self.state.t_fmt(
+                        "runtime.agent_allowed_models_updated",
+                        &[("agent", agent_name)],
+                    ),
                     ToastKind::Success,
                 );
             }
@@ -1420,7 +1455,22 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::DialogAccept => self.handle_dialog_accept(),
-            InputAction::DialogToggle => self.handle_mcp_toggle(),
+            InputAction::DialogToggle => {
+                if self
+                    .state
+                    .dialog()
+                    .is_some_and(|dialog| matches!(dialog.kind, DialogKind::ExpertModelPicker(_)))
+                {
+                    if let Some(dialog) = self.state.dialog_mut()
+                        && let Some(item) = dialog.items.get_mut(dialog.selected)
+                    {
+                        item.checked = !item.checked;
+                    }
+                    Ok(None)
+                } else {
+                    self.handle_mcp_toggle()
+                }
+            }
             InputAction::DialogCancel => {
                 if self.cancel_theme_preview() {
                     return Ok(None);
@@ -1609,6 +1659,7 @@ impl TuiRuntime {
                     .clear_pending_permission_mode_if(&mode.to_string());
             }
             crate::session::SessionCommand::SetExpertModel { .. }
+            | crate::session::SessionCommand::SetExpertAllowedModels { .. }
             | crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::AnchoredToggle
@@ -1648,6 +1699,7 @@ impl TuiRuntime {
                 self.state.set_pending_permission_mode(mode.to_string());
             }
             crate::session::SessionCommand::SetExpertModel { .. }
+            | crate::session::SessionCommand::SetExpertAllowedModels { .. }
             | crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
@@ -1986,6 +2038,15 @@ impl TuiRuntime {
                 RuntimeCommand::SetExpertModel {
                     agent_name,
                     model_id,
+                },
+            ))),
+            SessionCommand::SetExpertAllowedModels {
+                agent_name,
+                model_ids,
+            } => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::SetExpertAllowedModels {
+                    agent_name,
+                    model_ids,
                 },
             ))),
             SessionCommand::ToggleFastMode => Ok(Some(SubmittedCommand::Runtime(
@@ -2387,9 +2448,22 @@ impl TuiRuntime {
             return;
         }
         let selected_id = dialog.selected_item().map(|item| item.id.clone());
+        let checked_ids = matches!(dialog.kind, DialogKind::ExpertModelPicker(_)).then(|| {
+            dialog
+                .items
+                .iter()
+                .filter(|item| item.checked)
+                .map(|item| item.id.clone())
+                .collect::<std::collections::HashSet<_>>()
+        });
         let query = dialog.query.clone();
         let old_selected = dialog.selected;
         dialog.items = items;
+        if let Some(checked_ids) = checked_ids {
+            for item in &mut dialog.items {
+                item.checked = checked_ids.contains(&item.id);
+            }
+        }
         dialog.query = query;
         dialog.selected = selected_id
             .and_then(|id| dialog.items.iter().position(|item| item.id == id))
@@ -2474,17 +2548,27 @@ impl TuiRuntime {
                 )
             })
             .unwrap_or_default();
-        let current_route = self
+        let expert = self
             .available_experts
             .iter()
-            .find(|expert| expert.agent_name == agent_name)
+            .find(|expert| expert.agent_name == agent_name);
+        let current_route = expert
             .map(|expert| expert.route_id.clone())
             .unwrap_or_else(|| self.state.model_id.clone());
+        let allowed_models = expert
+            .map(|expert| expert.allowed_models.clone())
+            .unwrap_or_default();
         let mut dialog = DialogState::new(
             DialogKind::ExpertModelPicker(agent_name),
             self.state.t("runtime.select_expert_model"),
             None,
-            self.model_dialog_items(),
+            self.model_dialog_items()
+                .into_iter()
+                .map(|item| {
+                    let checked = allowed_models.contains(&item.id);
+                    item.with_checked(checked)
+                })
+                .collect(),
         );
         dialog.expert_primary_query = Some(primary_query);
         dialog.expert_primary_selected_agent = primary_selected_agent;
@@ -2833,10 +2917,26 @@ impl TuiRuntime {
                 Ok(None)
             }
             DialogKind::ExpertModelPicker(agent_name) => {
-                self.state.close_dialog();
-                Ok(Some(RuntimeCommand::SetExpertModel {
+                let (model_ids, query, selected_agent) = self
+                    .state
+                    .dialog()
+                    .map(|dialog| {
+                        (
+                            dialog
+                                .items
+                                .iter()
+                                .filter(|item| item.checked)
+                                .map(|item| item.id.clone())
+                                .collect::<Vec<_>>(),
+                            dialog.expert_primary_query.clone().unwrap_or_default(),
+                            dialog.expert_primary_selected_agent.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                self.show_agents_dialog_with_state(query, selected_agent);
+                Ok(Some(RuntimeCommand::SetExpertAllowedModels {
                     agent_name,
-                    model_id: selected.id,
+                    model_ids,
                 }))
             }
             DialogKind::PermissionPicker => {

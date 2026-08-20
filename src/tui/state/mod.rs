@@ -250,6 +250,7 @@ pub struct DialogItem {
     pub detail: Option<String>,
     pub section: Option<String>,
     pub right_detail: Option<String>,
+    pub checked: bool,
 }
 
 impl DialogItem {
@@ -260,6 +261,7 @@ impl DialogItem {
             detail,
             section: None,
             right_detail: None,
+            checked: false,
         }
     }
 
@@ -270,6 +272,11 @@ impl DialogItem {
 
     pub fn with_right_detail(mut self, right_detail: impl Into<String>) -> Self {
         self.right_detail = Some(right_detail.into());
+        self
+    }
+
+    pub fn with_checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
         self
     }
 }

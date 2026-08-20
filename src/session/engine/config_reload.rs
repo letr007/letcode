@@ -291,6 +291,22 @@ pub(crate) fn apply_config_reload(
             .or_insert(retained_credential);
     }
     *new_session_default_expert_routes = next_new_session_default_expert_routes;
+    let changed_expert_allowed_models = next_expert_allowed_models
+        .iter()
+        .filter(|(name, routes)| {
+            expert_allowed_models
+                .get(*name)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                != routes.as_slice()
+        })
+        .map(|(name, routes)| {
+            (
+                name.clone(),
+                routes.iter().map(ModelRoute::display_name).collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
     *expert_allowed_models = next_expert_allowed_models;
     *legacy_expert_models = next_legacy_expert_models;
     *provider_api_key_hints = next_provider_api_key_hints;
@@ -298,6 +314,12 @@ pub(crate) fn apply_config_reload(
     *global_retry = next_global_retry;
     *new_session_default_route = next_new_session_default_route;
     let _ = event_tx.send(SessionTransportEvent::ModelCatalogUpdated(catalog_event));
+    for (agent_name, model_ids) in changed_expert_allowed_models {
+        let _ = event_tx.send(SessionTransportEvent::ExpertAllowedModelsChanged {
+            agent_name,
+            model_ids,
+        });
+    }
     let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
         "configuration reloaded (supported runtime fields only; MCP, permissions, Fast Mode, max_iterations/max_tool_calls unchanged)",
     )));

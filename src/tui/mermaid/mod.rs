@@ -1,5 +1,10 @@
 //! Mermaid facade: classify diagrams and expose neutral rendered spans.
 
+use std::{
+    collections::VecDeque,
+    sync::{Mutex, OnceLock},
+};
+
 mod canvas;
 mod class;
 mod class_ir;
@@ -21,6 +26,7 @@ mod timeline;
 const MAX_SOURCE_CHARS: usize = 16_384;
 const MAX_SOURCE_LINES: usize = 512;
 const MAX_RENDER_LINES: usize = 1_024;
+const MAX_RENDER_CACHE_ENTRIES: usize = 32;
 
 fn source_within_limits(source: &str) -> bool {
     source.chars().count() <= MAX_SOURCE_CHARS && source.lines().count() <= MAX_SOURCE_LINES
@@ -102,6 +108,23 @@ pub(crate) fn render(source: &str, width: usize) -> Option<MermaidRender> {
     if !source_within_limits(source) {
         return None;
     }
+    if let Some(rendered) = render_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(source, width)
+    {
+        return Some(rendered);
+    }
+
+    let rendered = render_uncached(source, width)?;
+    render_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(source, width, rendered.clone());
+    Some(rendered)
+}
+
+fn render_uncached(source: &str, width: usize) -> Option<MermaidRender> {
     let first = source.lines().next()?;
     let lines = match first {
         "sequenceDiagram" => sequence::render(source, width)?,
@@ -122,6 +145,39 @@ pub(crate) fn render(source: &str, width: usize) -> Option<MermaidRender> {
         _ => return None,
     };
     Some(MermaidRender { lines })
+}
+
+#[derive(Default)]
+struct MermaidRenderCache {
+    entries: VecDeque<(String, usize, MermaidRender)>,
+}
+
+impl MermaidRenderCache {
+    fn get(&mut self, source: &str, width: usize) -> Option<MermaidRender> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(cached_source, cached_width, _)| {
+                cached_source == source && *cached_width == width
+            })?;
+        let entry = self.entries.remove(index)?;
+        let rendered = entry.2.clone();
+        self.entries.push_back(entry);
+        Some(rendered)
+    }
+
+    fn insert(&mut self, source: &str, width: usize, rendered: MermaidRender) {
+        if self.entries.len() == MAX_RENDER_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries
+            .push_back((source.to_string(), width, rendered));
+    }
+}
+
+fn render_cache() -> &'static Mutex<MermaidRenderCache> {
+    static CACHE: OnceLock<Mutex<MermaidRenderCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MermaidRenderCache::default()))
 }
 
 #[cfg(test)]

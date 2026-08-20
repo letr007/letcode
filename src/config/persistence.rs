@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -63,6 +63,35 @@ pub fn persist_expert_model_route(
             .ok_or_else(|| anyhow!("agents.{agent_name} is not a configured table"))?;
         agent.insert("provider", value(route.provider.clone()));
         agent.insert("model", value(route.model.clone()));
+        Ok(())
+    })
+}
+
+/// Persist one expert's complete provider-qualified allowlist.
+pub fn persist_expert_allowed_models(
+    config_path: &Path,
+    agent_name: &str,
+    routes: &[ModelRoute],
+) -> Result<()> {
+    if !crate::delegation::supported_agent_names().any(|name| name == agent_name) {
+        bail!("unknown expert '{agent_name}'");
+    }
+
+    persist_config_document(config_path, "expert allowed models", true, |document| {
+        let agents = document["agents"].or_insert(Item::Table(Table::new()));
+        let agents = agents
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("config [agents] entry is not a table"))?;
+        let agent = agents
+            .entry(agent_name)
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("agents.{agent_name} is not a configured table"))?;
+        let mut allowed_models = Array::default();
+        for route in routes {
+            allowed_models.push(route.display_name());
+        }
+        agent.insert("allowed_models", Item::Value(allowed_models.into()));
         Ok(())
     })
 }

@@ -111,4 +111,5 @@ fn model_provider(model_id: &str) -> String {
 pub(crate) struct AvailableExpert {
     pub(crate) agent_name: String,
     pub(crate) route_id: String,
+    pub(crate) allowed_models: Vec<String>,
 }

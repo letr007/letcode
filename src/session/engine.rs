@@ -1076,6 +1076,100 @@ async fn run_engine_loop(
                     break;
                 };
 
+                if let SessionEngineCommand::SetExpertAllowedModels {
+                    agent_name,
+                    model_ids,
+                } = &command
+                {
+                    if !crate::delegation::supported_agent_names().any(|name| name == agent_name) {
+                        send_setting_change_failed(
+                            &session_transport_tx,
+                            crate::session::SessionCommand::SetExpertAllowedModels {
+                                agent_name: agent_name.clone(),
+                                model_ids: model_ids.clone(),
+                            },
+                            format!("unknown expert: {agent_name}"),
+                        );
+                        continue;
+                    }
+                    let mut routes = Vec::with_capacity(model_ids.len());
+                    let mut seen = std::collections::HashSet::new();
+                    let mut invalid = None;
+                    for model_id in model_ids {
+                        let Some(route) = model_routes.get(model_id).cloned() else {
+                            invalid = Some(format!("unknown model: {model_id}"));
+                            break;
+                        };
+                        if !seen.insert(route.display_name()) {
+                            invalid = Some(format!("duplicate model: {}", route.display_name()));
+                            break;
+                        }
+                        routes.push(route);
+                    }
+                    if let Some(error) = invalid {
+                        send_setting_change_failed(
+                            &session_transport_tx,
+                            crate::session::SessionCommand::SetExpertAllowedModels {
+                                agent_name: agent_name.clone(),
+                                model_ids: model_ids.clone(),
+                            },
+                            error,
+                        );
+                        continue;
+                    }
+                    let mut updated_allowed_models = expert_allowed_models.clone();
+                    updated_allowed_models.insert(agent_name.clone(), routes.clone());
+                    let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
+                        crate::delegation::supported_agent_names().map(|name| {
+                            (
+                                name.to_string(),
+                                expert_model_routes.get(name).cloned(),
+                                updated_allowed_models.get(name).cloned().unwrap_or_default(),
+                            )
+                        }),
+                        &providers,
+                        &global_retry,
+                    ) {
+                        Ok(factory) => factory,
+                        Err(error) => {
+                            send_setting_change_failed(
+                                &session_transport_tx,
+                                crate::session::SessionCommand::SetExpertAllowedModels {
+                                    agent_name: agent_name.clone(),
+                                    model_ids: model_ids.clone(),
+                                },
+                                format!("failed to rebuild expert route factory: {error}"),
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(error) = crate::config::persist_expert_allowed_models(
+                        &mcp_config_path,
+                        agent_name,
+                        &routes,
+                    ) {
+                        send_setting_change_failed(
+                            &session_transport_tx,
+                            crate::session::SessionCommand::SetExpertAllowedModels {
+                                agent_name: agent_name.clone(),
+                                model_ids: model_ids.clone(),
+                            },
+                            format!("failed to persist expert allowed models: {error}"),
+                        );
+                        continue;
+                    }
+                    agent.set_subagent_child_factory(Arc::new(expert_factory));
+                    expert_allowed_models = updated_allowed_models;
+                    if agent_name == "reviewer" {
+                        sticky_auto_reviewer.clear_sticky_session();
+                    }
+                    let _ = session_transport_tx.send(SessionTransportEvent::ExpertAllowedModelsChanged {
+                        agent_name: agent_name.clone(),
+                        model_ids: routes.iter().map(ModelRoute::display_name).collect(),
+                    });
+                    continue;
+                }
+
                 if let SessionEngineCommand::SetExpertModel {
                     agent_name,
                     model_id,
@@ -1488,6 +1582,7 @@ async fn run_engine_loop(
                     | SessionEngineCommand::SetPermissionMode(_)
                     | SessionEngineCommand::SetModel(_)
                     | SessionEngineCommand::SetExpertModel { .. }
+                    | SessionEngineCommand::SetExpertAllowedModels { .. }
                     | SessionEngineCommand::ToggleFastMode
                     | SessionEngineCommand::SetReasoningEffort(_)
                     | SessionEngineCommand::ViewChild { .. }

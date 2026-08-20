@@ -233,6 +233,13 @@ async fn main() -> Result<()> {
                             .expert_route_for(agent_name)
                             .expect("supported expert has a resolved route")
                             .display_name(),
+                        allowed_models: config
+                            .agents
+                            .allowed_models_for(agent_name)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(config::ModelRoute::display_name)
+                            .collect(),
                     })
                     .collect(),
                 langfuse_startup_toast(&_tracing_guards.langfuse_status),

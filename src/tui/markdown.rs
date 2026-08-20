@@ -97,8 +97,11 @@ impl MarkdownRenderer {
 
     fn render_document(mut self, markdown: &str) -> Document<Style> {
         let markdown = normalize_markdown_math_delimiters(markdown);
-        for event in Parser::new_ext(&markdown, markdown_options()) {
-            self.handle_event(event);
+        for (event, range) in Parser::new_ext(&markdown, markdown_options()).into_offset_iter() {
+            let code_fence_closed = matches!(event, Event::Start(Tag::CodeBlock(_)))
+                .then(|| code_block_fence_closed(&markdown, range))
+                .flatten();
+            self.handle_event(event, code_fence_closed);
         }
         self.flush_spans(Break::End);
         if self.document.lines.is_empty() {
@@ -115,9 +118,9 @@ impl MarkdownRenderer {
         self.document
     }
 
-    fn handle_event(&mut self, event: Event<'_>) {
+    fn handle_event(&mut self, event: Event<'_>, code_fence_closed: Option<bool>) {
         match event {
-            Event::Start(tag) => self.start_tag(tag),
+            Event::Start(tag) => self.start_tag(tag, code_fence_closed),
             Event::End(tag) => self.end_tag(tag),
             Event::Text(text) => {
                 if let Some(code) = self.in_code_block.as_mut() {
@@ -142,7 +145,7 @@ impl MarkdownRenderer {
         }
     }
 
-    fn start_tag(&mut self, tag: Tag<'_>) {
+    fn start_tag(&mut self, tag: Tag<'_>, code_fence_closed: Option<bool>) {
         match tag {
             Tag::Paragraph => {
                 self.flush_spans(Break::BlockBreak);
@@ -158,9 +161,15 @@ impl MarkdownRenderer {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_spans(Break::BlockBreak);
+                let language = code_block_language(kind);
+                let fence_closed = language
+                    .as_deref()
+                    .is_none_or(|language| !language.eq_ignore_ascii_case("mermaid"))
+                    || code_fence_closed.unwrap_or(false);
                 self.in_code_block = Some(CodeBlockState {
-                    language: code_block_language(kind),
+                    language,
                     content: String::new(),
+                    fence_closed,
                 });
             }
             Tag::List(start) => {
@@ -459,10 +468,11 @@ impl MarkdownRenderer {
             self.document
                 .push_line(RenderLine::default(), Break::BlockBreak);
         }
-        if code
-            .language
-            .as_deref()
-            .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+        if code.fence_closed
+            && code
+                .language
+                .as_deref()
+                .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
             && self.push_mermaid_block(&code)
         {
             return;
@@ -1036,6 +1046,7 @@ enum ListKind {
 struct CodeBlockState {
     language: Option<String>,
     content: String,
+    fence_closed: bool,
 }
 
 struct CodeHighlighter<'a> {
@@ -1314,6 +1325,60 @@ fn markdown_options() -> Options {
         | Options::ENABLE_HEADING_ATTRIBUTES
         | Options::ENABLE_MATH
         | Options::ENABLE_GFM
+}
+
+fn code_block_fence_closed(markdown: &str, range: std::ops::Range<usize>) -> Option<bool> {
+    let block = markdown.get(range)?;
+    let first = block.lines().next()?;
+    let (_, marker, len) = fence_line(first)?;
+    let last = block.lines().last()?;
+    let (tail, close_marker, close_len) = fence_line(last)?;
+    Some(close_marker == marker && close_len >= len && tail.trim().is_empty())
+}
+
+fn fence_line(line: &str) -> Option<(&str, char, usize)> {
+    let line = strip_container_prefix(line);
+    let indent = line.chars().take_while(|ch| *ch == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let line = &line[indent..];
+    let marker = line.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let len = line.chars().take_while(|ch| *ch == marker).count();
+    (len >= 3).then(|| (&line[len..], marker, len))
+}
+
+fn strip_container_prefix(mut line: &str) -> &str {
+    loop {
+        let trimmed = line.trim_start_matches(' ');
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            line = rest.strip_prefix(' ').unwrap_or(rest);
+            continue;
+        }
+        if let Some(rest) = strip_list_marker(trimmed) {
+            line = rest;
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+fn strip_list_marker(line: &str) -> Option<&str> {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return Some(rest);
+        }
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    line[digits..]
+        .strip_prefix(". ")
+        .or_else(|| line[digits..].strip_prefix(") "))
 }
 
 fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
@@ -1625,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn mermaid_dag_renders_and_invalid_graph_falls_back_to_code_card() {
+    fn mermaid_dag_and_cycle_render_without_code_fallback() {
         let supported = render_markdown_document(
             "```mermaid\ngraph TD\nA[Start]\nB[Finish]\nA --> B\n```",
             Theme::dark(),
@@ -1646,13 +1711,15 @@ mod tests {
         assert!(!supported_text.contains("╭─ mermaid"), "{supported_text}");
         assert!(supported.validate(), "{supported:?}");
 
-        let invalid = rendered("```mermaid\ngraph TD\nA --> B\nB --> A\n```", 32);
-        let invalid_text = invalid
+        let cycle = rendered("```mermaid\ngraph TD\nA --> B\nB --> A\n```", 32);
+        let cycle_text = cycle
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(invalid_text.contains("╭─ mermaid"), "{invalid_text}");
+        assert!(cycle_text.contains("A"), "{cycle_text}");
+        assert!(cycle_text.contains("B"), "{cycle_text}");
+        assert!(!cycle_text.contains("╭─ mermaid"), "{cycle_text}");
     }
 
     #[test]
@@ -1842,6 +1909,108 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
         assert!(narrow.contains("╭─ mermaid"), "{narrow}");
+    }
+
+    #[test]
+    fn mermaid_waits_for_the_closing_fence_before_rendering() {
+        let open = render_markdown_document(
+            "```mermaid\nflowchart TD\nA[Start] --> B[End]\n",
+            Theme::dark(),
+            MarkdownRenderOptions::new(80),
+        );
+        let open_text = open
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(open_text.contains("╭─ mermaid"), "{open_text}");
+        assert!(!open_text.contains('▼'), "{open_text}");
+
+        let closed = render_markdown_document(
+            "```mermaid\nflowchart TD\nA[Start] --> B[End]\n```",
+            Theme::dark(),
+            MarkdownRenderOptions::new(80),
+        );
+        let closed_text = closed
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!closed_text.contains("╭─ mermaid"), "{closed_text}");
+        assert!(closed_text.contains('▼'), "{closed_text}");
+    }
+
+    #[test]
+    fn indented_code_with_mermaid_fence_text_does_not_shift_closure_state() {
+        let source = concat!(
+            "    ```mermaid\n",
+            "    flowchart TD\n",
+            "    A --> B\n",
+            "    ```\n",
+            "```mermaid\n",
+            "flowchart TD\n",
+            "C --> D\n",
+        );
+        let document = render_markdown_document(
+            source,
+            Theme::dark(),
+            MarkdownRenderOptions::new(80),
+        );
+        let text = document
+            .lines
+            .iter()
+            .map(|line| render_span_text(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("╭─ code"), "{text}");
+        assert!(text.contains("╭─ mermaid"), "{text}");
+        assert!(!text.contains('▼'), "{text}");
+    }
+
+    #[test]
+    fn mermaid_fence_closure_tracks_blockquotes_and_lists() {
+        for source in [
+            "> ```mermaid\n> flowchart TD\n> A --> B\n> ```\n",
+            "- ```mermaid\n  flowchart TD\n  A --> B\n  ```\n",
+            "10. ```mermaid\n    flowchart TD\n    A --> B\n    ```\n",
+            "> - ```mermaid\n>   flowchart TD\n>   A --> B\n>   ```\n",
+            "- outer\n    - ```mermaid\n      flowchart TD\n      A --> B\n      ```\n",
+        ] {
+            let document = render_markdown_document(
+                source,
+                Theme::dark(),
+                MarkdownRenderOptions::new(80),
+            );
+            let text = document
+                .lines
+                .iter()
+                .map(|line| render_span_text(&line.spans))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!text.contains("╭─ mermaid"), "{text}");
+            assert!(text.contains("A"), "{text}");
+            assert!(text.contains("B"), "{text}");
+        }
+    }
+
+    #[test]
+    fn mermaid_waits_for_matching_tilde_and_long_backtick_fences() {
+        for source in [
+            "~~~mermaid\nflowchart TD\nA --> B\n",
+            "````mermaid\nflowchart TD\nA --> B\n```\n",
+        ] {
+            let document =
+                render_markdown_document(source, Theme::dark(), MarkdownRenderOptions::new(80));
+            let text = document
+                .lines
+                .iter()
+                .map(|line| render_span_text(&line.spans))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("╭─ mermaid"), "{text}");
+        }
     }
 
     #[test]

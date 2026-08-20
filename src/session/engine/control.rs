@@ -31,6 +31,10 @@ pub(crate) enum SessionEngineCommand {
         agent_name: String,
         model_id: String,
     },
+    SetExpertAllowedModels {
+        agent_name: String,
+        model_ids: Vec<String>,
+    },
     ToggleFastMode,
     SetReasoningEffort(crate::request_builder::ModelReasoningEffort),
     ResumeSession(String),
@@ -72,6 +76,13 @@ impl SessionEngineCommand {
             } => Self::SetExpertModel {
                 agent_name,
                 model_id,
+            },
+            SessionCommand::SetExpertAllowedModels {
+                agent_name,
+                model_ids,
+            } => Self::SetExpertAllowedModels {
+                agent_name,
+                model_ids,
             },
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
             SessionCommand::AnchoredToggle => Self::AnchoredToggle,
@@ -144,6 +155,13 @@ pub(crate) fn session_engine_command_as_session_command(
             agent_name: agent_name.clone(),
             model_id: model_id.clone(),
         }),
+        SessionEngineCommand::SetExpertAllowedModels {
+            agent_name,
+            model_ids,
+        } => Some(crate::session::SessionCommand::SetExpertAllowedModels {
+            agent_name: agent_name.clone(),
+            model_ids: model_ids.clone(),
+        }),
         SessionEngineCommand::ResumeSession(session_id) => Some(
             crate::session::SessionCommand::ResumeSession(session_id.clone()),
         ),
@@ -185,6 +203,7 @@ pub(crate) fn session_engine_command_as_idle_session_command(
         | crate::session::SessionCommand::Compact
         | crate::session::SessionCommand::SetModel(_)
         | crate::session::SessionCommand::SetExpertModel { .. }
+        | crate::session::SessionCommand::SetExpertAllowedModels { .. }
         | crate::session::SessionCommand::ResumeSession(_)
         | crate::session::SessionCommand::NewSession
         | crate::session::SessionCommand::ToggleMcpServer(_)
@@ -244,6 +263,7 @@ enum DeferredCommandKey {
     PermissionMode,
     Model,
     ExpertModel(String),
+    ExpertAllowedModels(String),
     ReasoningEffort,
 }
 
@@ -253,6 +273,9 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         SessionEngineCommand::SetModel(_) => Some(DeferredCommandKey::Model),
         SessionEngineCommand::SetExpertModel { agent_name, .. } => {
             Some(DeferredCommandKey::ExpertModel(agent_name.clone()))
+        }
+        SessionEngineCommand::SetExpertAllowedModels { agent_name, .. } => {
+            Some(DeferredCommandKey::ExpertAllowedModels(agent_name.clone()))
         }
         SessionEngineCommand::SetReasoningEffort(_) => Some(DeferredCommandKey::ReasoningEffort),
         SessionEngineCommand::Prompt(_)

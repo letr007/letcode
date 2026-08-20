@@ -49,6 +49,10 @@ pub enum SessionCommand {
         agent_name: String,
         model_id: String,
     },
+    SetExpertAllowedModels {
+        agent_name: String,
+        model_ids: Vec<String>,
+    },
     ToggleFastMode,
     SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
@@ -66,6 +70,7 @@ impl SessionCommand {
             Self::SetPermissionMode(_)
             | Self::SetModel(_)
             | Self::SetExpertModel { .. }
+            | Self::SetExpertAllowedModels { .. }
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)
             | Self::ToggleMcpServer(_) => ActiveTurnCommandDisposition::Defer,
