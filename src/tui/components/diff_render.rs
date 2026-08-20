@@ -86,7 +86,11 @@ pub(super) fn render_append_diff_lines(
     )
 }
 
-pub(super) fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<SemanticLine<Style>> {
+pub(super) fn render_edit_diff_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
     };
@@ -94,8 +98,12 @@ pub(super) fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize
         return Vec::new();
     };
 
-    let mut diff = String::new();
+    let mut file_diffs = Vec::<(String, String)>::new();
     for edit in edits {
+        let path = edit
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("file");
         let find = edit
             .get("find")
             .and_then(serde_json::Value::as_str)
@@ -109,6 +117,13 @@ pub(super) fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize
             continue;
         }
 
+        let diff = match file_diffs.iter_mut().find(|(file, _)| file == path) {
+            Some((_, diff)) => diff,
+            None => {
+                file_diffs.push((path.to_string(), String::new()));
+                &mut file_diffs.last_mut().expect("just pushed file diff").1
+            }
+        };
         for line in find.lines() {
             diff.push('-');
             diff.push_str(&terminal_safe_text(line));
@@ -121,22 +136,18 @@ pub(super) fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize
         }
     }
 
-    if diff.trim().is_empty() {
-        Vec::new()
-    } else {
-        let paths = edits
-            .iter()
-            .filter_map(|edit| edit.get("path").and_then(serde_json::Value::as_str))
-            .map(terminal_safe_text)
-            .collect::<Vec<_>>();
-        render_diff_block(
-            diff_card_header_title("Patch", &paths),
-            &diff,
-            None,
-            theme,
-            width,
-        )
-    }
+    file_diffs
+        .into_iter()
+        .flat_map(|(path, diff)| {
+            render_diff_block(
+                diff_card_header_title("Patch", &[path]),
+                &diff,
+                None,
+                theme,
+                width,
+            )
+        })
+        .collect()
 }
 
 pub(super) fn render_diff_block(

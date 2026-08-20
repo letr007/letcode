@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-20
+
+### Fixed
+
+- 修复一次 `edit__apply_patch` 修改多个文件时，TUI 将所有变更连续渲染在同一张 diff 卡片中的问题；现在每个文件独立显示，同一文件的多项修改保持原始顺序。
+
 ## [0.5.1] - 2026-08-20
 
 ### Added
@@ -129,7 +135,9 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/letr007/letcode/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/letr007/letcode/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/letr007/letcode/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/letr007/letcode/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/letr007/letcode/compare/v0.2.0...v0.3.0

@@ -1331,6 +1331,83 @@ mod tests {
     }
 
     #[test]
+    fn patch_diff_renders_each_file_in_its_own_card() {
+        let tool = ToolView {
+            call_id: "call-multi-file-edit".into(),
+            name: "edit__apply_patch".into(),
+            summary: "patched".into(),
+            arguments: Some(
+                json!({
+                    "edits": [
+                        {
+                            "path": "src/one.rs",
+                            "find": "old one",
+                            "replace": "new one",
+                            "replace_all": false
+                        },
+                        {
+                            "path": "src/two.rs",
+                            "find": "old two",
+                            "replace": "new two",
+                            "replace_all": false
+                        },
+                        {
+                            "path": "src/one.rs",
+                            "find": "old three",
+                            "replace": "new three",
+                            "replace_all": false
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let rendered_lines = render_tool_card_lines(&tool, Theme::dark(), 40)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let rendered = rendered_lines.join("\n");
+        let one_header = rendered_lines
+            .iter()
+            .position(|line| line.contains("← Patch src/one.rs"))
+            .unwrap();
+        let two_header = rendered_lines
+            .iter()
+            .position(|line| line.contains("← Patch src/two.rs"))
+            .unwrap();
+
+        assert_eq!(
+            rendered_lines
+                .iter()
+                .filter(|line| line.contains("← Patch "))
+                .count(),
+            2,
+            "{rendered}"
+        );
+        assert!(one_header < two_header, "{rendered}");
+
+        let one_card = rendered_lines[one_header..two_header].join("\n");
+        let old_one = one_card.find("- old one").unwrap();
+        let new_one = one_card.find("+ new one").unwrap();
+        let old_three = one_card.find("- old three").unwrap();
+        let new_three = one_card.find("+ new three").unwrap();
+        assert!(
+            old_one < new_one && new_one < old_three && old_three < new_three,
+            "{rendered}"
+        );
+        assert!(!one_card.contains("old two"), "{rendered}");
+        assert!(!one_card.contains("new two"), "{rendered}");
+
+        let two_card = rendered_lines[two_header..].join("\n");
+        assert!(two_card.contains("- old two"), "{rendered}");
+        assert!(two_card.contains("+ new two"), "{rendered}");
+        assert!(!two_card.contains("old one"), "{rendered}");
+        assert!(!two_card.contains("new three"), "{rendered}");
+    }
+
+    #[test]
     fn patch_diff_sanitizes_terminal_controls_in_side_by_side_layout() {
         let tool = ToolView {
             call_id: "call-safe-edit".into(),
