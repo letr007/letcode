@@ -2732,6 +2732,175 @@ fn protocol_frames_remain_authoritative_for_history_cache() {
     );
 }
 
+/// Phase 0 baseline: pin the live in-memory consistency of the three protocol
+/// representations (history / protocol_frames / snapshot.active_protocol_frames)
+/// before the event-sourcing refactor. Item-wise, not just length.
+fn assert_three_way_protocol_consistency(agent: &Agent<OpenAIConfig>) {
+    let frames = agent.protocol_frames_for_test();
+    let history = agent.history_for_test();
+    let active = agent.runtime_snapshot.active_protocol_frames();
+    assert_eq!(
+        crate::protocol_frames::history_items_from_frames(&frames),
+        history,
+        "history must equal protocol_frames payload"
+    );
+    assert_eq!(
+        frames,
+        active,
+        "protocol_frames must equal snapshot.active_protocol_frames"
+    );
+    assert_eq!(
+        crate::protocol_frames::history_items_from_frames(&active),
+        history,
+        "history must equal snapshot.active_protocol_frames payload"
+    );
+}
+
+#[test]
+fn session_state_consistency_live_append_three_way() {
+    let mut agent = test_agent();
+    agent
+        .append_history_item(HistoryItem::user("hello"))
+        .expect("user append");
+    agent
+        .append_history_item(HistoryItem::AssistantToolCalls {
+            text: Some("working".into()),
+            reasoning_content: None,
+            calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
+        })
+        .expect("tool call append");
+    agent
+        .append_history_item(HistoryItem::ToolOutput {
+            call_id: "call-fs__read".into(),
+            output_json: r#"{"ok":true}"#.into(),
+            images: Vec::new(),
+        })
+        .expect("tool output append");
+    agent
+        .append_history_item(HistoryItem::assistant("done"))
+        .expect("assistant append");
+    assert_three_way_protocol_consistency(&agent);
+}
+
+#[test]
+fn session_state_consistency_restore_three_way() {
+    let mut agent = test_agent();
+    let history = vec![HistoryItem::user("seed"), HistoryItem::assistant("answer")];
+    agent
+        .restore_session_history(history.clone(), Vec::new(), 3)
+        .expect("restore session history");
+    assert_three_way_protocol_consistency(&agent);
+}
+
+#[tokio::test]
+async fn session_state_consistency_after_manual_compaction_three_way() {
+    let checkpoint = valid_checkpoint("continue validating the active request");
+    let (base_url, _requests, server) =
+        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
+    let mut agent = Agent::new(
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        ),
+        "m1",
+        8,
+        8,
+    );
+    agent.set_default_protocol(ApiProtocol::Completions);
+    agent
+        .replace_history(vec![
+            HistoryItem::user("older request"),
+            HistoryItem::assistant("older work"),
+            HistoryItem::user("active request"),
+            HistoryItem::assistant("active work"),
+        ])
+        .expect("history");
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.turn.turn_id = 10;
+    agent.turn.current_turn_start_index = Some(2);
+    agent.runtime_snapshot.current_turn_id = Some(10);
+    agent.runtime_snapshot.current_segment_id = Some(3);
+
+    let outcome = agent
+        .compact_session_async(|_| std::future::ready(Ok(())))
+        .await
+        .expect("compacts older turns");
+    assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
+    assert_three_way_protocol_consistency(&agent);
+    server.await.expect("server task should finish");
+}
+
+#[test]
+fn session_state_consistency_journal_resume_three_way() {
+    // Oracle Phase-1 priority: real transcript-journal resume projection path
+    // (TranscriptRecorder -> read_records -> project_runtime_restore_snapshot ->
+    // install into Agent) must also yield three-way consistency.
+    let dir = agents_test_dir();
+    let mut rec = TranscriptRecorder::create(&dir).expect("create recorder");
+    rec.record_session_started("m1").expect("session started");
+    let session_id = rec.session_id().to_string();
+    let path = rec.path().to_path_buf();
+    rec.record_user_message("hello").expect("user message");
+    rec.record_turn_started(TurnStartedEvent {
+        turn_id: 1,
+        intent: "engineering".into(),
+        directive: "none".into(),
+        validation_reminder: "none".into(),
+    })
+    .expect("turn started");
+    rec.record_assistant_tool_call_batch(
+        Some("working".into()),
+        None,
+        vec![HistoryToolCall {
+            call_id: "call-1".into(),
+            name: "fs__read".into(),
+            arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+        }],
+    )
+    .expect("tool call batch");
+    rec.record_tool_call_finished(
+        "call-1",
+        "fs__read",
+        true,
+        ToolResult::ok("fs__read", json!({"ok": true})),
+    )
+    .expect("tool call finished");
+    rec.record_assistant_message("done").expect("assistant message");
+    rec.record_turn_finalized(TurnFinalizedEvent {
+        turn_id: 1,
+        outcome: "completed".into(),
+        tool_call_count: 1,
+        continuation_count: 0,
+        write_effects: 0,
+        validation_effects: 0,
+        failed_validation_effects: 0,
+        validation_advisory_emitted: false,
+    })
+    .expect("turn finalized");
+    drop(rec);
+
+    let records = read_records(&path).expect("read records");
+    let projected = project_runtime_restore_snapshot(
+        session_id,
+        records,
+        SessionContextCursor {
+            branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("project runtime restore snapshot");
+
+    let mut agent = test_agent();
+    agent
+        .restore_runtime_snapshot(projected.protocol_frames, projected.snapshot)
+        .expect("restore runtime snapshot");
+    assert_three_way_protocol_consistency(&agent);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn append_history_item_is_atomic_when_protocol_validation_fails() {
     let mut agent = test_agent();
