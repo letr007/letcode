@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-20
+
 ### Added
 
 - 新增 `--version`、`update check` 和交互式 `update` 命令，可从 GitHub Releases 检查并安装新版本；发布产物同步生成 SHA-256 校验清单。
