@@ -1643,9 +1643,9 @@ impl<C: Config> Agent<C> {
             })
             .collect::<Vec<_>>();
         let frames = crate::protocol_frames::history_items_to_frames(&history);
-        self.runtime_snapshot =
-            self.rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
-                .expect("restored transcript messages should remain protocol-compatible");
+        self.runtime_snapshot = self
+            .rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
+            .expect("restored transcript messages should remain protocol-compatible");
         self.clear_resume_proc_local();
     }
 
@@ -1736,10 +1736,7 @@ impl<C: Config> Agent<C> {
 
     /// Install a package previously accepted by
     /// [`Self::validate_runtime_snapshot_restore`]. This mutation is infallible.
-    pub fn install_validated_runtime_snapshot(
-        &mut self,
-        runtime_snapshot: RuntimeSnapshot,
-    ) {
+    pub fn install_validated_runtime_snapshot(&mut self, runtime_snapshot: RuntimeSnapshot) {
         let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
         self.turn = TurnRuntimeState::default();
         self.runtime_snapshot = runtime_snapshot;
@@ -1978,7 +1975,6 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-
     /// Replace the active runtime with the provider's canonical projection.
     /// Unlike refresh, a context scope transition must not retain frames,
     /// contributors, or protocol identity from the outgoing scope.
@@ -2040,7 +2036,8 @@ impl<C: Config> Agent<C> {
             self.turn.current_turn_start_index,
         )?;
         let frames = crate::protocol_frames::history_items_to_frames(&history);
-        self.runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])?;
+        self.runtime_snapshot =
+            self.rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])?;
         self.clear_resume_proc_local();
         Ok(())
     }

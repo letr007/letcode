@@ -1,8 +1,8 @@
 pub mod composer;
 pub mod dialog;
+pub mod diff_render;
 pub mod footer;
 pub mod layout;
-pub mod diff_render;
 pub mod picker;
 pub mod question_card;
 pub mod reviewer_cards;

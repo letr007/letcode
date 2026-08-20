@@ -1953,11 +1953,8 @@ mod tests {
             "flowchart TD\n",
             "C --> D\n",
         );
-        let document = render_markdown_document(
-            source,
-            Theme::dark(),
-            MarkdownRenderOptions::new(80),
-        );
+        let document =
+            render_markdown_document(source, Theme::dark(), MarkdownRenderOptions::new(80));
         let text = document
             .lines
             .iter()
@@ -1978,11 +1975,8 @@ mod tests {
             "> - ```mermaid\n>   flowchart TD\n>   A --> B\n>   ```\n",
             "- outer\n    - ```mermaid\n      flowchart TD\n      A --> B\n      ```\n",
         ] {
-            let document = render_markdown_document(
-                source,
-                Theme::dark(),
-                MarkdownRenderOptions::new(80),
-            );
+            let document =
+                render_markdown_document(source, Theme::dark(), MarkdownRenderOptions::new(80));
             let text = document
                 .lines
                 .iter()

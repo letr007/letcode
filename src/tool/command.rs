@@ -10,11 +10,11 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
+use super::args::required_string;
+use super::delegation::optional_u64;
 use super::fold_artifact::{
     COMMAND_ARTIFACT_DIR, FOLD_PREVIEW_CHARS, FOLD_THRESHOLD_BYTES, fold_preview, write_artifact,
 };
-use super::args::required_string;
-use super::delegation::optional_u64;
 use super::{
     COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream,
     ToolRegistry, workspace_root,

@@ -358,4 +358,3 @@ pub(super) fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str
     }
     flags
 }
-

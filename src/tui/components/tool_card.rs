@@ -1,13 +1,13 @@
-use ratatui::style::{Modifier, Style};
 #[cfg(test)]
 use ratatui::style::Color;
+use ratatui::style::{Modifier, Style};
 #[cfg(test)]
 use ratatui::text::Line;
 use serde_json::Value;
 
-use super::semantic_spans::*;
 pub use super::semantic_spans::ToolCardStatus;
 pub(crate) use super::semantic_spans::truncate_display_width;
+use super::semantic_spans::*;
 use super::{diff_render::*, question_card::*, shell_output::*, subagent_card::*};
 use crate::tui::{
     measure::display_width,
@@ -18,7 +18,6 @@ use crate::tui::{
     timeline::{PermissionPromptStatus, PermissionView, ToolExecutionStatus, ToolView},
     transcript_render::{Break, CopyJoin, Document, SemanticLine, SemanticSpan},
 };
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCardDetails {
@@ -724,7 +723,6 @@ fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::
 
     ratatui::style::Style::default().fg(color).bg(theme.root_bg)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -255,7 +255,6 @@ impl ToolHandler for MkdirTool {
     }
 }
 
-
 async fn list_dir(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let path = existing_workspace_path(required_string(&args, "path")?, &context)?;
     let mut entries = fs::read_dir(&path)

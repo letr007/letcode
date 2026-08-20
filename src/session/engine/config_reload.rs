@@ -303,7 +303,10 @@ pub(crate) fn apply_config_reload(
         .map(|(name, routes)| {
             (
                 name.clone(),
-                routes.iter().map(ModelRoute::display_name).collect::<Vec<_>>(),
+                routes
+                    .iter()
+                    .map(ModelRoute::display_name)
+                    .collect::<Vec<_>>(),
             )
         })
         .collect::<Vec<_>>();

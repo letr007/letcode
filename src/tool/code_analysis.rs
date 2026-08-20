@@ -3,9 +3,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::args::{optional_usize, required_string};
-use super::{
-    ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry,
-};
+use super::{ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry};
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
 
 pub(super) fn register(registry: &mut ToolRegistry) {

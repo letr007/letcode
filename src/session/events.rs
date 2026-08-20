@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
@@ -8,10 +8,10 @@ use crate::agent::{ConversationMessage, LlmRetryLifecycle};
 use crate::permission::PermissionRequest;
 use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
-use crate::user_content::UserMessageSubmission;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
-use crate::transcript::{read_records, TranscriptRecord, TranscriptRecorder};
+use crate::transcript::{TranscriptRecord, TranscriptRecorder, read_records};
+use crate::user_content::UserMessageSubmission;
 
 use crate::session::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,

@@ -2,19 +2,19 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde_json::json;
 
 use crate::agent::{
-    subagent_tool_name_for_agent_name, Agent, SubagentDelegate, SubagentInvocation,
+    Agent, SubagentDelegate, SubagentInvocation, subagent_tool_name_for_agent_name,
 };
 use crate::subagent::{SubagentFailureKind, SubagentPool, SubagentStatus};
 use crate::tool::ToolResult;
 use crate::transcript::TranscriptRecorder;
 
 use super::events::SessionTransportEventSender;
-use super::subagent_event_sender;
 use super::formatting::compact_subagent_summary;
+use super::subagent_event_sender;
 
 pub(super) struct RunnerSubagentDelegate {
     pub(super) runtime: SubagentPool,

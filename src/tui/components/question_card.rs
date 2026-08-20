@@ -262,7 +262,12 @@ pub(super) fn append_question_card_text(
     text_truncated || wrapped_truncated
 }
 
-pub(super) fn question_card_line(text: &str, style: Style, theme: Theme, width: usize) -> SemanticLine<Style> {
+pub(super) fn question_card_line(
+    text: &str,
+    style: Style,
+    theme: Theme,
+    width: usize,
+) -> SemanticLine<Style> {
     question_card_line_with_boundary(text, style, theme, width, Break::HardBreak)
 }
 
@@ -338,4 +343,3 @@ pub(super) fn question_card_text(text: &str) -> (String, bool) {
         (visible, false)
     }
 }
-

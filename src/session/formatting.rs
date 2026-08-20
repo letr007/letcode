@@ -253,11 +253,7 @@ fn folded_suffix(data: &Value, label: &str) -> &'static str {
         .get(format!("{label}_folded"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if folded {
-        " · folded"
-    } else {
-        ""
-    }
+    if folded { " · folded" } else { "" }
 }
 
 fn output_line_count(data: &Value, key: &str, truncated_key: &str) -> Option<String> {

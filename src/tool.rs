@@ -48,13 +48,13 @@ mod search;
 mod web_fetch;
 mod workflow;
 
-pub use registry::ToolRegistry;
-pub use delegation::NormalizedSubagentInput;
 pub(crate) use apply_patch::{PreparedApplyPatch, prepare_apply_patch_targets};
+pub use delegation::NormalizedSubagentInput;
 pub(crate) use delegation::{
     SubagentPathScope, delegation_scope_denial, is_delegation_path_scoped_tool,
     normalize_subagent_input, subagent_parameters_schema,
 };
+pub use registry::ToolRegistry;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const MAX_READ_LINE_LIMIT: usize = 5_000;
@@ -825,7 +825,6 @@ fn required_trimmed_string_field(args: &Value, field: &str, max_chars: usize) ->
     Ok(trimmed.to_string())
 }
 
-
 pub(crate) fn prepare_writable_leaf(path: &str) -> Result<PreparedWritableLeaf> {
     prepare_writable_leaf_platform(path)
 }
@@ -994,8 +993,8 @@ async fn secure_write_writable_leaf(
 mod tests {
     use super::apply_patch::ApplyPatchWorkerPoint;
     use super::{
-        NormalizedSubagentInput, SubagentPathScope, ToolExecutionContext,
-        ToolRegistry, assert_strict_tool_parameters, external_workspace_access_for_tool,
+        NormalizedSubagentInput, SubagentPathScope, ToolExecutionContext, ToolRegistry,
+        assert_strict_tool_parameters, external_workspace_access_for_tool,
         normalize_subagent_input, permission_resource_for_tool, prepare_apply_patch_targets,
         prepare_writable_leaf, secure_write_writable_leaf, subagent_parameters_schema,
     };

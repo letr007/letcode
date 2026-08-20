@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_openai::config::Config;
 use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::agent::{Agent, AgentEvent, SubagentDelegate};
-use crate::agent_event_journal::{persist_agent_event, ContextProjection, JournalEffect};
+use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::PermissionApproval;
 use crate::subagent::SubagentPool;
 use crate::subagent_events::SubagentEventSender;
 use crate::transcript::{
-    read_records, transcript_has_session_title, transcript_has_user_message, TranscriptRecorder,
+    TranscriptRecorder, read_records, transcript_has_session_title, transcript_has_user_message,
 };
 use crate::user_content::{UserMessageContent, UserMessageSubmission};
 
@@ -22,7 +22,6 @@ mod events;
 mod formatting;
 #[path = "subagent_delegate.rs"]
 mod subagent_delegate;
-
 
 use events::SessionTransportEventMode;
 pub(crate) use events::{
@@ -1046,7 +1045,7 @@ mod tests {
     use crate::permission::PermissionRequest;
     use crate::session::{PermissionDecision, SessionEvent};
     use crate::transcript::TranscriptRecorder;
-    use async_openai::{config::OpenAIConfig, Client};
+    use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 

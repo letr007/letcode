@@ -255,4 +255,3 @@ pub(super) fn shell_card_title_style(theme: Theme) -> Style {
 pub(super) fn shell_card_command_style(theme: Theme) -> Style {
     Style::default().fg(theme.text).bg(theme.card_bg())
 }
-

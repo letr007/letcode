@@ -414,7 +414,11 @@ pub(super) fn diff_meta_style(theme: Theme) -> Style {
     Style::default().fg(theme.muted_text).bg(theme.card_bg())
 }
 
-pub(super) fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> SemanticLine<Style> {
+pub(super) fn render_diff_card_header_line(
+    title: &str,
+    theme: Theme,
+    width: usize,
+) -> SemanticLine<Style> {
     let text = format!(" {DIFF_CARD_HEADER_ARROW} {title}");
     render_card_line(
         &[(text, diff_header_style(theme))],
@@ -593,4 +597,3 @@ pub(super) fn diff_card_header_title(label: &str, paths: &[String]) -> String {
         None => label.to_string(),
     }
 }
-

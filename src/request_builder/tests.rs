@@ -331,12 +331,22 @@ fn deepseek_completions_preserves_skill_material_across_developer_messages() {
         .filter(|message| message["role"] == "system")
         .filter_map(|message| message["content"].as_str().map(String::from))
         .collect::<Vec<_>>();
-    assert_eq!(system_texts.len(), 3, "all developer preludes become system: {messages:?}");
+    assert_eq!(
+        system_texts.len(),
+        3,
+        "all developer preludes become system: {messages:?}"
+    );
     assert!(
-        system_texts.iter().any(|text| text.contains("SKILL BODY MAGIC")),
+        system_texts
+            .iter()
+            .any(|text| text.contains("SKILL BODY MAGIC")),
         "skill material must be preserved in the request: {system_texts:?}"
     );
-    assert!(system_texts.iter().any(|text| text.contains("persona stable instructions")));
+    assert!(
+        system_texts
+            .iter()
+            .any(|text| text.contains("persona stable instructions"))
+    );
     assert!(system_texts.iter().any(|text| text.contains("ctf-web")));
 }
 

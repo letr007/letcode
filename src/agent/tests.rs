@@ -539,11 +539,7 @@ fn evidence_has_one_runtime_snapshot_authority_and_failed_candidates_are_atomic(
         test_evidence("ev-duplicate", 2),
         test_evidence("ev-duplicate", 3),
     ]);
-    assert!(
-        agent
-            .restore_runtime_snapshot(invalid_restore)
-            .is_err()
-    );
+    assert!(agent.restore_runtime_snapshot(invalid_restore).is_err());
     assert_eq!(agent.runtime_snapshot.evidence, before);
 
     let mut replacement = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
@@ -2131,13 +2127,18 @@ fn protocol_prefix_digest_is_stable_for_identical_frames_and_sensitive_to_change
 fn protocol_prefix_digest_is_length_sensitive_for_large_tool_output() {
     // 工具输出远超 128 字符的有界前缀，长度不同必须仍能区分（不能退化为前缀-only）。
     let mk = |n: usize| {
-        crate::protocol_frames::ProtocolFrame::derived(crate::protocol_frames::ProtocolItem::ToolOutput {
-            call_id: "c1".into(),
-            output_json: "x".repeat(n),
-            images: Vec::new(),
-        })
+        crate::protocol_frames::ProtocolFrame::derived(
+            crate::protocol_frames::ProtocolItem::ToolOutput {
+                call_id: "c1".into(),
+                output_json: "x".repeat(n),
+                images: Vec::new(),
+            },
+        )
     };
-    assert_ne!(protocol_prefix_digest(&[mk(200)]), protocol_prefix_digest(&[mk(300)]));
+    assert_ne!(
+        protocol_prefix_digest(&[mk(200)]),
+        protocol_prefix_digest(&[mk(300)])
+    );
 }
 
 struct StaticSubagentDelegate {
@@ -2753,8 +2754,7 @@ fn assert_three_way_protocol_consistency(agent: &Agent<OpenAIConfig>) {
         "history must equal protocol_frames payload"
     );
     assert_eq!(
-        frames,
-        active,
+        frames, active,
         "protocol_frames must equal snapshot.active_protocol_frames"
     );
     assert_eq!(
@@ -2937,7 +2937,8 @@ fn session_state_consistency_journal_resume_three_way() {
         ToolResult::ok("fs__read", json!({"ok": true})),
     )
     .expect("tool call finished");
-    rec.record_assistant_message("done").expect("assistant message");
+    rec.record_assistant_message("done")
+        .expect("assistant message");
     rec.record_turn_finalized(TurnFinalizedEvent {
         turn_id: 1,
         outcome: "completed".into(),

@@ -17,9 +17,7 @@ use crate::permission::{PermissionResource, path_preview};
 
 use super::args::required_string;
 use super::paths::{join_workspace_path, workspace_root};
-use super::{
-    ExternalWorkspaceAccess, ToolExecutionContext, ToolHandler, ToolRegistry,
-};
+use super::{ExternalWorkspaceAccess, ToolExecutionContext, ToolHandler, ToolRegistry};
 
 /// An opaque, authorization-time binding for an ApplyPatch batch.
 #[derive(Clone)]
@@ -34,7 +32,6 @@ impl std::fmt::Debug for PreparedApplyPatch {
             .finish()
     }
 }
-
 
 const APPLY_PATCH_CHANGED: &str = "apply patch target changed after authorization";
 const APPLY_PATCH_MODIFIED: &str = "apply patch target was concurrently modified";
@@ -680,7 +677,6 @@ impl ToolHandler for ApplyPatchTool {
         apply_patch(args, context).await
     }
 }
-
 
 pub(super) fn register(registry: &mut ToolRegistry) {
     registry.register(ApplyPatchTool);

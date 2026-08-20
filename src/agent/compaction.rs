@@ -233,10 +233,7 @@ fn compacted_protocol_frames<C: Config>(
     let mut frames = candidate_frames.to_vec();
     let mut candidate_index = 1usize; // The compacted summary always gets a new identity.
     for old_index in cut.cut_end..live_frames.len() {
-        inherit_protocol_identity(
-            frames.get_mut(candidate_index),
-            live_frames.get(old_index),
-        )?;
+        inherit_protocol_identity(frames.get_mut(candidate_index), live_frames.get(old_index))?;
         candidate_index += 1;
     }
     anyhow::ensure!(
@@ -518,7 +515,8 @@ where
 fn sync_compaction_workflow_authority<C: Config>(agent: &mut Agent<C>) {
     // Transcript-projected history is authoritative after reload; drop stale
     // live turn counters and rebuild todos from the durable tool trail.
-    agent.turn.workflow.todos = latest_todos_from_history(&agent.active_history_items()).unwrap_or_default();
+    agent.turn.workflow.todos =
+        latest_todos_from_history(&agent.active_history_items()).unwrap_or_default();
     agent.turn.counters.validation_effects = 0;
     agent.turn.counters.failed_validation_effects = 0;
     agent.turn.counters.child_validation_effects = 0;
@@ -985,7 +983,9 @@ mod transaction_tests {
     async fn rejected_durable_compaction_does_not_change_live_history() {
         let mut agent = test_agent();
         let original = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
-        agent.replace_history(original.clone()).expect("seed history");
+        agent
+            .replace_history(original.clone())
+            .expect("seed history");
         let candidate = prepared(
             &agent,
             vec![
@@ -1010,7 +1010,10 @@ mod transaction_tests {
     async fn acknowledged_provider_compaction_reloads_the_canonical_projection() {
         let mut agent = test_agent();
         agent
-            .replace_history(vec![HistoryItem::user("old"), HistoryItem::assistant("reply")])
+            .replace_history(vec![
+                HistoryItem::user("old"),
+                HistoryItem::assistant("reply"),
+            ])
             .expect("seed history");
         let expected = vec![HistoryItem::context_summary("persisted summary")];
         let mut projected = RuntimeSnapshot::new("main");
@@ -1052,7 +1055,10 @@ mod transaction_tests {
     async fn acknowledged_durable_compaction_installs_exact_candidate() {
         let mut agent = test_agent();
         agent
-            .replace_history(vec![HistoryItem::user("old"), HistoryItem::assistant("reply")])
+            .replace_history(vec![
+                HistoryItem::user("old"),
+                HistoryItem::assistant("reply"),
+            ])
             .expect("seed history");
         let expected = vec![
             HistoryItem::context_summary("summary"),

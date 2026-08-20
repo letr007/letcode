@@ -69,7 +69,8 @@ pub(crate) fn plan_turn_cut_with_transcript(
     if requested_boundary <= base_start {
         return Ok(None);
     }
-    let mut cut_end = canonical_compaction_boundary_with_transcript(transcript, requested_boundary)?;
+    let mut cut_end =
+        canonical_compaction_boundary_with_transcript(transcript, requested_boundary)?;
     if let Some(first_incomplete) = transcript
         .tool_call_groups
         .iter()

@@ -37,8 +37,8 @@ use std::io::{self, Write};
 mod model;
 mod session_index;
 
-pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
 pub(crate) use model::TranscriptFileFingerprint;
+pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

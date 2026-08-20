@@ -5,8 +5,8 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::tui::{
-    surface,
     measure::display_width,
+    surface,
     theme::Theme,
     timeline::{ToolExecutionStatus, ToolView},
     transcript_render::{Break, SemanticLine, SemanticSpan},
@@ -241,7 +241,9 @@ pub(super) enum CsiOutcome {
 }
 
 /// Consume CSI parameter/intermediate bytes through the final byte (`@`..=`~`).
-pub(super) fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> CsiOutcome {
+pub(super) fn consume_csi_sequence(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> CsiOutcome {
     let mut sequence = String::new();
     let mut saw_final = false;
     let mut final_byte = '\0';
@@ -445,7 +447,11 @@ pub(super) fn max_body_lines() -> usize {
     120
 }
 
-pub(super) fn format_with_optional_fields(prefix: &str, subject: &str, fields: Vec<String>) -> String {
+pub(super) fn format_with_optional_fields(
+    prefix: &str,
+    subject: &str,
+    fields: Vec<String>,
+) -> String {
     if fields.is_empty() {
         format!("{prefix} {subject}")
     } else {
@@ -523,7 +529,6 @@ pub fn truncate_display_width(text: &str, width: usize) -> String {
     out.push('…');
     out
 }
-
 
 pub(crate) fn render_card_line(
     segments: &[(String, Style)],
@@ -609,7 +614,6 @@ pub(super) fn render_card_line_with_guide(
     SemanticLine { spans, boundary }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardStatus {
     Pending,
@@ -631,7 +635,10 @@ pub(super) fn map_tool_status(status: ToolExecutionStatus) -> ToolCardStatus {
     }
 }
 
-pub(super) fn status_label(status: ToolCardStatus, translator: &crate::tui::i18n::Translator) -> String {
+pub(super) fn status_label(
+    status: ToolCardStatus,
+    translator: &crate::tui::i18n::Translator,
+) -> String {
     translator.t(match status {
         ToolCardStatus::Pending => "status.pending",
         ToolCardStatus::Approved => "status.approved",
@@ -643,7 +650,10 @@ pub(super) fn status_label(status: ToolCardStatus, translator: &crate::tui::i18n
     })
 }
 
-pub(super) fn root_status_style(color: ratatui::style::Color, theme: Theme) -> ratatui::style::Style {
+pub(super) fn root_status_style(
+    color: ratatui::style::Color,
+    theme: Theme,
+) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(color)
         .bg(theme.root_bg)
@@ -657,4 +667,3 @@ pub(super) fn shell_card_content_width(width: usize) -> usize {
         .saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2)
         .max(1)
 }
-
