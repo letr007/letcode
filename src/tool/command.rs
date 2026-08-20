@@ -567,7 +567,7 @@ async fn fold_bytes_output(bytes: &[u8], ext: &str) -> StreamOutput {
 }
 
 fn add_stream_fields(map: &mut serde_json::Map<String, Value>, label: &str, stream: &StreamOutput) {
-    map.insert(format!("{label}"), json!(stream.text));
+    map.insert(label.to_string(), json!(stream.text));
     map.insert(format!("{label}_truncated"), json!(stream.truncated));
     if stream.folded {
         map.insert(format!("{label}_folded"), json!(true));

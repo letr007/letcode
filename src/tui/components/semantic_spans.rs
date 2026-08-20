@@ -172,7 +172,6 @@ pub(super) fn terminal_safe_text(text: &str) -> String {
 /// Contract: segment text never contains control characters. SGR becomes style;
 /// other CSI/OSC/C0 and truncated escapes are dropped so VT state cannot escape
 /// into the ratatui write path.
-
 pub(super) fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, Style)> {
     // Progress bars overwrite with CR; only the suffix after the last CR is visible.
     let text = text.rsplit('\r').next().unwrap_or(text);
@@ -242,7 +241,6 @@ pub(super) enum CsiOutcome {
 }
 
 /// Consume CSI parameter/intermediate bytes through the final byte (`@`..=`~`).
-
 pub(super) fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> CsiOutcome {
     let mut sequence = String::new();
     let mut saw_final = false;
@@ -280,7 +278,6 @@ pub(super) fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Cha
 }
 
 /// Consume OSC through BEL or ST (`ESC \`). Incomplete OSC is dropped.
-
 pub(super) fn consume_osc_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
     while let Some(next) = chars.next() {
         if next == '\u{07}' {
