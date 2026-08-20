@@ -39,11 +39,12 @@ mod tool_format;
 mod tool_names;
 mod transcript;
 mod tui;
+mod updater;
 mod user_content;
 
 use agent::{Agent, ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
 use anchored_bootstrap::AnchoredBootstrap;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_openai::config::OpenAIConfig;
 use config::AppConfig;
 use delegation::supported_agent_names;
@@ -78,8 +79,18 @@ use tui::runtime::{AvailableExpert, AvailableModel};
 async fn main() -> Result<()> {
     let options = CliOptions::parse()?;
     dotenvy::dotenv().ok();
-    if let EntryMode::ValidateConfig { path } = options.entry_mode {
-        return run_config_validate(path);
+    match options.entry_mode {
+        EntryMode::ValidateConfig { path } => return run_config_validate(path),
+        EntryMode::Version => {
+            println!("letcode {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        EntryMode::Update { check_only } => {
+            return tokio::task::spawn_blocking(move || updater::run(check_only))
+                .await
+                .context("updater task failed")?;
+        }
+        _ => {}
     }
     let config = AppConfig::load()?;
     let _tracing_guards = init_tracing(&config.global.log_file);
@@ -248,8 +259,8 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        EntryMode::ValidateConfig { .. } => {
-            unreachable!("config validate exits before AppConfig::load")
+        EntryMode::ValidateConfig { .. } | EntryMode::Version | EntryMode::Update { .. } => {
+            unreachable!("early command exits before AppConfig::load")
         }
     }
 
@@ -335,6 +346,8 @@ enum EntryMode {
     Tui,
     Resume { session_id: String },
     ValidateConfig { path: Option<String> },
+    Version,
+    Update { check_only: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +411,27 @@ impl CliOptions {
                         }
                         other => bail!("unknown config subcommand: {other}"),
                     }
+                }
+                "--version" | "-V" | "version" => {
+                    if args.next().is_some() {
+                        bail!("version accepts no arguments");
+                    }
+                    return Ok(Self {
+                        entry_mode: EntryMode::Version,
+                    });
+                }
+                "update" => {
+                    let check_only = match args.next() {
+                        None => false,
+                        Some(value) if value.as_ref() == "check" => true,
+                        Some(value) => bail!("unknown update subcommand: {}", value.as_ref()),
+                    };
+                    if args.next().is_some() {
+                        bail!("update accepts at most one subcommand (check)");
+                    }
+                    return Ok(Self {
+                        entry_mode: EntryMode::Update { check_only },
+                    });
                 }
                 "--json" => {
                     json = true;
@@ -830,11 +864,36 @@ mod tests {
     }
 
     #[test]
+    fn cli_options_parse_version_and_update_commands() {
+        assert_eq!(
+            CliOptions::parse_from(["--version"])
+                .expect("version should parse")
+                .entry_mode,
+            EntryMode::Version
+        );
+        assert_eq!(
+            CliOptions::parse_from(["update"])
+                .expect("update should parse")
+                .entry_mode,
+            EntryMode::Update { check_only: false }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["update", "check"])
+                .expect("update check should parse")
+                .entry_mode,
+            EntryMode::Update { check_only: true }
+        );
+    }
+
+    #[test]
     fn cli_options_reject_invalid_args() {
         assert!(CliOptions::parse_from(["--bogus"]).is_err());
         assert!(CliOptions::parse_from(["--prompt"]).is_err());
         assert!(CliOptions::parse_from(["--prompt", "--json"]).is_err());
         assert!(CliOptions::parse_from(["--json"]).is_err());
+        assert!(CliOptions::parse_from(["version", "extra"]).is_err());
+        assert!(CliOptions::parse_from(["update", "latest"]).is_err());
+        assert!(CliOptions::parse_from(["update", "check", "extra"]).is_err());
     }
 }
 

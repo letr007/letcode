@@ -42,7 +42,20 @@ cargo run -- --cli
 
 CLI 模式也可以通过 `cli` 或 `repl` 选择。TUI 可以通过 `--tui` 或 `tui` 显式选择。
 
-TUI 支持 English（`en`）和简体中文（`zh-CN`）。运行时可使用 `/language` 或别名 `/lang` 切换语言。未显式选择时，TUI 跟随系统 locale，将 `zh*` 映射为 `zh-CN`，不支持的 locale 回退到 English。显式选择会保存到 `tui-preferences.json` 的 `language` 字段。
+查看已安装版本并检查 GitHub Release 中的新版本：
+
+```sh
+letcode --version
+letcode update check
+```
+
+确认后更新通过 Release 安装的二进制：
+
+```sh
+letcode update
+```
+
+TUI 支持 English（`en`）和简体中文（`zh-CN`）。运行时可使用 `/language` 或别名 `/lang` 切换语言。
 
 ## 配置
 

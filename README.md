@@ -42,7 +42,20 @@ cargo run -- --cli
 
 CLI mode can also be selected with `cli` or `repl`. TUI can be selected explicitly with `--tui` or `tui`.
 
-The TUI supports English (`en`) and Simplified Chinese (`zh-CN`). Use `/language` or its `/lang` alias to switch languages at runtime. Without an explicit choice, it follows the system locale, mapping `zh*` to `zh-CN` and falling back to English for unsupported locales. An explicit choice is stored in the `language` field of `tui-preferences.json`.
+Show the installed version and check for a newer GitHub release:
+
+```sh
+letcode --version
+letcode update check
+```
+
+Update a release-installed binary after an interactive confirmation:
+
+```sh
+letcode update
+```
+
+The TUI supports English (`en`) and Simplified Chinese (`zh-CN`). Use `/language` or its `/lang` alias to switch languages at runtime.
 
 ## Configuration
 
