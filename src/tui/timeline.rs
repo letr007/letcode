@@ -12,7 +12,10 @@ use crate::agent::{ConversationMessage, ConversationRole};
 use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
@@ -313,26 +316,6 @@ fn is_runtime_context_section(text: &str) -> bool {
     )
 }
 
-fn successful_subagent_reconciliation(event: &ToolFinishedEvent) -> Option<(String, String)> {
-    if event.name != "agent__reconcile" || event.outcome != ToolOutcome::Success {
-        return None;
-    }
-
-    let output = serde_json::from_str::<serde_json::Value>(event.output.as_deref()?).ok()?;
-    if output.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return None;
-    }
-    let data = output.get("data")?;
-    if data.get("reconciled").and_then(serde_json::Value::as_bool) != Some(true) {
-        return None;
-    }
-
-    Some((
-        data.get("run_id")?.as_str()?.to_string(),
-        data.get("child_session_id")?.as_str()?.to_string(),
-    ))
-}
-
 fn append_streaming_tool_output(
     tool: &mut ToolView,
     stream: crate::tool::ToolOutputStream,
@@ -443,6 +426,8 @@ pub struct Timeline {
     mutation_revision: u64,
     cache_id: u64,
     last_reasoning_tick_second: Option<u64>,
+    tool_indices: HashMap<String, usize>,
+    permission_indices: HashMap<String, usize>,
 }
 
 impl PartialEq for Timeline {
@@ -462,6 +447,8 @@ impl Default for Timeline {
             mutation_revision: 0,
             cache_id: next_timeline_cache_id(),
             last_reasoning_tick_second: None,
+            tool_indices: HashMap::new(),
+            permission_indices: HashMap::new(),
         }
     }
 }
@@ -534,17 +521,34 @@ impl Timeline {
         if is_queued_user_item(&item) {
             self.items.push(item);
             self.revisions.push(revision);
-            return;
-        }
-
-        if let Some(index) = self.items.iter().position(is_queued_user_item) {
+        } else if let Some(index) = self.items.iter().position(is_queued_user_item) {
             self.items.insert(index, item);
             self.revisions.insert(index, revision);
-            return;
+        } else {
+            self.items.push(item);
+            self.revisions.push(revision);
         }
+        self.rebuild_lookup_indices();
+    }
 
-        self.items.push(item);
-        self.revisions.push(revision);
+    fn rebuild_lookup_indices(&mut self) {
+        self.tool_indices.clear();
+        self.permission_indices.clear();
+        for (index, item) in self.items.iter().enumerate() {
+            match item {
+                TimelineItem::Tool(tool) => {
+                    self.tool_indices
+                        .entry(tool.call_id.clone())
+                        .or_insert(index);
+                }
+                TimelineItem::Permission(permission) => {
+                    self.permission_indices
+                        .entry(permission.call_id.clone())
+                        .or_insert(index);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn bump_revision(&mut self, index: usize) {
@@ -571,6 +575,7 @@ impl Timeline {
             if index < self.revisions.len() {
                 self.revisions.remove(index);
             }
+            self.rebuild_lookup_indices();
             self.mark_mutated();
         }
     }
@@ -725,6 +730,7 @@ impl Timeline {
 
         self.items = retained_items;
         self.revisions = retained_revisions;
+        self.rebuild_lookup_indices();
         if self.items.len() != original_len {
             self.mark_mutated();
         }
@@ -746,6 +752,7 @@ impl Timeline {
 
         self.items.remove(index);
         self.revisions.remove(index);
+        self.rebuild_lookup_indices();
         self.mark_mutated();
         true
     }
@@ -965,7 +972,6 @@ impl Timeline {
     }
 
     pub fn push_tool_finished(&mut self, event: ToolFinishedEvent) -> bool {
-        let reconciliation = successful_subagent_reconciliation(&event);
         if let Some(index) = self.find_tool_index(&event.call_id) {
             if let TimelineItem::Tool(tool) = &mut self.items[index] {
                 if tool.status == ToolExecutionStatus::Cancelled {
@@ -994,56 +1000,7 @@ impl Timeline {
             }));
         }
 
-        if let Some((run_id, child_session_id)) = reconciliation {
-            self.reconcile_subagent_result(&run_id, &child_session_id);
-        }
         true
-    }
-
-    fn reconcile_subagent_result(&mut self, run_id: &str, child_session_id: &str) {
-        let Some(index) = self.items.iter().position(|item| {
-            let TimelineItem::Tool(tool) = item else {
-                return false;
-            };
-            if !is_subagent_tool_name(&tool.name) {
-                return false;
-            }
-            let Some(output) = tool.output.as_deref() else {
-                return false;
-            };
-            let Ok(output) = serde_json::from_str::<serde_json::Value>(output) else {
-                return false;
-            };
-            let Some(data) = output.get("data") else {
-                return false;
-            };
-            data.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
-                && data
-                    .get("child_session_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(child_session_id)
-        }) else {
-            return;
-        };
-
-        if let TimelineItem::Tool(tool) = &mut self.items[index] {
-            let Some(output) = tool.output.as_deref() else {
-                return;
-            };
-            let Ok(mut output) = serde_json::from_str::<serde_json::Value>(output) else {
-                return;
-            };
-            let Some(data) = output
-                .get_mut("data")
-                .and_then(serde_json::Value::as_object_mut)
-            else {
-                return;
-            };
-            data.insert("unreconciled".into(), serde_json::Value::Bool(false));
-            data.insert("reconciled".into(), serde_json::Value::Bool(true));
-            tool.output = Some(output.to_string());
-        }
-        self.bump_revision(index);
     }
 
     pub fn push_tool_output_delta(&mut self, event: ToolOutputDeltaEvent) -> bool {
@@ -1387,17 +1344,11 @@ impl Timeline {
     }
 
     fn find_tool_index(&self, call_id: &str) -> Option<usize> {
-        self.items.iter().position(|item| match item {
-            TimelineItem::Tool(tool) => tool.call_id == call_id,
-            _ => false,
-        })
+        self.tool_indices.get(call_id).copied()
     }
 
     fn find_permission_index(&self, call_id: &str) -> Option<usize> {
-        self.items.iter().position(|item| match item {
-            TimelineItem::Permission(permission) => permission.call_id == call_id,
-            _ => false,
-        })
+        self.permission_indices.get(call_id).copied()
     }
 
     fn has_streaming_reasoning(&self) -> bool {
@@ -1631,138 +1582,6 @@ mod tests {
             &timeline.items()[1],
             TimelineItem::User(message) if message.text == "continue"
         ));
-    }
-
-    fn successful_reconciliation_output(run_id: &str, child_session_id: &str) -> String {
-        json!({
-            "ok": true,
-            "tool": "agent__reconcile",
-            "data": {
-                "run_id": run_id,
-                "child_session_id": child_session_id,
-                "reconciled": true,
-            }
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn successful_reconcile_updates_matching_subagent_card_by_stable_ids() {
-        let mut timeline = Timeline::new();
-        timeline.push_tool_finished(ToolFinishedEvent {
-            call_id: "subagent-1".into(),
-            name: "agent__fixer".into(),
-            summary: "completed".into(),
-            outcome: ToolOutcome::Success,
-            output: Some(
-                json!({
-                    "ok": true,
-                    "tool": "agent__fixer",
-                    "data": {
-                        "run_id": "run-1",
-                        "child_session_id": "child-1",
-                        "unreconciled": true,
-                        "reconciled": false,
-                    }
-                })
-                .to_string(),
-            ),
-        });
-        timeline.push_tool_finished(ToolFinishedEvent {
-            call_id: "subagent-2".into(),
-            name: "agent__fixer".into(),
-            summary: "completed".into(),
-            outcome: ToolOutcome::Success,
-            output: Some(
-                json!({
-                    "ok": true,
-                    "tool": "agent__fixer",
-                    "data": {
-                        "run_id": "run-2",
-                        "child_session_id": "child-2",
-                        "unreconciled": true,
-                        "reconciled": false,
-                    }
-                })
-                .to_string(),
-            ),
-        });
-
-        timeline.push_tool_finished(ToolFinishedEvent {
-            call_id: "reconcile-1".into(),
-            name: "agent__reconcile".into(),
-            summary: "reconciled".into(),
-            outcome: ToolOutcome::Success,
-            output: Some(successful_reconciliation_output("run-1", "child-1")),
-        });
-
-        let subagent_data = |index| match &timeline.items()[index] {
-            TimelineItem::Tool(tool) => serde_json::from_str::<serde_json::Value>(
-                tool.output.as_deref().expect("subagent output"),
-            )
-            .expect("valid subagent output")["data"]
-                .clone(),
-            other => panic!("expected tool item, got {other:?}"),
-        };
-        assert_eq!(subagent_data(0)["unreconciled"], json!(false));
-        assert_eq!(subagent_data(0)["reconciled"], json!(true));
-        assert_eq!(subagent_data(1)["unreconciled"], json!(true));
-        assert_eq!(subagent_data(1)["reconciled"], json!(false));
-    }
-
-    #[test]
-    fn failed_or_invalid_reconcile_does_not_update_subagent_card() {
-        let mut timeline = Timeline::new();
-        timeline.push_tool_finished(ToolFinishedEvent {
-            call_id: "subagent-1".into(),
-            name: "agent__fixer".into(),
-            summary: "completed".into(),
-            outcome: ToolOutcome::Success,
-            output: Some(
-                json!({
-                    "ok": true,
-                    "tool": "agent__fixer",
-                    "data": {
-                        "run_id": "run-1",
-                        "child_session_id": "child-1",
-                        "unreconciled": true,
-                        "reconciled": false,
-                    }
-                })
-                .to_string(),
-            ),
-        });
-
-        for (call_id, outcome, output) in [
-            (
-                "reconcile-failed",
-                ToolOutcome::Failure,
-                successful_reconciliation_output("run-1", "child-1"),
-            ),
-            (
-                "reconcile-invalid",
-                ToolOutcome::Success,
-                json!({"ok": true, "data": {"reconciled": true}}).to_string(),
-            ),
-        ] {
-            timeline.push_tool_finished(ToolFinishedEvent {
-                call_id: call_id.into(),
-                name: "agent__reconcile".into(),
-                summary: "reconcile".into(),
-                outcome,
-                output: Some(output),
-            });
-        }
-
-        let TimelineItem::Tool(tool) = &timeline.items()[0] else {
-            panic!("expected subagent tool item");
-        };
-        let output = serde_json::from_str::<serde_json::Value>(
-            tool.output.as_deref().expect("subagent output"),
-        )
-        .expect("valid subagent output");
-        assert_eq!(output["data"]["unreconciled"], json!(true));
-        assert_eq!(output["data"]["reconciled"], json!(false));
     }
 
     #[test]

@@ -38,7 +38,9 @@ use super::theme_file::{
 #[cfg(test)]
 use crate::session::RunnerPermissionRequest;
 use crate::session::runner::ModelCatalogUpdatedEvent;
-use crate::session::{RunnerQuestionRequest, SessionEngine, SessionTransportEvent};
+use crate::session::{
+    RunnerQuestionRequest, SessionEngine, SessionEngineIngress, SessionTransportEvent,
+};
 use assistant::{AssistantTypewriter, assistant_delta_event, assistant_delta_parts};
 #[path = "runtime/assistant.rs"]
 mod assistant;
@@ -83,6 +85,43 @@ use std::sync::Mutex as StdMutex;
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
+const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
+const MAX_SESSION_EVENT_TIME_PER_FRAME: Duration = Duration::from_millis(4);
+const MAX_INPUT_EVENTS_PER_FRAME: usize = 64;
+
+struct SessionEventBudget {
+    started_at: Instant,
+    consumed: usize,
+    received: usize,
+}
+
+impl SessionEventBudget {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            consumed: 0,
+            received: 0,
+        }
+    }
+
+    fn can_receive(&self) -> bool {
+        self.received < MAX_SESSION_EVENTS_PER_FRAME
+            && self.started_at.elapsed() < MAX_SESSION_EVENT_TIME_PER_FRAME
+    }
+
+    fn receive(&mut self) {
+        self.received = self.received.saturating_add(1);
+    }
+
+    fn can_process(&self) -> bool {
+        self.consumed < MAX_SESSION_EVENTS_PER_FRAME
+            && self.started_at.elapsed() < MAX_SESSION_EVENT_TIME_PER_FRAME
+    }
+
+    fn consume(&mut self) {
+        self.consumed = self.consumed.saturating_add(1);
+    }
+}
 
 /// Compatibility alias: session commands are owned by the backend boundary.
 pub type RuntimeCommand = crate::session::SessionCommand;
@@ -466,25 +505,170 @@ impl TuiRuntime {
 }
 
 // ── 会话事件归约与后台轮询 ─────────────────────
+fn enqueue_merged_event(queue: &mut VecDeque<SessionTransportEvent>, event: SessionTransportEvent) {
+    if let Some(previous) = queue.back_mut()
+        && try_merge_adjacent_transport_events(previous, &event)
+    {
+        return;
+    }
+    queue.push_back(event);
+}
+
+fn try_merge_adjacent_transport_events(
+    previous: &mut SessionTransportEvent,
+    next: &SessionTransportEvent,
+) -> bool {
+    if let (
+        SessionTransportEvent::AssistantDelta(previous),
+        SessionTransportEvent::AssistantDelta(next),
+    ) = (&mut *previous, next)
+        && previous.message_id == next.message_id
+    {
+        previous.delta.push_str(&next.delta);
+        return true;
+    }
+    if let (
+        SessionTransportEvent::ReasoningDelta(previous),
+        SessionTransportEvent::ReasoningDelta(next),
+    ) = (&mut *previous, next)
+        && previous.item_id == next.item_id
+    {
+        previous.delta.push_str(&next.delta);
+        return true;
+    }
+    if let (
+        SessionTransportEvent::ToolOutputDelta(previous),
+        SessionTransportEvent::ToolOutputDelta(next),
+    ) = (&mut *previous, next)
+        && previous.call_id == next.call_id
+        && previous.stream == next.stream
+    {
+        previous.chunk.push_str(&next.chunk);
+        return true;
+    }
+    if let (
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id: previous_child,
+            agent_name: previous_agent,
+            parent_tool_call_id: previous_parent,
+            event: previous_event,
+        },
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id: next_child,
+            agent_name: next_agent,
+            parent_tool_call_id: next_parent,
+            event: next_event,
+        },
+    ) = (&mut *previous, next)
+        && previous_child == next_child
+        && previous_agent == next_agent
+        && previous_parent == next_parent
+        && try_merge_adjacent_session_events(previous_event, next_event)
+    {
+        return true;
+    }
+    false
+}
+
+fn try_merge_adjacent_session_events(previous: &mut SessionEvent, next: &SessionEvent) -> bool {
+    if let (SessionEvent::AssistantDelta(previous), SessionEvent::AssistantDelta(next)) =
+        (&mut *previous, next)
+        && previous.message_id == next.message_id
+    {
+        previous.delta.push_str(&next.delta);
+        return true;
+    }
+    if let (SessionEvent::ReasoningDelta(previous), SessionEvent::ReasoningDelta(next)) =
+        (&mut *previous, next)
+        && previous.item_id == next.item_id
+    {
+        previous.delta.push_str(&next.delta);
+        return true;
+    }
+    if let (SessionEvent::ToolOutputDelta(previous), SessionEvent::ToolOutputDelta(next)) =
+        (&mut *previous, next)
+        && previous.call_id == next.call_id
+        && previous.stream == next.stream
+    {
+        previous.chunk.push_str(&next.chunk);
+        return true;
+    }
+    false
+}
+
+fn process_terminal_event(
+    runtime: &mut TuiRuntime,
+    event: Event,
+    ingress: &SessionEngineIngress,
+) -> Result<()> {
+    match event {
+        Event::Key(key) => {
+            // Windows may report key-up records as key events; only handle presses.
+            if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+            let action = map_key_event(runtime.state(), key);
+            if let Some(command) = runtime.handle_input_action(action)? {
+                command_dispatch::dispatch_command(runtime, command, ingress, true);
+            }
+        }
+        Event::Mouse(mouse) => {
+            let action = map_mouse_event(runtime.state(), mouse);
+            if let Some(command) = runtime.handle_input_action(action)? {
+                command_dispatch::dispatch_command(runtime, command, ingress, false);
+            }
+        }
+        Event::Paste(text) => {
+            let action = map_paste_event(runtime.state(), text);
+            if let Some(command) = runtime.handle_input_action(action)? {
+                command_dispatch::dispatch_command(runtime, command, ingress, false);
+            }
+        }
+        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+    }
+    Ok(())
+}
+
 impl TuiRuntime {
     pub fn try_drain_session_events(&mut self) {
-        // Leave time in every frame for terminal input. In particular, an
-        // unbounded stream of model deltas must not prevent a confirmed Esc
-        // from reaching the session engine.
-        const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
-        self.advance_assistant_typewriter(Instant::now());
+        // Leave both time and event slots in every frame for terminal input.
+        // An unbounded model stream must not delay a confirmed Esc indefinitely.
+        let mut budget = SessionEventBudget::new();
+        self.advance_assistant_typewriter_with_budget(Instant::now(), &mut budget);
         self.poll_session_list();
         self.poll_update_check();
         self.poll_git_branch();
-        for _ in 0..MAX_SESSION_EVENTS_PER_FRAME {
+
+        let mut batch = VecDeque::new();
+        let mut stream_closed = false;
+        while budget.can_receive() {
             match self.session_transport_rx.try_recv() {
-                Ok(event) => self.consume_session_transport_event(event),
+                Ok(event) => {
+                    budget.receive();
+                    enqueue_merged_event(&mut batch, event);
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.handle_session_event_stream_closed();
+                    stream_closed = true;
                     break;
                 }
             }
+        }
+        while budget.can_process() {
+            let Some(event) = batch.pop_front() else {
+                break;
+            };
+            budget.consume();
+            self.consume_session_transport_event(event);
+        }
+        // Preserve events that were received but could not be applied within this
+        // frame. They remain ordered after already-deferred work and are handled by
+        // the same budget on the next frame.
+        while let Some(event) = batch.pop_front() {
+            self.enqueue_deferred_session_event(event);
+        }
+        if stream_closed {
+            self.handle_session_event_stream_closed();
         }
     }
 
@@ -567,7 +751,7 @@ impl TuiRuntime {
 
     fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
         if !self.deferred_session_events.is_empty() {
-            self.deferred_session_events.push_back(event);
+            self.enqueue_deferred_session_event(event);
             return;
         }
 
@@ -588,10 +772,14 @@ impl TuiRuntime {
         }
 
         if self.assistant_typewriter.is_some() || !self.deferred_session_events.is_empty() {
-            self.deferred_session_events.push_back(event);
+            self.enqueue_deferred_session_event(event);
         } else {
             self.apply_session_transport_event(event);
         }
+    }
+
+    fn enqueue_deferred_session_event(&mut self, event: SessionTransportEvent) {
+        enqueue_merged_event(&mut self.deferred_session_events, event);
     }
 
     #[cfg(test)]
@@ -601,18 +789,31 @@ impl TuiRuntime {
             .as_ref()
             .map(|typewriter| typewriter.last_frame_at + elapsed)
             .unwrap_or_else(Instant::now);
-        self.advance_assistant_typewriter(now);
+        let mut budget = SessionEventBudget {
+            started_at: Instant::now(),
+            consumed: 0,
+            received: 0,
+        };
+        self.advance_assistant_typewriter_with_budget(now, &mut budget);
     }
 
-    fn advance_assistant_typewriter(&mut self, now: Instant) {
+    fn advance_assistant_typewriter_with_budget(
+        &mut self,
+        now: Instant,
+        budget: &mut SessionEventBudget,
+    ) {
         let catch_up = !self.deferred_session_events.is_empty();
-        let event = self.assistant_typewriter.as_mut().and_then(|typewriter| {
-            let delta = typewriter.take_frame(now, catch_up);
-            (!delta.is_empty())
-                .then(|| assistant_delta_event(&typewriter.stream, &typewriter.agent_name, delta))
-        });
-        if let Some(event) = event {
-            self.apply_session_transport_event(event);
+        if self.assistant_typewriter.is_some() && budget.can_process() {
+            let event = self.assistant_typewriter.as_mut().and_then(|typewriter| {
+                let delta = typewriter.take_frame(now, catch_up);
+                (!delta.is_empty()).then(|| {
+                    assistant_delta_event(&typewriter.stream, &typewriter.agent_name, delta)
+                })
+            });
+            if let Some(event) = event {
+                budget.consume();
+                self.apply_session_transport_event(event);
+            }
         }
         if catch_up
             && self
@@ -621,15 +822,20 @@ impl TuiRuntime {
                 .is_some_and(|typewriter| typewriter.pending.is_empty())
         {
             self.assistant_typewriter = None;
-            self.apply_deferred_session_events();
         }
+        self.apply_deferred_session_events_with_budget(budget);
     }
 
-    fn apply_deferred_session_events(&mut self) {
-        while self.assistant_typewriter.is_none() {
-            let Some(event) = self.deferred_session_events.pop_front() else {
-                break;
-            };
+    fn apply_deferred_session_events_with_budget(&mut self, budget: &mut SessionEventBudget) {
+        while self.assistant_typewriter.is_none()
+            && !self.deferred_session_events.is_empty()
+            && budget.can_process()
+        {
+            let event = self
+                .deferred_session_events
+                .pop_front()
+                .expect("deferred queue checked above");
+            budget.consume();
             if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
                 let now = Instant::now();
                 let mut typewriter = AssistantTypewriter::new(stream, agent_name, now);
@@ -3939,6 +4145,12 @@ pub async fn run_tui(
         }
 
         loop {
+            for _ in 0..MAX_INPUT_EVENTS_PER_FRAME {
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+                process_terminal_event(&mut runtime, event::read()?, &ingress)?;
+            }
             runtime.try_drain_session_events();
             if let Some(command) = runtime.take_next_queued_prompt_command() {
                 command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
@@ -3956,49 +4168,7 @@ pub async fn run_tui(
                 break;
             }
             if event::poll(TUI_FRAME_POLL_INTERVAL)? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        // Windows 的 ReadConsoleInput 会同时上报 key-down/key-up
-                        // 记录，crossterm 把它们都转换为 KeyEvent；只处理 Press
-                        // 否则每个按键会被插入多次（如 `s` 变成 `sss`）。
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-                        let action = map_key_event(runtime.state(), key);
-                        if let Some(command) = runtime.handle_input_action(action)? {
-                            command_dispatch::dispatch_command(
-                                &mut runtime,
-                                command,
-                                &ingress,
-                                true,
-                            );
-                        }
-                    }
-                    Event::Mouse(mouse) => {
-                        let action = map_mouse_event(runtime.state(), mouse);
-                        if let Some(command) = runtime.handle_input_action(action)? {
-                            command_dispatch::dispatch_command(
-                                &mut runtime,
-                                command,
-                                &ingress,
-                                false,
-                            );
-                        }
-                    }
-                    Event::Paste(text) => {
-                        let action = map_paste_event(runtime.state(), text);
-                        if let Some(command) = runtime.handle_input_action(action)? {
-                            command_dispatch::dispatch_command(
-                                &mut runtime,
-                                command,
-                                &ingress,
-                                false,
-                            );
-                        }
-                    }
-                    Event::Resize(_, _) => {}
-                    _ => {}
-                }
+                process_terminal_event(&mut runtime, event::read()?, &ingress)?;
             } else {
                 let _ = runtime.handle_input_action(InputAction::Tick)?;
             }

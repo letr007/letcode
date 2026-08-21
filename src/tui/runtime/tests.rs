@@ -35,6 +35,7 @@ use crate::transcript::{
 };
 use crate::tui::events::NoticeEvent;
 use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_empty_session};
+use crate::tui::state::MAX_CACHED_CHILD_TIMELINES;
 use crate::tui::{
     AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
     PermissionResolutionEvent, SessionEvent, TimelineItem, ToolFinishedEvent, ToolOutcome,
@@ -6407,6 +6408,103 @@ fn repeated_child_view_projection_does_not_reset_live_child_state() {
 }
 
 #[test]
+fn adjacent_child_transport_events_merge_only_within_the_same_scope() {
+    let mut queue = VecDeque::new();
+    for (child, delta) in [("child-a", "a"), ("child-a", "b"), ("child-b", "c")] {
+        enqueue_merged_event(
+            &mut queue,
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id: child.into(),
+                agent_name: Some("explorer".into()),
+                parent_tool_call_id: Some(format!("tool-{child}")),
+                event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+            },
+        );
+    }
+
+    assert_eq!(queue.len(), 2);
+    assert!(matches!(
+        &queue[0],
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            event: SessionEvent::AssistantDelta(event),
+            ..
+        } if child_session_id == "child-a" && event.delta == "ab"
+    ));
+    assert!(matches!(
+        &queue[1],
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            event: SessionEvent::AssistantDelta(event),
+            ..
+        } if child_session_id == "child-b" && event.delta == "c"
+    ));
+}
+
+#[test]
+fn adjacent_transport_events_merge_without_crossing_barriers() {
+    let mut queue = VecDeque::new();
+    enqueue_merged_event(
+        &mut queue,
+        SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new("a")),
+    );
+    enqueue_merged_event(
+        &mut queue,
+        SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new("b")),
+    );
+    enqueue_merged_event(
+        &mut queue,
+        SessionTransportEvent::AssistantDone { message_id: None },
+    );
+    enqueue_merged_event(
+        &mut queue,
+        SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new("c")),
+    );
+
+    assert_eq!(queue.len(), 3);
+    assert!(matches!(
+        &queue[0],
+        SessionTransportEvent::AssistantDelta(event) if event.delta == "ab"
+    ));
+    assert!(matches!(
+        queue[1],
+        SessionTransportEvent::AssistantDone { .. }
+    ));
+    assert!(matches!(
+        &queue[2],
+        SessionTransportEvent::AssistantDelta(event) if event.delta == "c"
+    ));
+}
+
+#[test]
+fn deferred_transport_events_are_bounded_per_drain() {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let mut runtime = TuiRuntime::new(
+        TuiState::default(),
+        rx,
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    );
+    for index in 0..(MAX_SESSION_EVENTS_PER_FRAME * 2) {
+        runtime.enqueue_deferred_session_event(SessionTransportEvent::Notice(
+            crate::session::NoticeEvent::info(format!("notice-{index}")),
+        ));
+    }
+
+    let queued = runtime.deferred_session_events.len();
+    assert_eq!(queued, MAX_SESSION_EVENTS_PER_FRAME * 2);
+    runtime.try_drain_session_events();
+    let remaining = runtime.deferred_session_events.len();
+    assert!(remaining < queued, "the drain makes forward progress");
+    assert!(
+        queued - remaining <= MAX_SESSION_EVENTS_PER_FRAME,
+        "deferred application is frame-bounded"
+    );
+}
+
+#[test]
 fn assistant_typewriter_reveals_text_across_frames() {
     let mut runtime = runtime();
     runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
@@ -6812,6 +6910,67 @@ fn background_child_event_updates_cached_child_lifecycle() {
     assert_eq!(runtime.state().phase, AppPhase::Idle);
     assert_eq!(
         runtime.state().cached_child_phase("background-child"),
+        Some(AppPhase::Error)
+    );
+}
+
+#[test]
+fn background_child_cache_is_bounded_and_evicted_children_keep_summary_state() {
+    let mut runtime = runtime();
+    for index in 0..(MAX_CACHED_CHILD_TIMELINES + 4) {
+        let child_session_id = format!("background-child-{index}");
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+            child_session_id: child_session_id.clone(),
+            agent_name: Some("fixer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(format!(
+                "output-{index}"
+            ))),
+        });
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            agent_name: Some("fixer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::Done,
+        });
+    }
+
+    assert_eq!(runtime.state().child_timeline_cache_len(), 0);
+    assert!(
+        !runtime
+            .state()
+            .child_timeline_cache_contains("background-child-0")
+    );
+    assert_eq!(
+        runtime.state().cached_child_phase("background-child-0"),
+        Some(AppPhase::Completed)
+    );
+}
+
+#[test]
+fn evicted_child_summary_absorbs_later_terminal_events_without_rehydrating_timeline() {
+    let mut runtime = runtime();
+    for index in 0..(MAX_CACHED_CHILD_TIMELINES + 1) {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+            child_session_id: format!("background-child-{index}"),
+            agent_name: Some("fixer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("output")),
+        });
+    }
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "background-child-0".into(),
+        agent_name: Some("fixer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
+    });
+
+    assert!(
+        runtime.state().child_timeline_cache_len() <= MAX_CACHED_CHILD_TIMELINES,
+        "terminal child is compacted into summary state"
+    );
+    assert_eq!(
+        runtime.state().cached_child_phase("background-child-0"),
         Some(AppPhase::Error)
     );
 }

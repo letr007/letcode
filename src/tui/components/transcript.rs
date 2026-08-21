@@ -49,6 +49,7 @@ pub struct TranscriptRenderCache {
     entries: Vec<TranscriptRenderCacheEntry>,
     row_starts: Vec<usize>,
     row_counts: Vec<usize>,
+    live_render_frames: Vec<Option<usize>>,
     #[cfg(test)]
     row_count_rebuilds: usize,
 }
@@ -63,6 +64,7 @@ impl TranscriptRenderCache {
         self.entries.clear();
         self.row_starts.clear();
         self.row_counts.clear();
+        self.live_render_frames.clear();
     }
 
     #[cfg(test)]
@@ -75,6 +77,7 @@ impl TranscriptRenderCache {
             && self.entries.is_empty()
             && self.row_starts.is_empty()
             && self.row_counts.is_empty()
+            && self.live_render_frames.is_empty()
     }
 
     pub(crate) fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) {
@@ -90,6 +93,7 @@ impl TranscriptRenderCache {
             self.entries.clear();
             self.row_starts.clear();
             self.row_counts.clear();
+            self.live_render_frames.clear();
         }
     }
 
@@ -100,6 +104,7 @@ impl TranscriptRenderCache {
 
     #[cfg(test)]
     pub(crate) fn set_entries_for_test(&mut self, entries: Vec<TranscriptRenderCacheEntry>) {
+        self.live_render_frames.resize(entries.len(), None);
         self.entries = entries;
     }
 
@@ -116,6 +121,14 @@ impl TranscriptRenderCache {
     /// 获取行起始位置的引用（用于坐标映射）
     pub fn row_starts(&self) -> &[usize] {
         &self.row_starts
+    }
+
+    /// Invalidate row geometry while retaining item documents for incremental updates.
+    pub(crate) fn invalidate_row_metadata(&mut self) {
+        self.row_metadata_revision = None;
+        self.total_rows = None;
+        self.row_starts.clear();
+        self.row_counts.clear();
     }
 }
 
@@ -280,6 +293,10 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
             revision: None,
             document: Document::default(),
         });
+    state
+        .transcript_render_cache
+        .live_render_frames
+        .resize(item_count, None);
 
     let mut rows = surface::TRANSCRIPT_TOP_SPACER;
     state.transcript_render_cache.row_starts.clear();
@@ -404,20 +421,60 @@ fn visible_document_lines(
     visible_rows: u16,
     top_scroll: u16,
 ) -> Vec<Option<&RenderLine<Style>>> {
-    let mut rows = vec![None; surface::TRANSCRIPT_TOP_SPACER];
-    for (index, entry) in state.transcript_render_cache.entries.iter().enumerate() {
-        if timeline_item_needs_separator_before(
+    let visible_rows = visible_rows as usize;
+    if visible_rows == 0 {
+        return Vec::new();
+    }
+
+    let start = (top_scroll as usize).min(state.transcript_render_cache.total_rows.unwrap_or(0));
+    let end = start
+        .saturating_add(visible_rows)
+        .min(state.transcript_render_cache.total_rows.unwrap_or(start));
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+
+    let spacer_end = surface::TRANSCRIPT_TOP_SPACER.min(end);
+    if start < spacer_end {
+        rows.extend((start..spacer_end).map(|_| None));
+    }
+
+    let items = state.active_timeline().items();
+    let first_item = state
+        .transcript_render_cache
+        .row_starts
+        .partition_point(|row_start| *row_start < start)
+        .saturating_sub(1);
+    for index in first_item..items.len() {
+        let item_start = state.transcript_render_cache.row_starts[index];
+        let item_count = state.transcript_render_cache.row_counts[index];
+        let separator_rows = usize::from(timeline_item_needs_separator_before(
             index,
-            state.active_timeline().items(),
+            items,
             state.thoughts_display,
-        ) {
+        ));
+        let separator_start = item_start.saturating_sub(separator_rows);
+        let item_end = item_start.saturating_add(item_count);
+        if separator_start >= end {
+            break;
+        }
+        if separator_rows > 0 && separator_start >= start {
             rows.push(None);
         }
-        rows.extend(entry.document.lines.iter().map(Some));
+        if item_end <= start {
+            continue;
+        }
+        let line_start = start.saturating_sub(item_start).min(item_count);
+        let line_end = end.saturating_sub(item_start).min(item_count);
+        rows.extend(
+            state.transcript_render_cache.entries[index].document.lines[line_start..line_end]
+                .iter()
+                .map(Some),
+        );
+        if rows.len() >= visible_rows {
+            break;
+        }
     }
-    let start = (top_scroll as usize).min(rows.len());
-    let end = start.saturating_add(visible_rows as usize).min(rows.len());
-    rows.drain(start..end).collect()
+    rows.truncate(visible_rows);
+    rows
 }
 
 fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
@@ -458,7 +515,10 @@ fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool 
 }
 
 fn cached_item_line_count(state: &mut TuiState, index: usize, theme: Theme, width: usize) -> usize {
-    refresh_cached_item_document(state, index, theme, width);
+    let revision = state.active_timeline().item_revisions().get(index).copied();
+    if state.transcript_render_cache.entries[index].revision != revision {
+        refresh_cached_item_document(state, index, theme, width);
+    }
     state.transcript_render_cache.entries[index]
         .document
         .lines
@@ -499,7 +559,10 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         &state.active_timeline().items()[index],
         TimelineItem::Reasoning(reasoning) if reasoning.streaming
     );
-    if state.transcript_render_cache.entries[index].revision == revision && !live {
+    let frame = state.status_spinner_frame;
+    if state.transcript_render_cache.entries[index].revision == revision
+        && (!live || state.transcript_render_cache.live_render_frames[index] == Some(frame))
+    {
         return;
     }
 
@@ -520,6 +583,7 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
     let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;
     entry.document = document;
+    state.transcript_render_cache.live_render_frames[index] = live.then_some(frame);
 }
 
 struct TimelineDocument {

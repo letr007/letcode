@@ -78,7 +78,7 @@ impl ComposerToken {
 }
 
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 文本选择范围
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +364,13 @@ impl TranscriptViewState {
     pub fn is_child(&self) -> bool {
         matches!(self, Self::Child { .. })
     }
+}
+
+pub(crate) const MAX_CACHED_CHILD_TIMELINES: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildSessionCacheSummary {
+    phase: AppPhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1083,6 +1090,8 @@ pub struct TuiState {
     context: ContextPaneState,
     child_timeline: Option<ChildTranscriptState>,
     child_timeline_cache: HashMap<String, ChildTranscriptState>,
+    child_timeline_cache_order: VecDeque<String>,
+    child_session_summaries: HashMap<String, ChildSessionCacheSummary>,
     pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
     pub pending_question: Option<PendingQuestionState>,
@@ -1163,6 +1172,8 @@ impl Default for TuiState {
             context: ContextPaneState::default(),
             child_timeline: None,
             child_timeline_cache: HashMap::new(),
+            child_timeline_cache_order: VecDeque::new(),
+            child_session_summaries: HashMap::new(),
             active_session: false,
             pending_permission: None,
             pending_question: None,
@@ -2176,6 +2187,9 @@ impl TuiState {
             return Ok(());
         }
 
+        self.child_timeline_cache_order
+            .retain(|cached_id| cached_id != &child_session_id);
+        self.child_session_summaries.remove(&child_session_id);
         let child_state = match self.child_timeline_cache.remove(&child_session_id) {
             Some(mut cached) => {
                 if cached.snapshot_dirty {
@@ -2190,8 +2204,7 @@ impl TuiState {
         };
 
         if let Some(active_child) = self.child_timeline.take() {
-            self.child_timeline_cache
-                .insert(active_child.session_id.clone(), active_child);
+            self.cache_child_timeline(active_child);
         }
         self.child_timeline = Some(child_state);
         self.active_session = true;
@@ -2305,11 +2318,21 @@ impl TuiState {
         self.child_timeline_cache
             .get(child_session_id)
             .map(|child| child.phase)
+            .or_else(|| {
+                self.child_session_summaries
+                    .get(child_session_id)
+                    .map(|summary| summary.phase)
+            })
     }
 
     #[cfg(test)]
     pub fn child_timeline_cache_contains(&self, child_session_id: &str) -> bool {
         self.child_timeline_cache.contains_key(child_session_id)
+    }
+
+    #[cfg(test)]
+    pub fn child_timeline_cache_len(&self) -> usize {
+        self.child_timeline_cache.len()
     }
 
     pub fn child_view_metadata(&self) -> Option<ChildViewMetadata> {
@@ -2338,15 +2361,53 @@ impl TuiState {
         })
     }
 
+    fn touch_cached_child_timeline(&mut self, child_session_id: &str) {
+        if self.child_timeline_cache.contains_key(child_session_id) {
+            self.child_timeline_cache_order
+                .retain(|cached_id| cached_id != child_session_id);
+            self.child_timeline_cache_order
+                .push_back(child_session_id.to_string());
+        }
+    }
+
+    fn cache_child_timeline(&mut self, child: ChildTranscriptState) {
+        let child_session_id = child.session_id.clone();
+        self.child_session_summaries.remove(&child_session_id);
+        self.child_timeline_cache_order
+            .retain(|cached_id| cached_id != &child_session_id);
+        self.child_timeline_cache_order
+            .push_back(child_session_id.clone());
+        self.child_timeline_cache.insert(child_session_id, child);
+        while self.child_timeline_cache_order.len() > MAX_CACHED_CHILD_TIMELINES {
+            let Some(candidate_index) = self.child_timeline_cache_order.iter().position(|id| {
+                self.child_timeline_cache.get(id).is_some_and(|child| {
+                    matches!(child.phase, AppPhase::Completed | AppPhase::Error)
+                        && !child.snapshot_dirty
+                })
+            }) else {
+                break;
+            };
+            let evicted = self
+                .child_timeline_cache_order
+                .remove(candidate_index)
+                .expect("eviction candidate index came from cache order");
+            if let Some(child) = self.child_timeline_cache.remove(&evicted) {
+                self.child_session_summaries
+                    .insert(evicted, ChildSessionCacheSummary { phase: child.phase });
+            }
+        }
+    }
+
     pub fn cache_active_child_timeline(&mut self) {
         if let Some(active_child) = self.child_timeline.take() {
-            self.child_timeline_cache
-                .insert(active_child.session_id.clone(), active_child);
+            self.cache_child_timeline(active_child);
         }
     }
 
     pub fn clear_child_timeline_cache(&mut self) {
         self.child_timeline_cache.clear();
+        self.child_timeline_cache_order.clear();
+        self.child_session_summaries.clear();
     }
 
     pub fn try_restore_parent_timeline_view_with_runtime_context(
@@ -2475,11 +2536,36 @@ impl TuiState {
             &event,
         );
 
+        let terminal_event = matches!(
+            &event,
+            SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
+        );
         if !self.child_event_targets_loaded_child(child_session_id) {
-            self.child_timeline_cache.insert(
-                child_session_id.to_string(),
-                ChildTranscriptState::empty(child_session_id),
-            );
+            if let Some(summary) = self.child_session_summaries.get_mut(child_session_id) {
+                update_child_session_summary(summary, &event);
+                return;
+            }
+            if matches!(
+                &event,
+                SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
+            ) {
+                self.child_session_summaries.insert(
+                    child_session_id.to_string(),
+                    ChildSessionCacheSummary {
+                        phase: child_phase_for_event(&event),
+                    },
+                );
+                return;
+            }
+            self.cache_child_timeline(ChildTranscriptState::empty(child_session_id));
+        } else if !viewing_child {
+            self.touch_cached_child_timeline(child_session_id);
+        }
+        if !self.child_event_targets_loaded_child(child_session_id) {
+            if let Some(summary) = self.child_session_summaries.get_mut(child_session_id) {
+                update_child_session_summary(summary, &event);
+            }
+            return;
         }
 
         if self.apply_child_context_event(child_session_id, &event, viewing_child) {
@@ -2516,6 +2602,15 @@ impl TuiState {
             }
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
+        } else if terminal_event
+            && let Some(child) = self.child_timeline_cache.remove(child_session_id)
+        {
+            self.child_timeline_cache_order
+                .retain(|cached_id| cached_id != child_session_id);
+            self.child_session_summaries.insert(
+                child_session_id.to_string(),
+                ChildSessionCacheSummary { phase: child.phase },
+            );
         }
     }
 
@@ -2768,7 +2863,7 @@ impl TuiState {
             &status,
             &summary,
         ) {
-            self.invalidate_transcript_cache();
+            self.transcript_render_cache.invalidate_row_metadata();
             self.last_transcript_total_rows = None;
         }
     }
@@ -2963,6 +3058,22 @@ fn column_to_char_offset(text: &str, target_col: u16) -> usize {
 mod event_projection;
 use event_projection::*;
 pub(crate) use event_projection::{context_detail_target_exists, context_dialog_items};
+
+fn child_phase_for_event(event: &SessionEvent) -> AppPhase {
+    match event {
+        SessionEvent::Error(_) => AppPhase::Error,
+        SessionEvent::Done | SessionEvent::Interrupted => AppPhase::Completed,
+        SessionEvent::PermissionRequested(_) => AppPhase::WaitingForPermission,
+        _ => AppPhase::Running,
+    }
+}
+
+fn update_child_session_summary(summary: &mut ChildSessionCacheSummary, event: &SessionEvent) {
+    if matches!(summary.phase, AppPhase::Completed | AppPhase::Error) {
+        return;
+    }
+    summary.phase = child_phase_for_event(event);
+}
 
 fn child_feedback_message(
     agent_name: Option<&str>,
