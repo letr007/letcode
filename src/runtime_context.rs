@@ -5,6 +5,7 @@ use crate::context_view::ContextViewProjection;
 use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::HistoryItem;
+use crate::workflow_state::WorkflowState;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -360,6 +361,8 @@ pub(crate) struct RuntimeSnapshot {
     pub evidence: Vec<EvidenceRecord>,
     pub active_context: ActiveContextMetadata,
     pub compaction: CompactionState,
+    #[serde(default, skip_serializing_if = "WorkflowState::is_empty")]
+    pub workflow: WorkflowState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_contributors: Vec<PromptContributorPlaceholder>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -387,6 +390,7 @@ impl RuntimeSnapshot {
                 explicit_protected_frame_ids: Vec::new(),
                 turn_protected_frame_ids: Vec::new(),
             },
+            workflow: WorkflowState::default(),
             prompt_contributors: Vec::new(),
             child_sessions: Vec::new(),
         }
@@ -1031,6 +1035,29 @@ mod tests {
             frame_ids: Vec::new(),
             source_frame_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn workflow_state_serde_is_backward_compatible_and_omits_empty_state() {
+        let empty = RuntimeSnapshot::new("main");
+        let empty_json = serde_json::to_value(&empty).expect("serialize empty snapshot");
+        assert!(empty_json.get("workflow").is_none());
+
+        let legacy: RuntimeSnapshot = serde_json::from_value(empty_json)
+            .expect("legacy snapshot without workflow remains readable");
+        assert!(legacy.workflow.is_empty());
+
+        let mut populated = RuntimeSnapshot::new("main");
+        populated.workflow.todos = vec![crate::agent::TodoItem {
+            id: "todo".into(),
+            content: "persist workflow".into(),
+            status: crate::agent::TodoStatus::InProgress,
+        }];
+        populated.workflow.auto_continue.enabled = true;
+        let populated_json = serde_json::to_value(&populated).expect("serialize workflow snapshot");
+        let restored: RuntimeSnapshot =
+            serde_json::from_value(populated_json).expect("restore workflow snapshot");
+        assert_eq!(restored.workflow, populated.workflow);
     }
 
     #[test]

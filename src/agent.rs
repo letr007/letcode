@@ -75,12 +75,10 @@ mod history_compact;
 mod protocol_stream;
 #[path = "agent/tool_execution.rs"]
 mod tool_execution;
-#[path = "agent/workflow_state.rs"]
-mod workflow_state;
-
 pub(crate) use auto_review::{AutoReviewResolution, AutoReviewService};
 
 use crate::anchored_bootstrap::{AnchoredBootstrap, AnchoredPhase};
+pub use crate::workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
 pub(crate) use catalog::{
     SUBAGENT_CATALOG, agent_name_for_subagent_tool, is_subagent_tool_name,
@@ -98,7 +96,6 @@ pub use events::{
 };
 #[cfg(test)]
 pub(crate) use events::{CompactionCheckpoint, CompactionFileOperations};
-pub use workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 
 #[cfg(test)]
 use compaction::{
@@ -1440,12 +1437,12 @@ impl<C: Config> Agent<C> {
 
     #[cfg(test)]
     fn todos(&self) -> &[TodoItem] {
-        &self.turn.workflow.todos
+        &self.runtime_snapshot.workflow.todos
     }
 
     #[cfg(test)]
     fn auto_continue(&self) -> &AutoContinueState {
-        &self.turn.workflow.auto_continue
+        &self.runtime_snapshot.workflow.auto_continue
     }
 
     #[cfg(test)]
@@ -1646,6 +1643,7 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = self
             .rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
             .expect("restored transcript messages should remain protocol-compatible");
+        self.runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
         self.clear_resume_proc_local();
     }
 
@@ -1689,6 +1687,7 @@ impl<C: Config> Agent<C> {
             self.rebuilt_runtime_snapshot_from_protocol_frames(&transcript.frames, 0, &[])?;
         runtime_snapshot.current_turn_id = Some(max_turn_id);
         runtime_snapshot.set_evidence(evidence);
+        runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
 
         self.runtime_snapshot = runtime_snapshot;
         self.next_turn_id = max_turn_id;
@@ -2970,6 +2969,7 @@ impl<C: Config> Agent<C> {
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
+        self.runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
         if self.pressure_compaction_suppressed {
             self.turn.pressure_compaction.suppress();
         }
@@ -3079,7 +3079,7 @@ impl<C: Config> Agent<C> {
                     items: payload.items.clone(),
                 })
                 .await?;
-                self.turn.workflow.todos = payload.items;
+                self.runtime_snapshot.workflow.todos = payload.items;
             }
             "workflow__auto_continue" => {
                 let payload: WorkflowAutoContinuePayload = serde_json::from_value(args.clone())?;
@@ -3090,7 +3090,7 @@ impl<C: Config> Agent<C> {
                     state: next_state.clone(),
                 })
                 .await?;
-                self.turn.workflow.auto_continue = next_state;
+                self.runtime_snapshot.workflow.auto_continue = next_state;
                 if payload.enabled {
                     self.turn.auto_continue_active = true;
                 }
@@ -3102,7 +3102,7 @@ impl<C: Config> Agent<C> {
     }
 
     fn finalize_turn_decision(&self) -> FinalizeDecision {
-        if self.turn.workflow.auto_continue.enabled {
+        if self.runtime_snapshot.workflow.auto_continue.enabled {
             FinalizeDecision::Continue
         } else {
             FinalizeDecision::Finish
@@ -3365,7 +3365,7 @@ impl<C: Config> Agent<C> {
 
     fn remaining_unfinished_todos(&self) -> Option<usize> {
         if self
-            .turn
+            .runtime_snapshot
             .workflow
             .todos
             .iter()
@@ -3375,7 +3375,7 @@ impl<C: Config> Agent<C> {
         }
 
         let unfinished = self
-            .turn
+            .runtime_snapshot
             .workflow
             .todos
             .iter()
@@ -3994,6 +3994,7 @@ fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &Ru
     target.context_view = source.context_view.clone();
     target.context_tree = source.context_tree.clone();
     target.active_context = source.active_context.clone();
+    target.workflow = source.workflow.clone();
     target.compaction.compacted_frame_ids = source.compaction.compacted_frame_ids.clone();
     target.compaction.retired_source_spans = source.compaction.retired_source_spans.clone();
     // Keep any non-protocol frames (no protocol payload) that the rebuild dropped.
@@ -4053,7 +4054,6 @@ struct TurnRuntimeState {
     turn_id: u64,
     current_turn_start_index: Option<usize>,
     policy: WorkflowTurnState,
-    workflow: WorkflowState,
     counters: TurnCounters,
     // Once enabled, auto-continue owns the rest of this turn so the LLM can
     // explicitly disable it and still receive one final response. This is
@@ -4075,7 +4075,6 @@ impl TurnRuntimeState {
             turn_id,
             current_turn_start_index: None,
             policy,
-            workflow: WorkflowState::default(),
             counters: TurnCounters::default(),
             auto_continue_active: false,
             frozen_evidence: None,
@@ -4127,12 +4126,6 @@ impl Default for TurnRuntimeState {
     fn default() -> Self {
         Self::new(0, WorkflowTurnState::default())
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WorkflowState {
-    todos: Vec<TodoItem>,
-    auto_continue: AutoContinueState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

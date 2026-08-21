@@ -8,6 +8,7 @@ use crate::protocol_frames::history_items_to_frames;
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeSnapshot;
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
+use crate::workflow_state::WorkflowState;
 use anyhow::ensure;
 
 #[cfg(test)]
@@ -296,13 +297,14 @@ pub(crate) fn project_runtime_restore_snapshot(
     // Keep allocation global to this session while all active state below stays
     // scoped to the resolved branch and leaf.
     let max_turn_id = restore_max_turn_id_projection(&records);
-    let snapshot = runtime_snapshot_from_resolved_context(
+    let mut snapshot = runtime_snapshot_from_resolved_context(
         &session_id,
         &records,
         &resolved,
         latest_model.as_deref(),
         child_sessions,
     )?;
+    snapshot.workflow = project_workflow_state(&resolved.records).state;
     // The runtime projection is the authority for restored protocol identity.
     // Do not rebuild these from compatibility history, which deliberately has
     // no runtime IDs or transcript provenance.
@@ -319,6 +321,42 @@ pub(crate) fn project_runtime_restore_snapshot(
         latest_permission_mode,
         max_turn_id,
     })
+}
+
+pub(crate) struct WorkflowProjection {
+    pub state: WorkflowState,
+    pub has_todos: bool,
+    pub has_auto_continue: bool,
+}
+
+pub(crate) fn project_workflow_state(records: &[TranscriptRecord]) -> WorkflowProjection {
+    let mut projection = WorkflowProjection {
+        state: WorkflowState::default(),
+        has_todos: false,
+        has_auto_continue: false,
+    };
+    for record in records {
+        match &record.event {
+            TranscriptEvent::UserMessage { .. }
+            | TranscriptEvent::TurnStarted(_)
+            | TranscriptEvent::TurnInterrupted { .. }
+            | TranscriptEvent::Error { .. } => {
+                projection.state = WorkflowState::default();
+                projection.has_todos = false;
+                projection.has_auto_continue = false;
+            }
+            TranscriptEvent::TodoSnapshot { items } => {
+                projection.state.todos = items.clone();
+                projection.has_todos = true;
+            }
+            TranscriptEvent::AutoContinueChanged { state } => {
+                projection.state.auto_continue = state.clone();
+                projection.has_auto_continue = true;
+            }
+            _ => {}
+        }
+    }
+    projection
 }
 
 #[cfg(test)]

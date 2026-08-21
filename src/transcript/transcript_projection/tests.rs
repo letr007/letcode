@@ -1260,6 +1260,163 @@ fn runtime_snapshot_projection_respects_branch_cursor() {
 }
 
 #[test]
+fn runtime_snapshot_projects_workflow_state_from_resolved_turn() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 7,
+                intent: "engineering".into(),
+                directive: "execute".into(),
+                validation_reminder: String::new(),
+            }),
+        ),
+        record_at(
+            2,
+            TranscriptEvent::TodoSnapshot {
+                items: vec![crate::agent::TodoItem {
+                    id: "phase-1".into(),
+                    content: "preserve durable workflow".into(),
+                    status: crate::agent::TodoStatus::InProgress,
+                }],
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::AutoContinueChanged {
+                state: crate::agent::AutoContinueState { enabled: true },
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent::succeeded_at(
+                "checkpoint",
+                None,
+            )),
+        ),
+    ];
+
+    let projected = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("runtime workflow projection");
+
+    assert_eq!(projected.snapshot.workflow.todos.len(), 1);
+    assert_eq!(projected.snapshot.workflow.todos[0].id, "phase-1");
+    assert!(projected.snapshot.workflow.auto_continue.enabled);
+}
+
+#[test]
+fn runtime_snapshot_workflow_respects_branch_and_leaf_cursor() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::TodoSnapshot {
+                items: vec![crate::agent::TodoItem {
+                    id: "root-before".into(),
+                    content: "root prefix".into(),
+                    status: crate::agent::TodoStatus::Pending,
+                }],
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "feature".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        branch_record_at(
+            3,
+            "feature",
+            TranscriptEvent::TodoSnapshot {
+                items: vec![crate::agent::TodoItem {
+                    id: "feature".into(),
+                    content: "feature only".into(),
+                    status: crate::agent::TodoStatus::InProgress,
+                }],
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::TodoSnapshot {
+                items: vec![crate::agent::TodoItem {
+                    id: "root-after".into(),
+                    content: "sibling root".into(),
+                    status: crate::agent::TodoStatus::Blocked,
+                }],
+            },
+        ),
+    ];
+
+    let projected = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: Some("feature".into()),
+            leaf_sequence: Some(3),
+        },
+        &[],
+    )
+    .expect("branch workflow projection");
+
+    assert_eq!(projected.snapshot.workflow.todos.len(), 1);
+    assert_eq!(projected.snapshot.workflow.todos[0].id, "feature");
+}
+
+#[test]
+fn runtime_snapshot_workflow_resets_at_next_turn() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::TodoSnapshot {
+                items: vec![crate::agent::TodoItem {
+                    id: "stale".into(),
+                    content: "old turn".into(),
+                    status: crate::agent::TodoStatus::Pending,
+                }],
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AutoContinueChanged {
+                state: crate::agent::AutoContinueState { enabled: true },
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 8,
+                intent: "engineering".into(),
+                directive: "execute".into(),
+                validation_reminder: String::new(),
+            }),
+        ),
+    ];
+
+    let projected = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("runtime workflow reset projection");
+
+    assert!(projected.snapshot.workflow.is_empty());
+}
+
+#[test]
 fn runtime_snapshot_marks_entire_current_turn_as_protected() {
     let records = vec![
         record_at(

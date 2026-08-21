@@ -98,9 +98,6 @@ where
 {
     if agent.runtime_snapshot_provider.is_some() {
         agent.reload_runtime_snapshot_from_provider()?;
-        // Reload replaces history/snapshot from transcript but leaves live
-        // turn.workflow/counters untouched; realign before facts/cut.
-        sync_compaction_workflow_authority(agent);
     }
     // History structure is validated once below and reused by cut planning.
     // Reload already analyzed with turn_start=None for install safety; this
@@ -512,63 +509,10 @@ where
     Ok(trimmed.to_string())
 }
 
-fn sync_compaction_workflow_authority<C: Config>(agent: &mut Agent<C>) {
-    // Transcript-projected history is authoritative after reload; drop stale
-    // live turn counters and rebuild todos from the durable tool trail.
-    agent.turn.workflow.todos =
-        latest_todos_from_history(&agent.active_history_items()).unwrap_or_default();
-    agent.turn.counters.validation_effects = 0;
-    agent.turn.counters.failed_validation_effects = 0;
-    agent.turn.counters.child_validation_effects = 0;
-    agent.turn.counters.child_failed_validation_effects = 0;
-}
-
-fn latest_todos_from_history(history: &[HistoryItem]) -> Option<Vec<TodoItem>> {
-    let mut pending = std::collections::HashMap::<String, Vec<TodoItem>>::new();
-    let mut latest = None;
-    for item in history {
-        match item {
-            HistoryItem::AssistantToolCalls { calls, .. } => {
-                for call in calls {
-                    if call.name != "workflow__todos" {
-                        continue;
-                    }
-                    let Ok(payload) = serde_json::from_str::<Value>(&call.arguments_json) else {
-                        continue;
-                    };
-                    let Ok(items) = serde_json::from_value::<Vec<TodoItem>>(
-                        payload.get("items").cloned().unwrap_or(Value::Null),
-                    ) else {
-                        continue;
-                    };
-                    pending.insert(call.call_id.clone(), items);
-                }
-            }
-            HistoryItem::ToolOutput {
-                call_id,
-                output_json,
-                ..
-            } => {
-                let Some(items) = pending.remove(call_id) else {
-                    continue;
-                };
-                let Ok(output) = serde_json::from_str::<Value>(output_json) else {
-                    continue;
-                };
-                if output.get("ok").and_then(Value::as_bool) == Some(true) {
-                    latest = Some(items);
-                }
-            }
-            _ => {}
-        }
-    }
-    latest
-}
-
 fn render_protected_workflow_facts<C: Config>(agent: &Agent<C>) -> String {
     let mut facts = Vec::new();
     let unfinished_todos = agent
-        .turn
+        .runtime_snapshot
         .workflow
         .todos
         .iter()
@@ -1015,6 +959,11 @@ mod transaction_tests {
             .expect("seed history");
         let expected = vec![HistoryItem::context_summary("persisted summary")];
         let mut projected = RuntimeSnapshot::new("main");
+        projected.workflow.todos = vec![TodoItem {
+            id: "durable-todo".into(),
+            content: "survives provider compaction reload".into(),
+            status: TodoStatus::InProgress,
+        }];
         projected.frames = protocol_frames_with_spans(&expected)
             .into_iter()
             .enumerate()
@@ -1047,6 +996,8 @@ mod transaction_tests {
             .expect("durable acknowledgement reloads provider projection");
 
         assert_eq!(agent.history_for_test(), expected);
+        assert_eq!(agent.runtime_snapshot.workflow.todos.len(), 1);
+        assert_eq!(agent.runtime_snapshot.workflow.todos[0].id, "durable-todo");
     }
 
     #[tokio::test]
@@ -1093,31 +1044,6 @@ mod transaction_tests {
             "",
         );
         assert!(!prompt.contains("受保护工作流事实"));
-    }
-
-    #[test]
-    fn latest_todos_follow_successful_workflow_tool_trail() {
-        let history = vec![
-            HistoryItem::user("go"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                reasoning_content: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "t1".into(),
-                    name: "workflow__todos".into(),
-                    arguments_json: r#"{"items":[{"id":"a","content":"one","status":"pending"}]}"#
-                        .into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "t1".into(),
-                output_json: r#"{"ok":true,"tool":"workflow__todos","data":{"items":[{"id":"a","content":"one","status":"pending"}]}}"#.into(),
-                images: Vec::new(),
-            },
-        ];
-        let todos = latest_todos_from_history(&history).expect("todos restored");
-        assert_eq!(todos.len(), 1);
-        assert_eq!(todos[0].id, "a");
     }
 
     #[test]

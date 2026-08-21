@@ -110,35 +110,17 @@ pub(crate) fn restore_session_evidence(
 }
 
 pub fn restore_latest_todo_snapshot(records: &[TranscriptRecord]) -> Option<Vec<TodoItem>> {
-    let mut latest = None;
-    for record in records {
-        match &record.event {
-            TranscriptEvent::UserMessage { .. }
-            | TranscriptEvent::TurnStarted(_)
-            | TranscriptEvent::TurnInterrupted { .. }
-            | TranscriptEvent::Error { .. } => latest = None,
-            TranscriptEvent::TodoSnapshot { items } => latest = Some(items.clone()),
-            _ => {}
-        }
-    }
-    latest
+    let projection = transcript_projection::project_workflow_state(records);
+    projection.has_todos.then_some(projection.state.todos)
 }
 
 pub fn restore_latest_auto_continue_state(
     records: &[TranscriptRecord],
 ) -> Option<AutoContinueState> {
-    let mut latest = None;
-    for record in records {
-        match &record.event {
-            TranscriptEvent::UserMessage { .. }
-            | TranscriptEvent::TurnStarted(_)
-            | TranscriptEvent::TurnInterrupted { .. }
-            | TranscriptEvent::Error { .. } => latest = None,
-            TranscriptEvent::AutoContinueChanged { state } => latest = Some(state.clone()),
-            _ => {}
-        }
-    }
-    latest
+    let projection = transcript_projection::project_workflow_state(records);
+    projection
+        .has_auto_continue
+        .then_some(projection.state.auto_continue)
 }
 
 #[cfg(test)]

@@ -6070,11 +6070,43 @@ async fn yolo_mode_executes_commands_that_default_mode_asks() {
     );
 }
 
+#[test]
+fn legacy_session_history_restore_clears_runtime_workflow_state() {
+    let mut agent = test_agent();
+    agent.runtime_snapshot.workflow.todos = vec![TodoItem {
+        id: "stale".into(),
+        content: "old session".into(),
+        status: TodoStatus::Pending,
+    }];
+    agent.runtime_snapshot.workflow.auto_continue.enabled = true;
+
+    agent
+        .restore_session_history(vec![HistoryItem::user("restored session")], Vec::new(), 4)
+        .expect("legacy history restore");
+
+    assert!(agent.runtime_snapshot.workflow.is_empty());
+}
+
+#[test]
+fn new_turn_resets_runtime_workflow_state() {
+    let mut agent = test_agent();
+    agent.runtime_snapshot.workflow.todos = vec![TodoItem {
+        id: "stale".into(),
+        content: "old turn".into(),
+        status: TodoStatus::Pending,
+    }];
+    agent.runtime_snapshot.workflow.auto_continue.enabled = true;
+
+    agent.prepare_turn_prelude("start a new turn");
+
+    assert!(agent.runtime_snapshot.workflow.is_empty());
+}
+
 #[tokio::test]
 async fn auto_continue_stops_only_when_llm_disables_it() {
     let mut agent = test_agent();
-    agent.turn.workflow.auto_continue.enabled = true;
-    agent.turn.workflow.todos = vec![TodoItem {
+    agent.runtime_snapshot.workflow.auto_continue.enabled = true;
+    agent.runtime_snapshot.workflow.todos = vec![TodoItem {
         id: "blocked".into(),
         content: "LLM records this as blocked but remains in control".into(),
         status: TodoStatus::Blocked,
@@ -6091,7 +6123,7 @@ async fn auto_continue_stops_only_when_llm_disables_it() {
             .expect("blocked todo must not stop auto-continue")
     );
 
-    agent.turn.workflow.auto_continue.enabled = false;
+    agent.runtime_snapshot.workflow.auto_continue.enabled = false;
     assert!(
         !agent
             .continue_after_no_tool_reply(

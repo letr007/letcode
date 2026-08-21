@@ -41,6 +41,7 @@ mod transcript;
 mod tui;
 mod updater;
 mod user_content;
+mod workflow_state;
 
 use agent::{Agent, ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
 use anchored_bootstrap::AnchoredBootstrap;
