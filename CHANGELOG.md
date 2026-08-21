@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-21
+
 ### Added
 
 - TUI 启动后在后台检查稳定版更新；发现新版本时通过现有 info toast 提示运行 `letcode update`，网络失败不影响启动。
@@ -155,7 +157,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/letr007/letcode/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/letr007/letcode/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/letr007/letcode/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/letr007/letcode/compare/v0.4.0...v0.5.0
