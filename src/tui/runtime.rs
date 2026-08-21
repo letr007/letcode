@@ -83,7 +83,8 @@ use session_dialog::session_dialog_item;
 use std::sync::Mutex as StdMutex;
 
 const PAGE_SCROLL_ROWS: u16 = 10;
-const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
+// ~3 seconds at the 33ms TUI frame interval, long enough for deliberate chords.
+const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 90;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
 const MAX_SESSION_EVENT_TIME_PER_FRAME: Duration = Duration::from_millis(4);
@@ -1541,6 +1542,19 @@ impl TuiRuntime {
                     .show_toast(self.state.t("runtime.sidebar_toggled"), ToastKind::Info);
                 Ok(None)
             }
+            InputAction::ShowModel => self.handle_shortcut_command(CommandIntent::ModelShow),
+            InputAction::ShowPermission => {
+                self.handle_shortcut_command(CommandIntent::PermissionShow)
+            }
+            InputAction::ShowReasoning => {
+                self.handle_shortcut_command(CommandIntent::ReasoningShow)
+            }
+            InputAction::ShowThoughts => self.handle_shortcut_command(CommandIntent::ThoughtsShow),
+            InputAction::ShowAgents => self.handle_shortcut_command(CommandIntent::AgentsShow),
+            InputAction::ShowContext => self.handle_shortcut_command(CommandIntent::ContextBrowse),
+            InputAction::ShowMcp => self.handle_shortcut_command(CommandIntent::McpBrowse),
+            InputAction::ShowSkills => self.handle_shortcut_command(CommandIntent::SkillBrowse),
+            InputAction::ShowHelp => self.handle_shortcut_command(CommandIntent::Help),
             InputAction::CycleReasoningEffort => {
                 if self.state.is_read_only_child_view() {
                     Ok(None)
@@ -2237,6 +2251,11 @@ impl TuiRuntime {
         self.state
             .show_toast(self.state.t("runtime.interrupting"), ToastKind::Info);
         Ok(Some(RuntimeCommand::Interrupt))
+    }
+
+    fn handle_shortcut_command(&mut self, intent: CommandIntent) -> Result<Option<RuntimeCommand>> {
+        self.handle_parsed_command(Ok(intent))?;
+        Ok(None)
     }
 
     fn handle_parsed_command(

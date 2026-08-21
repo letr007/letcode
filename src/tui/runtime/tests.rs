@@ -1783,6 +1783,22 @@ fn child_transcript_view_blocks_parent_mutating_submit_paths() {
 }
 
 #[test]
+fn model_shortcut_opens_model_picker() {
+    let mut runtime = runtime();
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::ShowModel)
+            .expect("model shortcut"),
+        None
+    );
+    assert_eq!(
+        runtime.state().dialog().map(|dialog| &dialog.kind),
+        Some(&DialogKind::ModelPicker)
+    );
+}
+
+#[test]
 fn child_view_navigation_and_read_only_actions_do_not_show_toasts() {
     let mut runtime = runtime();
     runtime.state_mut().replace_child_timeline_from_records(
@@ -1807,11 +1823,16 @@ fn child_view_navigation_and_read_only_actions_do_not_show_toasts() {
         .handle_input_action(InputAction::ChildPrefix)
         .expect("child navigation prefix");
     assert!(runtime.state().toast().is_none());
-    for _ in 0..CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS {
+    assert_eq!(CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS, 90);
+    for _ in 0..CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS - 1 {
         runtime
             .handle_input_action(InputAction::Tick)
             .expect("prefix timeout tick");
     }
+    assert!(runtime.state().child_navigation_prefix);
+    runtime
+        .handle_input_action(InputAction::Tick)
+        .expect("final prefix timeout tick");
     assert!(!runtime.state().child_navigation_prefix);
     assert!(runtime.state().toast().is_none());
 

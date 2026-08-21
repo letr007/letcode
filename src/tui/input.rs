@@ -45,6 +45,15 @@ pub enum InputAction {
     ClearSelection,
     CycleReasoningEffort,
     ToggleSidebar,
+    ShowModel,
+    ShowPermission,
+    ShowReasoning,
+    ShowThoughts,
+    ShowAgents,
+    ShowContext,
+    ShowMcp,
+    ShowSkills,
+    ShowHelp,
     ChildPrefix,
     ChildFirst,
     ChildNext,
@@ -183,7 +192,9 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     if (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('x')))
         || matches!(key.code, KeyCode::Char(''))
     {
-        return InputAction::ChildPrefix;
+        if !state.dialog_is_open() && !state.slash_panel_is_open() {
+            return InputAction::ChildPrefix;
+        }
     }
 
     if state.is_read_only_child_view()
@@ -206,6 +217,15 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     if state.child_navigation_prefix {
         return match key.code {
             KeyCode::Char('b') | KeyCode::Char('B') => InputAction::ToggleSidebar,
+            KeyCode::Char('m') | KeyCode::Char('M') => InputAction::ShowModel,
+            KeyCode::Char('p') | KeyCode::Char('P') => InputAction::ShowPermission,
+            KeyCode::Char('r') | KeyCode::Char('R') => InputAction::ShowReasoning,
+            KeyCode::Char('t') | KeyCode::Char('T') => InputAction::ShowThoughts,
+            KeyCode::Char('a') | KeyCode::Char('A') => InputAction::ShowAgents,
+            KeyCode::Char('c') | KeyCode::Char('C') => InputAction::ShowContext,
+            KeyCode::Char('i') | KeyCode::Char('I') => InputAction::ShowMcp,
+            KeyCode::Char('s') | KeyCode::Char('S') => InputAction::ShowSkills,
+            KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => InputAction::ShowHelp,
             KeyCode::Down => InputAction::ChildFirst,
             KeyCode::Left => InputAction::ChildPrev,
             KeyCode::Right => InputAction::ChildNext,
@@ -735,6 +755,50 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('b'))),
             InputAction::ToggleSidebar
+        );
+    }
+
+    #[test]
+    fn ctrl_x_common_command_shortcuts_map_to_local_actions() {
+        let mut state = TuiState::default();
+        state.child_navigation_prefix = true;
+
+        for (ch, action) in [
+            ('m', InputAction::ShowModel),
+            ('p', InputAction::ShowPermission),
+            ('r', InputAction::ShowReasoning),
+            ('t', InputAction::ShowThoughts),
+            ('a', InputAction::ShowAgents),
+            ('c', InputAction::ShowContext),
+            ('i', InputAction::ShowMcp),
+            ('s', InputAction::ShowSkills),
+            ('h', InputAction::ShowHelp),
+            ('?', InputAction::ShowHelp),
+        ] {
+            assert_eq!(map_key_event(&state, key(KeyCode::Char(ch))), action);
+        }
+    }
+
+    #[test]
+    fn ctrl_x_prefix_preserves_child_navigation_arrows() {
+        let mut state = TuiState::default();
+        state.child_navigation_prefix = true;
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ChildFirst
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::ChildPrev
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::ChildNext
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::ChildParent
         );
     }
 
