@@ -50,7 +50,8 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$bin_dir/letcode.exe" "$staging/"
             asset="${staging}.zip"
-            7z a -tzip "$asset" "./${staging}/"*
+            staging_name="$(basename "$staging")"
+            (cd dist && 7z a -tzip "${staging_name}.zip" "$staging_name")
           else
             cp "$bin_dir/letcode" "$staging/"
             asset="${staging}.tar.gz"
