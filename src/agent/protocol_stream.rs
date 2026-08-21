@@ -1370,6 +1370,7 @@ where
             let mut provider_usage: Option<TokenUsageEstimate> = None;
             let mut provider_cache_details_present = false;
             let mut provider_response_id: Option<String> = None;
+            let mut final_provider_usage_event: Option<AgentEvent> = None;
 
             let mut stream_had_side_effect = false;
             while let Some(chunk) = byte_stream.next().await {
@@ -1498,12 +1499,11 @@ where
                     };
                     if let Some(usage) = &response.usage {
                         stream_had_side_effect = true;
-                        on_event(token_usage_event_from_completion_usage(
+                        final_provider_usage_event = Some(token_usage_event_from_completion_usage(
                             usage,
                             build.budget.context_window_tokens,
                             &cache_report,
-                        ))
-                        .await?;
+                        ));
                         provider_cache_details_present = usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).is_some();
                         provider_usage = Some(TokenUsageEstimate { used_tokens: usage.total_tokens as u64, context_window_tokens: build.budget.context_window_tokens, input_tokens: usage.prompt_tokens as u64, output_tokens: usage.completion_tokens as u64, cached_tokens: usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).unwrap_or(0) as u64 });
                         prepared_telemetry.usage = provider_usage;
@@ -1646,12 +1646,11 @@ where
                 };
                 if let Some(usage) = &response.usage {
                     stream_had_side_effect = true;
-                    on_event(token_usage_event_from_completion_usage(
+                    final_provider_usage_event = Some(token_usage_event_from_completion_usage(
                         usage,
                         build.budget.context_window_tokens,
                         &cache_report,
-                    ))
-                    .await?;
+                    ));
                     provider_cache_details_present = usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).is_some();
                     provider_usage = Some(TokenUsageEstimate { used_tokens: usage.total_tokens as u64, context_window_tokens: build.budget.context_window_tokens, input_tokens: usage.prompt_tokens as u64, output_tokens: usage.completion_tokens as u64, cached_tokens: usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).unwrap_or(0) as u64 });
                     prepared_telemetry.usage = provider_usage;
@@ -1831,6 +1830,10 @@ where
                 return Err(error);
             }
             let finish_reasons_label = format!("{finish_reasons:?}");
+
+            if let Some(event) = final_provider_usage_event {
+                on_event(event).await?;
+            }
 
             if !has_tool_calls {
                 let completed_telemetry = prepared_telemetry.completed(

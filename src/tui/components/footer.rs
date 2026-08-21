@@ -222,9 +222,8 @@ fn token_budget_spans(
 
     let cached_input_tokens = usage.cached_tokens.min(usage.input_tokens);
     let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
-    let accounted_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-    let used_tokens = usage.used_tokens.max(accounted_tokens);
-    let unknown_used_tokens = used_tokens.saturating_sub(accounted_tokens);
+    let used_tokens = usage.used_tokens;
+    let current_output_tokens = used_tokens.saturating_sub(usage.input_tokens);
     let cache_hit_percent = token_budget_cache_hit_percent(usage.input_tokens, cached_input_tokens);
     let used_percent = token_budget_used_percent(usage.context_window_tokens, used_tokens);
 
@@ -233,8 +232,8 @@ fn token_budget_spans(
         BAR_WIDTH,
         [
             cached_input_tokens,
-            uncached_input_tokens.saturating_add(unknown_used_tokens),
-            usage.output_tokens,
+            uncached_input_tokens,
+            current_output_tokens,
         ],
     );
 
@@ -963,6 +962,31 @@ mod tests {
         assert_eq!(
             token_budget_segment_units(1_000_000, 10, [0, 10, 0]),
             [0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn token_budget_uses_snapshot_usage_for_percent_and_output_bar() {
+        let usage = crate::tui::state::ModelTokenUsage {
+            used_tokens: 228_000,
+            context_window_tokens: 1_000_000,
+            input_tokens: 200_000,
+            output_tokens: 1_300_000,
+            cached_tokens: 0,
+            cache_report: None,
+        };
+
+        let rendered = token_budget_spans(&usage, crate::tui::Theme::dark())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("↓1.3m"), "{rendered}");
+        assert!(rendered.contains("~23%"), "{rendered}");
+        assert!(!rendered.contains("100%"), "{rendered}");
+        assert_eq!(
+            token_budget_segment_units(1_000_000, 10, [0, 200_000, 28_000]),
+            [0, 16, 2]
         );
     }
 

@@ -863,6 +863,55 @@ fn chat_final_sse_with_usage(text: &str) -> &'static str {
     ))
 }
 
+fn chat_multiple_usage_sse() -> &'static str {
+    sse_response(concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
+        "data: [DONE]\n\n"
+    ).to_string())
+}
+
+#[tokio::test]
+async fn chat_stream_emits_one_final_usage_event_for_multiple_usage_snapshots() {
+    let (base_url, _, server) = spawn_chat_completion_server(vec![chat_multiple_usage_sse()]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 1, 0);
+    let mut events = Vec::new();
+
+    agent
+        .run_oai_comp_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("chat stream completes");
+
+    let usage_events = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TokenUsageUpdated { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(usage_events.len(), 1);
+    assert!(matches!(
+        usage_events[0],
+        AgentEvent::TokenUsageUpdated {
+            used_tokens: 14,
+            input_tokens: 10,
+            output_tokens: 4,
+            ..
+        }
+    ));
+    server.await.expect("server task should finish");
+}
+
 #[tokio::test]
 async fn responses_installs_provider_anchor_after_assistant_frame() {
     let (base_url, _, server) =
