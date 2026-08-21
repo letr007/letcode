@@ -652,11 +652,9 @@ fn render_compaction_prompt_with_workflow_facts(
     );
     match previous_summary {
         Some(previous_summary) => {
-            let previous_summary = truncate_for_compaction(
-                previous_summary,
-                history_char_budget.clamp(512, 8_000),
-                "… [先前摘要已为压缩而缩减]",
-            );
+            // Preserve the previous checkpoint intact. The canonical one-shot
+            // request builder remains the input-budget authority and fails before
+            // transport if the complete compaction prompt cannot fit.
             format!(
                 "请根据以下内容更新已有执行检查点。保留仍正确的重要事实，删除过时或被推翻的信息，并合并新的事实、约束、决定、进度、验证、文件操作与精确下一步。输出必须仍遵循 prelude 的 Markdown section 结构。\n\n已有执行检查点：\n{}\n\n需要并入的新历史：\n{}{}",
                 previous_summary, serialized_history, common

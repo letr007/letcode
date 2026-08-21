@@ -3465,6 +3465,25 @@ fn render_compaction_tool_output_strips_media_like_fields() {
 }
 
 #[test]
+fn render_compaction_prompt_preserves_complete_previous_summary() {
+    let previous_summary = format!(
+        "{}\nTAIL-CURRENT-STATE-MUST-SURVIVE",
+        "old checkpoint detail ".repeat(600)
+    );
+
+    let prompt = compaction::render_compaction_prompt(
+        Some(&previous_summary),
+        &[HistoryItem::assistant("new history")],
+        4_000,
+    );
+
+    assert!(previous_summary.chars().count() > 8_000);
+    assert!(prompt.contains(&previous_summary));
+    assert!(prompt.contains("TAIL-CURRENT-STATE-MUST-SURVIVE"));
+    assert!(!prompt.contains("先前摘要已为压缩而缩减"));
+}
+
+#[test]
 fn render_compaction_prompt_applies_total_history_cap() {
     let items = (0..20)
         .map(|index| HistoryItem::ToolOutput {
