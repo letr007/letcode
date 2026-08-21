@@ -1266,7 +1266,11 @@ impl TuiState {
     }
 
     pub fn set_language(&mut self, language: Option<crate::tui::i18n::Language>) {
+        let previous = self.language();
         self.language = language;
+        if self.language() != previous {
+            self.invalidate_transcript_cache();
+        }
     }
 
     #[cfg(test)]

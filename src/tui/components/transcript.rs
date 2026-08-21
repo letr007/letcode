@@ -18,6 +18,7 @@ use crate::subagent::{
     looks_like_structured_subagent_output, try_parse_structured_subagent_result,
 };
 use crate::tui::{
+    i18n::Translator,
     markdown::{MarkdownRenderOptions, render_markdown_document},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
     surface,
@@ -254,6 +255,7 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 is_reviewer_child_view(state),
                 state.thoughts_display,
                 index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_)),
+                &state.translator(),
             ),
         ));
     }
@@ -579,6 +581,7 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         is_reviewer_child_view(state),
         state.thoughts_display,
         next_reasoning,
+        &state.translator(),
     );
     let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;
@@ -652,6 +655,7 @@ struct TimelineItemComponent<'a> {
     reviewer_view: bool,
     thoughts_display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
+    translator: &'a Translator,
 }
 
 impl Component<Style> for TimelineItemComponent<'_> {
@@ -696,6 +700,7 @@ impl Component<Style> for TimelineItemComponent<'_> {
                 self.width,
                 self.frame,
                 self.expanded_output,
+                self.translator,
             ),
             TimelineItem::Todo(todo) => build_todo_card(&mut out, todo, self.theme, self.width),
             TimelineItem::Permission(permission) => {
@@ -765,6 +770,7 @@ fn render_timeline_item_document(
     reviewer_view: bool,
     thoughts_display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
+    translator: &Translator,
 ) -> Document<Style> {
     let mut document = Document::default();
     TimelineItemComponent {
@@ -776,6 +782,7 @@ fn render_timeline_item_document(
         reviewer_view,
         thoughts_display,
         next_reasoning,
+        translator,
     }
     .render(&mut document);
     document.finish();
@@ -1355,6 +1362,7 @@ fn build_tool_lines(
     width: usize,
     frame: usize,
     expanded_output: bool,
+    translator: &Translator,
 ) {
     append_card_document(
         out,
@@ -1364,6 +1372,7 @@ fn build_tool_lines(
             card_content_width(width),
             frame,
             expanded_output,
+            translator,
         ),
         width,
     );
@@ -2180,6 +2189,7 @@ mod tests {
             false,
             crate::command::ThoughtsDisplayMode::Full,
             false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
         );
         let expanded = render_timeline_item_document(
             &item,
@@ -2190,6 +2200,7 @@ mod tests {
             false,
             crate::command::ThoughtsDisplayMode::Full,
             false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
         );
         let collapsed_text = collapsed
             .lines
@@ -2229,6 +2240,7 @@ mod tests {
             false,
             crate::command::ThoughtsDisplayMode::Full,
             false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
         );
         assert!(narrow.validate());
         assert!(
@@ -2316,6 +2328,7 @@ mod tests {
                         false,
                         crate::command::ThoughtsDisplayMode::Full,
                         false,
+                        &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
                     ),
                 ));
             assert!(
@@ -2347,6 +2360,7 @@ mod tests {
                 false,
                 crate::command::ThoughtsDisplayMode::Full,
                 false,
+                &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
             ));
         assert!(
             ordinary_lines
@@ -2847,6 +2861,41 @@ mod tests {
             !lines.iter().any(|line| line.contains("cargo test all")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn running_subagent_status_follows_language_switch_and_refreshes_cache() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent {
+            call_id: "run-localized".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running".into(),
+            arguments: Some(serde_json::json!({"task":"inspect localization"}).to_string()),
+        }));
+
+        cached_transcript_row_count(&mut state, Theme::dark(), 100);
+        let english = state.transcript_render_cache.entries()[0]
+            .document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(english.contains("running"), "{english}");
+        assert!(!english.contains("运行中"), "{english}");
+
+        state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+        assert!(state.transcript_render_cache.is_empty());
+        cached_transcript_row_count(&mut state, Theme::dark(), 100);
+        let chinese = state.transcript_render_cache.entries()[0]
+            .document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(chinese.contains("运行中"), "{chinese}");
     }
 
     #[test]

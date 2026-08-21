@@ -6,6 +6,7 @@ use super::semantic_spans::*;
 use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
 use crate::subagent::StructuredSubagentResult;
 use crate::tui::{
+    i18n::Translator,
     measure::{display_width, wrap_text_to_width},
     theme::Theme,
     timeline::{ToolExecutionStatus, ToolView},
@@ -18,6 +19,7 @@ pub(super) fn render_subagent_lines(
     width: usize,
     frame: usize,
     expanded_output: bool,
+    translator: &Translator,
 ) -> Vec<SemanticLine<Style>> {
     if width == 0 {
         return Vec::new();
@@ -30,13 +32,12 @@ pub(super) fn render_subagent_lines(
         .cloned()
         .and_then(|value| serde_json::from_value::<StructuredSubagentResult>(value).ok())
         .filter(|result| !result.malformed);
-    let localized_status = crate::tui::state::TuiState::default().translator();
     let status = data
         .as_ref()
         .and_then(|data| data.get("status").and_then(serde_json::Value::as_str))
         .or_else(|| structured.as_ref().map(|result| result.status.as_str()))
         .map(str::to_owned)
-        .unwrap_or_else(|| subagent_status_label(tool.status, &localized_status));
+        .unwrap_or_else(|| subagent_status_label(tool.status, translator));
     let child_id = data
         .as_ref()
         .and_then(|data| data.get("child_session_id"))
@@ -98,10 +99,7 @@ pub(super) fn render_subagent_lines(
         format!(
             "{} {}",
             PROCESS_FRAMES[frame % PROCESS_FRAMES.len()],
-            status_label(
-                map_tool_status(tool.status),
-                &crate::tui::state::TuiState::default().translator()
-            )
+            status_label(map_tool_status(tool.status), translator)
         )
     } else {
         status

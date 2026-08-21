@@ -181,6 +181,7 @@ pub(crate) fn render_tool_card_lines_with_frame(
         width,
         frame,
         expanded_output,
+        &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
     ))
 }
 
@@ -192,6 +193,7 @@ pub fn render_tool_card_document(
     width: usize,
     frame: usize,
     expanded_output: bool,
+    translator: &crate::tui::i18n::Translator,
 ) -> Document<Style> {
     let policy = PresentationPolicy;
     let mut document = Document::default();
@@ -199,7 +201,7 @@ pub fn render_tool_card_document(
         return document;
     }
     let lines = if is_subagent_tool(&tool.name) {
-        render_subagent_lines(tool, theme, width, frame, expanded_output)
+        render_subagent_lines(tool, theme, width, frame, expanded_output, translator)
     } else {
         let body = render_tool_body_lines(tool, theme, width, expanded_output);
         if body.is_empty() {
@@ -1054,7 +1056,14 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        let expanded_document = render_tool_card_document(&tool, Theme::dark(), 80, 0, true);
+        let expanded_document = render_tool_card_document(
+            &tool,
+            Theme::dark(),
+            80,
+            0,
+            true,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+        );
         let expanded = render_tool_card_lines_with_frame(&tool, Theme::dark(), 80, 0, true)
             .into_iter()
             .map(|line| line.to_string())
@@ -1698,7 +1707,14 @@ mod tests {
             output: Some(json!({"data": {"stdout": "hello", "stderr": "warn"}}).to_string()),
             status: ToolExecutionStatus::Succeeded,
         };
-        let document = render_tool_card_document(&tool, Theme::dark(), 80, 0, false);
+        let document = render_tool_card_document(
+            &tool,
+            Theme::dark(),
+            80,
+            0,
+            false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+        );
         let copied = document
             .lines
             .iter()
@@ -1774,7 +1790,14 @@ mod tests {
             ),
             status: ToolExecutionStatus::Succeeded,
         };
-        let document = render_tool_card_document(&tool, Theme::dark(), 80, 0, false);
+        let document = render_tool_card_document(
+            &tool,
+            Theme::dark(),
+            80,
+            0,
+            false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+        );
         let source_lines = document
             .lines
             .iter()
