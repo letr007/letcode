@@ -5,7 +5,6 @@ use std::collections::HashSet;
 
 use crate::agent::{ToolEffectKind, ToolExecutionRecord, is_subagent_tool_name};
 use crate::tool::ToolResult;
-use crate::tool_names;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
 const MAX_EVIDENCE_DETAIL_BYTES: usize = 8 * 1024;
@@ -520,8 +519,7 @@ fn evidence_source_for_tool(
 }
 
 fn evidence_source_for_record(record: &ToolExecutionRecord, args: &Value) -> EvidenceSource {
-    if (is_subagent_tool_name(&record.tool_name)
-        || record.tool_name == tool_names::TOOL_AGENT_RECONCILE)
+    if is_subagent_tool_name(&record.tool_name)
         && let Some(run_id) = data_string(&record.output, "run_id")
         && let Some(child_session_id) = data_string(&record.output, "child_session_id")
     {
@@ -649,19 +647,6 @@ fn evidence_tags_for_record(record: &ToolExecutionRecord, args: &Value) -> Vec<S
     let mut tags = vec![record.tool_name.clone(), record.output.tool.clone()];
     if is_subagent_tool_name(&record.tool_name) {
         tags.push("subagent_result".into());
-        tags.push("unreconciled".into());
-    } else if record.tool_name == tool_names::TOOL_AGENT_RECONCILE {
-        tags.push("subagent_reconciliation".into());
-        if record
-            .output
-            .data
-            .as_ref()
-            .and_then(|data| data.get("reconciled"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            tags.push("reconciled".into());
-        }
     }
     if let Some(run_id) = data_string(&record.output, "run_id") {
         tags.push(run_id);

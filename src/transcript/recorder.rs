@@ -696,9 +696,6 @@ impl TranscriptRecorder {
                 subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
                     anyhow!("subagent result recorded with unknown agent name: {agent_name}")
                 })?;
-            // System experts (e.g. auto-reviewer) are not user-delegated jobs — mark
-            // reconciled immediately so they never pollute agent__reconcile context.
-            let system_expert = parent_tool.starts_with("system__");
             let detail = serde_json::to_string(&result).ok();
             let evidence = EvidenceDraft {
                 id: None,
@@ -714,60 +711,11 @@ impl TranscriptRecorder {
                     parent_turn_id: Some(parent_run_id),
                     parent_session_id: Some(parent_session_id),
                 },
-                tags: if system_expert {
-                    vec![
-                        agent_name,
-                        "subagent_result".into(),
-                        "system_expert".into(),
-                        "reconciled".into(),
-                    ]
-                } else {
-                    vec![agent_name, "subagent_result".into(), "unreconciled".into()]
-                },
+                tags: vec![agent_name, "subagent_result".into()],
             };
             self.record_evidence(evidence)?;
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn record_subagent_reconciliation(
-        &mut self,
-        run_id: impl Into<String>,
-        child_session_id: impl Into<String>,
-        agent_name: impl Into<String>,
-        parent_turn_id: impl Into<String>,
-        summary: impl Into<String>,
-    ) -> Result<EvidenceRecord> {
-        let run_id = run_id.into();
-        let child_session_id = child_session_id.into();
-        let agent_name = agent_name.into();
-        self.record_evidence(EvidenceDraft {
-            id: None,
-            evidence_kind: EvidenceKind::Decision,
-            title: format!("reconciled subagent {agent_name} result"),
-            summary: summary.into(),
-            detail: None,
-            source: EvidenceSource::Subagent {
-                run_id,
-                child_session_id: child_session_id.clone(),
-                source_session_id: child_session_id,
-                parent_tool: subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(
-                    || {
-                        anyhow!(
-                            "subagent reconciliation recorded with unknown agent name: {agent_name}"
-                        )
-                    },
-                )?,
-                parent_turn_id: Some(parent_turn_id.into()),
-                parent_session_id: Some(self.session_id.clone()),
-            },
-            tags: vec![
-                agent_name,
-                "subagent_reconciliation".into(),
-                "reconciled".into(),
-            ],
-        })
     }
 
     pub fn record_user_message(&mut self, content: impl Into<String>) -> Result<()> {

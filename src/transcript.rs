@@ -201,9 +201,6 @@ pub fn sort_child_session_summaries(children: &mut [ChildSessionSummary]) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobBoardEntry {
     pub active: bool,
-    pub unreconciled: bool,
-    pub reconciled: bool,
-    pub reusable_eligible: bool,
     pub run_id: String,
     pub child_session_id: String,
     pub agent_name: String,

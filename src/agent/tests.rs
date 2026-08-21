@@ -2315,7 +2315,7 @@ fn capturing_delegate(
 }
 
 #[tokio::test]
-async fn contiguous_different_role_subagents_overlap_and_reconcile_in_model_order() {
+async fn contiguous_different_role_subagents_overlap_and_return_in_model_order() {
     let mut agent = test_agent();
     let started = Arc::new(Mutex::new(Vec::new()));
     agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
@@ -2566,7 +2566,7 @@ async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() 
 }
 
 #[tokio::test]
-async fn delegated_structured_subagent_results_surface_in_next_turn_prelude() {
+async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
     let mut agent = test_agent();
     agent.prepare_turn_prelude("Delegate implementation work");
     agent.set_subagent_delegate(static_delegate(ToolResult::ok(
@@ -2587,7 +2587,7 @@ async fn delegated_structured_subagent_results_surface_in_next_turn_prelude() {
                 "commands_run": ["cargo test subagent --quiet"],
                 "validation": ["cargo test subagent --quiet passed"],
                 "blockers": [],
-                "next_steps": ["reconcile in parent turn"],
+                "next_steps": ["continue parent task"],
                 "run_id": "run-structured-1",
                 "child_session_id": "child-structured-1"
             }
@@ -2615,25 +2615,7 @@ async fn delegated_structured_subagent_results_surface_in_next_turn_prelude() {
         event,
         AgentEvent::EvidenceRecorded(record)
             if record.tags.iter().any(|tag| tag == "subagent_result")
-                && record.tags.iter().any(|tag| tag == "unreconciled")
     )));
-
-    let jobs = agent.pending_subagent_jobs();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].agent_name, "fixer");
-    assert_eq!(jobs[0].run_id, "run-structured-1");
-    assert_eq!(jobs[0].child_session_id, "child-structured-1");
-    assert_eq!(jobs[0].summary, "implemented bounded fix");
-
-    let prelude = agent.prepare_turn_prelude("Reconcile child work");
-    assert!(prelude.iter().any(|message| {
-        message.text.contains("来自更早回合的待处理子代理结果")
-            && message.text.contains("run-structured-1")
-            && message.text.contains("implemented bounded fix")
-            && message.text.contains("child-structured-1")
-            && message.text.contains("child_session_id=child-structured-1")
-            && message.text.contains("仅用于子会话 transcript 导航")
-    }));
 }
 
 #[test]
@@ -6525,165 +6507,4 @@ async fn audit_event_failures_do_not_fail_tool_execution() {
         record.rejection,
         Some(ToolExecutionRejection::InvalidJsonArguments)
     );
-}
-
-#[test]
-fn pending_subagent_jobs_clear_after_live_reconciliation_evidence() {
-    let mut agent = test_agent();
-    agent
-        .add_evidence(
-            EvidenceDraft {
-                id: Some("ev-result".into()),
-                evidence_kind: crate::evidence::EvidenceKind::Decision,
-                title: "subagent result".into(),
-                summary: "child completed".into(),
-                detail: Some(
-                    serde_json::to_string(&crate::subagent::StructuredSubagentResult {
-                        status: "completed".into(),
-                        summary: "child completed".into(),
-                        malformed: false,
-                        findings: vec![],
-                        files_read: vec![],
-                        files_changed: vec![],
-                        commands_run: vec![],
-                        validation: vec![],
-                        blockers: vec![],
-                        next_steps: vec![],
-                        run_id: "run-1".into(),
-                        child_session_id: "child-1".into(),
-                        raw_excerpt: None,
-                    })
-                    .expect("serialize structured result"),
-                ),
-                source: EvidenceSource::Subagent {
-                    run_id: "run-1".into(),
-                    child_session_id: "child-1".into(),
-                    source_session_id: "child-1".into(),
-                    parent_tool: "agent__explore".into(),
-                    parent_turn_id: Some("turn-1".into()),
-                    parent_session_id: None,
-                },
-                tags: vec![
-                    "explorer".into(),
-                    "subagent_result".into(),
-                    "unreconciled".into(),
-                ],
-            }
-            .into_record("ev-result".into(), 1, 0)
-            .expect("build evidence"),
-        )
-        .expect("add result evidence");
-    assert_eq!(agent.pending_subagent_jobs().len(), 1);
-
-    let record = ToolExecutionRecord::new(
-        &test_tool_call(
-            tool_names::TOOL_AGENT_RECONCILE,
-            r#"{"run_id":"run-1","child_session_id":"child-1","agent_name":"explorer","decision":"accepted","summary":"accepted child result"}"#,
-        ),
-        Some(json!({
-            "run_id": "run-1",
-            "child_session_id": "child-1",
-            "agent_name": "explorer",
-            "decision": "accepted",
-            "summary": "accepted child result"
-        })),
-        crate::permission::ToolPermissionClass::Preview,
-        ExecutionDirective::None,
-        ToolExecutionStatus::Executed,
-        None,
-        ToolResult::ok(
-            tool_names::TOOL_AGENT_RECONCILE,
-            json!({
-                "run_id": "run-1",
-                "child_session_id": "child-1",
-                "agent_name": "explorer",
-                "decision": "accepted",
-                "summary": "accepted child result",
-                "reconciled": true,
-                "pending_recording": true
-            }),
-        ),
-    );
-    agent.record_tool_effects(&record);
-    let evidence = agent
-        .remember_tool_evidence(&record)
-        .expect("record live reconciliation evidence");
-    assert!(
-        evidence
-            .tags
-            .iter()
-            .any(|tag| tag == "subagent_reconciliation")
-    );
-    assert!(evidence.tags.iter().any(|tag| tag == "reconciled"));
-    assert_eq!(agent.pending_subagent_jobs().len(), 0);
-}
-
-#[tokio::test]
-async fn finalization_does_not_auto_reconcile_unreconciled_subagent_jobs() {
-    let mut agent = test_agent();
-    agent.prepare_turn_prelude("Follow up on child work");
-    agent
-        .add_evidence(
-            EvidenceDraft {
-                id: Some("ev-1".into()),
-                evidence_kind: crate::evidence::EvidenceKind::Decision,
-                title: "subagent result".into(),
-                summary: "child completed".into(),
-                detail: Some(
-                    serde_json::to_string(&crate::subagent::StructuredSubagentResult {
-                        status: "completed".into(),
-                        summary: "child completed".into(),
-                        malformed: false,
-                        findings: vec![],
-                        files_read: vec![],
-                        files_changed: vec![],
-                        commands_run: vec![],
-                        validation: vec![],
-                        blockers: vec![],
-                        next_steps: vec![],
-                        run_id: "run-1".into(),
-                        child_session_id: "child-1".into(),
-                        raw_excerpt: None,
-                    })
-                    .expect("serialize structured result"),
-                ),
-                source: EvidenceSource::Subagent {
-                    run_id: "run-1".into(),
-                    child_session_id: "child-1".into(),
-                    source_session_id: "child-1".into(),
-                    parent_tool: "agent__explore".into(),
-                    parent_turn_id: Some("turn-1".into()),
-                    parent_session_id: None,
-                },
-                tags: vec![
-                    "explorer".into(),
-                    "subagent_result".into(),
-                    "unreconciled".into(),
-                ],
-            }
-            .into_record("ev-1".into(), 1, 0)
-            .expect("build evidence"),
-        )
-        .expect("add evidence");
-
-    let mut events = Vec::new();
-    let continued = agent
-        .continue_or_finalize_no_tool_reply(
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            0,
-            &mut 0,
-        )
-        .await
-        .expect("finalization succeeds");
-
-    assert!(!continued);
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        AgentEvent::EvidenceRecorded(record)
-            if record.tags.iter().any(|tag| tag == "subagent_reconciliation")
-    )));
-    assert_eq!(agent.pending_subagent_jobs().len(), 1);
 }

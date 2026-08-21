@@ -440,7 +440,7 @@ fn effective_runtime_prompt(
                         PromptMessageOrigin::StaticPrelude
                             | PromptMessageOrigin::SkillCatalog
                             | PromptMessageOrigin::SkillMaterial
-                    ) && message.origin != PromptMessageOrigin::UnreconciledSubagentContext
+                    )
                 })
                 .cloned(),
         );
@@ -767,7 +767,7 @@ pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
     let mut current = Vec::new();
     for segment in plan.segments.drain(..) {
         // Protocol frames take precedence over contributor classification. In
-        // particular, a reconciled skill output must remain beside the
+        // particular, a resolved skill output must remain beside the
         // assistant call that introduced it rather than moving into kernel
         // material ahead of that call.
         if matches!(
@@ -1048,12 +1048,6 @@ fn classify_prelude_message(message: &PromptMessage) -> PreludeClassification {
         PromptMessageOrigin::WorkflowTurn => (
             PromptContributorKind::CurrentTurn,
             "workflow_turn",
-            PromptSegmentStability::Volatile,
-            RuntimeSource::ContextView,
-        ),
-        PromptMessageOrigin::UnreconciledSubagentContext => (
-            PromptContributorKind::RuntimeContext,
-            "unreconciled_subagent_context",
             PromptSegmentStability::Volatile,
             RuntimeSource::ContextView,
         ),

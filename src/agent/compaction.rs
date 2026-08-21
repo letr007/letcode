@@ -538,10 +538,7 @@ fn render_protected_workflow_facts<C: Config>(agent: &Agent<C>) -> String {
             matches!(
                 evidence.evidence_kind,
                 crate::evidence::EvidenceKind::Decision
-            ) || evidence
-                .tags
-                .iter()
-                .any(|tag| matches!(tag.as_str(), "reconciled" | "subagent_reconciliation"))
+            )
         })
         .map(|evidence| format!("- {}: {}", evidence.title, evidence.summary))
         .collect::<Vec<_>>();

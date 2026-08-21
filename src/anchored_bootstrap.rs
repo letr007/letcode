@@ -3,7 +3,7 @@
 //! injected context, then restore the full catalog and regular injections after
 //! the session's first durable promotion signal.
 //!
-//! Design decisions (see docs/anchored-bootstrap-design.md):
+//! Design decisions:
 //! - Persona stays Minimal for the whole session (dsh-anch behavior) — no jump.
 //! - The promoted phase restores the FULL catalog and injections with zero
 //!   residue: alias names only exist while the phase is not promoted.
@@ -143,7 +143,6 @@ impl AnchoredBootstrap {
     /// Assemble the turn prelude for this phase. The persona (first base
     /// message) is replaced with the Minimal persona for the whole session;
     /// bootstrap/fallback keeps ONLY the persona plus manual skill gestures.
-    #[allow(clippy::too_many_arguments)]
     pub fn prelude(
         &self,
         phase: &AnchoredPhase,
@@ -152,7 +151,6 @@ impl AnchoredBootstrap {
         skill: Option<PromptMessage>,
         workflow: Option<PromptMessage>,
         manual: &[PromptMessage],
-        subagent: Option<PromptMessage>,
     ) -> Vec<PromptMessage> {
         let mut persona = base
             .first()
@@ -168,7 +166,7 @@ impl AnchoredBootstrap {
                 out.extend(base.iter().skip(1).cloned());
                 // Message order matches the regular (non-experiment) path:
                 // persona, AGENTS.md chain, runtime, skill catalog, manual
-                // skill material, workflow, subagent context.
+                // skill material, workflow.
                 if let Some(runtime) = runtime {
                     out.push(runtime);
                 }
@@ -178,9 +176,6 @@ impl AnchoredBootstrap {
                 out.extend(manual.iter().cloned());
                 if let Some(workflow) = workflow {
                     out.push(workflow);
-                }
-                if let Some(subagent) = subagent {
-                    out.push(subagent);
                 }
                 out
             }
@@ -419,7 +414,6 @@ mod tests {
             Some(PromptMessage::developer("skill catalog")),
             Some(PromptMessage::developer("workflow")),
             &manual,
-            Some(PromptMessage::developer("subagent context")),
         );
         let texts: Vec<_> = prelude
             .iter()
@@ -439,7 +433,6 @@ mod tests {
             Some(PromptMessage::developer("skill catalog")),
             Some(PromptMessage::developer("workflow")),
             &manual,
-            Some(PromptMessage::developer("subagent context")),
         );
         let texts: Vec<_> = prelude
             .iter()
@@ -454,7 +447,6 @@ mod tests {
                 "skill catalog",
                 "manual skill material",
                 "workflow",
-                "subagent context",
             ]
         );
     }

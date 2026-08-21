@@ -336,19 +336,6 @@ pub(super) fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str
         flags.push("active");
     }
     if data
-        .get("unreconciled")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        flags.push("unreconciled");
-    }
-    if data.get("reconciled").and_then(serde_json::Value::as_bool) == Some(true) {
-        flags.push("reconciled");
-    }
-    if data.get("reusable").and_then(serde_json::Value::as_bool) == Some(true) {
-        flags.push("reusable");
-    }
-    if data
         .get("structured_result")
         .and_then(|result| result.get("malformed"))
         .and_then(serde_json::Value::as_bool)

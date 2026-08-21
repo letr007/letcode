@@ -782,10 +782,10 @@ impl AgentFactory {
             session_reasoning_efforts: parent.session_reasoning_efforts.clone(),
             prelude,
             runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&model),
-            tools: parent.tools.scoped(template.tool_scope).without_tools(&[
-                tool_names::TOOL_MEMORY_RECALL,
-                tool_names::TOOL_AGENT_RECONCILE,
-            ]),
+            tools: parent
+                .tools
+                .scoped(template.tool_scope)
+                .without_tools(&[tool_names::TOOL_MEMORY_RECALL]),
             skill_registry: parent.skill_registry.clone(),
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,
@@ -2631,7 +2631,7 @@ impl<C: Config> Agent<C> {
 
     /// Executes model-issued calls in order. Contiguous ordinary tools that
     /// explicitly support parallel execution are polled together after a
-    /// no-prompt permission preflight; results are reconciled in model order.
+    /// no-prompt permission preflight; results are returned in model order.
     /// Subagents retain their separate role-aware batching rules.
     async fn execute_tool_calls_and_record<E, A, Efut, Afut>(
         &mut self,
@@ -2993,7 +2993,6 @@ impl<C: Config> Agent<C> {
                 self.skill_prelude_message(),
                 turn.developer_context_message(),
                 &manual_skill_material,
-                self.unreconciled_subagent_context_message(),
             ));
         }
 
@@ -3004,9 +3003,6 @@ impl<C: Config> Agent<C> {
         }
         turn_prelude.extend(manual_skill_material);
         if let Some(message) = turn.developer_context_message() {
-            turn_prelude.push(message);
-        }
-        if let Some(message) = self.unreconciled_subagent_context_message() {
             turn_prelude.push(message);
         }
         Ok(turn_prelude)
@@ -3291,78 +3287,6 @@ impl<C: Config> Agent<C> {
         })
     }
 
-    fn unreconciled_subagent_context_message(&self) -> Option<PromptMessage> {
-        let jobs = self.pending_subagent_jobs();
-        if jobs.is_empty() {
-            return None;
-        }
-        let mut text = String::from(
-            "来自更早回合的待处理子代理结果：\n在依赖它们之前，请使用 agent__reconcile 显式记录接受、拒绝或冲突决策。",
-        );
-        for job in jobs {
-            text.push_str(&format!(
-                "\n- {} [{}] {} — {} (child_session_id={}；仅用于子会话 transcript 导航，不是上下文 node_id)",
-                job.agent_name, job.status, job.run_id, job.summary, job.child_session_id
-            ));
-        }
-        Some(PromptMessage::developer_with_origin(
-            text,
-            PromptMessageOrigin::UnreconciledSubagentContext,
-        ))
-    }
-
-    fn pending_subagent_jobs(&self) -> Vec<PendingSubagentJob> {
-        let mut jobs = BTreeMap::<String, PendingSubagentJob>::new();
-        let mut reconciled = HashSet::new();
-
-        for evidence in &self.runtime_snapshot.evidence {
-            let EvidenceSource::Subagent {
-                run_id,
-                child_session_id,
-                parent_tool,
-                ..
-            } = &evidence.source
-            else {
-                continue;
-            };
-
-            if evidence
-                .tags
-                .iter()
-                .any(|tag| tag == "subagent_reconciliation" || tag == "reconciled")
-            {
-                reconciled.insert(run_id.clone());
-                continue;
-            }
-
-            if evidence.tags.iter().any(|tag| tag == "subagent_result") {
-                let status = evidence
-                    .detail
-                    .as_deref()
-                    .and_then(|detail| {
-                        serde_json::from_str::<crate::subagent::StructuredSubagentResult>(detail)
-                            .ok()
-                    })
-                    .map(|structured| structured.status)
-                    .unwrap_or_else(|| "completed".into());
-                jobs.insert(
-                    run_id.clone(),
-                    PendingSubagentJob {
-                        run_id: run_id.clone(),
-                        child_session_id: child_session_id.clone(),
-                        agent_name: subagent_agent_name_from_parent_tool(parent_tool),
-                        status,
-                        summary: evidence.summary.clone(),
-                    },
-                );
-            }
-        }
-
-        jobs.into_iter()
-            .filter_map(|(run_id, job)| (!reconciled.contains(&run_id)).then_some(job))
-            .collect()
-    }
-
     fn remaining_unfinished_todos(&self) -> Option<usize> {
         if self
             .runtime_snapshot
@@ -3619,7 +3543,7 @@ impl ToolEffects {
                         }
                     }
                     "shell__exec" => ToolEffectKind::Command,
-                    "workflow__todos" | "workflow__auto_continue" | "agent__reconcile" => {
+                    "workflow__todos" | "workflow__auto_continue" => {
                         ToolEffectKind::WorkflowControl
                     }
                     _ => ToolEffectKind::Unknown,
@@ -4137,23 +4061,6 @@ struct TurnCounters {
     child_write_effects: usize,
     child_validation_effects: usize,
     child_failed_validation_effects: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingSubagentJob {
-    run_id: String,
-    child_session_id: String,
-    agent_name: String,
-    status: String,
-    summary: String,
-}
-
-fn subagent_agent_name_from_parent_tool(parent_tool: &str) -> String {
-    parent_tool
-        .strip_prefix("agent__")
-        .or_else(|| parent_tool.strip_prefix("system__"))
-        .unwrap_or(parent_tool)
-        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

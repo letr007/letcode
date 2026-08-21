@@ -62,15 +62,6 @@ fn summarize_subagent_flags(data: &Value) -> Vec<&'static str> {
     if data.get("active").and_then(Value::as_bool) == Some(true) {
         flags.push("active");
     }
-    if data.get("unreconciled").and_then(Value::as_bool) == Some(true) {
-        flags.push("unreconciled");
-    }
-    if data.get("reconciled").and_then(Value::as_bool) == Some(true) {
-        flags.push("reconciled");
-    }
-    if data.get("reusable").and_then(Value::as_bool) == Some(true) {
-        flags.push("reusable");
-    }
     if data
         .get("structured_result")
         .and_then(|value| value.get("malformed"))

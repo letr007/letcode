@@ -61,7 +61,6 @@ const MAX_READ_LINE_LIMIT: usize = 5_000;
 const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
 const MAX_READ_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 300;
-const MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS: usize = 2_000;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
 const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
 
@@ -439,7 +438,6 @@ impl ToolRegistry {
         config_validate::register(&mut registry);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
-        registry.register(AgentReconcileTool);
         fs::register(&mut registry);
         command::register(&mut registry);
         search::register(&mut registry);
@@ -630,8 +628,6 @@ struct AgentExploreTool;
 
 struct AgentFixerTool;
 
-struct AgentReconcileTool;
-
 #[async_trait]
 impl ToolHandler for EchoTool {
     fn name(&self) -> &'static str {
@@ -715,114 +711,6 @@ impl ToolHandler for AgentFixerTool {
 fn validate_agent_fixer(args: &Value) -> Result<()> {
     normalize_subagent_input("agent__fixer", args)?;
     Ok(())
-}
-
-#[async_trait]
-impl ToolHandler for AgentReconcileTool {
-    fn name(&self) -> &'static str {
-        tool_names::TOOL_AGENT_RECONCILE
-    }
-
-    fn description(&self) -> &'static str {
-        "显式记录父代理已采纳、驳回或标记冲突的子代理结果。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "run_id": {
-                    "type": "string",
-                    "maxLength": MAX_SUBAGENT_TEXT_FIELD_CHARS
-                },
-                "child_session_id": {
-                    "type": "string",
-                    "maxLength": MAX_SUBAGENT_TEXT_FIELD_CHARS
-                },
-                "agent_name": {
-                    "type": "string",
-                    "enum": ["fixer", "explorer", "oracle", "designer", "librarian", "general"]
-                },
-                "decision": {
-                    "type": "string",
-                    "enum": ["accepted", "rejected", "conflict"]
-                },
-                "summary": {
-                    "type": "string",
-                    "maxLength": MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS
-                }
-            },
-            "required": ["run_id", "child_session_id", "agent_name", "decision", "summary"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        let payload = validate_agent_reconcile(&args)?;
-        Ok(json!({
-            "run_id": payload.run_id,
-            "child_session_id": payload.child_session_id,
-            "agent_name": payload.agent_name,
-            "decision": payload.decision,
-            "summary": payload.summary,
-            "reconciled": true,
-            "pending_recording": true
-        }))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentReconcilePayload {
-    run_id: String,
-    child_session_id: String,
-    agent_name: String,
-    decision: String,
-    summary: String,
-}
-
-fn validate_agent_reconcile(args: &Value) -> Result<AgentReconcilePayload> {
-    let run_id = required_trimmed_string_field(args, "run_id", MAX_SUBAGENT_TEXT_FIELD_CHARS)?;
-    let child_session_id =
-        required_trimmed_string_field(args, "child_session_id", MAX_SUBAGENT_TEXT_FIELD_CHARS)?;
-    let agent_name = required_trimmed_string_field(args, "agent_name", 64)?;
-    if crate::agent::subagent_tool_name_for_agent_name(&agent_name).is_none() {
-        bail!(
-            "field 'agent_name' must be one of fixer, explorer, oracle, designer, librarian, general"
-        );
-    }
-    let decision = required_trimmed_string_field(args, "decision", 32)?;
-    if !matches!(decision.as_str(), "accepted" | "rejected" | "conflict") {
-        bail!("field 'decision' must be one of accepted, rejected, conflict");
-    }
-    let summary =
-        required_trimmed_string_field(args, "summary", MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS)?;
-    Ok(AgentReconcilePayload {
-        run_id,
-        child_session_id,
-        agent_name,
-        decision,
-        summary,
-    })
-}
-
-fn required_trimmed_string_field(args: &Value, field: &str, max_chars: usize) -> Result<String> {
-    let Some(value) = args.get(field) else {
-        bail!(
-            "{} requires string field '{field}'",
-            tool_names::TOOL_AGENT_RECONCILE
-        );
-    };
-    let Some(text) = value.as_str() else {
-        bail!("field '{field}' must be a string");
-    };
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        bail!("field '{field}' must not be empty or whitespace");
-    }
-    if trimmed.chars().count() > max_chars {
-        bail!("field '{field}' exceeds {max_chars} characters");
-    }
-    Ok(trimmed.to_string())
 }
 
 pub(crate) fn prepare_writable_leaf(path: &str) -> Result<PreparedWritableLeaf> {
@@ -1540,71 +1428,6 @@ mod tests {
         assert_eq!(
             output.error.as_ref().expect("scope error").message,
             "tool 'agent__fixer' is not allowed in read_only_explorer scope"
-        );
-
-        let output = tools
-            .call(
-                "agent__reconcile",
-                json!({
-                    "run_id": "run-1",
-                    "child_session_id": "child-1",
-                    "agent_name": "explorer",
-                    "decision": "accepted",
-                    "summary": "accepted child result"
-                }),
-            )
-            .await;
-        assert!(!output.ok);
-        assert_eq!(
-            output.error.as_ref().expect("scope error").message,
-            "tool 'agent__reconcile' is not allowed in read_only_explorer scope"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_reconcile_rejects_invalid_payload() {
-        let output = ToolRegistry::default_tools()
-            .call(
-                tool_names::TOOL_AGENT_RECONCILE,
-                json!({
-                    "run_id": "run-1",
-                    "child_session_id": "child-1",
-                    "agent_name": "explorer",
-                    "decision": "merge",
-                    "summary": "ok"
-                }),
-            )
-            .await;
-        assert!(!output.ok);
-        assert!(
-            output
-                .error
-                .as_ref()
-                .expect("reconcile error")
-                .message
-                .contains("field 'decision' must be one of accepted, rejected, conflict")
-        );
-
-        let output = ToolRegistry::default_tools()
-            .call(
-                tool_names::TOOL_AGENT_RECONCILE,
-                json!({
-                    "run_id": "run-1",
-                    "child_session_id": "child-1",
-                    "agent_name": "unknown",
-                    "decision": "accepted",
-                    "summary": "ok"
-                }),
-            )
-            .await;
-        assert!(!output.ok);
-        assert!(
-            output
-                .error
-                .as_ref()
-                .expect("reconcile error")
-                .message
-                .contains("field 'agent_name' must be one of")
         );
     }
 

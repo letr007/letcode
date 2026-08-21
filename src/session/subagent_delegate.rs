@@ -115,9 +115,6 @@ impl RunnerSubagentDelegate {
             "summary": summary,
             "full_summary": summary,
             "active": false,
-            "unreconciled": false,
-            "reconciled": false,
-            "reusable": false,
         });
         ToolResult::err_with_data(tool_name, summary, data)
     }
@@ -146,9 +143,6 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                         "summary": compact_subagent_summary(&summary),
                         "full_summary": summary,
                         "active": false,
-                        "unreconciled": false,
-                        "reconciled": false,
-                        "reusable": false,
                     });
                     return Ok(ToolResult::err_with_data(tool_name, summary, data));
                 }
@@ -174,9 +168,6 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                         "summary": summary,
                         "full_summary": summary,
                         "active": false,
-                        "unreconciled": false,
-                        "reconciled": false,
-                        "reusable": false,
                     });
                     return Ok(ToolResult::err_with_data(tool_name, summary, data));
                 }
@@ -214,9 +205,6 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                         "summary": compact_subagent_summary(&summary),
                         "full_summary": summary,
                         "active": false,
-                        "unreconciled": false,
-                        "reconciled": false,
-                        "reusable": false,
                     });
                     return Ok(ToolResult::err_with_data(tool_name, summary, data));
                 }
@@ -237,9 +225,6 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                 "full_summary": summary.summary,
                 "structured_result": summary.structured_result,
                 "active": false,
-                "unreconciled": status == SubagentStatus::Completed,
-                "reconciled": false,
-                "reusable": false,
             });
 
             if status == SubagentStatus::Completed {

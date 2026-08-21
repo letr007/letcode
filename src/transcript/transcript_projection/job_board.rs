@@ -152,18 +152,10 @@ pub(crate) fn project_job_board(
                         && let Ok(structured) =
                             serde_json::from_str::<StructuredSubagentResult>(detail)
                     {
-                        entry.malformed = structured.malformed;
-                        entry.structured_status = Some(structured.status.clone());
                         if entry.status.is_empty() {
                             entry.status = structured.status;
                         }
                     }
-                }
-                if tags
-                    .iter()
-                    .any(|tag| tag == "subagent_reconciliation" || tag == "reconciled")
-                {
-                    entry.reconciled = true;
                 }
             }
             _ => {}
@@ -180,24 +172,13 @@ pub(crate) fn project_job_board(
     let mut entries = jobs
         .into_iter()
         .filter(|entry| !entry.run_id.is_empty())
-        .map(|entry| {
-            let reconciled = entry.terminal && entry.reconciled;
-            let unreconciled = entry.terminal && !entry.reconciled;
-            let reusable_eligible = reconciled
-                && entry.status == "completed"
-                && entry.structured_status.as_deref() == Some("completed")
-                && !entry.malformed;
-            JobBoardEntry {
-                active: entry.active,
-                unreconciled,
-                reconciled,
-                reusable_eligible,
-                run_id: entry.run_id,
-                child_session_id: entry.child_session_id,
-                agent_name: entry.agent_name,
-                status: entry.status,
-                summary: entry.summary,
-            }
+        .map(|entry| JobBoardEntry {
+            active: entry.active,
+            run_id: entry.run_id,
+            child_session_id: entry.child_session_id,
+            agent_name: entry.agent_name,
+            status: entry.status,
+            summary: entry.summary,
         })
         .collect::<Vec<_>>();
     entries.sort_by(|a, b| a.run_id.cmp(&b.run_id));
@@ -259,7 +240,4 @@ struct JobBoardAccumulator {
     summary: String,
     active: bool,
     terminal: bool,
-    reconciled: bool,
-    malformed: bool,
-    structured_status: Option<String>,
 }

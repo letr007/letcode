@@ -245,7 +245,6 @@ pub enum PromptMessageOrigin {
     SkillMaterial,
     RuntimeClock,
     WorkflowTurn,
-    UnreconciledSubagentContext,
     RuntimeContextView,
 }
 

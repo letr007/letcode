@@ -1080,69 +1080,6 @@ fn child_transcript_records_parent_attribution_without_affecting_parent_restore(
 }
 
 #[test]
-fn restore_job_board_derives_unreconciled_reconciled_and_reusable_states() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-job-board-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    let parent_session_id = recorder.session_id().to_string();
-
-    recorder
-        .record_subagent_result_structured(
-            "run-1",
-            &parent_session_id,
-            "turn-1",
-            "child-1",
-            "explorer",
-            "completed",
-            "done",
-            Some(StructuredSubagentResult {
-                status: "completed".into(),
-                summary: "done".into(),
-                malformed: false,
-                findings: vec![],
-                files_read: vec!["src/lib.rs".into()],
-                files_changed: vec![],
-                commands_run: vec![],
-                validation: vec![],
-                blockers: vec![],
-                next_steps: vec![],
-                run_id: "run-1".into(),
-                child_session_id: "child-1".into(),
-                raw_excerpt: None,
-            }),
-        )
-        .expect("record result");
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read records");
-    let job_board = restore_job_board(&base_dir, &records).expect("derive unreconciled board");
-    assert_eq!(job_board.len(), 1);
-    assert!(job_board[0].unreconciled);
-    assert!(!job_board[0].reconciled);
-    assert!(!job_board[0].reusable_eligible);
-
-    let mut recorder = TranscriptRecorder::open_existing(&base_dir, recorder.session_id())
-        .expect("reopen recorder");
-    recorder
-        .record_subagent_reconciliation(
-            "run-1",
-            "child-1",
-            "explorer",
-            "turn-2",
-            "reconciled child run run-1",
-        )
-        .expect("record reconciliation");
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read updated records");
-    let job_board = restore_job_board(&base_dir, &records).expect("derive reconciled board");
-    assert_eq!(job_board.len(), 1);
-    assert!(!job_board[0].unreconciled);
-    assert!(job_board[0].reconciled);
-    assert!(job_board[0].reusable_eligible);
-}
-
-#[test]
 fn context_view_remove_is_append_only_metadata_not_raw_purge() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-context-view-append-only-test-{}",

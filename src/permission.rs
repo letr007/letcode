@@ -483,7 +483,6 @@ pub fn is_internal_tool(tool: &str) -> bool {
             | tool_names::TOOL_MEMORY_RECALL
             | tool_names::TOOL_WORKFLOW_TODOS
             | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
-            | tool_names::TOOL_AGENT_RECONCILE
     )
 }
 
@@ -549,8 +548,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER
         | tool_names::TOOL_AGENT_LIBRARIAN
-        | tool_names::TOOL_AGENT_GENERAL
-        | tool_names::TOOL_AGENT_RECONCILE => ToolPermissionClass::Preview,
+        | tool_names::TOOL_AGENT_GENERAL => ToolPermissionClass::Preview,
         tool_names::TOOL_AGENT_FIXER
         | tool_names::TOOL_FS_WRITE
         | tool_names::TOOL_FS_APPEND
