@@ -8,6 +8,7 @@ pub mod question_card;
 pub mod reviewer_cards;
 pub mod semantic_spans;
 pub mod shell_output;
+pub mod sidebar;
 pub mod slash_panel;
 pub mod structured_subagent;
 pub mod subagent_card;

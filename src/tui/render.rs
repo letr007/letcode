@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::{
-    components::{composer, dialog, footer, layout, slash_panel, transcript},
+    components::{composer, dialog, footer, layout, sidebar, slash_panel, transcript},
     measure::{display_width, wrap_text_to_width, wrapped_row_count},
     state::{ToastKind, TuiState},
     surface,
@@ -69,6 +69,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.frame_hyperlink_cells.clear();
     let theme = state.theme();
     let area = frame.area();
+    state.last_terminal_width = area.width;
 
     if area.is_empty() {
         return;
@@ -77,7 +78,12 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     // Root background.
     frame.render_widget(Block::new().style(theme.app_style()), area);
 
-    let workspace = layout::workspace_area(area);
+    let sidebar_allowed = state.pending_permission.is_none()
+        && state.pending_question.is_none()
+        && !state.dialog_is_open();
+    let sidebar_layout =
+        layout::split_sidebar_layout(area, sidebar_allowed && state.sidebar_visible(area.width));
+    let workspace = layout::workspace_area(sidebar_layout.main);
     if workspace.height == 0 {
         // If bottom padding collapses the workspace, still render a 1-row footer.
         footer::render_footer(frame, state, area, theme);
@@ -91,6 +97,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     if state.show_dashboard() {
         render_dashboard(frame, state, workspace, theme);
         render_transcript_toast(frame, state, workspace, theme);
+        if let Some(sidebar_area) = sidebar_layout.sidebar {
+            sidebar::render_sidebar(frame, state, sidebar_area, theme);
+        }
         dialog::render_dialog(frame, state, area, theme);
         render_pending_question(frame, state, area, theme);
         return;
@@ -139,6 +148,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         composer::render_composer(frame, state, composer_area, theme);
     }
     footer::render_footer(frame, state, footer_area, theme);
+    if let Some(sidebar_area) = sidebar_layout.sidebar {
+        sidebar::render_sidebar(frame, state, sidebar_area, theme);
+    }
     dialog::render_dialog(frame, state, area, theme);
 }
 

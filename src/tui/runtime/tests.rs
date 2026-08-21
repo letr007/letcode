@@ -1888,6 +1888,68 @@ fn running_turn_queues_plain_prompts() {
 }
 
 #[test]
+fn panel_command_toggles_visibility() {
+    let mut runtime = runtime();
+    runtime.state_mut().last_terminal_width = 160;
+    runtime.state_mut().set_input("/panel off");
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("panel off"),
+        None
+    );
+    assert!(!runtime.state().sidebar_visible(160));
+
+    runtime.state_mut().set_input("/panel on");
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("panel on"),
+        None
+    );
+    assert!(runtime.state().sidebar_visible(100));
+}
+
+#[test]
+fn submitted_long_paste_is_restored_as_a_composer_token_from_history() {
+    let mut runtime = runtime();
+    runtime
+        .handle_input_action(InputAction::PasteLongText("one\ntwo\nthree".into()))
+        .expect("paste succeeds");
+    let command = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("submit succeeds");
+    assert!(matches!(command, Some(RuntimeCommand::SubmitPrompt(_))));
+
+    runtime
+        .handle_input_action(InputAction::HistoryPrev)
+        .expect("history navigation succeeds");
+    assert_eq!(runtime.state().composer_tokens.len(), 1);
+    assert_eq!(runtime.state().composer_content().text, "one\ntwo\nthree");
+}
+
+#[test]
+fn submitted_long_paste_history_matches_trimmed_prompt_content() {
+    let mut runtime = runtime();
+    runtime
+        .handle_input_action(InputAction::PasteLongText("  one\ntwo\nthree  ".into()))
+        .expect("paste succeeds");
+    let command = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("submit succeeds")
+        .expect("submit command");
+    let RuntimeCommand::SubmitPrompt(prompt) = command else {
+        panic!("expected prompt");
+    };
+    assert_eq!(prompt.content.text, "one\ntwo\nthree");
+
+    runtime
+        .handle_input_action(InputAction::HistoryPrev)
+        .expect("history navigation succeeds");
+    assert_eq!(runtime.state().composer_content().text, prompt.content.text);
+}
+
+#[test]
 fn running_turn_preserves_selected_skills_in_queued_prompt() {
     let mut runtime = runtime();
     runtime.state_mut().phase = AppPhase::Running;

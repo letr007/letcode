@@ -8,8 +8,8 @@ use crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc;
 
 use crate::command::{
-    ChildNavigation as SharedChildNavigation, CommandIntent, ThemeCommand, ThoughtsDisplayMode,
-    ToolOutputMode, TranscriptScrollbarMode, help_summary, parse_command,
+    ChildNavigation as SharedChildNavigation, CommandIntent, PanelMode, ThemeCommand,
+    ThoughtsDisplayMode, ToolOutputMode, TranscriptScrollbarMode, help_summary, parse_command,
 };
 use crate::mcp;
 use crate::permission::PermissionMode;
@@ -189,6 +189,7 @@ pub struct TuiRuntime {
     pending_question_child_session_id: Option<String>,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
+    submitted_prompt_drafts: Vec<ComposerDraft>,
     queued_prompts: VecDeque<UserMessageSubmission>,
     queued_prompt_lifecycle: QueuedPromptLifecycle,
     session_turn_active: bool,
@@ -230,6 +231,7 @@ impl TuiRuntime {
             pending_question_child_session_id: None,
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
+            submitted_prompt_drafts: Vec::new(),
             queued_prompts: VecDeque::new(),
             queued_prompt_lifecycle: QueuedPromptLifecycle::default(),
             session_turn_active: false,
@@ -1447,14 +1449,20 @@ impl TuiRuntime {
     pub fn handle_input_action(&mut self, action: InputAction) -> Result<Option<RuntimeCommand>> {
         if !matches!(
             action,
-            InputAction::Interrupt | InputAction::Tick | InputAction::ChildPrefix
+            InputAction::Interrupt
+                | InputAction::Tick
+                | InputAction::ChildPrefix
+                | InputAction::ToggleSidebar
         ) {
             self.interrupt_confirmation_pending = false;
         }
 
         if !matches!(
             action,
-            InputAction::NoOp | InputAction::Tick | InputAction::ChildPrefix
+            InputAction::NoOp
+                | InputAction::Tick
+                | InputAction::ChildPrefix
+                | InputAction::ToggleSidebar
         ) {
             self.state.child_navigation_prefix = false;
         }
@@ -1464,6 +1472,7 @@ impl TuiRuntime {
                 action,
                 InputAction::Insert(_)
                     | InputAction::Paste(_)
+                    | InputAction::PasteLongText(_)
                     | InputAction::InsertNewline
                     | InputAction::Backspace
                     | InputAction::Delete
@@ -1516,6 +1525,20 @@ impl TuiRuntime {
             }
             InputAction::MouseScrollDown => {
                 self.state.scroll_transcript_down(1);
+                Ok(None)
+            }
+            InputAction::ToggleSidebar => {
+                if self.state.is_read_only_child_view() {
+                    self.state.child_navigation_prefix = false;
+                    return Ok(None);
+                }
+                self.state.toggle_sidebar();
+                self.state.child_navigation_prefix = false;
+                if let Err(error) = self.tui_preferences().save_to_dir(&self.preferences_dir) {
+                    tracing::warn!(%error, "failed to save TUI preferences");
+                }
+                self.state
+                    .show_toast(self.state.t("runtime.sidebar_toggled"), ToastKind::Info);
                 Ok(None)
             }
             InputAction::CycleReasoningEffort => {
@@ -1866,6 +1889,7 @@ impl TuiRuntime {
             }
             InputAction::Insert(_)
             | InputAction::Paste(_)
+            | InputAction::PasteLongText(_)
             | InputAction::InsertNewline
             | InputAction::Backspace
             | InputAction::Delete
@@ -2040,6 +2064,7 @@ impl TuiRuntime {
                 | CommandIntent::SkillBrowse
                 | CommandIntent::ToolOutputSet(_)
                 | CommandIntent::TranscriptScrollbarSet(_)
+                | CommandIntent::PanelSet(_)
                 | CommandIntent::Theme(_))
         );
         if active_session_turn {
@@ -2080,6 +2105,7 @@ impl TuiRuntime {
             });
         }
 
+        let submitted_draft = composer_draft_for_submission(&self.state);
         self.state.clear_input();
         self.state.clear_composer_tokens();
         self.state.mark_session_active();
@@ -2088,6 +2114,7 @@ impl TuiRuntime {
         self.session_turn_active = true;
         self.state.toast = None;
         self.submitted_prompts.push(prompt.clone());
+        self.submitted_prompt_drafts.push(submitted_draft);
 
         Ok(Some(RuntimeCommand::SubmitPrompt(
             UserMessageSubmission::new(next_submission_id(), content),
@@ -2113,8 +2140,7 @@ impl TuiRuntime {
         };
 
         self.history_selection = Some(next_index);
-        self.state
-            .set_input(self.submitted_prompts[next_index].clone());
+        self.restore_submitted_prompt_draft(next_index);
     }
 
     fn navigate_history_next(&mut self) {
@@ -2125,8 +2151,7 @@ impl TuiRuntime {
         if index + 1 < self.submitted_prompts.len() {
             let next_index = index + 1;
             self.history_selection = Some(next_index);
-            self.state
-                .set_input(self.submitted_prompts[next_index].clone());
+            self.restore_submitted_prompt_draft(next_index);
             return;
         }
 
@@ -2144,16 +2169,31 @@ impl TuiRuntime {
         self.state.sync_slash_panel();
     }
 
+    fn restore_submitted_prompt_draft(&mut self, index: usize) {
+        let Some(draft) = self.submitted_prompt_drafts.get(index).cloned() else {
+            self.state.set_input(self.submitted_prompts[index].clone());
+            return;
+        };
+        self.state.input_buffer = draft.input_buffer;
+        self.state.input_cursor = draft.input_cursor.min(self.state.input_buffer.len());
+        self.state.composer_tokens = draft.tokens;
+        self.state.assert_composer_token_invariant();
+        self.state.sync_input_phase();
+        self.state.sync_slash_panel();
+    }
+
     fn reset_history_navigation(&mut self) {
         self.history_selection = None;
         self.history_draft = None;
     }
 
     fn queue_prompt(&mut self, prompt: UserMessageSubmission) {
+        let submitted_draft = composer_draft_for_submission(&self.state);
         self.state.clear_input();
         self.state.clear_composer_tokens();
         self.state.mark_session_active();
         self.submitted_prompts.push(prompt.content.text.clone());
+        self.submitted_prompt_drafts.push(submitted_draft);
         self.queued_prompts.push_back(prompt.clone());
         self.state.push_queued_user_message_preview(prompt);
         self.state.toast = None;
@@ -2241,6 +2281,7 @@ impl TuiRuntime {
             CommandIntent::TranscriptScrollbarSet(mode) => {
                 Ok(Some(self.handle_transcript_scrollbar_command(mode)))
             }
+            CommandIntent::PanelSet(mode) => Ok(Some(self.handle_panel_command(mode))),
             CommandIntent::ResumeShow => self.show_resume_dialog(),
             CommandIntent::ContextBrowse => self.show_context_dialog(),
             CommandIntent::McpBrowse => self.show_mcp_dialog(),
@@ -2433,6 +2474,20 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn handle_panel_command(&mut self, mode: PanelMode) -> SubmittedCommand {
+        match mode {
+            PanelMode::Toggle => self.state.toggle_sidebar(),
+            PanelMode::Visible => self.state.set_sidebar_preference(false, true),
+            PanelMode::Hidden => self.state.set_sidebar_preference(true, false),
+        }
+        if let Err(error) = self.tui_preferences().save_to_dir(&self.preferences_dir) {
+            tracing::warn!(%error, "failed to save TUI preferences");
+        }
+        self.state
+            .show_toast(self.state.t("runtime.sidebar_toggled"), ToastKind::Info);
+        SubmittedCommand::LocalOnly
+    }
+
     fn handle_transcript_scrollbar_command(
         &mut self,
         mode: TranscriptScrollbarMode,
@@ -2462,6 +2517,8 @@ impl TuiRuntime {
         TuiPreferences {
             tool_output_expanded: self.state.tool_output_expanded,
             transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
+            sidebar_hidden: self.state.sidebar_hidden,
+            sidebar_forced_open: self.state.sidebar_forced_open,
             theme: self.state.theme_id.clone(),
             thoughts_display: self.state.thoughts_display,
             language: self
@@ -3644,6 +3701,30 @@ impl TuiRuntime {
     }
 }
 
+fn composer_draft_for_submission(state: &TuiState) -> ComposerDraft {
+    let mut input_buffer = state.input_buffer.trim().to_string();
+    let mut tokens = state.composer_tokens.clone();
+    if input_buffer.starts_with(crate::tui::state::COMPOSER_ATTACHMENT_MARKER)
+        && let Some(crate::tui::state::ComposerToken::PastedText(text)) = tokens.first_mut()
+    {
+        *text = text.trim_start().to_string();
+    }
+    if input_buffer.ends_with(crate::tui::state::COMPOSER_ATTACHMENT_MARKER)
+        && let Some(crate::tui::state::ComposerToken::PastedText(text)) = tokens.last_mut()
+    {
+        *text = text.trim_end().to_string();
+    }
+    if input_buffer.is_empty() {
+        tokens.clear();
+    }
+    let input_cursor = input_buffer.len();
+    ComposerDraft {
+        input_buffer: std::mem::take(&mut input_buffer),
+        input_cursor,
+        tokens,
+    }
+}
+
 fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
     crate::command::parse_reasoning_effort(value)
 }
@@ -4090,6 +4171,7 @@ pub async fn run_tui(
     state.set_language(preferences.explicit_language());
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
+    state.set_sidebar_preference(preferences.sidebar_hidden, preferences.sidebar_forced_open);
     state.set_thoughts_display(preferences.thoughts_display);
     apply_preferences_theme(&mut state, &preferences_dir, &preferences.theme);
     state.set_provider_label(provider_label);

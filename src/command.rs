@@ -35,6 +35,13 @@ pub enum TranscriptScrollbarMode {
     Hidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMode {
+    Toggle,
+    Visible,
+    Hidden,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThoughtsDisplayMode {
@@ -123,6 +130,7 @@ pub enum CommandIntent {
     ThoughtsSet(ThoughtsDisplayMode),
     ToolOutputSet(ToolOutputMode),
     TranscriptScrollbarSet(TranscriptScrollbarMode),
+    PanelSet(PanelMode),
     Theme(ThemeCommand),
     Compact,
     Tree,
@@ -352,6 +360,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/panel",
+        insert_text: "/panel ",
+        description_key: "command.panel",
+        usage: "/panel [on|off]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/theme",
         insert_text: "/theme ",
         description_key: "command.theme",
@@ -488,6 +505,7 @@ pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
         "/permission",
         "/tool-output",
         "/scrollbar",
+        "/panel",
         "/theme",
         "/compact",
         "/tree",
@@ -557,6 +575,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/thoughts" => parse_thoughts(&parts),
         "/tool-output" => parse_tool_output(&parts),
         "/scrollbar" => parse_transcript_scrollbar(&parts),
+        "/panel" => parse_panel(&parts),
         "/theme" => parse_theme(&parts),
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/tree" => expect_no_extra_args(&parts, "/tree", CommandIntent::Tree),
@@ -686,6 +705,19 @@ fn parse_transcript_scrollbar(parts: &[&str]) -> Result<CommandIntent, CommandPa
             None => Err(CommandParseError::with_args("parse.unknown_scrollbar", [])),
         },
         ["/scrollbar", ..] => Err(CommandParseError::new("Usage: /scrollbar [on|off]")),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_panel(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/panel"] => Ok(CommandIntent::PanelSet(PanelMode::Toggle)),
+        ["/panel", value] => match value.to_ascii_lowercase().as_str() {
+            "on" | "show" | "visible" => Ok(CommandIntent::PanelSet(PanelMode::Visible)),
+            "off" | "hide" | "hidden" => Ok(CommandIntent::PanelSet(PanelMode::Hidden)),
+            _ => Err(CommandParseError::with_args("parse.unknown_panel", [])),
+        },
+        ["/panel", ..] => Err(CommandParseError::new("Usage: /panel [on|off]")),
         _ => unreachable!(),
     }
 }
@@ -917,6 +949,22 @@ mod tests {
         assert_eq!(
             parse_command("/scrollbar maybe"),
             Err(CommandParseError::with_args("parse.unknown_scrollbar", []))
+        );
+        assert_eq!(
+            parse_command("/panel"),
+            Ok(CommandIntent::PanelSet(PanelMode::Toggle))
+        );
+        assert_eq!(
+            parse_command("/panel on"),
+            Ok(CommandIntent::PanelSet(PanelMode::Visible))
+        );
+        assert_eq!(
+            parse_command("/panel off"),
+            Ok(CommandIntent::PanelSet(PanelMode::Hidden))
+        );
+        assert_eq!(
+            parse_command("/panel maybe"),
+            Err(CommandParseError::with_args("parse.unknown_panel", []))
         );
         assert_eq!(
             parse_command("/theme bad!id"),

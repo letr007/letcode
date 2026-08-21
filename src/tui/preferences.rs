@@ -18,6 +18,10 @@ pub struct TuiPreferences {
     pub tool_output_expanded: bool,
     #[serde(default = "default_transcript_scrollbar_visible")]
     pub transcript_scrollbar_visible: bool,
+    #[serde(default)]
+    pub sidebar_hidden: bool,
+    #[serde(default)]
+    pub sidebar_forced_open: bool,
     #[serde(default = "default_theme_id")]
     pub theme: String,
     #[serde(default)]
@@ -31,6 +35,8 @@ impl Default for TuiPreferences {
         Self {
             tool_output_expanded: false,
             transcript_scrollbar_visible: default_transcript_scrollbar_visible(),
+            sidebar_hidden: false,
+            sidebar_forced_open: false,
             theme: default_theme_id(),
             thoughts_display: ThoughtsDisplayMode::default(),
             language: None,
@@ -85,6 +91,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_preferences_default_to_automatic_sidebar() {
+        let loaded: TuiPreferences = serde_json::from_str(
+            r#"{"tool_output_expanded":false,"transcript_scrollbar_visible":true,"theme":"dark"}"#,
+        )
+        .expect("legacy preferences deserialize");
+        assert!(!loaded.sidebar_hidden);
+        assert!(!loaded.sidebar_forced_open);
+    }
+
+    #[test]
     fn preferences_round_trip() {
         let base = std::env::temp_dir().join(format!(
             "letcode-tui-preferences-test-{}",
@@ -97,6 +113,8 @@ mod tests {
         let prefs = TuiPreferences {
             tool_output_expanded: true,
             transcript_scrollbar_visible: false,
+            sidebar_hidden: true,
+            sidebar_forced_open: false,
             theme: "forest".into(),
             thoughts_display: ThoughtsDisplayMode::Titles,
             language: Some("zh-CN".into()),
@@ -148,6 +166,8 @@ mod tests {
         let prefs = TuiPreferences {
             tool_output_expanded: false,
             transcript_scrollbar_visible: true,
+            sidebar_hidden: false,
+            sidebar_forced_open: true,
             theme: "sunset".into(),
             thoughts_display: ThoughtsDisplayMode::Compact,
             language: None,

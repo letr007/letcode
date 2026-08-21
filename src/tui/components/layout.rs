@@ -13,6 +13,50 @@ pub struct WorkspaceLayoutMetrics {
     pub composer_height: u16,
 }
 
+pub const SIDEBAR_WIDTH: u16 = 42;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarLayout {
+    pub main: Rect,
+    pub sidebar: Option<Rect>,
+    pub overlay: bool,
+}
+
+pub fn split_sidebar_layout(area: Rect, visible: bool) -> SidebarLayout {
+    if !visible || area.width == 0 || area.height == 0 {
+        return SidebarLayout {
+            main: area,
+            sidebar: None,
+            overlay: false,
+        };
+    }
+
+    let sidebar_width = SIDEBAR_WIDTH.min(area.width);
+    if area.width > 120 {
+        SidebarLayout {
+            main: Rect::new(area.x, area.y, area.width - sidebar_width, area.height),
+            sidebar: Some(Rect::new(
+                area.right().saturating_sub(sidebar_width),
+                area.y,
+                sidebar_width,
+                area.height,
+            )),
+            overlay: false,
+        }
+    } else {
+        SidebarLayout {
+            main: area,
+            sidebar: Some(Rect::new(
+                area.right().saturating_sub(sidebar_width),
+                area.y,
+                sidebar_width,
+                area.height,
+            )),
+            overlay: true,
+        }
+    }
+}
+
 pub fn workspace_area(area: Rect) -> Rect {
     if area.width <= surface::OUTER_PAD_X * 2 + 4 {
         return area;
@@ -234,6 +278,19 @@ pub fn workspace_metrics(
 mod tests {
     use super::*;
     use crate::user_content::UserImageAttachment;
+
+    #[test]
+    fn sidebar_layout_splits_wide_and_overlays_narrow_workspaces() {
+        let wide = split_sidebar_layout(Rect::new(0, 0, 160, 30), true);
+        assert_eq!(wide.main.width, 118);
+        assert_eq!(wide.sidebar.expect("sidebar").width, 42);
+        assert!(!wide.overlay);
+
+        let narrow = split_sidebar_layout(Rect::new(0, 0, 100, 30), true);
+        assert_eq!(narrow.main.width, 100);
+        assert_eq!(narrow.sidebar.expect("sidebar").x, 58);
+        assert!(narrow.overlay);
+    }
 
     #[test]
     fn inline_attachment_row_count_keeps_tokens_atomic_at_narrow_widths() {

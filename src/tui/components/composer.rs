@@ -1397,6 +1397,21 @@ mod tests {
     }
 
     #[test]
+    fn pasted_text_token_renders_as_a_compact_chip() {
+        let mut state = TuiState::default();
+        state.add_composer_pasted_text("one\ntwo\nthree".into());
+
+        let rendered = composer_inline_lines(&state, 80, Theme::dark())
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert_eq!(rendered, "[Pasted ~3 lines]");
+        assert_eq!(state.composer_content().text, "one\ntwo\nthree");
+    }
+
+    #[test]
     fn narrow_attachment_tokens_reserve_the_same_rows_as_the_renderer() {
         let attachment = test_attachment("img-1", "clipboard");
         let mut state = TuiState::default();

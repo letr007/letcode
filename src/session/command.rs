@@ -138,6 +138,7 @@ impl SessionCommand {
             | CommandIntent::ThoughtsSet(_)
             | CommandIntent::ToolOutputSet(_)
             | CommandIntent::TranscriptScrollbarSet(_)
+            | CommandIntent::PanelSet(_)
             | CommandIntent::Theme(_)
             | CommandIntent::ResumeShow
             | CommandIntent::ContextBrowse

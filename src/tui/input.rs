@@ -6,6 +6,7 @@ use super::state::{COMPOSER_ATTACHMENT_MARKER, DialogKind, TuiState};
 pub enum InputAction {
     Insert(char),
     Paste(String),
+    PasteLongText(String),
     PasteFromClipboard,
     InsertNewline,
     Backspace,
@@ -43,6 +44,7 @@ pub enum InputAction {
     CopySelection,
     ClearSelection,
     CycleReasoningEffort,
+    ToggleSidebar,
     ChildPrefix,
     ChildFirst,
     ChildNext,
@@ -203,6 +205,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 
     if state.child_navigation_prefix {
         return match key.code {
+            KeyCode::Char('b') | KeyCode::Char('B') => InputAction::ToggleSidebar,
             KeyCode::Down => InputAction::ChildFirst,
             KeyCode::Left => InputAction::ChildPrev,
             KeyCode::Right => InputAction::ChildNext,
@@ -343,6 +346,15 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
     match action {
         InputAction::Insert(ch) => insert_at_cursor(state, *ch),
         InputAction::Paste(text) => insert_text_at_cursor(state, text),
+        InputAction::PasteLongText(text) => {
+            let text = text.replace(COMPOSER_ATTACHMENT_MARKER, "");
+            if text.is_empty() {
+                false
+            } else {
+                state.add_composer_pasted_text(text);
+                true
+            }
+        }
         InputAction::InsertNewline => insert_at_cursor(state, '\n'),
         InputAction::Backspace => backspace_at_cursor(state),
         InputAction::Delete => delete_at_cursor(state),
@@ -385,7 +397,20 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
         }
     }
 
-    InputAction::Paste(text)
+    let text = text.replace(COMPOSER_ATTACHMENT_MARKER, "");
+    if long_text_paste(&text) {
+        InputAction::PasteLongText(text)
+    } else {
+        InputAction::Paste(text)
+    }
+}
+
+fn long_text_paste(text: &str) -> bool {
+    pasted_text_line_count(text) >= 3 || text.trim().chars().count() > 150
+}
+
+fn pasted_text_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
 }
 
 pub fn map_mouse_event(_state: &TuiState, mouse: MouseEvent) -> InputAction {
@@ -579,6 +604,63 @@ mod tests {
     }
 
     #[test]
+    fn long_text_paste_becomes_an_atomic_composer_token() {
+        let state = TuiState::default();
+        let pasted = "one\ntwo\nthree".to_string();
+        assert_eq!(
+            map_paste_event(&state, pasted.clone()),
+            InputAction::PasteLongText(pasted.clone())
+        );
+
+        let mut state = TuiState::default();
+        assert!(apply_edit_action(
+            &mut state,
+            &InputAction::PasteLongText(pasted.clone())
+        ));
+        assert_eq!(state.input_buffer, COMPOSER_ATTACHMENT_MARKER.to_string());
+        assert_eq!(state.composer_content().text, pasted);
+        assert!(apply_edit_action(&mut state, &InputAction::Backspace));
+        assert!(state.input_buffer.is_empty());
+        assert!(state.composer_tokens.is_empty());
+    }
+
+    #[test]
+    fn pasted_text_token_preserves_surrounding_text_order() {
+        let mut state = TuiState::default();
+        state.set_input("before after");
+        state.input_cursor = "before ".len();
+        assert!(apply_edit_action(
+            &mut state,
+            &InputAction::PasteLongText("one\ntwo\nthree".into())
+        ));
+        assert_eq!(state.composer_content().text, "before one\ntwo\nthreeafter");
+    }
+
+    #[test]
+    fn short_text_paste_remains_inline_text() {
+        let state = TuiState::default();
+        assert_eq!(
+            map_paste_event(&state, "one\ntwo".into()),
+            InputAction::Paste("one\ntwo".into())
+        );
+        assert!(matches!(
+            map_paste_event(&state, "one\ntwo\n".into()),
+            InputAction::PasteLongText(_)
+        ));
+    }
+
+    #[test]
+    fn long_text_paste_strips_reserved_composer_markers() {
+        let mut state = TuiState::default();
+        assert!(apply_edit_action(
+            &mut state,
+            &InputAction::PasteLongText(format!("one\ntwo\nthree{COMPOSER_ATTACHMENT_MARKER}"))
+        ));
+        assert_eq!(state.composer_content().text, "one\ntwo\nthree");
+        state.assert_composer_token_invariant();
+    }
+
+    #[test]
     fn external_marker_text_is_ignored_without_touching_attachments() {
         let mut state = TuiState::default();
         state.add_composer_attachment(attachment("one"));
@@ -644,6 +726,16 @@ mod tests {
         assert_eq!(state.input_buffer, "review");
         assert!(state.composer_tokens.is_empty());
         assert!(state.composer_content().selected_skills.is_empty());
+    }
+
+    #[test]
+    fn ctrl_x_b_toggles_sidebar() {
+        let mut state = TuiState::default();
+        state.child_navigation_prefix = true;
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('b'))),
+            InputAction::ToggleSidebar
+        );
     }
 
     #[test]

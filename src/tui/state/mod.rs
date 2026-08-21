@@ -50,6 +50,7 @@ impl PendingComposerSettings {
 pub enum ComposerToken {
     Image(UserImageAttachment),
     Skill(String),
+    PastedText(String),
 }
 
 impl ComposerToken {
@@ -57,6 +58,7 @@ impl ComposerToken {
         match self {
             Self::Image(_) => format!("[Image {}]", image_index + 1),
             Self::Skill(name) => format!("[Skill: {name}]"),
+            Self::PastedText(text) => format!("[Pasted ~{} lines]", pasted_text_line_count(text)),
         }
     }
 
@@ -64,17 +66,21 @@ impl ComposerToken {
     pub fn image(&self) -> Option<&UserImageAttachment> {
         match self {
             Self::Image(attachment) => Some(attachment),
-            Self::Skill(_) => None,
+            Self::Skill(_) | Self::PastedText(_) => None,
         }
     }
 
     #[cfg(test)]
     pub fn skill_name(&self) -> Option<&str> {
         match self {
-            Self::Image(_) => None,
+            Self::Image(_) | Self::PastedText(_) => None,
             Self::Skill(name) => Some(name),
         }
     }
+}
+
+fn pasted_text_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
 }
 
 use anyhow::Result;
@@ -1133,6 +1139,9 @@ pub struct TuiState {
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
     pub transcript_scrollbar_visible: bool,
+    pub sidebar_hidden: bool,
+    pub sidebar_forced_open: bool,
+    pub last_terminal_width: u16,
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
     pub tool_output_expanded: bool,
@@ -1212,6 +1221,9 @@ impl Default for TuiState {
             transcript_scroll: 0,
             auto_scroll: true,
             transcript_scrollbar_visible: true,
+            sidebar_hidden: false,
+            sidebar_forced_open: false,
+            last_terminal_width: 0,
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
             tool_output_expanded: false,
@@ -1418,6 +1430,27 @@ impl TuiState {
             .insert(call_id.to_string(), expanded);
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
+    }
+
+    pub fn set_sidebar_preference(&mut self, hidden: bool, forced_open: bool) {
+        self.sidebar_hidden = hidden;
+        self.sidebar_forced_open = !hidden && forced_open;
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        if self.sidebar_visible(self.last_terminal_width) {
+            self.sidebar_hidden = true;
+            self.sidebar_forced_open = false;
+        } else {
+            self.sidebar_hidden = false;
+            self.sidebar_forced_open = true;
+        }
+    }
+
+    pub fn sidebar_visible(&self, terminal_width: u16) -> bool {
+        !self.is_read_only_child_view()
+            && !self.sidebar_hidden
+            && (self.sidebar_forced_open || terminal_width > 120)
     }
 
     pub fn set_transcript_scrollbar_visible(&mut self, visible: bool) {
@@ -1774,6 +1807,11 @@ impl TuiState {
                         });
                     }
                     Some(ComposerToken::Skill(name)) => selected_skills.push(name.clone()),
+                    Some(ComposerToken::PastedText(pasted)) => {
+                        parts.push(UserMessagePart::Text {
+                            text: pasted.clone(),
+                        });
+                    }
                     None => unreachable!("composer token invariant violated"),
                 }
             } else {
@@ -1795,6 +1833,10 @@ impl TuiState {
 
     pub fn add_composer_attachment(&mut self, attachment: UserImageAttachment) {
         self.insert_composer_token(ComposerToken::Image(attachment));
+    }
+
+    pub fn add_composer_pasted_text(&mut self, text: String) {
+        self.insert_composer_token(ComposerToken::PastedText(text));
     }
 
     pub fn add_composer_skill(&mut self, name: String) -> bool {
@@ -3415,6 +3457,32 @@ mod tests {
 
         assert_eq!(state.first_unanswered_tab(), Some(1));
         assert!(state.is_confirm_tab());
+    }
+
+    #[test]
+    fn sidebar_defaults_to_wide_auto_and_can_be_forced_on_narrow_terminals() {
+        let mut state = TuiState::default();
+        assert!(state.sidebar_visible(121));
+        assert!(!state.sidebar_visible(120));
+
+        state.last_terminal_width = 100;
+        state.toggle_sidebar();
+        assert!(state.sidebar_visible(100));
+        state.toggle_sidebar();
+        assert!(!state.sidebar_visible(160));
+    }
+
+    #[test]
+    fn composer_draft_keeps_boundary_skill_tokens_after_outer_text_trim() {
+        let mut state = TuiState::default();
+        state.add_composer_skill("rust-audit".into());
+        state.input_buffer.push_str("  inspect  ");
+        state.input_cursor = state.input_buffer.len();
+
+        let mut content = state.composer_content();
+        content.trim_outer_text();
+        assert_eq!(content.text, "inspect");
+        assert_eq!(content.selected_skills, vec!["rust-audit"]);
     }
 
     #[test]
