@@ -85,6 +85,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         );
     }
 
+    let context_header_line = lines.len();
     if let Some(usage) = state
         .active_model_token_usage()
         .filter(|usage| usage.context_window_tokens > 0)
@@ -95,8 +96,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
             compact_count(usage.input_tokens),
             compact_count(usage.context_window_tokens)
         );
-        wrapped_context_field(
+        collapsible_context_field(
             &mut lines,
+            state.sidebar_context_expanded,
             state.t("sidebar.context"),
             &state.current_context_branch,
             &usage_summary,
@@ -105,8 +107,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
             theme,
         );
     } else {
-        compact_field(
+        collapsible_field(
             &mut lines,
+            state.sidebar_context_expanded,
             state.t("sidebar.context"),
             &state.current_context_branch,
             inner.width as usize,
@@ -115,9 +118,10 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         );
     }
     let mcp_rows = mcp_row_count(state);
-    if let Some(usage) = state
-        .active_model_token_usage()
-        .filter(|usage| usage.context_window_tokens > 0)
+    if state.sidebar_context_expanded
+        && let Some(usage) = state
+            .active_model_token_usage()
+            .filter(|usage| usage.context_window_tokens > 0)
     {
         render_context_usage_details(&mut lines, usage, inner.width as usize, state, theme);
     }
@@ -131,13 +135,17 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     if context_rendered && mcp_rendered {
         lines.push(Line::default());
     }
+    let mcp_header_line = mcp_rendered.then_some(lines.len());
     render_mcp_status(&mut lines, state, inner.width as usize, mcp_rows, theme);
 
+    let mut todos_header_line = None;
     if let Some(todo) = state.latest_todo.as_ref() {
         let items = todo.items.iter().collect::<Vec<_>>();
         if !items.is_empty() {
             lines.push(Line::default());
+            todos_header_line = Some(lines.len());
             lines.push(Line::from(vec![
+                section_arrow(state.sidebar_todos_expanded, theme),
                 Span::styled(
                     state.t("sidebar.todos"),
                     Style::default()
@@ -147,33 +155,35 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
                 ),
                 Span::styled(format!("  {}", items.len()), label_style),
             ]));
-            for item in items {
-                let (marker, marker_color) = match item.status {
-                    TodoStatus::Pending => ("○", theme.muted_text),
-                    TodoStatus::InProgress => ("●", theme.approval),
-                    TodoStatus::Blocked => ("!", theme.error),
-                    TodoStatus::Completed => ("✓", theme.success),
-                    TodoStatus::Cancelled => ("×", theme.error),
-                };
-                let content_width = inner.width.saturating_sub(2) as usize;
-                for (index, row) in wrap_to_width(&item.content, content_width)
-                    .into_iter()
-                    .enumerate()
-                {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            if index == 0 {
-                                format!("{marker} ")
-                            } else {
-                                "  ".into()
-                            },
-                            Style::default()
-                                .fg(marker_color)
-                                .bg(theme.element_bg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(row, value_style),
-                    ]));
+            if state.sidebar_todos_expanded {
+                for item in items {
+                    let (marker, marker_color) = match item.status {
+                        TodoStatus::Pending => ("○", theme.muted_text),
+                        TodoStatus::InProgress => ("●", theme.approval),
+                        TodoStatus::Blocked => ("!", theme.error),
+                        TodoStatus::Completed => ("✓", theme.success),
+                        TodoStatus::Cancelled => ("×", theme.error),
+                    };
+                    let content_width = inner.width.saturating_sub(2) as usize;
+                    for (index, row) in wrap_to_width(&item.content, content_width)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                if index == 0 {
+                                    format!("{marker} ")
+                                } else {
+                                    "  ".into()
+                                },
+                                Style::default()
+                                    .fg(marker_color)
+                                    .bg(theme.element_bg)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(row, value_style),
+                        ]));
+                    }
                 }
             }
         }
@@ -184,12 +194,26 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(footer_height)])
         .split(inner);
+    let context_header_row =
+        rendered_row_before(&lines, context_header_line, areas[0].width, style);
+    let mcp_header_row =
+        mcp_header_line.map(|line| rendered_row_before(&lines, line, areas[0].width, style));
+    let todos_header_row =
+        todos_header_line.map(|line| rendered_row_before(&lines, line, areas[0].width, style));
     let paragraph = Paragraph::new(lines)
         .style(style)
         .wrap(Wrap { trim: false });
     let total_rows = paragraph.line_count(areas[0].width);
     state.sync_sidebar_scroll(total_rows, areas[0].height);
-    frame.render_widget(paragraph.scroll((state.sidebar_scroll, 0)), areas[0]);
+    let scroll = state.sidebar_scroll;
+    state.last_sidebar_context_header = sidebar_header_rect(areas[0], context_header_row, scroll);
+    state.last_sidebar_mcp_header = mcp_header_row
+        .map(|row| sidebar_header_rect(areas[0], row, scroll))
+        .unwrap_or_default();
+    state.last_sidebar_todos_header = todos_header_row
+        .map(|row| sidebar_header_rect(areas[0], row, scroll))
+        .unwrap_or_default();
+    frame.render_widget(paragraph.scroll((scroll, 0)), areas[0]);
     if footer_height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -199,6 +223,37 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
             .style(style),
             areas[1],
         );
+    }
+}
+
+fn section_arrow(expanded: bool, theme: Theme) -> Span<'static> {
+    Span::styled(
+        if expanded { "▾ " } else { "▸ " },
+        Style::default()
+            .fg(theme.dim_text)
+            .bg(theme.element_bg)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn rendered_row_before(lines: &[Line<'static>], line: usize, width: u16, style: Style) -> usize {
+    Paragraph::new(lines[..line].to_vec())
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+fn sidebar_header_rect(area: Rect, rendered_line: usize, scroll: u16) -> Rect {
+    let visible_line = rendered_line.saturating_sub(scroll as usize);
+    if rendered_line < scroll as usize || visible_line >= area.height as usize {
+        Rect::default()
+    } else {
+        Rect::new(
+            area.x,
+            area.y.saturating_add(visible_line as u16),
+            area.width,
+            1,
+        )
     }
 }
 
@@ -663,8 +718,58 @@ fn compact_field(
     ]));
 }
 
-fn wrapped_context_field(
+fn compact_field_spans(
+    label: &str,
+    value: &str,
+    width: usize,
+    value_color: Color,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let label = padded_label(label, LABEL_COLUMN_WIDTH);
+    let value_width = width.saturating_sub(LABEL_COLUMN_WIDTH);
+    vec![
+        Span::styled(
+            label,
+            Style::default().fg(theme.muted_text).bg(theme.element_bg),
+        ),
+        Span::styled(
+            truncate_to_width(value, value_width),
+            Style::default()
+                .fg(value_color)
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
+fn compact_field_width(branch: &str, usage: &str) -> usize {
+    LABEL_COLUMN_WIDTH + display_width(branch) + 2 + display_width(usage)
+}
+
+fn collapsible_field(
     lines: &mut Vec<Line<'static>>,
+    expanded: bool,
+    label: String,
+    value: &str,
+    width: usize,
+    value_color: Color,
+    theme: Theme,
+) {
+    let content_width = width.saturating_sub(2);
+    let mut line = vec![section_arrow(expanded, theme)];
+    line.extend(compact_field_spans(
+        &label,
+        value,
+        content_width,
+        value_color,
+        theme,
+    ));
+    lines.push(Line::from(line));
+}
+
+fn collapsible_context_field(
+    lines: &mut Vec<Line<'static>>,
+    expanded: bool,
     label: String,
     branch: &str,
     usage: &str,
@@ -672,18 +777,26 @@ fn wrapped_context_field(
     value_color: Color,
     theme: Theme,
 ) {
-    let value_width = width.saturating_sub(LABEL_COLUMN_WIDTH);
-    let inline = format!("{branch} · {usage}");
-    if display_width(&inline) <= value_width {
-        compact_field(lines, label, &inline, width, value_color, theme);
+    let content_width = width.saturating_sub(2);
+    if compact_field_width(branch, usage) <= content_width {
+        let value = format!("{branch}  {usage}");
+        collapsible_field(lines, expanded, label, &value, width, value_color, theme);
         return;
     }
 
-    compact_field(lines, label, branch, width, value_color, theme);
+    let mut line = vec![section_arrow(expanded, theme)];
+    line.extend(compact_field_spans(
+        &label,
+        branch,
+        content_width,
+        value_color,
+        theme,
+    ));
+    lines.push(Line::from(line));
     lines.push(Line::from(vec![
         Span::raw(" ".repeat(LABEL_COLUMN_WIDTH)),
         Span::styled(
-            truncate_to_width(usage, value_width),
+            truncate_to_width(usage, content_width.saturating_sub(LABEL_COLUMN_WIDTH)),
             Style::default()
                 .fg(value_color)
                 .bg(theme.element_bg)
@@ -718,8 +831,9 @@ fn render_mcp_status(
 
     match state.mcp_discovery {
         McpDiscoveryState::Loading => {
-            compact_field(
+            collapsible_field(
                 lines,
+                state.sidebar_mcp_expanded,
                 state.t("sidebar.mcp"),
                 &state.t("sidebar.mcp_loading"),
                 width,
@@ -728,8 +842,9 @@ fn render_mcp_status(
             );
         }
         McpDiscoveryState::Unavailable => {
-            compact_field(
+            collapsible_field(
                 lines,
+                state.sidebar_mcp_expanded,
                 state.t("sidebar.mcp"),
                 &state.t("sidebar.mcp_unavailable"),
                 width,
@@ -739,42 +854,47 @@ fn render_mcp_status(
         }
         McpDiscoveryState::Ready if state.mcp_servers.is_empty() => {}
         McpDiscoveryState::Ready => {
-            lines.push(Line::from(Span::styled(
-                state.t("sidebar.mcp"),
-                Style::default()
-                    .fg(theme.accent)
-                    .bg(theme.element_bg)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for server in state.mcp_servers.iter().take(row_limit.saturating_sub(1)) {
-                let (marker, status, color) = if state.mcp_updating.contains(&server.name) {
-                    ("◌", state.t("status.updating"), theme.warning)
-                } else {
-                    match server.status {
-                        McpServerStatus::Disabled => {
-                            ("○", state.t("status.disabled"), theme.muted_text)
-                        }
-                        McpServerStatus::Online { tool_count } => (
-                            "●",
-                            state.t_fmt(
-                                "sidebar.mcp_server_online",
-                                &[("count", &tool_count.to_string())],
+            lines.push(Line::from(vec![
+                section_arrow(state.sidebar_mcp_expanded, theme),
+                Span::styled(
+                    state.t("sidebar.mcp"),
+                    Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.element_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            if state.sidebar_mcp_expanded {
+                for server in state.mcp_servers.iter().take(row_limit.saturating_sub(1)) {
+                    let (marker, status, color) = if state.mcp_updating.contains(&server.name) {
+                        ("◌", state.t("status.updating"), theme.warning)
+                    } else {
+                        match server.status {
+                            McpServerStatus::Disabled => {
+                                ("○", state.t("status.disabled"), theme.muted_text)
+                            }
+                            McpServerStatus::Online { tool_count } => (
+                                "●",
+                                state.t_fmt(
+                                    "sidebar.mcp_server_online",
+                                    &[("count", &tool_count.to_string())],
+                                ),
+                                theme.success,
                             ),
-                            theme.success,
-                        ),
-                        McpServerStatus::Offline { .. } => {
-                            ("●", state.t("status.offline"), theme.error)
+                            McpServerStatus::Offline { .. } => {
+                                ("●", state.t("status.offline"), theme.error)
+                            }
                         }
-                    }
-                };
-                lines.push(mcp_server_line(
-                    &server.name,
-                    marker,
-                    &status,
-                    width,
-                    color,
-                    theme,
-                ));
+                    };
+                    lines.push(mcp_server_line(
+                        &server.name,
+                        marker,
+                        &status,
+                        width,
+                        color,
+                        theme,
+                    ));
+                }
             }
         }
     }
@@ -1161,7 +1281,13 @@ mod tests {
             .iter()
             .position(|row| row.contains("history-13"))
             .expect("context branch row");
-        assert!(rows[context_row + 1].contains("84.1k / 1.0m (8%)"));
+        assert!(
+            rows.iter()
+                .skip(context_row + 1)
+                .take(2)
+                .any(|row| row.contains("84.1k / 1.0m")),
+            "{rows:?}"
+        );
         let todo_start = rows
             .iter()
             .position(|row| row.contains("Todos  1"))
@@ -1307,10 +1433,65 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows.iter().all(|row| display_width(row) <= 24), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Ctrl-X B")), "{rows:?}");
         assert!(
-            rows.iter().any(|row| row.contains("Scroll panel")),
+            rows.iter().all(|row| !row.contains("Scroll panel")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_collapses_context_mcp_and_todo_sections() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.sidebar_context_expanded = false;
+        state.sidebar_mcp_expanded = false;
+        state.sidebar_todos_expanded = false;
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            used_tokens: 10_000,
+            context_window_tokens: 20_000,
+            input_tokens: 10_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cache_report: None,
+            prompt_composition: vec![crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 10_000,
+                segments: 1,
+            }],
+        });
+        state.set_mcp_servers(vec![crate::mcp::McpServerCatalogEntry {
+            name: "docs".into(),
+            enabled: true,
+            status: crate::mcp::McpServerStatus::Online { tool_count: 2 },
+        }]);
+        state.latest_todo = Some(crate::tui::timeline::TodoView {
+            items: vec![crate::agent::TodoItem {
+                id: "todo".into(),
+                content: "hidden todo".into(),
+                status: crate::agent::TodoStatus::Pending,
+            }],
+            auto_continue: crate::agent::AutoContinueState::default(),
+        });
+        let backend = TestBackend::new(42, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("▸ Context"), "{rendered}");
+        assert!(rendered.contains("▸ MCP"), "{rendered}");
+        assert!(rendered.contains("▸ Todos"), "{rendered}");
+        assert!(!rendered.contains("Context usage"), "{rendered}");
+        assert!(!rendered.contains("docs"), "{rendered}");
+        assert!(!rendered.contains("hidden todo"), "{rendered}");
     }
 
     #[test]

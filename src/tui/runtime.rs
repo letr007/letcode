@@ -1540,6 +1540,18 @@ impl TuiRuntime {
                 self.state.scroll_sidebar_down(1);
                 Ok(None)
             }
+            InputAction::ToggleSidebarContext => {
+                self.state.toggle_sidebar_context();
+                Ok(None)
+            }
+            InputAction::ToggleSidebarMcp => {
+                self.state.toggle_sidebar_mcp();
+                Ok(None)
+            }
+            InputAction::ToggleSidebarTodos => {
+                self.state.toggle_sidebar_todos();
+                Ok(None)
+            }
             InputAction::ToggleSidebar => {
                 if self.state.is_read_only_child_view() {
                     self.state.child_navigation_prefix = false;

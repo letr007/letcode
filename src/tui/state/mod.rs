@@ -1144,7 +1144,13 @@ pub struct TuiState {
     pub sidebar_forced_open: bool,
     pub sidebar_scroll: u16,
     pub sidebar_max_scroll: u16,
+    pub sidebar_context_expanded: bool,
+    pub sidebar_mcp_expanded: bool,
+    pub sidebar_todos_expanded: bool,
     pub last_sidebar_area: ratatui::layout::Rect,
+    pub last_sidebar_context_header: ratatui::layout::Rect,
+    pub last_sidebar_mcp_header: ratatui::layout::Rect,
+    pub last_sidebar_todos_header: ratatui::layout::Rect,
     pub last_terminal_width: u16,
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
@@ -1229,7 +1235,13 @@ impl Default for TuiState {
             sidebar_forced_open: false,
             sidebar_scroll: 0,
             sidebar_max_scroll: 0,
+            sidebar_context_expanded: true,
+            sidebar_mcp_expanded: true,
+            sidebar_todos_expanded: true,
             last_sidebar_area: ratatui::layout::Rect::default(),
+            last_sidebar_context_header: ratatui::layout::Rect::default(),
+            last_sidebar_mcp_header: ratatui::layout::Rect::default(),
+            last_sidebar_todos_header: ratatui::layout::Rect::default(),
             last_terminal_width: 0,
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
@@ -1480,6 +1492,21 @@ impl TuiState {
             .sidebar_scroll
             .saturating_add(rows)
             .min(self.sidebar_max_scroll);
+    }
+
+    pub fn toggle_sidebar_context(&mut self) {
+        self.sidebar_context_expanded = !self.sidebar_context_expanded;
+        self.sidebar_scroll = 0;
+    }
+
+    pub fn toggle_sidebar_mcp(&mut self) {
+        self.sidebar_mcp_expanded = !self.sidebar_mcp_expanded;
+        self.sidebar_scroll = 0;
+    }
+
+    pub fn toggle_sidebar_todos(&mut self) {
+        self.sidebar_todos_expanded = !self.sidebar_todos_expanded;
+        self.sidebar_scroll = 0;
     }
 
     #[cfg(test)]

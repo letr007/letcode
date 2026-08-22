@@ -343,6 +343,25 @@ fn prepared_usage_does_not_regress_the_current_context_snapshot() {
 }
 
 #[test]
+fn sidebar_section_toggle_actions_update_expansion_state() {
+    let mut runtime = runtime();
+
+    runtime
+        .handle_input_action(InputAction::ToggleSidebarContext)
+        .expect("toggle context");
+    runtime
+        .handle_input_action(InputAction::ToggleSidebarMcp)
+        .expect("toggle mcp");
+    runtime
+        .handle_input_action(InputAction::ToggleSidebarTodos)
+        .expect("toggle todos");
+
+    assert!(!runtime.state().sidebar_context_expanded);
+    assert!(!runtime.state().sidebar_mcp_expanded);
+    assert!(!runtime.state().sidebar_todos_expanded);
+}
+
+#[test]
 fn sidebar_scroll_actions_update_independent_offset() {
     let mut runtime = runtime();
     runtime.state_mut().sidebar_max_scroll = 20;

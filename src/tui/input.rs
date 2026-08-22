@@ -39,6 +39,9 @@ pub enum InputAction {
     MouseScrollDown,
     SidebarScrollUp,
     SidebarScrollDown,
+    ToggleSidebarContext,
+    ToggleSidebarMcp,
+    ToggleSidebarTodos,
     MouseSelectionStart(u16, u16),
     MouseSelectionDrag(u16, u16),
     /// Third flag is true when Ctrl/Cmd is held — used to activate underlined links.
@@ -446,6 +449,27 @@ pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
         && mouse.row < state.last_sidebar_area.bottom();
 
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)
+            if state
+                .last_sidebar_context_header
+                .contains((mouse.column, mouse.row).into()) =>
+        {
+            InputAction::ToggleSidebarContext
+        }
+        MouseEventKind::Down(MouseButton::Left)
+            if state
+                .last_sidebar_mcp_header
+                .contains((mouse.column, mouse.row).into()) =>
+        {
+            InputAction::ToggleSidebarMcp
+        }
+        MouseEventKind::Down(MouseButton::Left)
+            if state
+                .last_sidebar_todos_header
+                .contains((mouse.column, mouse.row).into()) =>
+        {
+            InputAction::ToggleSidebarTodos
+        }
         MouseEventKind::ScrollUp if over_sidebar => InputAction::SidebarScrollUp,
         MouseEventKind::ScrollDown if over_sidebar => InputAction::SidebarScrollDown,
         MouseEventKind::ScrollUp => InputAction::MouseScrollUp,
@@ -606,6 +630,7 @@ mod tests {
     use super::*;
     use crate::tui::{AppPhase, PermissionRequestEvent};
     use crate::user_content::UserImageAttachment;
+    use crossterm::event::MouseButton;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1177,6 +1202,30 @@ mod tests {
             map_key_event(&state, key(KeyCode::Down)),
             InputAction::DialogNext
         );
+    }
+
+    #[test]
+    fn sidebar_section_header_click_routes_to_toggle_action() {
+        let mut state = TuiState::default();
+        state.last_terminal_width = 140;
+        state.last_sidebar_area = ratatui::layout::Rect::new(100, 1, 40, 20);
+        state.last_sidebar_context_header = ratatui::layout::Rect::new(103, 7, 35, 1);
+        state.last_sidebar_mcp_header = ratatui::layout::Rect::new(103, 12, 35, 1);
+        state.last_sidebar_todos_header = ratatui::layout::Rect::new(103, 16, 35, 1);
+
+        for (row, expected) in [
+            (7, InputAction::ToggleSidebarContext),
+            (12, InputAction::ToggleSidebarMcp),
+            (16, InputAction::ToggleSidebarTodos),
+        ] {
+            let mouse = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 110,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(map_mouse_event(&state, mouse), expected);
+        }
     }
 
     #[test]

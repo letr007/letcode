@@ -124,7 +124,7 @@ mcp_loading = "发现中"
 mcp_unavailable = "不可用"
 mcp_server_online = "{count} 个工具"
 todos = "待办"
-toggle_hint = "滚轮滚动 · Ctrl-X B  切换"
+toggle_hint = "Ctrl-X B  切换"
 
 [dashboard]
 resume_hint = "会话"

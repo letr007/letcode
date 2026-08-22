@@ -68,6 +68,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.frame_hyperlink_cells.clear();
     state.last_sidebar_area = Rect::default();
+    state.last_sidebar_context_header = Rect::default();
+    state.last_sidebar_mcp_header = Rect::default();
+    state.last_sidebar_todos_header = Rect::default();
     let theme = state.theme();
     let area = frame.area();
     state.last_terminal_width = area.width;

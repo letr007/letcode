@@ -125,7 +125,7 @@ mcp_loading = "Discovering"
 mcp_unavailable = "Unavailable"
 mcp_server_online = "{count} tools"
 todos = "Todos"
-toggle_hint = "Scroll panel · Ctrl-X B  toggle"
+toggle_hint = "Ctrl-X B  toggle"
 
 [dashboard]
 resume_hint = "sessions"
