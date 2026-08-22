@@ -89,10 +89,10 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         .active_model_token_usage()
         .filter(|usage| usage.context_window_tokens > 0)
     {
-        let percent = context_used_percent(usage.used_tokens, usage.context_window_tokens);
+        let percent = context_used_percent(usage.input_tokens, usage.context_window_tokens);
         let usage_summary = format!(
             "{} / {} ({percent}%)",
-            compact_count(usage.used_tokens),
+            compact_count(usage.input_tokens),
             compact_count(usage.context_window_tokens)
         );
         wrapped_context_field(
@@ -217,8 +217,7 @@ fn render_context_usage_details(
         usage.prompt_composition.iter().fold(0u64, |total, entry| {
             total.saturating_add(entry.estimated_tokens)
         });
-    let output_context_tokens = usage.used_tokens.saturating_sub(usage.input_tokens);
-    let display_used_tokens = usage.used_tokens;
+    let display_used_tokens = usage.input_tokens;
     let remaining = usage
         .context_window_tokens
         .saturating_sub(display_used_tokens.min(usage.context_window_tokens));
@@ -247,7 +246,6 @@ fn render_context_usage_details(
         &usage.prompt_composition,
         estimated_composition_tokens,
         usage.input_tokens,
-        output_context_tokens,
         usage.context_window_tokens,
         theme,
     ));
@@ -269,14 +267,6 @@ fn render_context_usage_details(
             )
         })
         .collect::<Vec<_>>();
-    if output_context_tokens > 0 {
-        details.push(context_detail_line(
-            state.t("sidebar.context_output"),
-            output_context_tokens,
-            theme.assistant,
-            theme,
-        ));
-    }
     details.push(context_detail_line(
         state.t("sidebar.context_remaining"),
         remaining,
@@ -322,17 +312,12 @@ fn context_bar_line(
     composition: &[crate::agent::PromptCompositionEntry],
     estimated_total: u64,
     actual_input_tokens: u64,
-    output_context_tokens: u64,
     context_window_tokens: u64,
     theme: Theme,
 ) -> Line<'static> {
     let bar_width = width.max(1);
-    let target_cells = proportional_cells(
-        actual_input_tokens.saturating_add(output_context_tokens),
-        context_window_tokens,
-        bar_width,
-    );
-    let mut segments = composition
+    let target_cells = proportional_cells(actual_input_tokens, context_window_tokens, bar_width);
+    let segments = composition
         .iter()
         .enumerate()
         .map(|(index, entry)| {
@@ -346,9 +331,6 @@ fn context_bar_line(
             )
         })
         .collect::<Vec<_>>();
-    if output_context_tokens > 0 {
-        segments.push((output_context_tokens, theme.assistant));
-    }
 
     context_bar_spans(bar_width, target_cells, &segments, theme)
 }
@@ -394,7 +376,10 @@ fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
     if cell.iter().all(|color| *color == cell[0]) {
         return match cell[0] {
             Some(color) => Span::styled("█", Style::default().fg(color).bg(theme.element_bg)),
-            None => Span::styled(" ", Style::default().fg(theme.border).bg(theme.elevated_bg)),
+            None => Span::styled(
+                "█",
+                Style::default().fg(theme.elevated_bg).bg(theme.element_bg),
+            ),
         };
     }
 
@@ -420,7 +405,10 @@ fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
             .unwrap_or((None, cell.len()));
         return match color {
             Some(color) => Span::styled("█", Style::default().fg(color).bg(theme.element_bg)),
-            None => Span::styled(" ", Style::default().fg(theme.border).bg(theme.elevated_bg)),
+            None => Span::styled(
+                "█",
+                Style::default().fg(theme.elevated_bg).bg(theme.element_bg),
+            ),
         };
     }
 
@@ -1045,7 +1033,7 @@ mod tests {
 
         for expected in [
             "Context usage",
-            "70.0k / 128.0k · 55%",
+            "64.0k / 128.0k · 50%",
             "System prompt",
             "16.5k",
             "Skills",
@@ -1054,20 +1042,19 @@ mod tests {
             "18.3k",
             "Messages",
             "18.3k",
-            "Output",
-            "6.0k",
             "Remaining",
-            "58.0k",
+            "64.0k",
         ] {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}: {rendered}"
             );
         }
+        assert!(!rendered.contains("Output"), "{rendered}");
     }
 
     #[test]
-    fn context_breakdown_includes_current_output_tokens() {
+    fn context_breakdown_excludes_current_output_tokens() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
         state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
@@ -1097,7 +1084,8 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Messages        10.0k"), "{rendered}");
-        assert!(rendered.contains("Output          2.0k"), "{rendered}");
+        assert!(!rendered.contains("Output"), "{rendered}");
+        assert!(rendered.contains("10.0k / 20.0k · 50%"), "{rendered}");
         let bar_cells = terminal
             .backend()
             .buffer()
@@ -1111,17 +1099,20 @@ mod tests {
             })
             .expect("context bar");
         assert_eq!(
-            bar_cells.iter().filter(|cell| cell.symbol() == "█").count(),
-            21
+            bar_cells
+                .iter()
+                .filter(|cell| cell.symbol() == "█" && cell.fg != Theme::dark().elevated_bg)
+                .count(),
+            19
         );
         assert_eq!(
             bar_cells
                 .iter()
                 .filter(|cell| "▉▊▋▌▍▎▏".contains(cell.symbol()))
                 .count(),
-            2
+            1
         );
-        assert!(rendered.contains("Remaining       8.0k"), "{rendered}");
+        assert!(rendered.contains("Remaining       10.0k"), "{rendered}");
     }
 
     #[test]
@@ -1410,13 +1401,13 @@ mod tests {
                 segments: 1,
             },
         ];
-        let line = context_bar_line(20, &composition, 10_000, 10_000, 0, 20_000, Theme::dark());
+        let line = context_bar_line(20, &composition, 10_000, 10_000, 20_000, Theme::dark());
         assert_eq!(line.width(), 20);
         assert_eq!(line.spans.len(), 20);
         assert_eq!(
             line.spans
                 .iter()
-                .filter(|span| span.style.bg == Some(Theme::dark().elevated_bg))
+                .filter(|span| span.style.fg == Some(Theme::dark().elevated_bg))
                 .count(),
             10
         );
@@ -1480,6 +1471,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_context_bar_uses_visible_track_cells() {
+        let theme = Theme::dark();
+        let line = context_bar_spans(4, 0, &[], theme);
+
+        assert_eq!(line.width(), 4);
+        assert!(line.spans.iter().all(|span| span.content.as_ref() == "█"));
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.elevated_bg))
+        );
+    }
+
+    #[test]
     fn context_bar_falls_back_to_used_color_without_composition() {
         let theme = Theme::dark();
         let line = context_bar_spans(4, 2, &[], theme);
@@ -1487,8 +1492,10 @@ mod tests {
         assert_eq!(line.width(), 4);
         assert_eq!(line.spans[0].style.fg, Some(theme.accent));
         assert_eq!(line.spans[1].style.fg, Some(theme.accent));
-        assert_eq!(line.spans[2].content.as_ref(), " ");
-        assert_eq!(line.spans[3].content.as_ref(), " ");
+        assert_eq!(line.spans[2].content.as_ref(), "█");
+        assert_eq!(line.spans[2].style.fg, Some(theme.elevated_bg));
+        assert_eq!(line.spans[3].content.as_ref(), "█");
+        assert_eq!(line.spans[3].style.fg, Some(theme.elevated_bg));
     }
 
     #[test]
@@ -1534,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_iteration_reclassification_keeps_context_bar_width() {
+    fn tool_iteration_adds_prior_output_only_after_it_becomes_input() {
         let before = context_bar_line(
             40,
             &[crate::agent::PromptCompositionEntry {
@@ -1544,7 +1551,6 @@ mod tests {
             }],
             100,
             100,
-            20,
             200,
             Theme::dark(),
         );
@@ -1557,18 +1563,17 @@ mod tests {
             }],
             120,
             120,
-            0,
             200,
             Theme::dark(),
         );
         let filled_cells = |line: &Line<'_>| {
             line.spans
                 .iter()
-                .filter(|span| span.content.as_ref() != " ")
+                .filter(|span| span.style.fg != Some(Theme::dark().elevated_bg))
                 .count()
         };
 
-        assert_eq!(filled_cells(&before), 24);
+        assert_eq!(filled_cells(&before), 20);
         assert_eq!(filled_cells(&after), 24);
     }
 
