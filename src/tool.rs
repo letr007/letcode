@@ -12,6 +12,7 @@ use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
+#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 
 use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, path_preview};
@@ -358,16 +359,29 @@ pub(crate) struct PreparedWritableLeaf {
     workspace_root: PathBuf,
     destination: PathBuf,
     parent: PathBuf,
+    #[cfg(unix)]
     leaf: std::ffi::OsString,
     #[cfg(unix)]
     parent_dev: u64,
     #[cfg(unix)]
     parent_ino: u64,
+    #[cfg(windows)]
+    parent_dir: Arc<cap_std::fs::Dir>,
+    #[cfg(windows)]
+    existing_file: Option<Arc<cap_std::fs::File>>,
 }
 
 impl PreparedWritableLeaf {
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    #[cfg(windows)]
+    fn leaf_name(&self) -> std::ffi::OsString {
+        self.destination
+            .file_name()
+            .expect("prepared writable leaf has file name")
+            .to_os_string()
     }
 
     pub(crate) fn external_workspace_access(&self) -> Option<ExternalWorkspaceAccess> {
@@ -384,10 +398,13 @@ impl PreparedWritableLeaf {
     }
 
     fn validate_current_path(&self, raw_path: &str) -> Result<()> {
-        let current = prepare_writable_leaf(raw_path)?;
-        if current.destination != self.destination
-            || current.parent != self.parent
-            || !current.same_parent_instance(self)
+        let workspace_root = workspace_root()?;
+        let candidate = join_workspace_path(&workspace_root, raw_path);
+        let destination = current_writable_destination(&candidate)?;
+        if workspace_root != self.workspace_root
+            || destination != self.destination
+            || destination.parent() != Some(self.parent.as_path())
+            || !self.parent_instance_is_current()
         {
             bail!(WRITABLE_DESTINATION_CHANGED);
         }
@@ -395,12 +412,24 @@ impl PreparedWritableLeaf {
     }
 
     #[cfg(unix)]
-    fn same_parent_instance(&self, other: &Self) -> bool {
-        self.parent_dev == other.parent_dev && self.parent_ino == other.parent_ino
+    fn parent_instance_is_current(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&self.parent).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && metadata.dev() == self.parent_dev
+                && metadata.ino() == self.parent_ino
+        })
     }
 
-    #[cfg(not(unix))]
-    fn same_parent_instance(&self, _other: &Self) -> bool {
+    #[cfg(windows)]
+    fn parent_instance_is_current(&self) -> bool {
+        // cap-std keeps the directory capability open without FILE_SHARE_DELETE,
+        // so Windows cannot replace or rename this parent while authorization is live.
+        self.parent_dir.dir_metadata().is_ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn parent_instance_is_current(&self) -> bool {
         true
     }
 }
@@ -747,9 +776,95 @@ fn prepare_writable_leaf_platform(path: &str) -> Result<PreparedWritableLeaf> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn prepare_writable_leaf_platform(path: &str) -> Result<PreparedWritableLeaf> {
+    let workspace_root = workspace_root()?;
+    let candidate = join_workspace_path(&workspace_root, path);
+    let destination = resolve_writable_leaf_destination_windows(&candidate)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", destination.display()))?
+        .to_path_buf();
+    if destination.file_name().is_none() {
+        bail!("path has no file name: {}", destination.display());
+    }
+    let parent_dir = Arc::new(
+        cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())
+            .with_context(|| format!("failed to open parent directory {}", parent.display()))?,
+    );
+    let existing_file = match parent_dir.open(destination.file_name().expect("validated file name"))
+    {
+        Ok(file) => Some(Arc::new(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to bind writable destination"),
+    };
+    Ok(PreparedWritableLeaf {
+        workspace_root,
+        destination,
+        parent,
+        parent_dir,
+        existing_file,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn prepare_writable_leaf_platform(_path: &str) -> Result<PreparedWritableLeaf> {
     bail!("secure writable leaf authorization is unsupported on this platform")
+}
+
+#[cfg(windows)]
+fn resolve_writable_leaf_destination_windows(candidate: &Path) -> Result<PathBuf> {
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", candidate.display()))?
+        .canonicalize()
+        .with_context(|| format!("parent directory does not exist: {}", candidate.display()))?;
+    let leaf = candidate
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no file name: {}", candidate.display()))?;
+    let resolved = parent.join(leaf);
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "writable destination cannot be a link: {}",
+                resolved.display()
+            )
+        }
+        Ok(metadata) if windows_metadata_is_reparse_point(&metadata) => {
+            bail!(
+                "writable destination cannot be a reparse point: {}",
+                resolved.display()
+            )
+        }
+        Ok(_) => resolved.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize writable destination: {}",
+                resolved.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect writable destination: {}",
+                resolved.display()
+            )
+        }),
+    }
+}
+
+fn current_writable_destination(candidate: &Path) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        resolve_writable_leaf_destination(candidate)
+    }
+    #[cfg(windows)]
+    {
+        resolve_writable_leaf_destination_windows(candidate)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(candidate.to_path_buf())
+    }
 }
 
 #[cfg(unix)]
@@ -868,13 +983,53 @@ async fn secure_write_writable_leaf(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn secure_write_writable_leaf(
+    prepared: &PreparedWritableLeaf,
+    content: &[u8],
+    append: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(existing_file) = &prepared.existing_file {
+        let mut file = existing_file
+            .try_clone()
+            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?;
+        if append {
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::End(0))?;
+        } else {
+            file.set_len(0)?;
+        }
+        file.write_all(content)?;
+        file.flush()?;
+    } else {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = prepared
+            .parent_dir
+            .open_with(&prepared.leaf_name(), &options)
+            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?;
+        file.write_all(content)?;
+        file.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn secure_write_writable_leaf(
     _prepared: &PreparedWritableLeaf,
     _content: &[u8],
     _append: bool,
 ) -> Result<()> {
     bail!("secure writable leaf authorization is unsupported on this platform")
+}
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(test)]
@@ -1259,6 +1414,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(retired);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_write_and_append_tools_modify_regular_files() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = PathBuf::from("target").join(format!("letcode-windows-write-{unique}.txt"));
+        std::fs::create_dir_all("target").expect("create target directory");
+        let registry = ToolRegistry::default_tools();
+
+        let written = registry
+            .call(
+                "fs__write",
+                json!({"path": path.to_string_lossy(), "content": "first"}),
+            )
+            .await;
+        assert!(written.ok, "{:?}", written.error);
+        let appended = registry
+            .call(
+                "fs__append",
+                json!({"path": path.to_string_lossy(), "content": " second"}),
+            )
+            .await;
+        assert!(appended.ok, "{:?}", appended.error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first second");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_writable_leaf_rejects_symlink_replacement() {
+        use std::os::windows::fs::symlink_file;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let parent = PathBuf::from("target").join(format!("letcode-windows-link-{unique}"));
+        let leaf = parent.join("leaf.txt");
+        let target = parent.join("target.txt");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(&leaf, "original").unwrap();
+        std::fs::write(&target, "unchanged").unwrap();
+        let prepared = prepare_writable_leaf(leaf.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&leaf).unwrap();
+        symlink_file(&target, &leaf).expect("create replacement symlink");
+
+        let error = secure_write_writable_leaf(&prepared, b"must not write", false)
+            .await
+            .expect_err("replacement link must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "writable destination changed after authorization"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
     #[tokio::test]
     async fn unknown_tool_scope_rejection_precedes_lookup() {
         let name = "missing__tool";
@@ -1429,6 +1643,34 @@ mod tests {
             output.error.as_ref().expect("scope error").message,
             "tool 'agent__fixer' is not allowed in read_only_explorer scope"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_apply_patch_updates_existing_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = PathBuf::from("target").join(format!("letcode-windows-patch-{unique}.txt"));
+        std::fs::create_dir_all("target").unwrap();
+        std::fs::write(&path, "before\n").unwrap();
+
+        let output = ToolRegistry::default_tools()
+            .call(
+                "edit__apply_patch",
+                json!({"edits": [{
+                    "path": path.to_string_lossy(),
+                    "find": "before",
+                    "replace": "after",
+                    "replace_all": false
+                }]}),
+            )
+            .await;
+
+        assert!(output.ok, "{:?}", output.error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

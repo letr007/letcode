@@ -1,13 +1,11 @@
 //! ApplyPatch secure batch authorization and execution.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
-use std::{
-    fs::File,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
-};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -82,7 +80,19 @@ struct PreparedApplyPatchTarget {
     nlink: u64,
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct PreparedApplyPatchTarget {
+    file: File,
+    parent: Arc<cap_std::fs::Dir>,
+    leaf: std::ffi::OsString,
+    volume_serial: u32,
+    file_index: u64,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+}
+
+#[cfg(not(any(unix, windows)))]
 struct PreparedApplyPatchTarget;
 
 fn parse_apply_patch(args: &Value) -> Result<Vec<ParsedApplyPatchEdit>> {
@@ -240,7 +250,89 @@ fn prepare_apply_patch_edits(edits: &[ParsedApplyPatchEdit]) -> Result<PreparedA
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn prepare_apply_patch_edits(edits: &[ParsedApplyPatchEdit]) -> Result<PreparedApplyPatch> {
+    let workspace_root = workspace_root()?;
+    let edit_paths = edits.iter().map(|edit| edit.path.clone()).collect();
+    let mut edit_targets = Vec::with_capacity(edits.len());
+    let mut canonical = BTreeSet::new();
+    for edit in edits {
+        let candidate = join_workspace_path(&workspace_root, &edit.path);
+        let target = candidate
+            .canonicalize()
+            .with_context(|| format!("path does not exist: {}", candidate.display()))?;
+        edit_targets.push(target.clone());
+        canonical.insert(target);
+    }
+    if canonical.len() > 64 {
+        bail!("apply patch accepts at most 64 unique target files");
+    }
+
+    let mut targets = BTreeMap::new();
+    let mut identities = BTreeSet::new();
+    for destination in canonical {
+        let metadata = std::fs::symlink_metadata(&destination)
+            .with_context(|| format!("failed to inspect file {}", destination.display()))?;
+        if metadata.file_type().is_symlink() || windows_metadata_is_reparse_point(&metadata) {
+            bail!("edits path cannot be a link: {}", destination.display());
+        }
+        let parent_path = destination
+            .parent()
+            .ok_or_else(|| anyhow!("path has no parent: {}", destination.display()))?;
+        let leaf = destination
+            .file_name()
+            .ok_or_else(|| anyhow!("path has no file name: {}", destination.display()))?
+            .to_os_string();
+        let parent = Arc::new(
+            cap_std::fs::Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())
+                .with_context(|| {
+                    format!("failed to open parent directory {}", parent_path.display())
+                })?,
+        );
+        let file = parent
+            .open(&leaf)
+            .with_context(|| format!("failed to open file {}", destination.display()))?
+            .into_std();
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect file {}", destination.display()))?;
+        if !metadata.is_file() || windows_metadata_is_reparse_point(&metadata) {
+            bail!(
+                "edits path is not a regular file: {}",
+                destination.display()
+            );
+        }
+        let (volume_serial, file_index) = windows_file_identity(&file)?;
+        if !identities.insert((volume_serial, file_index)) {
+            bail!("apply patch targets alias the same existing file");
+        }
+        targets.insert(
+            destination,
+            PreparedApplyPatchTarget {
+                file,
+                parent,
+                leaf,
+                volume_serial,
+                file_index,
+                size: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+            },
+        );
+    }
+    Ok(PreparedApplyPatch {
+        inner: Arc::new(PreparedApplyPatchInner {
+            workspace_root,
+            edit_paths,
+            edit_targets,
+            targets,
+            #[cfg(test)]
+            hook: std::sync::Mutex::new(None),
+        }),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn prepare_apply_patch_edits(_edits: &[ParsedApplyPatchEdit]) -> Result<PreparedApplyPatch> {
     bail!("secure apply patch authorization is unsupported on this platform")
 }
@@ -300,7 +392,11 @@ fn prepared_apply_patch_for_execution(
         Some(prepared) => prepared.clone(),
         None => prepare_apply_patch_edits(&edits)?,
     };
-    if !context.allow_outside_workspace && prepared.external_workspace_access().is_some() {
+    if !context.allow_outside_workspace
+        && prepared
+            .target_paths()
+            .any(|path| !path.starts_with(&prepared.inner.workspace_root))
+    {
         bail!("path is outside workspace");
     }
     validate_apply_patch_mapping(&prepared, &edits)?;
@@ -342,6 +438,19 @@ fn validate_apply_patch_mapping(
             let leaf_metadata = std::fs::metadata(expected)
                 .map_err(|error| apply_patch_open_error(expected, "inspect file", error))?;
             if !apply_patch_metadata_matches(target, &leaf_metadata) {
+                bail!(APPLY_PATCH_CHANGED);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let target = prepared
+                .inner
+                .targets
+                .get(expected)
+                .expect("prepared target");
+            let current =
+                windows_open_patch_file(target, false).map_err(|_| anyhow!(APPLY_PATCH_CHANGED))?;
+            if !windows_file_identity_matches(target, &current)? {
                 bail!(APPLY_PATCH_CHANGED);
             }
         }
@@ -514,6 +623,86 @@ pub(crate) async fn apply_patch(args: Value, context: ToolExecutionContext) -> R
     tokio::task::spawn_blocking(move || apply_patch_worker(args, context)).await?
 }
 
+#[cfg(windows)]
+fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_open_patch_file(target: &PreparedApplyPatchTarget, writable: bool) -> Result<File> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).write(writable);
+    let file = target
+        .parent
+        .open_with(&target.leaf, &options)
+        .map_err(|_| anyhow!(APPLY_PATCH_CHANGED))?
+        .into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!(APPLY_PATCH_CHANGED);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect Windows file handle");
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_file_identity_matches(target: &PreparedApplyPatchTarget, file: &File) -> Result<bool> {
+    let (volume_serial, file_index) = windows_file_identity(file)?;
+    Ok(volume_serial == target.volume_serial && file_index == target.file_index)
+}
+
+#[cfg(windows)]
+fn windows_file_version_matches(target: &PreparedApplyPatchTarget, file: &File) -> Result<bool> {
+    let metadata = file.metadata()?;
+    Ok(windows_file_identity_matches(target, file)?
+        && metadata.len() == target.size
+        && metadata.modified().ok() == target.modified
+        && metadata.created().ok() == target.created)
+}
+
+#[cfg(windows)]
+fn windows_file_identity_is_current(
+    target: &PreparedApplyPatchTarget,
+    writable: bool,
+) -> Result<bool> {
+    let file = windows_open_patch_file(target, writable)?;
+    windows_file_identity_matches(target, &file)
+}
+
+#[cfg(windows)]
+fn windows_read_patch_file(file: &mut File, target: &PreparedApplyPatchTarget) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !windows_file_version_matches(target, file)? {
+        bail!(APPLY_PATCH_MODIFIED);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if !windows_file_version_matches(target, file)? {
+        bail!(APPLY_PATCH_MODIFIED);
+    }
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 fn apply_patch_worker(args: Value, context: ToolExecutionContext) -> Result<Value> {
     use std::io::{Seek, SeekFrom, Write};
@@ -603,7 +792,86 @@ fn apply_patch_worker(args: Value, context: ToolExecutionContext) -> Result<Valu
     Ok(json!({"files_changed": contents.len(), "edits_applied": edits.len(), "edits": results}))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn apply_patch_worker(args: Value, context: ToolExecutionContext) -> Result<Value> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let (edits, prepared) = prepared_apply_patch_for_execution(&args, &context)?;
+    let mut contents = BTreeMap::new();
+    let mut originals = BTreeMap::new();
+    for (path, target) in &prepared.inner.targets {
+        let mut file = target.file.try_clone()?;
+        let bytes = windows_read_patch_file(&mut file, target)?;
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("failed to read UTF-8 file {}", path.display()))?;
+        originals.insert(path.clone(), content.clone());
+        contents.insert(path.clone(), content);
+    }
+    #[cfg(test)]
+    prepared.run_worker_hook(ApplyPatchWorkerPoint::BeforeStagingValidation);
+    let mut results = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let path = &prepared.inner.edit_targets[index];
+        let content = contents.get_mut(path).expect("staged content");
+        let matches = content.matches(&edit.find).count();
+        let label = bound_display(&prepared.inner.workspace_root, path);
+        if matches == 0 {
+            bail!("edits[{index}] did not match any text in {label}");
+        }
+        if !edit.replace_all && matches != 1 {
+            bail!(
+                "edits[{index}] matched {matches} occurrences in {label}; provide more context or set replace_all=true"
+            );
+        }
+        *content = if edit.replace_all {
+            content.replace(&edit.find, &edit.replace)
+        } else {
+            content.replacen(&edit.find, &edit.replace, 1)
+        };
+        results
+            .push(json!({"path": label, "replacements": matches, "replace_all": edit.replace_all}));
+    }
+    validate_apply_patch_mapping(&prepared, &edits)?;
+    #[cfg(test)]
+    prepared.run_worker_hook(ApplyPatchWorkerPoint::BeforeBatchPrecommit);
+    for (path, target) in &prepared.inner.targets {
+        let mut file = windows_open_patch_file(target, false)?;
+        let bytes = windows_read_patch_file(&mut file, target)?;
+        if bytes != originals.get(path).expect("staged original").as_bytes() {
+            bail!(APPLY_PATCH_MODIFIED);
+        }
+    }
+    for (ordinal, (path, content)) in contents.iter().enumerate() {
+        #[cfg(test)]
+        prepared.run_worker_hook(ApplyPatchWorkerPoint::BeforeCommitOpen {
+            path: path.clone(),
+            ordinal,
+        });
+        #[cfg(not(test))]
+        let _ = ordinal;
+        let target = prepared.inner.targets.get(path).expect("prepared target");
+        if !windows_file_identity_is_current(target, true)? {
+            bail!(APPLY_PATCH_CHANGED);
+        }
+        let mut file = windows_open_patch_file(target, true)?;
+        let current = windows_read_patch_file(&mut file, target)?;
+        if current != originals.get(path).expect("staged original").as_bytes() {
+            bail!(APPLY_PATCH_MODIFIED);
+        }
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut verified = Vec::new();
+        file.read_to_end(&mut verified)?;
+        if verified != content.as_bytes() {
+            bail!("failed to write patched file {}", path.display());
+        }
+    }
+    Ok(json!({"files_changed": contents.len(), "edits_applied": edits.len(), "edits": results}))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn apply_patch_worker(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let _ = prepared_apply_patch_for_execution(&args, &context)?;
     bail!("secure apply patch authorization is unsupported on this platform")

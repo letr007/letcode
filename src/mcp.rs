@@ -5,13 +5,14 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
 use crate::config::{
     McpLocalServerConfig, McpRemoteServerConfig, McpServerConfig, McpTransportConfig,
 };
 use crate::permission::ToolPermissionClass;
+use crate::process_tree::ManagedChild;
 #[cfg(test)]
 use crate::request_builder::ToolSpec;
 use crate::tool::ToolHandler;
@@ -444,7 +445,7 @@ fn discovered_tool_from_value(server_name: &str, tool: &Value) -> Result<Discove
 }
 
 struct LocalMcpSession {
-    child: Option<Child>,
+    child: Option<ManagedChild>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -464,35 +465,20 @@ impl LocalMcpSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        #[cfg(unix)]
-        unsafe {
-            // Keep wrappers such as npx and their server descendants in an owned
-            // group so session teardown can terminate all of them together.
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let mut child = command.spawn().with_context(|| {
+        let mut child = ManagedChild::spawn(command).with_context(|| {
             format!(
                 "failed to start MCP server command '{}': {:?}",
                 program, server.command
             )
         })?;
         let stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| anyhow!("failed to open MCP server stdin"))?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| anyhow!("failed to open MCP server stdout"))?;
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| anyhow!("failed to open MCP server stderr"))?;
         tokio::spawn(drain_mcp_stderr(stderr));
 
@@ -589,97 +575,39 @@ impl LocalMcpSession {
     }
 
     async fn shutdown(&mut self) {
-        // EOF is the standard MCP stdio shutdown signal; MCP defines no
-        // shutdown/exit RPC. Keep the child in the session while awaiting so
-        // cancellation invokes Drop's hard process-group cleanup.
+        // EOF is the standard MCP stdio shutdown signal. If the server does not
+        // exit promptly, terminate its owned process tree.
         self.stdin.take();
-        if self.child.is_none() {
+        let Some(mut child) = self.child.take() else {
             return;
-        }
-
-        #[cfg(unix)]
-        let process_group = self
-            .child
-            .as_ref()
-            .and_then(|child| child.id().map(|pid| pid as i32));
-
+        };
         let child_exited = matches!(
-            timeout(
-                LOCAL_MCP_SHUTDOWN_TIMEOUT,
-                self.child.as_mut().expect("child remains owned").wait(),
-            )
-            .await,
+            timeout(LOCAL_MCP_SHUTDOWN_TIMEOUT, child.wait()).await,
             Ok(Ok(_))
         );
-
-        #[cfg(not(unix))]
         if child_exited {
-            self.child.take();
+            child.disarm();
             return;
         }
-
-        #[cfg(unix)]
-        if let Some(process_group) = process_group {
-            if child_exited && !process_group_exists(process_group) {
-                self.child.take();
-                return;
-            }
-            unsafe {
-                // The child owns this group, so SIGTERM reaches wrappers and
-                // all server descendants without affecting the parent process.
-                libc::kill(-process_group, libc::SIGTERM);
-            }
-            let child_exited = child_exited
-                || matches!(
-                    timeout(
-                        LOCAL_MCP_SHUTDOWN_TIMEOUT,
-                        self.child.as_mut().expect("child remains owned").wait(),
-                    )
-                    .await,
-                    Ok(Ok(_))
-                );
-            if child_exited && !process_group_exists(process_group) {
-                self.child.take();
-                return;
-            }
-            unsafe {
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-        }
-
-        // Direct-child escalation is required on non-Unix and covers a child
-        // that exited while the Unix process-group signals were being sent.
-        let _ = self
-            .child
-            .as_mut()
-            .expect("child remains owned")
-            .start_kill();
-        let child_reaped = matches!(
-            timeout(
-                LOCAL_MCP_SHUTDOWN_TIMEOUT,
-                self.child.as_mut().expect("child remains owned").wait(),
-            )
-            .await,
+        child.terminate_gracefully();
+        let graceful_exit = matches!(
+            timeout(LOCAL_MCP_SHUTDOWN_TIMEOUT, child.wait()).await,
             Ok(Ok(_))
         );
-        if !child_reaped {
-            // The spawned task now owns reaping; disarm Drop immediately
-            // before transferring ownership to it.
-            let mut child = self.child.take().expect("child remains owned");
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-        } else {
-            self.child.take();
+        if graceful_exit {
+            child.disarm();
+            return;
         }
-    }
-}
-
-#[cfg(unix)]
-fn process_group_exists(process_group: i32) -> bool {
-    unsafe {
-        libc::kill(-process_group, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        child.terminate();
+        let child_reaped = matches!(
+            timeout(LOCAL_MCP_SHUTDOWN_TIMEOUT, child.wait()).await,
+            Ok(Ok(_))
+        );
+        if child_reaped {
+            child.disarm();
+        } else {
+            child.spawn_reaper();
+        }
     }
 }
 
@@ -695,32 +623,9 @@ async fn drain_mcp_stderr(mut stderr: tokio::process::ChildStderr) {
 
 impl Drop for LocalMcpSession {
     fn drop(&mut self) {
-        // Async callers use shutdown() for the normal EOF -> TERM -> KILL
-        // lifecycle. Drop remains a nonblocking hard-cancellation and panic
-        // fallback, where waiting would be unsafe.
         self.stdin.take();
-
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-
-        #[cfg(unix)]
-        if let Some(process_group) = child.id().map(|pid| pid as i32) {
-            unsafe {
-                // Ignore ESRCH: the group may have exited between discovery and
-                // teardown. A negative PID targets the entire process group.
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-        }
-
-        // This is also the direct-child fallback on non-Unix platforms.
-        let _ = child.start_kill();
-
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = child.wait().await;
-            });
-        }
+        // ManagedChild owns cancellation cleanup and asynchronous reaping.
+        self.child.take();
     }
 }
 

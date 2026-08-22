@@ -130,11 +130,12 @@ fn persist_config_document(
         update_name,
         require_full_config,
     )?;
-    atomic_write_config(
+    atomic_write_config_with_source(
         &config_target,
         &config_text,
         &original_metadata,
         updated_config.as_bytes(),
+        Some(&config_file),
     )
 }
 
@@ -191,11 +192,28 @@ pub fn persist_mcp_server_enabled(
     Ok(persisted_server.expect("MCP server persistence validates and stores the server"))
 }
 
+#[cfg(test)]
 pub(super) fn atomic_write_config(
     config_path: &Path,
     original_contents: &str,
     original_metadata: &fs::Metadata,
     contents: &[u8],
+) -> Result<()> {
+    atomic_write_config_with_source(
+        config_path,
+        original_contents,
+        original_metadata,
+        contents,
+        None,
+    )
+}
+
+fn atomic_write_config_with_source(
+    config_path: &Path,
+    original_contents: &str,
+    original_metadata: &fs::Metadata,
+    contents: &[u8],
+    source_file: Option<&fs::File>,
 ) -> Result<()> {
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = config_path
@@ -221,8 +239,14 @@ pub(super) fn atomic_write_config(
                 temp_path.display()
             )
         })?;
-        revalidate_config_source(config_path, original_contents, original_metadata)?;
-        fs::rename(&temp_path, config_path).with_context(|| {
+        drop(temp);
+        revalidate_config_source(
+            config_path,
+            original_contents,
+            original_metadata,
+            source_file,
+        )?;
+        replace_file(&temp_path, config_path).with_context(|| {
             format!(
                 "failed to atomically replace config file {} with {}",
                 config_path.display(),
@@ -231,7 +255,7 @@ pub(super) fn atomic_write_config(
         })?;
         Ok(())
     })();
-    if write_result.is_err() {
+    if write_result.is_err() && temp_path.exists() {
         let _ = fs::remove_file(&temp_path);
     }
     write_result
@@ -268,6 +292,7 @@ fn revalidate_config_source(
     config_path: &Path,
     original_contents: &str,
     original_metadata: &fs::Metadata,
+    source_file: Option<&fs::File>,
 ) -> Result<()> {
     let current_metadata = fs::metadata(config_path)
         .with_context(|| format!("failed to restat config file {}", config_path.display()))?;
@@ -275,6 +300,7 @@ fn revalidate_config_source(
         .with_context(|| format!("failed to reread config file {}", config_path.display()))?;
     if current_contents != original_contents
         || !config_metadata_matches(original_metadata, &current_metadata)
+        || source_file.is_some_and(|source| !config_source_identity_matches(source, config_path))
     {
         bail!(
             "config file {} changed while updating configuration; refusing to overwrite it",
@@ -282,6 +308,39 @@ fn revalidate_config_source(
         );
     }
     Ok(())
+}
+
+fn config_source_identity_matches(source: &fs::File, path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        fn identity(handle: std::os::windows::io::RawHandle) -> Option<(u32, u64)> {
+            let mut information = BY_HANDLE_FILE_INFORMATION::default();
+            let ok = unsafe { GetFileInformationByHandle(handle.cast(), &mut information) };
+            (ok != 0).then_some((
+                information.dwVolumeSerialNumber,
+                ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+            ))
+        }
+        let Ok(current) = fs::File::open(path) else {
+            return false;
+        };
+        match (
+            identity(source.as_raw_handle()),
+            identity(current.as_raw_handle()),
+        ) {
+            (Some(source), Some(current)) => source == current,
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, path);
+        true
+    }
 }
 
 fn config_metadata_matches(expected: &fs::Metadata, current: &fs::Metadata) -> bool {
@@ -300,6 +359,49 @@ fn config_metadata_matches(expected: &fs::Metadata, current: &fs::Metadata) -> b
 
 pub(super) struct ConfigLock {
     _file: fs::File,
+}
+
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return fs::rename(source, destination).context("failed to install new file");
+        }
+        Err(error) => return Err(error).context("failed to inspect replacement destination"),
+        Ok(_) => {}
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let ok = unsafe {
+            ReplaceFileW(
+                destination.as_ptr(),
+                source.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to replace file");
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination).context("failed to replace file")
+    }
 }
 
 pub(super) fn acquire_config_lock(config_target: &Path) -> Result<ConfigLock> {
@@ -385,15 +487,22 @@ fn lock_file_with_mode(file: &fs::File, mode: i32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn lock_file(file: &fs::File) -> Result<()> {
+    fs4::fs_std::FileExt::lock_exclusive(file).context("failed to lock config lock file")
+}
+
+#[cfg(windows)]
+fn lock_file_shared(file: &fs::File) -> Result<()> {
+    fs4::fs_std::FileExt::lock_shared(file).context("failed to acquire shared config lock")
+}
+
+#[cfg(not(any(unix, windows)))]
 fn lock_file(_file: &fs::File) -> Result<()> {
-    // std does not expose a cross-platform advisory file lock. Source
-    // revalidation detects changes before replacement but cannot serialize a
-    // writer that races between revalidation and rename.
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn lock_file_shared(_file: &fs::File) -> Result<()> {
     Ok(())
 }

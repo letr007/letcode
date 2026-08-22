@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
+use crate::process_tree::ManagedChild;
+
 use super::args::required_string;
 use super::delegation::optional_u64;
 use super::fold_artifact::{
@@ -36,7 +38,7 @@ impl ToolHandler for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a shell command in the current workspace when specialized tools are not a better fit (prefer fs__/search__/git__/edit tools for file and repo work). Avoid high-impact irreversible commands without clear scope; keep compound commands (&&, ||, ;, pipes) from chaining steps that need separate confirmation; ensure loops/listeners have exit/timeout limits. Authorization is handled by the tool-level permission policy."
+        "Run a shell command in the current workspace when specialized tools are not a better fit (prefer fs__/search__/git__/edit tools for file and repo work). Commands run with cmd.exe on Windows and /bin/sh elsewhere. Avoid high-impact irreversible commands without clear scope; keep compound commands from chaining steps that need separate confirmation; ensure loops/listeners have exit/timeout limits. Authorization is handled by the tool-level permission policy."
     }
 
     fn parameters(&self) -> Value {
@@ -45,7 +47,7 @@ impl ToolHandler for RunCommandTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Shell command to run, e.g. cargo check or ls -la"
+                    "description": "Shell command to run. Uses cmd.exe on Windows and /bin/sh elsewhere, e.g. cargo check"
                 },
                 "timeout_secs": {
                     "type": ["integer", "null"],
@@ -97,99 +99,6 @@ struct CommandOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-}
-
-/// Owns a child until it has been waited for.  Dropping it kills the child and,
-/// on Unix, its process group so shell grandchildren cannot outlive a cancelled tool call.
-struct ManagedChild {
-    child: Option<tokio::process::Child>,
-    #[cfg(unix)]
-    process_group: Option<i32>,
-}
-
-impl ManagedChild {
-    fn spawn(mut command: Command) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            // Put the command in a new group before it can execute user code.
-            // This lets cancellation kill shell descendants as well as the shell itself.
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setpgid(0, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        let child = command.spawn()?;
-        #[cfg(unix)]
-        let process_group = child.id().map(|pid| pid as i32);
-        Ok(Self {
-            child: Some(child),
-            #[cfg(unix)]
-            process_group,
-        })
-    }
-
-    fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
-        self.child.as_mut()?.stdout.take()
-    }
-
-    fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
-        self.child.as_mut()?.stderr.take()
-    }
-
-    async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.child
-            .as_mut()
-            .ok_or_else(|| anyhow!("child is no longer managed"))?
-            .wait()
-            .await
-            .map_err(Into::into)
-    }
-
-    fn terminate(&mut self) {
-        #[cfg(unix)]
-        if let Some(process_group) = self.process_group {
-            // A negative PID addresses the process group. Ignore ESRCH because the
-            // process may have exited between timeout/cancellation and this signal.
-            unsafe {
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-        }
-
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-        }
-    }
-
-    async fn terminate_and_wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.terminate();
-        self.wait().await
-    }
-
-    fn disarm(&mut self) {
-        self.child.take();
-    }
-}
-
-impl Drop for ManagedChild {
-    fn drop(&mut self) {
-        self.terminate();
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-
-        // Tool futures are polled inside Tokio. Reap asynchronously so cancellation
-        // does not leave a zombie while keeping Drop non-blocking.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = child.wait().await;
-            });
-        }
-    }
 }
 
 async fn read_all_command_stream<R>(mut reader: R) -> Result<Vec<u8>>
@@ -272,9 +181,8 @@ async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result
     debug!(command = %command, shell = %shell, "running workspace shell command");
 
     let mut shell_command = Command::new(shell);
+    configure_shell_command(&mut shell_command, shell_flag, command);
     shell_command
-        .arg(shell_flag)
-        .arg(command)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -335,9 +243,8 @@ async fn run_workspace_shell_command_streaming(
     debug!(command = %command, shell = %shell, "running streaming workspace shell command");
 
     let mut shell_command = Command::new(shell);
+    configure_shell_command(&mut shell_command, shell_flag, command);
     shell_command
-        .arg(shell_flag)
-        .arg(command)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -590,9 +497,45 @@ fn open_stream_artifact(ext: &str) -> Result<(std::fs::File, String)> {
     Ok((file, path.to_string_lossy().to_string()))
 }
 
+fn configure_shell_command(command: &mut Command, shell_flag: &str, script: &str) {
+    #[cfg(windows)]
+    {
+        let raw = format!("{shell_flag} {}", quote_windows_arg(script));
+        command.raw_arg(raw);
+    }
+    #[cfg(not(windows))]
+    {
+        command.arg(shell_flag).arg(script);
+    }
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 fn shell_invocation() -> (&'static str, &'static str) {
     if cfg!(windows) {
-        ("cmd", "/C")
+        ("cmd.exe", "/D /S /C")
     } else {
         ("/bin/sh", "-c")
     }

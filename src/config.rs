@@ -47,6 +47,7 @@ mod persistence;
 // Kept re-exported for API compatibility; persist_mcp_server_enabled is the
 // only one referenced by production code today.
 use persistence::acquire_config_read_lock;
+pub(crate) use persistence::replace_file;
 #[allow(unused_imports)]
 pub use persistence::{
     persist_expert_allowed_models, persist_expert_model_route, persist_mcp_server_enabled,
@@ -1379,6 +1380,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 mod tests {
     use super::persistence::{
         acquire_config_lock, atomic_write_config, config_lock_path, open_config_lock_file,
+        replace_file,
     };
     use super::*;
     use std::fs;
@@ -1877,6 +1879,18 @@ model = "shared"
             fs::read_to_string(&path).expect("read externally changed config"),
             "external edit\n"
         );
+    }
+
+    #[test]
+    fn replace_file_overwrites_existing_destination() {
+        let destination = write_temp_config("old\n");
+        let source = destination.with_extension("replacement");
+        fs::write(&source, "new\n").expect("write replacement");
+
+        replace_file(&source, &destination).expect("replace destination");
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new\n");
+        assert!(!source.exists());
     }
 
     #[cfg(unix)]

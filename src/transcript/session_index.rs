@@ -127,7 +127,7 @@ fn save_index(base_dir: &Path, index: &SessionsIndexFile) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(index)?;
     fs::write(&tmp, bytes)
         .with_context(|| format!("failed to write session index {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
+    crate::config::replace_file(&tmp, &path)
         .with_context(|| format!("failed to replace session index {}", path.display()))?;
     Ok(())
 }

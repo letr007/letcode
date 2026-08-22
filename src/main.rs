@@ -26,6 +26,7 @@ mod langfuse_trace;
 mod mcp;
 mod memory;
 mod permission;
+mod process_tree;
 mod protocol_frames;
 mod request_builder;
 mod retry;
