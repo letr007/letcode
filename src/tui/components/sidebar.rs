@@ -85,46 +85,29 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         );
     }
 
-    let context_header_line = lines.len();
-    if let Some(usage) = state
+    let usage = state
         .active_model_token_usage()
-        .filter(|usage| usage.context_window_tokens > 0)
-    {
-        let percent = context_used_percent(usage.input_tokens, usage.context_window_tokens);
-        let usage_summary = format!(
-            "{} / {} ({percent}%)",
-            compact_count(usage.input_tokens),
-            compact_count(usage.context_window_tokens)
-        );
-        collapsible_context_field(
-            &mut lines,
-            state.sidebar_context_expanded,
-            state.t("sidebar.context"),
-            &state.current_context_branch,
-            &usage_summary,
-            inner.width as usize,
-            context_usage_color(percent, theme),
-            theme,
-        );
-    } else {
-        collapsible_field(
-            &mut lines,
-            state.sidebar_context_expanded,
-            state.t("sidebar.context"),
-            &state.current_context_branch,
-            inner.width as usize,
-            theme.notice,
-            theme,
-        );
-    }
-    let mcp_rows = mcp_row_count(state);
-    if state.sidebar_context_expanded
-        && let Some(usage) = state
-            .active_model_token_usage()
-            .filter(|usage| usage.context_window_tokens > 0)
-    {
+        .filter(|usage| usage.context_window_tokens > 0);
+    compact_field(
+        &mut lines,
+        state.t("sidebar.context_node"),
+        &state.current_context_branch,
+        inner.width as usize,
+        usage
+            .map(|usage| {
+                context_usage_color(
+                    context_used_percent(usage.input_tokens, usage.context_window_tokens),
+                    theme,
+                )
+            })
+            .unwrap_or(theme.notice),
+        theme,
+    );
+    let context_header_line = usage.map(|_| lines.len().saturating_add(1));
+    if let Some(usage) = usage {
         render_context_usage_details(&mut lines, usage, inner.width as usize, state, theme);
     }
+    let mcp_rows = mcp_row_count(state);
 
     let context_rendered = state
         .active_model_token_usage()
@@ -195,7 +178,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         .constraints([Constraint::Min(0), Constraint::Length(footer_height)])
         .split(inner);
     let context_header_row =
-        rendered_row_before(&lines, context_header_line, areas[0].width, style);
+        context_header_line.map(|line| rendered_row_before(&lines, line, areas[0].width, style));
     let mcp_header_row =
         mcp_header_line.map(|line| rendered_row_before(&lines, line, areas[0].width, style));
     let todos_header_row =
@@ -206,7 +189,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     let total_rows = paragraph.line_count(areas[0].width);
     state.sync_sidebar_scroll(total_rows, areas[0].height);
     let scroll = state.sidebar_scroll;
-    state.last_sidebar_context_header = sidebar_header_rect(areas[0], context_header_row, scroll);
+    state.last_sidebar_context_header = context_header_row
+        .map(|row| sidebar_header_rect(areas[0], row, scroll))
+        .unwrap_or_default();
     state.last_sidebar_mcp_header = mcp_header_row
         .map(|row| sidebar_header_rect(areas[0], row, scroll))
         .unwrap_or_default();
@@ -228,7 +213,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
 
 fn section_arrow(expanded: bool, theme: Theme) -> Span<'static> {
     Span::styled(
-        if expanded { "▾ " } else { "▸ " },
+        if expanded { "▼ " } else { "▶ " },
         Style::default()
             .fg(theme.dim_text)
             .bg(theme.element_bg)
@@ -280,6 +265,7 @@ fn render_context_usage_details(
 
     lines.push(Line::default());
     lines.push(Line::from(vec![
+        section_arrow(state.sidebar_context_expanded, theme),
         Span::styled(
             state.t("sidebar.context_usage"),
             Style::default()
@@ -287,15 +273,10 @@ fn render_context_usage_details(
                 .bg(theme.element_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(
-                "  {} / {} · {percent}%",
-                compact_count(display_used_tokens),
-                compact_count(usage.context_window_tokens)
-            ),
-            Style::default().fg(theme.muted_text).bg(theme.element_bg),
-        ),
     ]));
+    if !state.sidebar_context_expanded {
+        return;
+    }
     lines.push(context_bar_line(
         width,
         &usage.prompt_composition,
@@ -742,10 +723,6 @@ fn compact_field_spans(
     ]
 }
 
-fn compact_field_width(branch: &str, usage: &str) -> usize {
-    LABEL_COLUMN_WIDTH + display_width(branch) + 2 + display_width(usage)
-}
-
 fn collapsible_field(
     lines: &mut Vec<Line<'static>>,
     expanded: bool,
@@ -765,44 +742,6 @@ fn collapsible_field(
         theme,
     ));
     lines.push(Line::from(line));
-}
-
-fn collapsible_context_field(
-    lines: &mut Vec<Line<'static>>,
-    expanded: bool,
-    label: String,
-    branch: &str,
-    usage: &str,
-    width: usize,
-    value_color: Color,
-    theme: Theme,
-) {
-    let content_width = width.saturating_sub(2);
-    if compact_field_width(branch, usage) <= content_width {
-        let value = format!("{branch}  {usage}");
-        collapsible_field(lines, expanded, label, &value, width, value_color, theme);
-        return;
-    }
-
-    let mut line = vec![section_arrow(expanded, theme)];
-    line.extend(compact_field_spans(
-        &label,
-        branch,
-        content_width,
-        value_color,
-        theme,
-    ));
-    lines.push(Line::from(line));
-    lines.push(Line::from(vec![
-        Span::raw(" ".repeat(LABEL_COLUMN_WIDTH)),
-        Span::styled(
-            truncate_to_width(usage, content_width.saturating_sub(LABEL_COLUMN_WIDTH)),
-            Style::default()
-                .fg(value_color)
-                .bg(theme.element_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
 }
 
 fn mcp_row_count(state: &TuiState) -> usize {
@@ -1152,8 +1091,8 @@ mod tests {
             .collect::<String>();
 
         for expected in [
-            "Context usage",
-            "64.0k / 128.0k · 50%",
+            "Node",
+            "Context",
             "System prompt",
             "16.5k",
             "Skills",
@@ -1170,6 +1109,7 @@ mod tests {
                 "missing {expected:?}: {rendered}"
             );
         }
+        assert!(!rendered.contains("64.0k / 128.0k"), "{rendered}");
         assert!(!rendered.contains("Output"), "{rendered}");
     }
 
@@ -1205,7 +1145,7 @@ mod tests {
 
         assert!(rendered.contains("Messages        10.0k"), "{rendered}");
         assert!(!rendered.contains("Output"), "{rendered}");
-        assert!(rendered.contains("10.0k / 20.0k · 50%"), "{rendered}");
+        assert!(!rendered.contains("10.0k / 20.0k"), "{rendered}");
         let bar_cells = terminal
             .backend()
             .buffer()
@@ -1281,11 +1221,9 @@ mod tests {
             .iter()
             .position(|row| row.contains("history-13"))
             .expect("context branch row");
+        assert!(rows[context_row].contains("Node"), "{rows:?}");
         assert!(
-            rows.iter()
-                .skip(context_row + 1)
-                .take(2)
-                .any(|row| row.contains("84.1k / 1.0m")),
+            rows.iter().all(|row| !row.contains("84.1k / 1.0m")),
             "{rows:?}"
         );
         let todo_start = rows
@@ -1486,10 +1424,11 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("▸ Context"), "{rendered}");
-        assert!(rendered.contains("▸ MCP"), "{rendered}");
-        assert!(rendered.contains("▸ Todos"), "{rendered}");
-        assert!(!rendered.contains("Context usage"), "{rendered}");
+        assert!(rendered.contains("Node"), "{rendered}");
+        assert!(rendered.contains("▶ Context"), "{rendered}");
+        assert!(rendered.contains("▶ MCP"), "{rendered}");
+        assert!(rendered.contains("▶ Todos"), "{rendered}");
+        assert!(!rendered.contains("System prompt"), "{rendered}");
         assert!(!rendered.contains("docs"), "{rendered}");
         assert!(!rendered.contains("hidden todo"), "{rendered}");
     }
