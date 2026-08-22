@@ -1567,11 +1567,7 @@ impl TuiRuntime {
                 }
                 self.state.toggle_sidebar();
                 self.state.child_navigation_prefix = false;
-                if let Err(error) = self.tui_preferences().save_to_dir(&self.preferences_dir) {
-                    tracing::warn!(%error, "failed to save TUI preferences");
-                }
-                self.state
-                    .show_toast(self.state.t("runtime.sidebar_toggled"), ToastKind::Info);
+                self.persist_sidebar_preference();
                 Ok(None)
             }
             InputAction::ShowModel => self.handle_shortcut_command(CommandIntent::ModelShow),
@@ -2531,12 +2527,16 @@ impl TuiRuntime {
             PanelMode::Visible => self.state.set_sidebar_preference(false, true),
             PanelMode::Hidden => self.state.set_sidebar_preference(true, false),
         }
+        self.persist_sidebar_preference();
+        SubmittedCommand::LocalOnly
+    }
+
+    fn persist_sidebar_preference(&mut self) {
         if let Err(error) = self.tui_preferences().save_to_dir(&self.preferences_dir) {
             tracing::warn!(%error, "failed to save TUI preferences");
         }
         self.state
             .show_toast(self.state.t("runtime.sidebar_toggled"), ToastKind::Info);
-        SubmittedCommand::LocalOnly
     }
 
     fn handle_transcript_scrollbar_command(

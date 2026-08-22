@@ -1498,18 +1498,15 @@ impl TuiState {
     }
 
     pub fn toggle_sidebar_context(&mut self) {
-        self.sidebar_context_expanded = !self.sidebar_context_expanded;
-        self.sidebar_scroll = 0;
+        toggle_sidebar_section(&mut self.sidebar_context_expanded, &mut self.sidebar_scroll);
     }
 
     pub fn toggle_sidebar_mcp(&mut self) {
-        self.sidebar_mcp_expanded = !self.sidebar_mcp_expanded;
-        self.sidebar_scroll = 0;
+        toggle_sidebar_section(&mut self.sidebar_mcp_expanded, &mut self.sidebar_scroll);
     }
 
     pub fn toggle_sidebar_todos(&mut self) {
-        self.sidebar_todos_expanded = !self.sidebar_todos_expanded;
-        self.sidebar_scroll = 0;
+        toggle_sidebar_section(&mut self.sidebar_todos_expanded, &mut self.sidebar_scroll);
     }
 
     #[cfg(test)]
@@ -3292,6 +3289,11 @@ fn apply_event_to_child_transcript(
     {
         child.snapshot_dirty = true;
     }
+}
+
+fn toggle_sidebar_section(expanded: &mut bool, scroll: &mut u16) {
+    *expanded = !*expanded;
+    *scroll = 0;
 }
 
 fn merge_prompt_composition(previous: Option<&ModelTokenUsage>, usage: &mut TokenUsageEvent) {

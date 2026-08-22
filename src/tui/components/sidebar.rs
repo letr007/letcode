@@ -109,9 +109,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     }
     let mcp_rows = mcp_row_count(state);
 
-    let context_rendered = state
-        .active_sidebar_model_token_usage()
-        .is_some_and(|usage| usage.context_window_tokens > 0);
+    let context_rendered = usage.is_some();
     let mcp_rendered = mcp_rows > 0
         && (state.mcp_discovery != crate::tui::state::McpDiscoveryState::Ready
             || !state.mcp_servers.is_empty());
@@ -690,21 +688,13 @@ fn compact_field(
     value_color: Color,
     theme: Theme,
 ) {
-    let label = padded_label(&label, LABEL_COLUMN_WIDTH);
-    let value_width = width.saturating_sub(LABEL_COLUMN_WIDTH);
-    lines.push(Line::from(vec![
-        Span::styled(
-            label,
-            Style::default().fg(theme.muted_text).bg(theme.element_bg),
-        ),
-        Span::styled(
-            truncate_to_width(value, value_width),
-            Style::default()
-                .fg(value_color)
-                .bg(theme.element_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(compact_field_spans(
+        &label,
+        value,
+        width,
+        value_color,
+        theme,
+    )));
 }
 
 fn compact_field_spans(
