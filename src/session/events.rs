@@ -148,6 +148,8 @@ pub(crate) enum SessionTransportEvent {
         message_id: Option<String>,
     },
     TokenUsage(TokenUsageEvent),
+    /// Request-plan estimate used by live footer telemetry, not the sidebar snapshot.
+    PreparedTokenUsage(TokenUsageEvent),
     /// A complete local estimate of the committed session, rather than
     /// provider telemetry for the current turn.
     SessionTokenUsage(TokenUsageEvent),
@@ -324,6 +326,7 @@ impl SessionTransportEvent {
                 message_id: message_id.clone(),
             }),
             Self::TokenUsage(event) => Some(SessionEvent::TokenUsage(event.clone())),
+            Self::PreparedTokenUsage(event) => Some(SessionEvent::TokenUsage(event.clone())),
             Self::SessionTokenUsage(event) => Some(SessionEvent::SessionTokenUsage(event.clone())),
             Self::ToolPending(event) => Some(SessionEvent::ToolPending(event.clone())),
             Self::ToolCancelled(event) => Some(SessionEvent::ToolCancelled(event.clone())),
@@ -475,6 +478,14 @@ pub(super) fn wrap_child_session_transport_event(
             parent_tool_call_id: parent_tool_call_id.clone(),
             event: SessionEvent::TokenUsage(event),
         },
+        SessionTransportEvent::PreparedTokenUsage(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::TokenUsage(event),
+            }
+        }
         SessionTransportEvent::ToolPending(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),

@@ -309,6 +309,59 @@ fn parent_token_usage_does_not_merge_prompt_composition_from_viewed_child() {
 }
 
 #[test]
+fn sidebar_usage_ignores_prepared_estimate_until_provider_response() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_token_usage(
+        TokenUsageEvent::with_breakdown(100, 1_000, 100, 0, 0)
+            .with_prompt_composition(vec![crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 100,
+                segments: 1,
+            }])
+            .into(),
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::PreparedTokenUsage(
+        TokenUsageEvent::with_breakdown(330, 1_000, 330, 0, 0).with_prompt_composition(vec![
+            crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 330,
+                segments: 1,
+            },
+        ]),
+    ));
+
+    assert_eq!(
+        runtime
+            .state()
+            .active_model_token_usage()
+            .unwrap()
+            .input_tokens,
+        330
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .active_sidebar_model_token_usage()
+            .unwrap()
+            .input_tokens,
+        100
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+        TokenUsageEvent::with_breakdown(300, 1_000, 300, 0, 0),
+    ));
+    assert_eq!(
+        runtime
+            .state()
+            .active_sidebar_model_token_usage()
+            .unwrap()
+            .input_tokens,
+        300
+    );
+}
+
+#[test]
 fn prepared_usage_does_not_regress_the_current_context_snapshot() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(

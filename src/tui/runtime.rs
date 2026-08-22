@@ -1129,6 +1129,13 @@ impl TuiRuntime {
                 token_usage.output_tokens = self.current_turn_output_tokens;
                 self.state
                     .apply_event(SessionEvent::TokenUsage(token_usage));
+                self.state.commit_sidebar_token_usage();
+                suppress_session_event = true;
+            }
+            SessionTransportEvent::PreparedTokenUsage(token_usage) => {
+                let mut token_usage = token_usage.clone();
+                self.state.merge_parent_prompt_composition(&mut token_usage);
+                self.state.apply_live_token_usage(token_usage.into());
                 suppress_session_event = true;
             }
             SessionTransportEvent::SessionTokenUsage(token_usage) => {
@@ -1137,6 +1144,7 @@ impl TuiRuntime {
                 self.current_turn_output_tokens = 0;
                 self.state
                     .apply_event(SessionEvent::TokenUsage(token_usage.clone()));
+                self.state.commit_sidebar_token_usage();
                 suppress_session_event = true;
             }
             SessionTransportEvent::ToolBatchFinished

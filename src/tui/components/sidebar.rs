@@ -86,7 +86,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     }
 
     let usage = state
-        .active_model_token_usage()
+        .active_sidebar_model_token_usage()
         .filter(|usage| usage.context_window_tokens > 0);
     compact_field(
         &mut lines,
@@ -110,7 +110,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     let mcp_rows = mcp_row_count(state);
 
     let context_rendered = state
-        .active_model_token_usage()
+        .active_sidebar_model_token_usage()
         .is_some_and(|usage| usage.context_window_tokens > 0);
     let mcp_rendered = mcp_rows > 0
         && (state.mcp_discovery != crate::tui::state::McpDiscoveryState::Ready
@@ -272,6 +272,14 @@ fn render_context_usage_details(
                 .fg(context_usage_color(percent, theme))
                 .bg(theme.element_bg)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} / {} · {percent}%",
+                compact_count(display_used_tokens),
+                compact_count(usage.context_window_tokens)
+            ),
+            Style::default().fg(theme.muted_text).bg(theme.element_bg),
         ),
     ]));
     if !state.sidebar_context_expanded {
@@ -1035,7 +1043,7 @@ mod tests {
     fn sidebar_renders_detailed_context_usage_breakdown() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
-        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
             used_tokens: 70_000,
             context_window_tokens: 128_000,
             input_tokens: 64_000,
@@ -1093,6 +1101,7 @@ mod tests {
         for expected in [
             "Node",
             "Context",
+            "64.0k / 128.0k · 50%",
             "System prompt",
             "16.5k",
             "Skills",
@@ -1109,7 +1118,6 @@ mod tests {
                 "missing {expected:?}: {rendered}"
             );
         }
-        assert!(!rendered.contains("64.0k / 128.0k"), "{rendered}");
         assert!(!rendered.contains("Output"), "{rendered}");
     }
 
@@ -1117,7 +1125,7 @@ mod tests {
     fn context_breakdown_excludes_current_output_tokens() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
-        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
             used_tokens: 12_000,
             context_window_tokens: 20_000,
             input_tokens: 10_000,
@@ -1145,7 +1153,7 @@ mod tests {
 
         assert!(rendered.contains("Messages        10.0k"), "{rendered}");
         assert!(!rendered.contains("Output"), "{rendered}");
-        assert!(!rendered.contains("10.0k / 20.0k"), "{rendered}");
+        assert!(rendered.contains("10.0k / 20.0k · 50%"), "{rendered}");
         let bar_cells = terminal
             .backend()
             .buffer()
@@ -1181,7 +1189,7 @@ mod tests {
         state.set_language(Some(crate::tui::i18n::Language::En));
         state.current_context_branch = "history-13".into();
         state.mcp_discovery = crate::tui::state::McpDiscoveryState::Ready;
-        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
             used_tokens: 84_100,
             context_window_tokens: 1_000_000,
             input_tokens: 84_100,
@@ -1223,7 +1231,7 @@ mod tests {
             .expect("context branch row");
         assert!(rows[context_row].contains("Node"), "{rows:?}");
         assert!(
-            rows.iter().all(|row| !row.contains("84.1k / 1.0m")),
+            rows.iter().any(|row| row.contains("84.1k / 1.0m")),
             "{rows:?}"
         );
         let todo_start = rows
@@ -1256,7 +1264,7 @@ mod tests {
             enabled: true,
             status: crate::mcp::McpServerStatus::Online { tool_count: 2 },
         }]);
-        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
             used_tokens: 10_000,
             context_window_tokens: 20_000,
             input_tokens: 9_000,
@@ -1385,7 +1393,7 @@ mod tests {
         state.sidebar_context_expanded = false;
         state.sidebar_mcp_expanded = false;
         state.sidebar_todos_expanded = false;
-        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
             used_tokens: 10_000,
             context_window_tokens: 20_000,
             input_tokens: 10_000,

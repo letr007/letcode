@@ -1121,6 +1121,7 @@ pub struct TuiState {
     /// Anchored bootstrap experiment active for the current session (composer badge).
     pub anchored_active: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
+    pub sidebar_model_token_usage: Option<ModelTokenUsage>,
     /// 上下文压缩进行中：footer 指示条改用开火车式往返扫描，隐藏过期的 token 数字。
     pub compaction_active: bool,
     /// 压缩动画相对于全局 spinner 的起始帧，确保每次都从左→右填充开始。
@@ -1214,6 +1215,7 @@ impl Default for TuiState {
             language: None,
             anchored_active: false,
             model_token_usage: None,
+            sidebar_model_token_usage: None,
             compaction_active: false,
             compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
@@ -1338,6 +1340,7 @@ impl TuiState {
                 cache_report: None,
                 prompt_composition: Vec::new(),
             });
+        self.sidebar_model_token_usage = self.model_token_usage.clone();
     }
 
     pub fn set_reasoning_effort_label(&mut self, label: Option<String>) {
@@ -1523,7 +1526,16 @@ impl TuiState {
     }
 
     pub fn set_token_usage(&mut self, usage: ModelTokenUsage) {
+        self.sidebar_model_token_usage = Some(usage.clone());
         self.model_token_usage = Some(usage);
+    }
+
+    pub fn apply_live_token_usage(&mut self, usage: ModelTokenUsage) {
+        self.model_token_usage = Some(usage);
+    }
+
+    pub fn commit_sidebar_token_usage(&mut self) {
+        self.sidebar_model_token_usage = self.model_token_usage.clone();
     }
 
     pub fn dialog(&self) -> Option<&DialogState> {
@@ -1545,6 +1557,16 @@ impl TuiState {
                 .unwrap_or(&self.timeline)
         } else {
             &self.timeline
+        }
+    }
+
+    pub fn active_sidebar_model_token_usage(&self) -> Option<&ModelTokenUsage> {
+        if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .and_then(|state| state.model_token_usage.as_ref())
+        } else {
+            self.sidebar_model_token_usage.as_ref()
         }
     }
 
@@ -2569,6 +2591,7 @@ impl TuiState {
         self.ignore_late_tool_events = false;
         self.phase = AppPhase::Completed;
         self.model_token_usage = None;
+        self.sidebar_model_token_usage = None;
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();

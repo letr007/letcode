@@ -453,7 +453,7 @@ impl<C: Config> AgentRunner<C> {
                                             child_session_id.as_deref(),
                                             agent_name.as_deref(),
                                             parent_tool_call_id.as_deref(),
-                                            SessionTransportEvent::TokenUsage(
+                                            SessionTransportEvent::PreparedTokenUsage(
                                                 TokenUsageEvent::with_breakdown(
                                                     telemetry.estimated_request_tokens,
                                                     telemetry.context_window_tokens,
