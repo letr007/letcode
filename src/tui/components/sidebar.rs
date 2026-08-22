@@ -387,26 +387,43 @@ fn allocate_bar_cells(weights: &[u64], target_cells: usize) -> Vec<usize> {
     if target_cells == 0 || weights.is_empty() {
         return cells;
     }
-    let total = weights
+    let positive = weights
         .iter()
-        .fold(0u128, |sum, weight| sum.saturating_add(*weight as u128));
-    if total == 0 {
+        .enumerate()
+        .filter_map(|(index, weight)| (*weight > 0).then_some(index))
+        .collect::<Vec<_>>();
+    if positive.is_empty() {
         return cells;
     }
 
-    let mut remainders = Vec::with_capacity(weights.len());
+    let remaining = if positive.len() <= target_cells {
+        for index in &positive {
+            cells[*index] = 1;
+        }
+        target_cells - positive.len()
+    } else {
+        target_cells
+    };
+    if remaining == 0 {
+        return cells;
+    }
+
+    let total = positive.iter().fold(0u128, |sum, index| {
+        sum.saturating_add(weights[*index] as u128)
+    });
+    let mut remainders = Vec::with_capacity(positive.len());
     let mut allocated = 0usize;
-    for (index, weight) in weights.iter().enumerate() {
-        let scaled = (*weight as u128).saturating_mul(target_cells as u128);
-        let base = usize::try_from(scaled / total).unwrap_or(target_cells);
-        cells[index] = base;
+    for index in positive {
+        let scaled = (weights[index] as u128).saturating_mul(remaining as u128);
+        let base = usize::try_from(scaled / total).unwrap_or(remaining);
+        cells[index] = cells[index].saturating_add(base);
         allocated = allocated.saturating_add(base);
         remainders.push((scaled % total, index));
     }
     remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     for (_, index) in remainders
         .into_iter()
-        .take(target_cells.saturating_sub(allocated))
+        .take(remaining.saturating_sub(allocated))
     {
         cells[index] = cells[index].saturating_add(1);
     }
@@ -1230,6 +1247,15 @@ mod tests {
         assert_eq!(line.spans[1].content.chars().count(), 6);
         assert_eq!(line.spans[2].content.chars().count(), 10);
         assert_eq!(line.spans[2].style.bg, Some(Theme::dark().elevated_bg));
+    }
+
+    #[test]
+    fn context_bar_keeps_small_positive_categories_visible() {
+        let cells = allocate_bar_cells(&[7_600, 7_300, 4_100, 668_800, 4_600], 43);
+
+        assert_eq!(cells.iter().sum::<usize>(), 43);
+        assert!(cells.iter().all(|cells| *cells >= 1), "{cells:?}");
+        assert!(cells[3] > cells[0]);
     }
 
     #[test]
