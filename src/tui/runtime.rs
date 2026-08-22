@@ -1532,6 +1532,14 @@ impl TuiRuntime {
                 self.state.scroll_transcript_down(1);
                 Ok(None)
             }
+            InputAction::SidebarScrollUp => {
+                self.state.scroll_sidebar_up(1);
+                Ok(None)
+            }
+            InputAction::SidebarScrollDown => {
+                self.state.scroll_sidebar_down(1);
+                Ok(None)
+            }
             InputAction::ToggleSidebar => {
                 if self.state.is_read_only_child_view() {
                     self.state.child_navigation_prefix = false;

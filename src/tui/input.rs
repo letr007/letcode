@@ -37,6 +37,8 @@ pub enum InputAction {
     ScrollToBottom,
     MouseScrollUp,
     MouseScrollDown,
+    SidebarScrollUp,
+    SidebarScrollDown,
     MouseSelectionStart(u16, u16),
     MouseSelectionDrag(u16, u16),
     /// Third flag is true when Ctrl/Cmd is held — used to activate underlined links.
@@ -433,10 +435,19 @@ fn pasted_text_line_count(text: &str) -> usize {
     text.split('\n').count().max(1)
 }
 
-pub fn map_mouse_event(_state: &TuiState, mouse: MouseEvent) -> InputAction {
+pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
     use crossterm::event::MouseButton;
 
+    let over_sidebar = state.sidebar_visible(state.last_terminal_width)
+        && state.last_sidebar_area.width > 0
+        && mouse.column >= state.last_sidebar_area.x
+        && mouse.column < state.last_sidebar_area.right()
+        && mouse.row >= state.last_sidebar_area.y
+        && mouse.row < state.last_sidebar_area.bottom();
+
     match mouse.kind {
+        MouseEventKind::ScrollUp if over_sidebar => InputAction::SidebarScrollUp,
+        MouseEventKind::ScrollDown if over_sidebar => InputAction::SidebarScrollDown,
         MouseEventKind::ScrollUp => InputAction::MouseScrollUp,
         MouseEventKind::ScrollDown => InputAction::MouseScrollDown,
 
@@ -1165,6 +1176,24 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Down)),
             InputAction::DialogNext
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_over_sidebar_routes_to_sidebar_scroll() {
+        let mut state = TuiState::default();
+        state.last_terminal_width = 140;
+        state.last_sidebar_area = ratatui::layout::Rect::new(100, 1, 40, 20);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 120,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            map_mouse_event(&state, mouse),
+            InputAction::SidebarScrollDown
         );
     }
 

@@ -10,7 +10,7 @@ use crate::agent::TodoStatus;
 
 use super::super::{measure::display_width, state::TuiState, surface, theme::Theme};
 
-pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
     }
@@ -29,6 +29,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
         return;
     }
 
+    state.last_sidebar_area = inner;
     let label_style = Style::default().fg(theme.muted_text).bg(theme.element_bg);
     let value_style = Style::default().fg(theme.text).bg(theme.element_bg);
     let mut lines = Vec::new();
@@ -113,24 +114,23 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
             theme,
         );
     }
-    let todo_rows = todo_row_count(state, inner.width.saturating_sub(2) as usize);
-    let mcp_rows = mcp_row_count(state, inner.height as usize, lines.len(), todo_rows);
-    let reserved_rows = mcp_rows.saturating_add(todo_rows);
+    let mcp_rows = mcp_row_count(state);
     if let Some(usage) = state
         .active_model_token_usage()
         .filter(|usage| usage.context_window_tokens > 0)
     {
-        render_context_usage_details(
-            &mut lines,
-            usage,
-            inner.width as usize,
-            inner.height as usize,
-            reserved_rows,
-            state,
-            theme,
-        );
+        render_context_usage_details(&mut lines, usage, inner.width as usize, state, theme);
     }
 
+    let context_rendered = state
+        .active_model_token_usage()
+        .is_some_and(|usage| usage.context_window_tokens > 0);
+    let mcp_rendered = mcp_rows > 0
+        && (state.mcp_discovery != crate::tui::state::McpDiscoveryState::Ready
+            || !state.mcp_servers.is_empty());
+    if context_rendered && mcp_rendered {
+        lines.push(Line::default());
+    }
     render_mcp_status(&mut lines, state, inner.width as usize, mcp_rows, theme);
 
     if let Some(todo) = state.latest_todo.as_ref() {
@@ -184,12 +184,12 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(footer_height)])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(style)
-            .wrap(Wrap { trim: false }),
-        areas[0],
-    );
+    let paragraph = Paragraph::new(lines)
+        .style(style)
+        .wrap(Wrap { trim: false });
+    let total_rows = paragraph.line_count(areas[0].width);
+    state.sync_sidebar_scroll(total_rows, areas[0].height);
+    frame.render_widget(paragraph.scroll((state.sidebar_scroll, 0)), areas[0]);
     if footer_height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -206,12 +206,10 @@ fn render_context_usage_details(
     lines: &mut Vec<Line<'static>>,
     usage: &crate::tui::state::ModelTokenUsage,
     width: usize,
-    available_height: usize,
-    reserved_rows: usize,
     state: &TuiState,
     theme: Theme,
 ) {
-    if width < 8 || available_height.saturating_sub(lines.len().saturating_add(reserved_rows)) < 4 {
+    if width < 8 {
         return;
     }
 
@@ -254,11 +252,6 @@ fn render_context_usage_details(
         theme,
     ));
 
-    let detail_capacity = available_height
-        .saturating_sub(lines.len().saturating_add(reserved_rows).saturating_add(1));
-    if detail_capacity == 0 {
-        return;
-    }
     let mut details = usage
         .prompt_composition
         .iter()
@@ -290,7 +283,7 @@ fn render_context_usage_details(
         theme.muted_text,
         theme,
     ));
-    lines.extend(details.into_iter().take(detail_capacity));
+    lines.extend(details);
 }
 
 fn format_composition_label(
@@ -334,38 +327,52 @@ fn context_bar_line(
     theme: Theme,
 ) -> Line<'static> {
     let bar_width = width.max(1);
-    let mut remaining_cells = bar_width;
-    let mut spans = Vec::new();
-    for (index, entry) in composition.iter().enumerate() {
-        let tokens =
-            scaled_composition_tokens(entry.estimated_tokens, estimated_total, actual_input_tokens);
-        let cells =
-            proportional_cells(tokens, context_window_tokens, bar_width).min(remaining_cells);
-        if cells == 0 {
-            continue;
-        }
-        spans.push(Span::styled(
-            "█".repeat(cells),
-            Style::default()
-                .fg(context_composition_color(entry, index, theme))
-                .bg(theme.element_bg),
-        ));
-        remaining_cells = remaining_cells.saturating_sub(cells);
-        if remaining_cells == 0 {
-            break;
-        }
+    let target_cells = proportional_cells(
+        actual_input_tokens.saturating_add(output_context_tokens),
+        context_window_tokens,
+        bar_width,
+    );
+    let mut segments = composition
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                scaled_composition_tokens(
+                    entry.estimated_tokens,
+                    estimated_total,
+                    actual_input_tokens,
+                ),
+                context_composition_color(entry, index, theme),
+            )
+        })
+        .collect::<Vec<_>>();
+    if output_context_tokens > 0 {
+        segments.push((output_context_tokens, theme.assistant));
     }
-    if remaining_cells > 0 && output_context_tokens > 0 {
-        let cells = proportional_cells(output_context_tokens, context_window_tokens, bar_width)
-            .min(remaining_cells);
-        if cells > 0 {
-            spans.push(Span::styled(
+
+    let weights = segments
+        .iter()
+        .map(|(tokens, _)| *tokens)
+        .collect::<Vec<_>>();
+    let cells = allocate_bar_cells(&weights, target_cells);
+    let mut spans = segments
+        .into_iter()
+        .zip(cells)
+        .filter(|(_, cells)| *cells > 0)
+        .map(|((_, color), cells)| {
+            Span::styled(
                 "█".repeat(cells),
-                Style::default().fg(theme.assistant).bg(theme.element_bg),
-            ));
-            remaining_cells = remaining_cells.saturating_sub(cells);
-        }
+                Style::default().fg(color).bg(theme.element_bg),
+            )
+        })
+        .collect::<Vec<_>>();
+    if spans.is_empty() && target_cells > 0 {
+        spans.push(Span::styled(
+            "█".repeat(target_cells),
+            Style::default().fg(theme.accent).bg(theme.element_bg),
+        ));
     }
+    let remaining_cells = bar_width.saturating_sub(target_cells);
     if remaining_cells > 0 {
         spans.push(Span::styled(
             " ".repeat(remaining_cells),
@@ -373,6 +380,37 @@ fn context_bar_line(
         ));
     }
     Line::from(spans)
+}
+
+fn allocate_bar_cells(weights: &[u64], target_cells: usize) -> Vec<usize> {
+    let mut cells = vec![0; weights.len()];
+    if target_cells == 0 || weights.is_empty() {
+        return cells;
+    }
+    let total = weights
+        .iter()
+        .fold(0u128, |sum, weight| sum.saturating_add(*weight as u128));
+    if total == 0 {
+        return cells;
+    }
+
+    let mut remainders = Vec::with_capacity(weights.len());
+    let mut allocated = 0usize;
+    for (index, weight) in weights.iter().enumerate() {
+        let scaled = (*weight as u128).saturating_mul(target_cells as u128);
+        let base = usize::try_from(scaled / total).unwrap_or(target_cells);
+        cells[index] = base;
+        allocated = allocated.saturating_add(base);
+        remainders.push((scaled % total, index));
+    }
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, index) in remainders
+        .into_iter()
+        .take(target_cells.saturating_sub(allocated))
+    {
+        cells[index] = cells[index].saturating_add(1);
+    }
+    cells
 }
 
 fn context_composition_color(
@@ -494,40 +532,14 @@ fn wrapped_context_field(
     ]));
 }
 
-fn mcp_row_count(
-    state: &TuiState,
-    available_height: usize,
-    current_rows: usize,
-    todo_rows: usize,
-) -> usize {
-    let desired = match state.mcp_discovery {
+fn mcp_row_count(state: &TuiState) -> usize {
+    match state.mcp_discovery {
         crate::tui::state::McpDiscoveryState::Ready => {
             usize::from(!state.mcp_servers.is_empty()) + state.mcp_servers.len()
         }
         crate::tui::state::McpDiscoveryState::Loading
         | crate::tui::state::McpDiscoveryState::Unavailable => 1,
-    };
-    let capacity =
-        available_height.saturating_sub(current_rows.saturating_add(todo_rows).saturating_add(1));
-    if desired > 1 && capacity == 1 {
-        0
-    } else {
-        desired.min(capacity)
     }
-}
-
-fn todo_row_count(state: &TuiState, content_width: usize) -> usize {
-    state.latest_todo.as_ref().map_or(0, |todo| {
-        let items = todo.items.iter().collect::<Vec<_>>();
-        if items.is_empty() {
-            0
-        } else {
-            2 + items
-                .iter()
-                .map(|item| wrap_to_width(&item.content, content_width).len())
-                .sum::<usize>()
-        }
-    })
 }
 
 fn render_mcp_status(
@@ -778,7 +790,7 @@ mod tests {
         let backend = TestBackend::new(42, 18);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rendered = terminal
             .backend()
@@ -849,7 +861,7 @@ mod tests {
         let backend = TestBackend::new(42, 28);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rendered = terminal
             .backend()
@@ -902,7 +914,7 @@ mod tests {
         let backend = TestBackend::new(42, 22);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rendered = terminal
             .backend()
@@ -922,7 +934,7 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .find(|row| row.matches('█').count() > 0)
             .expect("context bar");
-        assert_eq!(bar.matches('█').count(), 23, "{bar}");
+        assert_eq!(bar.matches('█').count(), 22, "{bar}");
         assert!(rendered.contains("Remaining       8.0k"), "{rendered}");
     }
 
@@ -952,7 +964,7 @@ mod tests {
         let backend = TestBackend::new(32, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rows = (0..terminal.backend().buffer().area.height)
             .map(|y| {
@@ -1029,7 +1041,7 @@ mod tests {
         let backend = TestBackend::new(42, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rendered = terminal
             .backend()
@@ -1039,9 +1051,44 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
+        assert!(state.sidebar_max_scroll > 0);
+        state.scroll_sidebar_to_bottom();
+        terminal
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
+            .expect("draw scrolled sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
         assert!(rendered.contains("MCP"), "{rendered}");
         assert!(rendered.contains("docs"), "{rendered}");
         assert!(rendered.contains("2 tools"), "{rendered}");
+        let rows = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .skip(y as usize * 42)
+                    .take(42)
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let mcp_row = rows
+            .iter()
+            .position(|row| row.contains("MCP"))
+            .expect("MCP heading");
+        assert!(
+            rows[mcp_row.saturating_sub(1)]
+                .trim_matches(|ch: char| ch == '▎' || ch.is_whitespace())
+                .is_empty(),
+            "{rows:?}"
+        );
         assert!(rendered.contains("Todos  1"), "{rendered}");
         assert!(rendered.contains("important todo"), "{rendered}");
     }
@@ -1062,7 +1109,7 @@ mod tests {
         let backend = TestBackend::new(24, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rows = (0..terminal.backend().buffer().area.height)
             .map(|y| {
@@ -1083,7 +1130,45 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows.iter().all(|row| display_width(row) <= 24), "{rows:?}");
-        assert!(rows.iter().any(|row| row.contains("Ctrl-X B")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("Scroll panel")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_scroll_reveals_overflow_content() {
+        let mut state = TuiState::default();
+        state.sidebar_scroll = 3;
+        state.set_mcp_servers(
+            (0..8)
+                .map(|index| crate::mcp::McpServerCatalogEntry {
+                    name: format!("server-{index}"),
+                    enabled: true,
+                    status: crate::mcp::McpServerStatus::Online {
+                        tool_count: index + 1,
+                    },
+                })
+                .collect(),
+        );
+        state.latest_todo = Some(crate::tui::timeline::TodoView {
+            items: (0..5)
+                .map(|index| crate::agent::TodoItem {
+                    id: format!("todo-{index}"),
+                    content: format!("long scrolling todo item {index}"),
+                    status: crate::agent::TodoStatus::Pending,
+                })
+                .collect(),
+            auto_continue: crate::agent::AutoContinueState::default(),
+        });
+        let backend = TestBackend::new(42, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
+            .expect("draw");
+
+        assert!(state.sidebar_max_scroll > 0);
+        assert_eq!(state.sidebar_scroll, 3.min(state.sidebar_max_scroll));
     }
 
     #[test]
@@ -1107,7 +1192,7 @@ mod tests {
         let backend = TestBackend::new(42, 18);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
             .expect("draw");
         let rendered = terminal
             .backend()
@@ -1145,6 +1230,46 @@ mod tests {
         assert_eq!(line.spans[1].content.chars().count(), 6);
         assert_eq!(line.spans[2].content.chars().count(), 10);
         assert_eq!(line.spans[2].style.bg, Some(Theme::dark().elevated_bg));
+    }
+
+    #[test]
+    fn tool_iteration_reclassification_keeps_context_bar_width() {
+        let before = context_bar_line(
+            40,
+            &[crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 100,
+                segments: 1,
+            }],
+            100,
+            100,
+            20,
+            200,
+            Theme::dark(),
+        );
+        let after = context_bar_line(
+            40,
+            &[crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 120,
+                segments: 1,
+            }],
+            120,
+            120,
+            0,
+            200,
+            Theme::dark(),
+        );
+        let filled = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .filter(|span| span.style.bg == Some(Theme::dark().element_bg))
+                .map(|span| span.content.chars().count())
+                .sum::<usize>()
+        };
+
+        assert_eq!(filled(&before), 24);
+        assert_eq!(filled(&after), 24);
     }
 
     #[test]

@@ -343,6 +343,25 @@ fn prepared_usage_does_not_regress_the_current_context_snapshot() {
 }
 
 #[test]
+fn sidebar_scroll_actions_update_independent_offset() {
+    let mut runtime = runtime();
+    runtime.state_mut().sidebar_max_scroll = 20;
+    runtime.state_mut().sidebar_scroll = 10;
+    runtime.state_mut().transcript_scroll = 7;
+
+    runtime
+        .handle_input_action(InputAction::SidebarScrollDown)
+        .expect("sidebar scroll down");
+    assert_eq!(runtime.state().sidebar_scroll, 11);
+    assert_eq!(runtime.state().transcript_scroll, 7);
+
+    runtime
+        .handle_input_action(InputAction::SidebarScrollUp)
+        .expect("sidebar scroll up");
+    assert_eq!(runtime.state().sidebar_scroll, 10);
+}
+
+#[test]
 fn permission_prompt_keeps_the_active_terminal_spinner() {
     let mut runtime = runtime();
     runtime.session_title = Some("Review plan".into());

@@ -1142,6 +1142,9 @@ pub struct TuiState {
     pub transcript_scrollbar_visible: bool,
     pub sidebar_hidden: bool,
     pub sidebar_forced_open: bool,
+    pub sidebar_scroll: u16,
+    pub sidebar_max_scroll: u16,
+    pub last_sidebar_area: ratatui::layout::Rect,
     pub last_terminal_width: u16,
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
@@ -1224,6 +1227,9 @@ impl Default for TuiState {
             transcript_scrollbar_visible: true,
             sidebar_hidden: false,
             sidebar_forced_open: false,
+            sidebar_scroll: 0,
+            sidebar_max_scroll: 0,
+            last_sidebar_area: ratatui::layout::Rect::default(),
             last_terminal_width: 0,
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
@@ -1457,6 +1463,28 @@ impl TuiState {
         !self.is_read_only_child_view()
             && !self.sidebar_hidden
             && (self.sidebar_forced_open || terminal_width > 120)
+    }
+
+    pub fn sync_sidebar_scroll(&mut self, total_rows: usize, viewport_rows: u16) {
+        self.sidebar_max_scroll =
+            u16::try_from(total_rows.saturating_sub(viewport_rows as usize)).unwrap_or(u16::MAX);
+        self.sidebar_scroll = self.sidebar_scroll.min(self.sidebar_max_scroll);
+    }
+
+    pub fn scroll_sidebar_up(&mut self, rows: u16) {
+        self.sidebar_scroll = self.sidebar_scroll.saturating_sub(rows);
+    }
+
+    pub fn scroll_sidebar_down(&mut self, rows: u16) {
+        self.sidebar_scroll = self
+            .sidebar_scroll
+            .saturating_add(rows)
+            .min(self.sidebar_max_scroll);
+    }
+
+    #[cfg(test)]
+    pub fn scroll_sidebar_to_bottom(&mut self) {
+        self.sidebar_scroll = self.sidebar_max_scroll;
     }
 
     pub fn set_transcript_scrollbar_visible(&mut self, visible: bool) {
