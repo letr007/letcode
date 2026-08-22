@@ -231,6 +231,7 @@ mod tests {
             truncated: true,
             prompt_segment_count: 4,
             prompt_contributor_count: 3,
+            prompt_composition: Vec::new(),
             prompt_stable_prefix_hash: Some("opaque-prefix-hash".into()),
             cache_first_volatile_index: Some(2),
             cache_configured: true,

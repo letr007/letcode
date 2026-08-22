@@ -3,7 +3,9 @@
 //! This contract is independent of frontend modules. Compatibility aliases
 //! remain at the frontend boundary during the migration.
 
-use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage, TodoItem};
+use crate::agent::{
+    AutoContinueState, CacheUsageReport, ConversationMessage, PromptCompositionEntry, TodoItem,
+};
 use crate::context_tree::ContextTreeState;
 use crate::context_view::{ContextViewProjection, SummaryArtifact};
 use crate::runtime_context::RuntimeActiveContext;
@@ -162,6 +164,7 @@ pub struct TokenUsageEvent {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cache_report: Option<CacheUsageReport>,
+    pub prompt_composition: Vec<PromptCompositionEntry>,
 }
 
 impl TokenUsageEvent {
@@ -184,12 +187,27 @@ impl TokenUsageEvent {
             output_tokens,
             cached_tokens,
             cache_report: None,
+            prompt_composition: Vec::new(),
         }
     }
 
     pub fn with_cache_report(mut self, cache_report: Option<CacheUsageReport>) -> Self {
         self.cache_report = cache_report;
         self
+    }
+
+    pub fn with_prompt_composition(
+        mut self,
+        prompt_composition: Vec<PromptCompositionEntry>,
+    ) -> Self {
+        self.prompt_composition = prompt_composition;
+        self
+    }
+
+    pub fn merge_prompt_composition_from(&mut self, previous: &Self) {
+        if self.prompt_composition.is_empty() {
+            self.prompt_composition = previous.prompt_composition.clone();
+        }
     }
 }
 

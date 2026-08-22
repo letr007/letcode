@@ -446,7 +446,26 @@ impl<C: Config> AgentRunner<C> {
                                         ).with_cache_report(cache_report)),
                                     )?;
                                 }
-                                AgentEvent::LlmRequestTelemetry(_) => {}
+                                AgentEvent::LlmRequestTelemetry(telemetry) => {
+                                    if telemetry.phase == crate::agent::LlmRequestTelemetryPhase::Prepared {
+                                        send_scoped_event(
+                                            &sender,
+                                            child_session_id.as_deref(),
+                                            agent_name.as_deref(),
+                                            parent_tool_call_id.as_deref(),
+                                            SessionTransportEvent::TokenUsage(
+                                                TokenUsageEvent::with_breakdown(
+                                                    telemetry.estimated_request_tokens,
+                                                    telemetry.context_window_tokens,
+                                                    telemetry.estimated_request_tokens,
+                                                    0,
+                                                    0,
+                                                )
+                                                .with_prompt_composition(telemetry.prompt_composition.clone()),
+                                            ),
+                                        )?;
+                                    }
+                                }
                                 AgentEvent::FastModeChanged { enabled } => {
                                     send_scoped_event(
                                         &sender,

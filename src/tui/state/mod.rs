@@ -247,6 +247,7 @@ pub struct ModelTokenUsage {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cache_report: Option<CacheUsageReport>,
+    pub prompt_composition: Vec<crate::agent::PromptCompositionEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1317,6 +1318,7 @@ impl TuiState {
                 output_tokens: 0,
                 cached_tokens: 0,
                 cache_report: None,
+                prompt_composition: Vec::new(),
             });
     }
 
@@ -1499,6 +1501,27 @@ impl TuiState {
         } else {
             self.model_token_usage.as_ref()
         }
+    }
+
+    pub fn merge_parent_prompt_composition(&self, usage: &mut TokenUsageEvent) {
+        merge_prompt_composition(self.model_token_usage.as_ref(), usage);
+    }
+
+    pub fn merge_child_prompt_composition(&self, child_session_id: &str, event: &mut SessionEvent) {
+        let SessionEvent::TokenUsage(usage) = event else {
+            return;
+        };
+        let previous = self
+            .child_timeline
+            .as_ref()
+            .filter(|child| child.session_id == child_session_id)
+            .and_then(|child| child.model_token_usage.as_ref())
+            .or_else(|| {
+                self.child_timeline_cache
+                    .get(child_session_id)
+                    .and_then(|child| child.model_token_usage.as_ref())
+            });
+        merge_prompt_composition(previous, usage);
     }
 
     pub fn active_compaction_animation_start_frame(&self) -> Option<usize> {
@@ -3193,6 +3216,21 @@ fn apply_event_to_child_transcript(
     }
 }
 
+fn merge_prompt_composition(previous: Option<&ModelTokenUsage>, usage: &mut TokenUsageEvent) {
+    let Some(previous) = previous else {
+        return;
+    };
+    let previous = TokenUsageEvent::with_breakdown(
+        previous.used_tokens,
+        previous.context_window_tokens,
+        previous.input_tokens,
+        previous.output_tokens,
+        previous.cached_tokens,
+    )
+    .with_prompt_composition(previous.prompt_composition.clone());
+    usage.merge_prompt_composition_from(&previous);
+}
+
 impl From<TokenUsageEvent> for ModelTokenUsage {
     fn from(event: TokenUsageEvent) -> Self {
         Self {
@@ -3202,6 +3240,7 @@ impl From<TokenUsageEvent> for ModelTokenUsage {
             output_tokens: event.output_tokens,
             cached_tokens: event.cached_tokens,
             cache_report: event.cache_report,
+            prompt_composition: event.prompt_composition,
         }
     }
 }
@@ -3499,6 +3538,7 @@ mod tests {
             output_tokens: 100,
             cached_tokens: 400,
             cache_report: None,
+            prompt_composition: Vec::new(),
         });
 
         state.status_spinner_frame = 77;

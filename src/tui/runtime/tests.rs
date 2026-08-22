@@ -236,6 +236,79 @@ fn pending_question_terminal_title_uses_question_marker_before_session_title() {
 }
 
 #[test]
+fn parent_token_usage_does_not_merge_prompt_composition_from_viewed_child() {
+    let mut runtime = runtime();
+    runtime.state_mut().model_token_usage = Some(
+        TokenUsageEvent::with_breakdown(100, 1_000, 100, 0, 0)
+            .with_prompt_composition(vec![crate::agent::PromptCompositionEntry {
+                category: "parent".into(),
+                estimated_tokens: 100,
+                segments: 1,
+            }])
+            .into(),
+    );
+    runtime.state_mut().replace_child_timeline_from_records(
+        &[],
+        "parent",
+        "child",
+        "explorer",
+        1,
+        1,
+        1,
+    );
+    runtime.state_mut().apply_child_session_event(
+        "child",
+        SessionEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(50, 1_000, 50, 0, 0).with_prompt_composition(vec![
+                crate::agent::PromptCompositionEntry {
+                    category: "child".into(),
+                    estimated_tokens: 50,
+                    segments: 1,
+                },
+            ]),
+        ),
+    );
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::TokenUsage(TokenUsageEvent::with_breakdown(60, 1_000, 60, 0, 0)),
+    });
+
+    runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+        TokenUsageEvent::with_breakdown(120, 1_000, 120, 0, 0),
+    ));
+
+    assert_eq!(
+        runtime
+            .state()
+            .model_token_usage
+            .as_ref()
+            .unwrap()
+            .prompt_composition[0]
+            .category,
+        "parent"
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .active_model_token_usage()
+            .unwrap()
+            .prompt_composition[0]
+            .category,
+        "child"
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .active_model_token_usage()
+            .unwrap()
+            .used_tokens,
+        60
+    );
+}
+
+#[test]
 fn permission_prompt_keeps_the_active_terminal_spinner() {
     let mut runtime = runtime();
     runtime.session_title = Some("Review plan".into());

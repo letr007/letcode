@@ -1221,6 +1221,130 @@ fn restore_job_board_derives_active_state_from_child_transcript() {
 }
 
 #[test]
+fn read_records_accepts_legacy_prompt_composition_shapes() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-legacy-prompt-composition-test-{}",
+        unix_timestamp_ms()
+    ));
+    fs::create_dir_all(&base_dir).expect("create temp dir");
+    let path = base_dir.join("legacy.jsonl");
+    let telemetry = |sequence: u64, prompt_composition: serde_json::Value| {
+        let mut value = serde_json::to_value(TranscriptRecord {
+            session_id: "s".into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event: TranscriptEvent::LlmRequestTelemetry {
+                version: 6,
+                logical_request_id: format!("request-{sequence}"),
+                turn_id: 1,
+                iteration: 0,
+                attempt: 1,
+                phase: "prepared".into(),
+                error_class: None,
+                model: "test".into(),
+                protocol: "responses".into(),
+                context_window_tokens: 1_000_000,
+                input_budget_tokens: 700_000,
+                estimated_request_tokens: 100,
+                estimated_prelude_tokens: 10,
+                estimated_protected_tokens: 10,
+                protected_safe_ceiling_tokens: 0,
+                protected_reserve_tokens: 0,
+                estimated_unaddressable_protected_tokens: 0,
+                estimated_retained_history_tokens: 10,
+                estimated_tools_tokens: 10,
+                estimated_evidence_tokens: 0,
+                estimated_required_fallback_tokens: 0,
+                original_history_items: 1,
+                retained_history_items: 1,
+                dropped_history_items: 0,
+                selected_evidence_items: 0,
+                dropped_evidence_items: 0,
+                selected_evidence_ids: Vec::new(),
+                evidence_fingerprint: String::new(),
+                truncated: false,
+                prompt_segment_count: 1,
+                prompt_contributor_count: 1,
+                prompt_composition: Vec::new(),
+                prompt_stable_prefix_hash: None,
+                cache_first_volatile_index: None,
+                plan_total_prompt_tokens: 10,
+                plan_stable_prompt_tokens: 10,
+                plan_volatile_prompt_tokens: 0,
+                plan_cacheable_prefix_tokens: 10,
+                plan_stable_after_boundary_tokens: 0,
+                cache_configured: false,
+                cache_hint_serialized: false,
+                cache_retention_sent: None,
+                cache_stable_prefix_segments: 0,
+                cache_stable_prompt_tokens: 10,
+                cache_volatile_prompt_tokens: 0,
+                cacheable_prefix_tokens: 0,
+                cache_stable_after_boundary_tokens: 0,
+                tool_call_count_before: 0,
+                tool_definitions_count: 0,
+                local_prefix_fingerprint: None,
+                routing_key: None,
+                provider_cached_tokens: None,
+                provider_input_tokens: None,
+                provider_output_tokens: None,
+                provider_total_tokens: None,
+                provider_response_id: None,
+                adjacent_lcp_units: None,
+                adjacent_lcp_bytes: None,
+                adjacent_lcp_estimated_tokens: None,
+                current_unit_count: 0,
+                first_breaker: None,
+                cohort_comparable: false,
+                cohort_changed: false,
+                usage_completeness: "usage_missing".into(),
+                cache_write_tokens: None,
+            },
+        })
+        .expect("serialize telemetry");
+        value
+            .as_object_mut()
+            .expect("telemetry object")
+            .insert("prompt_composition".into(), prompt_composition);
+        value
+    };
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            telemetry(1, json!([])),
+            telemetry(
+                2,
+                json!([{
+                    "key": "SkillMaterial:Developer:skill_catalog",
+                    "role": "developer",
+                    "source_label": "skill_catalog",
+                    "tokens": 42,
+                    "segments": 1
+                }])
+            )
+        ),
+    )
+    .expect("write transcript");
+
+    let records = read_records(&path).expect("read legacy telemetry");
+    match &records[1].event {
+        TranscriptEvent::LlmRequestTelemetry {
+            prompt_composition, ..
+        } => {
+            assert_eq!(
+                prompt_composition[0].category,
+                "SkillMaterial:Developer:skill_catalog"
+            );
+            assert_eq!(prompt_composition[0].estimated_tokens, 42);
+            assert_eq!(prompt_composition[0].segments, 1);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
 fn read_records_accepts_legacy_subagent_result_without_structured_payload() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-legacy-subagent-test-{}",

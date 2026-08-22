@@ -229,6 +229,8 @@ pub struct CacheUsageReport {
     pub actual_cached_tokens: Option<u64>,
 }
 
+pub type PromptCompositionEntry = crate::request_builder::prompt_plan::PromptCompositionEntry;
+
 /// Safe, scalar-only provenance for one attempt of a logical model request.
 /// Prompt, tool, evidence, and provider payloads deliberately do not cross this boundary.
 #[derive(Debug, Clone)]
@@ -262,6 +264,7 @@ pub struct LlmRequestTelemetry {
     pub truncated: bool,
     pub prompt_segment_count: usize,
     pub prompt_contributor_count: usize,
+    pub prompt_composition: Vec<PromptCompositionEntry>,
     pub prompt_stable_prefix_hash: Option<String>,
     pub cache_first_volatile_index: Option<usize>,
     pub cache_configured: bool,
@@ -339,6 +342,7 @@ impl LlmRequestTelemetry {
             truncated: budget.truncated,
             prompt_segment_count: build.prompt_plan.segments.len(),
             prompt_contributor_count: build.prompt_plan.contributors.len(),
+            prompt_composition: build.prompt_plan.composition(budget.estimated_tools_tokens),
             prompt_stable_prefix_hash: build.prompt_plan.stable_prefix_hash().map(str::to_owned),
             cache_first_volatile_index: plan.first_volatile_index,
             cache_configured: cache.configured,

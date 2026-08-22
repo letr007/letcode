@@ -237,6 +237,8 @@ pub enum TranscriptEvent {
         truncated: bool,
         prompt_segment_count: usize,
         prompt_contributor_count: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prompt_composition: Vec<crate::agent::PromptCompositionEntry>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_stable_prefix_hash: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

@@ -84,34 +84,55 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
         );
     }
 
-    let context_usage = state
+    if let Some(usage) = state
         .active_model_token_usage()
         .filter(|usage| usage.context_window_tokens > 0)
-        .map(|usage| {
-            let percent = ((usage.used_tokens.min(usage.context_window_tokens) as f64
-                / usage.context_window_tokens as f64)
-                * 100.0)
-                .round() as u64;
-            (
-                format!(
-                    "{} · {} / {} ({percent}%)",
-                    state.current_context_branch,
-                    compact_count(usage.used_tokens),
-                    compact_count(usage.context_window_tokens)
-                ),
-                context_usage_color(percent, theme),
-            )
-        });
-    let (context_value, context_color) =
-        context_usage.unwrap_or_else(|| (state.current_context_branch.clone(), theme.notice));
-    compact_field(
-        &mut lines,
-        state.t("sidebar.context"),
-        &context_value,
-        inner.width as usize,
-        context_color,
-        theme,
-    );
+    {
+        let percent = context_used_percent(usage.used_tokens, usage.context_window_tokens);
+        let usage_summary = format!(
+            "{} / {} ({percent}%)",
+            compact_count(usage.used_tokens),
+            compact_count(usage.context_window_tokens)
+        );
+        wrapped_context_field(
+            &mut lines,
+            state.t("sidebar.context"),
+            &state.current_context_branch,
+            &usage_summary,
+            inner.width as usize,
+            context_usage_color(percent, theme),
+            theme,
+        );
+    } else {
+        compact_field(
+            &mut lines,
+            state.t("sidebar.context"),
+            &state.current_context_branch,
+            inner.width as usize,
+            theme.notice,
+            theme,
+        );
+    }
+    let reserved_rows = mcp_row_count(state).saturating_add(todo_row_count(
+        state,
+        inner.width.saturating_sub(2) as usize,
+    ));
+    if let Some(usage) = state
+        .active_model_token_usage()
+        .filter(|usage| usage.context_window_tokens > 0)
+    {
+        render_context_usage_details(
+            &mut lines,
+            usage,
+            inner.width as usize,
+            inner.height as usize,
+            reserved_rows,
+            state,
+            theme,
+        );
+    }
+
+    render_mcp_status(&mut lines, state, inner.width as usize, theme);
 
     if let Some(todo) = state.latest_todo.as_ref() {
         let items = todo.items.iter().collect::<Vec<_>>();
@@ -135,19 +156,26 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
                     TodoStatus::Completed => ("✓", theme.success),
                     TodoStatus::Cancelled => ("×", theme.error),
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{marker} "),
-                        Style::default()
-                            .fg(marker_color)
-                            .bg(theme.element_bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        truncate_to_width(&item.content, inner.width.saturating_sub(2) as usize),
-                        value_style,
-                    ),
-                ]));
+                let content_width = inner.width.saturating_sub(2) as usize;
+                for (index, row) in wrap_to_width(&item.content, content_width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if index == 0 {
+                                format!("{marker} ")
+                            } else {
+                                "  ".into()
+                            },
+                            Style::default()
+                                .fg(marker_color)
+                                .bg(theme.element_bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(row, value_style),
+                    ]));
+                }
             }
         }
     }
@@ -175,6 +203,244 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
     }
 }
 
+fn render_context_usage_details(
+    lines: &mut Vec<Line<'static>>,
+    usage: &crate::tui::state::ModelTokenUsage,
+    width: usize,
+    available_height: usize,
+    reserved_rows: usize,
+    state: &TuiState,
+    theme: Theme,
+) {
+    if width < 8 || available_height.saturating_sub(lines.len().saturating_add(reserved_rows)) < 4 {
+        return;
+    }
+
+    let estimated_composition_tokens =
+        usage.prompt_composition.iter().fold(0u64, |total, entry| {
+            total.saturating_add(entry.estimated_tokens)
+        });
+    let output_context_tokens = usage.used_tokens.saturating_sub(usage.input_tokens);
+    let display_used_tokens = usage.used_tokens;
+    let remaining = usage
+        .context_window_tokens
+        .saturating_sub(display_used_tokens.min(usage.context_window_tokens));
+    let percent = context_used_percent(display_used_tokens, usage.context_window_tokens);
+
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled(
+            state.t("sidebar.context_usage"),
+            Style::default()
+                .fg(context_usage_color(percent, theme))
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} / {} · {percent}%",
+                compact_count(display_used_tokens),
+                compact_count(usage.context_window_tokens)
+            ),
+            Style::default().fg(theme.muted_text).bg(theme.element_bg),
+        ),
+    ]));
+    lines.push(context_bar_line(
+        width,
+        &usage.prompt_composition,
+        estimated_composition_tokens,
+        usage.input_tokens,
+        output_context_tokens,
+        usage.context_window_tokens,
+        theme,
+    ));
+
+    let detail_capacity = available_height
+        .saturating_sub(lines.len().saturating_add(reserved_rows).saturating_add(1));
+    if detail_capacity == 0 {
+        return;
+    }
+    let mut details = usage
+        .prompt_composition
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            context_detail_line(
+                format_composition_label(entry, state),
+                scaled_composition_tokens(
+                    entry.estimated_tokens,
+                    estimated_composition_tokens,
+                    usage.input_tokens,
+                ),
+                context_composition_color(entry, index, theme),
+                theme,
+            )
+        })
+        .collect::<Vec<_>>();
+    if output_context_tokens > 0 {
+        details.push(context_detail_line(
+            state.t("sidebar.context_output"),
+            output_context_tokens,
+            theme.assistant,
+            theme,
+        ));
+    }
+    details.push(context_detail_line(
+        state.t("sidebar.context_remaining"),
+        remaining,
+        theme.muted_text,
+        theme,
+    ));
+    lines.extend(details.into_iter().take(detail_capacity));
+}
+
+fn format_composition_label(
+    entry: &crate::agent::PromptCompositionEntry,
+    state: &TuiState,
+) -> String {
+    state.t(match composition_category(entry.category.as_str()) {
+        "system" => "sidebar.context_system",
+        "tools" => "sidebar.context_tools",
+        "skills" => "sidebar.context_skills",
+        "context" => "sidebar.context_material",
+        "messages" => "sidebar.context_messages",
+        _ => "sidebar.context_other",
+    })
+}
+
+fn context_detail_line(label: String, tokens: u64, color: Color, theme: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("● ", Style::default().fg(color).bg(theme.element_bg)),
+        Span::styled(
+            padded_label(&label, 16),
+            Style::default().fg(theme.muted_text).bg(theme.element_bg),
+        ),
+        Span::styled(
+            compact_count(tokens),
+            Style::default()
+                .fg(color)
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn context_bar_line(
+    width: usize,
+    composition: &[crate::agent::PromptCompositionEntry],
+    estimated_total: u64,
+    actual_input_tokens: u64,
+    output_context_tokens: u64,
+    context_window_tokens: u64,
+    theme: Theme,
+) -> Line<'static> {
+    let bar_width = width.max(1);
+    let mut remaining_cells = bar_width;
+    let mut spans = Vec::new();
+    for (index, entry) in composition.iter().enumerate() {
+        let tokens =
+            scaled_composition_tokens(entry.estimated_tokens, estimated_total, actual_input_tokens);
+        let cells =
+            proportional_cells(tokens, context_window_tokens, bar_width).min(remaining_cells);
+        if cells == 0 {
+            continue;
+        }
+        spans.push(Span::styled(
+            "█".repeat(cells),
+            Style::default()
+                .fg(context_composition_color(entry, index, theme))
+                .bg(theme.element_bg),
+        ));
+        remaining_cells = remaining_cells.saturating_sub(cells);
+        if remaining_cells == 0 {
+            break;
+        }
+    }
+    if remaining_cells > 0 && output_context_tokens > 0 {
+        let cells = proportional_cells(output_context_tokens, context_window_tokens, bar_width)
+            .min(remaining_cells);
+        if cells > 0 {
+            spans.push(Span::styled(
+                "█".repeat(cells),
+                Style::default().fg(theme.assistant).bg(theme.element_bg),
+            ));
+            remaining_cells = remaining_cells.saturating_sub(cells);
+        }
+    }
+    if remaining_cells > 0 {
+        spans.push(Span::styled(
+            " ".repeat(remaining_cells),
+            Style::default().fg(theme.border).bg(theme.elevated_bg),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn context_composition_color(
+    entry: &crate::agent::PromptCompositionEntry,
+    index: usize,
+    theme: Theme,
+) -> Color {
+    match composition_category(entry.category.as_str()) {
+        "system" => theme.notice,
+        "tools" => theme.warning,
+        "skills" => theme.success,
+        "context" => theme.approval,
+        "messages" => theme.user,
+        _ => [theme.accent, theme.success, theme.error][index % 3],
+    }
+}
+
+fn composition_category(value: &str) -> &'static str {
+    if value == "tools" || value == "tool_definitions" {
+        "tools"
+    } else if value == "skills" || value.starts_with("SkillMaterial:") {
+        "skills"
+    } else if value == "system"
+        || value.starts_with("SystemPrelude:")
+        || value.starts_with("DeveloperPrelude:")
+    {
+        "system"
+    } else if value == "context"
+        || value.starts_with("RuntimeContext:")
+        || value.starts_with("ContextMaterial:")
+        || value.starts_with("ContextIndex:")
+        || value.starts_with("Evidence:")
+    {
+        "context"
+    } else if value == "messages"
+        || value.starts_with("TranscriptFrame:")
+        || value.starts_with("CurrentTurn:")
+    {
+        "messages"
+    } else {
+        "other"
+    }
+}
+
+fn scaled_composition_tokens(estimated: u64, estimated_total: u64, actual_total: u64) -> u64 {
+    if estimated_total == 0 || actual_total == 0 {
+        return estimated;
+    }
+    ((estimated as u128 * actual_total as u128) / estimated_total as u128) as u64
+}
+
+fn proportional_cells(tokens: u64, total: u64, width: usize) -> usize {
+    if tokens == 0 || total == 0 || width == 0 {
+        return 0;
+    }
+    (((tokens.min(total) as f64 / total as f64) * width as f64).round() as usize).clamp(1, width)
+}
+
+fn context_used_percent(used: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (((used.min(total) as f64 / total as f64) * 100.0).round() as u64).min(100)
+}
+
+const LABEL_COLUMN_WIDTH: usize = 10;
+
 fn compact_field(
     lines: &mut Vec<Line<'static>>,
     label: String,
@@ -183,7 +449,6 @@ fn compact_field(
     value_color: Color,
     theme: Theme,
 ) {
-    const LABEL_COLUMN_WIDTH: usize = 10;
     let label = padded_label(&label, LABEL_COLUMN_WIDTH);
     let value_width = width.saturating_sub(LABEL_COLUMN_WIDTH);
     lines.push(Line::from(vec![
@@ -199,6 +464,124 @@ fn compact_field(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+}
+
+fn wrapped_context_field(
+    lines: &mut Vec<Line<'static>>,
+    label: String,
+    branch: &str,
+    usage: &str,
+    width: usize,
+    value_color: Color,
+    theme: Theme,
+) {
+    let value_width = width.saturating_sub(LABEL_COLUMN_WIDTH);
+    let inline = format!("{branch} · {usage}");
+    if display_width(&inline) <= value_width {
+        compact_field(lines, label, &inline, width, value_color, theme);
+        return;
+    }
+
+    compact_field(lines, label, branch, width, value_color, theme);
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(LABEL_COLUMN_WIDTH)),
+        Span::styled(
+            truncate_to_width(usage, value_width),
+            Style::default()
+                .fg(value_color)
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+}
+
+fn mcp_row_count(state: &TuiState) -> usize {
+    usize::from(
+        state.mcp_discovery != crate::tui::state::McpDiscoveryState::Ready
+            || !state.mcp_servers.is_empty(),
+    )
+}
+
+fn todo_row_count(state: &TuiState, content_width: usize) -> usize {
+    state.latest_todo.as_ref().map_or(0, |todo| {
+        let items = todo.items.iter().collect::<Vec<_>>();
+        if items.is_empty() {
+            0
+        } else {
+            2 + items
+                .iter()
+                .map(|item| wrap_to_width(&item.content, content_width).len())
+                .sum::<usize>()
+        }
+    })
+}
+
+fn render_mcp_status(lines: &mut Vec<Line<'static>>, state: &TuiState, width: usize, theme: Theme) {
+    use crate::mcp::McpServerStatus;
+    use crate::tui::state::McpDiscoveryState;
+
+    if state.mcp_discovery == McpDiscoveryState::Ready && state.mcp_servers.is_empty() {
+        return;
+    }
+
+    let (value, color) = match state.mcp_discovery {
+        McpDiscoveryState::Loading => (state.t("sidebar.mcp_loading"), theme.notice),
+        McpDiscoveryState::Unavailable => (state.t("sidebar.mcp_unavailable"), theme.error),
+        McpDiscoveryState::Ready => {
+            let mut online = 0usize;
+            let mut offline = 0usize;
+            let mut disabled = 0usize;
+            let mut tools = 0usize;
+            for server in &state.mcp_servers {
+                match server.status {
+                    McpServerStatus::Online { tool_count } => {
+                        online += 1;
+                        tools = tools.saturating_add(tool_count);
+                    }
+                    McpServerStatus::Offline { .. } => offline += 1,
+                    McpServerStatus::Disabled => disabled += 1,
+                }
+            }
+            if !state.mcp_updating.is_empty() {
+                (
+                    state.t_fmt(
+                        "sidebar.mcp_updating",
+                        &[("count", &state.mcp_updating.len().to_string())],
+                    ),
+                    theme.warning,
+                )
+            } else if offline > 0 {
+                (
+                    state.t_fmt(
+                        "sidebar.mcp_degraded",
+                        &[
+                            ("online", &online.to_string()),
+                            ("offline", &offline.to_string()),
+                        ],
+                    ),
+                    theme.warning,
+                )
+            } else if online > 0 {
+                (
+                    state.t_fmt(
+                        "sidebar.mcp_online",
+                        &[
+                            ("servers", &online.to_string()),
+                            ("tools", &tools.to_string()),
+                        ],
+                    ),
+                    theme.success,
+                )
+            } else {
+                (
+                    state.t_fmt("sidebar.mcp_disabled", &[("count", &disabled.to_string())]),
+                    theme.muted_text,
+                )
+            }
+        }
+    };
+
+    compact_field(lines, state.t("sidebar.mcp"), &value, width, color, theme);
 }
 
 fn render_panel_guide(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
@@ -276,6 +659,34 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     format!("{result}…")
 }
 
+fn wrap_to_width(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut rows = Vec::new();
+    for logical_line in text.lines() {
+        let mut remaining = logical_line;
+        if remaining.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        while !remaining.is_empty() {
+            let row = truncate_to_width_without_ellipsis(remaining, max_width);
+            if row.is_empty() {
+                break;
+            }
+            let consumed = row.len();
+            rows.push(row);
+            remaining = &remaining[consumed..];
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
 fn truncate_to_width_without_ellipsis(text: &str, max_width: usize) -> String {
     let mut result = String::new();
     let mut width = 0usize;
@@ -323,6 +734,312 @@ mod tests {
             1,
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn sidebar_renders_detailed_context_usage_breakdown() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            used_tokens: 70_000,
+            context_window_tokens: 128_000,
+            input_tokens: 64_000,
+            output_tokens: 6_000,
+            cached_tokens: 24_000,
+            prompt_composition: vec![
+                crate::agent::PromptCompositionEntry {
+                    category: "system".into(),
+                    estimated_tokens: 18_000,
+                    segments: 2,
+                },
+                crate::agent::PromptCompositionEntry {
+                    category: "skills".into(),
+                    estimated_tokens: 12_000,
+                    segments: 2,
+                },
+                crate::agent::PromptCompositionEntry {
+                    category: "tools".into(),
+                    estimated_tokens: 20_000,
+                    segments: 1,
+                },
+                crate::agent::PromptCompositionEntry {
+                    category: "messages".into(),
+                    estimated_tokens: 20_000,
+                    segments: 3,
+                },
+            ],
+            cache_report: Some(crate::agent::CacheUsageReport {
+                configured: true,
+                hint_serialized: true,
+                retention_sent: None,
+                stable_prefix_segments: 2,
+                stable_prompt_tokens: 42_000,
+                volatile_prompt_tokens: 22_000,
+                cacheable_prefix_tokens: 40_000,
+                stable_after_boundary_tokens: 2_000,
+                local_prefix_fingerprint: None,
+                routing_key: None,
+                actual_cached_tokens: Some(24_000),
+            }),
+        });
+        let backend = TestBackend::new(42, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for expected in [
+            "Context usage",
+            "70.0k / 128.0k · 55%",
+            "System prompt",
+            "16.5k",
+            "Skills",
+            "11.0k",
+            "Tools",
+            "18.3k",
+            "Messages",
+            "18.3k",
+            "Output",
+            "6.0k",
+            "Remaining",
+            "58.0k",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_breakdown_includes_current_output_tokens() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            used_tokens: 12_000,
+            context_window_tokens: 20_000,
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            cached_tokens: 0,
+            cache_report: None,
+            prompt_composition: vec![crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 10_000,
+                segments: 1,
+            }],
+        });
+        let backend = TestBackend::new(42, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Messages        10.0k"), "{rendered}");
+        assert!(rendered.contains("Output          2.0k"), "{rendered}");
+        let bar = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(42)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .find(|row| row.matches('█').count() > 0)
+            .expect("context bar");
+        assert_eq!(bar.matches('█').count(), 23, "{bar}");
+        assert!(rendered.contains("Remaining       8.0k"), "{rendered}");
+    }
+
+    #[test]
+    fn sidebar_wraps_long_context_summary_and_todo_content() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.current_context_branch = "history-13".into();
+        state.mcp_discovery = crate::tui::state::McpDiscoveryState::Ready;
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            used_tokens: 84_100,
+            context_window_tokens: 1_000_000,
+            input_tokens: 84_100,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cache_report: None,
+            prompt_composition: Vec::new(),
+        });
+        state.latest_todo = Some(crate::tui::timeline::TodoView {
+            items: vec![crate::agent::TodoItem {
+                id: "wrap".into(),
+                content: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".into(),
+                status: crate::agent::TodoStatus::InProgress,
+            }],
+            auto_continue: crate::agent::AutoContinueState::default(),
+        });
+        let backend = TestBackend::new(32, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rows = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .skip(y as usize * 32)
+                    .take(32)
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        let context_row = rows
+            .iter()
+            .position(|row| row.contains("history-13"))
+            .expect("context branch row");
+        assert!(rows[context_row + 1].contains("84.1k / 1.0m (8%)"));
+        let todo_start = rows
+            .iter()
+            .position(|row| row.contains("Todos  1"))
+            .expect("todo heading");
+        let todo_rows = rows
+            .iter()
+            .skip(todo_start + 1)
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(todo_rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            todo_rows
+                .iter()
+                .flat_map(|row| row.chars().filter(|ch| ch.is_ascii_alphanumeric()))
+                .collect::<String>(),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        );
+        assert!(!todo_rows.iter().any(|row| row.contains('…')));
+    }
+
+    #[test]
+    fn context_details_leave_room_for_mcp_and_todos() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_mcp_servers(vec![crate::mcp::McpServerCatalogEntry {
+            name: "docs".into(),
+            enabled: true,
+            status: crate::mcp::McpServerStatus::Online { tool_count: 2 },
+        }]);
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            used_tokens: 10_000,
+            context_window_tokens: 20_000,
+            input_tokens: 9_000,
+            output_tokens: 1_000,
+            cached_tokens: 0,
+            cache_report: None,
+            prompt_composition: (0..8)
+                .map(|index| crate::agent::PromptCompositionEntry {
+                    category: format!("other-{index}"),
+                    estimated_tokens: 1_000,
+                    segments: 1,
+                })
+                .collect(),
+        });
+        state.latest_todo = Some(crate::tui::timeline::TodoView {
+            items: vec![crate::agent::TodoItem {
+                id: "keep".into(),
+                content: "important todo".into(),
+                status: crate::agent::TodoStatus::Pending,
+            }],
+            auto_continue: crate::agent::AutoContinueState::default(),
+        });
+        let backend = TestBackend::new(42, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("MCP       1 online · 2 tools"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Todos  1"), "{rendered}");
+        assert!(rendered.contains("important todo"), "{rendered}");
+    }
+
+    #[test]
+    fn sidebar_renders_mcp_summary() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_mcp_servers(vec![
+            crate::mcp::McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Online { tool_count: 3 },
+            },
+            crate::mcp::McpServerCatalogEntry {
+                name: "broken".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Offline {
+                    message: "unreachable".into(),
+                },
+            },
+        ]);
+        let backend = TestBackend::new(42, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("MCP       1 online · 1 offline"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn context_bar_fills_used_share_and_leaves_capacity_visible() {
+        let composition = vec![
+            crate::agent::PromptCompositionEntry {
+                category: "system".into(),
+                estimated_tokens: 4_000,
+                segments: 1,
+            },
+            crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 6_000,
+                segments: 1,
+            },
+        ];
+        let line = context_bar_line(20, &composition, 10_000, 10_000, 0, 20_000, Theme::dark());
+        assert_eq!(line.width(), 20);
+        assert_eq!(line.spans[0].content.chars().count(), 4);
+        assert_eq!(line.spans[1].content.chars().count(), 6);
+        assert_eq!(line.spans[2].content.chars().count(), 10);
+        assert_eq!(line.spans[2].style.bg, Some(Theme::dark().elevated_bg));
     }
 
     #[test]

@@ -1120,6 +1120,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::TokenUsage(token_usage) => {
                 let mut token_usage = token_usage.clone();
+                self.state.merge_parent_prompt_composition(&mut token_usage);
                 if token_usage.output_tokens > 0 {
                     self.current_turn_output_tokens = self
                         .current_turn_output_tokens
@@ -1390,7 +1391,10 @@ impl TuiRuntime {
                 parent_tool_call_id,
                 event,
             } => {
-                if self.child_event_clears_pending_permission(child_session_id, event) {
+                let mut event = event.clone();
+                self.state
+                    .merge_child_prompt_composition(child_session_id, &mut event);
+                if self.child_event_clears_pending_permission(child_session_id, &event) {
                     self.permission_lifecycle.clear();
                 }
                 if self.pending_question_child_session_id.as_deref() == Some(child_session_id)
@@ -1407,7 +1411,7 @@ impl TuiRuntime {
                     child_session_id,
                     agent_name.as_deref(),
                     parent_tool_call_id.as_deref(),
-                    event.clone(),
+                    event,
                 );
             }
             _ => {}

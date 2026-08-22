@@ -783,6 +783,7 @@ impl TranscriptRecorder {
             truncated: telemetry.truncated,
             prompt_segment_count: telemetry.prompt_segment_count,
             prompt_contributor_count: telemetry.prompt_contributor_count,
+            prompt_composition: telemetry.prompt_composition.clone(),
             prompt_stable_prefix_hash: telemetry
                 .prompt_stable_prefix_hash
                 .map(|value| truncate_text(&value, 256)),

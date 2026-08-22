@@ -91,8 +91,8 @@ pub use events::{
     AgentEvent, CacheUsageReport, CompactionAttemptOutcome, CompactionBlocker,
     CompactionNoProgress, CompactionTrigger, ContextCompactionEvent, LlmRequestErrorClass,
     LlmRequestTelemetry, LlmRequestTelemetryPhase, LlmRetryLifecycle, ManualCompactionOutcome,
-    ProviderUsageCompleteness, TokenUsageEstimate, ToolExecutionSummaryEvent, TurnFinalizedEvent,
-    TurnStartedEvent, ValidationAdvisory,
+    PromptCompositionEntry, ProviderUsageCompleteness, TokenUsageEstimate,
+    ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 #[cfg(test)]
 pub(crate) use events::{CompactionCheckpoint, CompactionFileOperations};

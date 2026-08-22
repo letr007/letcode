@@ -818,6 +818,7 @@ mod tests {
             used_tokens: 700,
             context_window_tokens: 1_000,
             cache_report: None,
+            prompt_composition: Vec::new(),
         });
 
         let status = token_budget_spans(
@@ -850,6 +851,7 @@ mod tests {
             output_tokens: 0,
             cached_tokens: 0,
             cache_report: None,
+            prompt_composition: Vec::new(),
         });
         state.replace_child_timeline_from_records(
             &[],
@@ -974,6 +976,7 @@ mod tests {
             output_tokens: 1_300_000,
             cached_tokens: 0,
             cache_report: None,
+            prompt_composition: Vec::new(),
         };
 
         let rendered = token_budget_spans(&usage, crate::tui::Theme::dark())
@@ -1015,6 +1018,7 @@ mod tests {
             output_tokens: 0,
             cached_tokens: 1,
             cache_report: None,
+            prompt_composition: Vec::new(),
         };
 
         let rendered = token_budget_spans(&usage, crate::tui::Theme::dark())
@@ -1034,6 +1038,7 @@ mod tests {
             output_tokens: 0,
             cached_tokens: 0,
             cache_report: None,
+            prompt_composition: Vec::new(),
         };
 
         let rendered = super::token_budget_spans(&usage, crate::tui::Theme::dark())

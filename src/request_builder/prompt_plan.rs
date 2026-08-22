@@ -489,6 +489,16 @@ pub(crate) struct PromptPlanTokenReport {
     pub first_volatile_index: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCompositionEntry {
+    #[serde(default, alias = "key")]
+    pub category: String,
+    #[serde(default, alias = "tokens")]
+    pub estimated_tokens: u64,
+    #[serde(default)]
+    pub segments: usize,
+}
+
 impl PromptPlan {
     pub(crate) fn recompute_cache_metadata(&mut self) {
         self.stable_prefix_end = None;
@@ -558,6 +568,32 @@ impl PromptPlan {
             .stable_prompt_tokens
             .saturating_sub(report.cacheable_prefix_tokens);
         report
+    }
+
+    pub(crate) fn composition(&self, tool_definition_tokens: u64) -> Vec<PromptCompositionEntry> {
+        let mut entries = Vec::<PromptCompositionEntry>::new();
+        for segment in &self.segments {
+            let category = composition_category(segment.source.contributor_kind).to_string();
+            let tokens = segment.tokens.estimated_input_tokens.unwrap_or(0);
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.category == category) {
+                entry.estimated_tokens = entry.estimated_tokens.saturating_add(tokens);
+                entry.segments = entry.segments.saturating_add(1);
+            } else {
+                entries.push(PromptCompositionEntry {
+                    category,
+                    estimated_tokens: tokens,
+                    segments: 1,
+                });
+            }
+        }
+        if tool_definition_tokens > 0 {
+            entries.push(PromptCompositionEntry {
+                category: "tools".into(),
+                estimated_tokens: tool_definition_tokens,
+                segments: 1,
+            });
+        }
+        entries
     }
 
     pub(crate) fn stable_prefix_hash(&self) -> Option<&str> {
@@ -1011,6 +1047,20 @@ struct HistoryClassification {
     source: RuntimeSource,
 }
 
+fn composition_category(kind: PromptContributorKind) -> &'static str {
+    match kind {
+        PromptContributorKind::SystemPrelude | PromptContributorKind::DeveloperPrelude => "system",
+        PromptContributorKind::SkillMaterial => "skills",
+        PromptContributorKind::RuntimeContext
+        | PromptContributorKind::ContextMaterial
+        | PromptContributorKind::ContextIndex
+        | PromptContributorKind::Evidence => "context",
+        PromptContributorKind::TranscriptFrame
+        | PromptContributorKind::CurrentTurn
+        | PromptContributorKind::Other => "messages",
+    }
+}
+
 fn classify_prelude_message(message: &PromptMessage) -> PreludeClassification {
     let (kind, label, stability, source) = match message.origin {
         PromptMessageOrigin::StaticPrelude => match message.role {
@@ -1401,6 +1451,65 @@ mod tests {
         assert_eq!(
             plan.segments[2].cache.boundary,
             Some(PromptCacheBoundaryKind::VolatileRegionStart)
+        );
+    }
+
+    #[test]
+    fn prompt_composition_groups_request_material_by_context_category() {
+        let plan = build_prompt_plan(PromptPlanBuildInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            prelude: &[
+                PromptMessage::system("system"),
+                PromptMessage::developer_with_origin(
+                    "skill body",
+                    PromptMessageOrigin::SkillMaterial,
+                ),
+            ],
+            snapshot: &RuntimeSnapshot::new("test"),
+            selected_frames: &history_items_to_frames(&[
+                HistoryItem::user("question"),
+                HistoryItem::assistant("answer"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    reasoning_content: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-1".into(),
+                        name: "fs__read".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "call-1".into(),
+                    output_json: "{}".into(),
+                    images: Vec::new(),
+                },
+            ]),
+            protected_suffix_len: 0,
+            evidence_message: None,
+            selected_evidence_ids: &[],
+        });
+
+        let composition = plan.composition(321);
+        assert!(
+            composition
+                .iter()
+                .any(|entry| { entry.category == "system" && entry.estimated_tokens > 0 })
+        );
+        assert!(
+            composition
+                .iter()
+                .any(|entry| { entry.category == "skills" && entry.estimated_tokens > 0 })
+        );
+        assert!(
+            composition
+                .iter()
+                .any(|entry| { entry.category == "messages" && entry.estimated_tokens > 0 })
+        );
+        assert!(
+            composition
+                .iter()
+                .any(|entry| { entry.category == "tools" && entry.estimated_tokens == 321 })
         );
     }
 
