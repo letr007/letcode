@@ -437,6 +437,20 @@ impl<C: Config> PreparedPrimaryRoute<C> {
         }
     }
 
+    pub(crate) fn candidate_session_usage_with_composition(
+        &self,
+        agent: &Agent<C>,
+        runtime_snapshot: &RuntimeSnapshot,
+    ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
+        agent.candidate_session_usage_with_route(
+            &self.route,
+            self.default_protocol,
+            &self.model_protocols,
+            &self.model_catalog,
+            runtime_snapshot,
+        )
+    }
+
     pub(crate) fn into_install(self) -> PreparedPrimaryRouteInstall<C> {
         PreparedPrimaryRouteInstall { route: self }
     }
@@ -1497,6 +1511,25 @@ impl<C: Config> Agent<C> {
         self.candidate_session_token_usage(&self.model, &self.runtime_snapshot)
     }
 
+    pub(crate) fn candidate_session_usage_with_composition(
+        &self,
+        model_id: &str,
+        runtime_snapshot: &RuntimeSnapshot,
+    ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
+        let build = self.build_candidate_session_request(model_id, runtime_snapshot)?;
+        let usage = TokenUsageEstimate {
+            used_tokens: build.budget.estimated_request_tokens,
+            context_window_tokens: build.budget.context_window_tokens,
+            input_tokens: build.budget.estimated_request_tokens,
+            output_tokens: 0,
+            cached_tokens: 0,
+        };
+        let composition = build
+            .prompt_plan
+            .composition(build.budget.estimated_tools_tokens);
+        Ok((usage, composition))
+    }
+
     /// Estimate a prospective session request without changing this agent's
     /// selected model, history, runtime snapshot, or turn state.
     pub(crate) fn candidate_session_token_usage(
@@ -1504,38 +1537,134 @@ impl<C: Config> Agent<C> {
         model_id: &str,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<TokenUsageEstimate> {
-        let model = self.model_metadata_for(model_id);
-        // Build the catalog for the CANDIDATE model: the anchored bootstrap
-        // whitelist may include or exclude it independently of the active model.
-        let tools = self.tool_definitions_for(model_id);
-        let policy = ProtectedContextPolicy::from_configured_reserve(
-            None,
-            effective_input_budget_tokens(model.clone(), &tools),
-        );
-        let build = build_request_with_policy(
-            RequestBuilderInput {
-                protocol: self.protocol_for_model(model_id),
-                provider: self
-                    .primary_route
-                    .as_ref()
-                    .map(|route| route.provider.as_str()),
-                model_id,
-                model,
-                prelude: &[],
-                snapshot: runtime_snapshot,
-                tools: &tools,
-            },
-            None,
-            Some(policy),
-        )?;
+        self.candidate_session_usage_with_composition(model_id, runtime_snapshot)
+            .map(|(usage, _)| usage)
+    }
 
-        Ok(TokenUsageEstimate {
+    fn candidate_session_usage_with_route(
+        &self,
+        route: &ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: &HashMap<String, ApiProtocol>,
+        model_catalog: &HashMap<String, ModelRequestMetadata>,
+        runtime_snapshot: &RuntimeSnapshot,
+    ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
+        let build = self.build_candidate_session_request_with_route(
+            &route.provider,
+            &route.model,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            runtime_snapshot,
+        )?;
+        let usage = TokenUsageEstimate {
             used_tokens: build.budget.estimated_request_tokens,
             context_window_tokens: build.budget.context_window_tokens,
             input_tokens: build.budget.estimated_request_tokens,
             output_tokens: 0,
             cached_tokens: 0,
-        })
+        };
+        let composition = build
+            .prompt_plan
+            .composition(build.budget.estimated_tools_tokens);
+        Ok((usage, composition))
+    }
+
+    fn build_candidate_session_request(
+        &self,
+        model_id: &str,
+        runtime_snapshot: &RuntimeSnapshot,
+    ) -> Result<crate::request_builder::BuildResult> {
+        let provider = self
+            .primary_route
+            .as_ref()
+            .map(|route| route.provider.as_str());
+        self.build_candidate_session_request_with_route(
+            provider.unwrap_or_default(),
+            model_id,
+            self.default_protocol,
+            &self.model_protocols,
+            &self.model_catalog,
+            runtime_snapshot,
+        )
+    }
+
+    fn build_candidate_session_request_with_route(
+        &self,
+        provider: &str,
+        model_id: &str,
+        default_protocol: ApiProtocol,
+        model_protocols: &HashMap<String, ApiProtocol>,
+        model_catalog: &HashMap<String, ModelRequestMetadata>,
+        runtime_snapshot: &RuntimeSnapshot,
+    ) -> Result<crate::request_builder::BuildResult> {
+        let model = model_catalog
+            .get(model_id)
+            .cloned()
+            .unwrap_or(ModelRequestMetadata {
+                context_window: None,
+                max_output_tokens: None,
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            });
+        let candidate_history = crate::request_builder::history_items_from_frames(
+            &crate::request_builder::provider_visible_protocol_frames(runtime_snapshot),
+        );
+        let mut tools = self.tools.specs();
+        tools.retain(|spec| !is_subagent_tool_name(&spec.name));
+        tools.extend(
+            subagent_tool_specs()
+                .into_iter()
+                .filter(|spec| is_executable_tool(self, &spec.name)),
+        );
+        let anchored_phase = self
+            .anchored
+            .as_ref()
+            .filter(|anchored| anchored.enabled_for(model_id) && self.anchored_override)
+            .map(|anchored| anchored.phase(&candidate_history));
+        if let (Some(anchored), Some(phase)) = (&self.anchored, anchored_phase) {
+            tools = anchored.tool_catalog(&phase, tools);
+        }
+        let policy = ProtectedContextPolicy::from_configured_reserve(
+            None,
+            effective_input_budget_tokens(model.clone(), &tools),
+        );
+        let runtime_message = runtime_context_message();
+        let skill_message = self.skill_prelude_message();
+        let prelude = if let (Some(anchored), Some(phase)) = (&self.anchored, anchored_phase) {
+            anchored.prelude(
+                &phase,
+                &self.prelude,
+                Some(runtime_message),
+                skill_message,
+                None,
+                &[],
+            )
+        } else {
+            let mut prelude = self.prelude.clone();
+            prelude.push(runtime_message);
+            if let Some(message) = skill_message {
+                prelude.push(message);
+            }
+            prelude
+        };
+        build_request_with_policy(
+            RequestBuilderInput {
+                protocol: model_protocols
+                    .get(model_id)
+                    .cloned()
+                    .unwrap_or(default_protocol),
+                provider: (!provider.is_empty()).then_some(provider),
+                model_id,
+                model,
+                prelude: &prelude,
+                snapshot: runtime_snapshot,
+                tools: &tools,
+            },
+            None,
+            Some(policy),
+        )
     }
 
     #[cfg(test)]

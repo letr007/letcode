@@ -309,6 +309,40 @@ fn parent_token_usage_does_not_merge_prompt_composition_from_viewed_child() {
 }
 
 #[test]
+fn prepared_usage_does_not_regress_the_current_context_snapshot() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+        TokenUsageEvent::with_breakdown(140, 1_000, 120, 20, 60)
+            .with_cache_report(Some(cache_report(Some(60)))),
+    ));
+    runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+        TokenUsageEvent::with_breakdown(130, 1_000, 130, 0, 0).with_prompt_composition(vec![
+            crate::agent::PromptCompositionEntry {
+                category: "messages".into(),
+                estimated_tokens: 130,
+                segments: 1,
+            },
+        ]),
+    ));
+
+    let usage = runtime.state().model_token_usage.as_ref().unwrap();
+    assert_eq!(usage.used_tokens, 140);
+    assert_eq!(usage.input_tokens, 140);
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(usage.cached_tokens, 0);
+    assert_eq!(usage.cache_report, None);
+    assert_eq!(usage.prompt_composition[0].category, "messages");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+        TokenUsageEvent::with_breakdown(135, 1_000, 125, 10, 0),
+    ));
+    let provider_usage = runtime.state().model_token_usage.as_ref().unwrap();
+    assert_eq!(provider_usage.used_tokens, 135);
+    assert_eq!(provider_usage.input_tokens, 125);
+    assert_eq!(provider_usage.prompt_composition[0].category, "messages");
+}
+
+#[test]
 fn permission_prompt_keeps_the_active_terminal_spinner() {
     let mut runtime = runtime();
     runtime.session_title = Some("Review plan".into());
@@ -1661,6 +1695,18 @@ fn resumed_session_usage_uses_target_agent_and_drops_response_accounting() {
     assert_eq!(resumed_usage.output_tokens, 0);
     assert_eq!(resumed_usage.cached_tokens, 0);
     assert_eq!(resumed_usage.cache_report, None);
+    assert!(
+        resumed_usage
+            .prompt_composition
+            .iter()
+            .any(|entry| entry.category == "system" && entry.estimated_tokens > 0)
+    );
+    assert!(
+        resumed_usage
+            .prompt_composition
+            .iter()
+            .any(|entry| entry.category == "messages" && entry.estimated_tokens > 0)
+    );
 }
 
 #[test]

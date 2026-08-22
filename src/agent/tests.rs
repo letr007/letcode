@@ -3085,6 +3085,26 @@ fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
 }
 
 #[test]
+fn uncatalogued_candidate_session_usage_keeps_tools_enabled() {
+    let agent = test_agent();
+    let snapshot = runtime_snapshot_for_history(
+        ROOT_CONTEXT_BRANCH_ID,
+        &[HistoryItem::user("target session")],
+    );
+
+    let (usage, composition) = agent
+        .candidate_session_usage_with_composition("uncatalogued-model", &snapshot)
+        .expect("uncatalogued model uses backward-compatible defaults");
+
+    assert!(usage.used_tokens > 0);
+    assert!(
+        composition
+            .iter()
+            .any(|entry| entry.category == "tools" && entry.estimated_tokens > 0)
+    );
+}
+
+#[test]
 fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
     let mut agent = test_agent();
     let history = vec![

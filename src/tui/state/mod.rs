@@ -3217,6 +3217,7 @@ fn apply_event_to_child_transcript(
 }
 
 fn merge_prompt_composition(previous: Option<&ModelTokenUsage>, usage: &mut TokenUsageEvent) {
+    let preserve_monotonic_context = !usage.prompt_composition.is_empty();
     let Some(previous) = previous else {
         return;
     };
@@ -3227,8 +3228,12 @@ fn merge_prompt_composition(previous: Option<&ModelTokenUsage>, usage: &mut Toke
         previous.output_tokens,
         previous.cached_tokens,
     )
+    .with_cache_report(previous.cache_report.clone())
     .with_prompt_composition(previous.prompt_composition.clone());
     usage.merge_prompt_composition_from(&previous);
+    if preserve_monotonic_context {
+        usage.preserve_context_floor_from(&previous);
+    }
 }
 
 impl From<TokenUsageEvent> for ModelTokenUsage {

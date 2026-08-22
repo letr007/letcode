@@ -186,6 +186,24 @@ impl<C: Config> PreparedRestoredRoute<C> {
         }
     }
 
+    pub(crate) fn candidate_session_usage_with_composition(
+        &self,
+        agent: &Agent<C>,
+        runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
+    ) -> Result<(
+        crate::agent::TokenUsageEstimate,
+        Vec<crate::agent::PromptCompositionEntry>,
+    )> {
+        match self {
+            Self::Prepared { route, .. } => {
+                route.candidate_session_usage_with_composition(agent, runtime_snapshot)
+            }
+            Self::ModelOnly(model) => {
+                agent.candidate_session_usage_with_composition(model, runtime_snapshot)
+            }
+        }
+    }
+
     pub(crate) fn apply(self, agent: &mut Agent<C>) {
         match self {
             Self::Prepared { route, .. } => agent.apply_prepared_route(route),
@@ -311,13 +329,27 @@ pub fn install_prepared_routed_resume_for_agent(
     let target_model = route
         .as_ref()
         .map_or_else(|| agent.model(), PreparedRestoredRoute::target_model);
-    let token_usage =
-        restored_session_token_usage(agent, target_model, &prepared.snapshot.snapshot)
-            .map_err(|error| ResumeInstallError::new(error, false))?;
-    let prepared_scope = prepare_context_scope(&prepared.recorder)
-        .map_err(|error| ResumeInstallError::new(error, false))?;
     let runtime_snapshot = agent
         .validate_runtime_snapshot_restore(prepared.snapshot.snapshot.clone())
+        .map_err(|error| ResumeInstallError::new(error, false))?;
+    let token_usage = match route.as_ref() {
+        Some(route) => {
+            let (usage, prompt_composition) = route
+                .candidate_session_usage_with_composition(agent, &runtime_snapshot)
+                .map_err(|error| ResumeInstallError::new(error, false))?;
+            crate::session::event::TokenUsageEvent::with_breakdown(
+                usage.used_tokens,
+                usage.context_window_tokens,
+                usage.input_tokens,
+                0,
+                0,
+            )
+            .with_prompt_composition(prompt_composition)
+        }
+        None => restored_session_token_usage(agent, target_model, &runtime_snapshot)
+            .map_err(|error| ResumeInstallError::new(error, false))?,
+    };
+    let prepared_scope = prepare_context_scope(&prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, false))?;
     let prepared_fast_mode_disable = agent
         .prepare_fast_mode_auto_disable(target_model)
@@ -392,14 +424,16 @@ pub fn restored_session_token_usage<C: Config>(
     model_id: &str,
     runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
 ) -> Result<crate::session::event::TokenUsageEvent> {
-    let usage = agent.candidate_session_token_usage(model_id, runtime_snapshot)?;
+    let (usage, prompt_composition) =
+        agent.candidate_session_usage_with_composition(model_id, runtime_snapshot)?;
     Ok(crate::session::event::TokenUsageEvent::with_breakdown(
         usage.used_tokens,
         usage.context_window_tokens,
         usage.input_tokens,
         0,
         0,
-    ))
+    )
+    .with_prompt_composition(prompt_composition))
 }
 
 #[cfg(test)]
@@ -559,6 +593,12 @@ mod tests {
             Some(expected_route)
         );
         assert_eq!(agent.model(), "shared");
+        assert!(
+            token_usage
+                .prompt_composition
+                .iter()
+                .any(|entry| entry.category == "system" && entry.estimated_tokens > 0)
+        );
         assert_eq!(
             agent.reasoning_effort(),
             None,

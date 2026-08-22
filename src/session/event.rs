@@ -209,6 +209,15 @@ impl TokenUsageEvent {
             self.prompt_composition = previous.prompt_composition.clone();
         }
     }
+
+    pub fn preserve_context_floor_from(&mut self, previous: &Self) {
+        if self.prompt_composition.is_empty() || self.used_tokens >= previous.used_tokens {
+            return;
+        }
+        let delta = previous.used_tokens.saturating_sub(self.used_tokens);
+        self.used_tokens = previous.used_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(delta);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

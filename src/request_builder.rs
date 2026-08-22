@@ -17,9 +17,8 @@ use crate::config::{ApiProtocol, PromptCacheConfig, PromptCacheRetention};
 use crate::context_view::ContextViewProjection;
 #[cfg(test)]
 use crate::protocol_frames::ProtocolFrameItem;
-use crate::protocol_frames::{
-    ProtocolFrame, history_items_from_frames, validate_history_items_complete,
-};
+pub(crate) use crate::protocol_frames::history_items_from_frames;
+use crate::protocol_frames::{ProtocolFrame, validate_history_items_complete};
 pub use crate::protocol_frames::{
     ProtocolItem as HistoryItem, ProtocolToolCall as HistoryToolCall,
 };
@@ -1001,7 +1000,7 @@ fn runtime_context_history_adapter(
     runtime_projection::runtime_context_history_adapter(snapshot, history, protected_start_index)
 }
 
-fn provider_visible_protocol_frames(snapshot: &RuntimeSnapshot) -> Vec<ProtocolFrame> {
+pub(crate) fn provider_visible_protocol_frames(snapshot: &RuntimeSnapshot) -> Vec<ProtocolFrame> {
     runtime_projection::provider_visible_protocol_frames(snapshot)
 }
 

@@ -113,10 +113,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
             theme,
         );
     }
-    let reserved_rows = mcp_row_count(state).saturating_add(todo_row_count(
-        state,
-        inner.width.saturating_sub(2) as usize,
-    ));
+    let todo_rows = todo_row_count(state, inner.width.saturating_sub(2) as usize);
+    let mcp_rows = mcp_row_count(state, inner.height as usize, lines.len(), todo_rows);
+    let reserved_rows = mcp_rows.saturating_add(todo_rows);
     if let Some(usage) = state
         .active_model_token_usage()
         .filter(|usage| usage.context_window_tokens > 0)
@@ -132,7 +131,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme
         );
     }
 
-    render_mcp_status(&mut lines, state, inner.width as usize, theme);
+    render_mcp_status(&mut lines, state, inner.width as usize, mcp_rows, theme);
 
     if let Some(todo) = state.latest_todo.as_ref() {
         let items = todo.items.iter().collect::<Vec<_>>();
@@ -495,11 +494,26 @@ fn wrapped_context_field(
     ]));
 }
 
-fn mcp_row_count(state: &TuiState) -> usize {
-    usize::from(
-        state.mcp_discovery != crate::tui::state::McpDiscoveryState::Ready
-            || !state.mcp_servers.is_empty(),
-    )
+fn mcp_row_count(
+    state: &TuiState,
+    available_height: usize,
+    current_rows: usize,
+    todo_rows: usize,
+) -> usize {
+    let desired = match state.mcp_discovery {
+        crate::tui::state::McpDiscoveryState::Ready => {
+            usize::from(!state.mcp_servers.is_empty()) + state.mcp_servers.len()
+        }
+        crate::tui::state::McpDiscoveryState::Loading
+        | crate::tui::state::McpDiscoveryState::Unavailable => 1,
+    };
+    let capacity =
+        available_height.saturating_sub(current_rows.saturating_add(todo_rows).saturating_add(1));
+    if desired > 1 && capacity == 1 {
+        0
+    } else {
+        desired.min(capacity)
+    }
 }
 
 fn todo_row_count(state: &TuiState, content_width: usize) -> usize {
@@ -516,72 +530,122 @@ fn todo_row_count(state: &TuiState, content_width: usize) -> usize {
     })
 }
 
-fn render_mcp_status(lines: &mut Vec<Line<'static>>, state: &TuiState, width: usize, theme: Theme) {
+fn render_mcp_status(
+    lines: &mut Vec<Line<'static>>,
+    state: &TuiState,
+    width: usize,
+    row_limit: usize,
+    theme: Theme,
+) {
     use crate::mcp::McpServerStatus;
     use crate::tui::state::McpDiscoveryState;
 
-    if state.mcp_discovery == McpDiscoveryState::Ready && state.mcp_servers.is_empty() {
+    if row_limit == 0 {
         return;
     }
 
-    let (value, color) = match state.mcp_discovery {
-        McpDiscoveryState::Loading => (state.t("sidebar.mcp_loading"), theme.notice),
-        McpDiscoveryState::Unavailable => (state.t("sidebar.mcp_unavailable"), theme.error),
+    match state.mcp_discovery {
+        McpDiscoveryState::Loading => {
+            compact_field(
+                lines,
+                state.t("sidebar.mcp"),
+                &state.t("sidebar.mcp_loading"),
+                width,
+                theme.notice,
+                theme,
+            );
+        }
+        McpDiscoveryState::Unavailable => {
+            compact_field(
+                lines,
+                state.t("sidebar.mcp"),
+                &state.t("sidebar.mcp_unavailable"),
+                width,
+                theme.error,
+                theme,
+            );
+        }
+        McpDiscoveryState::Ready if state.mcp_servers.is_empty() => {}
         McpDiscoveryState::Ready => {
-            let mut online = 0usize;
-            let mut offline = 0usize;
-            let mut disabled = 0usize;
-            let mut tools = 0usize;
-            for server in &state.mcp_servers {
-                match server.status {
-                    McpServerStatus::Online { tool_count } => {
-                        online += 1;
-                        tools = tools.saturating_add(tool_count);
+            lines.push(Line::from(Span::styled(
+                state.t("sidebar.mcp"),
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.element_bg)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for server in state.mcp_servers.iter().take(row_limit.saturating_sub(1)) {
+                let (marker, status, color) = if state.mcp_updating.contains(&server.name) {
+                    ("◌", state.t("status.updating"), theme.warning)
+                } else {
+                    match server.status {
+                        McpServerStatus::Disabled => {
+                            ("○", state.t("status.disabled"), theme.muted_text)
+                        }
+                        McpServerStatus::Online { tool_count } => (
+                            "●",
+                            state.t_fmt(
+                                "sidebar.mcp_server_online",
+                                &[("count", &tool_count.to_string())],
+                            ),
+                            theme.success,
+                        ),
+                        McpServerStatus::Offline { .. } => {
+                            ("●", state.t("status.offline"), theme.error)
+                        }
                     }
-                    McpServerStatus::Offline { .. } => offline += 1,
-                    McpServerStatus::Disabled => disabled += 1,
-                }
-            }
-            if !state.mcp_updating.is_empty() {
-                (
-                    state.t_fmt(
-                        "sidebar.mcp_updating",
-                        &[("count", &state.mcp_updating.len().to_string())],
-                    ),
-                    theme.warning,
-                )
-            } else if offline > 0 {
-                (
-                    state.t_fmt(
-                        "sidebar.mcp_degraded",
-                        &[
-                            ("online", &online.to_string()),
-                            ("offline", &offline.to_string()),
-                        ],
-                    ),
-                    theme.warning,
-                )
-            } else if online > 0 {
-                (
-                    state.t_fmt(
-                        "sidebar.mcp_online",
-                        &[
-                            ("servers", &online.to_string()),
-                            ("tools", &tools.to_string()),
-                        ],
-                    ),
-                    theme.success,
-                )
-            } else {
-                (
-                    state.t_fmt("sidebar.mcp_disabled", &[("count", &disabled.to_string())]),
-                    theme.muted_text,
-                )
+                };
+                lines.push(mcp_server_line(
+                    &server.name,
+                    marker,
+                    &status,
+                    width,
+                    color,
+                    theme,
+                ));
             }
         }
-    };
+    }
+}
 
-    compact_field(lines, state.t("sidebar.mcp"), &value, width, color, theme);
+fn mcp_server_line(
+    name: &str,
+    marker: &str,
+    status: &str,
+    width: usize,
+    color: Color,
+    theme: Theme,
+) -> Line<'static> {
+    let marker_width = display_width(marker).saturating_add(1);
+    if width <= marker_width {
+        return Line::from(Span::styled(
+            truncate_to_width(marker, width),
+            Style::default().fg(color).bg(theme.element_bg),
+        ));
+    }
+    let content_width = width.saturating_sub(marker_width);
+    let status = truncate_to_width(status, content_width);
+    let status_width = display_width(&status);
+    let gap_width = usize::from(status_width > 0 && content_width > status_width);
+    let name_width = content_width.saturating_sub(status_width.saturating_add(gap_width));
+    Line::from(vec![
+        Span::styled(
+            format!("{marker} "),
+            Style::default().fg(color).bg(theme.element_bg),
+        ),
+        Span::styled(
+            padded_label(&truncate_to_width(name, name_width), name_width),
+            Style::default().fg(theme.text).bg(theme.element_bg),
+        ),
+        Span::styled(" ".repeat(gap_width), Style::default().bg(theme.element_bg)),
+        Span::styled(
+            status,
+            Style::default()
+                .fg(color)
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 fn render_panel_guide(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
@@ -975,16 +1039,55 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(
-            rendered.contains("MCP       1 online · 2 tools"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("MCP"), "{rendered}");
+        assert!(rendered.contains("docs"), "{rendered}");
+        assert!(rendered.contains("2 tools"), "{rendered}");
         assert!(rendered.contains("Todos  1"), "{rendered}");
         assert!(rendered.contains("important todo"), "{rendered}");
     }
 
     #[test]
-    fn sidebar_renders_mcp_summary() {
+    fn mcp_list_respects_width_and_height_limits() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_mcp_servers(
+            (0..6)
+                .map(|index| crate::mcp::McpServerCatalogEntry {
+                    name: format!("very-long-mcp-server-name-{index}"),
+                    enabled: true,
+                    status: crate::mcp::McpServerStatus::Online { tool_count: 12 },
+                })
+                .collect(),
+        );
+        let backend = TestBackend::new(24, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &state, frame.area(), Theme::dark()))
+            .expect("draw");
+        let rows = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .skip(y as usize * 24)
+                    .take(24)
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rows.iter().filter(|row| row.contains("12 tools")).count() <= 2,
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(|row| display_width(row) <= 24), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Ctrl-X B")), "{rows:?}");
+    }
+
+    #[test]
+    fn sidebar_renders_mcp_server_list() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
         state.set_mcp_servers(vec![
@@ -1014,10 +1117,12 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(
-            rendered.contains("MCP       1 online · 1 offline"),
-            "{rendered}"
-        );
+        for expected in ["MCP", "docs", "3 tools", "broken", "Offline"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
     }
 
     #[test]
