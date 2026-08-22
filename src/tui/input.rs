@@ -194,12 +194,12 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         return InputAction::CycleReasoningEffort;
     }
 
-    if (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('x')))
-        || matches!(key.code, KeyCode::Char(''))
+    if ((key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('x')))
+        || matches!(key.code, KeyCode::Char('')))
+        && !state.dialog_is_open()
+        && !state.slash_panel_is_open()
     {
-        if !state.dialog_is_open() && !state.slash_panel_is_open() {
-            return InputAction::ChildPrefix;
-        }
+        return InputAction::ChildPrefix;
     }
 
     if state.is_read_only_child_view()

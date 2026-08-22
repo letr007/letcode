@@ -541,7 +541,7 @@ fn spread_bar_boundaries(
     total_units: usize,
     units_per_cell: usize,
 ) -> Vec<usize> {
-    if units.len() < 2 || units_per_cell == 0 || units.iter().any(|units| *units == 0) {
+    if units.len() < 2 || units_per_cell == 0 || units.contains(&0) {
         return units;
     }
 
@@ -562,7 +562,7 @@ fn spread_bar_boundaries(
         let desired = desired.clamp(lower, upper);
         let boundary =
             nearest_visible_boundary(desired, lower, upper, units_per_cell, &mixed_cells);
-        if boundary % units_per_cell != 0 {
+        if !boundary.is_multiple_of(units_per_cell) {
             mixed_cells.insert(boundary / units_per_cell);
         }
         adjusted_boundaries.push(boundary);
@@ -587,7 +587,8 @@ fn nearest_visible_boundary(
     mixed_cells: &std::collections::HashSet<usize>,
 ) -> usize {
     let valid = |boundary: usize| {
-        boundary % units_per_cell == 0 || !mixed_cells.contains(&(boundary / units_per_cell))
+        boundary.is_multiple_of(units_per_cell)
+            || !mixed_cells.contains(&(boundary / units_per_cell))
     };
     if valid(desired) {
         return desired;

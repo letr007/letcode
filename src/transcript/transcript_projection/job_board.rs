@@ -151,10 +151,9 @@ pub(crate) fn project_job_board(
                     if let Some(detail) = detail
                         && let Ok(structured) =
                             serde_json::from_str::<StructuredSubagentResult>(detail)
+                        && entry.status.is_empty()
                     {
-                        if entry.status.is_empty() {
-                            entry.status = structured.status;
-                        }
+                        entry.status = structured.status;
                     }
                 }
             }
