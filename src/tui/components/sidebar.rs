@@ -350,42 +350,118 @@ fn context_bar_line(
         segments.push((output_context_tokens, theme.assistant));
     }
 
+    context_bar_spans(bar_width, target_cells, &segments, theme)
+}
+
+fn context_bar_spans(
+    width: usize,
+    target_cells: usize,
+    segments: &[(u64, Color)],
+    theme: Theme,
+) -> Line<'static> {
+    const UNITS_PER_CELL: usize = 8;
+
+    let target_units = target_cells.saturating_mul(UNITS_PER_CELL);
     let weights = segments
         .iter()
         .map(|(tokens, _)| *tokens)
         .collect::<Vec<_>>();
-    let cells = allocate_bar_cells(&weights, target_cells);
-    let mut spans = segments
-        .into_iter()
-        .zip(cells)
-        .filter(|(_, cells)| *cells > 0)
-        .map(|((_, color), cells)| {
-            Span::styled(
-                "█".repeat(cells),
-                Style::default().fg(color).bg(theme.element_bg),
-            )
-        })
-        .collect::<Vec<_>>();
-    if spans.is_empty() && target_cells > 0 {
-        spans.push(Span::styled(
-            "█".repeat(target_cells),
-            Style::default().fg(theme.accent).bg(theme.element_bg),
-        ));
+    let mut units = allocate_bar_units(&weights, target_units);
+    let fallback_color = segments
+        .iter()
+        .zip(&units)
+        .find_map(|((_, color), units)| (*units > 0).then_some(*color))
+        .unwrap_or(theme.accent);
+    units = spread_bar_boundaries(units, target_units, UNITS_PER_CELL);
+    let mut subcells = Vec::with_capacity(width.saturating_mul(UNITS_PER_CELL));
+    for ((_, color), units) in segments.iter().zip(units) {
+        subcells.extend(std::iter::repeat_n(Some(*color), units));
     }
-    let remaining_cells = bar_width.saturating_sub(target_cells);
-    if remaining_cells > 0 {
-        spans.push(Span::styled(
-            " ".repeat(remaining_cells),
-            Style::default().fg(theme.border).bg(theme.elevated_bg),
-        ));
-    }
-    Line::from(spans)
+    subcells.resize(target_units, Some(fallback_color));
+    subcells.truncate(target_units);
+    subcells.resize(width.saturating_mul(UNITS_PER_CELL), None);
+
+    Line::from(
+        subcells
+            .chunks(UNITS_PER_CELL)
+            .map(|cell| context_bar_cell(cell, theme))
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn allocate_bar_cells(weights: &[u64], target_cells: usize) -> Vec<usize> {
-    let mut cells = vec![0; weights.len()];
-    if target_cells == 0 || weights.is_empty() {
-        return cells;
+fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
+    debug_assert_eq!(cell.len(), 8);
+    if cell.iter().all(|color| *color == cell[0]) {
+        return match cell[0] {
+            Some(color) => Span::styled("█", Style::default().fg(color).bg(theme.element_bg)),
+            None => Span::styled(" ", Style::default().fg(theme.border).bg(theme.elevated_bg)),
+        };
+    }
+
+    let runs =
+        cell.iter()
+            .copied()
+            .fold(Vec::<(Option<Color>, usize)>::new(), |mut runs, color| {
+                if let Some((last_color, count)) = runs.last_mut()
+                    && *last_color == color
+                {
+                    *count += 1;
+                } else {
+                    runs.push((color, 1));
+                }
+                runs
+            });
+    if runs.len() > 2 {
+        let (color, _) = runs
+            .into_iter()
+            .enumerate()
+            .max_by_key(|(index, (_, count))| (*count, *index))
+            .map(|(_, run)| run)
+            .unwrap_or((None, cell.len()));
+        return match color {
+            Some(color) => Span::styled("█", Style::default().fg(color).bg(theme.element_bg)),
+            None => Span::styled(" ", Style::default().fg(theme.border).bg(theme.elevated_bg)),
+        };
+    }
+
+    let split = cell
+        .windows(2)
+        .position(|pair| pair[0] != pair[1])
+        .map_or(cell.len(), |index| index + 1);
+    let foreground = cell[..split]
+        .iter()
+        .flatten()
+        .copied()
+        .next()
+        .unwrap_or(theme.elevated_bg);
+    let background = cell[split..]
+        .iter()
+        .flatten()
+        .copied()
+        .next()
+        .unwrap_or(theme.elevated_bg);
+    Span::styled(
+        partial_context_block(split),
+        Style::default().fg(foreground).bg(background),
+    )
+}
+
+fn partial_context_block(units: usize) -> &'static str {
+    match units.clamp(1, 7) {
+        1 => "▏",
+        2 => "▎",
+        3 => "▍",
+        4 => "▌",
+        5 => "▋",
+        6 => "▊",
+        _ => "▉",
+    }
+}
+
+fn allocate_bar_units(weights: &[u64], target_units: usize) -> Vec<usize> {
+    let mut units = vec![0; weights.len()];
+    if target_units == 0 || weights.is_empty() {
+        return units;
     }
     let positive = weights
         .iter()
@@ -393,19 +469,19 @@ fn allocate_bar_cells(weights: &[u64], target_cells: usize) -> Vec<usize> {
         .filter_map(|(index, weight)| (*weight > 0).then_some(index))
         .collect::<Vec<_>>();
     if positive.is_empty() {
-        return cells;
+        return units;
     }
 
-    let remaining = if positive.len() <= target_cells {
+    let remaining = if positive.len() <= target_units {
         for index in &positive {
-            cells[*index] = 1;
+            units[*index] = 1;
         }
-        target_cells - positive.len()
+        target_units - positive.len()
     } else {
-        target_cells
+        target_units
     };
     if remaining == 0 {
-        return cells;
+        return units;
     }
 
     let total = positive.iter().fold(0u128, |sum, index| {
@@ -416,7 +492,7 @@ fn allocate_bar_cells(weights: &[u64], target_cells: usize) -> Vec<usize> {
     for index in positive {
         let scaled = (weights[index] as u128).saturating_mul(remaining as u128);
         let base = usize::try_from(scaled / total).unwrap_or(remaining);
-        cells[index] = cells[index].saturating_add(base);
+        units[index] = units[index].saturating_add(base);
         allocated = allocated.saturating_add(base);
         remainders.push((scaled % total, index));
     }
@@ -425,9 +501,88 @@ fn allocate_bar_cells(weights: &[u64], target_cells: usize) -> Vec<usize> {
         .into_iter()
         .take(remaining.saturating_sub(allocated))
     {
-        cells[index] = cells[index].saturating_add(1);
+        units[index] = units[index].saturating_add(1);
     }
-    cells
+    units
+}
+
+fn spread_bar_boundaries(
+    units: Vec<usize>,
+    total_units: usize,
+    units_per_cell: usize,
+) -> Vec<usize> {
+    if units.len() < 2 || units_per_cell == 0 || units.iter().any(|units| *units == 0) {
+        return units;
+    }
+
+    let mut original_boundaries = Vec::with_capacity(units.len().saturating_sub(1));
+    let mut cumulative = 0usize;
+    for units in units.iter().take(units.len() - 1) {
+        cumulative = cumulative.saturating_add(*units);
+        original_boundaries.push(cumulative);
+    }
+
+    let mut adjusted_boundaries = Vec::with_capacity(original_boundaries.len());
+    let mut mixed_cells = std::collections::HashSet::new();
+    let mut previous = 0usize;
+    for (index, desired) in original_boundaries.into_iter().enumerate() {
+        let remaining_segments = units.len().saturating_sub(index + 1);
+        let lower = previous.saturating_add(1);
+        let upper = total_units.saturating_sub(remaining_segments);
+        let desired = desired.clamp(lower, upper);
+        let boundary =
+            nearest_visible_boundary(desired, lower, upper, units_per_cell, &mixed_cells);
+        if boundary % units_per_cell != 0 {
+            mixed_cells.insert(boundary / units_per_cell);
+        }
+        adjusted_boundaries.push(boundary);
+        previous = boundary;
+    }
+
+    let mut adjusted = Vec::with_capacity(units.len());
+    let mut start = 0usize;
+    for boundary in adjusted_boundaries {
+        adjusted.push(boundary.saturating_sub(start));
+        start = boundary;
+    }
+    adjusted.push(total_units.saturating_sub(start));
+    adjusted
+}
+
+fn nearest_visible_boundary(
+    desired: usize,
+    lower: usize,
+    upper: usize,
+    units_per_cell: usize,
+    mixed_cells: &std::collections::HashSet<usize>,
+) -> usize {
+    let valid = |boundary: usize| {
+        boundary % units_per_cell == 0 || !mixed_cells.contains(&(boundary / units_per_cell))
+    };
+    if valid(desired) {
+        return desired;
+    }
+
+    let desired_cell = desired / units_per_cell;
+    let next_cell_start = desired_cell
+        .saturating_add(1)
+        .saturating_mul(units_per_cell);
+    let next_cell_boundary = next_cell_start.saturating_add(1);
+    if next_cell_boundary >= lower && next_cell_boundary <= upper && valid(next_cell_boundary) {
+        return next_cell_boundary;
+    }
+
+    for distance in 1..=upper.saturating_sub(lower) {
+        let left = desired.saturating_sub(distance);
+        if left >= lower && valid(left) {
+            return left;
+        }
+        let right = desired.saturating_add(distance);
+        if right <= upper && valid(right) {
+            return right;
+        }
+    }
+    desired
 }
 
 fn context_composition_color(
@@ -943,15 +1098,29 @@ mod tests {
 
         assert!(rendered.contains("Messages        10.0k"), "{rendered}");
         assert!(rendered.contains("Output          2.0k"), "{rendered}");
-        let bar = terminal
+        let bar_cells = terminal
             .backend()
             .buffer()
             .content()
             .chunks(42)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .find(|row| row.matches('█').count() > 0)
+            .filter(|row| row.iter().any(|cell| "█▉▊▋▌▍▎▏".contains(cell.symbol())))
+            .max_by_key(|row| {
+                row.iter()
+                    .filter(|cell| "█▉▊▋▌▍▎▏".contains(cell.symbol()))
+                    .count()
+            })
             .expect("context bar");
-        assert_eq!(bar.matches('█').count(), 22, "{bar}");
+        assert_eq!(
+            bar_cells.iter().filter(|cell| cell.symbol() == "█").count(),
+            21
+        );
+        assert_eq!(
+            bar_cells
+                .iter()
+                .filter(|cell| "▉▊▋▌▍▎▏".contains(cell.symbol()))
+                .count(),
+            2
+        );
         assert!(rendered.contains("Remaining       8.0k"), "{rendered}");
     }
 
@@ -1243,19 +1412,125 @@ mod tests {
         ];
         let line = context_bar_line(20, &composition, 10_000, 10_000, 0, 20_000, Theme::dark());
         assert_eq!(line.width(), 20);
-        assert_eq!(line.spans[0].content.chars().count(), 4);
-        assert_eq!(line.spans[1].content.chars().count(), 6);
-        assert_eq!(line.spans[2].content.chars().count(), 10);
-        assert_eq!(line.spans[2].style.bg, Some(Theme::dark().elevated_bg));
+        assert_eq!(line.spans.len(), 20);
+        assert_eq!(
+            line.spans
+                .iter()
+                .filter(|span| span.style.bg == Some(Theme::dark().elevated_bg))
+                .count(),
+            10
+        );
     }
 
     #[test]
     fn context_bar_keeps_small_positive_categories_visible() {
-        let cells = allocate_bar_cells(&[7_600, 7_300, 4_100, 668_800, 4_600], 43);
+        let units = spread_bar_boundaries(
+            allocate_bar_units(&[7_600, 7_300, 4_100, 668_800, 4_600], 43 * 8),
+            43 * 8,
+            8,
+        );
 
-        assert_eq!(cells.iter().sum::<usize>(), 43);
-        assert!(cells.iter().all(|cells| *cells >= 1), "{cells:?}");
-        assert!(cells[3] > cells[0]);
+        assert_eq!(units.iter().sum::<usize>(), 43 * 8);
+        assert!(units.iter().all(|units| *units >= 1), "{units:?}");
+        assert!(units[3] > units[0]);
+        let boundaries = units
+            .iter()
+            .scan(0usize, |total, units| {
+                *total += *units;
+                Some(*total)
+            })
+            .take(units.len() - 1)
+            .filter(|boundary| *boundary % 8 != 0)
+            .map(|boundary| boundary / 8)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            boundaries
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            boundaries.len(),
+            "{units:?}"
+        );
+    }
+
+    #[test]
+    fn context_bar_small_categories_use_two_color_cells() {
+        let theme = Theme::dark();
+        let segments = [
+            (7_600, theme.notice),
+            (7_300, theme.warning),
+            (4_100, theme.success),
+            (668_800, theme.user),
+            (4_600, theme.error),
+        ];
+        let line = context_bar_spans(43, 43, &segments, theme);
+
+        assert_eq!(line.width(), 43);
+        for pair in segments.windows(2) {
+            assert!(
+                line.spans.iter().any(|span| {
+                    span.style.fg == Some(pair[0].1)
+                        && span.style.bg == Some(pair[1].1)
+                        && "▉▊▋▌▍▎▏".contains(span.content.as_ref())
+                }),
+                "missing boundary for {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_bar_falls_back_to_used_color_without_composition() {
+        let theme = Theme::dark();
+        let line = context_bar_spans(4, 2, &[], theme);
+
+        assert_eq!(line.width(), 4);
+        assert_eq!(line.spans[0].style.fg, Some(theme.accent));
+        assert_eq!(line.spans[1].style.fg, Some(theme.accent));
+        assert_eq!(line.spans[2].content.as_ref(), " ");
+        assert_eq!(line.spans[3].content.as_ref(), " ");
+    }
+
+    #[test]
+    fn context_bar_cell_uses_dominant_run_when_three_colors_share_a_cell() {
+        let theme = Theme::dark();
+        let cell = [
+            Some(theme.notice),
+            Some(theme.warning),
+            Some(theme.success),
+            Some(theme.success),
+            Some(theme.success),
+            Some(theme.user),
+            Some(theme.user),
+            Some(theme.user),
+        ];
+        let span = context_bar_cell(&cell, theme);
+
+        assert_eq!(span.content.as_ref(), "█");
+        assert_eq!(span.style.fg, Some(theme.user));
+        assert_eq!(span.style.bg, Some(theme.element_bg));
+    }
+
+    #[test]
+    fn context_bar_handles_more_categories_than_subcells() {
+        let theme = Theme::dark();
+        let colors = [
+            theme.user,
+            theme.accent,
+            theme.approval,
+            theme.assistant,
+            theme.notice,
+            theme.warning,
+            theme.success,
+            theme.error,
+        ];
+        let segments = (0..12)
+            .map(|index| (1, colors[index % colors.len()]))
+            .collect::<Vec<_>>();
+        let line = context_bar_spans(1, 1, &segments, theme);
+
+        assert_eq!(line.width(), 1);
+        assert_eq!(line.spans.len(), 1);
     }
 
     #[test]
@@ -1286,16 +1561,15 @@ mod tests {
             200,
             Theme::dark(),
         );
-        let filled = |line: &Line<'_>| {
+        let filled_cells = |line: &Line<'_>| {
             line.spans
                 .iter()
-                .filter(|span| span.style.bg == Some(Theme::dark().element_bg))
-                .map(|span| span.content.chars().count())
-                .sum::<usize>()
+                .filter(|span| span.content.as_ref() != " ")
+                .count()
         };
 
-        assert_eq!(filled(&before), 24);
-        assert_eq!(filled(&after), 24);
+        assert_eq!(filled_cells(&before), 24);
+        assert_eq!(filled_cells(&after), 24);
     }
 
     #[test]
