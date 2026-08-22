@@ -7,21 +7,28 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-22
+
 ### Added
 
 - 会话面板新增上下文组成明细和 MCP 服务器列表，逐项展示发现、在线工具数、离线、禁用与更新状态。
+- Windows 测试加入持续集成矩阵，覆盖平台专用文件写入、补丁和路径安全行为。
 
 ### Changed
 
 - 会话面板在上下文分支与用量无法同行显示时自动换行，TODO 长文本按面板宽度完整折行，不再以省略号截断。
 - 会话面板的上下文、MCP 与 TODO 区块支持点击三角箭头折叠或展开；上下文节点名称与占用明细分层展示，上下文用量以每次请求完成后的服务商返回为准。
 - 会话面板内容超出可见高度时支持面板区域鼠标滚轮独立滚动；上下文明细与 MCP 列表之间保留空行。
+- Windows 的 shell 命令使用 `cmd.exe` 原生命令行语义；shell 与本地 MCP 共用跨平台进程树生命周期管理。
 
 ### Fixed
 
 - `/resume` 兼容开发期间写入的旧版 prompt composition 记录结构，避免单个旧会话导致会话列表解析失败。
 - 恢复会话时立即从目标快照重建上下文组成，无需等到发送下一条消息才显示明细。
 - 会话面板的上下文占用只统计实际输入上下文，不再将当前响应输出显示为独立分类；上下文组成条使用八分之一格和前景/背景双色边界，提高小分类的显示精度。
+- Windows 的 `fs__write`、`fs__append` 和 `edit__apply_patch` 可正常写入，并通过目录/文件句柄约束授权后的目标变化。
+- Windows 命令与本地 MCP 在取消、超时或关闭时终止完整进程树，正常结束时保留有意启动的后台进程。
+- Windows 配置和会话索引支持文件锁与替换已有目标，配置更新会拒绝覆盖读取后已被替换的文件实例。
 
 ## [0.6.0] - 2026-08-21
 
@@ -173,7 +180,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/letr007/letcode/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/letr007/letcode/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/letr007/letcode/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/letr007/letcode/compare/v0.5.0...v0.5.1
