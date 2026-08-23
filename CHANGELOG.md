@@ -7,6 +7,23 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-23
+
+### Added
+
+- 子代理工具新增 `background` 运行模式；只读专家可在后台继续执行，父会话立即获得运行回执，并在结果返回后自动衔接当前任务。
+
+### Changed
+
+- 推理强度作为会话设置按完整模型路由持久化，恢复会话、切换模型和重载配置后保持对应选择。
+- 左下角状态指示跟随当前可见视图：父会话视图显示父会话状态，子代理视图显示对应子代理的运行、等待授权、完成或错误状态。
+
+### Fixed
+
+- 后台子代理使用会话级事件通道，父回合结束后 reasoning、工具调用和输出仍会实时更新子代理视图，并在完成时更新父级工具卡。
+- 后台结果通过内部 continuation 合并回父会话，不再生成空白用户消息。
+- 中断父回合时不再误取消仍在运行的后台子代理；关闭会话时仍会统一结算活动任务。
+
 ## [0.6.1] - 2026-08-22
 
 ### Added
@@ -180,7 +197,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/letr007/letcode/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/letr007/letcode/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/letr007/letcode/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/letr007/letcode/compare/v0.5.1...v0.5.2
