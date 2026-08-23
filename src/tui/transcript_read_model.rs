@@ -192,6 +192,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::FoldedOutputMetadata { .. }
             | TranscriptEvent::TurnStarted(_)
             | TranscriptEvent::ModelChanged { .. }
+            | TranscriptEvent::ReasoningEffortChanged { .. }
             | TranscriptEvent::ExpertModelChanged { .. }
             | TranscriptEvent::PermissionModeChanged { .. }
             | TranscriptEvent::AutoContinuationScheduled { .. }

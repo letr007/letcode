@@ -49,6 +49,7 @@ pub enum InternalContinuationSource {
     AutoContinue,
     StreamRecovery,
     LogicalCheckpoint,
+    SubagentCompletion,
 }
 
 /// Durable, provider-facing facts retained when a logical segment is closed.
@@ -150,7 +151,7 @@ pub(crate) use restore::{
 };
 pub use restore::{
     restore_latest_auto_continue_state, restore_latest_expert_models, restore_latest_model,
-    restore_latest_permission_mode, restore_latest_todo_snapshot,
+    restore_latest_permission_mode, restore_latest_reasoning_effort, restore_latest_todo_snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

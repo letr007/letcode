@@ -257,6 +257,7 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
                 max_tool_calls: template.max_tool_calls,
                 model: None,
                 target_child_session_id: takeover.clone(),
+                background: false,
             };
             let governance = SubagentRunGovernance {
                 timeout_secs: input.effective_timeout_secs(template.timeout_secs),

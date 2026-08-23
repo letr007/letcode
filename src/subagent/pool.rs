@@ -214,6 +214,30 @@ impl SubagentPool {
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
         event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<SubagentRunSummary> {
+        self.complete_started_run(self.start_named_governed(
+            parent,
+            agent_name,
+            invocation,
+            sessions_dir,
+            parent_session_id,
+            parent_turn_id,
+            parent_transcript,
+            event_sender,
+        )?)
+        .await
+    }
+
+    pub fn start_named_governed<C: Config + Clone + Send + Sync + 'static>(
+        &self,
+        parent: &Agent<C>,
+        agent_name: &str,
+        invocation: SubagentInvocation,
+        sessions_dir: impl AsRef<Path>,
+        parent_session_id: String,
+        parent_turn_id: String,
+        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
+        event_sender: Option<SubagentEventSender<C>>,
+    ) -> Result<StartedSubagentRun<C>> {
         let template = AgentTemplate::from_name(agent_name)
             .ok_or_else(|| anyhow!("unknown subagent template: {agent_name}"))?;
         let governance = SubagentRunGovernance::from_template_and_input(
@@ -221,10 +245,11 @@ impl SubagentPool {
             invocation.input.clone(),
             invocation.model.clone(),
         );
-        self.run_with_executor(
+        let task = invocation.prompt;
+        let run = self.start_run(
             parent,
             template,
-            invocation.prompt,
+            task.clone(),
             governance,
             sessions_dir.as_ref().to_path_buf(),
             parent_session_id,
@@ -233,6 +258,29 @@ impl SubagentPool {
             event_sender
                 .map(|sender| sender.with_parent_tool_call_id(invocation.parent_tool_call_id)),
             invocation.input.target_child_session_id.clone(),
+        )?;
+        let receipt = run
+            .guard
+            .active_by_agent
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&run.agent_name).map(|slot| slot.child.clone()))
+            .ok_or_else(|| anyhow!("started subagent slot is unavailable"))?;
+        Ok(StartedSubagentRun {
+            run_id: run.run_id.clone(),
+            receipt,
+            run,
+            task,
+        })
+    }
+
+    pub async fn complete_started_run<C: Config + Clone + Send + Sync + 'static>(
+        &self,
+        started: StartedSubagentRun<C>,
+    ) -> Result<SubagentRunSummary> {
+        complete_started_run(
+            started.run,
+            started.task,
             |agent, prompt, transcript, event_sender, child_session_id, agent_name| {
                 async move {
                     run_child_prompt(
@@ -567,6 +615,23 @@ impl SubagentPool {
         format!(
             "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel"
         )
+    }
+}
+
+pub struct StartedSubagentRun<C: Config> {
+    run_id: String,
+    receipt: ChildSessionSummary,
+    run: StartedRun<C>,
+    task: String,
+}
+
+impl<C: Config> StartedSubagentRun<C> {
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn receipt(&self) -> &ChildSessionSummary {
+        &self.receipt
     }
 }
 

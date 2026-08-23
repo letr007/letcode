@@ -78,8 +78,45 @@ mod tests {
                 max_tool_calls: None,
                 model: None,
                 target_child_session_id: None,
+                background: false,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn started_named_run_exposes_receipt_before_completion() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let mut invocation_input = test_governance().input;
+        invocation_input.background = true;
+        let invocation = crate::agent::SubagentInvocation {
+            prompt: "test".into(),
+            input: invocation_input,
+            model: None,
+            parent_tool_call_id: Some("call-bg".into()),
+        };
+        let started = runtime
+            .start_named_governed(
+                &agent,
+                "explorer",
+                invocation,
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                None,
+            )
+            .expect("background run starts");
+
+        assert_eq!(started.receipt().agent_name, "explorer");
+        assert_eq!(started.receipt().status, "running");
+        assert!(runtime.is_running());
+        runtime.cancel_active();
+        let result = runtime
+            .complete_started_run(started)
+            .await
+            .expect("cancelled run settles");
+        assert_eq!(result.status, SubagentStatus::Cancelled);
     }
 
     async fn wait_until<F>(mut condition: F)

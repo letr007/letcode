@@ -418,7 +418,9 @@ where
     let mut protected_start_index = agent.active_history_items().len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
-    if let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content)) {
+    if !user_content.has_no_parts()
+        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
+    {
         agent.turn.current_turn_start_index = previous_turn_start_index;
         return Err(error);
     }
@@ -1187,7 +1189,9 @@ where
     let mut protected_start_index = agent.active_history_items().len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
-    if let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content)) {
+    if !user_content.has_no_parts()
+        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
+    {
         agent.turn.current_turn_start_index = previous_turn_start_index;
         return Err(error);
     }

@@ -569,6 +569,19 @@ pub(crate) fn restore_latest_permission_mode_projection(
     mode
 }
 
+pub(crate) fn restore_latest_reasoning_effort_projection(
+    records: &[TranscriptRecord],
+    model_id: &str,
+) -> Option<crate::request_builder::ModelReasoningEffort> {
+    records.iter().rev().find_map(|record| match &record.event {
+        TranscriptEvent::ReasoningEffortChanged {
+            model_id: recorded_model,
+            effort,
+        } if recorded_model == model_id => Some(effort.clone()),
+        _ => None,
+    })
+}
+
 pub(crate) fn restore_max_turn_id_projection(records: &[TranscriptRecord]) -> u64 {
     records
         .iter()

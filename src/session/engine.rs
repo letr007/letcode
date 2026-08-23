@@ -191,7 +191,9 @@ impl SessionEngine {
     pub(crate) fn new() -> (Self, SessionEngineIngress, SessionEngineEventEgress) {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let ingress = SessionEngineIngress { control_tx };
+        let ingress = SessionEngineIngress {
+            control_tx: control_tx.clone(),
+        };
         (
             Self {
                 control_rx: Some(control_rx),
@@ -234,7 +236,9 @@ impl SessionEngine {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let title_event_tx = event_tx.clone();
-        let ingress = SessionEngineIngress { control_tx };
+        let ingress = SessionEngineIngress {
+            control_tx: control_tx.clone(),
+        };
         let (reload_tx, reload_rx) = mpsc::unbounded_channel();
         let config_path = config.mcp_config_path.clone();
         let reload_watcher = create_config_watcher(&config_path, reload_tx)?;
@@ -265,6 +269,7 @@ impl SessionEngine {
             mcp_tools_rx,
             reload_rx,
             control_rx,
+            control_tx.clone(),
             event_tx.clone(),
             title_event_tx,
             subagent_runtime,
@@ -398,13 +403,16 @@ impl SessionEngine {
     #[cfg(test)]
     pub(crate) fn into_session_executor_parts(
         self,
+        control_tx: mpsc::UnboundedSender<SessionEngineControl>,
     ) -> (
         mpsc::UnboundedReceiver<SessionEngineControl>,
+        mpsc::UnboundedSender<SessionEngineControl>,
         mpsc::UnboundedSender<SessionTransportEvent>,
     ) {
         (
             self.control_rx
                 .expect("test engine control receiver unavailable"),
+            control_tx,
             self.event_tx.expect("test engine event sender unavailable"),
         )
     }
@@ -986,6 +994,7 @@ async fn run_engine_loop(
     mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
     mut reload_rx: mpsc::UnboundedReceiver<()>,
     mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
+    control_tx: mpsc::UnboundedSender<SessionEngineControl>,
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     title_event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     subagent_runtime: SubagentPool,
@@ -1328,6 +1337,11 @@ async fn run_engine_loop(
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                                 model_id: model_id.clone(),
                             });
+                            if let Some(effort) = agent.reasoning_effort() {
+                                let _ = session_transport_tx.send(
+                                    SessionTransportEvent::ReasoningEffortChanged { effort },
+                                );
+                            }
                             let _ = session_transport_tx.send(SessionTransportEvent::AnchoredChanged {
                                 active: agent.anchored_active(),
                             });
@@ -1476,6 +1490,67 @@ async fn run_engine_loop(
                     continue;
                 }
 
+                if let SessionEngineCommand::BackgroundSubagentCompleted {
+                    parent_session_id,
+                    parent_tool_call_id,
+                    result,
+                } = command
+                {
+                    let current_session_id = transcript
+                        .lock()
+                        .ok()
+                        .map(|recorder| recorder.session_id().to_string());
+                    if current_session_id.as_deref() != Some(parent_session_id.as_str()) {
+                        continue;
+                    }
+                    let prompt = match result {
+                        Ok(result) => {
+                            if let Err(error) = agent.install_background_subagent_result(&result) {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(format!(
+                                        "failed to install background subagent result: {error}"
+                                    )),
+                                ));
+                                continue;
+                            }
+                            let _ = session_transport_tx.send(
+                                SessionTransportEvent::BackgroundSubagentCompleted {
+                                    parent_tool_call_id,
+                                    result: result.clone(),
+                                },
+                            );
+                            format_background_subagent_completion(&result)
+                        }
+                        Err(error) => format!(
+                            "A background subagent failed before producing a structured result.\n\n{error}\n\nContinue the user's task and account for this failure."
+                        ),
+                    };
+                    if let Err(error) = agent
+                        .begin_internal_continuation_turn(&prompt)
+                        .and_then(|()| {
+                            transcript
+                                .lock()
+                                .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                .and_then(|mut recorder| {
+                                    recorder.record_internal_continuation(
+                                        prompt.clone(),
+                                        crate::transcript::InternalContinuationSource::SubagentCompletion,
+                                    )
+                                })
+                                .and_then(|()| agent.append_internal_continuation(prompt))
+                        })
+                    {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!(
+                                "failed to record background subagent continuation: {error}"
+                            )),
+                        ));
+                        continue;
+                    }
+                    deferred_commands.push_front(SessionEngineCommand::ContinueSession);
+                    continue;
+                }
+
                 let prompt = match command {
                     SessionEngineCommand::ToggleMcpServer(server_name) => {
                         let Some(server_config) = mcp_config.get(&server_name).cloned() else {
@@ -1575,6 +1650,15 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::Prompt(prompt) => prompt,
+                    SessionEngineCommand::ContinueSession => {
+                        crate::user_content::UserMessageSubmission::new(
+                            "internal-continuation",
+                            crate::user_content::UserMessageContent::default(),
+                        )
+                    }
+                    SessionEngineCommand::BackgroundSubagentCompleted { .. } => {
+                        unreachable!("background completion was handled above")
+                    }
                     SessionEngineCommand::ShowHistoryTree
                     | SessionEngineCommand::Undo
                     | SessionEngineCommand::Redo
@@ -2046,6 +2130,10 @@ async fn run_engine_loop(
                                 .map(|(name, route)| (name.clone(), route.display_name()))
                                 .collect(),
                         });
+                        if let Some(effort) = agent.reasoning_effort() {
+                            let _ = session_transport_tx
+                                .send(SessionTransportEvent::ReasoningEffortChanged { effort });
+                        }
                         continue;
                     }
                     SessionEngineCommand::NewSession => {
@@ -2221,9 +2309,18 @@ async fn run_engine_loop(
                             .unwrap_or_else(|error| error.into_inner())
                             .clone(),
                         api_key_hint.clone(),
+                        Some(control_tx.clone()),
+                        Some(session_transport_tx.clone()),
                     );
                 let (interrupted, shutdown) = {
-                    let run = runner.run_prompt(&mut agent, prompt);
+                    let run: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
+                    > =
+                        if prompt.content.is_empty() {
+                            Box::pin(runner.continue_session(&mut agent))
+                        } else {
+                            Box::pin(runner.run_prompt(&mut agent, prompt))
+                        };
                     tokio::pin!(run);
                     let mut interrupted = None;
                     let mut shutdown = false;
@@ -2251,7 +2348,7 @@ async fn run_engine_loop(
                                     &subagent_runtime,
                                 );
                                 interrupted = Some(interrupt);
-                                if subagent_runtime.is_running() {
+                                if is_shutdown && subagent_runtime.is_running() {
                                     subagent_runtime.cancel_active();
                                     let settle_shutdown = wait_for_subagent_cancel_settle(
                                         &mut control_rx,
@@ -2341,7 +2438,6 @@ async fn run_engine_loop(
                 };
 
                 if let Some(interrupt) = interrupted {
-                    subagent_runtime.cancel_active();
                     record_interrupt_transcript(&transcript, &interrupt);
                     if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
                         let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
@@ -2418,6 +2514,21 @@ async fn run_engine_loop(
             }
         }
     }
+}
+
+pub(crate) fn format_background_subagent_completion(
+    result: &crate::subagent::SubagentRunSummary,
+) -> String {
+    let structured = serde_json::to_string_pretty(&result.structured_result)
+        .unwrap_or_else(|_| result.summary.clone());
+    format!(
+        "A background subagent has completed.\n\nagent: {}\nrun_id: {}\nchild_session_id: {}\nstatus: {}\n\n{}\n\nContinue the user's task using this result. Do not repeat work already completed.",
+        result.agent_name,
+        result.run_id,
+        result.child_session_id,
+        result.status.as_str(),
+        structured
+    )
 }
 
 #[cfg(test)]

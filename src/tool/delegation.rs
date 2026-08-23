@@ -26,6 +26,8 @@ pub struct NormalizedSubagentInput {
     pub max_tool_calls: Option<usize>,
     pub model: Option<String>,
     pub target_child_session_id: Option<String>,
+    #[serde(default)]
+    pub background: bool,
 }
 
 impl NormalizedSubagentInput {
@@ -430,7 +432,21 @@ pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<Normali
         max_tool_calls: optional_u64(args, "max_tool_calls")?.map(|value| value as usize),
         model,
         target_child_session_id,
+        background: optional_bool(args, "background")?.unwrap_or(false),
     })
+}
+
+fn optional_bool(args: &Value, field: &str) -> Result<Option<bool>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| anyhow!("field '{field}' must be a boolean or null"))
 }
 
 fn optional_trimmed_string(args: &Value, field: &str) -> Result<Option<String>> {
@@ -542,6 +558,10 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
             "target_child_session_id": {
                 "type": ["string", "null"],
                 "description": "接替已有终态子会话并复用其上下文；省略则新建子代理会话"
+            },
+            "background": {
+                "type": ["boolean", "null"],
+                "description": "true=在后台运行并立即返回；完成后自动通知父会话。默认 false，等待结果后再继续"
             }
         },
         // OpenAI strict tool schemas require every properties key to appear in
@@ -554,7 +574,8 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
             "forbidden_paths",
             "owned_paths",
             "model",
-            "target_child_session_id"
+            "target_child_session_id",
+            "background"
         ],
         "additionalProperties": false
     })

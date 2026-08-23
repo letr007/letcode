@@ -102,6 +102,13 @@ pub fn restore_latest_permission_mode(records: &[TranscriptRecord]) -> Option<St
     transcript_projection::restore_latest_permission_mode_projection(records)
 }
 
+pub fn restore_latest_reasoning_effort(
+    records: &[TranscriptRecord],
+    model_id: &str,
+) -> Option<crate::request_builder::ModelReasoningEffort> {
+    transcript_projection::restore_latest_reasoning_effort_projection(records, model_id)
+}
+
 #[cfg(test)]
 pub(crate) fn restore_session_evidence(
     records: &[TranscriptRecord],

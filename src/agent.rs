@@ -2568,6 +2568,17 @@ impl<C: Config> Agent<C> {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn execute_subagent_tool_with_parent_call_for_test(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        parent_tool_call_id: String,
+    ) -> ToolResult {
+        self.execute_subagent_tool_for_call(tool_name, args, Some(parent_tool_call_id))
+            .await
+    }
+
     async fn execute_subagent_tool_for_call(
         &self,
         tool_name: &str,
@@ -3459,6 +3470,55 @@ impl<C: Config> Agent<C> {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn append_internal_continuation(&mut self, text: String) -> Result<()> {
+        self.append_history_item(HistoryItem::internal_continuation(text))
+    }
+
+    pub(crate) fn begin_internal_continuation_turn(&mut self, text: &str) -> Result<()> {
+        let _ = self.try_prepare_turn_prelude_with_skills(text, &[])?;
+        Ok(())
+    }
+
+    pub(crate) fn install_background_subagent_result(
+        &mut self,
+        result: &crate::subagent::SubagentRunSummary,
+    ) -> Result<()> {
+        let parent_tool = subagent_tool_name_for_agent_name(&result.agent_name)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("agent__{}", result.agent_name));
+        let record = ToolExecutionRecord {
+            call_id: format!("background-{}", result.run_id),
+            tool_name: parent_tool.clone(),
+            arguments: Some(serde_json::json!({ "background": true })),
+            permission_class: crate::permission::ToolPermissionClass::Preview,
+            directive: self.turn.policy.directive,
+            status: ToolExecutionStatus::Executed,
+            rejection: None,
+            output: ToolResult::ok(
+                parent_tool,
+                serde_json::json!({
+                    "run_id": result.run_id,
+                    "child_session_id": result.child_session_id,
+                    "agent_name": result.agent_name,
+                    "status": result.status.as_str(),
+                    "summary": result.summary,
+                    "structured_result": result.structured_result,
+                    "active": false,
+                    "background": true,
+                }),
+            ),
+            effects: ToolEffects {
+                kind: ToolEffectKind::Read,
+                primary_path: None,
+                edited_paths: result.structured_result.files_changed.clone(),
+                command: None,
+            },
+        };
+        self.record_subagent_effects(&record);
+        let _ = self.remember_tool_evidence(&record)?;
+        Ok(())
     }
 
     fn record_subagent_effects(&mut self, record: &ToolExecutionRecord) {

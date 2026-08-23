@@ -192,6 +192,10 @@ impl UserMessageContent {
             )
     }
 
+    pub fn has_no_parts(&self) -> bool {
+        self.selected_skills.is_empty() && self.parts().is_empty()
+    }
+
     pub fn trim_outer_text(&mut self) {
         let mut parts = self.parts();
         if let Some(UserMessagePart::Text { text }) = parts.first_mut() {

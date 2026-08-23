@@ -63,7 +63,8 @@ mod history;
 
 pub(crate) use history::{
     restore_latest_model_projection, restore_latest_permission_mode_projection,
-    restore_max_turn_id_projection, restore_session_history_projection,
+    restore_latest_reasoning_effort_projection, restore_max_turn_id_projection,
+    restore_session_history_projection,
 };
 
 use history::{

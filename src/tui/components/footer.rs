@@ -732,14 +732,15 @@ fn phase_style(phase: AppPhase, theme: Theme) -> Style {
 }
 
 fn phase_indicator_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
-    match state.phase {
+    let phase = state.active_phase();
+    match phase {
         AppPhase::Running => scanner_frame_spans(state.status_spinner_frame, theme),
         AppPhase::Idle | AppPhase::Editing | AppPhase::Completed => {
-            vec![Span::styled("◆", phase_style(state.phase, theme))]
+            vec![Span::styled("◆", phase_style(phase, theme))]
         }
-        AppPhase::WaitingForPermission => vec![Span::styled("▲", phase_style(state.phase, theme))],
-        AppPhase::Error => vec![Span::styled("◆", phase_style(state.phase, theme))],
-        AppPhase::Quitting => vec![Span::styled("◇", phase_style(state.phase, theme))],
+        AppPhase::WaitingForPermission => vec![Span::styled("▲", phase_style(phase, theme))],
+        AppPhase::Error => vec![Span::styled("◆", phase_style(phase, theme))],
+        AppPhase::Quitting => vec![Span::styled("◇", phase_style(phase, theme))],
     }
 }
 
@@ -894,6 +895,55 @@ mod tests {
 
         assert!(line.width() <= 24, "{rendered}");
         assert!(rendered.contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn footer_phase_indicator_tracks_the_visible_child_session() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::Completed;
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        state.set_child_view_phase_for_test(AppPhase::WaitingForPermission);
+
+        let rendered = footer_status_spans(&state, crate::tui::Theme::dark())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(state.active_phase(), AppPhase::WaitingForPermission);
+        assert_eq!(rendered, "▲");
+    }
+
+    #[test]
+    fn footer_phase_indicator_returns_to_parent_session_state() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::Running;
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        state.set_child_view_phase_for_test(AppPhase::Completed);
+        assert_eq!(state.active_phase(), AppPhase::Completed);
+
+        state.transcript_view = crate::tui::state::TranscriptViewState::Parent;
+
+        assert_eq!(state.active_phase(), AppPhase::Running);
+        assert_eq!(
+            footer_status_spans(&state, crate::tui::Theme::dark()).len(),
+            8
+        );
     }
 
     #[test]

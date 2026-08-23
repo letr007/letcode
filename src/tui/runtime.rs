@@ -1062,6 +1062,13 @@ impl TuiRuntime {
                     ToastKind::Success,
                 );
             }
+            SessionTransportEvent::BackgroundSubagentCompleted {
+                parent_tool_call_id,
+                result,
+            } => {
+                self.state
+                    .update_background_subagent_result(parent_tool_call_id.as_deref(), result);
+            }
             SessionTransportEvent::SettingChangeFailed { command } => {
                 self.clear_failed_pending_setting(command);
                 suppress_session_event = true;

@@ -1068,6 +1068,7 @@ mod tests {
             max_tool_calls: None,
             model: None,
             target_child_session_id: None,
+            background: false,
         };
         assert!(
             SubagentPathScope::from_input(&empty)
@@ -1521,6 +1522,25 @@ mod tests {
         )
         .expect("model override normalizes");
         assert_eq!(input.model.as_deref(), Some("expert/special"));
+        assert!(!input.background);
+
+        let background = normalize_subagent_input(
+            "agent__explore",
+            &json!({"objective": "inspect", "background": true}),
+        )
+        .expect("background flag normalizes");
+        assert!(background.background);
+
+        let invalid_background = normalize_subagent_input(
+            "agent__explore",
+            &json!({"objective": "inspect", "background": "yes"}),
+        )
+        .expect_err("non-boolean background should fail");
+        assert!(
+            invalid_background
+                .to_string()
+                .contains("field 'background' must be a boolean or null")
+        );
 
         let error = normalize_subagent_input(
             "agent__explore",

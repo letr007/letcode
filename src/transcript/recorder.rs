@@ -283,6 +283,17 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_reasoning_effort_changed(
+        &mut self,
+        model_id: impl Into<String>,
+        effort: crate::request_builder::ModelReasoningEffort,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::ReasoningEffortChanged {
+            model_id: model_id.into(),
+            effort,
+        })
+    }
+
     pub fn set_current_context_branch_id(&mut self, branch_id: Option<String>) {
         self.current_context_branch_id = branch_id;
     }
@@ -1385,6 +1396,7 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
         event,
         TranscriptEvent::SessionStarted { .. }
             | TranscriptEvent::ModelChanged { .. }
+            | TranscriptEvent::ReasoningEffortChanged { .. }
             | TranscriptEvent::ExpertModelChanged { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::SubagentResult { .. }

@@ -18,10 +18,11 @@ use crate::session::AgentRunner;
 use crate::session::engine::{
     ActiveSessionOperation, InterruptRequest, ManualCompactionOperation, SessionEngineCommand,
     SessionEngineControl, derive_interrupt_request, enqueue_deferred_command,
-    flush_parked_commands, initial_session_metadata, manual_compaction_session_token_usage,
-    next_idle_session_command, park_active_turn_command, record_interrupt_transcript,
-    rehydrate_agent_from_transcript, run_manual_compaction, select_active_session_operation,
-    select_manual_compaction_operation, send_subagent_interrupted, wait_for_subagent_cancel_settle,
+    flush_parked_commands, format_background_subagent_completion, initial_session_metadata,
+    manual_compaction_session_token_usage, next_idle_session_command, park_active_turn_command,
+    record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
+    select_active_session_operation, select_manual_compaction_operation, send_subagent_interrupted,
+    wait_for_subagent_cancel_settle,
 };
 use crate::session::restore::restored_session_token_usage;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
@@ -4173,13 +4174,17 @@ fn start_session_executor_harness_with_poll_gate(
 ) -> SessionExecutorHarness {
     let (engine, ingress, egress) = SessionEngine::new();
     let event_rx = egress.into_receiver();
-    let (control_rx, session_transport_tx) = engine.into_session_executor_parts();
+    let (background_control_tx, background_control_rx) = mpsc::unbounded_channel();
+    let (control_rx, control_tx, session_transport_tx) =
+        engine.into_session_executor_parts(background_control_tx);
     let task = tokio::spawn(test_session_executor_loop(
         agent,
         transcript,
         sessions_dir,
         session_transport_tx,
         control_rx,
+        control_tx,
+        background_control_rx,
         poll_gate,
     ));
     SessionExecutorHarness {
@@ -4218,10 +4223,13 @@ async fn test_session_executor_loop(
     sessions_dir: PathBuf,
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
+    control_tx: mpsc::UnboundedSender<SessionEngineControl>,
+    mut background_control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
     poll_gate: Option<SessionExecutorPollGate>,
 ) -> Agent<OpenAIConfig> {
     let subagent_runtime = SubagentPool::new();
     let mut deferred_commands = VecDeque::new();
+    let mut background_control_open = true;
 
     if let Some(SessionExecutorPollGate { ready, release }) = poll_gate {
         ready.send(()).expect("test releases the control poll gate");
@@ -4231,9 +4239,20 @@ async fn test_session_executor_loop(
     }
 
     loop {
-        let Some(command) =
-            next_idle_session_command(&mut control_rx, &mut deferred_commands).await
-        else {
+        let command = tokio::select! {
+            background = background_control_rx.recv(), if background_control_open => {
+                match background {
+                    Some(SessionEngineControl::Command(command)) => Some(command),
+                    Some(SessionEngineControl::Interrupt) | Some(SessionEngineControl::Shutdown) => None,
+                    None => {
+                        background_control_open = false;
+                        continue;
+                    }
+                }
+            }
+            command = next_idle_session_command(&mut control_rx, &mut deferred_commands) => command,
+        };
+        let Some(command) = command else {
             break;
         };
 
@@ -4261,6 +4280,87 @@ async fn test_session_executor_loop(
                     break;
                 }
             }
+            SessionEngineCommand::BackgroundSubagentCompleted {
+                parent_session_id,
+                parent_tool_call_id,
+                result,
+            } => {
+                let current_session_id = transcript
+                    .lock()
+                    .expect("transcript")
+                    .session_id()
+                    .to_string();
+                if current_session_id != parent_session_id {
+                    continue;
+                }
+                let result = result.expect("background result");
+                agent
+                    .install_background_subagent_result(&result)
+                    .expect("install background result");
+                let prompt = format_background_subagent_completion(&result);
+                agent
+                    .begin_internal_continuation_turn(&prompt)
+                    .expect("begin continuation turn");
+                transcript
+                    .lock()
+                    .expect("transcript")
+                    .record_internal_continuation(
+                        prompt.clone(),
+                        crate::transcript::InternalContinuationSource::SubagentCompletion,
+                    )
+                    .expect("record continuation");
+                agent
+                    .append_internal_continuation(prompt)
+                    .expect("append continuation");
+                let _ =
+                    session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
+                        parent_tool_call_id,
+                        result,
+                    });
+                deferred_commands.push_front(SessionEngineCommand::ContinueSession);
+            }
+            SessionEngineCommand::ContinueSession => {
+                let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
+                let runner = AgentRunner::<OpenAIConfig>::with_transcript(
+                    runner_event_tx,
+                    Arc::clone(&transcript),
+                );
+                let run = runner.continue_session(&mut agent);
+                tokio::pin!(run);
+                loop {
+                    match crate::session::engine::select_active_session_operation_with_events(
+                        &mut control_rx,
+                        &mut deferred_commands,
+                        run.as_mut(),
+                        Some(&mut runner_event_rx),
+                    )
+                    .await
+                    {
+                        ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done) => {
+                            crate::session::engine::forward_queued_runner_events(
+                                &mut runner_event_rx,
+                                &session_transport_tx,
+                            );
+                            let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                            break;
+                        }
+                        ActiveSessionOperation::RunnerEvent(event) => {
+                            let _ = session_transport_tx.send(event);
+                        }
+                        ActiveSessionOperation::Completed(_) => {
+                            crate::session::engine::forward_queued_runner_events(
+                                &mut runner_event_rx,
+                                &session_transport_tx,
+                            );
+                            let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                            break;
+                        }
+                        ActiveSessionOperation::Interrupted
+                        | ActiveSessionOperation::Shutdown
+                        | ActiveSessionOperation::Command(_) => break,
+                    }
+                }
+            }
             SessionEngineCommand::Prompt(prompt) => {
                 let _ = session_transport_tx.send(SessionTransportEvent::QueuedPromptAccepted {
                     prompt: prompt.clone(),
@@ -4279,6 +4379,8 @@ async fn test_session_executor_loop(
                     route_api_key_configured,
                     indexmap::IndexMap::new(),
                     String::new(),
+                    Some(control_tx.clone()),
+                    Some(session_transport_tx.clone()),
                 );
                 let (interrupted, shutdown) = {
                     let run = runner.run_prompt(&mut agent, prompt);
@@ -4313,8 +4415,12 @@ async fn test_session_executor_loop(
                                 break (Some(interrupt), is_shutdown || settle_shutdown);
                             }
                             ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done) => {
-                                // Runner completion is internal until its future
-                                // settles and the executor emits authoritative Done.
+                                crate::session::engine::forward_queued_runner_events(
+                                    &mut runner_event_rx,
+                                    &session_transport_tx,
+                                );
+                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                break (None, false);
                             }
                             ActiveSessionOperation::RunnerEvent(event) => {
                                 let _ = session_transport_tx.send(event);
@@ -4548,6 +4654,9 @@ async fn finish_session_executor_harness(harness: SessionExecutorHarness) -> Age
         event_rx,
         task,
     } = harness;
+    if let Some(ingress) = ingress.as_ref() {
+        let _ = ingress.shutdown();
+    }
     drop(ingress);
     drop(event_rx);
     timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, task)
@@ -5510,6 +5619,132 @@ async fn session_prompt_ingress_disconnect_interrupts_active_turn() {
         }
         _ => true,
     }));
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn background_child_events_outlive_parent_runner_channel() {
+    let mut server = spawn_controlled_sse_server(vec![
+        ControlledSseResponse::Immediate(responses_sse_tool_call_body(
+            "search__rg",
+            serde_json::json!({
+                "pattern": "background",
+                "path": "src",
+                "include": "*.rs",
+                "case_sensitive": true,
+                "max_results": 10
+            }),
+        )),
+        ControlledSseResponse::Blocked(responses_sse_body(
+            r#"{"status":"completed","summary":"background child done","findings":[],"files_read":[],"files_changed":[],"commands_run":[],"validation":[],"blockers":[],"next_steps":[]}"#,
+        )),
+    ])
+    .await;
+    let (sessions_dir, transcript) = test_transcript("background-child-events", Vec::new());
+    let mut parent = integration_agent_with_tools(server.base_url.clone(), 32_000, true);
+    let route = parent.route_display_name();
+    let (transient_tx, transient_rx) = mpsc::unbounded_channel();
+    let (durable_tx, mut durable_rx) = mpsc::unbounded_channel();
+    let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let runtime = SubagentPool::new();
+    let runner =
+        AgentRunner::<OpenAIConfig>::with_transcript(transient_tx, Arc::clone(&transcript))
+            .with_subagent_runtime_test_hooks(
+                runtime.clone(),
+                sessions_dir,
+                indexmap::IndexMap::new(),
+                indexmap::IndexMap::from([(route, true)]),
+                indexmap::IndexMap::new(),
+                String::new(),
+                Some(completion_tx),
+                Some(durable_tx),
+                started_tx,
+            );
+    runner.install_subagent_delegate_for_test(&mut parent);
+
+    let receipt = parent
+        .execute_subagent_tool_with_parent_call_for_test(
+            "agent__explore",
+            &serde_json::json!({ "task": "inspect in background", "background": true }),
+            "parent-bg-call".into(),
+        )
+        .await;
+    assert!(receipt.ok);
+    let child_session_id = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, started_rx.recv())
+        .await
+        .expect("background child starts")
+        .expect("background child start channel remains open");
+    server.expect_request(0).await;
+    drop(transient_rx);
+
+    let event = loop {
+        let event = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, durable_rx.recv())
+            .await
+            .expect("background child event remains live after parent channel drops")
+            .expect("durable background event sender remains connected");
+        if matches!(
+            event,
+            SessionTransportEvent::ChildSessionEvent {
+                event: SessionEvent::ToolStarted(_),
+                ..
+            }
+        ) {
+            break event;
+        }
+    };
+    assert!(matches!(
+        event,
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id: ref actual_child_session_id,
+            parent_tool_call_id: Some(ref parent_tool_call_id),
+            event: SessionEvent::ToolStarted(ref tool),
+            ..
+        } if actual_child_session_id == &child_session_id
+            && parent_tool_call_id == "parent-bg-call"
+            && tool.name == "search__rg"
+    ));
+
+    runtime.cancel_active();
+    server.abort().await;
+}
+
+#[tokio::test]
+async fn runner_existing_history_continuation_does_not_append_empty_user_message() {
+    let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+        responses_sse_body("continued"),
+    )])
+    .await;
+    let agent = integration_agent(server.base_url.clone(), 32_000);
+    let (runner_event_tx, _runner_event_rx) = mpsc::unbounded_channel();
+    let runner = AgentRunner::<OpenAIConfig>::with_transcript(
+        runner_event_tx,
+        Arc::new(StdMutex::new(
+            TranscriptRecorder::create(std::env::temp_dir()).expect("transcript"),
+        )),
+    );
+    let mut agent = agent;
+    agent
+        .begin_internal_continuation_turn("continue internally")
+        .expect("begin continuation turn");
+    agent
+        .append_internal_continuation("continue internally".into())
+        .expect("append continuation");
+
+    runner
+        .run_existing_history(&mut agent)
+        .await
+        .expect("continue existing history");
+    server.expect_request(0).await;
+
+    assert!(agent.history_for_test().iter().any(|item| matches!(
+        item,
+        HistoryItem::InternalContinuation { text } if text == "continue internally"
+    )));
+    assert!(!agent.history_for_test().iter().any(|item| matches!(
+        item,
+        HistoryItem::UserMessage { content } if content.text.is_empty()
+    )));
     server.finish().await;
 }
 

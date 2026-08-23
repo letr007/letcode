@@ -5243,6 +5243,7 @@ async fn delegation_scope_authorizes_owned_writes_and_denies_outside() {
         max_tool_calls: None,
         model: None,
         target_child_session_id: None,
+        background: false,
     })
     .expect("scope")
     .expect("non-empty scope");
@@ -5326,6 +5327,7 @@ async fn delegation_scope_allows_reads_in_allowed_paths_and_forbids_forbidden() 
         max_tool_calls: None,
         model: None,
         target_child_session_id: None,
+        background: false,
     })
     .expect("scope")
     .expect("non-empty scope");
@@ -5413,6 +5415,7 @@ async fn delegation_scope_apply_patch_requires_all_targets_owned() {
         max_tool_calls: None,
         model: None,
         target_child_session_id: None,
+        background: false,
     })
     .expect("scope")
     .expect("non-empty scope");
@@ -5593,6 +5596,7 @@ async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
         max_tool_calls: None,
         model: None,
         target_child_session_id: None,
+        background: false,
     })
     .expect("scope")
     .expect("non-empty scope");

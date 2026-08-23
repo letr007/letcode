@@ -1546,6 +1546,17 @@ impl TuiState {
             && self.pending_question.is_none()
     }
 
+    pub fn active_phase(&self) -> AppPhase {
+        if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .map(|state| state.phase)
+                .unwrap_or(self.phase)
+        } else {
+            self.phase
+        }
+    }
+
     pub fn active_timeline(&self) -> &Timeline {
         if self.is_read_only_child_view() {
             self.child_timeline
@@ -2457,6 +2468,13 @@ impl TuiState {
     }
 
     #[cfg(test)]
+    pub fn set_child_view_phase_for_test(&mut self, phase: AppPhase) {
+        if let Some(child) = self.child_timeline.as_mut() {
+            child.phase = phase;
+        }
+    }
+
+    #[cfg(test)]
     pub fn cached_child_phase(&self, child_session_id: &str) -> Option<AppPhase> {
         self.child_timeline_cache
             .get(child_session_id)
@@ -2975,6 +2993,23 @@ impl TuiState {
             self.pending_permission = None;
         }
         self.phase = AppPhase::Running;
+    }
+
+    pub fn update_background_subagent_result(
+        &mut self,
+        parent_tool_call_id: Option<&str>,
+        result: &crate::subagent::SubagentRunSummary,
+    ) {
+        let Some(parent_tool_call_id) = parent_tool_call_id else {
+            return;
+        };
+        if self
+            .timeline
+            .finish_background_subagent_tool(parent_tool_call_id, result)
+        {
+            self.transcript_render_cache.invalidate_row_metadata();
+            self.last_transcript_total_rows = None;
+        }
     }
 
     fn project_child_event_to_parent_subagent_tool(

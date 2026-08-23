@@ -189,6 +189,10 @@ pub(crate) enum SessionTransportEvent {
     ReasoningEffortChanged {
         effort: ModelReasoningEffort,
     },
+    BackgroundSubagentCompleted {
+        parent_tool_call_id: Option<String>,
+        result: crate::subagent::SubagentRunSummary,
+    },
     ModelCatalogUpdated(ModelCatalogUpdatedEvent),
     SettingChangeFailed {
         command: crate::session::SessionCommand,
@@ -343,6 +347,7 @@ impl SessionTransportEvent {
             | Self::ExpertAllowedModelsChanged { .. }
             | Self::PermissionModeChanged { .. }
             | Self::ReasoningEffortChanged { .. }
+            | Self::BackgroundSubagentCompleted { .. }
             | Self::ModelCatalogUpdated(_)
             | Self::SettingChangeFailed { .. }
             | Self::QueuedPromptAccepted { .. } => None,
@@ -536,6 +541,7 @@ pub(super) fn wrap_child_session_transport_event(
         | SessionTransportEvent::ExpertAllowedModelsChanged { .. }
         | SessionTransportEvent::PermissionModeChanged { .. }
         | SessionTransportEvent::ReasoningEffortChanged { .. }
+        | SessionTransportEvent::BackgroundSubagentCompleted { .. }
         | SessionTransportEvent::SettingChangeFailed { .. } => event,
         SessionTransportEvent::PermissionResolved(event) => {
             SessionTransportEvent::ChildSessionEvent {
@@ -752,9 +758,7 @@ pub(super) fn send_optional_event(
     event: SessionTransportEvent,
 ) -> Result<()> {
     if let Some(sender) = sender {
-        sender
-            .send(event)
-            .map_err(|_| anyhow!("runner event channel closed"))?;
+        let _ = sender.send(event);
     }
     Ok(())
 }

@@ -138,12 +138,21 @@ pub(crate) fn persist_and_apply_model_route_with(
     }
 }
 
-/// Apply reasoning effort. No transcript provenance event today.
+/// Apply reasoning effort and record the session-local selection.
 pub fn apply_reasoning_effort<C: Config>(
     agent: &mut Agent<C>,
+    transcript: &Arc<Mutex<TranscriptRecorder>>,
     effort: ModelReasoningEffort,
 ) -> Result<()> {
-    agent.set_reasoning_effort(effort)
+    let previous = agent.reasoning_effort();
+    agent.set_reasoning_effort(effort.clone())?;
+    if previous.as_ref() != Some(&effort) {
+        transcript
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?
+            .record_reasoning_effort_changed(agent.route_display_name(), effort)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -232,7 +241,8 @@ protocol = "responses"
             },
         )]));
 
-        apply_reasoning_effort(&mut agent, ModelReasoningEffort::High)
+        let (_session_dir, transcript, _session_id) = temp_transcript();
+        apply_reasoning_effort(&mut agent, &transcript, ModelReasoningEffort::High)
             .expect("reasoning effort changes in memory");
 
         assert_eq!(agent.reasoning_effort(), Some(ModelReasoningEffort::High));
@@ -244,6 +254,38 @@ protocol = "responses"
         assert_eq!(
             std::fs::read_to_string(&config_path).expect("read config after change"),
             before
+        );
+        let records =
+            crate::transcript::read_records(transcript.lock().expect("transcript").path())
+                .expect("read transcript");
+        assert_eq!(
+            crate::transcript::restore_latest_reasoning_effort(&records, "gpt-5.5"),
+            Some(ModelReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn restored_reasoning_effort_is_scoped_to_model_route() {
+        let (_base_dir, transcript, _session_id) = temp_transcript();
+        {
+            let mut recorder = transcript.lock().expect("transcript");
+            recorder
+                .record_reasoning_effort_changed("primary/gpt-5.5", ModelReasoningEffort::High)
+                .expect("record primary effort");
+            recorder
+                .record_reasoning_effort_changed("other/gpt-5.5", ModelReasoningEffort::Low)
+                .expect("record other effort");
+        }
+        let records =
+            crate::transcript::read_records(transcript.lock().expect("transcript").path())
+                .expect("read transcript");
+        assert_eq!(
+            crate::transcript::restore_latest_reasoning_effort(&records, "primary/gpt-5.5"),
+            Some(ModelReasoningEffort::High)
+        );
+        assert_eq!(
+            crate::transcript::restore_latest_reasoning_effort(&records, "other/gpt-5.5"),
+            Some(ModelReasoningEffort::Low)
         );
     }
 

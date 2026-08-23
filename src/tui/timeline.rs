@@ -1334,6 +1334,41 @@ impl Timeline {
         true
     }
 
+    pub fn finish_background_subagent_tool(
+        &mut self,
+        parent_tool_call_id: &str,
+        result: &crate::subagent::SubagentRunSummary,
+    ) -> bool {
+        let Some(index) = self.find_tool_index(parent_tool_call_id) else {
+            return false;
+        };
+        let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !is_subagent_tool_name(&tool.name) {
+            return false;
+        }
+        tool.status = if result.status == crate::subagent::SubagentStatus::Completed {
+            ToolExecutionStatus::Succeeded
+        } else {
+            ToolExecutionStatus::Failed
+        };
+        tool.summary = result.summary.clone();
+        tool.output = serde_json::to_string(&serde_json::json!({
+            "run_id": result.run_id,
+            "child_session_id": result.child_session_id,
+            "agent_name": result.agent_name,
+            "status": result.status.as_str(),
+            "summary": result.summary,
+            "structured_result": result.structured_result,
+            "active": false,
+            "background": true,
+        }))
+        .ok();
+        self.bump_revision(index);
+        true
+    }
+
     fn active_assistant_message_index(&self, message_id: Option<&str>) -> Option<usize> {
         self.items.iter().rposition(|item| match item {
             TimelineItem::Assistant(message) => {
@@ -1935,6 +1970,54 @@ mod tests {
                 .as_deref()
                 .is_some_and(|output| output.contains("fixer-child"))
         );
+    }
+
+    #[test]
+    fn background_completion_replaces_running_receipt_on_parent_tool() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "background-call",
+            "agent__explore",
+            "inspect in background",
+        ));
+        timeline.push_tool_finished(ToolFinishedEvent::new(
+            "background-call",
+            "agent__explore",
+            "explorer running",
+            ToolOutcome::Success,
+        ));
+        let result = crate::subagent::SubagentRunSummary {
+            run_id: "run-bg".into(),
+            child_session_id: "child-bg".into(),
+            agent_name: "explorer".into(),
+            status: crate::subagent::SubagentStatus::Completed,
+            failure_kind: None,
+            summary: "background finding".into(),
+            structured_result: crate::subagent::StructuredSubagentResult {
+                status: "completed".into(),
+                summary: "background finding".into(),
+                malformed: false,
+                findings: vec!["found it".into()],
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-bg".into(),
+                child_session_id: "child-bg".into(),
+                raw_excerpt: None,
+            },
+        };
+
+        assert!(timeline.finish_background_subagent_tool("background-call", &result));
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::Tool(tool))
+                if tool.status == ToolExecutionStatus::Succeeded
+                    && tool.summary == "background finding"
+                    && tool.output.as_deref().is_some_and(|output| output.contains("child-bg"))
+        ));
     }
 
     #[test]

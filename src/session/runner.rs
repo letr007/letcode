@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::agent::{Agent, AgentEvent, SubagentDelegate};
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
-use crate::permission::PermissionApproval;
+use crate::permission::{PermissionApproval, PermissionMode};
 use crate::subagent::SubagentPool;
 use crate::subagent_events::SubagentEventSender;
 use crate::transcript::{
@@ -41,9 +41,11 @@ use subagent_delegate::RunnerSubagentDelegate;
 use crate::session::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent, ProcessIssueEvent,
     ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition, SessionEvent,
-    TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolOutputDeltaEvent, ToolPendingEvent,
-    UserMessageEvent,
+    TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome,
+    ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
+use crate::tool_format::format_tool_call;
+use formatting::{output_json, output_summary};
 
 pub(crate) struct AgentRunner<C: Config> {
     event_tx: Option<SessionTransportEventSender>,
@@ -67,6 +69,40 @@ impl AgentRunner<async_openai::config::OpenAIConfig> {
         route_api_key_configured: indexmap::IndexMap<String, bool>,
         provider_api_key_hints: indexmap::IndexMap<String, String>,
         api_key_hint: String,
+        background_control_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<super::engine::SessionEngineControl>,
+        >,
+        background_event_tx: Option<SessionTransportEventSender>,
+    ) -> Self {
+        self.with_subagent_runtime_inner(
+            runtime,
+            sessions_dir,
+            expert_model_routes,
+            route_api_key_configured,
+            provider_api_key_hints,
+            api_key_hint,
+            background_control_tx,
+            background_event_tx,
+            None,
+        )
+    }
+
+    fn with_subagent_runtime_inner(
+        self,
+        runtime: SubagentPool,
+        sessions_dir: PathBuf,
+        expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
+        route_api_key_configured: indexmap::IndexMap<String, bool>,
+        provider_api_key_hints: indexmap::IndexMap<String, String>,
+        api_key_hint: String,
+        background_control_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<super::engine::SessionEngineControl>,
+        >,
+        background_event_tx: Option<SessionTransportEventSender>,
+        #[cfg(test)] background_child_started_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<String>,
+        >,
+        #[cfg(not(test))] _background_child_started_tx: Option<()>,
     ) -> Self {
         let mut self_ = self;
         if let Some(transcript) = self_.transcript.clone() {
@@ -75,6 +111,9 @@ impl AgentRunner<async_openai::config::OpenAIConfig> {
                 sessions_dir,
                 transcript,
                 event_tx: self_.event_tx.clone(),
+                background_event_tx,
+                #[cfg(test)]
+                background_child_started_tx,
                 route_api_key_configured,
                 retained_session_routes: expert_model_routes
                     .into_values()
@@ -82,9 +121,48 @@ impl AgentRunner<async_openai::config::OpenAIConfig> {
                     .collect(),
                 provider_api_key_hints,
                 api_key_hint,
+                background_control_tx,
             }));
         }
         self_
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_subagent_runtime_test_hooks(
+        self,
+        runtime: SubagentPool,
+        sessions_dir: PathBuf,
+        expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
+        route_api_key_configured: indexmap::IndexMap<String, bool>,
+        provider_api_key_hints: indexmap::IndexMap<String, String>,
+        api_key_hint: String,
+        background_control_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<super::engine::SessionEngineControl>,
+        >,
+        background_event_tx: Option<SessionTransportEventSender>,
+        background_child_started_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        self.with_subagent_runtime_inner(
+            runtime,
+            sessions_dir,
+            expert_model_routes,
+            route_api_key_configured,
+            provider_api_key_hints,
+            api_key_hint,
+            background_control_tx,
+            background_event_tx,
+            Some(background_child_started_tx),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_subagent_delegate_for_test(
+        &self,
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    ) {
+        if let Some(delegate) = self.subagent_delegate.clone() {
+            agent.set_subagent_delegate(delegate);
+        }
     }
 }
 
@@ -198,24 +276,167 @@ impl<C: Config> AgentRunner<C> {
         self.run_prompt_with_options(agent, prompt, true).await
     }
 
-    #[cfg(test)]
-    pub async fn run_internal_prompt(
-        &self,
-        agent: &mut Agent<C>,
-        prompt: impl Into<String>,
-    ) -> Result<String>
+    pub async fn continue_session(&self, agent: &mut Agent<C>) -> Result<String>
     where
         C: Clone + Send + Sync + 'static,
     {
-        self.run_prompt_with_options(
-            agent,
-            UserMessageSubmission::new(
-                "internal-continuation",
-                UserMessageContent::new(prompt, Vec::new()),
-            ),
-            false,
-        )
-        .await
+        self.run_existing_history(agent).await
+    }
+
+    pub(crate) async fn run_existing_history(&self, agent: &mut Agent<C>) -> Result<String>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        if let Some(transcript) = self.transcript.clone() {
+            agent.clear_logical_checkpoint_candidate_provider();
+            agent.set_runtime_snapshot_provider(Arc::new(move || {
+                let transcript = transcript
+                    .lock()
+                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                let records = read_records(transcript.path())?;
+                Ok(
+                    crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                        transcript.session_id().to_string(),
+                        records,
+                        crate::transcript::transcript_projection::SessionContextCursor {
+                            branch_id: transcript.current_context_branch_id().map(str::to_string),
+                            leaf_sequence: None,
+                        },
+                        &[],
+                    )?
+                    .snapshot,
+                )
+            }));
+        }
+        if let Some(delegate) = self.subagent_delegate.clone() {
+            agent.set_subagent_delegate(delegate);
+        }
+        let original_permission_mode = agent.permission_mode();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let sender = self.event_tx.clone();
+        let response = agent
+            .run_stream_content_with_interactions_async(
+                UserMessageContent::default(),
+                move |delta| {
+                    let sender = sender.clone();
+                    let delta = delta.to_string();
+                    async move {
+                        send_optional_event(
+                            &sender,
+                            SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+                        )
+                    }
+                },
+                {
+                    let sender = self.event_tx.clone();
+                    let transcript = self.transcript.clone();
+                    move |event| {
+                        let sender = sender.clone();
+                        let transcript = transcript.clone();
+                        async move {
+                            if let Some(transcript) = transcript {
+                                let mut recorder = transcript
+                                    .lock()
+                                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                                let _ = persist_agent_event(&mut recorder, &event)?;
+                            }
+                            match event {
+                                AgentEvent::ToolCallStarted { call_id, name, args } => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::ToolStarted(ToolStartedEvent {
+                                            call_id,
+                                            name: name.clone(),
+                                            summary: format_tool_call(&name, &args),
+                                            arguments: Some(args.to_string()),
+                                        }),
+                                    )?;
+                                }
+                                AgentEvent::ToolCallFinished {
+                                    call_id,
+                                    name,
+                                    ok,
+                                    output,
+                                } => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::ToolFinished(ToolFinishedEvent {
+                                            call_id,
+                                            name,
+                                            summary: output_summary(&output)
+                                                .unwrap_or_else(|| "tool completed".into()),
+                                            outcome: if ok {
+                                                ToolOutcome::Success
+                                            } else {
+                                                ToolOutcome::Failure
+                                            },
+                                            output: Some(output_json(&output).to_string()),
+                                        }),
+                                    )?;
+                                }
+                                AgentEvent::ToolCallBatchFinished => {
+                                    send_optional_event(&sender, SessionTransportEvent::ToolBatchFinished)?;
+                                }
+                                AgentEvent::ReasoningDelta { item_id, delta } => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::ReasoningDelta(
+                                            ReasoningDeltaEvent::new(item_id, delta),
+                                        ),
+                                    )?;
+                                }
+                                AgentEvent::ReasoningDone { item_id, text } => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::ReasoningDone(ReasoningDoneEvent::new(
+                                            item_id, text,
+                                        )),
+                                    )?;
+                                }
+                                AgentEvent::TodoSnapshotUpdated { items } => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::TodoSnapshot(TodoSnapshotEvent::new(items)),
+                                    )?;
+                                }
+                                AgentEvent::AutoContinueChanged { state } => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::AutoContinueChanged(
+                                            AutoContinueChangedEvent::new(state),
+                                        ),
+                                    )?;
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        }
+                    }
+                },
+                |_| async { Ok(PermissionApproval::Deny) },
+                |request| async move {
+                    Err(anyhow!(
+                        "question tool is unavailable during background continuation; received {} question(s)",
+                        request.questions.len()
+                    ))
+                },
+            )
+            .await;
+        agent.set_permission_mode(original_permission_mode);
+        match response {
+            Ok(message) => {
+                self.emit(SessionTransportEvent::AssistantDone { message_id: None })?;
+                self.emit(SessionTransportEvent::Done)?;
+                Ok(message)
+            }
+            Err(error) => {
+                self.emit(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                    "{error:#}"
+                ))))?;
+                self.emit(SessionTransportEvent::Done)?;
+                Err(error)
+            }
+        }
     }
 
     async fn run_prompt_with_options(
@@ -858,7 +1079,6 @@ impl<C: Config> AgentRunner<C> {
                 },
             )
             .await;
-
         match response {
             Ok(message) => {
                 emit_context_projection_updates(
@@ -1005,14 +1225,12 @@ pub(crate) fn subagent_event_sender(
     let error_tx = event_tx.clone();
     SubagentEventSender::new(
         Arc::new(move |message| {
-            status_tx
-                .send(SessionTransportEvent::Notice(NoticeEvent::info(message)))
-                .map_err(|_| anyhow!("runner event channel closed"))
+            let _ = status_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(message)));
+            Ok(())
         }),
         Arc::new(move |message| {
-            error_tx
-                .send(SessionTransportEvent::Error(ErrorEvent::new(message)))
-                .map_err(|_| anyhow!("runner event channel closed"))
+            let _ = error_tx.send(SessionTransportEvent::Error(ErrorEvent::new(message)));
+            Ok(())
         }),
         Arc::new(
             move |agent,
@@ -1155,6 +1373,9 @@ mod tests {
                 "Set EXPERT_API_KEY.".into(),
             )]),
             api_key_hint: "Set <PROVIDER>_API_KEY.".into(),
+            background_control_tx: None,
+            background_event_tx: None,
+            background_child_started_tx: None,
         }
     }
 
@@ -1200,6 +1421,7 @@ mod tests {
                 max_tool_calls: None,
                 model: Some(selected.display_name()),
                 target_child_session_id: None,
+                background: false,
             },
             model: Some(selected),
             prompt: "inspect route credentials".into(),
@@ -1238,6 +1460,7 @@ mod tests {
                 max_tool_calls: None,
                 model: None,
                 target_child_session_id: None,
+                background: false,
             },
             model: None,
             prompt: "inspect route credentials".into(),
@@ -1311,6 +1534,7 @@ mod tests {
                 max_tool_calls: None,
                 model: Some(selected.display_name()),
                 target_child_session_id: None,
+                background: false,
             },
             model: Some(selected),
             prompt: "inspect route credentials".into(),

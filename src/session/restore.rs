@@ -165,6 +165,8 @@ pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
         agent.set_model(model);
     }
     apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
+    agent.clear_session_reasoning_efforts();
+    let _ = apply_restored_reasoning_effort(agent, &prepared.snapshot.records);
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     apply_prepared_context_scope(agent, prepared_scope);
     Ok(())
@@ -279,6 +281,22 @@ pub(crate) fn apply_restored_permission_mode<C: Config>(agent: &mut Agent<C>, mo
     }
 }
 
+pub(crate) fn apply_restored_reasoning_effort<C: Config>(
+    agent: &mut Agent<C>,
+    records: &[TranscriptRecord],
+) -> Option<String> {
+    let model_id = agent.route_display_name();
+    let effort = crate::transcript::restore_latest_reasoning_effort(records, &model_id)?;
+    match agent.set_reasoning_effort(effort.clone()) {
+        Ok(()) => None,
+        Err(error) => Some(format!(
+            "saved reasoning effort '{}' is unavailable for model '{}': {error}; using the model default",
+            effort.as_str(),
+            model_id
+        )),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn apply_restored_model_route(
     agent: &mut Agent<async_openai::config::OpenAIConfig>,
@@ -312,7 +330,6 @@ pub fn install_prepared_resume_for_agent<C: Config>(
     let new_path = prepared.recorder.path().to_path_buf();
     let old_path = replace_live_transcript(live, prepared.recorder)
         .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
-    agent.clear_session_reasoning_efforts();
     let _ = cleanup_replaced_empty_session(old_path, &new_path);
     Ok(fast_mode_auto_disabled)
 }
@@ -366,6 +383,7 @@ pub fn install_prepared_routed_resume_for_agent(
     agent.clear_session_reasoning_efforts();
     apply_prepared_restored_route(agent, route);
     apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
+    let _ = apply_restored_reasoning_effort(agent, &prepared.snapshot.records);
     agent.install_validated_runtime_snapshot(runtime_snapshot);
     agent.restore_turn_sequence(prepared.snapshot.max_turn_id);
     apply_prepared_context_scope(agent, prepared_scope);

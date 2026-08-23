@@ -7,7 +7,7 @@ use crate::agent::{
 };
 use crate::context_tree::{ContextBlockRef, ContextNodeStatus, ContextSourceRef};
 use crate::evidence::{EvidenceKind, EvidenceSource};
-use crate::request_builder::HistoryToolCall;
+use crate::request_builder::{HistoryToolCall, ModelReasoningEffort};
 use crate::tool::ToolResult;
 use crate::user_content::UserMessageContent;
 
@@ -79,6 +79,10 @@ pub enum TranscriptEvent {
     ModelChanged {
         previous_model: String,
         new_model: String,
+    },
+    ReasoningEffortChanged {
+        model_id: String,
+        effort: ModelReasoningEffort,
     },
     ExpertModelChanged {
         agent_name: String,

@@ -18,8 +18,8 @@ use crate::session::child_view::{
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
 use crate::session::restore::{
-    apply_prepared_restored_route, apply_restored_permission_mode, prepare_restored_model_route,
-    restored_messages_from_protocol_frames,
+    apply_prepared_restored_route, apply_restored_permission_mode, apply_restored_reasoning_effort,
+    prepare_restored_model_route, restored_messages_from_protocol_frames,
 };
 use crate::session::runner::SessionTransportEvent;
 use crate::session::settings::{apply_permission_mode, apply_reasoning_effort};
@@ -217,7 +217,7 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetReasoningEffort(effort) => {
-                if let Err(error) = apply_reasoning_effort(agent, effort.clone()) {
+                if let Err(error) = apply_reasoning_effort(agent, transcript, effort.clone()) {
                     let message = error.to_string();
                     let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
                         command: SessionCommand::SetReasoningEffort(effort),
@@ -577,12 +577,18 @@ impl SessionCoordinator {
                 route,
                 fast_mode_auto_disabled,
             )) => {
+                agent.clear_session_reasoning_efforts();
                 apply_prepared_restored_route(agent, route);
                 apply_restored_permission_mode(agent, snapshot.latest_permission_mode.as_deref());
+                let reasoning_notice = apply_restored_reasoning_effort(agent, &snapshot.records);
                 agent.install_validated_runtime_snapshot(runtime_snapshot);
                 agent.restore_turn_sequence(snapshot.max_turn_id);
                 if fast_mode_auto_disabled {
                     Self::emit_fast_mode_auto_disabled(event_tx);
+                }
+                if let Some(message) = reasoning_notice {
+                    let _ =
+                        event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(message)));
                 }
                 let expert_models =
                     crate::transcript::restore_latest_expert_models(&snapshot.records);
@@ -597,6 +603,9 @@ impl SessionCoordinator {
                     runtime_context,
                     expert_models,
                 });
+                if let Some(effort) = agent.reasoning_effort() {
+                    let _ = event_tx.send(SessionTransportEvent::ReasoningEffortChanged { effort });
+                }
                 true
             }
             Err(error) => {

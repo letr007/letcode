@@ -13,6 +13,12 @@ pub(crate) enum SessionEngineCommand {
         agent_name: String,
         task: String,
     },
+    BackgroundSubagentCompleted {
+        parent_session_id: String,
+        parent_tool_call_id: Option<String>,
+        result: Result<crate::subagent::SubagentRunSummary, String>,
+    },
+    ContinueSession,
     Compact,
     ShowHistoryTree,
     Undo,
@@ -144,6 +150,8 @@ pub(crate) fn session_engine_command_as_session_command(
                 task: task.clone(),
             })
         }
+        SessionEngineCommand::BackgroundSubagentCompleted { .. }
+        | SessionEngineCommand::ContinueSession => None,
         SessionEngineCommand::Compact => Some(crate::session::SessionCommand::Compact),
         SessionEngineCommand::SetModel(model) => {
             Some(crate::session::SessionCommand::SetModel(model.clone()))
@@ -280,6 +288,8 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         SessionEngineCommand::SetReasoningEffort(_) => Some(DeferredCommandKey::ReasoningEffort),
         SessionEngineCommand::Prompt(_)
         | SessionEngineCommand::DelegateSubagent { .. }
+        | SessionEngineCommand::BackgroundSubagentCompleted { .. }
+        | SessionEngineCommand::ContinueSession
         | SessionEngineCommand::Compact
         | SessionEngineCommand::ShowHistoryTree
         | SessionEngineCommand::Undo

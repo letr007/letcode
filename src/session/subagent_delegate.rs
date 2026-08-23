@@ -8,6 +8,7 @@ use serde_json::json;
 use crate::agent::{
     Agent, SubagentDelegate, SubagentInvocation, subagent_tool_name_for_agent_name,
 };
+use crate::session::engine::{SessionEngineCommand, SessionEngineControl};
 use crate::subagent::{SubagentFailureKind, SubagentPool, SubagentStatus};
 use crate::tool::ToolResult;
 use crate::transcript::TranscriptRecorder;
@@ -21,10 +22,15 @@ pub(super) struct RunnerSubagentDelegate {
     pub(super) sessions_dir: PathBuf,
     pub(super) transcript: Arc<Mutex<TranscriptRecorder>>,
     pub(super) event_tx: Option<SessionTransportEventSender>,
+    pub(super) background_event_tx: Option<SessionTransportEventSender>,
+    #[cfg(test)]
+    pub(super) background_child_started_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub(super) route_api_key_configured: indexmap::IndexMap<String, bool>,
     pub(super) retained_session_routes: std::collections::HashSet<String>,
     pub(super) provider_api_key_hints: indexmap::IndexMap<String, String>,
     pub(super) api_key_hint: String,
+    pub(super) background_control_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<SessionEngineControl>>,
 }
 
 impl RunnerSubagentDelegate {
@@ -179,20 +185,92 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                     .unwrap_or_default()
                     .as_millis()
             );
-            let summary = self
-                .runtime
-                .run_named_governed(
-                    parent,
-                    agent_name,
-                    invocation,
-                    self.sessions_dir.clone(),
-                    parent_session_id,
-                    parent_turn_id,
-                    Some(self.transcript.clone()),
-                    self.event_tx.clone().map(subagent_event_sender),
-                )
-                .await;
+            let background = invocation.input.background;
+            if background && agent_name == "fixer" {
+                return Ok(ToolResult::err(
+                    tool_name,
+                    "background execution is unavailable for fixer",
+                ));
+            }
+            if background && self.background_control_tx.is_none() {
+                return Ok(ToolResult::err(
+                    tool_name,
+                    "background execution is unavailable in this runtime",
+                ));
+            }
+            let parent_tool_call_id = invocation.parent_tool_call_id.clone();
+            let started = self.runtime.start_named_governed(
+                parent,
+                agent_name,
+                invocation,
+                self.sessions_dir.clone(),
+                parent_session_id.clone(),
+                parent_turn_id,
+                Some(self.transcript.clone()),
+                if background {
+                    self.background_event_tx.clone()
+                } else {
+                    self.event_tx.clone()
+                }
+                .map(subagent_event_sender),
+            );
+            let started = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    let summary = error.to_string();
+                    let data = json!({
+                        "agent_name": agent_name,
+                        "child_session_id": target_child_session_id,
+                        "status": SubagentStatus::Failed.as_str(),
+                        "failure_kind": SubagentFailureKind::Hard.as_str(),
+                        "summary": compact_subagent_summary(&summary),
+                        "full_summary": summary,
+                        "active": false,
+                    });
+                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                }
+            };
 
+            if background {
+                #[cfg(test)]
+                if let Some(started_tx) = &self.background_child_started_tx {
+                    let _ = started_tx.send(started.receipt().child_session_id.clone());
+                }
+                let run_id = started.run_id().to_string();
+                let receipt = started.receipt().clone();
+                let runtime = self.runtime.clone();
+                let control_tx = self
+                    .background_control_tx
+                    .clone()
+                    .expect("background runtime checked above");
+                tokio::spawn(async move {
+                    let result = runtime
+                        .complete_started_run(started)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = control_tx.send(SessionEngineControl::Command(
+                        SessionEngineCommand::BackgroundSubagentCompleted {
+                            parent_session_id,
+                            parent_tool_call_id,
+                            result,
+                        },
+                    ));
+                });
+                return Ok(ToolResult::ok(
+                    tool_name,
+                    json!({
+                        "run_id": run_id,
+                        "child_session_id": receipt.child_session_id,
+                        "agent_name": receipt.agent_name,
+                        "status": SubagentStatus::Running.as_str(),
+                        "summary": receipt.summary,
+                        "active": true,
+                        "background": true,
+                    }),
+                ));
+            }
+
+            let summary = self.runtime.complete_started_run(started).await;
             let summary = match summary {
                 Ok(summary) => summary,
                 Err(error) => {

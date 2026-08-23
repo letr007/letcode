@@ -330,6 +330,9 @@ pub(super) fn subagent_status_label(
 
 pub(super) fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str> {
     let mut flags = Vec::new();
+    if data.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
+        flags.push("background");
+    }
     if data.get("active").and_then(serde_json::Value::as_bool) == Some(true) {
         flags.push("active");
     }
