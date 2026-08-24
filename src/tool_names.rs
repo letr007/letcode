@@ -28,3 +28,7 @@ pub const TOOL_AGENT_ORACLE: &str = "agent__oracle";
 pub const TOOL_AGENT_DESIGNER: &str = "agent__designer";
 pub const TOOL_AGENT_LIBRARIAN: &str = "agent__librarian";
 pub const TOOL_AGENT_GENERAL: &str = "agent__general";
+pub const TOOL_AGENT_JOBS: &str = "agent__jobs";
+pub const TOOL_AGENT_STATUS: &str = "agent__status";
+pub const TOOL_AGENT_WAIT: &str = "agent__wait";
+pub const TOOL_AGENT_CANCEL: &str = "agent__cancel";

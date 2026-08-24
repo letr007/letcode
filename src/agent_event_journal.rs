@@ -119,6 +119,7 @@ pub fn persist_agent_event(
             recorder.record_auto_continue_changed(state.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
+        AgentEvent::TurnContinuationBoundary => JournalEffect::IGNORED,
         AgentEvent::AutoContinuationScheduled {
             continuation_count,
             remaining_unfinished,

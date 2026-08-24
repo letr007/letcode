@@ -2,7 +2,7 @@ use super::*;
 use crate::config::ApiProtocol;
 use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
 use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
-use crate::subagent::StructuredSubagentResult;
+use crate::subagent::{StructuredSubagentResult, SubagentPool};
 use crate::tool_names;
 use crate::transcript::transcript_projection::{
     SessionContextCursor, project_runtime_restore_snapshot,
@@ -1187,7 +1187,7 @@ fn restore_job_board_derives_active_state_from_child_transcript() {
             &child_session_id,
             "fixer",
             "apply patch",
-            0,
+            7,
         )
         .expect("register child");
     child
@@ -1218,6 +1218,65 @@ fn restore_job_board_derives_active_state_from_child_transcript() {
     assert!(job_board[0].active);
     assert_eq!(job_board[0].child_session_id, child_session_id);
     assert_eq!(job_board[0].status, "running");
+
+    let projected = project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].run_id, "run-active");
+    assert_eq!(projected[0].pool_ordinal, 7);
+}
+
+#[test]
+fn project_subagent_jobs_ignores_results_from_unowned_child_sessions() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-unowned-job-test-{}",
+        unix_timestamp_ms()
+    ));
+    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+    let parent_session_id = parent.session_id().to_string();
+    parent
+        .record_subagent_result(
+            "run-unowned",
+            &parent_session_id,
+            "turn-1",
+            "missing-child",
+            "explorer",
+            "completed",
+            "foreign result",
+        )
+        .expect("record result");
+    let parent_records = read_records(parent.path()).expect("read parent records");
+
+    let projected = project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
+    assert!(projected.is_empty());
+}
+
+#[test]
+fn project_subagent_jobs_requires_started_ownership_even_when_child_file_exists() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-unowned-existing-child-test-{}",
+        unix_timestamp_ms()
+    ));
+    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+    let parent_session_id = parent.session_id().to_string();
+    let child_dir = child_sessions_dir(&base_dir);
+    let child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+    let child_session_id = child.session_id().to_string();
+    parent
+        .record_subagent_result(
+            "run-unowned-existing",
+            &parent_session_id,
+            "turn-1",
+            &child_session_id,
+            "explorer",
+            "completed",
+            "foreign result",
+        )
+        .expect("record result");
+    let parent_records = read_records(parent.path()).expect("read parent records");
+
+    let projected = project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
+    assert!(projected.is_empty());
+    assert!(SubagentPool::child_sessions(&base_dir, &parent_records).is_empty());
 }
 
 #[test]
@@ -1342,6 +1401,54 @@ fn read_records_accepts_legacy_prompt_composition_shapes() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+#[test]
+fn structured_subagent_result_and_evidence_commit_atomically() {
+    let base_dir = journal_test_dir("subagent-result-transaction");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    let session_id = recorder.session_id().to_string();
+    let structured = StructuredSubagentResult {
+        status: "completed".into(),
+        summary: "done".into(),
+        malformed: false,
+        findings: Vec::new(),
+        files_read: Vec::new(),
+        files_changed: Vec::new(),
+        commands_run: Vec::new(),
+        validation: Vec::new(),
+        blockers: Vec::new(),
+        next_steps: Vec::new(),
+        run_id: "run-transaction".into(),
+        child_session_id: "child-transaction".into(),
+        raw_excerpt: None,
+    };
+    recorder
+        .record_subagent_result_structured(
+            "run-transaction",
+            &session_id,
+            "turn-1",
+            "child-transaction",
+            "explorer",
+            "completed",
+            "done",
+            Some(structured),
+        )
+        .expect("record structured result");
+
+    let records = read_records(recorder.path()).expect("read records");
+    assert_eq!(records.len(), 2);
+    assert!(matches!(
+        records[0].event,
+        TranscriptEvent::SubagentResult { .. }
+    ));
+    assert!(matches!(
+        &records[1].event,
+        TranscriptEvent::Evidence {
+            source: EvidenceSource::Subagent { run_id, .. },
+            ..
+        } if run_id == "run-transaction"
+    ));
 }
 
 #[test]

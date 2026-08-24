@@ -483,6 +483,10 @@ pub fn is_internal_tool(tool: &str) -> bool {
             | tool_names::TOOL_MEMORY_RECALL
             | tool_names::TOOL_WORKFLOW_TODOS
             | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
+            | tool_names::TOOL_AGENT_JOBS
+            | tool_names::TOOL_AGENT_STATUS
+            | tool_names::TOOL_AGENT_WAIT
+            | tool_names::TOOL_AGENT_CANCEL
     )
 }
 
@@ -548,7 +552,11 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER
         | tool_names::TOOL_AGENT_LIBRARIAN
-        | tool_names::TOOL_AGENT_GENERAL => ToolPermissionClass::Preview,
+        | tool_names::TOOL_AGENT_GENERAL
+        | tool_names::TOOL_AGENT_JOBS
+        | tool_names::TOOL_AGENT_STATUS
+        | tool_names::TOOL_AGENT_WAIT
+        | tool_names::TOOL_AGENT_CANCEL => ToolPermissionClass::Preview,
         tool_names::TOOL_AGENT_FIXER
         | tool_names::TOOL_FS_WRITE
         | tool_names::TOOL_FS_APPEND
@@ -644,6 +652,19 @@ fn contains_write_capable_read_option(command: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn subagent_control_tools_are_internal_preview_operations() {
+        for tool in [
+            tool_names::TOOL_AGENT_JOBS,
+            tool_names::TOOL_AGENT_STATUS,
+            tool_names::TOOL_AGENT_WAIT,
+            tool_names::TOOL_AGENT_CANCEL,
+        ] {
+            assert!(is_internal_tool(tool));
+            assert_eq!(classify_tool(tool), ToolPermissionClass::Preview);
+        }
+    }
 
     #[test]
     fn default_mode_asks_risky_commands_instead_of_hard_deny() {

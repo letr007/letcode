@@ -52,42 +52,174 @@ impl SubagentRunGovernance {
 
 #[derive(Clone)]
 pub struct SubagentPool {
-    /// agent_name -> active child (one running slot per role).
-    active_by_agent: Arc<Mutex<std::collections::HashMap<String, ActiveSlot>>>,
+    /// Active and completed runs keyed by stable run id.
+    state: Arc<Mutex<SubagentPoolState>>,
+    /// Wakes waiters whenever the active or completed run set changes.
+    changed: Arc<tokio::sync::Notify>,
     /// Monotonic ordinal issuer for stable TUI pool numbers (1-based).
     next_ordinal: Arc<Mutex<u32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SubagentJob {
+    pub active: bool,
+    pub run_id: String,
+    pub child_session_id: String,
+    pub agent_name: String,
+    pub status: String,
+    pub summary: String,
+    pub pool_ordinal: u32,
+}
+
+pub struct ForegroundRunGuard {
+    state: Arc<Mutex<SubagentPoolState>>,
+    run_id: String,
+    retained: bool,
+}
+
+impl ForegroundRunGuard {
+    fn new(state: Arc<Mutex<SubagentPoolState>>, run_id: String) -> Self {
+        Self {
+            state,
+            run_id,
+            retained: false,
+        }
+    }
+
+    pub fn retain(&mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for ForegroundRunGuard {
+    fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.foregrounded_by_run.remove(&self.run_id);
+        }
+    }
+}
+
+impl SubagentJob {
+    pub fn from_result(result: SubagentRunSummary) -> Self {
+        Self {
+            active: false,
+            run_id: result.run_id,
+            child_session_id: result.child_session_id,
+            agent_name: result.agent_name,
+            status: result.status.as_str().into(),
+            summary: result.summary,
+            pool_ordinal: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SubagentPoolState {
+    active_by_run: std::collections::HashMap<String, ActiveSlot>,
+    completed_by_run: std::collections::HashMap<String, SubagentRunSummary>,
+    foregrounded_by_run: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunPathAccess {
+    Read(Vec<PathBuf>),
+    Write(Vec<PathBuf>),
 }
 
 #[derive(Debug)]
 struct ActiveSlot {
     cancel: Option<oneshot::Sender<()>>,
     child: ChildSessionSummary,
+    path_access: RunPathAccess,
+    takeover_child_session_id: Option<String>,
+}
+
+struct RunReservation {
+    state: Arc<Mutex<SubagentPoolState>>,
+    changed: Arc<tokio::sync::Notify>,
     run_id: String,
+    activated: bool,
+}
+
+impl RunReservation {
+    fn activate(mut self, cancel: oneshot::Sender<()>, child: ChildSessionSummary) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
+        let slot = state
+            .active_by_run
+            .get_mut(&self.run_id)
+            .ok_or_else(|| anyhow!("subagent run reservation disappeared"))?;
+        slot.cancel = Some(cancel);
+        slot.child = child;
+        self.activated = true;
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+}
+
+impl Drop for RunReservation {
+    fn drop(&mut self) {
+        if self.activated {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.active_by_run.remove(&self.run_id);
+        }
+        self.changed.notify_waiters();
+    }
+}
+
+struct DropTerminalContext {
+    child_transcript: Arc<Mutex<TranscriptRecorder>>,
+    parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
+    parent_session_id: String,
+    parent_turn_id: String,
+    child_session_id: String,
+    agent_name: String,
 }
 
 struct ActiveRunGuard {
-    active_by_agent: Arc<Mutex<std::collections::HashMap<String, ActiveSlot>>>,
-    agent_name: String,
+    state: Arc<Mutex<SubagentPoolState>>,
+    changed: Arc<tokio::sync::Notify>,
     run_id: String,
+    terminal_context: DropTerminalContext,
+    terminal: bool,
 }
 
 impl ActiveRunGuard {
     fn new(
-        active_by_agent: Arc<Mutex<std::collections::HashMap<String, ActiveSlot>>>,
-        agent_name: String,
+        state: Arc<Mutex<SubagentPoolState>>,
+        changed: Arc<tokio::sync::Notify>,
         run_id: String,
+        terminal_context: DropTerminalContext,
     ) -> Self {
         Self {
-            active_by_agent,
-            agent_name,
+            state,
+            changed,
             run_id,
+            terminal_context,
+            terminal: false,
         }
     }
 
+    fn complete(&mut self, summary: SubagentRunSummary) {
+        if let Ok(mut state) = self.state.lock() {
+            state.completed_by_run.insert(self.run_id.clone(), summary);
+            state.active_by_run.remove(&self.run_id);
+        }
+        self.terminal = true;
+        self.changed.notify_waiters();
+    }
+
     fn clear_cancel(&self) {
-        if let Ok(mut map) = self.active_by_agent.lock()
-            && let Some(slot) = map.get_mut(&self.agent_name)
-            && slot.run_id == self.run_id
+        if let Ok(mut state) = self.state.lock()
+            && let Some(slot) = state.active_by_run.get_mut(&self.run_id)
         {
             slot.cancel.take();
         }
@@ -96,12 +228,50 @@ impl ActiveRunGuard {
 
 impl Drop for ActiveRunGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.active_by_agent.lock()
-            && let Some(slot) = map.get(&self.agent_name)
-            && slot.run_id == self.run_id
-        {
-            map.remove(&self.agent_name);
+        if self.terminal {
+            return;
         }
+        let context = &self.terminal_context;
+        let mut summary = build_runtime_summary(
+            &self.run_id,
+            &context.child_session_id,
+            &context.agent_name,
+            SubagentStatus::Cancelled,
+            format!("{} cancelled", context.agent_name),
+        );
+        if let Err(error) = record_child_completion(
+            &context.child_transcript,
+            &summary,
+            &context.parent_session_id,
+            &context.parent_turn_id,
+        ) {
+            set_hard_failure(
+                &mut summary,
+                format!("failed to record dropped child subagent completion: {error}"),
+            );
+        }
+        if let Err(error) = record_parent_result(
+            &context.parent_transcript,
+            &summary,
+            &context.parent_session_id,
+            &context.parent_turn_id,
+        ) {
+            set_hard_failure(
+                &mut summary,
+                format!("failed to record dropped parent subagent result: {error}"),
+            );
+            let _ = record_child_completion(
+                &context.child_transcript,
+                &summary,
+                &context.parent_session_id,
+                &context.parent_turn_id,
+            );
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.completed_by_run.insert(self.run_id.clone(), summary);
+            state.active_by_run.remove(&self.run_id);
+        }
+        self.changed.notify_waiters();
     }
 }
 
@@ -114,17 +284,18 @@ impl Default for SubagentPool {
 impl SubagentPool {
     pub fn new() -> Self {
         Self {
-            active_by_agent: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            state: Arc::new(Mutex::new(SubagentPoolState::default())),
+            changed: Arc::new(tokio::sync::Notify::new()),
             next_ordinal: Arc::new(Mutex::new(1)),
         }
     }
 
     pub fn cancel_active(&self) -> bool {
-        let Ok(mut map) = self.active_by_agent.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return false;
         };
         let mut cancelled = false;
-        for slot in map.values_mut() {
+        for slot in state.active_by_run.values_mut() {
             if let Some(tx) = slot.cancel.take() {
                 let _ = tx.send(());
                 cancelled = true;
@@ -133,18 +304,171 @@ impl SubagentPool {
         cancelled
     }
 
+    pub fn cancel_run(&self, run_id: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(slot) = state.active_by_run.get_mut(run_id) else {
+            return false;
+        };
+        let Some(tx) = slot.cancel.take() else {
+            return false;
+        };
+        tx.send(()).is_ok()
+    }
+
     pub fn is_running(&self) -> bool {
-        self.active_by_agent
+        self.state
             .lock()
-            .map(|map| !map.is_empty())
+            .map(|state| !state.active_by_run.is_empty())
             .unwrap_or(false)
     }
 
     pub fn active_child(&self) -> Option<ChildSessionSummary> {
-        let map = self.active_by_agent.lock().ok()?;
-        map.values()
+        let state = self.state.lock().ok()?;
+        state
+            .active_by_run
+            .values()
             .map(|slot| slot.child.clone())
             .min_by_key(|child| (child.pool_ordinal, child.child_session_id.clone()))
+    }
+
+    pub fn active_jobs(&self) -> Vec<SubagentJob> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut jobs = state
+            .active_by_run
+            .iter()
+            .map(|(run_id, slot)| SubagentJob {
+                active: true,
+                run_id: run_id.clone(),
+                child_session_id: slot.child.child_session_id.clone(),
+                agent_name: slot.child.agent_name.clone(),
+                status: slot.child.status.clone(),
+                summary: slot.child.summary.clone(),
+                pool_ordinal: slot.child.pool_ordinal,
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by_key(|job| (job.pool_ordinal, job.run_id.clone()));
+        jobs
+    }
+
+    pub fn claim_foreground(&self, run_id: &str) -> Result<Option<ForegroundRunGuard>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
+        if state.completed_by_run.contains_key(run_id)
+            || !state.active_by_run.contains_key(run_id)
+            || !state.foregrounded_by_run.insert(run_id.to_string())
+        {
+            return Ok(None);
+        }
+        Ok(Some(ForegroundRunGuard::new(
+            Arc::clone(&self.state),
+            run_id.to_string(),
+        )))
+    }
+
+    pub fn release_foreground(&self, run_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.foregrounded_by_run.remove(run_id);
+        }
+    }
+
+    pub fn is_foregrounded(&self, run_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.foregrounded_by_run.contains(run_id))
+            .unwrap_or(false)
+    }
+
+    pub fn completed_result(&self, run_id: &str) -> Option<SubagentRunSummary> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.completed_by_run.get(run_id).cloned())
+    }
+
+    pub async fn wait_for_result(&self, run_id: &str) -> Result<Option<SubagentRunSummary>> {
+        loop {
+            if let Some(result) = self.completed_result(run_id) {
+                return Ok(Some(result));
+            }
+            let running = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("subagent pool lock poisoned"))?
+                .active_by_run
+                .contains_key(run_id);
+            if !running {
+                return Ok(None);
+            }
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.completed_result(run_id) {
+                return Ok(Some(result));
+            }
+            let running = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("subagent pool lock poisoned"))?
+                .active_by_run
+                .contains_key(run_id);
+            if !running {
+                return Ok(None);
+            }
+            notified.await;
+        }
+    }
+
+    fn reserve_run(
+        &self,
+        path_access: RunPathAccess,
+        takeover_child_session_id: Option<&str>,
+    ) -> Result<RunReservation> {
+        let run_id = generate_run_id();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
+        ensure_path_access_available_in_map(&state.active_by_run, &path_access)?;
+        if let Some(target) = takeover_child_session_id
+            && state
+                .active_by_run
+                .values()
+                .any(|slot| slot.takeover_child_session_id.as_deref() == Some(target))
+        {
+            bail!("takeover failed: child `{target}` already has an active takeover");
+        }
+        state.active_by_run.insert(
+            run_id.clone(),
+            ActiveSlot {
+                cancel: None,
+                child: ChildSessionSummary {
+                    parent_session_id: String::new(),
+                    parent_run_id: String::new(),
+                    child_session_id: String::new(),
+                    agent_name: String::new(),
+                    status: "starting".into(),
+                    summary: String::new(),
+                    timestamp_ms: current_timestamp_ms(),
+                    pool_ordinal: 0,
+                },
+                path_access,
+                takeover_child_session_id: takeover_child_session_id.map(str::to_string),
+            },
+        );
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(RunReservation {
+            state: Arc::clone(&self.state),
+            changed: Arc::clone(&self.changed),
+            run_id,
+            activated: false,
+        })
     }
 
     pub fn child_sessions(
@@ -191,12 +515,25 @@ impl SubagentPool {
             .map(|child| child.pool_ordinal)
             .max()
             .unwrap_or(0);
+        let max_active = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .active_by_run
+                    .values()
+                    .map(|slot| slot.child.pool_ordinal)
+                    .max()
+            })
+            .unwrap_or(0);
         let mut next = self
             .next_ordinal
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if *next <= max_existing {
-            *next = max_existing.saturating_add(1);
+        let max_known = max_existing.max(max_active);
+        if *next <= max_known {
+            *next = max_known.saturating_add(1);
         }
         let ordinal = *next;
         *next = next.saturating_add(1);
@@ -261,10 +598,15 @@ impl SubagentPool {
         )?;
         let receipt = run
             .guard
-            .active_by_agent
+            .state
             .lock()
             .ok()
-            .and_then(|map| map.get(&run.agent_name).map(|slot| slot.child.clone()))
+            .and_then(|state| {
+                state
+                    .active_by_run
+                    .get(&run.run_id)
+                    .map(|slot| slot.child.clone())
+            })
             .ok_or_else(|| anyhow!("started subagent slot is unavailable"))?;
         Ok(StartedSubagentRun {
             run_id: run.run_id.clone(),
@@ -357,16 +699,10 @@ impl SubagentPool {
     where
         C: Config + Clone + Send + Sync + 'static,
     {
-        {
-            let busy = self
-                .active_by_agent
-                .lock()
-                .map_err(|_| anyhow!("subagent pool lock poisoned"))?
-                .contains_key(template.name.as_str());
-            if busy {
-                return Err(anyhow!(self.busy_error_message_for(template.name.as_str())));
-            }
-        }
+        let scope = SubagentPathScope::from_input(&governance.input)?;
+        let path_access = run_path_access(&template, &governance.input, scope.as_ref())?;
+        let mut reservation =
+            self.reserve_run(path_access.clone(), takeover_child_session_id.as_deref())?;
 
         let effective_timeout_secs = governance.timeout_secs.or(template.timeout_secs);
         let effective_max_tool_calls = governance.max_tool_calls.or(template.max_tool_calls);
@@ -374,7 +710,6 @@ impl SubagentPool {
             bail!("model override cannot be used when taking over a child session");
         }
 
-        let scope = SubagentPathScope::from_input(&governance.input)?;
         let existing_children = {
             let parent_records = parent_transcript
                 .as_ref()
@@ -391,7 +726,7 @@ impl SubagentPool {
             Arc<Mutex<TranscriptRecorder>>,
             Agent<C>,
         )> {
-            let run_id = generate_run_id();
+            let run_id = reservation.run_id.clone();
             let child_dir = child_sessions_dir(&sessions_dir);
 
             if let Some(target_id) = takeover_child_session_id.as_ref() {
@@ -540,7 +875,7 @@ impl SubagentPool {
 
         let (run_id, child_session_id, pool_ordinal, child_transcript, child_agent) = setup?;
 
-        record_parent_started(
+        if let Err(error) = record_parent_started(
             &parent_transcript,
             &run_id,
             &parent_session_id,
@@ -549,7 +884,60 @@ impl SubagentPool {
             &template.name,
             &task,
             pool_ordinal,
-        )?;
+        ) {
+            let mut summary = build_runtime_summary(
+                &run_id,
+                &child_session_id,
+                &template.name,
+                SubagentStatus::Failed,
+                String::new(),
+            );
+            set_hard_failure(
+                &mut summary,
+                format!("failed to record parent subagent start: {error}"),
+            );
+            let _ = record_child_completion(
+                &child_transcript,
+                &summary,
+                &parent_session_id,
+                &parent_turn_id,
+            );
+            if let Some(parent_path) = parent_transcript
+                .as_ref()
+                .and_then(|recorder| recorder.lock().ok())
+                .map(|recorder| recorder.path().to_path_buf())
+                && crate::transcript::repair_partial_tail(&parent_path).is_ok()
+                && let Some(parent_dir) = parent_path.parent()
+                && let Ok(mut recorder) = TranscriptRecorder::open(parent_dir, &parent_session_id)
+            {
+                let _ = recorder.record_subagent_started(
+                    run_id.clone(),
+                    parent_session_id.clone(),
+                    parent_turn_id.clone(),
+                    child_session_id.clone(),
+                    template.name.clone(),
+                    task.clone(),
+                    pool_ordinal,
+                );
+                let _ = recorder.record_subagent_result_structured(
+                    run_id.clone(),
+                    parent_session_id.clone(),
+                    parent_turn_id.clone(),
+                    child_session_id.clone(),
+                    template.name.clone(),
+                    summary.status.as_str().to_string(),
+                    summary.summary.clone(),
+                    Some(summary.structured_result.clone()),
+                );
+            }
+            if let Ok(mut state) = self.state.lock() {
+                state.completed_by_run.insert(run_id.clone(), summary);
+                state.active_by_run.remove(&run_id);
+            }
+            self.changed.notify_waiters();
+            reservation.activated = true;
+            return Err(error);
+        }
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let summary = ChildSessionSummary {
@@ -563,31 +951,23 @@ impl SubagentPool {
             pool_ordinal,
         };
 
-        {
-            let mut map = self
-                .active_by_agent
-                .lock()
-                .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
-            if map.contains_key(template.name.as_str()) {
-                drop(map);
-                return Err(anyhow!(self.busy_error_message_for(template.name.as_str())));
-            }
-            map.insert(
-                template.name.clone(),
-                ActiveSlot {
-                    cancel: Some(cancel_tx),
-                    child: summary,
-                    run_id: run_id.clone(),
-                },
-            );
-        }
+        reservation.activate(cancel_tx, summary)?;
 
         Ok(StartedRun {
             guard: ActiveRunGuard::new(
-                Arc::clone(&self.active_by_agent),
-                template.name.clone(),
+                Arc::clone(&self.state),
+                Arc::clone(&self.changed),
                 run_id.clone(),
+                DropTerminalContext {
+                    child_transcript: Arc::clone(&child_transcript),
+                    parent_transcript: parent_transcript.clone(),
+                    parent_session_id: parent_session_id.clone(),
+                    parent_turn_id: parent_turn_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    agent_name: template.name.clone(),
+                },
             ),
+            path_access,
             run_id,
             child_session_id,
             agent_name: template.name.clone(),
@@ -602,20 +982,103 @@ impl SubagentPool {
             cancel_rx,
         })
     }
+}
 
-    fn busy_error_message_for(&self, agent_name: &str) -> String {
-        if let Ok(map) = self.active_by_agent.lock()
-            && let Some(slot) = map.get(agent_name)
-        {
-            return format!(
-                "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel (run_id={}, child_session_id={}, pool_ordinal={})",
-                slot.run_id, slot.child.child_session_id, slot.child.pool_ordinal
+fn run_path_access(
+    template: &AgentTemplate,
+    input: &NormalizedSubagentInput,
+    scope: Option<&SubagentPathScope>,
+) -> Result<RunPathAccess> {
+    if template.can_write {
+        if input.owned_paths.is_empty() {
+            bail!(
+                "writable subagent `{}` requires non-empty owned_paths for concurrent file locking",
+                template.name
             );
         }
-        format!(
-            "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel"
-        )
+        let roots = scope
+            .map(|scope| scope.owned_roots().to_vec())
+            .unwrap_or_default();
+        return Ok(RunPathAccess::Write(roots));
     }
+
+    let roots = if input.allowed_paths.is_empty() && input.owned_paths.is_empty() {
+        vec![crate::tool::workspace_root_for_subagent_lock()?]
+    } else {
+        let mut paths = input.allowed_paths.clone();
+        paths.extend(input.owned_paths.clone());
+        canonical_lock_roots(&paths)?
+    };
+    Ok(RunPathAccess::Read(roots))
+}
+
+fn validate_write_lock_coverage(
+    requested: &RunPathAccess,
+    observed_changed_paths: &[String],
+) -> Vec<String> {
+    let RunPathAccess::Write(roots) = requested else {
+        return Vec::new();
+    };
+    observed_changed_paths
+        .iter()
+        .filter(|path| {
+            crate::tool::canonical_subagent_observed_path(path)
+                .map(|path| {
+                    !roots
+                        .iter()
+                        .any(|root| path == *root || path.starts_with(root))
+                })
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn canonical_lock_roots(paths: &[String]) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for path in paths {
+        let root = crate::tool::canonical_subagent_lock_root(path)?;
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+fn ensure_path_access_available_in_map(
+    map: &std::collections::HashMap<String, ActiveSlot>,
+    requested: &RunPathAccess,
+) -> Result<()> {
+    for (run_id, slot) in map {
+        if path_access_conflicts(requested, &slot.path_access) {
+            bail!(
+                "subagent path lock conflict with run_id={} child_session_id={} agent_name={}",
+                run_id,
+                slot.child.child_session_id,
+                slot.child.agent_name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn path_access_conflicts(left: &RunPathAccess, right: &RunPathAccess) -> bool {
+    match (left, right) {
+        (RunPathAccess::Read(_), RunPathAccess::Read(_)) => false,
+        (RunPathAccess::Read(reads), RunPathAccess::Write(writes))
+        | (RunPathAccess::Write(writes), RunPathAccess::Read(reads)) => {
+            path_sets_overlap(reads, writes)
+        }
+        (RunPathAccess::Write(left), RunPathAccess::Write(right)) => path_sets_overlap(left, right),
+    }
+}
+
+fn path_sets_overlap(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    left.iter().any(|left| {
+        right
+            .iter()
+            .any(|right| left == right || left.starts_with(right) || right.starts_with(left))
+    })
 }
 
 pub struct StartedSubagentRun<C: Config> {
@@ -637,6 +1100,7 @@ impl<C: Config> StartedSubagentRun<C> {
 
 struct StartedRun<C: Config> {
     guard: ActiveRunGuard,
+    path_access: RunPathAccess,
     run_id: String,
     child_session_id: String,
     agent_name: String,
@@ -670,7 +1134,8 @@ where
         + 'static,
 {
     let StartedRun {
-        guard,
+        mut guard,
+        path_access,
         run_id,
         child_session_id,
         agent_name,
@@ -747,6 +1212,19 @@ where
     let mut summary = summary;
     let observed_changed_paths = observed_changed_paths_from_child_transcript(&child_transcript);
     enforce_write_scope(&mut summary, &governance, &observed_changed_paths);
+    let unlocked_changes = validate_write_lock_coverage(&path_access, &observed_changed_paths);
+    if !unlocked_changes.is_empty() {
+        let message = format!(
+            "changes outside acquired file locks detected: {}",
+            unlocked_changes.join(", ")
+        );
+        summary.status = SubagentStatus::Failed;
+        summary.failure_kind = Some(SubagentFailureKind::Logical);
+        summary.summary = message.clone();
+        summary.structured_result.status = SubagentStatus::Failed.as_str().into();
+        summary.structured_result.summary = message.clone();
+        summary.structured_result.blockers.push(message);
+    }
 
     guard.clear_cancel();
 
@@ -756,10 +1234,9 @@ where
         &parent_session_id,
         &parent_turn_id,
     ) {
-        emit_error(
-            &event_sender,
-            format!("failed to record child subagent completion: {error}"),
-        );
+        let message = format!("failed to record child subagent completion: {error}");
+        emit_error(&event_sender, message.clone());
+        set_hard_failure(&mut summary, message);
     }
 
     let parent_record_result = record_parent_result(
@@ -769,12 +1246,24 @@ where
         &parent_turn_id,
     );
     if let Err(error) = parent_record_result {
-        emit_error(
-            &event_sender,
-            format!("failed to record parent subagent result: {error}"),
-        );
-        return Err(error);
+        let message = format!("failed to record parent subagent result: {error}");
+        emit_error(&event_sender, message.clone());
+        set_hard_failure(&mut summary, message.clone());
+        if let Err(child_error) = record_child_completion(
+            &child_transcript,
+            &summary,
+            &parent_session_id,
+            &parent_turn_id,
+        ) {
+            emit_error(
+                &event_sender,
+                format!(
+                    "failed to record reconciled child subagent completion after parent failure: {child_error}"
+                ),
+            );
+        }
     }
+    guard.complete(summary.clone());
     if summary.status != SubagentStatus::Completed {
         emit_status(
             &event_sender,
@@ -788,6 +1277,15 @@ where
         );
     }
     Ok(summary)
+}
+
+fn set_hard_failure(summary: &mut SubagentRunSummary, message: String) {
+    summary.status = SubagentStatus::Failed;
+    summary.failure_kind = Some(SubagentFailureKind::Hard);
+    summary.summary = message.clone();
+    summary.structured_result.status = SubagentStatus::Failed.as_str().into();
+    summary.structured_result.summary = message.clone();
+    summary.structured_result.blockers.push(message);
 }
 
 fn record_parent_started(

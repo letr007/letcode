@@ -751,7 +751,7 @@ where
         return Ok(record);
     }
 
-    if !agent.tools.scope().allows_tool(&call.name) {
+    if !agent.tools.scope().allows_tool(&call.name) && !is_subagent_control_tool_name(&call.name) {
         let output = ToolResult::err(
             &call.name,
             agent.tools.scope().rejection_message(&call.name),
@@ -975,131 +975,132 @@ where
         })
         .await?;
 
-        let output = if is_subagent_tool_name(&call.name) {
-            agent
-                .execute_subagent_tool_for_call(&call.name, &args, Some(call.call_id.clone()))
-                .await
-        } else {
-            let mut context = match agent
-                .tool_execution_context_for(&call.name, external_workspace_access.is_some())
-            {
-                Ok(context) => context,
-                Err(error) => {
-                    let output = ToolResult::err(&call.name, error.to_string());
-                    let record = ToolExecutionRecord::new(
-                        call,
-                        Some(args),
-                        permission_class,
-                        directive,
-                        ToolExecutionStatus::Rejected,
-                        None,
-                        output,
-                    );
-                    emit_finished(on_event, call, &record).await?;
-                    return Ok(record);
-                }
-            };
-            if let Some(prepared) = prepared_writable_leaf {
-                context.attach_prepared_writable_leaf(prepared);
-            }
-            if let Some(prepared) = prepared_apply_patch {
-                context.attach_prepared_apply_patch(prepared);
-            }
-            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
-            let timeout_secs = non_shell_tool_timeout_secs(agent.tool_timeout_secs, &call.name);
-            let output = {
-                let emit_tx = delta_tx.clone();
-                drop(delta_tx);
-                let mut emit = move |stream, chunk| {
-                    emit_tx
-                        .send((stream, chunk))
-                        .map_err(|_| anyhow::anyhow!("tool output receiver closed"))
-                };
-                let output =
-                    agent
-                        .tools
-                        .call_streaming(&call.name, args.clone(), context, &mut emit);
-                tokio::pin!(output);
-                if let Some(timeout_secs) = timeout_secs {
-                    let timeout_sleep = tokio::time::sleep(Duration::from_secs(timeout_secs));
-                    tokio::pin!(timeout_sleep);
-
-                    loop {
-                        tokio::select! {
-                            output = &mut output => break Ok(output),
-                            Some((stream, chunk)) = delta_rx.recv() => {
-                                on_event(AgentEvent::ToolOutputDelta {
-                                    call_id: call.call_id.clone(),
-                                    stream,
-                                    chunk,
-                                })
-                                .await?;
-                            }
-                            _ = &mut timeout_sleep => break Err(timeout_secs),
-                        }
+        let output =
+            if is_subagent_tool_name(&call.name) || is_subagent_control_tool_name(&call.name) {
+                agent
+                    .execute_subagent_tool_for_call(&call.name, &args, Some(call.call_id.clone()))
+                    .await
+            } else {
+                let mut context = match agent
+                    .tool_execution_context_for(&call.name, external_workspace_access.is_some())
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let output = ToolResult::err(&call.name, error.to_string());
+                        let record = ToolExecutionRecord::new(
+                            call,
+                            Some(args),
+                            permission_class,
+                            directive,
+                            ToolExecutionStatus::Rejected,
+                            None,
+                            output,
+                        );
+                        emit_finished(on_event, call, &record).await?;
+                        return Ok(record);
                     }
-                } else {
-                    let output = loop {
-                        tokio::select! {
-                            output = &mut output => break output,
-                            Some((stream, chunk)) = delta_rx.recv() => {
-                                on_event(AgentEvent::ToolOutputDelta {
-                                    call_id: call.call_id.clone(),
-                                    stream,
-                                    chunk,
-                                })
-                                .await?;
+                };
+                if let Some(prepared) = prepared_writable_leaf {
+                    context.attach_prepared_writable_leaf(prepared);
+                }
+                if let Some(prepared) = prepared_apply_patch {
+                    context.attach_prepared_apply_patch(prepared);
+                }
+                let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+                let timeout_secs = non_shell_tool_timeout_secs(agent.tool_timeout_secs, &call.name);
+                let output = {
+                    let emit_tx = delta_tx.clone();
+                    drop(delta_tx);
+                    let mut emit = move |stream, chunk| {
+                        emit_tx
+                            .send((stream, chunk))
+                            .map_err(|_| anyhow::anyhow!("tool output receiver closed"))
+                    };
+                    let output =
+                        agent
+                            .tools
+                            .call_streaming(&call.name, args.clone(), context, &mut emit);
+                    tokio::pin!(output);
+                    if let Some(timeout_secs) = timeout_secs {
+                        let timeout_sleep = tokio::time::sleep(Duration::from_secs(timeout_secs));
+                        tokio::pin!(timeout_sleep);
+
+                        loop {
+                            tokio::select! {
+                                output = &mut output => break Ok(output),
+                                Some((stream, chunk)) = delta_rx.recv() => {
+                                    on_event(AgentEvent::ToolOutputDelta {
+                                        call_id: call.call_id.clone(),
+                                        stream,
+                                        chunk,
+                                    })
+                                    .await?;
+                                }
+                                _ = &mut timeout_sleep => break Err(timeout_secs),
                             }
                         }
-                    };
-                    Ok(output)
-                }
-            };
-            let output = match output {
-                Ok(output) => output,
-                Err(timeout_secs) => {
-                    on_event(AgentEvent::ToolCallCancelled {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                    })
-                    .await?;
-                    while let Some((stream, chunk)) = delta_rx.recv().await {
-                        on_event(AgentEvent::ToolOutputDelta {
+                    } else {
+                        let output = loop {
+                            tokio::select! {
+                                output = &mut output => break output,
+                                Some((stream, chunk)) = delta_rx.recv() => {
+                                    on_event(AgentEvent::ToolOutputDelta {
+                                        call_id: call.call_id.clone(),
+                                        stream,
+                                        chunk,
+                                    })
+                                    .await?;
+                                }
+                            }
+                        };
+                        Ok(output)
+                    }
+                };
+                let output = match output {
+                    Ok(output) => output,
+                    Err(timeout_secs) => {
+                        on_event(AgentEvent::ToolCallCancelled {
                             call_id: call.call_id.clone(),
-                            stream,
-                            chunk,
+                            name: call.name.clone(),
                         })
                         .await?;
+                        while let Some((stream, chunk)) = delta_rx.recv().await {
+                            on_event(AgentEvent::ToolOutputDelta {
+                                call_id: call.call_id.clone(),
+                                stream,
+                                chunk,
+                            })
+                            .await?;
+                        }
+                        let output = timed_out_tool_result(&call.name, timeout_secs);
+                        on_event(AgentEvent::ToolCallFinished {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            ok: false,
+                            output: output.clone(),
+                        })
+                        .await?;
+                        return Ok(ToolExecutionRecord::new(
+                            call,
+                            Some(args),
+                            permission_class,
+                            directive,
+                            ToolExecutionStatus::TimedOut,
+                            None,
+                            output,
+                        ));
                     }
-                    let output = timed_out_tool_result(&call.name, timeout_secs);
-                    on_event(AgentEvent::ToolCallFinished {
+                };
+                while let Some((stream, chunk)) = delta_rx.recv().await {
+                    on_event(AgentEvent::ToolOutputDelta {
                         call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        ok: false,
-                        output: output.clone(),
+                        stream,
+                        chunk,
                     })
                     .await?;
-                    return Ok(ToolExecutionRecord::new(
-                        call,
-                        Some(args),
-                        permission_class,
-                        directive,
-                        ToolExecutionStatus::TimedOut,
-                        None,
-                        output,
-                    ));
                 }
+                output
             };
-            while let Some((stream, chunk)) = delta_rx.recv().await {
-                on_event(AgentEvent::ToolOutputDelta {
-                    call_id: call.call_id.clone(),
-                    stream,
-                    chunk,
-                })
-                .await?;
-            }
-            output
-        };
 
         if output.ok {
             agent
@@ -1157,7 +1158,8 @@ where
 fn non_shell_tool_timeout_secs(tool_timeout_secs: Option<u64>, tool_name: &str) -> Option<u64> {
     (tool_name != tool_names::TOOL_SHELL_EXEC
         && tool_name != tool_names::TOOL_QUESTION
-        && !is_subagent_tool_name(tool_name))
+        && !is_subagent_tool_name(tool_name)
+        && !is_subagent_control_tool_name(tool_name))
     .then_some(tool_timeout_secs)
     .flatten()
 }

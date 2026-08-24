@@ -1086,13 +1086,15 @@ where
             );
             drop(iteration_span);
 
-            if agent
-                .continue_or_finalize_no_tool_reply(
-                    &mut on_event,
-                    tool_call_count,
-                    &mut continuation_count,
-                )
-                .await?
+            on_event(AgentEvent::TurnContinuationBoundary).await?;
+            if agent.drain_turn_continuations(&mut on_event).await?
+                || agent
+                    .continue_or_finalize_no_tool_reply(
+                        &mut on_event,
+                        tool_call_count,
+                        &mut continuation_count,
+                    )
+                    .await?
             {
                 continue;
             }
@@ -1152,6 +1154,8 @@ where
             .execute_tool_calls_and_record(&tool_calls, &mut on_event, &mut approve)
             .await?;
         on_event(AgentEvent::ToolCallBatchFinished).await?;
+        on_event(AgentEvent::TurnContinuationBoundary).await?;
+        let _ = agent.drain_turn_continuations(&mut on_event).await?;
     }
     }
     .instrument(turn_span.clone())
@@ -1870,13 +1874,15 @@ where
                 );
                 drop(iteration_span);
 
-                if agent
-                    .continue_or_finalize_no_tool_reply(
-                        &mut on_event,
-                        tool_call_count,
-                        &mut continuation_count,
-                    )
-                    .await?
+                on_event(AgentEvent::TurnContinuationBoundary).await?;
+                if agent.drain_turn_continuations(&mut on_event).await?
+                    || agent
+                        .continue_or_finalize_no_tool_reply(
+                            &mut on_event,
+                            tool_call_count,
+                            &mut continuation_count,
+                        )
+                        .await?
                 {
                     continue 'agent_iteration;
                 }
@@ -1974,6 +1980,8 @@ where
                 .execute_tool_calls_and_record(&tool_calls, &mut on_event, &mut approve)
                 .await?;
             on_event(AgentEvent::ToolCallBatchFinished).await?;
+            on_event(AgentEvent::TurnContinuationBoundary).await?;
+            let _ = agent.drain_turn_continuations(&mut on_event).await?;
             break 'retry_chat_stream;
         }
     }

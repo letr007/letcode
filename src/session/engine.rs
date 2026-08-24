@@ -1503,8 +1503,17 @@ async fn run_engine_loop(
                     if current_session_id.as_deref() != Some(parent_session_id.as_str()) {
                         continue;
                     }
+                    if result
+                        .as_ref()
+                        .is_ok_and(|result| subagent_runtime.is_foregrounded(&result.run_id))
+                    {
+                        continue;
+                    }
                     let prompt = match result {
                         Ok(result) => {
+                            if background_subagent_result_already_delivered(&agent, &result.run_id) {
+                                continue;
+                            }
                             if let Err(error) = agent.install_background_subagent_result(&result) {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     ErrorEvent::new(format!(
@@ -2290,6 +2299,9 @@ async fn run_engine_loop(
                     continue;
                 }
 
+                let turn_continuation_queue = Arc::new(StdMutex::new(
+                    crate::agent::TurnContinuationQueue::default(),
+                ));
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
                 let runner = AgentRunner::<async_openai::config::OpenAIConfig>::with_transcript(
                     runner_event_tx,
@@ -2317,9 +2329,16 @@ async fn run_engine_loop(
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
                     > =
                         if prompt.content.is_empty() {
-                            Box::pin(runner.continue_session(&mut agent))
+                            Box::pin(runner.run_existing_history_with_continuations(
+                                &mut agent,
+                                Arc::clone(&turn_continuation_queue),
+                            ))
                         } else {
-                            Box::pin(runner.run_prompt(&mut agent, prompt))
+                            Box::pin(runner.run_prompt_with_continuations(
+                                &mut agent,
+                                prompt,
+                                Arc::clone(&turn_continuation_queue),
+                            ))
                         };
                     tokio::pin!(run);
                     let mut interrupted = None;
@@ -2380,6 +2399,9 @@ async fn run_engine_loop(
                             }
                             ActiveSessionOperation::Command(command) => match command {
                                 Some(SessionEngineCommand::Prompt(prompt)) => {
+                                    if let Ok(mut queue) = turn_continuation_queue.lock() {
+                                        queue.mark_user_prompt_queued();
+                                    }
                                     deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));
                                     let _ = session_transport_tx.send(SessionTransportEvent::AssistantDone {
                                         message_id: None,
@@ -2416,6 +2438,88 @@ async fn run_engine_loop(
                                         ),
                                     ));
                                 }
+                                Some(SessionEngineCommand::BackgroundSubagentCompleted {
+                                    parent_session_id,
+                                    parent_tool_call_id,
+                                    result,
+                                }) => {
+                                    let current_session_id = transcript
+                                        .lock()
+                                        .ok()
+                                        .map(|recorder| recorder.session_id().to_string());
+                                    if current_session_id.as_deref()
+                                        != Some(parent_session_id.as_str())
+                                    {
+                                        continue;
+                                    }
+                                    if result.as_ref().is_ok_and(|result| {
+                                        subagent_runtime.is_foregrounded(&result.run_id)
+                                    }) {
+                                        continue;
+                                    }
+                                    let (text, continuation) = match result {
+                                        Ok(result) => {
+                                            let parent_records = transcript
+                                                .lock()
+                                                .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                                .and_then(|recorder| read_records(recorder.path()));
+                                            if parent_records.is_ok_and(|records| {
+                                                records.iter().any(|record| matches!(
+                                                    &record.event,
+                                                    crate::transcript::TranscriptEvent::Evidence {
+                                                        source: crate::evidence::EvidenceSource::Subagent {
+                                                            run_id,
+                                                            ..
+                                                        },
+                                                        ..
+                                                    } if run_id == &result.run_id
+                                                ))
+                                            }) {
+                                                continue;
+                                            }
+                                            let _ = session_transport_tx.send(
+                                                SessionTransportEvent::BackgroundSubagentCompleted {
+                                                    parent_tool_call_id,
+                                                    result: result.clone(),
+                                                },
+                                            );
+                                            (
+                                                format_background_subagent_completion(&result),
+                                                crate::agent::PendingTurnContinuation {
+                                                    result: Some(result),
+                                                },
+                                            )
+                                        }
+                                        Err(error) => (
+                                            format!(
+                                                "A background subagent failed before producing a structured result.\n\n{error}\n\nContinue the user's task and account for this failure."
+                                            ),
+                                            crate::agent::PendingTurnContinuation { result: None },
+                                        ),
+                                    };
+                                    if let Err(error) = transcript
+                                        .lock()
+                                        .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                        .and_then(|mut recorder| {
+                                            recorder.record_internal_continuation(
+                                                text,
+                                                crate::transcript::InternalContinuationSource::SubagentCompletion,
+                                            )
+                                        })
+                                        .and_then(|()| {
+                                            turn_continuation_queue
+                                                .lock()
+                                                .map_err(|_| anyhow!("turn continuation queue poisoned"))
+                                                .map(|mut queue| queue.push(continuation))
+                                        })
+                                    {
+                                        let _ = session_transport_tx.send(
+                                            SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                                "failed to queue background subagent completion: {error}"
+                                            ))),
+                                        );
+                                    }
+                                }
                                 Some(SessionEngineCommand::ShowHistoryTree)
                                 | Some(SessionEngineCommand::NavigateHistory { .. }) => {
                                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
@@ -2437,6 +2541,18 @@ async fn run_engine_loop(
                     (interrupted, shutdown)
                 };
 
+                if turn_continuation_queue
+                    .lock()
+                    .map(|queue| queue.preempted_by_user_prompt())
+                    .unwrap_or(false)
+                    && let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript)
+                {
+                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                        ErrorEvent::new(format!(
+                            "failed to restore background completion before queued prompt: {error}"
+                        )),
+                    ));
+                }
                 if let Some(interrupt) = interrupted {
                     record_interrupt_transcript(&transcript, &interrupt);
                     if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
@@ -2514,6 +2630,21 @@ async fn run_engine_loop(
             }
         }
     }
+}
+
+fn background_subagent_result_already_delivered<C>(agent: &Agent<C>, run_id: &str) -> bool
+where
+    C: Config,
+{
+    agent.evidence().iter().any(|evidence| {
+        matches!(
+            &evidence.source,
+            crate::evidence::EvidenceSource::Subagent {
+                run_id: recorded,
+                ..
+            } if recorded == run_id
+        )
+    })
 }
 
 pub(crate) fn format_background_subagent_completion(

@@ -32,7 +32,6 @@ pub(crate) use context_tree::replay_context_tree;
 mod job_board;
 
 pub(crate) use job_board::project_child_session_summaries;
-#[cfg(test)]
 pub(crate) use job_board::project_job_board;
 
 #[path = "transcript_projection/branch.rs"]

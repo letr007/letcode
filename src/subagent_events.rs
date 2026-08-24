@@ -165,6 +165,7 @@ where
                             | AgentEvent::ToolCallBatchFinished
                             | AgentEvent::TodoSnapshotUpdated { .. }
                             | AgentEvent::AutoContinueChanged { .. }
+                            | AgentEvent::TurnContinuationBoundary
                             | AgentEvent::AutoContinuationScheduled { .. }
                             | AgentEvent::ValidationAdvisory(_)
                             | AgentEvent::ToolExecutionSummary(_)

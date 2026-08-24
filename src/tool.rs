@@ -55,6 +55,43 @@ pub(crate) use delegation::{
     SubagentPathScope, delegation_scope_denial, is_delegation_path_scoped_tool,
     normalize_subagent_input, subagent_parameters_schema,
 };
+
+pub(crate) fn workspace_root_for_subagent_lock() -> Result<PathBuf> {
+    workspace_root()
+}
+
+pub(crate) fn canonical_subagent_lock_root(path: &str) -> Result<PathBuf> {
+    canonical_existing_path(path)
+        .ok_or_else(|| anyhow!("subagent lock path cannot be resolved: {path}"))
+}
+
+pub(crate) fn canonical_subagent_observed_path(path: &str) -> Result<PathBuf> {
+    let root = workspace_root()?;
+    let candidate = join_workspace_path(&root, path);
+    if let Ok(canonical) = candidate.canonicalize() {
+        return Ok(canonical);
+    }
+    let mut current = candidate.clone();
+    let mut suffix = Vec::new();
+    loop {
+        if current.exists() {
+            let mut canonical = current.canonicalize()?;
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Ok(canonical);
+        }
+        let name = current
+            .file_name()
+            .ok_or_else(|| anyhow!("cannot resolve subagent changed path: {path}"))?
+            .to_os_string();
+        suffix.push(name);
+        current = current
+            .parent()
+            .ok_or_else(|| anyhow!("cannot resolve subagent changed path: {path}"))?
+            .to_path_buf();
+    }
+}
 pub use registry::ToolRegistry;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
@@ -1511,6 +1548,30 @@ mod tests {
             blank
                 .to_string()
                 .contains("field 'task' must not be empty or whitespace")
+        );
+    }
+
+    #[test]
+    fn fixer_requires_owned_paths_for_file_locking() {
+        let missing = normalize_subagent_input(
+            "agent__fixer",
+            &json!({
+                "task": "fix",
+                "objective": null,
+                "success_criteria": null,
+                "allowed_paths": null,
+                "forbidden_paths": null,
+                "owned_paths": null,
+                "model": null,
+                "target_child_session_id": null,
+                "background": true
+            }),
+        )
+        .expect_err("fixer without locks must fail");
+        assert!(
+            missing
+                .to_string()
+                .contains("requires non-empty owned_paths")
         );
     }
 

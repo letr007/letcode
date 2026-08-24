@@ -143,6 +143,28 @@ pub fn read_records_allow_partial_tail(path: impl AsRef<Path>) -> Result<Vec<Tra
     read_records_inner(path, true)
 }
 
+pub(crate) fn repair_partial_tail(path: &Path) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    if content.ends_with('\n') || parse_records_content(path, &content, false).is_ok() {
+        return Ok(());
+    }
+    let valid_len = content.rfind('\n').map_or(0, |index| index + 1);
+    parse_records_content(path, &content[..valid_len], false)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to open transcript {} for tail repair",
+                path.display()
+            )
+        })?;
+    file.set_len(valid_len as u64)?;
+    file.sync_data()?;
+    Ok(())
+}
+
 pub fn read_records_inner(
     path: impl AsRef<Path>,
     allow_partial_tail: bool,

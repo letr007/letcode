@@ -2,7 +2,7 @@ mod pool;
 mod result;
 mod route_factory;
 
-pub use pool::{SubagentPool, SubagentRunGovernance};
+pub use pool::{SubagentJob, SubagentPool, SubagentRunGovernance};
 pub use result::{
     StructuredSubagentResult, SubagentFailureKind, SubagentRunSummary, SubagentStatus,
     looks_like_structured_subagent_output, try_parse_structured_subagent_result,
@@ -41,10 +41,11 @@ mod tests {
     use super::*;
     use crate::config::ApiProtocol;
     use crate::session::SessionTransportEvent;
-    use crate::transcript::read_records;
+    use crate::transcript::{JournalSink, read_records};
     use async_openai::Client;
     use async_openai::config::OpenAIConfig;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::Barrier;
     use tokio::time::sleep;
 
@@ -633,6 +634,7 @@ mod tests {
         let owned = temp_scope_root("allowed");
         let mut governance = test_governance();
         governance.input.allowed_paths = vec![owned.to_string_lossy().into_owned()];
+        governance.input.owned_paths = governance.input.allowed_paths.clone();
 
         let summary = runtime
             .run_with_executor(
@@ -938,7 +940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_concurrency_guard_rejects_second_run() {
+    async fn same_role_readers_can_run_concurrently() {
         let runtime = SubagentPool::new();
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
@@ -998,16 +1000,8 @@ mod tests {
                  _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
             .await
-            .expect_err("second run should be rejected");
-
-        let error = second.to_string();
-        assert!(
-            error.contains("is busy") && error.contains("explorer"),
-            "{error}"
-        );
-        assert!(error.contains("only one active run per role"), "{error}");
-        assert!(error.contains("run_id="), "{error}");
-        assert!(error.contains("child_session_id="), "{error}");
+            .expect("second reader should run concurrently");
+        assert_eq!(second.status, SubagentStatus::Completed);
         let first_summary = first.await.expect("join first").expect("first ok");
         assert_eq!(first_summary.status, SubagentStatus::Completed);
 
@@ -1033,6 +1027,148 @@ mod tests {
             .await
             .expect("slot is reusable after completion");
         assert_eq!(next.status, SubagentStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn overlapping_fixer_write_locks_are_rejected() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let owned_dir =
+            std::env::temp_dir().join(format!("letcode-lock-dir-{}", generate_run_id()));
+        std::fs::create_dir_all(&owned_dir).expect("create owned dir");
+        let mut governance = test_governance();
+        governance.input.owned_paths = vec![owned_dir.to_string_lossy().into_owned()];
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_runtime = runtime.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_governance = governance.clone();
+        let first = tokio::spawn(async move {
+            first_runtime
+                .run_with_executor(
+                    &agent,
+                    AgentTemplate::fixer(),
+                    "first fix".into(),
+                    first_governance,
+                    temp_sessions_dir(),
+                    "parent-session".into(),
+                    "turn-1".into(),
+                    None,
+                    no_event_sender(),
+                    None,
+                    move |_agent, _task, _transcript, _tx, _child, _name| {
+                        async move {
+                            first_barrier.wait().await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok("done".into())
+                        }
+                        .boxed()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait().await;
+        let error = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::fixer(),
+                "second fix".into(),
+                governance,
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-2".into(),
+                None,
+                no_event_sender(),
+                None,
+                |_agent, _task, _transcript, _tx, _child, _name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
+            )
+            .await
+            .expect_err("overlapping writer must be rejected")
+            .to_string();
+        assert!(error.contains("path lock conflict"), "{error}");
+        assert_eq!(
+            first
+                .await
+                .expect("join first")
+                .expect("first summary")
+                .status,
+            SubagentStatus::Completed
+        );
+        let _ = std::fs::remove_dir_all(owned_dir);
+    }
+
+    #[tokio::test]
+    async fn disjoint_fixer_write_locks_can_run_concurrently() {
+        let runtime = SubagentPool::new();
+        let left = std::env::temp_dir().join(format!("letcode-lock-left-{}", generate_run_id()));
+        let right = std::env::temp_dir().join(format!("letcode-lock-right-{}", generate_run_id()));
+        std::fs::create_dir_all(&left).expect("create left");
+        std::fs::create_dir_all(&right).expect("create right");
+        let mut left_governance = test_governance();
+        left_governance.input.owned_paths = vec![left.to_string_lossy().into_owned()];
+        let mut right_governance = test_governance();
+        right_governance.input.owned_paths = vec![right.to_string_lossy().into_owned()];
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_runtime = runtime.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = tokio::spawn(async move {
+            first_runtime
+                .run_with_executor(
+                    &test_agent(),
+                    AgentTemplate::fixer(),
+                    "left fix".into(),
+                    left_governance,
+                    temp_sessions_dir(),
+                    "parent-session".into(),
+                    "turn-1".into(),
+                    None,
+                    no_event_sender(),
+                    None,
+                    move |_agent, _task, _transcript, _tx, _child, _name| {
+                        async move {
+                            first_barrier.wait().await;
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            Ok("done".into())
+                        }
+                        .boxed()
+                    },
+                )
+                .await
+        });
+        barrier.wait().await;
+        let second = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::fixer(),
+                "right fix".into(),
+                right_governance,
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-2".into(),
+                None,
+                no_event_sender(),
+                None,
+                |_agent, _task, _transcript, _tx, _child, _name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
+            )
+            .await
+            .expect("disjoint writer starts");
+        assert_eq!(second.status, SubagentStatus::Completed);
+        assert_eq!(
+            first
+                .await
+                .expect("join first")
+                .expect("first summary")
+                .status,
+            SubagentStatus::Completed
+        );
+        let _ = std::fs::remove_dir_all(left);
+        let _ = std::fs::remove_dir_all(right);
     }
 
     #[tokio::test]
@@ -1101,6 +1237,84 @@ mod tests {
             .await
             .expect("second run succeeds after cancellation");
         assert_eq!(next.status, SubagentStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn dropped_foreground_claim_releases_background_delivery() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let started = runtime
+            .start_named_governed(
+                &agent,
+                "explorer",
+                crate::agent::SubagentInvocation {
+                    prompt: "inspect".into(),
+                    input: test_governance().input,
+                    model: None,
+                    parent_tool_call_id: Some("call-claim".into()),
+                },
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                None,
+            )
+            .expect("start run");
+        let run_id = started.run_id().to_string();
+        let claim = runtime
+            .claim_foreground(&run_id)
+            .expect("claim succeeds")
+            .expect("active run can be claimed");
+        assert!(runtime.is_foregrounded(&run_id));
+        drop(claim);
+        assert!(!runtime.is_foregrounded(&run_id));
+        drop(started);
+    }
+
+    #[tokio::test]
+    async fn wait_and_cancel_address_one_run_by_id() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let mut invocation_input = test_governance().input;
+        invocation_input.background = true;
+        let started = runtime
+            .start_named_governed(
+                &agent,
+                "explorer",
+                crate::agent::SubagentInvocation {
+                    prompt: "inspect".into(),
+                    input: invocation_input,
+                    model: None,
+                    parent_tool_call_id: Some("call-1".into()),
+                },
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                None,
+            )
+            .expect("start run");
+        let run_id = started.run_id().to_string();
+        let run_runtime = runtime.clone();
+        let run = tokio::spawn(async move { run_runtime.complete_started_run(started).await });
+
+        assert!(
+            runtime
+                .active_jobs()
+                .iter()
+                .any(|job| job.run_id == run_id && job.active)
+        );
+        assert!(runtime.cancel_run(&run_id));
+        let waited = runtime
+            .wait_for_result(&run_id)
+            .await
+            .expect("wait succeeds")
+            .expect("terminal result available");
+        assert_eq!(waited.status, SubagentStatus::Cancelled);
+        assert_eq!(
+            run.await.expect("join run").expect("run summary").status,
+            SubagentStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -1192,6 +1406,202 @@ mod tests {
         }
     }
 
+    struct PartialFailParentSink {
+        file: std::fs::File,
+    }
+
+    impl JournalSink for PartialFailParentSink {
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let partial_len = (bytes.len() / 2).max(1);
+            self.file.write_all(&bytes[..partial_len])?;
+            Err(io::Error::other("injected partial parent start failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+
+        fn sync_data(&mut self) -> io::Result<()> {
+            self.file.sync_data()
+        }
+    }
+
+    struct FailingParentSink {
+        fail: Arc<AtomicBool>,
+    }
+
+    impl JournalSink for FailingParentSink {
+        fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                Err(io::Error::other("injected parent result failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn sync_data(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_parent_start_failure_repairs_tail_and_publishes_durable_terminal_job() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let sessions_dir = temp_sessions_dir();
+        let parent_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&parent_dir).expect("create parent recorder"),
+        ));
+        let (parent_session_id, parent_path) = {
+            let recorder = parent_recorder.lock().expect("lock parent recorder");
+            (
+                recorder.session_id().to_string(),
+                recorder.path().to_path_buf(),
+            )
+        };
+        let partial_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent_path)
+            .expect("open parent transcript for partial failure");
+        parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .replace_sink_for_test(Box::new(PartialFailParentSink { file: partial_file }));
+
+        let error = runtime
+            .run_with_executor(
+                &agent,
+                AgentTemplate::explorer(),
+                "inspect".into(),
+                test_governance(),
+                sessions_dir.clone(),
+                parent_session_id.clone(),
+                "turn-1".into(),
+                Some(parent_recorder),
+                no_event_sender(),
+                None,
+                |_agent, _task, _transcript, _tx, _child, _name| {
+                    async move { Ok("must not run".into()) }.boxed()
+                },
+            )
+            .await
+            .expect_err("parent start write fails");
+        assert!(error.to_string().contains("partial parent start failure"));
+
+        let records = read_records(&parent_path).expect("repaired parent transcript is readable");
+        let run_id = records
+            .iter()
+            .find_map(|record| match &record.event {
+                crate::transcript::TranscriptEvent::SubagentStarted { run_id, .. } => {
+                    Some(run_id.clone())
+                }
+                _ => None,
+            })
+            .expect("recovery writes parent ownership");
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            crate::transcript::TranscriptEvent::SubagentResult {
+                run_id: recorded,
+                status,
+                ..
+            } if recorded == &run_id && status == "failed"
+        )));
+        let jobs = crate::transcript::project_subagent_jobs(&sessions_dir, &records)
+            .expect("project repaired terminal job");
+        assert!(
+            jobs.iter()
+                .any(|job| { job.run_id == run_id && !job.active && job.status == "failed" }),
+            "jobs={jobs:?} records={records:?}"
+        );
+        assert_eq!(
+            runtime
+                .completed_result(&run_id)
+                .expect("runtime terminal result")
+                .status,
+            SubagentStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_result_failure_publishes_one_failed_terminal_summary() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let sessions_dir = temp_sessions_dir();
+        let parent_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&parent_dir).expect("create parent recorder"),
+        ));
+        let parent_session_id = parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .session_id()
+            .to_string();
+        let fail_parent_result = Arc::new(AtomicBool::new(false));
+        parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .replace_sink_for_test(Box::new(FailingParentSink {
+                fail: Arc::clone(&fail_parent_result),
+            }));
+        let barrier = Arc::new(Barrier::new(2));
+        let exec_barrier = Arc::clone(&barrier);
+        let run_runtime = runtime.clone();
+        let run = tokio::spawn(async move {
+            run_runtime
+                .run_with_executor(
+                    &agent,
+                    AgentTemplate::explorer(),
+                    "inspect".into(),
+                    test_governance(),
+                    sessions_dir,
+                    parent_session_id,
+                    "turn-1".into(),
+                    Some(parent_recorder),
+                    no_event_sender(),
+                    None,
+                    move |_agent, _task, _transcript, _tx, _child, _name| {
+                        async move {
+                            exec_barrier.wait().await;
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            Ok("completed summary".into())
+                        }
+                        .boxed()
+                    },
+                )
+                .await
+        });
+        barrier.wait().await;
+        fail_parent_result.store(true, Ordering::SeqCst);
+        let summary = run
+            .await
+            .expect("join run")
+            .expect("terminal summary remains available");
+
+        assert_eq!(summary.status, SubagentStatus::Failed);
+        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Hard));
+        assert!(
+            summary
+                .summary
+                .contains("failed to record parent subagent result")
+        );
+        let completed = runtime
+            .completed_result(&summary.run_id)
+            .expect("terminal result retained");
+        assert_eq!(completed.status, SubagentStatus::Failed);
+        assert_eq!(completed.summary, summary.summary);
+        let waited = runtime
+            .wait_for_result(&summary.run_id)
+            .await
+            .expect("wait succeeds")
+            .expect("wait returns terminal result");
+        assert_eq!(waited, summary);
+    }
+
     #[tokio::test]
     async fn dropped_run_future_releases_concurrency_guard() {
         let runtime = SubagentPool::new();
@@ -1201,6 +1611,7 @@ mod tests {
 
         let run_runtime = runtime.clone();
         let run_barrier = Arc::clone(&barrier);
+        let run_sessions_dir = sessions_dir.clone();
         let run = tokio::spawn(async move {
             run_runtime
                 .run_with_executor(
@@ -1208,7 +1619,7 @@ mod tests {
                     AgentTemplate::explorer(),
                     "inspect".into(),
                     test_governance(),
-                    sessions_dir,
+                    run_sessions_dir,
                     "parent-session".into(),
                     "turn-1".into(),
                     None,
@@ -1231,12 +1642,32 @@ mod tests {
         });
 
         barrier.wait().await;
+        let run_id = runtime
+            .active_jobs()
+            .into_iter()
+            .find(|job| job.agent_name == "explorer")
+            .expect("aborted run is active")
+            .run_id;
         run.abort();
         assert!(
             run.await
                 .expect_err("run task should be aborted")
                 .is_cancelled()
         );
+        let abandoned = runtime
+            .completed_result(&run_id)
+            .expect("aborted run publishes a terminal result");
+        assert_eq!(abandoned.status, SubagentStatus::Cancelled);
+        let child_records = read_records(
+            crate::transcript::child_sessions_dir(&sessions_dir)
+                .join(format!("{}.jsonl", abandoned.child_session_id)),
+        )
+        .expect("read abandoned child transcript");
+        assert!(child_records.iter().any(|record| matches!(
+            &record.event,
+            crate::transcript::TranscriptEvent::SubagentLifecycle { status, .. }
+                if status == "cancelled"
+        )));
 
         let next = runtime
             .run_with_executor(

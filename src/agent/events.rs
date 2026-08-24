@@ -580,6 +580,7 @@ pub enum AgentEvent {
     FastModeChanged {
         enabled: bool,
     },
+    TurnContinuationBoundary,
     AutoContinuationScheduled {
         continuation_count: usize,
         remaining_unfinished: usize,

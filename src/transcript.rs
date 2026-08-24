@@ -131,7 +131,9 @@ pub(crate) use journal::{
     scan_transcript_content, serialize_journal_record, transcript_file_fingerprint,
     transcript_records_match, validate_journal_entries,
 };
-pub(crate) use journal::{ParsedJournalLine, parse_journal_line, transaction_fields};
+pub(crate) use journal::{
+    ParsedJournalLine, parse_journal_line, repair_partial_tail, transaction_fields,
+};
 pub use journal::{read_records, read_records_allow_partial_tail, read_records_with_fingerprint};
 pub use recorder::TranscriptRecorder;
 #[cfg(test)]
@@ -198,7 +200,6 @@ pub fn sort_child_session_summaries(children: &mut [ChildSessionSummary]) {
     });
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobBoardEntry {
     pub active: bool,
@@ -207,6 +208,37 @@ pub struct JobBoardEntry {
     pub agent_name: String,
     pub status: String,
     pub summary: String,
+}
+
+pub(crate) fn project_subagent_jobs(
+    base_dir: impl AsRef<Path>,
+    parent_records: &[TranscriptRecord],
+) -> Result<Vec<crate::subagent::SubagentJob>> {
+    let ordinals = parent_records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TranscriptEvent::SubagentStarted {
+                run_id,
+                pool_ordinal,
+                ..
+            } => Some((run_id.clone(), *pool_ordinal)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(
+        transcript_projection::project_job_board(&child_sessions_dir(base_dir), parent_records)?
+            .into_iter()
+            .map(|job| crate::subagent::SubagentJob {
+                active: job.active,
+                pool_ordinal: ordinals.get(&job.run_id).copied().unwrap_or(0),
+                run_id: job.run_id,
+                child_session_id: job.child_session_id,
+                agent_name: job.agent_name,
+                status: job.status,
+                summary: job.summary,
+            })
+            .collect(),
+    )
 }
 
 pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> {

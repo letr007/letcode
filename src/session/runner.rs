@@ -273,17 +273,56 @@ impl<C: Config> AgentRunner<C> {
     where
         C: Clone + Send + Sync + 'static,
     {
-        self.run_prompt_with_options(agent, prompt, true).await
+        let queue = Arc::new(Mutex::new(crate::agent::TurnContinuationQueue::default()));
+        self.run_prompt_with_continuations(agent, prompt, queue)
+            .await
     }
 
+    pub(crate) async fn run_prompt_with_continuations(
+        &self,
+        agent: &mut Agent<C>,
+        prompt: UserMessageSubmission,
+        turn_continuation_queue: Arc<Mutex<crate::agent::TurnContinuationQueue>>,
+    ) -> Result<String>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        let continuation_queue = Arc::clone(&turn_continuation_queue);
+        let mut continuation_guard = agent.turn_continuation_provider_guard(Arc::new(move || {
+            let mut queue = continuation_queue
+                .lock()
+                .map_err(|_| anyhow!("turn continuation queue poisoned"))?;
+            Ok(queue.drain_ready())
+        }));
+        self.run_prompt_with_options(continuation_guard.agent(), prompt, true)
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn continue_session(&self, agent: &mut Agent<C>) -> Result<String>
     where
         C: Clone + Send + Sync + 'static,
     {
-        self.run_existing_history(agent).await
+        let queue = Arc::new(Mutex::new(crate::agent::TurnContinuationQueue::default()));
+        self.run_existing_history_with_continuations(agent, queue)
+            .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_existing_history(&self, agent: &mut Agent<C>) -> Result<String>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        let queue = Arc::new(Mutex::new(crate::agent::TurnContinuationQueue::default()));
+        self.run_existing_history_with_continuations(agent, queue)
+            .await
+    }
+
+    pub(crate) async fn run_existing_history_with_continuations(
+        &self,
+        agent: &mut Agent<C>,
+        turn_continuation_queue: Arc<Mutex<crate::agent::TurnContinuationQueue>>,
+    ) -> Result<String>
     where
         C: Clone + Send + Sync + 'static,
     {
@@ -311,6 +350,14 @@ impl<C: Config> AgentRunner<C> {
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
+        let continuation_queue = Arc::clone(&turn_continuation_queue);
+        let mut continuation_guard = agent.turn_continuation_provider_guard(Arc::new(move || {
+            let mut queue = continuation_queue
+                .lock()
+                .map_err(|_| anyhow!("turn continuation queue poisoned"))?;
+            Ok(queue.drain_ready())
+        }));
+        let agent = continuation_guard.agent();
         let sender = self.event_tx.clone();
         let response = agent
             .run_stream_content_with_interactions_async(
@@ -404,6 +451,9 @@ impl<C: Config> AgentRunner<C> {
                                             AutoContinueChangedEvent::new(state),
                                         ),
                                     )?;
+                                }
+                                AgentEvent::TurnContinuationBoundary => {
+                                    tokio::task::yield_now().await;
                                 }
                                 _ => {}
                             }
@@ -886,6 +936,9 @@ impl<C: Config> AgentRunner<C> {
                                             AutoContinueChangedEvent::new(state),
                                         ),
                                     )?;
+                                }
+                                AgentEvent::TurnContinuationBoundary => {
+                                    tokio::task::yield_now().await;
                                 }
                                 AgentEvent::AutoContinuationScheduled {
                                     ..

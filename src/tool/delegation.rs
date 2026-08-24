@@ -170,6 +170,10 @@ impl SubagentPathScope {
         true
     }
 
+    pub(crate) fn owned_roots(&self) -> &[PathBuf] {
+        &self.owned_roots
+    }
+
     pub(crate) fn permits_write<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> bool {
         for path in paths {
             if self.is_forbidden(path) {
@@ -422,12 +426,17 @@ pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<Normali
         bail!("field 'model' cannot be combined with 'target_child_session_id'");
     }
 
+    let owned_paths = optional_trimmed_string_list(args, "owned_paths")?;
+    if tool_name == tool_names::TOOL_AGENT_FIXER && owned_paths.is_empty() {
+        bail!("agent__fixer requires non-empty owned_paths for file-level write locking");
+    }
+
     Ok(NormalizedSubagentInput {
         objective,
         success_criteria: optional_trimmed_string_list(args, "success_criteria")?,
         allowed_paths: optional_trimmed_string_list(args, "allowed_paths")?,
         forbidden_paths: optional_trimmed_string_list(args, "forbidden_paths")?,
-        owned_paths: optional_trimmed_string_list(args, "owned_paths")?,
+        owned_paths,
         timeout_secs: optional_u64(args, "timeout_secs")?,
         max_tool_calls: optional_u64(args, "max_tool_calls")?.map(|value| value as usize),
         model,
@@ -549,7 +558,7 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
             "owned_paths": {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
-                "description": "当前委派拥有编辑权的路径集合"
+                "description": "当前委派拥有编辑权的文件或目录子树；fixer 必填，路径重叠的读写/写写任务会被拒绝"
             },
             "model": {
                 "type": ["string", "null"],

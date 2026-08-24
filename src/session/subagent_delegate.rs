@@ -9,9 +9,9 @@ use crate::agent::{
     Agent, SubagentDelegate, SubagentInvocation, subagent_tool_name_for_agent_name,
 };
 use crate::session::engine::{SessionEngineCommand, SessionEngineControl};
-use crate::subagent::{SubagentFailureKind, SubagentPool, SubagentStatus};
+use crate::subagent::{SubagentFailureKind, SubagentJob, SubagentPool, SubagentStatus};
 use crate::tool::ToolResult;
-use crate::transcript::TranscriptRecorder;
+use crate::transcript::{TranscriptEvent, TranscriptRecorder};
 
 use super::events::SessionTransportEventSender;
 use super::formatting::compact_subagent_summary;
@@ -124,9 +124,181 @@ impl RunnerSubagentDelegate {
         });
         ToolResult::err_with_data(tool_name, summary, data)
     }
+
+    fn job(&self, run_id: &str) -> Result<Option<SubagentJob>> {
+        let parent_records = self.parent_records()?;
+        if let Some(result) = self.runtime.completed_result(run_id) {
+            let pool_ordinal = pool_ordinal_for_run(&parent_records, run_id);
+            if pool_ordinal > 0 {
+                let mut job = SubagentJob::from_result(result);
+                job.pool_ordinal = pool_ordinal;
+                return Ok(Some(job));
+            }
+        }
+        if let Some(job) = self.runtime.active_jobs().into_iter().find(|job| {
+            job.run_id == run_id && pool_ordinal_for_run(&parent_records, &job.run_id) > 0
+        }) {
+            return Ok(Some(job));
+        }
+        Ok(
+            crate::transcript::project_subagent_jobs(&self.sessions_dir, &parent_records)?
+                .into_iter()
+                .find(|job| job.run_id == run_id),
+        )
+    }
+
+    fn parent_records(&self) -> Result<Vec<crate::transcript::TranscriptRecord>> {
+        self.transcript
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))
+            .and_then(|recorder| {
+                crate::transcript::read_records_allow_partial_tail(recorder.path())
+            })
+    }
+}
+
+fn pool_ordinal_for_run(records: &[crate::transcript::TranscriptRecord], run_id: &str) -> u32 {
+    records
+        .iter()
+        .find_map(|record| match &record.event {
+            TranscriptEvent::SubagentStarted {
+                run_id: recorded,
+                pool_ordinal,
+                ..
+            } if recorded == run_id => Some(*pool_ordinal),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn control_run_id<'a>(tool_name: &str, args: &'a serde_json::Value) -> Result<&'a str> {
+    args.get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+        .ok_or_else(|| anyhow!("{tool_name} requires non-empty run_id"))
+}
+
+fn merge_live_jobs(
+    jobs: &mut Vec<SubagentJob>,
+    live: Vec<SubagentJob>,
+    parent_records: &[crate::transcript::TranscriptRecord],
+) {
+    for live_job in live {
+        if pool_ordinal_for_run(parent_records, &live_job.run_id) == 0 {
+            continue;
+        }
+        if let Some(job) = jobs.iter_mut().find(|job| job.run_id == live_job.run_id) {
+            *job = live_job;
+        } else {
+            jobs.push(live_job);
+        }
+    }
+    jobs.sort_by_key(|job| (job.pool_ordinal, job.run_id.clone()));
 }
 
 impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDelegate {
+    fn control<'a>(
+        &'a self,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
+        Box::pin(async move {
+            match tool_name {
+                crate::tool_names::TOOL_AGENT_JOBS => {
+                    let parent_records = self.parent_records()?;
+                    let mut jobs = crate::transcript::project_subagent_jobs(
+                        &self.sessions_dir,
+                        &parent_records,
+                    )?;
+                    merge_live_jobs(&mut jobs, self.runtime.active_jobs(), &parent_records);
+                    Ok(ToolResult::ok(tool_name, json!({"jobs": jobs})))
+                }
+                crate::tool_names::TOOL_AGENT_STATUS => {
+                    let run_id = control_run_id(tool_name, args)?;
+                    let job = self.job(run_id)?;
+                    match job {
+                        Some(job) => Ok(ToolResult::ok(tool_name, serde_json::to_value(job)?)),
+                        None => Ok(ToolResult::err(
+                            tool_name,
+                            format!("unknown subagent run_id: {run_id}"),
+                        )),
+                    }
+                }
+                crate::tool_names::TOOL_AGENT_WAIT => {
+                    let run_id = control_run_id(tool_name, args)?;
+                    let Some(job) = self.job(run_id)? else {
+                        return Ok(ToolResult::err(
+                            tool_name,
+                            format!("unknown subagent run_id: {run_id}"),
+                        ));
+                    };
+                    if !job.active {
+                        return Ok(ToolResult::err(
+                            tool_name,
+                            format!("subagent run is already terminal: {run_id}"),
+                        ));
+                    }
+                    let Some(mut foreground) = self.runtime.claim_foreground(run_id)? else {
+                        return Ok(ToolResult::err(
+                            tool_name,
+                            format!("subagent run is already terminal or foregrounded: {run_id}"),
+                        ));
+                    };
+                    let result = self.runtime.wait_for_result(run_id).await?;
+                    match result {
+                        Some(result) => {
+                            foreground.retain();
+                            Ok(ToolResult::ok(
+                                tool_name,
+                                json!({
+                                    "run_id": result.run_id,
+                                    "child_session_id": result.child_session_id,
+                                    "agent_name": result.agent_name,
+                                    "status": result.status.as_str(),
+                                    "failure_kind": result.failure_kind.map(|kind| kind.as_str()),
+                                    "summary": result.summary,
+                                    "structured_result": result.structured_result,
+                                    "active": false,
+                                }),
+                            ))
+                        }
+                        None => {
+                            self.runtime.release_foreground(run_id);
+                            Ok(ToolResult::err(
+                                tool_name,
+                                format!("subagent run ended without a terminal result: {run_id}"),
+                            ))
+                        }
+                    }
+                }
+                crate::tool_names::TOOL_AGENT_CANCEL => {
+                    let run_id = control_run_id(tool_name, args)?;
+                    if self.job(run_id)?.is_some() && self.runtime.cancel_run(run_id) {
+                        Ok(ToolResult::ok(
+                            tool_name,
+                            json!({"run_id": run_id, "cancellation_requested": true}),
+                        ))
+                    } else if let Some(job) = self.job(run_id)? {
+                        Ok(ToolResult::ok(
+                            tool_name,
+                            json!({"run_id": run_id, "cancellation_requested": false, "job": job}),
+                        ))
+                    } else {
+                        Ok(ToolResult::err(
+                            tool_name,
+                            format!("unknown subagent run_id: {run_id}"),
+                        ))
+                    }
+                }
+                _ => Ok(ToolResult::err(
+                    tool_name,
+                    format!("unknown subagent control tool: {tool_name}"),
+                )),
+            }
+        })
+    }
+
     fn run_named<'a>(
         &'a self,
         parent: &'a Agent<async_openai::config::OpenAIConfig>,
@@ -186,12 +358,6 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                     .as_millis()
             );
             let background = invocation.input.background;
-            if background && agent_name == "fixer" {
-                return Ok(ToolResult::err(
-                    tool_name,
-                    "background execution is unavailable for fixer",
-                ));
-            }
             if background && self.background_control_tx.is_none() {
                 return Ok(ToolResult::err(
                     tool_name,

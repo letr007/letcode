@@ -29,7 +29,7 @@ use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCata
 use crate::session::{
     PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
 };
-use crate::subagent::SubagentPool;
+use crate::subagent::{SubagentPool, SubagentStatus};
 use crate::transcript::sync_recorder_branch;
 use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
@@ -5645,7 +5645,7 @@ async fn background_child_events_outlive_parent_runner_channel() {
     let route = parent.route_display_name();
     let (transient_tx, transient_rx) = mpsc::unbounded_channel();
     let (durable_tx, mut durable_rx) = mpsc::unbounded_channel();
-    let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let runtime = SubagentPool::new();
     let runner =
@@ -5705,7 +5705,83 @@ async fn background_child_events_outlive_parent_runner_channel() {
             && tool.name == "search__rg"
     ));
 
-    runtime.cancel_active();
+    let run_id = receipt
+        .data
+        .as_ref()
+        .and_then(|data| data.get("run_id"))
+        .and_then(serde_json::Value::as_str)
+        .expect("receipt has run id")
+        .to_string();
+    let jobs = parent
+        .execute_subagent_control_tool_for_test("agent__jobs", &serde_json::json!({}))
+        .await;
+    assert!(jobs.ok);
+    assert!(
+        jobs.data
+            .as_ref()
+            .and_then(|data| data.get("jobs"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|jobs| jobs
+                .iter()
+                .any(|job| job.get("run_id").and_then(serde_json::Value::as_str)
+                    == Some(run_id.as_str())))
+    );
+    let status = parent
+        .execute_subagent_control_tool_for_test(
+            "agent__status",
+            &serde_json::json!({"run_id": run_id}),
+        )
+        .await;
+    assert!(status.ok);
+    assert_eq!(
+        status
+            .data
+            .as_ref()
+            .and_then(|data| data.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("running")
+    );
+    let cancel = parent
+        .execute_subagent_control_tool_for_test(
+            "agent__cancel",
+            &serde_json::json!({"run_id": run_id}),
+        )
+        .await;
+    assert!(cancel.ok);
+    assert_eq!(
+        cancel
+            .data
+            .as_ref()
+            .and_then(|data| data.get("cancellation_requested"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let waited = parent
+        .execute_subagent_control_tool_for_test(
+            "agent__wait",
+            &serde_json::json!({"run_id": run_id}),
+        )
+        .await;
+    assert!(waited.ok);
+    assert_eq!(
+        waited
+            .data
+            .as_ref()
+            .and_then(|data| data.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("cancelled")
+    );
+    let completion = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, completion_rx.recv())
+        .await
+        .expect("background completion remains delivered after foreground wait")
+        .expect("background completion channel remains open");
+    assert!(matches!(
+        completion,
+        SessionEngineControl::Command(SessionEngineCommand::BackgroundSubagentCompleted {
+            result: Ok(ref result),
+            ..
+        }) if result.run_id == run_id && result.status == SubagentStatus::Cancelled
+    ));
     server.abort().await;
 }
 

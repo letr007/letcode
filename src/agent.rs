@@ -10,7 +10,7 @@ use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent, 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -485,6 +485,19 @@ pub trait SubagentDelegate<C: Config>: Send + Sync {
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
 
+    fn control<'a>(
+        &'a self,
+        tool_name: &'a str,
+        _args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(ToolResult::err(
+                tool_name,
+                format!("{tool_name} is unavailable in this subagent runtime"),
+            ))
+        })
+    }
+
     #[allow(dead_code)]
     fn capability_contracts(&self) -> Vec<SubagentCapabilityContract> {
         AgentTemplate::catalog()
@@ -529,7 +542,7 @@ const DEFAULT_AGENT_PRELUDE: &str = r#"你是运行在本地仓库中的编程�
 有意识地选择专家：explorer 用于广泛或未知代码搜索；fixer 用于有界实现与多文件机械修改；oracle 用于根因分析、风险审查或关键评估；designer 用于 UI/UX 决策；librarian 用于外部文档或库/框架行为；general 用于有界只读辅助工作。
 优先复用先前专家成果：使用会话历史或任务板中已完成或已调和的会话，再启动重叠工作；绝不要把已取消或出错的会话当作权威结果复用。
 当委派能提升质量、速度或上下文卫生时，委派有界工作，尤其是会污染主代理上下文的底层或读密集任务。
-SubagentPool 每个专家角色同时只允许一个活跃运行（不同角色可并行）。委派不会在忙碌角色上排队：等待该角色完成或取消它。引用子代理时优先使用稳定的池序号（#N），而不是列表位置。两种启动模式：省略 target_child_session_id 以创建新子会话，或设置 target_child_session_id 以接管已结束的子会话并复用其上下文。历史子会话是池记录；只有显式接管才会继续既有会话。
+SubagentPool 支持同角色并发；只读任务共享读锁，fixer 必须声明非空 owned_paths 并取得对应文件或目录子树的写锁。路径重叠的读写或写写任务不会排队，而是明确拒绝，待冲突任务完成或取消后再启动。使用 agent__jobs/status/wait/cancel 管理后台任务；查询和等待不得隐式接管或重复执行。引用子代理时优先使用稳定的池序号（#N），而不是列表位置。两种启动模式：省略 target_child_session_id 以创建新子会话，或设置 target_child_session_id 以接管已结束的子会话并复用其上下文。历史子会话是池记录；只有显式接管才会继续既有会话。
 保持委派受控：避免递归委派，避免不必要的多智能体编排，保持清晰的父代理叙事，调和子结果，并在停止前暴露剩余阻塞或有针对性的验证缺口。
 保持在范围内。除非必要，不要重构、重排格式、重命名或修改无关代码；若需要更广改动，说明原因。
 当工具、编辑或验证失败时，先检查错误再重试。不要用宽泛回退或跳过验证来掩盖失败；快速失败并解释可操作原因。
@@ -584,6 +597,41 @@ const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
 
+#[derive(Debug, Default)]
+pub(crate) struct TurnContinuationQueue {
+    pending: VecDeque<PendingTurnContinuation>,
+    preempted_by_user_prompt: bool,
+}
+
+impl TurnContinuationQueue {
+    pub(crate) fn push(&mut self, continuation: PendingTurnContinuation) {
+        self.pending.push_back(continuation);
+    }
+
+    pub(crate) fn mark_user_prompt_queued(&mut self) {
+        self.preempted_by_user_prompt = true;
+    }
+
+    pub(crate) fn preempted_by_user_prompt(&self) -> bool {
+        self.preempted_by_user_prompt
+    }
+
+    pub(crate) fn drain_ready(&mut self) -> Vec<PendingTurnContinuation> {
+        if self.preempted_by_user_prompt {
+            return Vec::new();
+        }
+        self.pending.drain(..).collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTurnContinuation {
+    pub result: Option<crate::subagent::SubagentRunSummary>,
+}
+
+pub(crate) type TurnContinuationProvider =
+    Arc<dyn Fn() -> Result<Vec<PendingTurnContinuation>> + Send + Sync>;
+
 pub struct Agent<C: Config> {
     pub client: Client<C>,
     model: String,
@@ -615,6 +663,7 @@ pub struct Agent<C: Config> {
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
+    turn_continuation_provider: Option<TurnContinuationProvider>,
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
     provider_usage_anchor: Option<ProviderUsageAnchor>,
@@ -826,6 +875,7 @@ impl AgentFactory {
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
+            turn_continuation_provider: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -1106,6 +1156,7 @@ impl<C: Config> Agent<C> {
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
+            turn_continuation_provider: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -1618,6 +1669,9 @@ impl<C: Config> Agent<C> {
                 .into_iter()
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
+        if self.subagent_delegate.is_some() {
+            tools.extend(subagent_control_tool_specs());
+        }
         let anchored_phase = self
             .anchored
             .as_ref()
@@ -2075,6 +2129,45 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot_provider = None;
     }
 
+    pub(crate) fn turn_continuation_provider_guard(
+        &mut self,
+        provider: TurnContinuationProvider,
+    ) -> TurnContinuationProviderGuard<'_, C> {
+        TurnContinuationProviderGuard::install(self, Some(provider))
+    }
+
+    async fn drain_turn_continuations<E, Efut>(&mut self, _on_event: &mut E) -> Result<bool>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        let Some(provider) = self.turn_continuation_provider.as_ref() else {
+            return Ok(false);
+        };
+        let messages = provider()?;
+        self.apply_turn_continuations(messages)
+    }
+
+    pub(crate) fn apply_turn_continuations(
+        &mut self,
+        messages: Vec<PendingTurnContinuation>,
+    ) -> Result<bool> {
+        if messages.is_empty() {
+            return Ok(false);
+        }
+        self.reload_runtime_snapshot_from_provider()?;
+        self.apply_turn_continuation_effects(&messages);
+        Ok(true)
+    }
+
+    fn apply_turn_continuation_effects(&mut self, messages: &[PendingTurnContinuation]) {
+        for message in messages {
+            if let Some(result) = &message.result {
+                self.record_background_subagent_effects(result);
+            }
+        }
+    }
+
     // Kept temporarily for the out-of-scope session runner's legacy restore cleanup.
     // The Agent retains no checkpoint candidate or production control state.
     pub(crate) fn clear_logical_checkpoint_candidate_provider(&mut self) {}
@@ -2377,6 +2470,7 @@ impl<C: Config> Agent<C> {
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
+            turn_continuation_provider: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -2569,6 +2663,16 @@ impl<C: Config> Agent<C> {
     }
 
     #[cfg(test)]
+    pub(crate) async fn execute_subagent_control_tool_for_test(
+        &self,
+        tool_name: &str,
+        args: &Value,
+    ) -> ToolResult {
+        self.execute_subagent_tool_for_call(tool_name, args, None)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn execute_subagent_tool_with_parent_call_for_test(
         &self,
         tool_name: &str,
@@ -2585,16 +2689,23 @@ impl<C: Config> Agent<C> {
         args: &Value,
         parent_tool_call_id: Option<String>,
     ) -> ToolResult {
-        let input = match normalize_subagent_input(tool_name, args) {
-            Ok(input) => input,
-            Err(error) => return ToolResult::err(tool_name, error.to_string()),
-        };
-
         let Some(delegate) = self.subagent_delegate.clone() else {
             return ToolResult::err(
                 tool_name,
                 format!("{tool_name} is unavailable outside a subagent-capable runtime"),
             );
+        };
+
+        if is_subagent_control_tool_name(tool_name) {
+            return match delegate.control(tool_name, args).await {
+                Ok(result) => result,
+                Err(error) => ToolResult::err(tool_name, error.to_string()),
+            };
+        }
+
+        let input = match normalize_subagent_input(tool_name, args) {
+            Ok(input) => input,
+            Err(error) => return ToolResult::err(tool_name, error.to_string()),
         };
 
         let task = self.render_subagent_prompt(tool_name, &input);
@@ -2646,6 +2757,9 @@ impl<C: Config> Agent<C> {
                 .into_iter()
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
+        if self.subagent_delegate.is_some() {
+            specs.extend(subagent_control_tool_specs());
+        }
         if let Some(anchored) = &self.anchored
             && anchored.enabled_for(model_id)
             && self.anchored_override
@@ -2891,16 +3005,18 @@ impl<C: Config> Agent<C> {
                 continue;
             }
 
-            let mut roles = HashSet::new();
             let mut end = index;
-            while let Some(call) = calls.get(end) {
-                let Some(role) = agent_name_for_subagent_tool(&call.name) else {
-                    break;
-                };
-                if !roles.insert(role) {
-                    break;
-                }
+            while calls
+                .get(end)
+                .is_some_and(|call| is_subagent_tool_name(&call.name))
+            {
                 end += 1;
+            }
+            if end == index {
+                self.execute_tool_call_and_record(&calls[index], on_event, approve)
+                    .await?;
+                index += 1;
+                continue;
             }
 
             let records = tool_execution::execute_subagent_tool_call_batch(
@@ -2997,14 +3113,42 @@ impl<C: Config> Agent<C> {
             "tool output appended to history"
         );
 
-        let evidence = self.remember_tool_evidence(&record)?;
-        on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
+        if !self.subagent_effects_are_already_recorded(&record) {
+            let evidence = self.remember_tool_evidence(&record)?;
+            on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
+        }
 
         if is_cancelled_subagent_record(&record) {
             return Ok(ToolCallRecordOutcome::Cancelled);
         }
 
         Ok(ToolCallRecordOutcome::Completed)
+    }
+
+    fn subagent_effects_are_already_recorded(&self, record: &ToolExecutionRecord) -> bool {
+        if !is_subagent_tool_name(&record.tool_name)
+            && record.tool_name != tool_names::TOOL_AGENT_WAIT
+        {
+            return false;
+        }
+        let Some(run_id) = record
+            .output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("run_id"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        self.runtime_snapshot.evidence.iter().any(|evidence| {
+            matches!(
+                &evidence.source,
+                crate::evidence::EvidenceSource::Subagent {
+                    run_id: recorded,
+                    ..
+                } if recorded == run_id
+            )
+        })
     }
 
     fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {
@@ -3449,7 +3593,9 @@ impl<C: Config> Agent<C> {
     }
 
     fn record_tool_effects(&mut self, record: &ToolExecutionRecord) {
-        if is_subagent_tool_name(&record.tool_name) {
+        if is_subagent_tool_name(&record.tool_name)
+            || record.tool_name == tool_names::TOOL_AGENT_WAIT
+        {
             self.record_subagent_effects(record);
         }
         match record.effects.kind {
@@ -3485,6 +3631,22 @@ impl<C: Config> Agent<C> {
         &mut self,
         result: &crate::subagent::SubagentRunSummary,
     ) -> Result<()> {
+        self.record_background_subagent_effects(result);
+        Ok(())
+    }
+
+    fn record_background_subagent_effects(&mut self, result: &crate::subagent::SubagentRunSummary) {
+        if self.runtime_snapshot.evidence.iter().any(|evidence| {
+            matches!(
+                &evidence.source,
+                crate::evidence::EvidenceSource::Subagent {
+                    run_id: recorded,
+                    ..
+                } if recorded == &result.run_id
+            )
+        }) {
+            return;
+        }
         let parent_tool = subagent_tool_name_for_agent_name(&result.agent_name)
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("agent__{}", result.agent_name));
@@ -3517,11 +3679,21 @@ impl<C: Config> Agent<C> {
             },
         };
         self.record_subagent_effects(&record);
-        let _ = self.remember_tool_evidence(&record)?;
-        Ok(())
+    }
+
+    #[cfg(test)]
+    fn child_effect_counts_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.turn.counters.child_write_effects,
+            self.turn.counters.child_validation_effects,
+            self.turn.counters.child_failed_validation_effects,
+        )
     }
 
     fn record_subagent_effects(&mut self, record: &ToolExecutionRecord) {
+        if self.subagent_effects_are_already_recorded(record) {
+            return;
+        }
         let Some(structured) = record
             .output
             .data
@@ -3552,6 +3724,29 @@ impl<C: Config> Agent<C> {
             .counters
             .child_failed_validation_effects
             .saturating_add(failed_validation_effects);
+    }
+}
+
+pub(crate) struct TurnContinuationProviderGuard<'a, C: Config> {
+    agent: &'a mut Agent<C>,
+    previous: Option<TurnContinuationProvider>,
+}
+
+impl<'a, C: Config> TurnContinuationProviderGuard<'a, C> {
+    fn install(agent: &'a mut Agent<C>, replacement: Option<TurnContinuationProvider>) -> Self {
+        let previous = agent.turn_continuation_provider.take();
+        agent.turn_continuation_provider = replacement;
+        Self { agent, previous }
+    }
+
+    pub(crate) fn agent(&mut self) -> &mut Agent<C> {
+        self.agent
+    }
+}
+
+impl<C: Config> Drop for TurnContinuationProviderGuard<'_, C> {
+    fn drop(&mut self) {
+        self.agent.turn_continuation_provider = self.previous.take();
     }
 }
 
@@ -3590,6 +3785,9 @@ fn permission_class_for_tool_call(
 /// step with tool advertisement so a model cannot request a virtual tool that
 /// will only fail after approval.
 fn is_executable_tool<C: Config>(agent: &Agent<C>, tool_name: &str) -> bool {
+    if is_subagent_control_tool_name(tool_name) {
+        return agent.subagent_delegate.is_some();
+    }
     match subagent_catalog_entry_by_tool_name(tool_name) {
         Some(_) => agent.subagent_delegate.is_some(),
         None => agent.tools.contains(tool_name),
@@ -3599,6 +3797,9 @@ fn is_executable_tool<C: Config>(agent: &Agent<C>, tool_name: &str) -> bool {
 fn subagent_tool_permission_class(
     tool_name: &str,
 ) -> Option<crate::permission::ToolPermissionClass> {
+    if is_subagent_control_tool_name(tool_name) {
+        return Some(crate::permission::ToolPermissionClass::Preview);
+    }
     let entry = subagent_catalog_entry_by_tool_name(tool_name)?;
     Some(if entry.read_only {
         crate::permission::ToolPermissionClass::Preview
@@ -3611,6 +3812,61 @@ fn is_read_only_subagent_tool_name(name: &str) -> bool {
     subagent_catalog_entry_by_tool_name(name)
         .map(|entry| entry.read_only)
         .unwrap_or(false)
+}
+
+fn is_subagent_control_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        tool_names::TOOL_AGENT_JOBS
+            | tool_names::TOOL_AGENT_STATUS
+            | tool_names::TOOL_AGENT_WAIT
+            | tool_names::TOOL_AGENT_CANCEL
+    )
+}
+
+fn subagent_control_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
+    vec![
+        crate::request_builder::ToolSpec {
+            name: tool_names::TOOL_AGENT_JOBS.into(),
+            description: "List subagent jobs for the current parent session, including active and terminal runs.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            strict: true,
+        },
+        crate::request_builder::ToolSpec {
+            name: tool_names::TOOL_AGENT_STATUS.into(),
+            description: "Get one existing subagent run by run_id without starting or taking over work.".into(),
+            parameters: subagent_run_id_schema(),
+            strict: true,
+        },
+        crate::request_builder::ToolSpec {
+            name: tool_names::TOOL_AGENT_WAIT.into(),
+            description: "Bring one active background subagent run to the foreground and block until it reaches a terminal state.".into(),
+            parameters: subagent_run_id_schema(),
+            strict: true,
+        },
+        crate::request_builder::ToolSpec {
+            name: tool_names::TOOL_AGENT_CANCEL.into(),
+            description: "Request cancellation of one active subagent run by run_id.".into(),
+            parameters: subagent_run_id_schema(),
+            strict: true,
+        },
+    ]
+}
+
+fn subagent_run_id_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "minLength": 1}
+        },
+        "required": ["run_id"],
+        "additionalProperties": false
+    })
 }
 
 fn subagent_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
@@ -3708,7 +3964,9 @@ impl ToolEffects {
         let kind = if !output.ok {
             ToolEffectKind::Diagnostic
         } else {
-            if is_read_only_subagent_tool_name(tool_name) {
+            if is_read_only_subagent_tool_name(tool_name)
+                || is_subagent_control_tool_name(tool_name)
+            {
                 ToolEffectKind::Read
             } else {
                 match tool_name {

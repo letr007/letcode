@@ -7,6 +7,21 @@ pub(crate) fn project_child_session_summaries(
     parent_records: &[TranscriptRecord],
 ) -> Vec<ChildSessionSummary> {
     let mut children = BTreeMap::new();
+    let owned_children = parent_records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TranscriptEvent::SubagentStarted {
+                parent_session_id,
+                child_session_id,
+                ..
+            } if parent_session_id == &record.session_id
+                && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
+            {
+                Some(child_session_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
 
     for record in parent_records {
         match &record.event {
@@ -21,9 +36,8 @@ pub(crate) fn project_child_session_summaries(
             } if parent_session_id == &record.session_id
                 && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
             {
-                children
-                    .entry(child_session_id.clone())
-                    .or_insert_with(|| ChildSessionSummary {
+                let child = children.entry(child_session_id.clone()).or_insert_with(|| {
+                    ChildSessionSummary {
                         parent_session_id: parent_session_id.clone(),
                         parent_run_id: parent_run_id.clone(),
                         child_session_id: child_session_id.clone(),
@@ -32,7 +46,14 @@ pub(crate) fn project_child_session_summaries(
                         summary: summary.clone(),
                         timestamp_ms: record.timestamp_ms,
                         pool_ordinal: *pool_ordinal,
-                    });
+                    }
+                });
+                child.parent_run_id = parent_run_id.clone();
+                child.agent_name = agent_name.clone();
+                child.status = "running".into();
+                child.summary = summary.clone();
+                child.timestamp_ms = record.timestamp_ms;
+                child.pool_ordinal = *pool_ordinal;
             }
             TranscriptEvent::SubagentResult {
                 parent_session_id,
@@ -43,20 +64,12 @@ pub(crate) fn project_child_session_summaries(
                 summary,
                 ..
             } if parent_session_id == &record.session_id
+                && owned_children.contains(child_session_id)
                 && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
             {
-                let child = children.entry(child_session_id.clone()).or_insert_with(|| {
-                    ChildSessionSummary {
-                        parent_session_id: parent_session_id.clone(),
-                        parent_run_id: parent_run_id.clone(),
-                        child_session_id: child_session_id.clone(),
-                        agent_name: agent_name.clone(),
-                        status: status.clone(),
-                        summary: summary.clone(),
-                        timestamp_ms: record.timestamp_ms,
-                        pool_ordinal: 0,
-                    }
-                });
+                let child = children
+                    .get_mut(child_session_id)
+                    .expect("owned child was inserted by SubagentStarted");
                 child.status = status.clone();
                 child.summary = summary.clone();
             }
@@ -73,14 +86,29 @@ pub(crate) fn project_child_session_summaries(
     children
 }
 
-#[cfg(test)]
 pub(crate) fn project_job_board(
     child_dir: &Path,
     parent_records: &[TranscriptRecord],
 ) -> anyhow::Result<Vec<crate::transcript::JobBoardEntry>> {
     use crate::subagent::StructuredSubagentResult;
-    use crate::transcript::{JobBoardEntry, read_records_allow_partial_tail};
+    use crate::transcript::JobBoardEntry;
     let mut jobs = BTreeMap::<String, JobBoardAccumulator>::new();
+    let owned_runs = parent_records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TranscriptEvent::SubagentStarted {
+                run_id,
+                parent_session_id,
+                child_session_id,
+                ..
+            } if parent_session_id == &record.session_id
+                && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
+            {
+                Some(run_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
 
     for record in parent_records {
         match &record.event {
@@ -111,7 +139,10 @@ pub(crate) fn project_job_board(
                 status,
                 summary,
                 ..
-            } if parent_session_id == &record.session_id => {
+            } if parent_session_id == &record.session_id
+                && owned_runs.contains(run_id)
+                && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
+            {
                 let entry = jobs.entry(run_id.clone()).or_default();
                 entry.run_id = run_id.clone();
                 entry.child_session_id = child_session_id.clone();
@@ -133,7 +164,7 @@ pub(crate) fn project_job_board(
                 detail,
                 tags,
                 ..
-            } => {
+            } if owned_runs.contains(run_id) => {
                 let entry = jobs.entry(run_id.clone()).or_default();
                 entry.run_id = run_id.clone();
                 if entry.child_session_id.is_empty() {
@@ -184,7 +215,6 @@ pub(crate) fn project_job_board(
     Ok(entries)
 }
 
-#[cfg(test)]
 fn hydrate_active_job_from_child_transcript(
     child_dir: &Path,
     entry: &mut JobBoardAccumulator,
@@ -221,7 +251,6 @@ fn hydrate_active_job_from_child_transcript(
     Ok(())
 }
 
-#[cfg(test)]
 fn is_terminal_subagent_status(status: &str) -> bool {
     matches!(
         status,
@@ -229,7 +258,6 @@ fn is_terminal_subagent_status(status: &str) -> bool {
     )
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct JobBoardAccumulator {
     run_id: String,

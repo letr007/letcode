@@ -519,7 +519,8 @@ fn evidence_source_for_tool(
 }
 
 fn evidence_source_for_record(record: &ToolExecutionRecord, args: &Value) -> EvidenceSource {
-    if is_subagent_tool_name(&record.tool_name)
+    if (is_subagent_tool_name(&record.tool_name)
+        || record.tool_name == crate::tool_names::TOOL_AGENT_WAIT)
         && let Some(run_id) = data_string(&record.output, "run_id")
         && let Some(child_session_id) = data_string(&record.output, "child_session_id")
     {

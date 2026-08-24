@@ -2194,6 +2194,10 @@ struct StaticSubagentDelegate {
     result: ToolResult,
 }
 
+struct RecordingControlDelegate {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
 struct CapturingSubagentDelegate {
     result: ToolResult,
     explorer_tasks: Arc<std::sync::Mutex<Vec<String>>>,
@@ -2209,6 +2213,35 @@ impl SubagentDelegate<OpenAIConfig> for StaticSubagentDelegate {
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
         let result = self.result.clone();
         Box::pin(async move { Ok(result) })
+    }
+}
+
+impl SubagentDelegate<OpenAIConfig> for RecordingControlDelegate {
+    fn run_named<'a>(
+        &'a self,
+        _parent: &'a Agent<OpenAIConfig>,
+        agent_name: &'a str,
+        _invocation: SubagentInvocation,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        let calls = Arc::clone(&self.calls);
+        let agent_name = agent_name.to_string();
+        Box::pin(async move {
+            calls.lock().expect("calls lock").push(agent_name);
+            Ok(ToolResult::ok("agent__explore", json!({"ok": true})))
+        })
+    }
+
+    fn control<'a>(
+        &'a self,
+        tool_name: &'a str,
+        _args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        let calls = Arc::clone(&self.calls);
+        let tool_name = tool_name.to_string();
+        Box::pin(async move {
+            calls.lock().expect("calls lock").push(tool_name.clone());
+            Ok(ToolResult::ok(tool_name, json!({"ok": true})))
+        })
     }
 }
 
@@ -2294,6 +2327,29 @@ fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate<OpenAIConfig>
     Arc::new(StaticSubagentDelegate { result })
 }
 
+#[test]
+fn parent_with_delegate_advertises_subagent_control_tools() {
+    let mut agent = test_agent();
+    agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+        "agent__explore",
+        json!({"status": "completed"}),
+    )));
+
+    let tools = agent
+        .tool_definitions_for_test()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    for name in [
+        "agent__jobs",
+        "agent__status",
+        "agent__wait",
+        "agent__cancel",
+    ] {
+        assert!(tools.iter().any(|tool| tool == name), "missing {name}");
+    }
+}
+
 fn capturing_delegate(
     result: ToolResult,
 ) -> (
@@ -2324,7 +2380,10 @@ async fn contiguous_different_role_subagents_overlap_and_return_in_model_order()
     }));
     let calls = vec![
         test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
-        test_tool_call("agent__fixer", r#"{"task":"change"}"#),
+        test_tool_call(
+            "agent__fixer",
+            r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
+        ),
     ];
     agent
         .append_assistant_tool_calls("", &calls)
@@ -2356,6 +2415,59 @@ async fn contiguous_different_role_subagents_overlap_and_return_in_model_order()
 }
 
 #[tokio::test]
+async fn subagent_control_tool_is_a_barrier_between_subagent_batches() {
+    let mut agent = test_agent();
+    let calls_seen = Arc::new(Mutex::new(Vec::new()));
+    agent.set_subagent_delegate(Arc::new(RecordingControlDelegate {
+        calls: Arc::clone(&calls_seen),
+    }));
+    let calls = vec![
+        HistoryToolCall {
+            call_id: "call-explore-first".into(),
+            name: "agent__explore".into(),
+            arguments_json: r#"{"task":"first"}"#.into(),
+        },
+        test_tool_call("agent__jobs", r#"{}"#),
+        HistoryToolCall {
+            call_id: "call-explore-second".into(),
+            name: "agent__explore".into(),
+            arguments_json: r#"{"task":"second"}"#.into(),
+        },
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        })
+        .await
+        .expect("calls execute");
+
+    assert_eq!(
+        *calls_seen.lock().expect("calls lock"),
+        vec!["explorer", "agent__jobs", "explorer"]
+    );
+    let history = agent.history_for_test();
+    let outputs = history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outputs,
+        vec![
+            "call-explore-first",
+            "call-agent__jobs",
+            "call-explore-second"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
     let mut agent = test_agent();
     let started = Arc::new(Mutex::new(Vec::new()));
@@ -2366,7 +2478,10 @@ async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
     let calls = vec![
         test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
         test_tool_call("util__echo", r#"{"text":"barrier"}"#),
-        test_tool_call("agent__fixer", r#"{"task":"change"}"#),
+        test_tool_call(
+            "agent__fixer",
+            r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
+        ),
     ];
     agent
         .append_assistant_tool_calls("", &calls)
@@ -2594,7 +2709,10 @@ async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
         }),
     )));
 
-    let call = test_tool_call("agent__fixer", r#"{"task":"implement bounded fix"}"#);
+    let call = test_tool_call(
+        "agent__fixer",
+        r#"{"task":"implement bounded fix","owned_paths":["src/agent.rs"]}"#,
+    );
     agent
         .append_assistant_tool_calls("", std::slice::from_ref(&call))
         .expect("assistant tool calls should append");
@@ -2616,6 +2734,69 @@ async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
         AgentEvent::EvidenceRecorded(record)
             if record.tags.iter().any(|tag| tag == "subagent_result")
     )));
+}
+
+#[tokio::test]
+async fn wait_and_background_delivery_apply_subagent_effects_once_per_turn() {
+    let mut agent = test_agent();
+    agent.prepare_turn_prelude("Reconcile one background result");
+    let result = json!({
+        "run_id": "run-dedupe-1",
+        "child_session_id": "child-dedupe-1",
+        "agent_name": "fixer",
+        "status": "completed",
+        "summary": "implemented and validated",
+        "structured_result": {
+            "status": "completed",
+            "summary": "implemented and validated",
+            "malformed": false,
+            "findings": [],
+            "files_read": [],
+            "files_changed": ["src/agent.rs"],
+            "commands_run": ["cargo test"],
+            "validation": ["cargo test passed"],
+            "blockers": [],
+            "next_steps": [],
+            "run_id": "run-dedupe-1",
+            "child_session_id": "child-dedupe-1"
+        }
+    });
+    let wait_record = ToolExecutionRecord {
+        call_id: "wait-dedupe-1".into(),
+        tool_name: tool_names::TOOL_AGENT_WAIT.into(),
+        arguments: Some(json!({"run_id": "run-dedupe-1"})),
+        permission_class: crate::permission::ToolPermissionClass::Preview,
+        directive: ExecutionDirective::None,
+        status: ToolExecutionStatus::Executed,
+        rejection: None,
+        output: ToolResult::ok("agent__wait", result.clone()),
+        effects: ToolEffects {
+            kind: ToolEffectKind::Read,
+            primary_path: None,
+            edited_paths: Vec::new(),
+            command: None,
+        },
+    };
+    agent.record_tool_effects(&wait_record);
+    assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
+    let _ = agent
+        .remember_tool_evidence(&wait_record)
+        .expect("remember wait evidence");
+
+    let summary = crate::subagent::SubagentRunSummary {
+        run_id: "run-dedupe-1".into(),
+        child_session_id: "child-dedupe-1".into(),
+        agent_name: "fixer".into(),
+        status: crate::subagent::SubagentStatus::Completed,
+        failure_kind: None,
+        summary: "implemented and validated".into(),
+        structured_result: serde_json::from_value(result["structured_result"].clone())
+            .expect("structured result"),
+    };
+    agent
+        .install_background_subagent_result(&summary)
+        .expect("background result installs");
+    assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
 }
 
 #[test]
@@ -5667,7 +5848,10 @@ async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
         }),
     )));
 
-    let call = test_tool_call("agent__fixer", r#"{"task":"apply focused fix"}"#);
+    let call = test_tool_call(
+        "agent__fixer",
+        r#"{"task":"apply focused fix","owned_paths":["src/agent.rs"]}"#,
+    );
     agent
         .append_assistant_tool_calls("", std::slice::from_ref(&call))
         .expect("append subagent call");

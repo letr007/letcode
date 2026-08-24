@@ -250,6 +250,11 @@ impl TranscriptRecorder {
         &self.session_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_sink_for_test(&mut self, sink: Box<dyn JournalSink>) {
+        self.sink = sink;
+    }
+
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
@@ -693,7 +698,7 @@ impl TranscriptRecorder {
         let parent_run_id = parent_run_id.into();
         let child_session_id = child_session_id.into();
         let agent_name = agent_name.into();
-        self.append(TranscriptEvent::SubagentResult {
+        let result_event = TranscriptEvent::SubagentResult {
             run_id: run_id.clone(),
             parent_session_id: parent_session_id.clone(),
             parent_run_id: parent_run_id.clone(),
@@ -701,32 +706,46 @@ impl TranscriptRecorder {
             agent_name: agent_name.clone(),
             status: status.into(),
             summary: summary.into(),
+        };
+        let Some(result) = structured_result else {
+            return self.append(result_event);
+        };
+        let parent_tool = subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
+            anyhow!("subagent result recorded with unknown agent name: {agent_name}")
         })?;
-        if let Some(result) = structured_result {
-            let parent_tool =
-                subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
-                    anyhow!("subagent result recorded with unknown agent name: {agent_name}")
-                })?;
-            let detail = serde_json::to_string(&result).ok();
-            let evidence = EvidenceDraft {
-                id: None,
-                evidence_kind: EvidenceKind::Decision,
-                title: format!("subagent {agent_name} result"),
-                summary: result.summary.clone(),
-                detail,
-                source: EvidenceSource::Subagent {
-                    run_id,
-                    child_session_id: child_session_id.clone(),
-                    source_session_id: child_session_id,
-                    parent_tool,
-                    parent_turn_id: Some(parent_run_id),
-                    parent_session_id: Some(parent_session_id),
-                },
-                tags: vec![agent_name, "subagent_result".into()],
-            };
-            self.record_evidence(evidence)?;
-        }
-        Ok(())
+        let detail = serde_json::to_string(&result).ok();
+        let evidence = EvidenceDraft {
+            id: None,
+            evidence_kind: EvidenceKind::Decision,
+            title: format!("subagent {agent_name} result"),
+            summary: result.summary.clone(),
+            detail,
+            source: EvidenceSource::Subagent {
+                run_id,
+                child_session_id: child_session_id.clone(),
+                source_session_id: child_session_id,
+                parent_tool,
+                parent_turn_id: Some(parent_run_id),
+                parent_session_id: Some(parent_session_id),
+            },
+            tags: vec![agent_name, "subagent_result".into()],
+        };
+        evidence.validate()?;
+        let evidence_event = TranscriptEvent::Evidence {
+            id: evidence
+                .id
+                .unwrap_or_else(|| evidence_id_for_sequence(self.sequence.saturating_add(2))),
+            evidence_kind: evidence.evidence_kind,
+            title: evidence.title,
+            summary: evidence.summary,
+            detail: evidence.detail,
+            source: evidence.source,
+            tags: evidence.tags,
+        };
+        self.append_transaction(vec![
+            (result_event, self.current_context_branch_id.clone()),
+            (evidence_event, self.current_context_branch_id.clone()),
+        ])
     }
 
     pub fn record_user_message(&mut self, content: impl Into<String>) -> Result<()> {
@@ -1107,6 +1126,7 @@ impl TranscriptRecorder {
         })
     }
 
+    #[cfg(test)]
     pub fn record_evidence(&mut self, draft: EvidenceDraft) -> Result<EvidenceRecord> {
         draft.validate()?;
         let sequence = self.sequence.saturating_add(1);
