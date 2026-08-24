@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::agent::{Agent, AgentEvent, SubagentDelegate};
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
-use crate::permission::{PermissionApproval, PermissionMode};
+use crate::permission::PermissionApproval;
 use crate::subagent::SubagentPool;
 use crate::subagent_events::SubagentEventSender;
 use crate::transcript::{
@@ -311,8 +311,6 @@ impl<C: Config> AgentRunner<C> {
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
-        let original_permission_mode = agent.permission_mode();
-        agent.set_permission_mode(PermissionMode::Auto);
         let sender = self.event_tx.clone();
         let response = agent
             .run_stream_content_with_interactions_async(
@@ -422,7 +420,6 @@ impl<C: Config> AgentRunner<C> {
                 },
             )
             .await;
-        agent.set_permission_mode(original_permission_mode);
         match response {
             Ok(message) => {
                 self.emit(SessionTransportEvent::AssistantDone { message_id: None })?;

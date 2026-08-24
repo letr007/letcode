@@ -233,6 +233,14 @@ pub(crate) fn handle_active_turn_command(
     parked_commands: &mut VecDeque<SessionEngineCommand>,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) {
+    if matches!(
+        command,
+        SessionEngineCommand::BackgroundSubagentCompleted { .. }
+    ) {
+        enqueue_deferred_command(parked_commands, command);
+        return;
+    }
+
     let disposition = session_engine_command_as_session_command(&command)
         .map(|command| command.active_turn_disposition())
         .unwrap_or(crate::session::ActiveTurnCommandDisposition::Defer);
