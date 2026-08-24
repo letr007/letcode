@@ -2119,8 +2119,13 @@ impl TuiState {
         self.auto_scroll = true;
     }
 
-    pub fn sync_transcript_viewport_rows(&mut self, total_rows: usize) {
-        if !self.auto_scroll
+    pub fn sync_transcript_viewport_rows_with_reflow(
+        &mut self,
+        total_rows: usize,
+        width_reflowed: bool,
+    ) {
+        if !width_reflowed
+            && !self.auto_scroll
             && let Some(previous_total_rows) = self.last_transcript_total_rows
             && total_rows > previous_total_rows
         {
@@ -3901,10 +3906,10 @@ mod tests {
     fn scroll_up_while_transcript_fits_viewport_keeps_auto_scroll() {
         let mut state = TuiState::default();
         state.last_transcript_area.height = 10;
-        state.sync_transcript_viewport_rows(3);
+        state.sync_transcript_viewport_rows_with_reflow(3, false);
 
         state.scroll_transcript_up(1);
-        state.sync_transcript_viewport_rows(12);
+        state.sync_transcript_viewport_rows_with_reflow(12, false);
 
         assert_eq!(state.transcript_scroll_offset(), 0);
         assert!(state.auto_scroll);
@@ -3914,12 +3919,12 @@ mod tests {
     fn long_transcript_scroll_can_cross_u16_boundary_after_narrow_reflow() {
         let mut state = TuiState::default();
         state.last_transcript_area.height = 30;
-        state.sync_transcript_viewport_rows(60_000);
+        state.sync_transcript_viewport_rows_with_reflow(60_000, false);
         state.scroll_transcript_up(59_970);
         assert_eq!(state.transcript_scroll_offset(), 59_970);
         assert!(!state.auto_scroll);
 
-        state.sync_transcript_viewport_rows(90_000);
+        state.sync_transcript_viewport_rows_with_reflow(90_000, false);
         assert_eq!(state.transcript_scroll_offset(), 89_970);
         state.scroll_transcript_up(1);
         assert_eq!(state.transcript_scroll_offset(), 89_970);
@@ -3930,13 +3935,13 @@ mod tests {
     fn sync_transcript_viewport_rows_clamps_invalid_offset_and_restores_auto_scroll() {
         let mut state = TuiState::default();
         state.last_transcript_area.height = 5;
-        state.sync_transcript_viewport_rows(10);
+        state.sync_transcript_viewport_rows_with_reflow(10, false);
         state.scroll_transcript_up(4);
         assert_eq!(state.transcript_scroll_offset(), 4);
         assert!(!state.auto_scroll);
 
         state.last_transcript_area.height = 10;
-        state.sync_transcript_viewport_rows(10);
+        state.sync_transcript_viewport_rows_with_reflow(10, false);
 
         assert_eq!(state.transcript_scroll_offset(), 0);
         assert!(state.auto_scroll);

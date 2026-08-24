@@ -174,8 +174,8 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     state.last_transcript_area = content_area;
 
     let width = content_area.width.max(1) as usize;
-    let total_rows = cached_transcript_row_count(state, theme, width);
-    state.sync_transcript_viewport_rows(total_rows);
+    let (total_rows, width_reflowed) = cached_transcript_row_count_with_reflow(state, theme, width);
+    state.sync_transcript_viewport_rows_with_reflow(total_rows, width_reflowed);
     let visible_rows = content_area.height;
     let scroll = crate::tui::measure::resolved_scroll_offset(
         total_rows,
@@ -266,9 +266,17 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
 }
 
 fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize) -> usize {
+    cached_transcript_row_count_with_reflow(state, theme, width).0
+}
+
+fn cached_transcript_row_count_with_reflow(
+    state: &mut TuiState,
+    theme: Theme,
+    width: usize,
+) -> (usize, bool) {
     let item_count = state.active_timeline().items().len();
     if item_count == 0 {
-        return 0;
+        return (0, false);
     }
 
     let timeline = state.active_timeline();
@@ -282,10 +290,13 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     }
 
     if state.transcript_render_cache.row_metadata_revision == Some(mutation_revision) {
-        return state
-            .transcript_render_cache
-            .total_rows
-            .expect("current transcript row metadata has a total row count");
+        return (
+            state
+                .transcript_render_cache
+                .total_rows
+                .expect("current transcript row metadata has a total row count"),
+            width_changed,
+        );
     }
 
     #[cfg(test)]
@@ -337,7 +348,7 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
         .truncate(item_count);
     state.transcript_render_cache.row_metadata_revision = Some(mutation_revision);
     state.transcript_render_cache.total_rows = Some(rows);
-    rows
+    (rows, width_changed)
 }
 
 fn visible_cached_transcript_lines(
@@ -1991,9 +2002,9 @@ fn split_grapheme_span(text: &str, start: usize, end: usize) -> (String, String,
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_transcript_row_count, render_timeline_item_document, render_transcript,
-        transcript_lines, transcript_row_count, try_render_reviewer_view_item,
-        visible_cached_transcript_lines, visible_transcript_lines,
+        cached_transcript_row_count, cached_transcript_row_count_with_reflow,
+        render_timeline_item_document, render_transcript, transcript_lines, transcript_row_count,
+        try_render_reviewer_view_item, visible_cached_transcript_lines, visible_transcript_lines,
     };
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
@@ -2856,7 +2867,7 @@ mod tests {
         }
 
         let before_lines = transcript_lines(&state, theme, width);
-        state.sync_transcript_viewport_rows(before_lines.len());
+        state.sync_transcript_viewport_rows_with_reflow(before_lines.len(), false);
         let target_top = 6usize;
         let before_max_scroll = crate::tui::measure::max_scroll(before_lines.len(), viewport_rows);
         state.transcript_scroll = before_max_scroll.saturating_sub(target_top);
@@ -2879,7 +2890,7 @@ mod tests {
         )));
 
         let after_lines = transcript_lines(&state, theme, width);
-        state.sync_transcript_viewport_rows(after_lines.len());
+        state.sync_transcript_viewport_rows_with_reflow(after_lines.len(), false);
         let after_top = crate::tui::measure::resolved_scroll_offset(
             after_lines.len(),
             viewport_rows,
@@ -2894,6 +2905,35 @@ mod tests {
 
         assert_eq!(after_top, before_top);
         assert_eq!(after_first, before_first);
+        assert!(!state.auto_scroll);
+    }
+
+    #[test]
+    fn width_reflow_does_not_treat_wrapped_rows_as_appended_content() {
+        let theme = Theme::dark();
+        let mut state = TuiState::default();
+        let content = std::iter::repeat_n("x".repeat(90), 200)
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            content,
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+
+        let (wide_rows, wide_reflowed) =
+            cached_transcript_row_count_with_reflow(&mut state, theme, 120);
+        assert!(!wide_reflowed);
+        state.last_transcript_area.height = 10;
+        state.sync_transcript_viewport_rows_with_reflow(wide_rows, wide_reflowed);
+        state.scroll_transcript_up(25);
+
+        let (narrow_rows, narrow_reflowed) =
+            cached_transcript_row_count_with_reflow(&mut state, theme, 60);
+        assert!(narrow_reflowed);
+        assert!(narrow_rows > wide_rows);
+        state.sync_transcript_viewport_rows_with_reflow(narrow_rows, narrow_reflowed);
+
+        assert_eq!(state.transcript_scroll, 25);
         assert!(!state.auto_scroll);
     }
 
