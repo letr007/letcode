@@ -68,6 +68,11 @@ pub(super) fn render_subagent_lines(
         .and_then(|data| data.get("agent_name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| subagent_name_from_tool(&tool.name));
+    let waiting = data
+        .as_ref()
+        .and_then(|data| data.get("waiting"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     let mut state_flags = data.as_ref().map(subagent_state_flags).unwrap_or_default();
     if let Some(failure_kind) = data
         .as_ref()
@@ -96,11 +101,12 @@ pub(super) fn render_subagent_lines(
         tool.status,
         ToolExecutionStatus::Pending | ToolExecutionStatus::Running
     ) {
-        format!(
-            "{} {}",
-            PROCESS_FRAMES[frame % PROCESS_FRAMES.len()],
+        let label = if waiting {
+            translator.t("status.waiting")
+        } else {
             status_label(map_tool_status(tool.status), translator)
-        )
+        };
+        format!("{} {label}", PROCESS_FRAMES[frame % PROCESS_FRAMES.len()])
     } else {
         status
     };
@@ -333,7 +339,9 @@ pub(super) fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str
     if data.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
         flags.push("background");
     }
-    if data.get("active").and_then(serde_json::Value::as_bool) == Some(true) {
+    if data.get("active").and_then(serde_json::Value::as_bool) == Some(true)
+        && data.get("waiting").and_then(serde_json::Value::as_bool) != Some(true)
+    {
         flags.push("active");
     }
     if data

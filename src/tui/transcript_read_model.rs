@@ -81,12 +81,21 @@ impl TranscriptTimelineProjection {
                 name,
                 args,
             } => {
-                self.timeline.push_tool_started(ToolStartedEvent {
+                let started = ToolStartedEvent {
                     call_id: call_id.clone(),
                     name: name.clone(),
                     summary: format_tool_call(name, args),
                     arguments: Some(args.to_string()),
-                });
+                };
+                if name == crate::tool_names::TOOL_AGENT_WAIT
+                    && args
+                        .get("run_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|run_id| self.timeline.begin_subagent_wait(call_id, run_id))
+                {
+                    return;
+                }
+                self.timeline.push_tool_started(started);
             }
             TranscriptEvent::ToolCallFinished {
                 call_id,
@@ -109,7 +118,12 @@ impl TranscriptTimelineProjection {
                 });
             }
             TranscriptEvent::ToolCallCancelled { call_id, name } => {
-                self.timeline.cancel_tool(call_id, name);
+                if name == crate::tool_names::TOOL_AGENT_WAIT
+                    && self.timeline.cancel_foreground_subagent_wait(call_id)
+                {
+                } else {
+                    self.timeline.cancel_tool(call_id, name);
+                }
             }
             TranscriptEvent::TodoSnapshot { items } => {
                 self.timeline
@@ -167,15 +181,30 @@ impl TranscriptTimelineProjection {
                 self.timeline.push_error(ErrorEvent::new(message.clone()));
             }
             TranscriptEvent::TurnInterrupted { .. } => {
+                self.timeline.cancel_foreground_subagent_waits();
                 self.timeline.cancel_active_tools();
             }
             TranscriptEvent::TurnFinalized(event) => {
                 if event.outcome == "interrupted" {
+                    self.timeline.cancel_foreground_subagent_waits();
                     self.timeline.cancel_active_tools();
                 }
             }
-            TranscriptEvent::SubagentStarted { .. }
-            | TranscriptEvent::SubagentResult { .. }
+            TranscriptEvent::SubagentStarted {
+                run_id,
+                child_session_id,
+                agent_name,
+                summary,
+                ..
+            } => {
+                self.timeline.register_subagent_started(
+                    run_id,
+                    child_session_id,
+                    agent_name,
+                    summary,
+                );
+            }
+            TranscriptEvent::SubagentResult { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::LlmRequestTelemetry { .. }
             | TranscriptEvent::SessionStarted { .. }
@@ -482,6 +511,168 @@ mod tests {
             },
         )]);
         assert!(timeline.items().is_empty());
+    }
+
+    #[test]
+    fn restored_active_wait_reuses_background_subagent_card() {
+        let structured = crate::subagent::StructuredSubagentResult {
+            status: "completed".into(),
+            summary: "wait restored".into(),
+            malformed: false,
+            findings: Vec::new(),
+            files_read: Vec::new(),
+            files_changed: Vec::new(),
+            commands_run: Vec::new(),
+            validation: Vec::new(),
+            blockers: Vec::new(),
+            next_steps: Vec::new(),
+            run_id: "run-bg".into(),
+            child_session_id: "child-bg".into(),
+            raw_excerpt: None,
+        };
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "background-call".into(),
+                    name: "agent__explore".into(),
+                    args: json!({"task": "inspect wait flow", "background": true}),
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::SubagentStarted {
+                    run_id: "run-bg".into(),
+                    parent_session_id: "s".into(),
+                    parent_run_id: "turn-1".into(),
+                    child_session_id: "child-bg".into(),
+                    agent_name: "explorer".into(),
+                    summary: "inspect wait flow".into(),
+                    pool_ordinal: 1,
+                },
+            ),
+            record(
+                3,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "background-call".into(),
+                    name: "agent__explore".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "agent__explore",
+                        json!({
+                            "run_id": "run-bg",
+                            "child_session_id": "child-bg",
+                            "agent_name": "explorer",
+                            "status": "running",
+                            "summary": "inspect wait flow",
+                            "active": true,
+                            "background": true
+                        }),
+                    ),
+                },
+            ),
+            record(
+                4,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "wait-call".into(),
+                    name: crate::tool_names::TOOL_AGENT_WAIT.into(),
+                    args: json!({"run_id": "run-bg"}),
+                },
+            ),
+            record(
+                5,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "wait-call".into(),
+                    name: crate::tool_names::TOOL_AGENT_WAIT.into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        crate::tool_names::TOOL_AGENT_WAIT,
+                        json!({
+                            "run_id": "run-bg",
+                            "child_session_id": "child-bg",
+                            "agent_name": "explorer",
+                            "status": "completed",
+                            "failure_kind": null,
+                            "summary": "wait restored",
+                            "structured_result": structured,
+                            "active": false
+                        }),
+                    ),
+                },
+            ),
+        ]);
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Tool(tool)]
+                if tool.call_id == "background-call"
+                    && tool.name == "agent__explore"
+                    && tool.status == ToolExecutionStatus::Succeeded
+                    && tool.summary == "wait restored"
+        ));
+    }
+
+    #[test]
+    fn restored_interrupted_wait_terminalizes_original_subagent_card() {
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "background-call".into(),
+                    name: "agent__explore".into(),
+                    args: json!({"task": "inspect wait flow", "background": true}),
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::SubagentStarted {
+                    run_id: "run-bg".into(),
+                    parent_session_id: "s".into(),
+                    parent_run_id: "turn-1".into(),
+                    child_session_id: "child-bg".into(),
+                    agent_name: "explorer".into(),
+                    summary: "inspect wait flow".into(),
+                    pool_ordinal: 1,
+                },
+            ),
+            record(
+                3,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "background-call".into(),
+                    name: "agent__explore".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "agent__explore",
+                        json!({
+                            "run_id": "run-bg",
+                            "child_session_id": "child-bg",
+                            "agent_name": "explorer",
+                            "status": "running",
+                            "summary": "inspect wait flow",
+                            "active": true,
+                            "background": true
+                        }),
+                    ),
+                },
+            ),
+            record(
+                4,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "wait-call".into(),
+                    name: crate::tool_names::TOOL_AGENT_WAIT.into(),
+                    args: json!({"run_id": "run-bg"}),
+                },
+            ),
+            record(5, TranscriptEvent::TurnInterrupted { turn_id: Some(1) }),
+        ]);
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Tool(tool)]
+                if tool.call_id == "background-call"
+                    && tool.status == ToolExecutionStatus::Cancelled
+                    && tool.summary == "subagent wait cancelled"
+        ));
     }
 
     #[test]

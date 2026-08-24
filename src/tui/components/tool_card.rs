@@ -901,6 +901,42 @@ mod tests {
     }
 
     #[test]
+    fn foreground_wait_subagent_card_renders_waiting_without_background_flags() {
+        let tool = ToolView {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "search__rg — searching wait flow".into(),
+            arguments: Some(json!({"task": "inspect wait flow"}).to_string()),
+            output: Some(
+                json!({
+                    "run_id": "run-bg",
+                    "child_session_id": "child-bg",
+                    "agent_name": "explorer",
+                    "status": "running",
+                    "summary": "search__rg — searching wait flow",
+                    "waiting": true,
+                    "active": true,
+                    "background": false
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Running,
+        };
+
+        let rendered = render_tool_card_lines_with_frame(&tool, Theme::dark(), 120, 0, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("waiting explorer"), "{rendered}");
+        assert!(rendered.contains("search__rg"), "{rendered}");
+        assert!(!rendered.contains("background"), "{rendered}");
+        assert!(!rendered.contains("active"), "{rendered}");
+        assert!(!rendered.contains("agent__wait"), "{rendered}");
+    }
+
+    #[test]
     fn subagent_card_falls_back_for_missing_or_invalid_structured_results() {
         for structured_result in [
             serde_json::json!("not an object"),

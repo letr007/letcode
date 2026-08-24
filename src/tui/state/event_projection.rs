@@ -89,7 +89,9 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             // Close any open assistant stream before tool cards so later
             // multi-iteration assistant text creates a new bubble after tools.
             projection.timeline.finalize_all_assistant_messages();
-            if projection.accepts_tool_events && projection.timeline.push_tool_pending(tool.clone())
+            if projection.accepts_tool_events
+                && tool.name != crate::tool_names::TOOL_AGENT_WAIT
+                && projection.timeline.push_tool_pending(tool.clone())
             {
                 *projection.active_tool_call_id = Some(tool.call_id.clone());
                 *projection.phase = AppPhase::Running;
@@ -97,7 +99,14 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
         }
         SessionEvent::ToolCancelled(tool) => {
             if projection.accepts_tool_events {
-                projection.timeline.cancel_tool(&tool.call_id, &tool.name);
+                if tool.name == crate::tool_names::TOOL_AGENT_WAIT
+                    && projection
+                        .timeline
+                        .cancel_foreground_subagent_wait(&tool.call_id)
+                {
+                } else {
+                    projection.timeline.cancel_tool(&tool.call_id, &tool.name);
+                }
                 if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
                     *projection.active_tool_call_id = None;
                 }
@@ -107,8 +116,28 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             // ToolStarted may arrive without a prior pending event for some
             // protocols; still seal open assistant streams first.
             projection.timeline.finalize_all_assistant_messages();
-            if projection.accepts_tool_events && projection.timeline.push_tool_started(tool.clone())
+            let started = if projection.accepts_tool_events
+                && tool.name == crate::tool_names::TOOL_AGENT_WAIT
             {
+                tool.arguments
+                    .as_deref()
+                    .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
+                    .and_then(|args| {
+                        args.get("run_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|run_id| {
+                        projection
+                            .timeline
+                            .begin_subagent_wait(&tool.call_id, &run_id)
+                    })
+                    || projection.timeline.push_tool_started(tool.clone())
+            } else {
+                projection.accepts_tool_events
+                    && projection.timeline.push_tool_started(tool.clone())
+            };
+            if started {
                 *projection.active_tool_call_id = Some(tool.call_id.clone());
                 *projection.phase = AppPhase::Running;
             }
@@ -213,6 +242,7 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             *projection.latest_auto_continue = AutoContinueState::default();
             *projection.latest_todo = None;
             *projection.ignore_late_tool_events = true;
+            projection.timeline.cancel_foreground_subagent_waits();
             projection.timeline.cancel_active_tools();
             *projection.toast = Some(ToastState::new(
                 "Interrupted by user",
