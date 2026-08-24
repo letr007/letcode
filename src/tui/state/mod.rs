@@ -1138,7 +1138,7 @@ pub struct TuiState {
     pub latest_todo: Option<TodoView>,
     pub retry: Option<RetryNoticeState>,
     pub transcript_view: TranscriptViewState,
-    pub transcript_scroll: u16,
+    pub transcript_scroll: usize,
     pub auto_scroll: bool,
     pub transcript_scrollbar_visible: bool,
     pub sidebar_hidden: bool,
@@ -1177,7 +1177,7 @@ pub struct TuiState {
     /// 最后渲染时已解析为 top-relative 的滚动顶部偏移（0 = 全文第一行可见）
     /// `transcript_scroll` 是 bottom-relative，选择锚点/高亮必须用 top-relative，否则
     /// 底部 auto-scroll 时会把点击映射到全文顶部不可见区域。
-    pub last_transcript_scroll_top: u16,
+    pub last_transcript_scroll_top: usize,
     /// 拖拽选择期间最后一次鼠标位置，用于边缘自动滚动
     pub selection_last_mouse: Option<(u16, u16)>,
 }
@@ -1720,7 +1720,7 @@ impl TuiState {
             );
         }
 
-        measure::max_scroll(rows, height)
+        u16::try_from(measure::max_scroll(rows, height)).unwrap_or(u16::MAX)
     }
 
     pub fn open_context_detail(&mut self, target: Option<ContextDetailTarget>) {
@@ -2048,8 +2048,13 @@ impl TuiState {
     }
 
     #[cfg(test)]
-    pub fn transcript_scroll_offset(&self) -> u16 {
+    pub fn transcript_scroll_offset(&self) -> usize {
         self.transcript_scroll
+    }
+
+    #[cfg(test)]
+    pub fn last_transcript_total_rows(&self) -> Option<usize> {
+        self.last_transcript_total_rows
     }
 
     pub fn slash_panel_is_open(&self) -> bool {
@@ -2093,7 +2098,7 @@ impl TuiState {
         measure::is_at_bottom(total_rows, viewport_rows, self.transcript_scroll)
     }
 
-    pub fn scroll_transcript_up(&mut self, rows: u16) {
+    pub fn scroll_transcript_up(&mut self, rows: usize) {
         self.transcript_scroll = self.transcript_scroll.saturating_add(rows);
         if let Some(total_rows) = self.last_transcript_total_rows {
             self.transcript_scroll = self.transcript_scroll.min(measure::max_scroll(
@@ -2104,7 +2109,7 @@ impl TuiState {
         self.auto_scroll = self.transcript_scroll == 0;
     }
 
-    pub fn scroll_transcript_down(&mut self, rows: u16) {
+    pub fn scroll_transcript_down(&mut self, rows: usize) {
         self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
         self.auto_scroll = self.transcript_scroll == 0;
     }
@@ -2120,7 +2125,6 @@ impl TuiState {
             && total_rows > previous_total_rows
         {
             let delta = total_rows.saturating_sub(previous_total_rows);
-            let delta = u16::try_from(delta).unwrap_or(u16::MAX);
             self.transcript_scroll = self.transcript_scroll.saturating_add(delta);
         }
 
@@ -3068,8 +3072,7 @@ impl TuiState {
             return None;
         }
 
-        let absolute_row =
-            (terminal_row - area.y) as usize + self.last_transcript_scroll_top as usize;
+        let absolute_row = (terminal_row - area.y) as usize + self.last_transcript_scroll_top;
         let cache = &self.transcript_render_cache;
         let item_index = match cache.row_starts().binary_search(&absolute_row) {
             Ok(index) => index,
@@ -3126,7 +3129,7 @@ impl TuiState {
 
         // 2. Terminal row → Viewport row → Absolute row（top-relative）
         let viewport_row = terminal_row - area.y;
-        let absolute_row = viewport_row as usize + self.last_transcript_scroll_top as usize;
+        let absolute_row = viewport_row as usize + self.last_transcript_scroll_top;
 
         // 3. 找到对应的 TimelineItem（二分查找）
         let cache = &self.transcript_render_cache;
@@ -3905,6 +3908,22 @@ mod tests {
 
         assert_eq!(state.transcript_scroll_offset(), 0);
         assert!(state.auto_scroll);
+    }
+
+    #[test]
+    fn long_transcript_scroll_can_cross_u16_boundary_after_narrow_reflow() {
+        let mut state = TuiState::default();
+        state.last_transcript_area.height = 30;
+        state.sync_transcript_viewport_rows(60_000);
+        state.scroll_transcript_up(59_970);
+        assert_eq!(state.transcript_scroll_offset(), 59_970);
+        assert!(!state.auto_scroll);
+
+        state.sync_transcript_viewport_rows(90_000);
+        assert_eq!(state.transcript_scroll_offset(), 89_970);
+        state.scroll_transcript_up(1);
+        assert_eq!(state.transcript_scroll_offset(), 89_970);
+        assert!(state.transcript_scroll_offset() > u16::MAX as usize);
     }
 
     #[test]

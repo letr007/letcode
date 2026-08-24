@@ -15,17 +15,17 @@ pub fn display_width(text: &str) -> usize {
 /// Compute max scroll (top-relative) given total transcript rows and viewport height.
 ///
 /// This math is intentionally UI-neutral so state/input logic doesn't depend on component modules.
-pub fn max_scroll(total_rows: usize, viewport_rows: u16) -> u16 {
-    u16::try_from(total_rows.saturating_sub(viewport_rows as usize)).unwrap_or(u16::MAX)
+pub fn max_scroll(total_rows: usize, viewport_rows: u16) -> usize {
+    total_rows.saturating_sub(viewport_rows as usize)
 }
 
 /// Convert bottom-relative scroll offset (0 = bottom/follow) into top-relative row offset.
 pub fn resolved_scroll_offset(
     total_rows: usize,
     viewport_rows: u16,
-    scroll_offset: u16,
+    scroll_offset: usize,
     auto_scroll: bool,
-) -> u16 {
+) -> usize {
     let max_scroll = max_scroll(total_rows, viewport_rows);
     let bottom_offset = if auto_scroll {
         0
@@ -37,7 +37,7 @@ pub fn resolved_scroll_offset(
 
 /// Whether we're at the transcript bottom using bottom-relative scroll offset.
 #[cfg(test)]
-pub fn is_at_bottom(total_rows: usize, viewport_rows: u16, scroll_offset: u16) -> bool {
+pub fn is_at_bottom(total_rows: usize, viewport_rows: u16, scroll_offset: usize) -> bool {
     max_scroll(total_rows, viewport_rows) == 0 || scroll_offset == 0
 }
 
@@ -272,5 +272,26 @@ mod tests {
         assert!(is_at_bottom(20, 5, 0));
         assert!(is_at_bottom(3, 10, 4));
         assert!(!is_at_bottom(20, 5, 14));
+    }
+
+    #[test]
+    fn transcript_scroll_math_exceeds_terminal_coordinate_range() {
+        let total_rows = u16::MAX as usize + 20_000;
+        let viewport_rows = 30;
+        let max = max_scroll(total_rows, viewport_rows);
+
+        assert!(max > u16::MAX as usize);
+        assert_eq!(
+            resolved_scroll_offset(total_rows, viewport_rows, 0, true),
+            max
+        );
+        assert_eq!(
+            resolved_scroll_offset(total_rows, viewport_rows, max, false),
+            0
+        );
+        assert_eq!(
+            resolved_scroll_offset(total_rows, viewport_rows, 10_000, false),
+            max - 10_000
+        );
     }
 }

@@ -473,9 +473,8 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
     let state = runtime.state();
     let item_row = state.transcript_render_cache.row_starts()[0] + 1;
     let area = state.last_transcript_area;
-    let visible_item_row =
-        u16::try_from(item_row.saturating_sub(state.last_transcript_scroll_top as usize))
-            .expect("auto-review row fits in terminal coordinates");
+    let visible_item_row = u16::try_from(item_row.saturating_sub(state.last_transcript_scroll_top))
+        .expect("auto-review row fits in terminal coordinates");
     let row = area.y + visible_item_row;
     let col = area.x + 3;
     assert!(row < area.bottom());

@@ -1343,6 +1343,40 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_reflow_keeps_long_transcript_scrollable_past_u16_rows() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        state.sidebar_hidden = true;
+        let line = format!("{}  ", "x".repeat(130));
+        let content = std::iter::repeat_n(line, 32_800)
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            content,
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+
+        let _ = draw_rows(&mut state, 160, 24);
+        let wide_rows = state
+            .last_transcript_total_rows()
+            .expect("wide transcript row count");
+        assert!(wide_rows < u16::MAX as usize, "{wide_rows}");
+
+        state.sidebar_hidden = false;
+        state.sidebar_forced_open = true;
+        let _ = draw_rows(&mut state, 160, 24);
+        let narrow_rows = state
+            .last_transcript_total_rows()
+            .expect("sidebar transcript row count");
+        assert!(narrow_rows > u16::MAX as usize, "{narrow_rows}");
+
+        state.scroll_transcript_up(narrow_rows);
+        let _ = draw_rows(&mut state, 160, 24);
+        assert_eq!(state.last_transcript_scroll_top, 0);
+        assert!(state.transcript_scroll > u16::MAX as usize);
+    }
+
+    #[test]
     fn child_read_only_status_centers_in_the_cap_excluded_surface() {
         let mut state = TuiState::default();
         state.replace_child_timeline_from_records(

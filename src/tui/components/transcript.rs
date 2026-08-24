@@ -81,7 +81,8 @@ impl TranscriptRenderCache {
             && self.live_render_frames.is_empty()
     }
 
-    pub(crate) fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) {
+    pub(crate) fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) -> bool {
+        let width_changed = self.width.is_some() && self.width != Some(width);
         if self.width != Some(width)
             || self.theme != Some(theme)
             || self.timeline_cache_id != Some(timeline_cache_id)
@@ -96,6 +97,7 @@ impl TranscriptRenderCache {
             self.row_counts.clear();
             self.live_render_frames.clear();
         }
+        width_changed
     }
 
     /// 获取缓存条目的引用（用于文本选择）
@@ -199,7 +201,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         && visible_rows > 0
     {
         let mut scrollbar_state = ScrollbarState::new(total_rows)
-            .position(scroll as usize)
+            .position(scroll)
             .viewport_content_length(visible_rows as usize);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -214,14 +216,14 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
 fn visible_transcript_lines(
     lines: &[Line<'static>],
     visible_rows: u16,
-    top_scroll: u16,
+    top_scroll: usize,
 ) -> Vec<Line<'static>> {
     let visible_rows = visible_rows as usize;
     if visible_rows == 0 {
         return Vec::new();
     }
 
-    let start = (top_scroll as usize).min(lines.len());
+    let start = top_scroll.min(lines.len());
     let end = start.saturating_add(visible_rows).min(lines.len());
     lines[start..end].to_vec()
 }
@@ -272,9 +274,12 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     let timeline = state.active_timeline();
     let timeline_cache_id = timeline.cache_id();
     let mutation_revision = timeline.mutation_revision();
-    state
+    let width_changed = state
         .transcript_render_cache
         .prepare(width, theme, timeline_cache_id);
+    if width_changed {
+        state.on_timeline_changed();
+    }
 
     if state.transcript_render_cache.row_metadata_revision == Some(mutation_revision) {
         return state
@@ -340,21 +345,25 @@ fn visible_cached_transcript_lines(
     theme: Theme,
     width: usize,
     visible_rows: u16,
-    top_scroll: u16,
+    top_scroll: usize,
 ) -> Vec<Line<'static>> {
     let visible_rows = visible_rows as usize;
     if visible_rows == 0 || state.active_timeline().items().is_empty() {
         return Vec::new();
     }
 
-    state
-        .transcript_render_cache
-        .prepare(width, theme, state.active_timeline().cache_id());
+    let width_changed =
+        state
+            .transcript_render_cache
+            .prepare(width, theme, state.active_timeline().cache_id());
+    if width_changed {
+        state.on_timeline_changed();
+    }
     if !transcript_row_metadata_is_current(state) {
         cached_transcript_row_count(state, theme, width);
     }
 
-    let start = top_scroll as usize;
+    let start = top_scroll;
     let end = start.saturating_add(visible_rows);
     let mut visible = Vec::with_capacity(visible_rows);
 
@@ -421,14 +430,14 @@ fn visible_cached_transcript_lines(
 fn visible_document_lines(
     state: &TuiState,
     visible_rows: u16,
-    top_scroll: u16,
+    top_scroll: usize,
 ) -> Vec<Option<&RenderLine<Style>>> {
     let visible_rows = visible_rows as usize;
     if visible_rows == 0 {
         return Vec::new();
     }
 
-    let start = (top_scroll as usize).min(state.transcript_render_cache.total_rows.unwrap_or(0));
+    let start = top_scroll.min(state.transcript_render_cache.total_rows.unwrap_or(0));
     let end = start
         .saturating_add(visible_rows)
         .min(state.transcript_render_cache.total_rows.unwrap_or(start));
@@ -1833,7 +1842,7 @@ fn apply_selection_highlight(
     selection: &crate::tui::state::TextSelection,
     state: &crate::tui::state::TuiState,
     theme: Theme,
-    scroll_offset: u16,
+    scroll_offset: usize,
 ) {
     use ratatui::style::Style;
 
@@ -1856,7 +1865,7 @@ fn apply_selection_highlight(
 
     // 遍历可见行，应用高亮
     for (idx, line) in lines.iter_mut().enumerate() {
-        let absolute_row = scroll_offset as usize + idx;
+        let absolute_row = scroll_offset + idx;
 
         if absolute_row < sel_start_row || absolute_row > sel_end_row {
             continue;
@@ -2454,6 +2463,33 @@ mod tests {
     }
 
     #[test]
+    fn width_reflow_clears_render_line_selection_anchors() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "a line that wraps when the transcript becomes narrower",
+        )));
+        cached_transcript_row_count(&mut state, Theme::dark(), 80);
+        state.text_selection = Some(crate::tui::state::TextSelection {
+            start: crate::tui::state::SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 0,
+                char_offset: 0,
+            },
+            end: crate::tui::state::SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 0,
+                char_offset: 4,
+            },
+        });
+        state.selection_in_progress = true;
+
+        cached_transcript_row_count(&mut state, Theme::dark(), 40);
+
+        assert!(state.text_selection.is_none());
+        assert!(!state.selection_in_progress);
+    }
+
+    #[test]
     fn visible_window_clips_transcript_rows_before_rendering() {
         let lines = (0..20)
             .map(|index| ratatui::text::Line::from(format!("row-{index}")))
@@ -2474,6 +2510,29 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert_eq!(bottom, vec!["row-18", "row-19"]);
+    }
+
+    #[test]
+    fn visible_window_supports_offsets_beyond_u16_max() {
+        let start = u16::MAX as usize + 500;
+        let lines = (0..start + 10)
+            .map(|index| ratatui::text::Line::from(format!("row-{index}")))
+            .collect::<Vec<_>>();
+
+        let visible = visible_transcript_lines(&lines, 4, start)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            vec![
+                format!("row-{start}"),
+                format!("row-{}", start + 1),
+                format!("row-{}", start + 2),
+                format!("row-{}", start + 3),
+            ]
+        );
     }
 
     #[test]
@@ -2800,7 +2859,7 @@ mod tests {
         state.sync_transcript_viewport_rows(before_lines.len());
         let target_top = 6usize;
         let before_max_scroll = crate::tui::measure::max_scroll(before_lines.len(), viewport_rows);
-        state.transcript_scroll = before_max_scroll.saturating_sub(target_top as u16);
+        state.transcript_scroll = before_max_scroll.saturating_sub(target_top);
         state.auto_scroll = false;
 
         let before_top = crate::tui::measure::resolved_scroll_offset(

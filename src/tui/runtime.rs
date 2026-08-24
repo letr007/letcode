@@ -82,7 +82,7 @@ use session_dialog::session_dialog_item;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 
-const PAGE_SCROLL_ROWS: u16 = 10;
+const PAGE_SCROLL_ROWS: usize = 10;
 // ~3 seconds at the 33ms TUI frame interval, long enough for deliberate chords.
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 90;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
