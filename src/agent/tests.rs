@@ -1970,6 +1970,36 @@ async fn parallel_permission_change_during_starts_cancels_batch_without_executio
 }
 
 #[tokio::test]
+async fn missing_model_metadata_still_parallelizes_parallel_tools() {
+    let mut agent = test_agent();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    for name in ["test__parallel_one", "test__parallel_two"] {
+        agent.register_tool(ParallelCountingReadTool {
+            name,
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+    }
+    let calls = vec![
+        test_tool_call("test__parallel_one", "{}"),
+        test_tool_call("test__parallel_two", "{}"),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        })
+        .await
+        .expect("parallel-capable reads execute concurrently");
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn disabled_model_parallel_tool_calls_keep_parallel_tools_sequential() {
     let mut agent = test_agent();
     agent.set_model_catalog(HashMap::from([(
@@ -2278,6 +2308,34 @@ struct PollCountingSubagentDelegate {
     polls: Arc<AtomicUsize>,
 }
 
+struct CountingSubagentDelegate {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl SubagentDelegate<OpenAIConfig> for CountingSubagentDelegate {
+    fn run_named<'a>(
+        &'a self,
+        _parent: &'a Agent<OpenAIConfig>,
+        agent_name: &'a str,
+        _invocation: SubagentInvocation,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        let active = Arc::clone(&self.active);
+        let max_active = Arc::clone(&self.max_active);
+        let agent_name = agent_name.to_string();
+        Box::pin(async move {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            sleep(Duration::from_millis(20)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolResult::ok(
+                format!("agent__{agent_name}"),
+                json!({"ok": true}),
+            ))
+        })
+    }
+}
+
 impl SubagentDelegate<OpenAIConfig> for PollCountingSubagentDelegate {
     fn run_named<'a>(
         &'a self,
@@ -2368,6 +2426,44 @@ fn capturing_delegate(
         explorer_tasks,
         fixer_tasks,
     )
+}
+
+#[tokio::test]
+async fn disabled_model_parallel_tool_calls_keep_subagents_sequential() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: false,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    agent.set_subagent_delegate(Arc::new(CountingSubagentDelegate {
+        active: Arc::clone(&active),
+        max_active: Arc::clone(&max_active),
+    }));
+    let calls = vec![
+        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+        test_tool_call(
+            "agent__fixer",
+            r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
+        ),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        })
+        .await
+        .expect("subagents execute sequentially");
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -105,7 +105,7 @@ display_name = "GPT-5.5"
 # context_window = 400000
 # effective_input_limit_tokens = 256000 # optional provider/model route input budget
 supports_tools = true
-parallel_tool_calls = false # allow one model response to request multiple tools
+parallel_tool_calls = true # optional; defaults to true, set false to require sequential tool calls
 supports_reasoning = true
 reasoning_effort = "medium" # model default
 # Optional: restrict selectable levels and TUI cycle order.

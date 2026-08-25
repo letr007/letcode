@@ -1482,10 +1482,9 @@ impl<C: Config> Agent<C> {
             .unwrap_or(ModelRequestMetadata {
                 context_window: None,
                 max_output_tokens: None,
-                // Backward compatible default: historically tools were always advertised.
-                // If a model isn't in the catalog, we assume tools are supported.
                 supports_tools: true,
                 supports_reasoning: false,
+                parallel_tool_calls: true,
                 ..Default::default()
             })
     }
@@ -1657,6 +1656,7 @@ impl<C: Config> Agent<C> {
                 max_output_tokens: None,
                 supports_tools: true,
                 supports_reasoning: false,
+                parallel_tool_calls: true,
                 ..Default::default()
             });
         let candidate_history = crate::request_builder::history_items_from_frames(
@@ -2886,7 +2886,7 @@ impl<C: Config> Agent<C> {
     /// Executes model-issued calls in order. Contiguous ordinary tools that
     /// explicitly support parallel execution are polled together after a
     /// no-prompt permission preflight; results are returned in model order.
-    /// Subagents retain their separate role-aware batching rules.
+    /// Subagents retain separate batching rules when model parallel calls are enabled.
     async fn execute_tool_calls_and_record<E, A, Efut, Afut>(
         &mut self,
         calls: &[HistoryToolCall],
@@ -3005,20 +3005,15 @@ impl<C: Config> Agent<C> {
                 continue;
             }
 
-            let mut end = index;
-            while calls
-                .get(end)
-                .is_some_and(|call| is_subagent_tool_name(&call.name))
-            {
-                end += 1;
+            let mut end = index + 1;
+            if self.active_model_metadata().parallel_tool_calls {
+                while calls
+                    .get(end)
+                    .is_some_and(|call| is_subagent_tool_name(&call.name))
+                {
+                    end += 1;
+                }
             }
-            if end == index {
-                self.execute_tool_call_and_record(&calls[index], on_event, approve)
-                    .await?;
-                index += 1;
-                continue;
-            }
-
             let records = tool_execution::execute_subagent_tool_call_batch(
                 self,
                 &calls[index..end],

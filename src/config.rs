@@ -887,7 +887,7 @@ fn normalize_model_config(
             temperature: raw.temperature,
             top_p: raw.top_p,
             prompt_cache,
-            parallel_tool_calls: raw.parallel_tool_calls.unwrap_or(false),
+            parallel_tool_calls: raw.parallel_tool_calls.unwrap_or(true),
         },
     ))
 }
@@ -1363,7 +1363,7 @@ pub struct ConfigValidationReport {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = false\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -1449,6 +1449,36 @@ mod tests {
             let path = write_temp_config(config);
             assert!(AppConfig::load_from_path(&path).is_err());
         }
+    }
+
+    #[test]
+    fn model_parallel_tool_calls_default_to_enabled_and_can_be_disabled() {
+        let _guard = lock_env();
+        let default_path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-default"]
+            "#,
+        );
+        let disabled_path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-disabled"]
+            parallel_tool_calls = false
+            "#,
+        );
+
+        let default_config =
+            AppConfig::load_from_path(&default_path).expect("default config should load");
+        let disabled_config =
+            AppConfig::load_from_path(&disabled_path).expect("disabled config should load");
+
+        assert!(default_config.providers["openai"].models["gpt-default"].parallel_tool_calls);
+        assert!(!disabled_config.providers["openai"].models["gpt-disabled"].parallel_tool_calls);
     }
 
     #[test]

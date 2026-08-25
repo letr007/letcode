@@ -17,6 +17,7 @@ use crate::transcript::list_sessions;
 use crate::user_content::{UserMessageContent, UserMessageSubmission};
 use anyhow::{Result, anyhow, bail};
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -405,7 +406,7 @@ async fn wait_for_command(
     output_mode: OutputMode,
 ) -> Result<WaitOutcome> {
     let interactive = matches!(output_mode, OutputMode::Streaming);
-    let mut spinner = None;
+    let mut spinners = HashMap::new();
     let mut compaction_pending = false;
     let mut assistant = String::new();
     let mut error = None;
@@ -421,7 +422,7 @@ async fn wait_for_command(
             event,
             output_mode,
             interactive,
-            &mut spinner,
+            &mut spinners,
             &mut compaction_pending,
             view,
             &mut assistant,
@@ -465,9 +466,7 @@ async fn wait_for_command(
         }
     }
 
-    if let Some(spinner) = spinner.take() {
-        let _ = spinner.stop();
-    }
+    stop_tool_spinners(&mut spinners)?;
     Ok(WaitOutcome {
         assistant,
         error,
@@ -484,7 +483,7 @@ async fn drain_brief(
     error: &mut Option<String>,
     notices: &mut Vec<String>,
 ) -> Result<()> {
-    let mut spinner = None;
+    let mut spinners = HashMap::new();
     let mut compaction_pending = false;
     let deadline = Instant::now() + Duration::from_millis(80);
     while Instant::now() < deadline {
@@ -499,7 +498,7 @@ async fn drain_brief(
                     event,
                     output_mode,
                     interactive,
-                    &mut spinner,
+                    &mut spinners,
                     &mut compaction_pending,
                     view,
                     assistant,
@@ -510,9 +509,7 @@ async fn drain_brief(
             Ok(None) | Err(_) => break,
         }
     }
-    if let Some(spinner) = spinner.take() {
-        let _ = spinner.stop();
-    }
+    stop_tool_spinners(&mut spinners)?;
     Ok(())
 }
 
@@ -534,7 +531,7 @@ fn present_transport_event(
     event: SessionTransportEvent,
     output_mode: OutputMode,
     interactive: bool,
-    spinner: &mut Option<ToolSpinner>,
+    spinners: &mut HashMap<String, ToolSpinner>,
     compaction_pending: &mut bool,
     view: &mut CliView,
     assistant: &mut String,
@@ -552,23 +549,23 @@ fn present_transport_event(
         }
         SessionTransportEvent::ToolStarted(tool) => {
             if matches!(output_mode, OutputMode::Streaming) {
-                *spinner = Some(ToolSpinner::start(tool.summary)?);
+                stop_tool_spinners(spinners)?;
+                spinners.insert(tool.call_id, ToolSpinner::start(tool.summary)?);
             }
         }
         SessionTransportEvent::ToolOutputDelta(delta) => {
             if matches!(output_mode, OutputMode::Streaming) {
-                if let Some(active) = spinner.take() {
-                    active.stop()?;
-                }
+                stop_tool_spinners(spinners)?;
                 print!("{}", delta.chunk);
                 io::stdout().flush()?;
             }
         }
         SessionTransportEvent::ToolFinished(tool) => {
             let ok = matches!(tool.outcome, ToolOutcome::Success);
-            if let Some(active) = spinner.take() {
+            if let Some(active) = spinners.remove(&tool.call_id) {
                 active.finish(ok)?;
             } else if matches!(output_mode, OutputMode::Streaming) {
+                stop_tool_spinners(spinners)?;
                 let status = if ok { "✓" } else { "✗" };
                 println!("-> {} {}", tool.name, status);
             }
@@ -715,6 +712,13 @@ fn present_transport_event(
         _ => {}
     }
     Ok(marker)
+}
+
+fn stop_tool_spinners(spinners: &mut HashMap<String, ToolSpinner>) -> Result<()> {
+    for (_, spinner) in spinners.drain() {
+        spinner.stop()?;
+    }
+    Ok(())
 }
 
 fn respond_permission(
@@ -1242,7 +1246,7 @@ mod tests {
             event,
             OutputMode::FinalOnly,
             false,
-            &mut None,
+            &mut HashMap::new(),
             &mut false,
             view,
             &mut String::new(),

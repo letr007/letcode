@@ -105,7 +105,7 @@ display_name = "GPT-5.5"
 # context_window = 400000
 # effective_input_limit_tokens = 256000 # 可选：当前 provider/model 路径输入预算
 supports_tools = true
-parallel_tool_calls = false # 允许模型在一次响应中请求多个工具
+parallel_tool_calls = true # 可选；默认 true，设为 false 可要求工具调用串行执行
 supports_reasoning = true
 reasoning_effort = "medium" # 该模型的默认值
 # 可选：限制可选思考等级，并控制 TUI 循环切换顺序。
