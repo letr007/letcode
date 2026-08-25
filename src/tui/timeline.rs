@@ -2447,7 +2447,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_for_background_run_reuses_original_subagent_card_and_removes_wait_tool() {
+    fn waiting_run_uses_single_live_subagent_card() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "background-call".into(),
@@ -2522,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_completion_finishes_original_subagent_card_without_duplicate() {
+    fn waiting_run_completes_the_existing_subagent_card() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "background-call".into(),
@@ -2631,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_cancels_foreground_wait_and_late_child_action_does_not_revive_card() {
+    fn interrupted_wait_stays_terminal_after_late_child_activity() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "background-call".into(),
@@ -2679,7 +2679,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_wait_owns_terminal_result_when_background_completion_arrives_first() {
+    fn waiting_run_uses_its_terminal_result_when_completion_events_race() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "background-call".into(),

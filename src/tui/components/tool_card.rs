@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_wait_subagent_card_renders_waiting_without_background_flags() {
+    fn waiting_subagent_card_shows_foreground_state() {
         let tool = ToolView {
             call_id: "background-call".into(),
             name: "agent__explore".into(),

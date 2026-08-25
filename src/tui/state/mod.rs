@@ -2052,11 +2052,6 @@ impl TuiState {
         self.transcript_scroll
     }
 
-    #[cfg(test)]
-    pub fn last_transcript_total_rows(&self) -> Option<usize> {
-        self.last_transcript_total_rows
-    }
-
     pub fn slash_panel_is_open(&self) -> bool {
         !self.is_read_only_child_view()
             && self.dialog.is_none()
@@ -3916,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn long_transcript_scroll_can_cross_u16_boundary_after_narrow_reflow() {
+    fn manual_history_offset_tracks_large_transcript_growth() {
         let mut state = TuiState::default();
         state.last_transcript_area.height = 30;
         state.sync_transcript_viewport_rows_with_reflow(60_000, false);
@@ -3928,7 +3923,6 @@ mod tests {
         assert_eq!(state.transcript_scroll_offset(), 89_970);
         state.scroll_transcript_up(1);
         assert_eq!(state.transcript_scroll_offset(), 89_970);
-        assert!(state.transcript_scroll_offset() > u16::MAX as usize);
     }
 
     #[test]

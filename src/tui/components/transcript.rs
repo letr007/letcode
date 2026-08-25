@@ -2524,8 +2524,8 @@ mod tests {
     }
 
     #[test]
-    fn visible_window_supports_offsets_beyond_u16_max() {
-        let start = u16::MAX as usize + 500;
+    fn visible_window_supports_large_document_offsets() {
+        let start = 100_000usize;
         let lines = (0..start + 10)
             .map(|index| ratatui::text::Line::from(format!("row-{index}")))
             .collect::<Vec<_>>();
@@ -2909,7 +2909,7 @@ mod tests {
     }
 
     #[test]
-    fn width_reflow_does_not_treat_wrapped_rows_as_appended_content() {
+    fn manual_history_offset_is_stable_across_width_reflow() {
         let theme = Theme::dark();
         let mut state = TuiState::default();
         let content = std::iter::repeat_n("x".repeat(90), 200)

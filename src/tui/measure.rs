@@ -275,12 +275,12 @@ mod tests {
     }
 
     #[test]
-    fn transcript_scroll_math_exceeds_terminal_coordinate_range() {
-        let total_rows = u16::MAX as usize + 20_000;
+    fn transcript_scroll_math_handles_large_documents() {
+        let total_rows = 100_000usize;
         let viewport_rows = 30;
         let max = max_scroll(total_rows, viewport_rows);
 
-        assert!(max > u16::MAX as usize);
+        assert_eq!(max, total_rows - viewport_rows as usize);
         assert_eq!(
             resolved_scroll_offset(total_rows, viewport_rows, 0, true),
             max

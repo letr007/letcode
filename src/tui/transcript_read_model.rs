@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_active_wait_reuses_background_subagent_card() {
+    fn restored_wait_keeps_a_single_subagent_card() {
         let structured = crate::subagent::StructuredSubagentResult {
             status: "completed".into(),
             summary: "wait restored".into(),
@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_interrupted_wait_terminalizes_original_subagent_card() {
+    fn restored_interrupted_wait_is_terminal() {
         let timeline = timeline_from_transcript_records(&[
             record(
                 1,
