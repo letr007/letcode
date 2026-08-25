@@ -283,6 +283,7 @@ struct SubagentToolBinding {
     child_session_id: String,
     agent_name: String,
     task: String,
+    background: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -948,16 +949,21 @@ impl Timeline {
             let agent_name = agent_name_for_subagent_tool(&event.name)
                 .unwrap_or(event.name.as_str())
                 .to_string();
-            let task = event
+            let arguments = event
                 .arguments
                 .as_deref()
-                .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
-                .and_then(|args| {
-                    args.get("task")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
+                .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok());
+            let task = arguments
+                .as_ref()
+                .and_then(|args| args.get("task"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
                 .unwrap_or_else(|| event.summary.clone());
+            let background = arguments
+                .as_ref()
+                .and_then(|args| args.get("background"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             self.pending_subagent_starts
                 .retain(|binding| binding.call_id != event.call_id);
             self.pending_subagent_starts.push(SubagentToolBinding {
@@ -966,6 +972,7 @@ impl Timeline {
                 child_session_id: String::new(),
                 agent_name,
                 task,
+                background,
             });
         }
         if let Some(index) = self.find_tool_index(&event.call_id) {
@@ -1072,6 +1079,7 @@ impl Timeline {
                         child_session_id: result.child_session_id.clone(),
                         agent_name: result.agent_name.clone(),
                         task,
+                        background: false,
                     },
                 );
             }
@@ -1094,8 +1102,12 @@ impl Timeline {
                         .or_else(|| {
                             agent_name_for_subagent_tool(&event.name).map(str::to_string)
                         })?;
+                    let background = data
+                        .get("background")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     (data.get("active").and_then(serde_json::Value::as_bool) == Some(true))
-                        .then_some((run_id, child_session_id, agent_name))
+                        .then_some((run_id, child_session_id, agent_name, background))
                 })
         } else {
             None
@@ -1106,7 +1118,7 @@ impl Timeline {
             return false;
         }
 
-        if let Some((run_id, child_session_id, agent_name)) = subagent_binding {
+        if let Some((run_id, child_session_id, agent_name, background)) = subagent_binding {
             let task = self
                 .find_tool_index(&call_id)
                 .and_then(|index| self.items.get(index))
@@ -1135,6 +1147,7 @@ impl Timeline {
                     child_session_id,
                     agent_name,
                     task,
+                    background,
                 },
             );
         }
@@ -1604,6 +1617,25 @@ impl Timeline {
         let waiting = run_id
             .as_ref()
             .is_some_and(|run_id| self.foreground_waits.contains_key(run_id));
+        let background = if waiting {
+            false
+        } else {
+            run_id
+                .as_ref()
+                .and_then(|run_id| self.subagent_tools_by_run.get(run_id))
+                .map(|binding| binding.background)
+                .or_else(|| {
+                    tool.arguments
+                        .as_deref()
+                        .and_then(|arguments| {
+                            serde_json::from_str::<serde_json::Value>(arguments).ok()
+                        })
+                        .and_then(|args| {
+                            args.get("background").and_then(serde_json::Value::as_bool)
+                        })
+                })
+                .unwrap_or(false)
+        };
         if !is_subagent_tool_name(&tool.name)
             || (!waiting
                 && !matches!(
@@ -1633,7 +1665,7 @@ impl Timeline {
                 "agent_name": resolved_agent_name,
                 "waiting": waiting,
                 "active": true,
-                "background": !waiting,
+                "background": background,
             })
             .to_string(),
         );
@@ -1807,6 +1839,7 @@ impl Timeline {
                     child_session_id: result.child_session_id.clone(),
                     agent_name: result.agent_name.clone(),
                     task: tool.summary.clone(),
+                    background: true,
                 },
             );
             self.subagent_run_by_child
@@ -2489,18 +2522,60 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(tools[0].summary, "explorer done");
-        assert!(
-            tools[0]
-                .output
-                .as_deref()
-                .is_some_and(|output| output.contains("explorer-child"))
+        let explorer_data = tools[0]
+            .output
+            .as_deref()
+            .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+            .expect("explorer live data");
+        assert_eq!(
+            explorer_data
+                .get("background")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
         assert_eq!(tools[1].summary, "fixer working");
-        assert!(
-            tools[1]
-                .output
-                .as_deref()
-                .is_some_and(|output| output.contains("fixer-child"))
+        let fixer_data = tools[1]
+            .output
+            .as_deref()
+            .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+            .expect("fixer live data");
+        assert_eq!(
+            fixer_data
+                .get("background")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn background_child_live_summary_keeps_background_flag() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "inspect in background".into(),
+            arguments: Some(json!({"task": "inspect", "background": true}).to_string()),
+        });
+
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "background-child",
+            Some("explorer"),
+            Some("background-call"),
+            "running",
+            "background explorer working",
+        ));
+
+        let Some(TimelineItem::Tool(tool)) = timeline.items().first() else {
+            panic!("expected background subagent tool");
+        };
+        let data = tool
+            .output
+            .as_deref()
+            .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+            .expect("background live data");
+        assert_eq!(
+            data.get("background").and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 
