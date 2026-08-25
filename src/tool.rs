@@ -815,6 +815,10 @@ fn prepare_writable_leaf_platform(path: &str) -> Result<PreparedWritableLeaf> {
 
 #[cfg(windows)]
 fn prepare_writable_leaf_platform(path: &str) -> Result<PreparedWritableLeaf> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
     let workspace_root = workspace_root()?;
     let candidate = join_workspace_path(&workspace_root, path);
     let destination = resolve_writable_leaf_destination_windows(&candidate)?;
@@ -829,11 +833,53 @@ fn prepare_writable_leaf_platform(path: &str) -> Result<PreparedWritableLeaf> {
         cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())
             .with_context(|| format!("failed to open parent directory {}", parent.display()))?,
     );
-    let existing_file = match parent_dir.open(destination.file_name().expect("validated file name"))
-    {
-        Ok(file) => Some(Arc::new(file)),
+    let existing_file = match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || windows_metadata_is_reparse_point(&metadata) {
+                bail!(
+                    "writable destination cannot be a link or reparse point: {}",
+                    destination.display()
+                );
+            }
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .follow(FollowSymlinks::No)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+            let file = parent_dir
+                .open_with(
+                    destination.file_name().expect("validated file name"),
+                    &options,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to bind writable destination {}",
+                        destination.display()
+                    )
+                })?;
+            if windows_file_is_reparse_point(
+                &file
+                    .try_clone()
+                    .context("failed to clone writable destination anchor")?
+                    .into_std(),
+            )? {
+                bail!(
+                    "writable destination cannot be a link or reparse point: {}",
+                    destination.display()
+                );
+            }
+            Some(Arc::new(file))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("failed to bind writable destination"),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect writable destination: {}",
+                    destination.display()
+                )
+            });
+        }
     };
     Ok(PreparedWritableLeaf {
         workspace_root,
@@ -1026,30 +1072,38 @@ async fn secure_write_writable_leaf(
     content: &[u8],
     append: bool,
 ) -> Result<()> {
-    use std::io::Write;
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use std::io::{Seek, SeekFrom, Write};
 
-    if let Some(existing_file) = &prepared.existing_file {
-        let mut file = existing_file
+    if !prepared.parent_instance_is_current() {
+        bail!(WRITABLE_DESTINATION_CHANGED);
+    }
+
+    let mut file = if let Some(existing_file) = &prepared.existing_file {
+        existing_file
             .try_clone()
-            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?;
-        if append {
-            use std::io::{Seek, SeekFrom};
-            file.seek(SeekFrom::End(0))?;
-        } else {
-            file.set_len(0)?;
-        }
-        file.write_all(content)?;
-        file.flush()?;
+            .map(cap_std::fs::File::into_std)
+            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?
     } else {
         let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = prepared
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        prepared
             .parent_dir
             .open_with(&prepared.leaf_name(), &options)
-            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?;
-        file.write_all(content)?;
-        file.flush()?;
+            .map(cap_std::fs::File::into_std)
+            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?
+    };
+    if append {
+        file.seek(SeekFrom::End(0))?;
+    } else {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
     }
+    file.write_all(content)?;
+    file.flush()?;
     Ok(())
 }
 
@@ -1067,6 +1121,30 @@ fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_file_is_reparse_point(file: &std::fs::File) -> Result<bool> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo,
+        GetFileInformationByHandleEx,
+    };
+    let mut information = FILE_ATTRIBUTE_TAG_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileAttributeTagInfo,
+            (&mut information as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect Windows file attributes");
+    }
+    Ok(information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 #[cfg(test)]
@@ -1461,6 +1539,7 @@ mod tests {
             .as_nanos();
         let path = PathBuf::from("target").join(format!("letcode-windows-write-{unique}.txt"));
         std::fs::create_dir_all("target").expect("create target directory");
+        std::fs::write(&path, "old").expect("write existing file");
         let registry = ToolRegistry::default_tools();
 
         let written = registry
@@ -1483,7 +1562,86 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_writable_leaf_rejects_symlink_replacement() {
+    async fn windows_write_tool_creates_missing_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = PathBuf::from("target").join(format!("letcode-windows-new-{unique}.txt"));
+        std::fs::create_dir_all("target").expect("create target directory");
+
+        let written = ToolRegistry::default_tools()
+            .call(
+                "fs__write",
+                json!({"path": path.to_string_lossy(), "content": "created"}),
+            )
+            .await;
+
+        assert!(written.ok, "{:?}", written.error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "created");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_missing_writable_leaf_rejects_intervening_file_creation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let parent = PathBuf::from("target").join(format!("letcode-windows-create-{unique}"));
+        let leaf = parent.join("leaf.txt");
+        std::fs::create_dir_all(&parent).unwrap();
+        let prepared = prepare_writable_leaf(leaf.to_str().unwrap()).unwrap();
+        std::fs::write(&leaf, "must stay unchanged").unwrap();
+
+        let error = secure_write_writable_leaf(&prepared, b"must not write", false)
+            .await
+            .expect_err("intervening file creation must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "writable destination changed after authorization"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&leaf).unwrap(),
+            "must stay unchanged"
+        );
+        drop(prepared);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_existing_writable_leaf_prevents_path_replacement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let parent = PathBuf::from("target").join(format!("letcode-windows-anchor-{unique}"));
+        let leaf = parent.join("leaf.txt");
+        let replacement = parent.join("replacement.txt");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(&leaf, "original").unwrap();
+        std::fs::write(&replacement, "replacement").unwrap();
+        let prepared = prepare_writable_leaf(leaf.to_str().unwrap()).unwrap();
+
+        assert!(std::fs::remove_file(&leaf).is_err());
+        assert!(std::fs::rename(&replacement, &leaf).is_err());
+        secure_write_writable_leaf(&prepared, b"updated", false)
+            .await
+            .expect("authorized file remains writable");
+        assert_eq!(std::fs::read_to_string(&leaf).unwrap(), "updated");
+        assert_eq!(
+            std::fs::read_to_string(&replacement).unwrap(),
+            "replacement"
+        );
+        drop(prepared);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writable_leaf_rejects_existing_symlink() {
         use std::os::windows::fs::symlink_file;
 
         let unique = std::time::SystemTime::now()
@@ -1494,19 +1652,12 @@ mod tests {
         let leaf = parent.join("leaf.txt");
         let target = parent.join("target.txt");
         std::fs::create_dir_all(&parent).unwrap();
-        std::fs::write(&leaf, "original").unwrap();
         std::fs::write(&target, "unchanged").unwrap();
-        let prepared = prepare_writable_leaf(leaf.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&leaf).unwrap();
-        symlink_file(&target, &leaf).expect("create replacement symlink");
+        symlink_file(&target, &leaf).expect("create fixture symlink");
 
-        let error = secure_write_writable_leaf(&prepared, b"must not write", false)
-            .await
-            .expect_err("replacement link must be rejected");
-        assert_eq!(
-            error.to_string(),
-            "writable destination changed after authorization"
-        );
+        let error = prepare_writable_leaf(leaf.to_str().unwrap())
+            .expect_err("link destination must be rejected");
+        assert!(error.to_string().contains("cannot be a link"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged");
         let _ = std::fs::remove_dir_all(parent);
     }

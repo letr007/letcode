@@ -55,6 +55,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+cap-fs-ext = "4.0"
 cap-std = "4.0"
 fs4 = "0.13"
 windows-sys = { version = "0.61", features = [

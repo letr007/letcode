@@ -1476,7 +1476,7 @@ mod tests {
     #[test]
     fn registry_rejects_directory_name_mismatch() {
         let temp = TempDir::new();
-        let skill_path = write_skill(
+        write_skill(
             temp.path(),
             "config/skills",
             "wrong-name",
@@ -1486,11 +1486,12 @@ mod tests {
         let error = load_test_registry(&temp.path().join("config"), temp.path())
             .expect_err("mismatch should fail");
         assert!(error.to_string().contains("must match name 'correct-name'"));
-        assert!(
-            error
-                .to_string()
-                .contains(&skill_path.display().to_string())
-        );
+        let rendered = error.to_string();
+        assert!(rendered.ends_with(&format!(
+            "wrong-name{}{}",
+            std::path::MAIN_SEPARATOR,
+            SKILL_FILE_NAME
+        )));
     }
 
     #[tokio::test]
