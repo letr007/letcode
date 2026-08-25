@@ -57,6 +57,18 @@ letcode update
 
 The TUI supports English (`en`) and Simplified Chinese (`zh-CN`). Use `/language` or its `/lang` alias to switch languages at runtime.
 
+## External dependencies
+
+Building from source requires the Rust toolchain. Some built-in tools also invoke the following external programs, which must be available on `PATH`:
+
+| Program | Used by | Requirement |
+| --- | --- | --- |
+| [`git`](https://git-scm.com/) | `git__status`, `git__diff`, `git__log`, and the TUI branch indicator | Recommended; only Git-related capabilities are unavailable when missing |
+| [`rg`](https://github.com/BurntSushi/ripgrep) | `search__rg` text search | Recommended; the search tool is unavailable when missing |
+| [`ast-grep`](https://ast-grep.github.io/) | `code__ast_search` and `code__ast_replace_preview` | Optional; only AST tools are unavailable when missing |
+
+In addition, `shell__exec` and local MCP servers depend on the system commands they invoke, while `web__fetch` and remote MCP require network access.
+
 ## Configuration
 
 `letcode` loads configuration from:

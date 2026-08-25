@@ -57,6 +57,18 @@ letcode update
 
 TUI 支持 English（`en`）和简体中文（`zh-CN`）。运行时可使用 `/language` 或别名 `/lang` 切换语言。
 
+## 外部依赖
+
+从源码构建需要 Rust 工具链。部分内置工具还会调用以下外部程序，请确保它们位于 `PATH` 中：
+
+| 程序 | 使用位置 | 是否必需 |
+| --- | --- | --- |
+| [`git`](https://git-scm.com/) | `git__status`、`git__diff`、`git__log`，以及 TUI 分支状态 | 推荐安装；缺少时仅相关 Git 能力不可用 |
+| [`rg`](https://github.com/BurntSushi/ripgrep) | `search__rg` 文本搜索 | 推荐安装；缺少时该工具不可用 |
+| [`ast-grep`](https://ast-grep.github.io/) | `code__ast_search`、`code__ast_replace_preview` | 可选；缺少时仅 AST 工具不可用 |
+
+此外，`shell__exec` 和本地 MCP 依赖实际调用的系统命令；`web__fetch` 与远程 MCP 需要可用的网络连接。
+
 ## 配置
 
 `letcode` 从以下路径加载配置：
