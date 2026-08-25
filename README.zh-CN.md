@@ -65,54 +65,101 @@ TUI 支持 English（`en`）和简体中文（`zh-CN`）。运行时可使用 `/
 ~/.config/letcode/letcode.toml
 ```
 
-最小示例：
+配置示例：
 
 ```toml
+# 可选；省略时使用配置中最先出现的 provider。
 active_provider = "openai"
+# 可选；默认 false。
+fast_mode = false
 
+# 可选；以下均有默认值。
 [global]
-# 可选的运行时限制：
 # max_iterations = 64
 # max_tool_calls = 128
+# tool_timeout_secs = 60
 sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
-[permissions]
-mode = "default" # safe/default/auto/yolo；读取时兼容旧的 solo
-# auto = Ask 集合与 default 相同，但由 sticky reviewer 专家回答审批
+# 可选；省略时根据当前模型输入预算保留最近上下文。
+[global.compaction]
+# preserve_recent_tokens = 12000
 
-# 可选：permission mode = "auto" 时的 reviewer 模型路由
-# [agents.reviewer]
+# 可选；以下为默认值。
+[global.retry]
+enabled = true
+max_attempts = 50
+max_recovery_attempts = 3
+initial_delay_secs = 1
+backoff_multiplier = 2.0
+jitter_secs = 1
+
+# 可选；默认 default。可选值：safe | default | auto | yolo。
+[permissions]
+mode = "default" # solo 是 yolo 的兼容别名
+
+# 可选；为内置专家指定默认路由或单次委派可选路由。
+# [agents.explorer]
 # provider = "openai"
 # model = "gpt-5.5"
-# 可选：单次委派时允许选择的 provider-qualified 路由
 # allowed_models = ["openai/gpt-5.5"]
+# 同样适用于 fixer、oracle、designer、librarian、general、reviewer。
 
-# 可选的本地执行策略。经过审查的读取工具可以声明支持并行；
-# 其他工具保持单例执行，除非其处理器明确选择并行。
+# 可选；只能收窄工具自身声明的并行能力。
 [tools.parallelism]
 # "fs__read" = "parallel"
 # "web__fetch" = "exclusive"
 
+# 可选；本地 MCP 服务。
+# [mcp.example_local]
+# type = "local"
+# command = ["/path/to/mcp-server", "--stdio"]
+# environment = { FOO = "bar" }
+# enabled = true
+# timeout = 5000
+
+# 可选；远程 MCP 服务，OAuth 暂不支持。
+# [mcp.example_remote]
+# type = "remote"
+# url = "https://example.com/mcp"
+# headers = { Authorization = "Bearer ..." }
+# enabled = true
+# timeout = 10000
+
+# 必需：至少配置一个 provider，且其中至少配置一个 model。
 [providers.openai]
+# 可选；也可使用 OPENAI_API_KEY 环境变量。
 api_key = "YOUR_API_KEY"
+# OpenAI provider 可省略，默认 https://api.openai.com/v1。
 base_url = "https://api.openai.com/v1"
-protocol = "responses" # responses/completions
+# OpenAI provider 可省略，默认 responses；其他 provider 必须配置。
+protocol = "responses" # responses | completions
+# 可选；省略时使用该 provider 下最先出现的 model。
 default_model = "gpt-5.5"
 
+# 必需：每个 provider 至少配置一个 model；model 内字段均可省略。
 [providers.openai.models."gpt-5.5"]
 display_name = "GPT-5.5"
+# protocol = "completions" # 可覆盖 provider 协议
 # context_window = 400000
-# effective_input_limit_tokens = 256000 # 可选：当前 provider/model 路径输入预算
-supports_tools = true
-parallel_tool_calls = true # 可选；默认 true，设为 false 可要求工具调用串行执行
-supports_reasoning = true
-reasoning_effort = "medium" # 该模型的默认值
-# 可选：限制可选思考等级，并控制 TUI 循环切换顺序。
-# 支持：none、minimal、low、medium、high、xhigh、max
+# effective_input_limit_tokens = 256000
+# max_output_tokens = 128000
+supports_tools = true # 默认 true
+parallel_tool_calls = true # 默认 true
+supports_reasoning = true # 默认 true
+reasoning_effort = "medium"
+# 可选；限制可选推理等级及 TUI 循环顺序。
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
-reasoning_summary = "auto"
-text_verbosity = "medium"
+reasoning_summary = "auto" # auto | concise | detailed
+text_verbosity = "medium" # low | medium | high
+# temperature = 0.2
+# top_p = 1.0
+
+# 可选；模型级 prompt cache。
+# [providers.openai.models."gpt-5.5".prompt_cache]
+# enabled = true
+# retention = "in_memory" # in_memory | 24h
+# namespace = "openai"
 ```
 
 Provider API key 和 base URL 也可以来自按 provider 名称生成的环境变量，例如 `OPENAI_API_KEY` / `OPENAI_BASE_URL`；若 provider 名为 `compat`，对应为 `COMPAT_API_KEY` / `COMPAT_BASE_URL`。
@@ -120,10 +167,6 @@ Provider API key 和 base URL 也可以来自按 provider 名称生成的环境�
 相对路径形式的 `sessions_dir` 和 `log_file` 会按配置文件所在目录解析。
 
 可选的 Langfuse/OpenTelemetry tracing 默认关闭。可用 `LETCODE_LANGFUSE_ENABLED=true`，并配置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 与可选的 `LANGFUSE_HOST`（或写在本地 `.env`）启用。缺少凭据时 tracing 保持关闭，不影响 Agent 运行。
-
-## 会话
-
-会话 transcript 以 append-only JSONL 保存在 `sessions_dir` 下，之后可以恢复。在 TUI 中可用 `/tree` 浏览历史，用 `/undo` / `/redo` 在已完成用户回合间移动，完整本地命令见 `/help`。行命令式 CLI 支持只读的 `/tree`；`/undo` 与 `/redo` 需要 TUI。
 
 ## 更新日志
 

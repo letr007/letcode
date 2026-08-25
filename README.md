@@ -65,54 +65,101 @@ The TUI supports English (`en`) and Simplified Chinese (`zh-CN`). Use `/language
 ~/.config/letcode/letcode.toml
 ```
 
-Minimal example:
+Configuration example:
 
 ```toml
+# Optional; defaults to the first provider in the file.
 active_provider = "openai"
+# Optional; defaults to false.
+fast_mode = false
 
+# Optional; all values below have defaults.
 [global]
-# Optional runtime limits:
 # max_iterations = 64
 # max_tool_calls = 128
+# tool_timeout_secs = 60
 sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
-[permissions]
-mode = "default" # safe/default/auto/yolo; legacy solo remains accepted when reading
-# auto = same Ask set as default, but a sticky reviewer expert answers approvals
+# Optional; by default, recent context is preserved according to the active model's input budget.
+[global.compaction]
+# preserve_recent_tokens = 12000
 
-# Optional reviewer model route used by permission mode "auto"
-# [agents.reviewer]
+# Optional; values below are the defaults.
+[global.retry]
+enabled = true
+max_attempts = 50
+max_recovery_attempts = 3
+initial_delay_secs = 1
+backoff_multiplier = 2.0
+jitter_secs = 1
+
+# Optional; defaults to default. Values: safe | default | auto | yolo.
+[permissions]
+mode = "default" # solo remains accepted as a yolo alias
+
+# Optional; choose a default route and per-invocation allowed routes for an expert.
+# [agents.explorer]
 # provider = "openai"
 # model = "gpt-5.5"
-# Optional provider-qualified routes selectable per delegation:
 # allowed_models = ["openai/gpt-5.5"]
+# The same shape applies to fixer, oracle, designer, librarian, general, and reviewer.
 
-# Optional local execution policy. Reviewed read tools may declare parallel support;
-# all other tools stay exclusive unless their handler explicitly opts in.
+# Optional; this can only narrow parallelism declared by a tool itself.
 [tools.parallelism]
 # "fs__read" = "parallel"
 # "web__fetch" = "exclusive"
 
+# Optional local MCP server.
+# [mcp.example_local]
+# type = "local"
+# command = ["/path/to/mcp-server", "--stdio"]
+# environment = { FOO = "bar" }
+# enabled = true
+# timeout = 5000
+
+# Optional remote MCP server; OAuth is not currently supported.
+# [mcp.example_remote]
+# type = "remote"
+# url = "https://example.com/mcp"
+# headers = { Authorization = "Bearer ..." }
+# enabled = true
+# timeout = 10000
+
+# Required: configure at least one provider with at least one model.
 [providers.openai]
+# Optional; OPENAI_API_KEY may be used instead.
 api_key = "YOUR_API_KEY"
+# Optional for the OpenAI provider; defaults to https://api.openai.com/v1.
 base_url = "https://api.openai.com/v1"
-protocol = "responses" # responses/completions
+# Optional for the OpenAI provider, where it defaults to responses; required for other providers.
+protocol = "responses" # responses | completions
+# Optional; defaults to the first model configured for this provider.
 default_model = "gpt-5.5"
 
+# Required: each provider needs at least one model; every field inside the model is optional.
 [providers.openai.models."gpt-5.5"]
 display_name = "GPT-5.5"
+# protocol = "completions" # overrides the provider protocol
 # context_window = 400000
-# effective_input_limit_tokens = 256000 # optional provider/model route input budget
-supports_tools = true
-parallel_tool_calls = true # optional; defaults to true, set false to require sequential tool calls
-supports_reasoning = true
-reasoning_effort = "medium" # model default
-# Optional: restrict selectable levels and TUI cycle order.
-# Supported values: none, minimal, low, medium, high, xhigh, max
+# effective_input_limit_tokens = 256000
+# max_output_tokens = 128000
+supports_tools = true # default: true
+parallel_tool_calls = true # default: true
+supports_reasoning = true # default: true
+reasoning_effort = "medium"
+# Optional; restricts selectable reasoning levels and the TUI cycle order.
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
-reasoning_summary = "auto"
-text_verbosity = "medium"
+reasoning_summary = "auto" # auto | concise | detailed
+text_verbosity = "medium" # low | medium | high
+# temperature = 0.2
+# top_p = 1.0
+
+# Optional model-level prompt cache.
+# [providers.openai.models."gpt-5.5".prompt_cache]
+# enabled = true
+# retention = "in_memory" # in_memory | 24h
+# namespace = "openai"
 ```
 
 Provider API keys and base URLs can also come from environment variables named from the provider, for example `OPENAI_API_KEY` / `OPENAI_BASE_URL`; for a provider named `compat`, use `COMPAT_API_KEY` / `COMPAT_BASE_URL`.
@@ -120,10 +167,6 @@ Provider API keys and base URLs can also come from environment variables named f
 Relative `sessions_dir` and `log_file` paths are resolved relative to the config file directory.
 
 Optional Langfuse/OpenTelemetry tracing is off by default. Enable it with `LETCODE_LANGFUSE_ENABLED=true`, and set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optional `LANGFUSE_HOST` (or the same variables in a local `.env`). Missing credentials leave tracing disabled without stopping the agent.
-
-## Sessions
-
-Session transcripts are stored as append-only JSONL under `sessions_dir` and can be restored later. In the TUI, use `/tree` to browse history, `/undo` / `/redo` to move between completed user turns, and `/help` for all local commands. The line-based CLI supports `/tree` as a read-only listing; `/undo` and `/redo` require the TUI.
 
 ## Changelog
 
