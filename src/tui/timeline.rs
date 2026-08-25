@@ -6,6 +6,7 @@ use super::events::{
 };
 use crate::agent::{
     AutoContinueState, TodoItem, agent_name_for_subagent_tool, is_subagent_tool_name,
+    subagent_tool_name_for_agent_name,
 };
 #[cfg(test)]
 use crate::agent::{ConversationMessage, ConversationRole};
@@ -285,6 +286,12 @@ struct SubagentToolBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SettledSubagentWait {
+    call_id: String,
+    child_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoView {
     pub items: Vec<TodoItem>,
     pub auto_continue: AutoContinueState,
@@ -440,6 +447,7 @@ pub struct Timeline {
     subagent_tools_by_run: HashMap<String, SubagentToolBinding>,
     subagent_run_by_child: HashMap<String, String>,
     foreground_waits: HashMap<String, String>,
+    settled_subagent_waits: HashMap<String, SettledSubagentWait>,
     pending_subagent_starts: Vec<SubagentToolBinding>,
 }
 
@@ -465,6 +473,7 @@ impl Default for Timeline {
             subagent_tools_by_run: HashMap::new(),
             subagent_run_by_child: HashMap::new(),
             foreground_waits: HashMap::new(),
+            settled_subagent_waits: HashMap::new(),
             pending_subagent_starts: Vec::new(),
         }
     }
@@ -1143,19 +1152,25 @@ impl Timeline {
         let handled = result
             .as_ref()
             .is_some_and(|result| self.finish_subagent_wait(&event.call_id, result));
-        if !handled && self.find_tool_index(&event.call_id).is_some() {
-            return self.push_ordinary_tool_finished(event);
+        if handled {
+            return true;
+        }
+        let foreground_run_id = self
+            .foreground_waits
+            .iter()
+            .find_map(|(run_id, call_id)| (call_id == &event.call_id).then(|| run_id.clone()));
+        if self.find_tool_index(&event.call_id).is_some() {
+            let finished = self.push_ordinary_tool_finished(event);
+            if let Some(run_id) = foreground_run_id {
+                self.foreground_waits.remove(&run_id);
+            }
+            return finished;
         }
         self.remove_tool(&event.call_id);
-        if !handled
-            && let Some(run_id) = self
-                .foreground_waits
-                .iter()
-                .find_map(|(run_id, call_id)| (call_id == &event.call_id).then(|| run_id.clone()))
-        {
+        if let Some(run_id) = foreground_run_id {
             self.foreground_waits.remove(&run_id);
         }
-        handled
+        false
     }
 
     fn push_ordinary_tool_finished(&mut self, event: ToolFinishedEvent) -> bool {
@@ -1209,7 +1224,7 @@ impl Timeline {
         let Some(binding) = self.subagent_tools_by_run.get(&run_id) else {
             return false;
         };
-        let Some(index) = self.find_tool_index(&binding.call_id) else {
+        let Some(index) = self.find_tool_index(wait_call_id) else {
             return false;
         };
         let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
@@ -1235,11 +1250,11 @@ impl Timeline {
     pub fn cancel_foreground_subagent_waits(&mut self) -> usize {
         let waits = self.foreground_waits.drain().collect::<Vec<_>>();
         let mut cancelled = 0usize;
-        for (run_id, _) in waits {
+        for (run_id, wait_call_id) in waits {
             let Some(binding) = self.subagent_tools_by_run.get(&run_id) else {
                 continue;
             };
-            let Some(index) = self.find_tool_index(&binding.call_id) else {
+            let Some(index) = self.find_tool_index(&wait_call_id) else {
                 continue;
             };
             let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
@@ -1567,8 +1582,14 @@ impl Timeline {
         let run_id = self.subagent_run_by_child.get(child_session_id).cloned();
         let target_call_id = run_id
             .as_ref()
-            .and_then(|run_id| self.subagent_tools_by_run.get(run_id))
-            .map(|binding| binding.call_id.clone())
+            .and_then(|run_id| self.foreground_waits.get(run_id))
+            .cloned()
+            .or_else(|| {
+                run_id
+                    .as_ref()
+                    .and_then(|run_id| self.subagent_tools_by_run.get(run_id))
+                    .map(|binding| binding.call_id.clone())
+            })
             .or_else(|| parent_tool_call_id.map(str::to_string));
         let Some(target_call_id) = target_call_id else {
             return false;
@@ -1580,23 +1601,26 @@ impl Timeline {
         let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
             return false;
         };
-        if !is_subagent_tool_name(&tool.name) {
-            return false;
-        }
-
         let waiting = run_id
             .as_ref()
             .is_some_and(|run_id| self.foreground_waits.contains_key(run_id));
-        if !waiting
-            && !matches!(
-                tool.status,
-                ToolExecutionStatus::Pending | ToolExecutionStatus::Running
-            )
+        if !is_subagent_tool_name(&tool.name)
+            || (!waiting
+                && !matches!(
+                    tool.status,
+                    ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+                ))
         {
             return false;
         }
 
         let resolved_agent_name = agent_name
+            .or_else(|| {
+                run_id
+                    .as_ref()
+                    .and_then(|run_id| self.subagent_tools_by_run.get(run_id))
+                    .map(|binding| binding.agent_name.as_str())
+            })
             .or_else(|| agent_name_for_subagent_tool(&tool.name))
             .unwrap_or(tool.name.as_str());
         tool.summary = summary.to_string();
@@ -1653,6 +1677,9 @@ impl Timeline {
     }
 
     pub fn begin_subagent_wait(&mut self, wait_call_id: &str, run_id: &str) -> bool {
+        if self.foreground_waits.contains_key(run_id) {
+            return false;
+        }
         let Some(binding) = self.subagent_tools_by_run.get(run_id).cloned() else {
             return false;
         };
@@ -1678,26 +1705,30 @@ impl Timeline {
         ) {
             return false;
         }
-        self.foreground_waits
-            .insert(run_id.to_string(), wait_call_id.to_string());
-        let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
-            self.foreground_waits.remove(run_id);
+        let Some(TimelineItem::Tool(origin)) = self.items.get(index) else {
             return false;
         };
-        tool.status = ToolExecutionStatus::Running;
-        tool.summary = binding.task;
-        tool.output = serde_json::to_string(&serde_json::json!({
+        let mut waiting = origin.clone();
+        waiting.call_id = wait_call_id.to_string();
+        waiting.name = subagent_tool_name_for_agent_name(&binding.agent_name)
+            .unwrap_or(origin.name.as_str())
+            .to_string();
+        waiting.status = ToolExecutionStatus::Running;
+        waiting.summary = binding.task;
+        waiting.output = serde_json::to_string(&serde_json::json!({
             "run_id": binding.run_id,
             "child_session_id": binding.child_session_id,
             "agent_name": binding.agent_name,
             "status": "running",
-            "summary": tool.summary,
+            "summary": waiting.summary,
             "waiting": true,
             "active": true,
             "background": false,
         }))
         .ok();
-        self.bump_revision(index);
+        self.foreground_waits
+            .insert(run_id.to_string(), wait_call_id.to_string());
+        self.push_item(TimelineItem::Tool(waiting));
         true
     }
 
@@ -1715,7 +1746,17 @@ impl Timeline {
             return false;
         }
         self.foreground_waits.remove(&result.run_id);
-        self.finish_subagent_tool(result, false)
+        if !self.finish_subagent_tool_by_call_id(wait_call_id, result, false) {
+            return false;
+        }
+        self.settled_subagent_waits.insert(
+            result.run_id.clone(),
+            SettledSubagentWait {
+                call_id: wait_call_id.to_string(),
+                child_session_id: result.child_session_id.clone(),
+            },
+        );
+        true
     }
 
     pub fn finish_background_subagent_tool(
@@ -1723,7 +1764,15 @@ impl Timeline {
         parent_tool_call_id: &str,
         result: &crate::subagent::SubagentRunSummary,
     ) -> bool {
-        if self.foreground_waits.contains_key(&result.run_id) {
+        if self.foreground_waits.contains_key(&result.run_id)
+            || self
+                .settled_subagent_waits
+                .get(&result.run_id)
+                .is_some_and(|wait| {
+                    wait.child_session_id == result.child_session_id
+                        && self.find_tool_index(&wait.call_id).is_some()
+                })
+        {
             return false;
         }
         if self
@@ -1774,7 +1823,16 @@ impl Timeline {
         let Some(binding) = self.subagent_tools_by_run.get(&result.run_id).cloned() else {
             return false;
         };
-        let Some(index) = self.find_tool_index(&binding.call_id) else {
+        self.finish_subagent_tool_by_call_id(&binding.call_id, result, background)
+    }
+
+    fn finish_subagent_tool_by_call_id(
+        &mut self,
+        call_id: &str,
+        result: &crate::subagent::SubagentRunSummary,
+        background: bool,
+    ) -> bool {
+        let Some(index) = self.find_tool_index(call_id) else {
             return false;
         };
         let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
@@ -2447,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_run_uses_single_live_subagent_card() {
+    fn waiting_run_clones_a_live_card_below_the_background_receipt() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "background-call".into(),
@@ -2477,15 +2535,13 @@ mod tests {
                 .to_string(),
             ),
         });
-        timeline.push_tool_started(ToolStartedEvent {
-            call_id: "wait-call".into(),
-            name: crate::tool_names::TOOL_AGENT_WAIT.into(),
-            summary: "wait for run-bg".into(),
-            arguments: Some(json!({"run_id": "run-bg"}).to_string()),
-        });
-
         assert!(timeline.begin_subagent_wait("wait-call", "run-bg"));
-        assert!(timeline.remove_tool("wait-call"));
+        assert!(matches!(
+            timeline.items().last(),
+            Some(TimelineItem::Tool(waiting))
+                if waiting.call_id == "wait-call"
+                    && waiting.status == ToolExecutionStatus::Running
+        ));
         assert!(timeline.update_active_subagent_tool_live_summary(
             "child-bg",
             Some("explorer"),
@@ -2502,11 +2558,28 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].call_id, "background-call");
-        assert_eq!(tools[0].status, ToolExecutionStatus::Running);
-        assert_eq!(tools[0].summary, "search__rg — searching wait flow");
-        let data = tools[0]
+        assert_eq!(tools[0].status, ToolExecutionStatus::Succeeded);
+        assert_eq!(tools[0].summary, "explorer running");
+        let background_data = tools[0]
+            .output
+            .as_deref()
+            .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+            .expect("background card data");
+        assert_eq!(
+            background_data
+                .get("data")
+                .unwrap_or(&background_data)
+                .get("background")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(tools[1].call_id, "wait-call");
+        assert_eq!(tools[1].name, "agent__explore");
+        assert_eq!(tools[1].status, ToolExecutionStatus::Running);
+        assert_eq!(tools[1].summary, "search__rg — searching wait flow");
+        let data = tools[1]
             .output
             .as_deref()
             .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
@@ -2522,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_run_completes_the_existing_subagent_card() {
+    fn waiting_run_completes_the_cloned_wait_card() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "background-call".into(),
@@ -2551,12 +2624,6 @@ mod tests {
                 })
                 .to_string(),
             ),
-        });
-        timeline.push_tool_started(ToolStartedEvent {
-            call_id: "wait-call".into(),
-            name: crate::tool_names::TOOL_AGENT_WAIT.into(),
-            summary: "wait for run-bg".into(),
-            arguments: Some(json!({"run_id": "run-bg"}).to_string()),
         });
         assert!(timeline.begin_subagent_wait("wait-call", "run-bg"));
         let result = crate::subagent::SubagentRunSummary {
@@ -2618,12 +2685,21 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].call_id, "background-call");
         assert_eq!(tools[0].status, ToolExecutionStatus::Succeeded);
-        assert_eq!(tools[0].summary, "wait flow verified");
+        assert_eq!(tools[0].summary, "explorer running");
         assert!(
             tools[0]
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("\"background\":true"))
+        );
+        assert_eq!(tools[1].call_id, "wait-call");
+        assert_eq!(tools[1].status, ToolExecutionStatus::Succeeded);
+        assert_eq!(tools[1].summary, "wait flow verified");
+        assert!(
+            tools[1]
                 .output
                 .as_deref()
                 .is_some_and(|output| output.contains("\"waiting\":false"))
@@ -2671,11 +2747,179 @@ mod tests {
             "late child action",
         ));
         assert!(matches!(
-            timeline.items().first(),
-            Some(TimelineItem::Tool(tool))
-                if tool.status == ToolExecutionStatus::Cancelled
-                    && tool.summary == "subagent wait cancelled"
+            timeline.items(),
+            [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
+                if background.call_id == "background-call"
+                    && background.status == ToolExecutionStatus::Succeeded
+                    && waiting.call_id == "wait-call"
+                    && waiting.status == ToolExecutionStatus::Cancelled
+                    && waiting.summary == "subagent wait cancelled"
         ));
+    }
+
+    #[test]
+    fn unstructured_wait_failure_clears_foreground_routing() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explore in background".into(),
+            arguments: Some(json!({"task": "inspect wait flow", "background": true}).to_string()),
+        });
+        timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "agent__explore",
+                    "data": {
+                        "run_id": "run-bg",
+                        "child_session_id": "child-bg",
+                        "agent_name": "explorer",
+                        "status": "running",
+                        "summary": "inspect wait flow",
+                        "active": true,
+                        "background": true
+                    }
+                })
+                .to_string(),
+            ),
+        });
+        assert!(timeline.begin_subagent_wait("wait-call", "run-bg"));
+        assert!(timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "wait-call".into(),
+            name: crate::tool_names::TOOL_AGENT_WAIT.into(),
+            summary: "wait failed".into(),
+            outcome: ToolOutcome::Failure,
+            output: Some(json!({"ok": false, "error": "wait failed"}).to_string()),
+        }));
+        assert!(!timeline.update_active_subagent_tool_live_summary(
+            "child-bg",
+            Some("explorer"),
+            Some("background-call"),
+            "running",
+            "late child activity",
+        ));
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
+                if background.summary == "explorer running"
+                    && waiting.call_id == "wait-call"
+                    && waiting.status == ToolExecutionStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn late_background_completion_does_not_overwrite_a_completed_wait_clone() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explore in background".into(),
+            arguments: Some(json!({"task": "inspect wait flow", "background": true}).to_string()),
+        });
+        timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "agent__explore",
+                    "data": {
+                        "run_id": "run-bg",
+                        "child_session_id": "child-bg",
+                        "agent_name": "explorer",
+                        "status": "running",
+                        "summary": "inspect wait flow",
+                        "active": true,
+                        "background": true
+                    }
+                })
+                .to_string(),
+            ),
+        });
+        assert!(timeline.begin_subagent_wait("wait-call", "run-bg"));
+        let result = crate::subagent::SubagentRunSummary {
+            run_id: "run-bg".into(),
+            child_session_id: "child-bg".into(),
+            agent_name: "explorer".into(),
+            status: crate::subagent::SubagentStatus::Completed,
+            failure_kind: None,
+            summary: "wait completed".into(),
+            structured_result: crate::subagent::StructuredSubagentResult {
+                status: "completed".into(),
+                summary: "wait completed".into(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-bg".into(),
+                child_session_id: "child-bg".into(),
+                raw_excerpt: None,
+            },
+        };
+
+        assert!(timeline.finish_subagent_wait("wait-call", &result));
+        assert!(!timeline.finish_background_subagent_tool("background-call", &result));
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
+                if background.summary == "explorer running"
+                    && waiting.summary == "wait completed"
+        ));
+    }
+
+    #[test]
+    fn a_second_wait_does_not_replace_the_active_wait_clone() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explore in background".into(),
+            arguments: Some(json!({"task": "inspect wait flow", "background": true}).to_string()),
+        });
+        timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "agent__explore",
+                    "data": {
+                        "run_id": "run-bg",
+                        "child_session_id": "child-bg",
+                        "agent_name": "explorer",
+                        "status": "running",
+                        "summary": "inspect wait flow",
+                        "active": true,
+                        "background": true
+                    }
+                })
+                .to_string(),
+            ),
+        });
+
+        assert!(timeline.begin_subagent_wait("wait-call", "run-bg"));
+        assert!(!timeline.begin_subagent_wait("wait-call-2", "run-bg"));
+        assert_eq!(
+            timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::Tool(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2736,10 +2980,14 @@ mod tests {
         assert!(!timeline.finish_background_subagent_tool("background-call", &result));
         assert!(timeline.finish_subagent_wait("wait-call", &result));
         assert!(matches!(
-            timeline.items().first(),
-            Some(TimelineItem::Tool(tool))
-                if tool.status == ToolExecutionStatus::Succeeded
-                    && tool.summary == "late completion"
+            timeline.items(),
+            [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
+                if background.call_id == "background-call"
+                    && background.status == ToolExecutionStatus::Succeeded
+                    && background.summary == "explorer running"
+                    && waiting.call_id == "wait-call"
+                    && waiting.status == ToolExecutionStatus::Succeeded
+                    && waiting.summary == "late completion"
         ));
     }
 

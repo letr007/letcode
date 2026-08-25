@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_wait_keeps_a_single_subagent_card() {
+    fn restored_wait_keeps_background_history_and_cloned_wait_card() {
         let structured = crate::subagent::StructuredSubagentResult {
             status: "completed".into(),
             summary: "wait restored".into(),
@@ -602,14 +602,39 @@ mod tests {
             ),
         ]);
 
-        assert!(matches!(
-            timeline.items(),
-            [TimelineItem::Tool(tool)]
-                if tool.call_id == "background-call"
-                    && tool.name == "agent__explore"
-                    && tool.status == ToolExecutionStatus::Succeeded
-                    && tool.summary == "wait restored"
-        ));
+        let tools = timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| (
+                    tool.call_id.as_str(),
+                    tool.name.as_str(),
+                    tool.status,
+                    tool.summary.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "background-call",
+                    "agent__explore",
+                    ToolExecutionStatus::Succeeded,
+                    "agent__explore completed",
+                ),
+                (
+                    "wait-call",
+                    "agent__explore",
+                    ToolExecutionStatus::Succeeded,
+                    "wait restored",
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -668,10 +693,12 @@ mod tests {
 
         assert!(matches!(
             timeline.items(),
-            [TimelineItem::Tool(tool)]
-                if tool.call_id == "background-call"
-                    && tool.status == ToolExecutionStatus::Cancelled
-                    && tool.summary == "subagent wait cancelled"
+            [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
+                if background.call_id == "background-call"
+                    && background.status == ToolExecutionStatus::Succeeded
+                    && waiting.call_id == "wait-call"
+                    && waiting.status == ToolExecutionStatus::Cancelled
+                    && waiting.summary == "subagent wait cancelled"
         ));
     }
 
