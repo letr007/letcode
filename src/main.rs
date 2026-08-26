@@ -21,6 +21,7 @@ mod context_tree;
 mod context_view;
 mod delegation;
 mod evidence;
+mod fake;
 mod fast_mode;
 mod langfuse_trace;
 mod mcp;
@@ -147,6 +148,16 @@ async fn main() -> Result<()> {
         config.fast_mode_enabled,
     ));
     agent.auto_disable_fast_mode_for_model(agent.model())?;
+    let mut startup_preferences =
+        tui::preferences::TuiPreferences::load_from_dir(&config.config_dir);
+    if let Some(fake_client) = startup_preferences.fake_client {
+        let installation_id = startup_preferences.ensure_fake_installation_id();
+        startup_preferences
+            .save_to_dir(&config.config_dir)
+            .map_err(|error| anyhow!("failed to persist fake installation id: {error}"))?;
+        agent.set_fake_installation_id(installation_id);
+        agent.set_fake_client(Some(fake_client));
+    }
     let workspace_dir = env::current_dir()?;
     agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
     agent.set_default_protocol(active_provider.protocol);

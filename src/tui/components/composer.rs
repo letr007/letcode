@@ -898,6 +898,14 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
         spans.push(Span::styled(" · ", dim));
         spans.push(Span::styled("anchored", accent));
     }
+    if let Some(client) = state.fake_client {
+        let fake_style = Style::default()
+            .fg(theme.fake)
+            .bg(theme.element_bg)
+            .add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(client.as_str(), fake_style));
+    }
 
     let metadata = Line::from(spans);
 

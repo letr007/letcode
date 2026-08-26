@@ -63,6 +63,8 @@ struct ThemeFile {
     #[serde(default)]
     notice: Option<String>,
     #[serde(default)]
+    fake: Option<String>,
+    #[serde(default)]
     diff_add_bg: Option<String>,
     #[serde(default)]
     diff_delete_bg: Option<String>,
@@ -224,6 +226,7 @@ impl ThemeFile {
             approval: parse_optional_color(self.approval.as_deref(), "approval")?
                 .unwrap_or(base.approval),
             notice: parse_optional_color(self.notice.as_deref(), "notice")?.unwrap_or(base.notice),
+            fake: parse_optional_color(self.fake.as_deref(), "fake")?.unwrap_or(base.fake),
             diff_add_bg: parse_optional_color(self.diff_add_bg.as_deref(), "diff_add_bg")?
                 .unwrap_or(base.diff_add_bg),
             diff_delete_bg: parse_optional_color(self.diff_delete_bg.as_deref(), "diff_delete_bg")?

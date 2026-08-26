@@ -297,6 +297,7 @@ pub enum DialogKind {
     ReasoningPicker,
     ThoughtsPicker,
     ThemePicker,
+    FakePicker,
     LanguagePicker,
     SessionPicker,
     HistoryTree,
@@ -1159,6 +1160,8 @@ pub struct TuiState {
     pub tool_output_overrides: HashMap<String, bool>,
     pub theme_id: String,
     pub custom_theme: Option<Theme>,
+    pub fake_client: Option<crate::fake::FakeClient>,
+    pub fake_installation_id: Option<String>,
     pub transcript_render_cache: TranscriptRenderCache,
     pub frame_hyperlink_cells: Vec<super::transcript_ratatui::HyperlinkCell>,
     last_transcript_total_rows: Option<usize>,
@@ -1251,6 +1254,8 @@ impl Default for TuiState {
             tool_output_overrides: HashMap::new(),
             theme_id: ThemeName::default().as_str().to_string(),
             custom_theme: None,
+            fake_client: None,
+            fake_installation_id: None,
             transcript_render_cache: TranscriptRenderCache::default(),
             frame_hyperlink_cells: Vec::new(),
             last_transcript_total_rows: None,
@@ -1428,6 +1433,10 @@ impl TuiState {
 
     pub fn set_theme_name(&mut self, theme_name: ThemeName) {
         self.set_active_theme(theme_name.as_str().to_string(), None);
+    }
+
+    pub fn set_fake_client(&mut self, client: Option<crate::fake::FakeClient>) {
+        self.fake_client = client;
     }
 
     pub fn set_active_theme(&mut self, theme_id: String, custom_theme: Option<Theme>) {

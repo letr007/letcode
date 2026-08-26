@@ -43,6 +43,7 @@ pub(crate) enum SessionEngineCommand {
     },
     ToggleFastMode,
     SetReasoningEffort(crate::request_builder::ModelReasoningEffort),
+    SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),
     NewSession,
     ToggleMcpServer(String),
@@ -93,6 +94,7 @@ impl SessionEngineCommand {
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
             SessionCommand::AnchoredToggle => Self::AnchoredToggle,
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
+            SessionCommand::SetFakeClient(client) => Self::SetFakeClient(client),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
             SessionCommand::NewSession => Self::NewSession,
             SessionCommand::ToggleMcpServer(server_name) => Self::ToggleMcpServer(server_name),
@@ -136,6 +138,9 @@ pub(crate) fn session_engine_command_as_session_command(
         SessionEngineCommand::SetReasoningEffort(effort) => Some(
             crate::session::SessionCommand::SetReasoningEffort(effort.clone()),
         ),
+        SessionEngineCommand::SetFakeClient(client) => {
+            Some(crate::session::SessionCommand::SetFakeClient(*client))
+        }
         SessionEngineCommand::ViewParent => Some(crate::session::SessionCommand::ViewParent),
         SessionEngineCommand::ViewChild {
             navigation,
@@ -204,6 +209,7 @@ pub(crate) fn session_engine_command_as_idle_session_command(
         | crate::session::SessionCommand::SetPermissionMode(_)
         | crate::session::SessionCommand::ToggleFastMode
         | crate::session::SessionCommand::SetReasoningEffort(_)
+        | crate::session::SessionCommand::SetFakeClient(_)
         | crate::session::SessionCommand::ViewParent
         | crate::session::SessionCommand::ViewChild { .. }) => Some(command),
         crate::session::SessionCommand::SubmitPrompt(_)
@@ -281,6 +287,7 @@ enum DeferredCommandKey {
     ExpertModel(String),
     ExpertAllowedModels(String),
     ReasoningEffort,
+    FakeClient,
 }
 
 fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredCommandKey> {
@@ -294,6 +301,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
             Some(DeferredCommandKey::ExpertAllowedModels(agent_name.clone()))
         }
         SessionEngineCommand::SetReasoningEffort(_) => Some(DeferredCommandKey::ReasoningEffort),
+        SessionEngineCommand::SetFakeClient(_) => Some(DeferredCommandKey::FakeClient),
         SessionEngineCommand::Prompt(_)
         | SessionEngineCommand::DelegateSubagent { .. }
         | SessionEngineCommand::BackgroundSubagentCompleted { .. }

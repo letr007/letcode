@@ -878,6 +878,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::Theme(_) => ReplCommand::Unsupported(
             "CLI does not support /theme; use the TUI to switch themes.".into(),
         ),
+        CommandIntent::Fake(_) => ReplCommand::Unsupported(
+            "CLI does not support /fake; use the TUI to select a fake client.".into(),
+        ),
         CommandIntent::ContextBrowse => ReplCommand::Unsupported(
             "CLI does not support /context yet; use the TUI for context browsing.".into(),
         ),
@@ -928,6 +931,9 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
         ),
         SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,
         SessionCommand::SetReasoningEffort(effort) => ReplCommand::ReasoningSet(effort),
+        SessionCommand::SetFakeClient(_) => ReplCommand::Unsupported(
+            "CLI does not support /fake; use the TUI to select a fake client.".into(),
+        ),
         SessionCommand::Compact => ReplCommand::Compact,
         SessionCommand::ResumeSession(session_id) => ReplCommand::Resume(session_id),
         SessionCommand::NewSession => ReplCommand::NewSession,

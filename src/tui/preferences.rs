@@ -28,6 +28,10 @@ pub struct TuiPreferences {
     pub thoughts_display: ThoughtsDisplayMode,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub fake_client: Option<crate::fake::FakeClient>,
+    #[serde(default)]
+    pub fake_installation_id: Option<String>,
 }
 
 impl Default for TuiPreferences {
@@ -40,6 +44,8 @@ impl Default for TuiPreferences {
             theme: default_theme_id(),
             thoughts_display: ThoughtsDisplayMode::default(),
             language: None,
+            fake_client: None,
+            fake_installation_id: None,
         }
     }
 }
@@ -49,6 +55,19 @@ const fn default_transcript_scrollbar_visible() -> bool {
 }
 
 impl TuiPreferences {
+    /// Returns a stable synthetic installation id, creating one only when the
+    /// fake pipeline needs it.
+    pub fn ensure_fake_installation_id(&mut self) -> String {
+        if let Some(id) = self.fake_installation_id.as_deref()
+            && !id.trim().is_empty()
+        {
+            return id.to_string();
+        }
+        let id = crate::fake::CodexIdentity::new("letcode").installation_id;
+        self.fake_installation_id = Some(id.clone());
+        id
+    }
+
     pub fn load_from_dir(config_dir: &Path) -> Self {
         let path = preferences_path(config_dir);
         fs::read_to_string(path)
@@ -118,6 +137,8 @@ mod tests {
             theme: "forest".into(),
             thoughts_display: ThoughtsDisplayMode::Titles,
             language: Some("zh-CN".into()),
+            fake_client: Some(crate::fake::FakeClient::Codex),
+            fake_installation_id: Some("fake-installation".into()),
         };
         prefs.save_to_dir(&base).expect("save preferences");
 
@@ -162,6 +183,17 @@ mod tests {
     }
 
     #[test]
+    fn fake_installation_id_is_stable_once_created() {
+        let mut prefs = TuiPreferences::default();
+        assert_eq!(prefs.fake_installation_id, None);
+
+        let first = prefs.ensure_fake_installation_id();
+        let second = prefs.ensure_fake_installation_id();
+        assert_eq!(first, second);
+        assert_eq!(prefs.fake_installation_id, Some(first));
+    }
+
+    #[test]
     fn custom_theme_id_round_trips() {
         let prefs = TuiPreferences {
             tool_output_expanded: false,
@@ -171,6 +203,8 @@ mod tests {
             theme: "sunset".into(),
             thoughts_display: ThoughtsDisplayMode::Compact,
             language: None,
+            fake_client: None,
+            fake_installation_id: None,
         };
         let json = serde_json::to_string(&prefs).expect("serialize");
         let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");

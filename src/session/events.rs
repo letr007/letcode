@@ -189,6 +189,9 @@ pub(crate) enum SessionTransportEvent {
     ReasoningEffortChanged {
         effort: ModelReasoningEffort,
     },
+    FakeClientChanged {
+        client: Option<crate::fake::FakeClient>,
+    },
     BackgroundSubagentCompleted {
         parent_tool_call_id: Option<String>,
         result: crate::subagent::SubagentRunSummary,
@@ -347,6 +350,7 @@ impl SessionTransportEvent {
             | Self::ExpertAllowedModelsChanged { .. }
             | Self::PermissionModeChanged { .. }
             | Self::ReasoningEffortChanged { .. }
+            | Self::FakeClientChanged { .. }
             | Self::BackgroundSubagentCompleted { .. }
             | Self::ModelCatalogUpdated(_)
             | Self::SettingChangeFailed { .. }

@@ -283,6 +283,18 @@ fn render_picker_body(
                         selected,
                         item.id == state.theme_id,
                     ),
+                    DialogKind::FakePicker => render_permission_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        item.id
+                            == state
+                                .fake_client
+                                .map(|client| client.as_str())
+                                .unwrap_or("off"),
+                    ),
                     DialogKind::LanguagePicker => render_permission_row(
                         frame,
                         row,
@@ -333,6 +345,7 @@ fn render_picker_body(
             DialogKind::SkillPicker => state.t("dialog.no_skills"),
             DialogKind::PermissionPicker => state.t("dialog.no_permission_modes"),
             DialogKind::ThemePicker => state.t("dialog.no_themes"),
+            DialogKind::FakePicker => state.t("dialog.no_fake_clients"),
             DialogKind::ReasoningPicker => state.t("dialog.no_reasoning"),
             DialogKind::ThoughtsPicker => state.t("dialog.no_thoughts"),
             DialogKind::AgentPicker => state.t("dialog.no_experts"),

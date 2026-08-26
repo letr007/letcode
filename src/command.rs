@@ -111,6 +111,12 @@ pub enum ThemeCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeCommand {
+    Show,
+    Set(Option<crate::fake::FakeClient>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandIntent {
     Prompt(String),
     Language(Option<String>),
@@ -132,6 +138,7 @@ pub enum CommandIntent {
     TranscriptScrollbarSet(TranscriptScrollbarMode),
     PanelSet(PanelMode),
     Theme(ThemeCommand),
+    Fake(FakeCommand),
     Compact,
     Tree,
     Undo,
@@ -378,6 +385,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/fake",
+        insert_text: "/fake ",
+        description_key: "command.fake",
+        usage: "/fake [codex|off]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/compact",
         insert_text: "/compact",
         description_key: "command.compact",
@@ -507,6 +523,7 @@ pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
         "/scrollbar",
         "/panel",
         "/theme",
+        "/fake",
         "/compact",
         "/tree",
         "/undo",
@@ -577,6 +594,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/scrollbar" => parse_transcript_scrollbar(&parts),
         "/panel" => parse_panel(&parts),
         "/theme" => parse_theme(&parts),
+        "/fake" => parse_fake(&parts),
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/tree" => expect_no_extra_args(&parts, "/tree", CommandIntent::Tree),
         "/undo" => expect_no_extra_args(&parts, "/undo", CommandIntent::Undo),
@@ -756,6 +774,24 @@ fn normalize_theme_command_id(value: &str) -> Option<String> {
         Some(id)
     } else {
         None
+    }
+}
+
+fn parse_fake(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/fake"] => Ok(CommandIntent::Fake(FakeCommand::Show)),
+        ["/fake", value] => match value.to_ascii_lowercase().as_str() {
+            "off" | "native" | "none" => Ok(CommandIntent::Fake(FakeCommand::Set(None))),
+            value => match crate::fake::FakeClient::parse(value) {
+                Some(client) => Ok(CommandIntent::Fake(FakeCommand::Set(Some(client)))),
+                None => Err(CommandParseError::with_args(
+                    "parse.unknown_fake",
+                    [("value", value)],
+                )),
+            },
+        },
+        ["/fake", ..] => Err(CommandParseError::new("Usage: /fake [codex|off]")),
+        _ => unreachable!(),
     }
 }
 
@@ -977,6 +1013,27 @@ mod tests {
         assert_eq!(
             parse_command("/theme sunset"),
             Ok(CommandIntent::Theme(ThemeCommand::Set("sunset".into())))
+        );
+        assert_eq!(
+            parse_command("/fake"),
+            Ok(CommandIntent::Fake(FakeCommand::Show))
+        );
+        assert_eq!(
+            parse_command("/fake codex"),
+            Ok(CommandIntent::Fake(FakeCommand::Set(Some(
+                crate::fake::FakeClient::Codex
+            ))))
+        );
+        assert_eq!(
+            parse_command("/fake off"),
+            Ok(CommandIntent::Fake(FakeCommand::Set(None)))
+        );
+        assert_eq!(
+            parse_command("/fake maybe"),
+            Err(CommandParseError::with_args(
+                "parse.unknown_fake",
+                [("value", "maybe")]
+            ))
         );
         assert_eq!(
             parse_command("@fixer"),

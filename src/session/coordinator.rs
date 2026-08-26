@@ -216,6 +216,23 @@ impl SessionCoordinator {
                 }
                 Ok(IdleDispatch::Handled)
             }
+            SessionCommand::SetFakeClient(client) => {
+                if client.is_some()
+                    && agent.active_protocol() != crate::config::ApiProtocol::Responses
+                {
+                    let command = SessionCommand::SetFakeClient(client);
+                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
+                        command: command.clone(),
+                    });
+                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                        "Fake codex requires a Responses API provider",
+                    )));
+                } else {
+                    agent.set_fake_client(client);
+                    let _ = event_tx.send(SessionTransportEvent::FakeClientChanged { client });
+                }
+                Ok(IdleDispatch::Handled)
+            }
             SessionCommand::SetReasoningEffort(effort) => {
                 if let Err(error) = apply_reasoning_effort(agent, transcript, effort.clone()) {
                     let message = error.to_string();
@@ -730,6 +747,7 @@ impl SessionCoordinator {
                 | SessionCommand::SetPermissionMode(_)
                 | SessionCommand::ToggleFastMode
                 | SessionCommand::SetReasoningEffort(_)
+                | SessionCommand::SetFakeClient(_)
                 | SessionCommand::ViewParent
                 | SessionCommand::ViewChild { .. }
         )
@@ -746,6 +764,7 @@ impl SessionCoordinator {
             | SessionCommand::SetPermissionMode(_)
             | SessionCommand::ToggleFastMode
             | SessionCommand::SetReasoningEffort(_)
+            | SessionCommand::SetFakeClient(_)
             | SessionCommand::ViewParent
             | SessionCommand::ViewChild { .. } => CommandOwnership::IdleCoordinator,
             SessionCommand::SubmitPrompt(_)

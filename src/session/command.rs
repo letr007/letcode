@@ -55,6 +55,7 @@ pub enum SessionCommand {
     },
     ToggleFastMode,
     SetReasoningEffort(ModelReasoningEffort),
+    SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),
     NewSession,
     ToggleMcpServer(String),
@@ -73,6 +74,7 @@ impl SessionCommand {
             | Self::SetExpertAllowedModels { .. }
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)
+            | Self::SetFakeClient(_)
             | Self::ToggleMcpServer(_) => ActiveTurnCommandDisposition::Defer,
             Self::Interrupt => ActiveTurnCommandDisposition::Interrupt,
             Self::DelegateSubagent { .. }
@@ -126,6 +128,9 @@ impl SessionCommand {
             CommandIntent::ModelSet(model) => Some(Self::SetModel(model)),
             CommandIntent::FastToggle => Some(Self::ToggleFastMode),
             CommandIntent::ReasoningSet(effort) => Some(Self::SetReasoningEffort(effort)),
+            CommandIntent::Fake(crate::command::FakeCommand::Set(client)) => {
+                Some(Self::SetFakeClient(client))
+            }
             CommandIntent::Resume(id) => Some(Self::ResumeSession(id)),
             CommandIntent::NewSession => Some(Self::NewSession),
             CommandIntent::Help
@@ -140,10 +145,39 @@ impl SessionCommand {
             | CommandIntent::TranscriptScrollbarSet(_)
             | CommandIntent::PanelSet(_)
             | CommandIntent::Theme(_)
+            | CommandIntent::Fake(crate::command::FakeCommand::Show)
             | CommandIntent::ResumeShow
             | CommandIntent::ContextBrowse
             | CommandIntent::McpBrowse
             | CommandIntent::SkillBrowse => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fake_set_maps_to_backend_and_show_stays_local() {
+        assert_eq!(
+            SessionCommand::from_command_intent(crate::command::CommandIntent::Fake(
+                crate::command::FakeCommand::Set(Some(crate::fake::FakeClient::Codex))
+            )),
+            Some(SessionCommand::SetFakeClient(Some(
+                crate::fake::FakeClient::Codex
+            )))
+        );
+        assert_eq!(
+            SessionCommand::from_command_intent(crate::command::CommandIntent::Fake(
+                crate::command::FakeCommand::Show
+            )),
+            None
+        );
+        assert_eq!(
+            SessionCommand::SetFakeClient(Some(crate::fake::FakeClient::Codex))
+                .active_turn_disposition(),
+            crate::session::ActiveTurnCommandDisposition::Defer
+        );
     }
 }

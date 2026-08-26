@@ -1547,6 +1547,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "reqwest 0.13.3",
+ "secrecy",
  "self_update",
  "serde",
  "serde_json",

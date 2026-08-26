@@ -33,6 +33,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             | DialogKind::ReasoningPicker
             | DialogKind::ThoughtsPicker
             | DialogKind::ThemePicker
+            | DialogKind::FakePicker
             | DialogKind::McpPicker
             | DialogKind::McpToolsPicker
             | DialogKind::SkillPicker

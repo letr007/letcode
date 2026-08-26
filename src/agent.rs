@@ -679,6 +679,9 @@ pub struct Agent<C: Config> {
     /// Phase bound once per turn by the prelude hook, so the tool catalog and
     /// alias resolution stay stable across iterations of one request.
     anchored_request_phase: Option<AnchoredPhase>,
+    fake_client: Option<crate::fake::FakeClient>,
+    fake_installation_id: String,
+    fake_identity: Option<crate::fake::CodexIdentity>,
 }
 
 impl AgentFactory {
@@ -886,6 +889,9 @@ impl AgentFactory {
             anchored: None,
             anchored_override: true,
             anchored_request_phase: None,
+            fake_client: parent.fake_client,
+            fake_installation_id: parent.fake_installation_id.clone(),
+            fake_identity: parent.fake_identity.clone(),
         }
     }
 }
@@ -1150,6 +1156,9 @@ impl<C: Config> Agent<C> {
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
+            fake_client: None,
+            fake_installation_id: crate::fake::CodexIdentity::new("letcode").installation_id,
+            fake_identity: None,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations,
@@ -1254,6 +1263,29 @@ impl<C: Config> Agent<C> {
 
     pub fn set_fast_mode(&mut self, fast_mode: Arc<crate::fast_mode::FastMode>) {
         self.fast_mode = Some(fast_mode);
+    }
+
+    pub fn set_fake_installation_id(&mut self, installation_id: impl Into<String>) {
+        let installation_id = installation_id.into();
+        if installation_id.is_empty() {
+            return;
+        }
+        self.fake_installation_id = installation_id;
+        if let Some(identity) = &mut self.fake_identity {
+            identity.installation_id = self.fake_installation_id.clone();
+        }
+    }
+
+    pub(crate) fn set_fake_client(&mut self, client: Option<crate::fake::FakeClient>) {
+        self.fake_client = client;
+        self.fake_identity =
+            client.map(|_| crate::fake::CodexIdentity::new(self.fake_installation_id.clone()));
+    }
+
+    pub(crate) fn fake_turn_context(&self) -> Option<crate::fake::CodexRequestContext> {
+        self.fake_identity
+            .as_ref()
+            .map(|identity| identity.turn_context())
     }
 
     /// Enable the anchored bootstrap experiment. Fails fast when the alias
@@ -1445,7 +1477,7 @@ impl<C: Config> Agent<C> {
         self.default_protocol
     }
 
-    fn active_protocol(&self) -> ApiProtocol {
+    pub(crate) fn active_protocol(&self) -> ApiProtocol {
         self.protocol_for_model(&self.model)
     }
 
@@ -2480,6 +2512,9 @@ impl<C: Config> Agent<C> {
             anchored: None,
             anchored_override: true,
             anchored_request_phase: None,
+            fake_client: None,
+            fake_installation_id: self.fake_installation_id.clone(),
+            fake_identity: None,
         }
     }
 

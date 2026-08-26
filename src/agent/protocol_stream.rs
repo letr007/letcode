@@ -105,6 +105,7 @@ where
 enum ResponseStreamRequest {
     Typed(async_openai::types::responses::CreateResponse),
     Compatible(Value),
+    FakeCodex(Value, crate::fake::CodexRequestContext),
 }
 
 enum CompletionStreamRequest {
@@ -171,7 +172,45 @@ async fn create_response_stream<C: Config>(
         ResponseStreamRequest::Compatible(request) => {
             client.responses().create_stream_byot(request.clone()).await
         }
+        ResponseStreamRequest::FakeCodex(request, context) => {
+            create_fake_codex_stream(client, request, context).await
+        }
     }
+}
+
+async fn create_fake_codex_stream<C: Config>(
+    client: &Client<C>,
+    request: &Value,
+    context: &crate::fake::CodexRequestContext,
+) -> Result<async_openai::types::stream::StreamResponse<Value>, OpenAIError> {
+    use async_openai::config::OpenAIConfig;
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    use secrecy::ExposeSecret;
+
+    let mut config = OpenAIConfig::new()
+        .with_api_base(client.config().api_base().to_string())
+        .with_api_key(client.config().api_key().expose_secret());
+    for (name, value) in context.headers() {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            OpenAIError::InvalidArgument(format!("invalid fake header name: {error}"))
+        })?;
+        let value = HeaderValue::from_str(&value).map_err(|error| {
+            OpenAIError::InvalidArgument(format!("invalid fake header value: {error}"))
+        })?;
+        let value = value
+            .to_str()
+            .map_err(|error| {
+                OpenAIError::InvalidArgument(format!("invalid fake header value: {error}"))
+            })?
+            .to_string();
+        config = config.with_header(name, value.as_str())?;
+    }
+
+    Client::with_config(config)
+        .responses()
+        .create_stream_byot(request.clone())
+        .await
 }
 
 /// Filters the validated provider side-band event and normalizes response payloads
@@ -452,6 +491,7 @@ where
     // Semantic recovery restarts the agent iteration; keep this budget outside
     // that loop so it applies to the complete Responses turn.
     let mut recovery_attempts = 0;
+    let fake_context = agent.fake_turn_context();
 
     let result = async {
         let mut iteration_count = 0;
@@ -506,8 +546,27 @@ where
         let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
 
         let response_request = match build.request.clone() {
-            BuiltRequest::Responses(request) => ResponseStreamRequest::Typed(request),
-            BuiltRequest::ResponsesCompatible(request) => ResponseStreamRequest::Compatible(request),
+            BuiltRequest::Responses(request) => {
+                let mut request = serde_json::to_value(request)
+                    .expect("CreateResponse should always serialize to JSON");
+                if let Some(context) = &fake_context {
+                    crate::fake::apply_codex_response_shape(&mut request, context);
+                    ResponseStreamRequest::FakeCodex(request, context.clone())
+                } else {
+                    ResponseStreamRequest::Typed(
+                        serde_json::from_value(request)
+                            .expect("serialized Responses request should round-trip"),
+                    )
+                }
+            }
+            BuiltRequest::ResponsesCompatible(mut request) => {
+                if let Some(context) = &fake_context {
+                    crate::fake::apply_codex_response_shape(&mut request, context);
+                    ResponseStreamRequest::FakeCodex(request, context.clone())
+                } else {
+                    ResponseStreamRequest::Compatible(request)
+                }
+            }
             BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
                 return Err(anyhow!("request builder returned non-responses request"));
             }

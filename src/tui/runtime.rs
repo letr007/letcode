@@ -8,7 +8,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc;
 
 use crate::command::{
-    ChildNavigation as SharedChildNavigation, CommandIntent, PanelMode, ThemeCommand,
+    ChildNavigation as SharedChildNavigation, CommandIntent, FakeCommand, PanelMode, ThemeCommand,
     ThoughtsDisplayMode, ToolOutputMode, TranscriptScrollbarMode, help_summary, parse_command,
 };
 use crate::mcp;
@@ -1062,6 +1062,19 @@ impl TuiRuntime {
                     ToastKind::Success,
                 );
             }
+            SessionTransportEvent::FakeClientChanged { client } => {
+                self.state.set_fake_client(*client);
+                self.show_toast(
+                    self.state.t_fmt(
+                        "runtime.fake_changed",
+                        &[(
+                            "client",
+                            client.map(|client| client.as_str()).unwrap_or("off"),
+                        )],
+                    ),
+                    ToastKind::Success,
+                );
+            }
             SessionTransportEvent::BackgroundSubagentCompleted {
                 parent_tool_call_id,
                 result,
@@ -1973,6 +1986,10 @@ impl TuiRuntime {
                 self.state
                     .clear_pending_permission_mode_if(&mode.to_string());
             }
+            crate::session::SessionCommand::SetFakeClient(_) => {
+                // The optimistic fake badge is authoritative until the next
+                // successful selection; a failed toggle leaves the prior state.
+            }
             crate::session::SessionCommand::SetExpertModel { .. }
             | crate::session::SessionCommand::SetExpertAllowedModels { .. }
             | crate::session::SessionCommand::ToggleFastMode
@@ -2013,6 +2030,7 @@ impl TuiRuntime {
             crate::session::SessionCommand::SetPermissionMode(mode) => {
                 self.state.set_pending_permission_mode(mode.to_string());
             }
+            crate::session::SessionCommand::SetFakeClient(_) => {}
             crate::session::SessionCommand::SetExpertModel { .. }
             | crate::session::SessionCommand::SetExpertAllowedModels { .. }
             | crate::session::SessionCommand::ToggleFastMode
@@ -2114,7 +2132,8 @@ impl TuiRuntime {
                 | CommandIntent::ToolOutputSet(_)
                 | CommandIntent::TranscriptScrollbarSet(_)
                 | CommandIntent::PanelSet(_)
-                | CommandIntent::Theme(_))
+                | CommandIntent::Theme(_)
+                | CommandIntent::Fake(_))
         );
         if active_session_turn {
             match active_turn_disposition {
@@ -2332,6 +2351,7 @@ impl TuiRuntime {
             CommandIntent::PermissionShow => self.show_permission_dialog(),
             CommandIntent::ToolOutputSet(mode) => self.handle_tool_output_command(mode),
             CommandIntent::Theme(command) => Ok(Some(self.handle_theme_command(command))),
+            CommandIntent::Fake(command) => Ok(Some(self.handle_fake_command(command))),
             CommandIntent::TranscriptScrollbarSet(mode) => {
                 Ok(Some(self.handle_transcript_scrollbar_command(mode)))
             }
@@ -2395,6 +2415,9 @@ impl TuiRuntime {
             SessionCommand::SetPermissionMode(mode) => {
                 Ok(Some(self.set_permission_mode_command(mode)))
             }
+            SessionCommand::SetFakeClient(client) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::SetFakeClient(client),
+            ))),
             SessionCommand::Compact => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
@@ -2583,6 +2606,8 @@ impl TuiRuntime {
                 .state
                 .language
                 .map(|language| language.id().to_string()),
+            fake_client: self.state.fake_client,
+            fake_installation_id: self.state.fake_installation_id.clone(),
         }
     }
 
@@ -2613,6 +2638,66 @@ impl TuiRuntime {
             ThemeCommand::Set(theme) => self.apply_theme_selection(&theme),
         }
         SubmittedCommand::LocalOnly
+    }
+
+    fn handle_fake_command(&mut self, command: FakeCommand) -> SubmittedCommand {
+        match command {
+            FakeCommand::Show => {
+                self.show_fake_dialog();
+                SubmittedCommand::LocalOnly
+            }
+            FakeCommand::Set(client) => self.apply_fake_selection(client),
+        }
+    }
+
+    fn show_fake_dialog(&mut self) {
+        let current = self
+            .state
+            .fake_client
+            .map(|client| client.as_str())
+            .unwrap_or("off");
+        let items = vec![
+            DialogItem::new(
+                "off",
+                "Off",
+                Some("Use letcode's native request shape".into()),
+            ),
+            DialogItem::new(
+                "codex",
+                "Codex",
+                Some("Disguise Responses requests as Codex".into()),
+            ),
+        ];
+        let mut dialog = DialogState::new(
+            DialogKind::FakePicker,
+            self.state.t("runtime.select_fake"),
+            Some(self.state.t("runtime.choose_fake")),
+            items,
+        );
+        dialog.selected = dialog
+            .items
+            .iter()
+            .position(|item| item.id == current)
+            .unwrap_or_default();
+        self.state.open_dialog(dialog);
+    }
+
+    fn apply_fake_selection(
+        &mut self,
+        client: Option<crate::fake::FakeClient>,
+    ) -> SubmittedCommand {
+        let mut prefs = self.tui_preferences();
+        prefs.fake_client = client;
+        if client.is_some() {
+            let installation_id = prefs.ensure_fake_installation_id();
+            self.state.fake_installation_id = Some(installation_id);
+        }
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            tracing::warn!(%error, "failed to save fake client preference");
+            self.state
+                .show_toast(self.state.t("runtime.fake_not_saved"), ToastKind::Info);
+        }
+        SubmittedCommand::Runtime(RuntimeCommand::SetFakeClient(client))
     }
 
     fn show_theme_dialog(&mut self) {
@@ -3329,6 +3414,14 @@ impl TuiRuntime {
                 self.state.close_dialog();
                 self.apply_theme_selection(&selected.id);
                 Ok(None)
+            }
+            DialogKind::FakePicker => {
+                self.state.close_dialog();
+                let client = crate::fake::FakeClient::parse(&selected.id);
+                match self.apply_fake_selection(client) {
+                    SubmittedCommand::LocalOnly => Ok(None),
+                    SubmittedCommand::Runtime(command) => Ok(Some(command)),
+                }
             }
             DialogKind::SessionPicker => {
                 self.state.close_dialog();
@@ -4232,6 +4325,8 @@ pub async fn run_tui(
     state.set_sidebar_preference(preferences.sidebar_hidden, preferences.sidebar_forced_open);
     state.set_thoughts_display(preferences.thoughts_display);
     apply_preferences_theme(&mut state, &preferences_dir, &preferences.theme);
+    state.set_fake_client(preferences.fake_client);
+    state.fake_installation_id = preferences.fake_installation_id;
     state.set_provider_label(provider_label);
     state.set_fast_mode_enabled(projection.fast_mode_enabled);
 

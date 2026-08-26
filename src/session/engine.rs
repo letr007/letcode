@@ -1678,6 +1678,7 @@ async fn run_engine_loop(
                     | SessionEngineCommand::SetExpertAllowedModels { .. }
                     | SessionEngineCommand::ToggleFastMode
                     | SessionEngineCommand::SetReasoningEffort(_)
+                    | SessionEngineCommand::SetFakeClient(_)
                     | SessionEngineCommand::ViewChild { .. }
                     | SessionEngineCommand::ViewParent => {
                         // Idle commands are handled above via SessionCoordinator.
