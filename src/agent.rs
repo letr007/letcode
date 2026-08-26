@@ -826,7 +826,7 @@ impl AgentFactory {
         max_tool_calls_override: Option<usize>,
     ) -> Agent<C> {
         let mut prelude = parent.prelude.clone();
-        prelude.push(PromptMessage::developer(template.system_prompt.clone()));
+        prelude.push(PromptMessage::system(template.system_prompt.clone()));
 
         let mut permission_session = parent
             .permission_session
@@ -1257,7 +1257,7 @@ impl<C: Config> Agent<C> {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         self.prelude
-            .push(PromptMessage::developer(format!("{marker}{content}")));
+            .push(PromptMessage::system(format!("{marker}{content}")));
         Ok(())
     }
 
@@ -2488,7 +2488,7 @@ impl<C: Config> Agent<C> {
             model_protocols: self.model_protocols.clone(),
             model_catalog: self.model_catalog.clone(),
             session_reasoning_efforts: self.session_reasoning_efforts.clone(),
-            prelude: vec![PromptMessage::developer(SESSION_TITLE_PRELUDE)],
+            prelude: vec![PromptMessage::system(SESSION_TITLE_PRELUDE)],
             runtime_snapshot: Self::fresh_runtime_snapshot(&self.model),
             tools: ToolRegistry::new(),
             skill_registry: None,
@@ -4916,7 +4916,7 @@ impl ToolEffectKind {
 mod tests;
 
 fn default_agent_prelude() -> Vec<PromptMessage> {
-    vec![PromptMessage::developer(DEFAULT_AGENT_PRELUDE)]
+    vec![PromptMessage::system(DEFAULT_AGENT_PRELUDE)]
 }
 
 fn runtime_context_message() -> PromptMessage {

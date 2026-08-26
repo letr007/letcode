@@ -155,7 +155,7 @@ impl AnchoredBootstrap {
         let mut persona = base
             .first()
             .cloned()
-            .unwrap_or_else(|| PromptMessage::developer(MINIMAL_PERSONA));
+            .unwrap_or_else(|| PromptMessage::system(MINIMAL_PERSONA));
         persona.text = MINIMAL_PERSONA.to_string();
 
         match phase {
@@ -399,8 +399,8 @@ mod tests {
 
     fn persona_base() -> Vec<PromptMessage> {
         vec![
-            PromptMessage::developer("你是运行在本地仓库中的编程代理。"),
-            PromptMessage::developer("来自 /tmp/AGENTS.md 的指令：\nworkspace rules"),
+            PromptMessage::system("你是运行在本地仓库中的编程代理。"),
+            PromptMessage::system("来自 /tmp/AGENTS.md 的指令：\nworkspace rules"),
         ]
     }
 

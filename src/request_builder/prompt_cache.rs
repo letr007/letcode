@@ -125,15 +125,15 @@ pub(super) fn canonical_cache_input(
 ) -> Value {
     let (items, provider_tools, parallel_tool_calls) = match protocol {
         ApiProtocol::Responses => (
-            serde_json::to_value(
-                prefix
+            serde_json::json!({
+                "instructions": provider_serialization::response_instructions(prefix),
+                "input": prefix
                     .iter()
                     .flat_map(|segment| {
                         provider_serialization::prompt_segment_to_response_inputs(segment, strategy)
                     })
                     .collect::<Vec<_>>(),
-            )
-            .expect("response input is serializable"),
+            }),
             serde_json::to_value(supports_tools.then(|| {
                 tools
                     .iter()

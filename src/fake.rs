@@ -175,7 +175,7 @@ pub fn apply_codex_response_shape(request: &mut Value, context: &CodexRequestCon
         .filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "model" | "input" | "tools" | "max_output_tokens"
+                "model" | "instructions" | "input" | "tools" | "max_output_tokens"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -277,6 +277,7 @@ mod tests {
     fn response_shape_preserves_prompt_and_tools() {
         let mut request = serde_json::json!({
             "model": "gpt-5.6-sol",
+            "instructions": "core and workspace instructions",
             "input": [{"type": "message"}],
             "tools": [{"name": "fs__read"}],
             "temperature": 0.2,
@@ -287,6 +288,7 @@ mod tests {
         apply_codex_response_shape(&mut request, &context);
 
         assert_eq!(request["model"], "gpt-5.6-sol");
+        assert_eq!(request["instructions"], "core and workspace instructions");
         assert_eq!(request["parallel_tool_calls"], false);
         assert_eq!(request["tool_choice"], "auto");
         assert_eq!(request["store"], false);

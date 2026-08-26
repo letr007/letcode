@@ -301,6 +301,82 @@ fn deepseek_chat_compat_uses_legacy_roles_and_tokens_and_thinking() {
 }
 
 #[test]
+fn instruction_hierarchy_uses_protocol_native_control_fields() {
+    let history = vec![HistoryItem::user("current")];
+    let prelude = [
+        PromptMessage::system("core persona"),
+        PromptMessage::system("workspace rules"),
+        PromptMessage::developer_with_origin("runtime context", PromptMessageOrigin::RuntimeClock),
+    ];
+
+    let responses_build = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Responses,
+        model_id: "gpt-test",
+        model: metadata(8_192),
+        prelude: &prelude,
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("responses request builds");
+    let responses = request_value(&responses_build);
+    assert_eq!(responses["instructions"], "core persona\n\nworkspace rules");
+    let response_input = responses["input"].as_array().expect("responses input");
+    assert!(!response_input.iter().any(|item| item["role"] == "system"));
+    assert!(
+        response_input
+            .iter()
+            .any(|item| { item["role"] == "developer" && item["content"] == "runtime context" })
+    );
+    assert_ne!(
+        provider_unit_prefix_digest(&responses_build, 1),
+        provider_unit_prefix_digest(&responses_build, 2),
+        "each system-prefix boundary must reflect only the instructions available at that prefix"
+    );
+
+    let completions = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Completions,
+        model_id: "chat-test",
+        model: metadata(8_192),
+        prelude: &prelude,
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("completions request builds");
+    let completions = request_value(&completions);
+    assert_eq!(completions["messages"][0]["role"], "system");
+    assert_eq!(completions["messages"][0]["content"], "core persona");
+    assert_eq!(completions["messages"][1]["role"], "system");
+    assert_eq!(completions["messages"][1]["content"], "workspace rules");
+    assert_eq!(completions["messages"][2]["role"], "developer");
+
+    let anthropic = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Anthropic,
+        model_id: "claude-test",
+        model: metadata(8_192),
+        prelude: &prelude,
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("anthropic request builds");
+    let anthropic = request_value(&anthropic);
+    assert_eq!(anthropic["system"][0]["text"], "core persona");
+    assert_eq!(anthropic["system"][1]["text"], "workspace rules");
+    assert_eq!(anthropic["system"][2]["text"], "runtime context");
+}
+
+#[test]
 fn anthropic_messages_maps_tool_turn_and_replays_signed_thinking() {
     let reasoning_wire = serde_json::to_string(&vec![json!({
         "type": "thinking",

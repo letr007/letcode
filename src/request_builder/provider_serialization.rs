@@ -33,6 +33,18 @@ use super::{
     PromptMessage, PromptRole, ProviderRequestStrategy, ToolSpec, cache_request_fields,
 };
 
+pub(super) fn response_instructions(segments: &[PromptSegment]) -> Option<String> {
+    let instructions = segments
+        .iter()
+        .filter(|segment| segment.role == PromptSegmentRole::System)
+        .filter_map(|segment| match &segment.content {
+            PromptSegmentContent::Text { text } if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!instructions.is_empty()).then(|| instructions.join("\n\n"))
+}
+
 pub(super) fn build_responses_request(
     strategy: ProviderRequestStrategy,
     model_id: &str,
@@ -45,6 +57,7 @@ pub(super) fn build_responses_request(
         .iter()
         .flat_map(|segment| prompt_segment_to_response_inputs(segment, strategy))
         .collect::<Vec<_>>();
+    let instructions = response_instructions(&prompt_plan.segments);
     let cache = cache_request_fields(
         strategy,
         ApiProtocol::Responses,
@@ -65,6 +78,7 @@ pub(super) fn build_responses_request(
     CreateResponse {
         model: Some(model_id.to_string()),
         input: input.into(),
+        instructions,
         max_output_tokens: model.max_output_tokens.and_then(u64_to_u32),
         previous_response_id: None,
         reasoning: response_reasoning(model.clone()),
@@ -367,9 +381,7 @@ pub(super) fn prompt_segment_to_response_inputs(
     strategy: ProviderRequestStrategy,
 ) -> Vec<InputItem> {
     match (&segment.role, &segment.content) {
-        (PromptSegmentRole::System, PromptSegmentContent::Text { text }) => {
-            vec![response_text_message(Role::System, text.clone())]
-        }
+        (PromptSegmentRole::System, _) => Vec::new(),
         (PromptSegmentRole::Developer, PromptSegmentContent::Text { text }) => {
             vec![response_text_message(Role::Developer, text.clone())]
         }

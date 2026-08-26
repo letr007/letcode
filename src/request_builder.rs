@@ -603,44 +603,59 @@ fn provider_request_without_units(build: &BuildResult) -> (Value, Value) {
     let items = request
         .as_object_mut()
         .and_then(|object| object.remove("input").or_else(|| object.remove("messages")));
-    (request, items.unwrap_or(Value::Array(Vec::new())))
-}
-
-/// Maps an exclusive segment prefix to the number of serialized provider units.
-/// Responses may expand a segment into several input items; chat emits one
-/// message for every segment.
-pub(crate) fn provider_unit_count_for_segment_prefix(
-    plan: &PromptPlan,
-    strategy: ProviderRequestStrategy,
-    segment_count: usize,
-) -> usize {
-    let segments = &plan.segments[..segment_count.min(plan.segments.len())];
-    match plan.protocol {
-        ApiProtocol::Responses => segments
-            .iter()
-            .map(|segment| {
-                provider_serialization::prompt_segment_to_response_inputs(segment, strategy).len()
-            })
-            .sum(),
-        ApiProtocol::Completions | ApiProtocol::Anthropic => segments.len(),
+    let mut items = items.unwrap_or(Value::Array(Vec::new()));
+    if build.prompt_plan.protocol == ApiProtocol::Responses
+        && let Some(instructions) = request
+            .as_object_mut()
+            .and_then(|object| object.remove("instructions"))
+        && !instructions.is_null()
+    {
+        let items = items
+            .as_array_mut()
+            .expect("response provider units serialize as an array");
+        items.insert(
+            0,
+            serde_json::json!({
+                "type": "instructions",
+                "content": instructions,
+            }),
+        );
     }
+    (request, items)
 }
 
 /// Identity of an exclusive plan prefix in its final provider-shaped form.
 pub(crate) fn provider_unit_prefix_digest(build: &BuildResult, segment_count: usize) -> String {
-    let (_, items) = provider_request_without_units(build);
-    let unit_count =
-        provider_unit_count_for_segment_prefix(&build.prompt_plan, build.strategy, segment_count);
-    let items = items
-        .as_array()
-        .expect("provider units serialize as an array");
-    assert!(
-        unit_count <= items.len(),
-        "segment prefix exceeds provider units"
-    );
+    let segments =
+        &build.prompt_plan.segments[..segment_count.min(build.prompt_plan.segments.len())];
+    let items = match build.prompt_plan.protocol {
+        ApiProtocol::Responses => {
+            let mut items = Vec::new();
+            if let Some(instructions) = provider_serialization::response_instructions(segments) {
+                items.push(serde_json::json!({
+                    "type": "instructions",
+                    "content": instructions,
+                }));
+            }
+            items.extend(segments.iter().flat_map(|segment| {
+                provider_serialization::prompt_segment_to_response_inputs(segment, build.strategy)
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).expect("response input serializes"))
+            }));
+            items
+        }
+        ApiProtocol::Completions | ApiProtocol::Anthropic => {
+            let (_, items) = provider_request_without_units(build);
+            let unit_count = segments.len();
+            items
+                .as_array()
+                .expect("provider units serialize as an array")[..unit_count]
+                .to_vec()
+        }
+    };
     let mut bytes = Vec::new();
-    for item in &items[..unit_count] {
-        let serialized = serde_json::to_vec(item).expect("provider unit serializes");
+    for item in items {
+        let serialized = serde_json::to_vec(&item).expect("provider unit serializes");
         bytes.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&serialized);
     }
@@ -649,11 +664,13 @@ pub(crate) fn provider_unit_prefix_digest(build: &BuildResult, segment_count: us
 
 fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUnitCategory> {
     match &build.request {
-        BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => build
-            .prompt_plan
-            .segments
-            .iter()
-            .flat_map(|segment| {
+        BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
+            let mut categories = Vec::new();
+            if provider_serialization::response_instructions(&build.prompt_plan.segments).is_some()
+            {
+                categories.push(LogicalRequestUnitCategory::StableKernel);
+            }
+            categories.extend(build.prompt_plan.segments.iter().flat_map(|segment| {
                 std::iter::repeat_n(
                     prompt_segment_category(segment),
                     provider_serialization::prompt_segment_to_response_inputs(
@@ -662,8 +679,9 @@ fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUni
                     )
                     .len(),
                 )
-            })
-            .collect(),
+            }));
+            categories
+        }
         BuiltRequest::Completions(_)
         | BuiltRequest::CompletionsCompatible(_)
         | BuiltRequest::Anthropic(_) => build

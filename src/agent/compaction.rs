@@ -472,7 +472,7 @@ where
     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
     let emit_tx = delta_tx.clone();
     drop(delta_tx);
-    let prelude = [PromptMessage::developer(CONTEXT_COMPACTION_PRELUDE)];
+    let prelude = [PromptMessage::system(CONTEXT_COMPACTION_PRELUDE)];
     let summary = super::protocol_stream::stream_oneshot_text_async(
         &agent.client,
         agent.model(),

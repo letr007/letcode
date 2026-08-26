@@ -6556,7 +6556,7 @@ fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
     assert!(
         instructions
             .iter()
-            .all(|message| message.role == crate::request_builder::PromptRole::Developer)
+            .all(|message| message.role == crate::request_builder::PromptRole::System)
     );
     assert!(instructions[0].text.contains(&format!(
         "来自 {} 的指令：",
@@ -6595,6 +6595,11 @@ fn config_agents_file_loads_before_workspace_instructions_without_duplicates() {
         .filter(|message| message.text.starts_with("来自 "))
         .collect::<Vec<_>>();
     assert_eq!(instructions.len(), 2);
+    assert!(
+        instructions
+            .iter()
+            .all(|message| message.role == crate::request_builder::PromptRole::System)
+    );
     assert!(instructions[0].text.ends_with("global instructions"));
     assert!(instructions[1].text.ends_with("workspace instructions"));
 
