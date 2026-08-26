@@ -508,6 +508,7 @@ pub struct ModelConfig {
     pub display_name: Option<String>,
     pub protocol: ApiProtocol,
     pub anthropic_thinking: crate::request_builder::AnthropicThinkingConfig,
+    pub anthropic_betas: Vec<String>,
     pub cache_control: bool,
     pub context_window: Option<u64>,
     pub effective_input_limit_tokens: Option<u64>,
@@ -542,6 +543,7 @@ impl ModelConfig {
             parallel_tool_calls: self.parallel_tool_calls,
             fast_mode: false,
             anthropic_thinking: self.anthropic_thinking,
+            anthropic_betas: self.anthropic_betas.clone(),
             cache_control: self.cache_control,
         }
     }
@@ -691,6 +693,8 @@ struct RawModelConfig {
     display_name: Option<String>,
     protocol: Option<ApiProtocol>,
     anthropic_thinking: Option<crate::request_builder::AnthropicThinkingConfig>,
+    #[serde(default)]
+    anthropic_betas: Vec<String>,
     #[serde(default)]
     cache_control: bool,
     context_window: Option<u64>,
@@ -943,12 +947,16 @@ fn normalize_model_config(
             .then(|| namespace.unwrap_or_else(|| provider_name.to_ascii_lowercase())),
     };
 
+    let anthropic_betas =
+        normalize_anthropic_betas(provider_name, &model_id, protocol, raw.anthropic_betas)?;
+
     Ok((
         model_id,
         ModelConfig {
             display_name,
             protocol,
             anthropic_thinking,
+            anthropic_betas,
             cache_control: raw.cache_control,
             context_window: raw.context_window,
             effective_input_limit_tokens,
@@ -965,6 +973,38 @@ fn normalize_model_config(
             parallel_tool_calls: raw.parallel_tool_calls.unwrap_or(true),
         },
     ))
+}
+
+fn normalize_anthropic_betas(
+    provider_name: &str,
+    model_id: &str,
+    protocol: ApiProtocol,
+    configured: Vec<String>,
+) -> Result<Vec<String>> {
+    if !configured.is_empty() && protocol != ApiProtocol::Anthropic {
+        bail!(
+            "providers.{provider_name}.models.{model_id}.anthropic_betas is only supported for anthropic protocol"
+        );
+    }
+    let path = format!("providers.{provider_name}.models.{model_id}.anthropic_betas");
+    let mut betas = Vec::with_capacity(configured.len());
+    for beta in configured {
+        let beta = beta.trim();
+        if beta.is_empty()
+            || beta.len() > 128
+            || beta.chars().any(|ch| ch.is_control() || ch == ',')
+            || beta.parse::<reqwest::header::HeaderValue>().is_err()
+        {
+            bail!(
+                "{path} entries must be valid HTTP header values: non-empty, at most 128 bytes, and contain no commas or control characters"
+            );
+        }
+        if betas.iter().any(|existing| existing == beta) {
+            bail!("{path} contains duplicate beta '{beta}'");
+        }
+        betas.push(beta.to_string());
+    }
+    Ok(betas)
 }
 
 fn normalize_reasoning_efforts(
@@ -1554,6 +1594,87 @@ mod tests {
 
         assert!(default_config.providers["openai"].models["gpt-default"].parallel_tool_calls);
         assert!(!disabled_config.providers["openai"].models["gpt-disabled"].parallel_tool_calls);
+    }
+
+    #[test]
+    fn anthropic_betas_are_explicit_and_protocol_scoped() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.anyrouter]
+            api_key = "config-key"
+            base_url = "https://anyrouter.example/v1"
+            protocol = "anthropic"
+            auth_mode = "api-key"
+
+            [providers.anyrouter.models."claude-opus"]
+            anthropic_betas = ["context-1m-2025-08-07"]
+            "#,
+        );
+        let config = AppConfig::load_from_path(&path).expect("anthropic beta config loads");
+        assert_eq!(
+            config.providers["anyrouter"].models["claude-opus"].anthropic_betas,
+            ["context-1m-2025-08-07"]
+        );
+
+        let unconfigured_path = write_temp_config(
+            r#"
+            [providers.anyrouter]
+            api_key = "config-key"
+            base_url = "https://anyrouter.example/v1"
+            protocol = "anthropic"
+            auth_mode = "api-key"
+
+            [providers.anyrouter.models."claude-opus"]
+            context_window = 1000000
+            "#,
+        );
+        let unconfigured = AppConfig::load_from_path(&unconfigured_path)
+            .expect("million-token context does not imply beta configuration");
+        assert!(
+            unconfigured.providers["anyrouter"].models["claude-opus"]
+                .anthropic_betas
+                .is_empty()
+        );
+
+        let invalid_path = write_temp_config(
+            r#"
+            [providers.compat]
+            api_key = "config-key"
+            base_url = "https://compat.example/v1"
+            protocol = "completions"
+
+            [providers.compat.models.model]
+            anthropic_betas = ["context-1m-2025-08-07"]
+            "#,
+        );
+        let error = AppConfig::load_from_path(&invalid_path)
+            .expect_err("non-anthropic beta config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("anthropic_betas is only supported for anthropic protocol")
+        );
+
+        for invalid in ["", "contains,comma", "contains\nnewline"] {
+            let config = format!(
+                r#"
+                [providers.anyrouter]
+                api_key = "config-key"
+                base_url = "https://anyrouter.example/v1"
+                protocol = "anthropic"
+                auth_mode = "api-key"
+
+                [providers.anyrouter.models.model]
+                anthropic_betas = [{invalid:?}]
+                "#
+            );
+            let invalid_path = write_temp_config(&config);
+            assert!(
+                AppConfig::load_from_path(&invalid_path).is_err(),
+                "invalid beta value should be rejected: {invalid:?}"
+            );
+        }
     }
 
     #[test]

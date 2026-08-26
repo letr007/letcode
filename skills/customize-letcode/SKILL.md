@@ -124,6 +124,7 @@ reasoning_summary = "auto"        # auto|concise|detailed
 text_verbosity = "medium"         # low|medium|high
 # temperature = 0.2
 # top_p = 1.0
+# anthropic_betas = ["context-1m-2025-08-07"] # 仅 Anthropic；发送为 anthropic-beta header
 
 # [providers.openai.models."gpt-5.5".prompt_cache]
 # enabled = true
@@ -137,7 +138,8 @@ text_verbosity = "medium"         # low|medium|high
 - Provider 环境变量覆盖 TOML：`<PROVIDER>_API_KEY`、`<PROVIDER>_BASE_URL`
   （provider 名大写；非字母数字变 `_`）。例：`openai` →
   `OPENAI_API_KEY` / `OPENAI_BASE_URL`。
-- TOML 里 `protocol` 用 kebab-case：`responses`、`completions`。
+- TOML 里 `protocol` 用 kebab-case：`responses`、`completions`、`anthropic`。
+- `anthropic_betas` 是可选的模型级字符串数组，仅适用于 `protocol = "anthropic"`；值会按配置顺序合并为 `anthropic-beta` HTTP 请求头，不会写入 Messages JSON body，也不会根据模型名或 `context_window` 自动推断。
 - `[tools.parallelism]` 只能**收窄**已声明 `Parallel` 的工具（例如强制
   `exclusive`）。把 exclusive 工具提成 `parallel` 会被拒绝。
 - 本地 MCP 的 `command` 必须是字符串数组，不能是单个字符串。`type` 必填。

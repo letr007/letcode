@@ -105,6 +105,7 @@ pub struct ModelRequestMetadata {
     pub parallel_tool_calls: bool,
     pub fast_mode: bool,
     pub anthropic_thinking: AnthropicThinkingConfig,
+    pub anthropic_betas: Vec<String>,
     pub cache_control: bool,
 }
 

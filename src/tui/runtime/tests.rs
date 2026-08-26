@@ -4074,6 +4074,7 @@ fn integration_agent_with_tools(
                     display_name: None,
                     protocol: crate::config::ApiProtocol::Responses,
                     anthropic_thinking: Default::default(),
+                    anthropic_betas: Vec::new(),
                     cache_control: false,
                     context_window: Some(m1_input_limit_tokens.saturating_add(1_000)),
                     effective_input_limit_tokens: Some(m1_input_limit_tokens),

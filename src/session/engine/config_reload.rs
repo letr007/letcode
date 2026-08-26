@@ -492,6 +492,7 @@ mod expert_route_switch_tests {
                             display_name: None,
                             protocol: crate::config::ApiProtocol::Completions,
                             anthropic_thinking: Default::default(),
+                            anthropic_betas: Vec::new(),
                             cache_control: false,
                             context_window: None,
                             effective_input_limit_tokens: None,

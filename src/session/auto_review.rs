@@ -546,6 +546,7 @@ mod tests {
         crate::config::ModelConfig {
             display_name: None,
             anthropic_thinking: Default::default(),
+            anthropic_betas: Vec::new(),
             cache_control: false,
             protocol,
             context_window: None,

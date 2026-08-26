@@ -4,6 +4,11 @@ use crate::retry::{is_retryable_provider_error_fields, retry_delay_from_headers}
 use crate::user_content::UserMessageContent;
 use tracing::Instrument;
 
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::net::TcpListener;
+
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
@@ -2085,6 +2090,22 @@ struct AnthropicStreamState {
     completed: bool,
 }
 
+fn merge_anthropic_beta_values(configured: &[String], fake_value: Option<&str>) -> Vec<String> {
+    let mut merged = configured.to_vec();
+    if let Some(value) = fake_value {
+        for beta in value
+            .split(',')
+            .map(str::trim)
+            .filter(|beta| !beta.is_empty())
+        {
+            if !merged.iter().any(|existing| existing == beta) {
+                merged.push(beta.to_string());
+            }
+        }
+    }
+    merged
+}
+
 impl AnthropicStreamState {
     fn merge_usage(&mut self, usage: &Value) {
         if let Some(value) = usage.get("input_tokens").and_then(Value::as_u64) {
@@ -2408,6 +2429,7 @@ impl AnthropicStreamState {
 async fn send_anthropic_messages_stream<C: Config>(
     client: &Client<C>,
     request: &Value,
+    anthropic_betas: &[String],
     fake_context: Option<&crate::fake::CodexRequestContext>,
 ) -> std::result::Result<reqwest::Response, ChatStreamCreationError> {
     use reqwest::header::{HeaderName, HeaderValue};
@@ -2422,8 +2444,20 @@ async fn send_anthropic_messages_stream<C: Config>(
         .headers(config.headers())
         .header("anthropic-version", "2023-06-01")
         .header(reqwest::header::ACCEPT, "text/event-stream");
-    if let Some(context) = fake_context {
-        for (name, value) in context.anthropic_headers() {
+    let fake_headers = fake_context.map(|context| context.anthropic_headers());
+    let fake_betas = fake_headers
+        .as_ref()
+        .and_then(|headers| headers.iter().find(|(name, _)| name == "anthropic-beta"))
+        .map(|(_, value)| value.as_str());
+    let merged_betas = merge_anthropic_beta_values(anthropic_betas, fake_betas);
+    if !merged_betas.is_empty() {
+        request_builder = request_builder.header("anthropic-beta", merged_betas.join(","));
+    }
+    if let Some(headers) = fake_headers {
+        for (name, value) in headers {
+            if name == "anthropic-beta" {
+                continue;
+            }
             let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
                 return Err(ChatStreamCreationError::Setup(format!(
                     "invalid fake header name: {name}"
@@ -2531,7 +2565,12 @@ where
                 on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
                 langfuse_trace::record_llm_request_telemetry(&iteration_span,&prepared_telemetry);
                 if attempt==1{agent.commit_final_logical_request(&build);agent.commit_active_epoch(epoch_preview.clone());}
-                let response=send_anthropic_messages_stream(&agent.client,&request,fake_context.as_ref()).await;
+                let response=send_anthropic_messages_stream(
+                    &agent.client,
+                    &request,
+                    &agent.active_model_metadata().anthropic_betas,
+                    fake_context.as_ref(),
+                ).await;
                 let response=match response{Ok(response)=>response,Err(error) if should_retry_chat_stream_creation(&agent.retry_config,attempt,&error)=>{
                     emit_attempt_terminal(LlmRequestErrorClass::RequestCreation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
                     let delay=match &error{ChatStreamCreationError::Status{headers,..}=>retry_delay_from_headers(&agent.retry_config,attempt,headers),_=>retry_delay(&agent.retry_config,attempt)};
@@ -2680,7 +2719,14 @@ where
             stream_oneshot_responses(client, &build, retry_config, &mut on_delta).await
         }
         ApiProtocol::Anthropic => {
-            stream_oneshot_anthropic(client, &build, retry_config, &mut on_delta).await
+            stream_oneshot_anthropic(
+                client,
+                &build,
+                &model.anthropic_betas,
+                retry_config,
+                &mut on_delta,
+            )
+            .await
         }
     }
 }
@@ -2688,6 +2734,7 @@ where
 async fn stream_oneshot_anthropic<C, F, Fut>(
     client: &Client<C>,
     build: &crate::request_builder::BuildResult,
+    anthropic_betas: &[String],
     retry_config: &RetryConfig,
     on_delta: &mut F,
 ) -> Result<String>
@@ -2708,22 +2755,23 @@ where
 
     let mut attempt = 1;
     loop {
-        let response = match send_anthropic_messages_stream(client, &request, None).await {
-            Ok(response) => response,
-            Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
-                tokio::time::sleep(retry_delay(retry_config, attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            Err(error) => {
-                return Err(anyhow!(error).context(request_creation_failure_context(
-                    "streamed anthropic messages",
-                    "oneshot",
-                    ModelRequestMetadata::default(),
-                    &build.budget,
-                )));
-            }
-        };
+        let response =
+            match send_anthropic_messages_stream(client, &request, anthropic_betas, None).await {
+                Ok(response) => response,
+                Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
+                    tokio::time::sleep(retry_delay(retry_config, attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow!(error).context(request_creation_failure_context(
+                        "streamed anthropic messages",
+                        "oneshot",
+                        ModelRequestMetadata::default(),
+                        &build.budget,
+                    )));
+                }
+            };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse_buffer = String::new();
@@ -3488,6 +3536,223 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    async fn capture_anthropic_request(
+        anthropic_betas: &[String],
+        fake_context: Option<&crate::fake::CodexRequestContext>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("server accepts request");
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 4096];
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("server reads request");
+                assert_ne!(read, 0, "client closed before sending the complete request");
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end])
+                    .expect("client sends UTF-8 request headers");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("server writes response");
+            String::from_utf8(request).expect("client sends UTF-8 request headers")
+        });
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(format!("http://{addr}"))
+                .with_api_key("test"),
+        );
+        send_anthropic_messages_stream(
+            &client,
+            &json!({"model":"test"}),
+            anthropic_betas,
+            fake_context,
+        )
+        .await
+        .expect("anthropic request succeeds");
+        server.await.expect("test server completes")
+    }
+
+    #[tokio::test]
+    async fn anthropic_betas_are_sent_only_as_http_header() {
+        let request = capture_anthropic_request(
+            &[
+                "context-1m-2025-08-07".to_string(),
+                "interleaved-thinking-2025-05-14".to_string(),
+            ],
+            None,
+        )
+        .await;
+        let (headers, body) = request
+            .split_once("\r\n\r\n")
+            .expect("request separates headers and body");
+        assert!(headers.lines().any(|line| {
+            line.eq_ignore_ascii_case(
+                "anthropic-beta: context-1m-2025-08-07,interleaved-thinking-2025-05-14",
+            )
+        }));
+        assert!(!body.contains("anthropic_beta"));
+        assert!(!body.contains("anthropic-beta"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_anthropic_betas_send_no_header() {
+        let request = capture_anthropic_request(&[], None).await;
+        let headers = request
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers)
+            .expect("request separates headers and body");
+        assert!(
+            !headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("anthropic-beta:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_oneshot_forwards_configured_beta_header() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("server accepts request");
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 4096];
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("server reads request");
+                assert_ne!(read, 0, "client closed before sending request headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"summary\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("server writes response");
+            String::from_utf8(request).expect("client sends UTF-8 request headers")
+        });
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(format!("http://{addr}"))
+                .with_api_key("test"),
+        );
+        let model = ModelRequestMetadata {
+            anthropic_betas: vec!["context-1m-2025-08-07".to_string()],
+            ..Default::default()
+        };
+        let output = stream_oneshot_text_async(
+            &client,
+            "test",
+            ApiProtocol::Anthropic,
+            model,
+            &RetryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            &[],
+            "summarize",
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("oneshot anthropic request succeeds");
+        assert_eq!(output, "summary");
+        let request = server.await.expect("test server completes");
+        let headers = request
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers)
+            .expect("request separates headers and body");
+        assert!(
+            headers
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("anthropic-beta: context-1m-2025-08-07") })
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_anthropic_headers_keep_one_configured_beta_header() {
+        let fake_context = crate::fake::CodexIdentity::new("installation").turn_context();
+        let request =
+            capture_anthropic_request(&["context-1m-2025-08-07".to_string()], Some(&fake_context))
+                .await;
+        let headers = request
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers)
+            .expect("request separates headers and body");
+        assert_eq!(
+            headers
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("anthropic-beta:"))
+                .count(),
+            1
+        );
+        assert!(
+            headers
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("anthropic-beta: context-1m-2025-08-07") })
+        );
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("originator: codex_exec"))
+        );
+    }
+
+    #[test]
+    fn anthropic_beta_values_merge_without_duplicates() {
+        let configured = vec!["context-1m-2025-08-07".to_string()];
+        assert_eq!(
+            merge_anthropic_beta_values(
+                &configured,
+                Some("interleaved-thinking-2025-05-14,context-1m-2025-08-07"),
+            ),
+            vec![
+                "context-1m-2025-08-07".to_string(),
+                "interleaved-thinking-2025-05-14".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn anthropic_stream_state_accumulates_text_thinking_and_tools() {

@@ -639,6 +639,7 @@ mod tests {
                     display_name: None,
                     protocol: config::ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
+                    anthropic_betas: Vec::new(),
                     cache_control: false,
                     context_window: Some(8_192),
                     effective_input_limit_tokens: Some(4_096),
