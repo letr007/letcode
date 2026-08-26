@@ -207,6 +207,9 @@ pub(super) fn build_anthropic_request(
         "messages": messages,
         "stream": true,
     });
+    if model.context_window_tokens() >= 1_000_000 {
+        request["anthropic_beta"] = serde_json::json!(["context-1m-2025-08-07"]);
+    }
     if !system.is_empty() {
         request["system"] = Value::Array(system.clone());
     }

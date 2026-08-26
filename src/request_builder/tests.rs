@@ -399,6 +399,25 @@ fn anthropic_logical_units_preserve_one_unit_per_prompt_segment() {
 }
 
 #[test]
+fn anthropic_million_token_context_adds_long_context_beta() {
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Anthropic,
+        model_id: "claude-test",
+        model: metadata(1_000_000),
+        prelude: &[],
+        history: &[HistoryItem::user("current")],
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("anthropic long-context request builds");
+    let request = request_value(&result);
+    assert_eq!(request["anthropic_beta"], json!(["context-1m-2025-08-07"]));
+}
+
+#[test]
 fn anthropic_messages_applies_adaptive_thinking_effort() {
     let history = vec![HistoryItem::user("current")];
     let mut model = metadata(8_192);
