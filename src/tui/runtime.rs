@@ -2665,7 +2665,7 @@ impl TuiRuntime {
             DialogItem::new(
                 "codex",
                 "Codex",
-                Some("Disguise Responses requests as Codex".into()),
+                Some("Disguise Responses/Anthropic requests as Codex".into()),
             ),
         ];
         let mut dialog = DialogState::new(

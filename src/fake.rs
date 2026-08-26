@@ -131,6 +131,16 @@ impl CodexRequestContext {
         })
     }
 
+    /// HTTP headers applied to Anthropic Messages requests when the fake is
+    /// active. The Messages body keeps its native shape; only transport
+    /// metadata is disguised.
+    pub fn anthropic_headers(&self) -> Vec<(String, String)> {
+        self.headers()
+            .into_iter()
+            .filter(|(name, _)| name != "accept")
+            .collect()
+    }
+
     pub fn client_metadata(&self) -> Value {
         serde_json::json!({
             "thread_id": self.thread_id,
@@ -286,5 +296,27 @@ mod tests {
 
         assert!(metadata.contains("/workspace"));
         assert!(!metadata.contains(r"/Users/"));
+    }
+
+    #[test]
+    fn anthropic_headers_keep_identity_and_drop_duplicate_accept() {
+        let identity = CodexIdentity::new("installation");
+        let context = identity.turn_context();
+        let headers = context.anthropic_headers();
+
+        assert!(
+            headers.iter().all(|(name, _)| name != "accept"),
+            "anthropic transport already sends its own Accept header"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "originator" && value == "codex_exec")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, _)| name == "x-codex-turn-metadata")
+        );
     }
 }

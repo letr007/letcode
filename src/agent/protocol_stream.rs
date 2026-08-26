@@ -2408,20 +2408,36 @@ impl AnthropicStreamState {
 async fn send_anthropic_messages_stream<C: Config>(
     client: &Client<C>,
     request: &Value,
+    fake_context: Option<&crate::fake::CodexRequestContext>,
 ) -> std::result::Result<reqwest::Response, ChatStreamCreationError> {
+    use reqwest::header::{HeaderName, HeaderValue};
+
     let config = client.config();
     let url = config.url("/messages");
     let http = reqwest_client_for_url(&url)
         .map_err(|error| ChatStreamCreationError::Setup(error.to_string()))?;
-    let response = http
+    let mut request_builder = http
         .post(url.clone())
         .query(&config.query())
         .headers(config.headers())
         .header("anthropic-version", "2023-06-01")
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .json(request)
-        .send()
-        .await;
+        .header(reqwest::header::ACCEPT, "text/event-stream");
+    if let Some(context) = fake_context {
+        for (name, value) in context.anthropic_headers() {
+            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+                return Err(ChatStreamCreationError::Setup(format!(
+                    "invalid fake header name: {name}"
+                )));
+            };
+            let Ok(value) = HeaderValue::from_str(&value) else {
+                return Err(ChatStreamCreationError::Setup(format!(
+                    "invalid fake header value: {value}"
+                )));
+            };
+            request_builder = request_builder.header(name, value);
+        }
+    }
+    let response = request_builder.json(request).send().await;
     let response = match response {
         Ok(response) => response,
         Err(error) => return Err(ChatStreamCreationError::Transport(error)),
@@ -2490,6 +2506,7 @@ where
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
     let mut recovery_attempts = 0;
+    let fake_context = agent.fake_turn_context();
     let result=async{
         let mut iteration_count=0;
         'agent_iteration:loop{
@@ -2514,7 +2531,7 @@ where
                 on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
                 langfuse_trace::record_llm_request_telemetry(&iteration_span,&prepared_telemetry);
                 if attempt==1{agent.commit_final_logical_request(&build);agent.commit_active_epoch(epoch_preview.clone());}
-                let response=send_anthropic_messages_stream(&agent.client,&request).await;
+                let response=send_anthropic_messages_stream(&agent.client,&request,fake_context.as_ref()).await;
                 let response=match response{Ok(response)=>response,Err(error) if should_retry_chat_stream_creation(&agent.retry_config,attempt,&error)=>{
                     emit_attempt_terminal(LlmRequestErrorClass::RequestCreation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
                     let delay=match &error{ChatStreamCreationError::Status{headers,..}=>retry_delay_from_headers(&agent.retry_config,attempt,headers),_=>retry_delay(&agent.retry_config,attempt)};
@@ -2691,7 +2708,7 @@ where
 
     let mut attempt = 1;
     loop {
-        let response = match send_anthropic_messages_stream(client, &request).await {
+        let response = match send_anthropic_messages_stream(client, &request, None).await {
             Ok(response) => response,
             Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
                 tokio::time::sleep(retry_delay(retry_config, attempt)).await;
