@@ -144,6 +144,24 @@ pub(super) fn canonical_cache_input(
             serde_json::to_value(supports_tools.then_some(parallel_tool_calls))
                 .expect("parallel tool calls is serializable"),
         ),
+        ApiProtocol::Anthropic => (
+            serde_json::to_value(
+                prefix
+                    .iter()
+                    .map(|segment| {
+                        serde_json::json!({
+                            "role": segment.role,
+                            "text": segment.text,
+                            "content": segment.content,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("anthropic canonical input is serializable"),
+            serde_json::to_value(supports_tools.then(|| tools))
+                .expect("anthropic tools are serializable"),
+            Value::Null,
+        ),
         ApiProtocol::Completions => (
             serde_json::to_value(
                 prefix

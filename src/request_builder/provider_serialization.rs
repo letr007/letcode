@@ -22,6 +22,8 @@ use async_openai::types::responses::{
     Verbosity as ResponseVerbosity,
 };
 
+use serde_json::Value;
+
 use crate::config::{ApiProtocol, PromptCacheRetention};
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
 
@@ -79,6 +81,261 @@ pub(super) fn build_responses_request(
     }
 }
 
+pub(super) fn build_anthropic_request(
+    model_id: &str,
+    model: ModelRequestMetadata,
+    prompt_plan: &PromptPlan,
+    tools: &[ToolSpec],
+) -> Value {
+    let mut system = Vec::new();
+    let mut messages = Vec::new();
+    let mut segment_message_index = Vec::with_capacity(prompt_plan.segments.len());
+
+    let push_message = |role: &str, mut content: Vec<Value>, messages: &mut Vec<Value>| {
+        if content.is_empty() {
+            content.push(anthropic_text_block(""));
+        }
+        messages.push(serde_json::json!({ "role": role, "content": content }));
+        messages.len() - 1
+    };
+
+    for segment in &prompt_plan.segments {
+        match (&segment.role, &segment.content) {
+            (
+                PromptSegmentRole::System | PromptSegmentRole::Developer,
+                PromptSegmentContent::Text { text },
+            ) if !text.is_empty() => {
+                system.push(anthropic_text_block(text));
+                segment_message_index.push(None);
+            }
+            (_, PromptSegmentContent::UserContent { content }) => {
+                let index = push_message(
+                    "user",
+                    content
+                        .parts()
+                        .into_iter()
+                        .map(anthropic_user_part)
+                        .collect(),
+                    &mut messages,
+                );
+                segment_message_index.push(Some(index));
+            }
+            (PromptSegmentRole::User, PromptSegmentContent::Text { text }) => {
+                let index = push_message("user", vec![anthropic_text_block(text)], &mut messages);
+                segment_message_index.push(Some(index));
+            }
+            (
+                PromptSegmentRole::Assistant,
+                PromptSegmentContent::AssistantToolCalls {
+                    text,
+                    reasoning_wire,
+                    calls,
+                    ..
+                },
+            ) => {
+                let mut content = Vec::new();
+                if let Some(wire) = reasoning_wire
+                    .as_deref()
+                    .and_then(|wire| serde_json::from_str::<Vec<Value>>(wire).ok())
+                {
+                    content.extend(wire.into_iter().filter_map(anthropic_thinking_block));
+                }
+                if let Some(text) = text.clone().filter(|text| !text.is_empty()) {
+                    content.push(anthropic_text_block(&text));
+                }
+                content.extend(calls.iter().map(|call| {
+                    serde_json::json!({
+                        "type": "tool_use",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "input": serde_json::from_str::<Value>(&call.arguments_json)
+                            .unwrap_or_else(|_| Value::Object(Default::default())),
+                    })
+                }));
+                let index = push_message("assistant", content, &mut messages);
+                segment_message_index.push(Some(index));
+            }
+            (
+                PromptSegmentRole::Tool,
+                PromptSegmentContent::ToolOutput {
+                    call_id,
+                    output_json,
+                    images,
+                },
+            ) => {
+                let block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": anthropic_tool_result_content(output_json, images),
+                    "is_error": false,
+                });
+                if let Some(last) = messages.last_mut()
+                    && last["role"] == "user"
+                    && last["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().all(|block| block["type"] == "tool_result")
+                    })
+                {
+                    last["content"]
+                        .as_array_mut()
+                        .expect("checked array")
+                        .push(block);
+                    segment_message_index.push(Some(messages.len() - 1));
+                } else {
+                    let index = push_message("user", vec![block], &mut messages);
+                    segment_message_index.push(Some(index));
+                }
+            }
+            (PromptSegmentRole::Assistant, PromptSegmentContent::Text { text }) => {
+                let index =
+                    push_message("assistant", vec![anthropic_text_block(text)], &mut messages);
+                segment_message_index.push(Some(index));
+            }
+            _ => {
+                let index = push_message(
+                    anthropic_role(segment.role),
+                    vec![anthropic_text_block(&segment.text)],
+                    &mut messages,
+                );
+                segment_message_index.push(Some(index));
+            }
+        }
+    }
+
+    let mut request = serde_json::json!({
+        "model": model_id,
+        "max_tokens": model.max_output_tokens.unwrap_or_else(|| model.output_reserve_tokens()),
+        "messages": messages,
+        "stream": true,
+    });
+    if !system.is_empty() {
+        request["system"] = Value::Array(system.clone());
+    }
+    if model.supports_tools && !tools.is_empty() {
+        request["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    apply_anthropic_thinking(&mut request, &model);
+    if model.cache_control {
+        if let Some(last) = system.last_mut() {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            if let Some(system_value) = request.get_mut("system") {
+                *system_value = Value::Array(system.clone());
+            }
+        }
+        if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut)
+            && let Some(last) = tools.last_mut()
+        {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
+        if let Some(segment_index) = prompt_plan.stable_prefix_end
+            && let Some(message_index) = segment_message_index.get(segment_index).copied().flatten()
+            && let Some(message) = messages.get_mut(message_index)
+            && let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut)
+            && let Some(last) = blocks.last_mut()
+        {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            request["messages"] = Value::Array(messages.clone());
+        }
+    }
+
+    request
+}
+
+fn apply_anthropic_thinking(request: &mut Value, model: &ModelRequestMetadata) {
+    match model.anthropic_thinking.mode {
+        crate::request_builder::AnthropicThinkingMode::Disabled => {}
+        crate::request_builder::AnthropicThinkingMode::Adaptive => {
+            request["thinking"] = serde_json::json!({ "type": "adaptive" });
+            let effort = model
+                .reasoning_effort
+                .as_ref()
+                .unwrap_or(&ModelReasoningEffort::Low);
+            request["output_config"] = serde_json::json!({ "effort": effort.as_str() });
+        }
+        crate::request_builder::AnthropicThinkingMode::Budget => {
+            let budget = model.anthropic_thinking.budget_tokens.unwrap_or(1024);
+            request["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
+    }
+}
+
+fn anthropic_thinking_block(block: Value) -> Option<Value> {
+    if block.get("type")?.as_str()? != "thinking" {
+        return None;
+    }
+    let thinking = block.get("thinking")?.as_str()?.to_string();
+    let signature = block
+        .get("signature")
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+        .map(ToString::to_string);
+    let mut block = serde_json::json!({ "type": "thinking", "thinking": thinking });
+    if let Some(signature) = signature {
+        block["signature"] = Value::String(signature);
+    }
+    Some(block)
+}
+
+fn anthropic_role(role: PromptSegmentRole) -> &'static str {
+    match role {
+        PromptSegmentRole::System | PromptSegmentRole::Developer | PromptSegmentRole::Tool => {
+            "user"
+        }
+        PromptSegmentRole::User => "user",
+        PromptSegmentRole::Assistant => "assistant",
+    }
+}
+
+fn anthropic_text_block(text: impl Into<String>) -> Value {
+    serde_json::json!({ "type": "text", "text": text.into() })
+}
+
+fn anthropic_image_block(attachment: &crate::user_content::UserImageAttachment) -> Value {
+    let data_url = attachment.data_url.trim_start_matches("data:");
+    let (media_type, data) = data_url
+        .split_once(";base64,")
+        .unwrap_or(("image/png", data_url));
+    serde_json::json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": media_type, "data": data },
+    })
+}
+
+fn anthropic_user_part(part: crate::user_content::UserMessagePart) -> Value {
+    match part {
+        crate::user_content::UserMessagePart::Text { text } => anthropic_text_block(text),
+        crate::user_content::UserMessagePart::Image { attachment } => {
+            anthropic_image_block(&attachment)
+        }
+    }
+}
+
+fn anthropic_tool_result_content(
+    output_json: &str,
+    images: &[crate::user_content::UserImageAttachment],
+) -> Value {
+    if images.is_empty() {
+        return Value::String(output_json.to_string());
+    }
+    let mut content = vec![anthropic_text_block(output_json)];
+    content.extend(images.iter().map(anthropic_image_block));
+    Value::Array(content)
+}
+
 fn openai_cache_retention(value: PromptCacheRetention) -> OpenAiPromptCacheRetention {
     match value {
         PromptCacheRetention::InMemory => OpenAiPromptCacheRetention::InMemory,
@@ -131,6 +388,7 @@ pub(super) fn prompt_segment_to_response_inputs(
                 text,
                 reasoning_content,
                 calls,
+                ..
             },
         ) => {
             let mut input = Vec::new();

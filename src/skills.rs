@@ -1166,6 +1166,7 @@ mod tests {
         .with_protocol(ProtocolFrameItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: call_id.into(),
                 name: "skill".into(),

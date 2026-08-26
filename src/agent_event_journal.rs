@@ -72,11 +72,13 @@ pub fn persist_agent_event(
         AgentEvent::AssistantToolCallBatch {
             text,
             reasoning_content,
+            reasoning_wire,
             calls,
         } => {
             recorder.record_assistant_tool_call_batch(
                 text.clone(),
                 reasoning_content.clone(),
+                reasoning_wire.clone(),
                 calls.clone(),
             )?;
             JournalEffect::persisted(ContextProjection::None)
@@ -387,6 +389,9 @@ mod tests {
         let event = AgentEvent::AssistantToolCallBatch {
             text: None,
             reasoning_content: Some("inspect the requested file".into()),
+            reasoning_wire: Some(
+                r#"[{"type":"thinking","thinking":"inspect","signature":"signed"}]"#.into(),
+            ),
             calls: vec![crate::request_builder::HistoryToolCall {
                 call_id: "call-1".into(),
                 name: "fs__read".into(),
@@ -411,8 +416,10 @@ mod tests {
             &records[0].event,
             TranscriptEvent::AssistantToolCallBatch {
                 reasoning_content: Some(reasoning_content),
+                reasoning_wire: Some(reasoning_wire),
                 ..
             } if reasoning_content == "inspect the requested file"
+                && reasoning_wire.contains("\"signature\":\"signed\"")
         ));
         let old: TranscriptEvent =
             serde_json::from_str(r#"{"kind":"assistant_tool_call_batch","text":null,"calls":[]}"#)
@@ -421,6 +428,7 @@ mod tests {
             old,
             TranscriptEvent::AssistantToolCallBatch {
                 reasoning_content: None,
+                reasoning_wire: None,
                 ..
             }
         ));
@@ -429,10 +437,12 @@ mod tests {
             [
                 crate::request_builder::HistoryItem::AssistantToolCalls {
                     reasoning_content: Some(reasoning_content),
+                    reasoning_wire: Some(reasoning_wire),
                     ..
                 },
                 crate::request_builder::HistoryItem::ToolOutput { .. }
             ] if reasoning_content == "inspect the requested file"
+                && reasoning_wire.contains("\"signature\":\"signed\"")
         ));
     }
 

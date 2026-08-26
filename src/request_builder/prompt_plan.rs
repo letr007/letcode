@@ -122,6 +122,8 @@ pub(crate) enum PromptSegmentContent {
     AssistantToolCalls {
         text: Option<String>,
         reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_wire: Option<String>,
         calls: Vec<HistoryToolCall>,
     },
     ToolOutput {
@@ -1371,10 +1373,12 @@ fn history_item_content(item: &HistoryItem) -> PromptSegmentContent {
         HistoryItem::AssistantToolCalls {
             text,
             reasoning_content,
+            reasoning_wire,
             calls,
         } => PromptSegmentContent::AssistantToolCalls {
             text: text.clone(),
             reasoning_content: reasoning_content.clone(),
+            reasoning_wire: reasoning_wire.clone(),
             calls: calls.clone(),
         },
         HistoryItem::ToolOutput {
@@ -1473,6 +1477,7 @@ mod tests {
                 HistoryItem::AssistantToolCalls {
                     text: None,
                     reasoning_content: None,
+                    reasoning_wire: None,
                     calls: vec![HistoryToolCall {
                         call_id: "call-1".into(),
                         name: "fs__read".into(),

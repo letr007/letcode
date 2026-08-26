@@ -959,6 +959,7 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
             ProtocolFrameItem::AssistantToolCalls {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![HistoryToolCall {
                     call_id: "current-call".into(),
                     name: "shell__exec".into(),

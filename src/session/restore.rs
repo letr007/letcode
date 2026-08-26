@@ -648,6 +648,7 @@ mod tests {
             .record_assistant_tool_call_batch(
                 None,
                 None,
+                None,
                 vec![crate::request_builder::HistoryToolCall {
                     call_id: "call-orphan".into(),
                     name: "agent__oracle".into(),
@@ -767,6 +768,7 @@ mod tests {
             .expect("record turn start");
         recorder
             .record_assistant_tool_call_batch(
+                None,
                 None,
                 None,
                 vec![crate::request_builder::HistoryToolCall {

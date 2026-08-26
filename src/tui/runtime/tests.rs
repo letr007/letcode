@@ -4063,6 +4063,7 @@ fn integration_agent_with_tools(
     if supports_tools {
         let provider = crate::config::ProviderConfig {
             base_url,
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "test".into(),
             protocol: crate::config::ApiProtocol::Responses,
             default_model: "m1".into(),
@@ -4072,6 +4073,8 @@ fn integration_agent_with_tools(
                 crate::config::ModelConfig {
                     display_name: None,
                     protocol: crate::config::ApiProtocol::Responses,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: Some(m1_input_limit_tokens.saturating_add(1_000)),
                     effective_input_limit_tokens: Some(m1_input_limit_tokens),
                     max_output_tokens: Some(128),

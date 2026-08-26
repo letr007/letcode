@@ -217,6 +217,7 @@ fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
         HistoryItem::AssistantToolCalls {
             text: Some("calling tools".into()),
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![
                 crate::protocol_frames::ProtocolToolCall {
                     call_id: "call-1".into(),
@@ -344,6 +345,7 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
         HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![crate::protocol_frames::ProtocolToolCall {
                 call_id: "call-1".into(),
                 name: "lookup".into(),
@@ -1288,6 +1290,7 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
             chat_final_sse(&valid_checkpoint("pressure summary")),
             chat_final_sse("final reply"),
         ),
+        ApiProtocol::Anthropic => unreachable!("pressure test does not use Anthropic"),
     };
     let (base_url, requests, server) =
         spawn_chat_completion_server(vec![summary_response, final_response]).await;
@@ -1324,6 +1327,7 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
                 )
                 .await
         }
+        ApiProtocol::Anthropic => unreachable!("pressure test does not use Anthropic"),
     }
     .expect("pressure compaction successor should complete");
 
@@ -1512,6 +1516,7 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
         .append_history_item(HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "pending".into(),
                 name: "fs__read".into(),
@@ -2109,6 +2114,7 @@ fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
             event: TranscriptEvent::AssistantToolCallBatch {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![HistoryToolCall {
                     call_id: "finished".into(),
                     name: "test__replay_guard".into(),
@@ -3028,6 +3034,7 @@ fn protocol_frames_remain_authoritative_for_history_cache() {
         .append_history_item(HistoryItem::AssistantToolCalls {
             text: Some("working".into()),
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
         })
         .expect("tool call append succeeds");
@@ -3082,6 +3089,7 @@ fn session_state_consistency_live_append_three_way() {
         .append_history_item(HistoryItem::AssistantToolCalls {
             text: Some("working".into()),
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
         })
         .expect("tool call append");
@@ -3230,6 +3238,7 @@ fn session_state_consistency_journal_resume_three_way() {
     .expect("turn started");
     rec.record_assistant_tool_call_batch(
         Some("working".into()),
+        None,
         None,
         vec![HistoryToolCall {
             call_id: "call-1".into(),
@@ -3480,6 +3489,7 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
             HistoryItem::AssistantToolCalls {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![HistoryToolCall {
                     call_id: "call-pending".into(),
                     name: "fs__read".into(),
@@ -3606,6 +3616,7 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
         HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-pending".into(),
                 name: "fs__read".into(),
@@ -3853,6 +3864,7 @@ async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
     let request = match prepared.build.request {
         BuiltRequest::Responses(request) => serde_json::to_value(request),
         BuiltRequest::ResponsesCompatible(request) => Ok(request),
+        BuiltRequest::Anthropic(_) => panic!("expected responses request"),
         BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
             panic!("expected responses request")
         }

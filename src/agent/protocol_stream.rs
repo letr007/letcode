@@ -567,6 +567,9 @@ where
                     ResponseStreamRequest::Compatible(request)
                 }
             }
+            BuiltRequest::Anthropic(_) => {
+                return Err(anyhow!("request builder returned non-responses request"));
+            }
             BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
                 return Err(anyhow!("request builder returned non-responses request"));
             }
@@ -1180,6 +1183,7 @@ where
         agent.append_assistant_tool_calls_with_reasoning_content(
             &turn_text,
             reasoning_content.as_deref(),
+            None,
             &tool_calls,
         )?;
         if let Some(usage) = response_usage {
@@ -1188,6 +1192,7 @@ where
         on_event(AgentEvent::AssistantToolCallBatch {
             text: (!turn_text.is_empty()).then(|| turn_text.clone()),
             reasoning_content: reasoning_content.clone(),
+            reasoning_wire: None,
             calls: tool_calls.clone(),
         })
         .await?;
@@ -1341,6 +1346,9 @@ where
         let completion_request = match build.request.clone() {
             BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request),
             BuiltRequest::CompletionsCompatible(request) => CompletionStreamRequest::Compatible(request),
+            BuiltRequest::Anthropic(_) => {
+                return Err(anyhow!("request builder returned non-completions request"));
+            }
             BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
                 return Err(anyhow!("request builder returned non-completions request"));
             }
@@ -2014,6 +2022,7 @@ where
             agent.append_assistant_tool_calls_with_reasoning_content(
                 &turn_text,
                 reasoning_content.as_deref(),
+                None,
                 &tool_calls,
             )?;
             if let Some(usage) = provider_usage {
@@ -2022,6 +2031,7 @@ where
             on_event(AgentEvent::AssistantToolCallBatch {
                 text: (!turn_text.is_empty()).then(|| turn_text.clone()),
                 reasoning_content: reasoning_content.clone(),
+                reasoning_wire: None,
                 calls: tool_calls.clone(),
             })
             .await?;
@@ -2047,6 +2057,531 @@ where
     }
     .instrument(turn_span.clone())
     .await;
+    langfuse_trace::finish_llm_turn_span(
+        &turn_span,
+        &result,
+        tool_call_count,
+        continuation_count,
+        agent.active_history_items().len(),
+    );
+    agent.turn.pressure_compaction.reset_for_turn_end();
+    result
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStreamState {
+    text: String,
+    thinking: Vec<Value>,
+    thinking_positions: BTreeMap<u64, usize>,
+    finished_thinking: HashSet<u64>,
+    block_types: BTreeMap<u64, String>,
+    tool_calls: BTreeMap<u64, HistoryToolCall>,
+    emitted_pending_tool_calls: HashSet<String>,
+    pending_tool_calls: BTreeMap<String, String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    stop_reason: Option<String>,
+    completed: bool,
+}
+
+impl AnthropicStreamState {
+    fn merge_usage(&mut self, usage: &Value) {
+        if let Some(value) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.input_tokens = Some(value);
+        }
+        if let Some(value) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = Some(value);
+        }
+        if let Some(value) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.cached_tokens = Some(value);
+        }
+    }
+
+    fn provider_usage(&self, context_window_tokens: u64) -> Option<TokenUsageEstimate> {
+        let input_tokens = self.input_tokens?;
+        let output_tokens = self.output_tokens?;
+        Some(TokenUsageEstimate {
+            used_tokens: input_tokens.saturating_add(output_tokens),
+            context_window_tokens,
+            input_tokens,
+            output_tokens,
+            cached_tokens: self.cached_tokens.unwrap_or(0),
+        })
+    }
+
+    fn append_thinking_delta(&mut self, index: u64, delta: &str) {
+        let Some(position) = self.thinking_positions.get(&index).copied() else {
+            return;
+        };
+        let Some(block) = self.thinking.get_mut(position) else {
+            return;
+        };
+        let current = block["thinking"].as_str().unwrap_or_default();
+        block["thinking"] = Value::String(current.to_string() + delta);
+    }
+
+    fn append_thinking_signature(&mut self, index: u64, signature: &str) {
+        let Some(position) = self.thinking_positions.get(&index).copied() else {
+            return;
+        };
+        let Some(block) = self.thinking.get_mut(position) else {
+            return;
+        };
+        let current = block["signature"].as_str().unwrap_or_default();
+        block["signature"] = Value::String(current.to_string() + signature);
+    }
+
+    fn handle_event(&mut self, event: &Value, item_id: &str) -> Result<(Vec<AgentEvent>, String)> {
+        let mut events = Vec::new();
+        let mut text_delta = String::new();
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(usage) = event.pointer("/message/usage") {
+                    self.merge_usage(usage);
+                }
+            }
+            Some("content_block_start") => {
+                let index = event
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("anthropic content_block_start missing index"))?;
+                let block = event.get("content_block").ok_or_else(|| {
+                    anyhow!("anthropic content_block_start missing content_block")
+                })?;
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        self.block_types.insert(index, "text".to_string());
+                        if let Some(text) = block.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            self.text.push_str(text);
+                            text_delta.push_str(text);
+                        }
+                    }
+                    Some("thinking") => {
+                        self.block_types.insert(index, "thinking".to_string());
+                        self.thinking.push(serde_json::json!({
+                            "type": "thinking",
+                            "thinking": String::new(),
+                        }));
+                        self.thinking_positions
+                            .insert(index, self.thinking.len() - 1);
+                        if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
+                            && !thinking.is_empty()
+                        {
+                            events.push(AgentEvent::ReasoningDelta {
+                                item_id: item_id.to_string(),
+                                delta: thinking.to_string(),
+                            });
+                            self.append_thinking_delta(index, thinking);
+                        }
+                    }
+                    Some("tool_use") => {
+                        self.block_types.insert(index, "tool_use".to_string());
+                        let call_id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let initial = block
+                            .get("input")
+                            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+                            .map(Value::to_string)
+                            .unwrap_or_default();
+                        self.tool_calls.insert(
+                            index,
+                            HistoryToolCall {
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                arguments_json: initial,
+                            },
+                        );
+                        if !call_id.is_empty()
+                            && self.emitted_pending_tool_calls.insert(call_id.clone())
+                        {
+                            self.pending_tool_calls
+                                .insert(call_id.clone(), name.clone());
+                            events.push(AgentEvent::ToolCallPending { call_id, name });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_delta") => {
+                let index = event
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("anthropic content_block_delta missing index"))?;
+                let delta = event
+                    .get("delta")
+                    .ok_or_else(|| anyhow!("anthropic content_block_delta missing delta"))?;
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            self.text.push_str(text);
+                            text_delta.push_str(text);
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        let thinking = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !thinking.is_empty() {
+                            if !self.thinking_positions.contains_key(&index) {
+                                self.thinking.push(
+                                    serde_json::json!({"type":"thinking","thinking":String::new()}),
+                                );
+                                self.thinking_positions
+                                    .insert(index, self.thinking.len() - 1);
+                            }
+                            self.append_thinking_delta(index, thinking);
+                            events.push(AgentEvent::ReasoningDelta {
+                                item_id: item_id.to_string(),
+                                delta: thinking.to_string(),
+                            });
+                        }
+                    }
+                    Some("signature_delta") => {
+                        let signature = delta
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !signature.is_empty() {
+                            self.append_thinking_signature(index, signature);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(call) = self.tool_calls.get_mut(&index) {
+                            call.arguments_json.push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                let index = event
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("anthropic content_block_stop missing index"))?;
+                if self.block_types.get(&index) == Some(&"thinking".to_string()) {
+                    let text = self
+                        .thinking_positions
+                        .get(&index)
+                        .copied()
+                        .and_then(|position| self.thinking.get(position))
+                        .and_then(|block| block.get("thinking"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !text.is_empty() && self.finished_thinking.insert(index) {
+                        events.push(AgentEvent::ReasoningDone {
+                            item_id: item_id.to_string(),
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            Some("message_delta") => {
+                if let Some(usage) = event.get("usage") {
+                    self.merge_usage(usage);
+                }
+                if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.stop_reason = Some(reason.to_string());
+                }
+            }
+            Some("message_stop") => {
+                self.completed = true;
+            }
+            Some("error") => {
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown Anthropic error");
+                return Err(anyhow!("anthropic stream error: {message}"));
+            }
+            _ => {}
+        }
+        Ok((events, text_delta))
+    }
+
+    fn finish_thinking(&mut self, item_id: &str) -> Vec<AgentEvent> {
+        self.thinking_positions
+            .iter()
+            .filter_map(|(index, position)| {
+                if self.finished_thinking.contains(index) {
+                    return None;
+                }
+                self.finished_thinking.insert(*index);
+                let text = self.thinking.get(*position)?.get("thinking")?.as_str()?;
+                (!text.is_empty()).then(|| AgentEvent::ReasoningDone {
+                    item_id: item_id.to_string(),
+                    text: text.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    fn reasoning_wire(&self) -> Option<String> {
+        if self.thinking.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&self.thinking).ok()
+    }
+
+    fn reasoning_content(&self) -> Option<String> {
+        let text = self
+            .thinking
+            .iter()
+            .filter_map(|b| b.get("thinking"))
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn tool_calls(&self) -> Result<Vec<HistoryToolCall>> {
+        let mut calls = Vec::new();
+        for (index, call) in &self.tool_calls {
+            if call.call_id.trim().is_empty() {
+                return Err(anyhow!(
+                    "invalid anthropic tool call at index {index}: missing id"
+                ));
+            }
+            if call.name.trim().is_empty() {
+                return Err(anyhow!(
+                    "invalid anthropic tool call at index {index}: missing name"
+                ));
+            }
+            let raw_arguments = call.arguments_json.trim();
+            let arguments = if raw_arguments.is_empty() {
+                Value::Object(Default::default())
+            } else {
+                serde_json::from_str::<Value>(raw_arguments)
+                    .with_context(|| format!("invalid anthropic tool arguments at index {index}"))?
+            };
+            if !arguments.is_object() {
+                return Err(anyhow!(
+                    "invalid anthropic tool arguments at index {index}: expected an object"
+                ));
+            }
+            calls.push(HistoryToolCall {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                arguments_json: arguments.to_string(),
+            });
+        }
+        Ok(calls)
+    }
+
+    fn validate_completion(&self, has_tool_calls: bool) -> Result<()> {
+        if !self.completed {
+            return Err(anyhow!("anthropic stream ended before message_stop"));
+        }
+        match self.stop_reason.as_deref() {
+            Some("max_tokens") => Err(anyhow!(
+                "anthropic response incomplete: stop_reason=max_tokens"
+            )),
+            Some("tool_use") if !has_tool_calls => Err(anyhow!(
+                "anthropic reported stop_reason=tool_use without a tool_use block"
+            )),
+            Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn" | "refusal") => Ok(()),
+            Some(reason) => Err(anyhow!("unexpected anthropic stop_reason {reason}")),
+            None => Err(anyhow!("anthropic stream ended without stop_reason")),
+        }
+    }
+}
+
+async fn send_anthropic_messages_stream<C: Config>(
+    client: &Client<C>,
+    request: &Value,
+) -> std::result::Result<reqwest::Response, ChatStreamCreationError> {
+    let config = client.config();
+    let url = config.url("/messages");
+    let http = reqwest_client_for_url(&url)
+        .map_err(|error| ChatStreamCreationError::Setup(error.to_string()))?;
+    let response = http
+        .post(url.clone())
+        .query(&config.query())
+        .headers(config.headers())
+        .header("anthropic-version", "2023-06-01")
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .json(request)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return Err(ChatStreamCreationError::Transport(error)),
+    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let message = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("failed to read error body: {error}"));
+    Err(ChatStreamCreationError::Status {
+        status,
+        headers,
+        message,
+    })
+}
+
+pub(super) async fn run_anthropic_stream_async<C, F, Dfut, E, Efut, A, Afut>(
+    agent: &mut Agent<C>,
+    user_content: UserMessageContent,
+    user_input: &str,
+    mut on_delta: F,
+    mut on_event: E,
+    mut approve: A,
+) -> Result<String>
+where
+    C: Config + Clone + Send + Sync + 'static,
+    F: FnMut(&str) -> Dfut,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    A: FnMut(PermissionRequest) -> Afut,
+    Dfut: Future<Output = Result<()>>,
+    Efut: Future<Output = Result<()>> + Send,
+    Afut: Future<Output = Result<PermissionApproval>>,
+{
+    let turn_prelude =
+        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
+    let mut protected_start_index = agent.active_history_items().len();
+    let previous_turn_start_index = agent.turn.current_turn_start_index;
+    agent.turn.current_turn_start_index = Some(protected_start_index);
+    if !user_content.has_no_parts()
+        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
+    {
+        agent.turn.current_turn_start_index = previous_turn_start_index;
+        return Err(error);
+    }
+    Agent::<C>::emit_audit_event(
+        &mut on_event,
+        AgentEvent::TurnStarted(agent.turn_started_event()),
+        "turn_started",
+    )
+    .await;
+    let turn_id = agent.turn.turn_id;
+    let turn_span = langfuse_trace::llm_turn_span(
+        turn_id,
+        "anthropic_messages",
+        &agent.model,
+        agent.max_iterations,
+        agent.max_tool_calls,
+        user_input.chars().count(),
+        agent.active_history_items().len(),
+    );
+    let mut final_text = String::new();
+    let mut tool_call_count = 0;
+    let mut continuation_count = 0;
+    let mut recovery_attempts = 0;
+    let result=async{
+        let mut iteration_count=0;
+        'agent_iteration:loop{
+            ensure_iteration_budget(agent.max_iterations,iteration_count,agent.turn.auto_continue_active)?;
+            let iteration=iteration_count;iteration_count+=1;
+            let tool_definitions=agent.tool_definitions();
+            let prepared=prepare_protocol_stream_request(agent,ApiProtocol::Anthropic,&turn_prelude,&mut protected_start_index,&tool_definitions,&mut on_event).await?;
+            protected_start_index=prepared.protected_start_index;
+            let epoch_preview=prepared.epoch_preview;
+            let build=prepared.build;
+            if agent.turn.frozen_evidence.is_none(){agent.turn.frozen_evidence=Some(FrozenTurnEvidence{message:build.selected_evidence_message.clone(),selected_ids:build.selected_evidence_ids.clone()});}
+            let logical_observation=agent.preview_final_logical_request(&build);
+            let cache_report=CacheUsageReport::from_build(&build);
+            let iteration_span=langfuse_trace::llm_iteration_span(turn_id,"anthropic_messages",&agent.model,iteration,build.budget.retained_history_items,tool_call_count,tool_definitions.len());
+            log_prepared_request_metadata(&build);
+            let logical_request_id=format!("turn-{turn_id}-iteration-{iteration}");
+            let request=match build.request.clone(){BuiltRequest::Anthropic(request)=>request,_=>return Err(anyhow!("request builder returned non-anthropic request"))};
+            let mut attempt=1;
+            'retry_anthropic_stream:loop{
+                let mut prepared_telemetry=llm_request_telemetry(&logical_request_id,turn_id,iteration,attempt,&agent.model,ApiProtocol::Anthropic,&build,tool_call_count,tool_definitions.len(),logical_observation);
+                if attempt>1{prepared_telemetry.adjacent_lcp_units=None;prepared_telemetry.adjacent_lcp_bytes=None;prepared_telemetry.adjacent_lcp_estimated_tokens=None;prepared_telemetry.first_breaker=None;}
+                on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
+                langfuse_trace::record_llm_request_telemetry(&iteration_span,&prepared_telemetry);
+                if attempt==1{agent.commit_final_logical_request(&build);agent.commit_active_epoch(epoch_preview.clone());}
+                let response=send_anthropic_messages_stream(&agent.client,&request).await;
+                let response=match response{Ok(response)=>response,Err(error) if should_retry_chat_stream_creation(&agent.retry_config,attempt,&error)=>{
+                    emit_attempt_terminal(LlmRequestErrorClass::RequestCreation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
+                    let delay=match &error{ChatStreamCreationError::Status{headers,..}=>retry_delay_from_headers(&agent.retry_config,attempt,headers),_=>retry_delay(&agent.retry_config,attempt)};
+                    wait_for_retry(attempt,agent.retry_config.max_attempts,delay,&error,&mut on_event).await?;attempt+=1;continue 'retry_anthropic_stream;
+                },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::RequestCreation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(anyhow!(error).context(request_creation_failure_context("streamed anthropic messages","anthropic_messages",agent.active_model_metadata(),&build.budget)));}};
+                let mut byte_stream=response.bytes_stream();let mut sse_buffer=String::new();let mut state=AnthropicStreamState::default();
+                let item_id=format!("anthropic-reasoning-{iteration}");let mut stream_had_side_effect=false;let mut provider_usage:Option<TokenUsageEstimate>=None;let mut final_provider_usage_event:Option<AgentEvent>=None;
+                while let Some(chunk)=byte_stream.next().await{
+                    let chunk=match chunk{Ok(chunk)=>chunk,Err(error) if !stream_had_side_effect&&should_retry_reqwest_error(&agent.retry_config,attempt,&error)=>{
+                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead,&prepared_telemetry,&iteration_span,&mut on_event).await?;
+                        let delay=retry_delay(&agent.retry_config,attempt);wait_for_retry(attempt,agent.retry_config.max_attempts,delay,&error,&mut on_event).await?;attempt+=1;continue 'retry_anthropic_stream;
+                    },Err(_error) if stream_had_side_effect=>{
+                        emit_attempt_interrupted(LlmRequestErrorClass::StreamRead,&prepared_telemetry,&iteration_span,&mut on_event).await?;
+                        recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","stream_read",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;
+                    },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::StreamRead,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error.into());}};
+                    append_sse_chunk(&mut sse_buffer,&chunk);
+                    for event in drain_sse_data_events(&mut sse_buffer){
+                        let Some(data)=event else{continue};
+                        let raw=match serde_json::from_str::<Value>(&data){Ok(raw)=>raw,Err(_error) if stream_had_side_effect=>{
+                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
+                            recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","event_parse",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;
+                        },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error).with_context(||format!("failed to parse anthropic stream event: {data}"));}};
+                        let (emitted,text_delta)=match state.handle_event(&raw,&item_id){Ok((events,text_delta))=>(events,text_delta),Err(_error) if stream_had_side_effect||!state.pending_tool_calls.is_empty()=>{
+                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
+                            recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","event_parse",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;
+                        },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error);}};
+                        if !text_delta.is_empty(){stream_had_side_effect=true;on_delta(&text_delta).await?;final_text.push_str(&text_delta);}
+                        if !emitted.is_empty(){stream_had_side_effect=true;for event in emitted{on_event(event).await?;}}
+                    }
+                }
+                for event in finish_sse_data_events(&mut sse_buffer){let Some(data)=event else{continue};let raw=serde_json::from_str::<Value>(&data).with_context(||format!("failed to parse anthropic stream event: {data}"))?;let (emitted,text_delta)=state.handle_event(&raw,&item_id)?;if !text_delta.is_empty(){stream_had_side_effect=true;on_delta(&text_delta).await?;final_text.push_str(&text_delta);}if !emitted.is_empty(){stream_had_side_effect=true;for event in emitted{on_event(event).await?;}}}
+                for event in state.finish_thinking(&item_id){stream_had_side_effect=true;on_event(event).await?;}
+                if let Some(usage)=state.provider_usage(build.budget.context_window_tokens){provider_usage=Some(usage.clone());prepared_telemetry.usage=provider_usage;prepared_telemetry.usage_completeness=ProviderUsageCompleteness::Complete;final_provider_usage_event=Some(AgentEvent::TokenUsageUpdated{used_tokens:usage.used_tokens,context_window_tokens:usage.context_window_tokens,input_tokens:usage.input_tokens,output_tokens:usage.output_tokens,cached_tokens:usage.cached_tokens,cache_report:Some(cache_report.clone().with_actual_cached_tokens(usage.cached_tokens))});}
+                let has_tool_calls=!state.tool_calls.is_empty();
+                if let Err(error)=state.validate_completion(has_tool_calls){
+                    if stream_had_side_effect||!state.pending_tool_calls.is_empty(){emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","finish_validation",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;}
+                    emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error);
+                }
+                let tool_calls=match state.tool_calls(){Ok(calls)=>calls,Err(_error) if stream_had_side_effect||!state.pending_tool_calls.is_empty()=>{emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","tool_validation",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;},Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error);}};
+                if let Some(event)=final_provider_usage_event{on_event(event).await?;}
+                let turn_text=state.text.clone();let reasoning_content=state.reasoning_content();let reasoning_wire=state.reasoning_wire();
+                if !has_tool_calls{
+                    let completed_telemetry=prepared_telemetry.completed(provider_usage,None,ProviderUsageCompleteness::Complete);
+                    on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;langfuse_trace::record_llm_request_telemetry(&iteration_span,&completed_telemetry);
+                    if final_text.is_empty(){final_text="No response content".to_string();}
+                    agent.append_history_item(HistoryItem::assistant(turn_text.clone()))?;
+                    if let Some(usage)=provider_usage{agent.install_provider_usage_anchor(usage);}
+                    on_event(AgentEvent::AssistantMessage{content:turn_text.clone()}).await?;
+                    langfuse_trace::finish_llm_iteration_span(&iteration_span,turn_text.chars().count(),0,0,Some(state.stop_reason.as_deref().unwrap_or("unknown")));drop(iteration_span);
+                    on_event(AgentEvent::TurnContinuationBoundary).await?;
+                    if agent.drain_turn_continuations(&mut on_event).await?||agent.continue_or_finalize_no_tool_reply(&mut on_event,tool_call_count,&mut continuation_count).await?{continue 'agent_iteration;}
+                    return Ok(final_text);
+                }
+                let completed_telemetry=prepared_telemetry.completed(provider_usage,None,ProviderUsageCompleteness::Complete);
+                on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;langfuse_trace::record_llm_request_telemetry(&iteration_span,&completed_telemetry);
+                agent.ensure_tool_call_budget(tool_call_count,tool_calls.len())?;tool_call_count+=tool_calls.len();
+                langfuse_trace::finish_llm_iteration_span(&iteration_span,turn_text.chars().count(),tool_calls.len(),tool_calls.len(),Some(state.stop_reason.as_deref().unwrap_or("unknown")));drop(iteration_span);
+                agent.append_assistant_tool_calls_with_reasoning_content(&turn_text,reasoning_content.as_deref(),reasoning_wire.as_deref(),&tool_calls)?;
+                if let Some(usage)=provider_usage{agent.install_provider_usage_anchor(usage);}
+                on_event(AgentEvent::AssistantToolCallBatch{text:(!turn_text.is_empty()).then(||turn_text.clone()),reasoning_content,reasoning_wire,calls:tool_calls.clone()}).await?;
+                for call in &tool_calls{info!(tool_name=%call.name,call_id=%call.call_id,"anthropic tool call requested");}
+                agent.execute_tool_calls_and_record(&tool_calls,&mut on_event,&mut approve).await?;
+                on_event(AgentEvent::ToolCallBatchFinished).await?;on_event(AgentEvent::TurnContinuationBoundary).await?;let _=agent.drain_turn_continuations(&mut on_event).await?;
+                break 'retry_anthropic_stream;
+            }
+        }
+    }.instrument(turn_span.clone()).await;
     langfuse_trace::finish_llm_turn_span(
         &turn_span,
         &result,
@@ -2127,6 +2662,79 @@ where
         ApiProtocol::Responses => {
             stream_oneshot_responses(client, &build, retry_config, &mut on_delta).await
         }
+        ApiProtocol::Anthropic => {
+            stream_oneshot_anthropic(client, &build, retry_config, &mut on_delta).await
+        }
+    }
+}
+
+async fn stream_oneshot_anthropic<C, F, Fut>(
+    client: &Client<C>,
+    build: &crate::request_builder::BuildResult,
+    retry_config: &RetryConfig,
+    on_delta: &mut F,
+) -> Result<String>
+where
+    C: Config,
+    F: FnMut(&str) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let request = match &build.request {
+        BuiltRequest::Anthropic(request) => request.clone(),
+        BuiltRequest::Responses(_)
+        | BuiltRequest::ResponsesCompatible(_)
+        | BuiltRequest::Completions(_)
+        | BuiltRequest::CompletionsCompatible(_) => {
+            bail!("request builder returned non-anthropic request for oneshot summary")
+        }
+    };
+
+    let mut attempt = 1;
+    loop {
+        let response = match send_anthropic_messages_stream(client, &request).await {
+            Ok(response) => response,
+            Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
+                tokio::time::sleep(retry_delay(retry_config, attempt)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow!(error).context(request_creation_failure_context(
+                    "streamed anthropic messages",
+                    "oneshot",
+                    ModelRequestMetadata::default(),
+                    &build.budget,
+                )));
+            }
+        };
+
+        let mut byte_stream = response.bytes_stream();
+        let mut sse_buffer = String::new();
+        let mut state = AnthropicStreamState::default();
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = chunk.context("failed to read oneshot anthropic stream")?;
+            append_sse_chunk(&mut sse_buffer, &chunk);
+            for event in drain_sse_data_events(&mut sse_buffer) {
+                let Some(data) = event else { continue };
+                let raw: Value = serde_json::from_str(&data)
+                    .context("failed to deserialize oneshot anthropic delta")?;
+                let (_, text_delta) = state.handle_event(&raw, "anthropic-oneshot")?;
+                if !text_delta.is_empty() {
+                    on_delta(&text_delta).await?;
+                }
+            }
+        }
+        for event in finish_sse_data_events(&mut sse_buffer) {
+            let Some(data) = event else { continue };
+            let raw: Value = serde_json::from_str(&data)
+                .context("failed to deserialize oneshot anthropic trailer")?;
+            let (_, text_delta) = state.handle_event(&raw, "anthropic-oneshot")?;
+            if !text_delta.is_empty() {
+                on_delta(&text_delta).await?;
+            }
+        }
+        state.validate_completion(false)?;
+        return Ok(state.text);
     }
 }
 
@@ -2145,6 +2753,9 @@ where
         BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request.clone()),
         BuiltRequest::CompletionsCompatible(request) => {
             CompletionStreamRequest::Compatible(request.clone())
+        }
+        BuiltRequest::Anthropic(_) => {
+            bail!("request builder returned non-completions request for oneshot summary")
         }
         BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
             bail!("request builder returned non-completions request for oneshot summary")
@@ -2234,6 +2845,9 @@ where
         BuiltRequest::Responses(request) => ResponseStreamRequest::Typed(request.clone()),
         BuiltRequest::ResponsesCompatible(request) => {
             ResponseStreamRequest::Compatible(request.clone())
+        }
+        BuiltRequest::Anthropic(_) => {
+            bail!("request builder returned non-responses request for oneshot summary")
         }
         BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
             bail!("request builder returned non-responses request for oneshot summary")
@@ -2857,6 +3471,63 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn anthropic_stream_state_accumulates_text_thinking_and_tools() {
+        let mut state = AnthropicStreamState::default();
+        let events = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":3}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-1","name":"read_file","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/main.rs\"}"}}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"hello"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ];
+
+        let mut reasoning_deltas = Vec::new();
+        let mut text = String::new();
+        for event in &events {
+            let (emitted, delta) = state
+                .handle_event(event, "item")
+                .expect("anthropic event parses");
+            text.push_str(&delta);
+            for emitted_event in emitted {
+                if let AgentEvent::ReasoningDelta { delta, .. } = emitted_event {
+                    reasoning_deltas.push(delta);
+                }
+            }
+        }
+
+        assert_eq!(text, "hello");
+        assert_eq!(reasoning_deltas, ["think"]);
+        assert_eq!(state.reasoning_content().as_deref(), Some("think"));
+        let wire = serde_json::from_str::<Value>(
+            state.reasoning_wire().as_deref().expect("reasoning wire"),
+        )
+        .expect("reasoning wire is valid JSON");
+        assert_eq!(
+            wire,
+            json!([{
+                "type": "thinking",
+                "thinking": "think",
+                "signature": "sig",
+            }])
+        );
+        let calls = state.tool_calls().expect("tool call is complete");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "call-1");
+        assert_eq!(calls[0].arguments_json, r#"{"path":"src/main.rs"}"#);
+        let usage = state.provider_usage(100_000).expect("provider usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.cached_tokens, 3);
+        state.validate_completion(false).expect("completion valid");
+    }
 
     fn prepared_build_agent() -> Agent<OpenAIConfig> {
         let client = Client::with_config(

@@ -545,6 +545,8 @@ mod tests {
     fn test_model_config(protocol: crate::config::ApiProtocol) -> crate::config::ModelConfig {
         crate::config::ModelConfig {
             display_name: None,
+            anthropic_thinking: Default::default(),
+            cache_control: false,
             protocol,
             context_window: None,
             effective_input_limit_tokens: None,
@@ -566,6 +568,7 @@ mod tests {
         let protocol = crate::config::ApiProtocol::Completions;
         crate::config::ProviderConfig {
             base_url: "http://127.0.0.1:9/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "reviewer-key".into(),
             protocol,
             default_model: model.into(),

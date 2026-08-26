@@ -1802,6 +1802,7 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
             event: TranscriptEvent::AssistantToolCallBatch {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls,
             },
         },
@@ -2199,6 +2200,8 @@ fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
     recorder
         .record_assistant_tool_call_batch(
             None,
+            None,
+            None,
             vec![HistoryToolCall {
                 call_id: "unfinished".into(),
                 name: "read".into(),
@@ -2225,6 +2228,7 @@ mod compaction_legacy_schema_tests {
         recorder.record_user_message("request").expect("user");
         recorder
             .record_assistant_tool_call_batch(
+                None,
                 None,
                 None,
                 vec![HistoryToolCall {

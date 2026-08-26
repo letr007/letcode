@@ -1169,6 +1169,7 @@ fn cancelled_durable_multi_call_batch_restores_every_terminal_output() {
             TranscriptEvent::AssistantToolCallBatch {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls,
             },
         ),
@@ -2622,6 +2623,7 @@ fn modern_active_turn_compaction_retires_current_user_with_prefix() {
             TranscriptEvent::AssistantToolCallBatch {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![HistoryToolCall {
                     call_id: "c1".into(),
                     name: "fs__read".into(),

@@ -786,6 +786,7 @@ impl TranscriptRecorder {
             protocol: match telemetry.protocol {
                 crate::config::ApiProtocol::Responses => "responses",
                 crate::config::ApiProtocol::Completions => "chat_completions",
+                crate::config::ApiProtocol::Anthropic => "anthropic_messages",
             }
             .into(),
             context_window_tokens: telemetry.context_window_tokens,
@@ -915,11 +916,13 @@ impl TranscriptRecorder {
         &mut self,
         text: Option<String>,
         reasoning_content: Option<String>,
+        reasoning_wire: Option<String>,
         calls: Vec<HistoryToolCall>,
     ) -> Result<()> {
         self.append(TranscriptEvent::AssistantToolCallBatch {
             text,
             reasoning_content,
+            reasoning_wire,
             calls,
         })
     }

@@ -196,6 +196,7 @@ fn request_json(result: BuildResult) -> String {
             serde_json::to_string(&request).expect("serialize")
         }
         BuiltRequest::Completions(request) => serde_json::to_string(&request).expect("serialize"),
+        BuiltRequest::Anthropic(request) => serde_json::to_string(&request).expect("serialize"),
     }
 }
 
@@ -238,6 +239,7 @@ fn request_value(result: &BuildResult) -> Value {
         BuiltRequest::ResponsesCompatible(request)
         | BuiltRequest::CompletionsCompatible(request) => Ok(request.clone()),
         BuiltRequest::Completions(request) => serde_json::to_value(request),
+        BuiltRequest::Anthropic(request) => Ok(request.clone()),
     }
     .expect("request serializes")
 }
@@ -299,6 +301,132 @@ fn deepseek_chat_compat_uses_legacy_roles_and_tokens_and_thinking() {
 }
 
 #[test]
+fn anthropic_messages_maps_tool_turn_and_replays_signed_thinking() {
+    let reasoning_wire = serde_json::to_string(&vec![json!({
+        "type": "thinking",
+        "thinking": "inspect the file",
+        "signature": "signed-state",
+    })])
+    .expect("reasoning wire serializes");
+    let history = vec![
+        HistoryItem::AssistantToolCalls {
+            text: Some("I will inspect it".into()),
+            reasoning_content: Some("inspect the file".into()),
+            reasoning_wire: Some(reasoning_wire),
+            calls: vec![HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "read_file".into(),
+                arguments_json: "{\"path\":\"src/main.rs\"}".into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-1".into(),
+            output_json: "ok".into(),
+            images: Vec::new(),
+        },
+        HistoryItem::user("continue"),
+    ];
+    let mut model = metadata(8_192);
+    model.cache_control = true;
+    model.anthropic_thinking = AnthropicThinkingConfig {
+        mode: AnthropicThinkingMode::Budget,
+        budget_tokens: Some(1_024),
+    };
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Anthropic,
+        model_id: "claude-test",
+        model,
+        prelude: &[PromptMessage::system("stable instructions")],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("anthropic request builds");
+    let request = request_value(&result);
+
+    assert_eq!(request["model"], "claude-test");
+    assert_eq!(request["max_tokens"], 256);
+    assert_eq!(request["stream"], true);
+    assert_eq!(request["system"][0]["text"], "stable instructions");
+    assert_eq!(request["thinking"]["type"], "enabled");
+    assert_eq!(request["thinking"]["budget_tokens"], 1_024);
+
+    let messages = request["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 3);
+    let assistant_content = messages[0]["content"].as_array().expect("assistant blocks");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "inspect the file");
+    assert_eq!(assistant_content[0]["signature"], "signed-state");
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[2]["type"], "tool_use");
+    assert_eq!(assistant_content[2]["id"], "call-1");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+    assert_eq!(messages[1]["content"][0]["tool_use_id"], "call-1");
+}
+
+#[test]
+fn anthropic_logical_units_preserve_one_unit_per_prompt_segment() {
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Anthropic,
+        model_id: "claude-test",
+        model: metadata(8_192),
+        prelude: &[
+            PromptMessage::system("system"),
+            PromptMessage::developer("developer"),
+        ],
+        history: &[
+            HistoryItem::user("question"),
+            HistoryItem::assistant("answer"),
+        ],
+        protected_start_index: 2,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("anthropic request builds");
+
+    let segment_count = result.prompt_plan.segments.len();
+    assert!(segment_count > 0);
+    assert_eq!(observe_logical_request(&result).units.len(), segment_count);
+    for prefix in 0..=segment_count {
+        let _ = provider_unit_prefix_digest(&result, prefix);
+    }
+}
+
+#[test]
+fn anthropic_messages_applies_adaptive_thinking_effort() {
+    let history = vec![HistoryItem::user("current")];
+    let mut model = metadata(8_192);
+    model.supports_reasoning = true;
+    model.reasoning_effort = Some(ModelReasoningEffort::Medium);
+    model.anthropic_thinking = AnthropicThinkingConfig {
+        mode: AnthropicThinkingMode::Adaptive,
+        budget_tokens: None,
+    };
+    let result = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Anthropic,
+        model_id: "claude-test",
+        model,
+        prelude: &[],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("anthropic adaptive request builds");
+    let request = request_value(&result);
+    assert_eq!(request["thinking"], json!({ "type": "adaptive" }));
+    assert_eq!(request["output_config"], json!({ "effort": "medium" }));
+}
+
+#[test]
 fn deepseek_completions_preserves_skill_material_across_developer_messages() {
     let history = vec![HistoryItem::user("current")];
     let result = build_test_request(TestRequestBuilderInput {
@@ -356,6 +484,7 @@ fn deepseek_chat_compat_preserves_empty_reasoning_content_for_tool_turns() {
         HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-1".into(),
                 name: "read_file".into(),
@@ -398,6 +527,7 @@ fn deepseek_responses_replays_reasoning_before_tool_call() {
         HistoryItem::AssistantToolCalls {
             text: Some("I will inspect it".into()),
             reasoning_content: Some("inspect the file".into()),
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-1".into(),
                 name: "read_file".into(),
@@ -503,6 +633,7 @@ fn responses_serializes_tool_output_images_as_input_image_content() {
         HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-image".into(),
                 name: "fs__read".into(),
@@ -550,6 +681,7 @@ fn completions_rejects_tool_output_images_without_text_fallback() {
         HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-image".into(),
                 name: "fs__read".into(),
@@ -1049,6 +1181,7 @@ fn planner_is_pure_deterministic_and_preserves_protected_tool_groups() {
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-1".into(),
                 name: "read".into(),
@@ -1172,6 +1305,7 @@ fn canonical_tool_result_snapshot(bytes: usize) -> RuntimeSnapshot {
         ProtocolFrameItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: "phase1b-call".into(),
                 name: tool.into(),
@@ -1282,6 +1416,7 @@ fn canonical_first_exposure_representation_is_pressure_invariant_and_impossible_
                             .map(|item| item["content"].as_str().unwrap().to_owned())
                             .collect::<Vec<_>>(),
                     ),
+                    ApiProtocol::Anthropic => unreachable!("pressure test does not use Anthropic"),
                 };
                 assert_eq!(call_ids, ["phase1b-call"]);
                 assert_eq!(output_call_ids, call_ids, "tool pair/order is preserved");

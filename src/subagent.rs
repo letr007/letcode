@@ -204,6 +204,8 @@ mod tests {
     fn test_model_config(protocol: ApiProtocol) -> crate::config::ModelConfig {
         crate::config::ModelConfig {
             display_name: None,
+            anthropic_thinking: Default::default(),
+            cache_control: false,
             protocol,
             context_window: None,
             effective_input_limit_tokens: None,
@@ -229,6 +231,7 @@ mod tests {
     ) -> ProviderConfig {
         ProviderConfig {
             base_url: base_url.into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: api_key.into(),
             protocol,
             default_model: models.first().copied().unwrap_or_default().into(),
@@ -363,6 +366,7 @@ mod tests {
     fn expert_route_factory_rejects_an_unconfigured_model_for_a_known_provider() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
@@ -372,6 +376,8 @@ mod tests {
                 crate::config::ModelConfig {
                     display_name: None,
                     protocol: ApiProtocol::Completions,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,
@@ -410,6 +416,7 @@ mod tests {
     fn routed_child_retains_route_factory_for_takeover_restoration() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
@@ -419,6 +426,8 @@ mod tests {
                 crate::config::ModelConfig {
                     display_name: None,
                     protocol: ApiProtocol::Completions,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,
@@ -462,6 +471,7 @@ mod tests {
     fn expert_route_factory_creates_children_with_the_routed_provider_settings() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
@@ -478,6 +488,8 @@ mod tests {
                 crate::config::ModelConfig {
                     display_name: None,
                     protocol: ApiProtocol::Completions,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: Some(8_192),
                     effective_input_limit_tokens: Some(4_096),
                     max_output_tokens: Some(512),
@@ -718,6 +730,7 @@ mod tests {
                         transcript.record_assistant_tool_call_batch(
                             None,
                             None,
+                            None,
                             vec![crate::request_builder::HistoryToolCall {
                                 call_id: "call-1".into(),
                                 name: "fs__read".into(),
@@ -823,6 +836,7 @@ mod tests {
             .to_string();
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
@@ -832,6 +846,8 @@ mod tests {
                 crate::config::ModelConfig {
                     display_name: None,
                     protocol: ApiProtocol::Completions,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,

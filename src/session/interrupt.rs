@@ -167,6 +167,7 @@ mod tests {
                 TranscriptEvent::AssistantToolCallBatch {
                     text: None,
                     reasoning_content: None,
+                    reasoning_wire: None,
                     calls: vec![HistoryToolCall {
                         call_id: "batch-call".into(),
                         name: "agent__oracle".into(),

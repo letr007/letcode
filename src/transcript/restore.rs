@@ -151,10 +151,12 @@ pub(crate) fn append_history_item_from_transcript_record(
         TranscriptEvent::AssistantToolCallBatch {
             text,
             reasoning_content,
+            reasoning_wire,
             calls,
         } => Some(HistoryItem::AssistantToolCalls {
             text: text.clone(),
             reasoning_content: reasoning_content.clone(),
+            reasoning_wire: reasoning_wire.clone(),
             calls: calls.clone(),
         }),
         TranscriptEvent::ToolCallStarted {
@@ -164,6 +166,7 @@ pub(crate) fn append_history_item_from_transcript_record(
         } => Some(HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![HistoryToolCall {
                 call_id: call_id.clone(),
                 name: name.clone(),

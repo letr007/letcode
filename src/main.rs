@@ -621,6 +621,7 @@ mod tests {
     fn active_provider_model_switch_reconfigures_complete_route() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: config::ApiProtocol::Completions,
             default_model: "shared".into(),
@@ -637,6 +638,8 @@ mod tests {
                 config::ModelConfig {
                     display_name: None,
                     protocol: config::ApiProtocol::Completions,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: Some(8_192),
                     effective_input_limit_tokens: Some(4_096),
                     max_output_tokens: Some(512),
@@ -713,6 +716,7 @@ mod tests {
 
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "test-key".into(),
             protocol: config::ApiProtocol::Responses,
             default_model: "available".into(),

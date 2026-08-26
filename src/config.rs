@@ -18,6 +18,14 @@ pub enum ApiProtocol {
     #[default]
     Responses,
     Completions,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAuthMode {
+    ApiKey,
+    Bearer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -283,11 +291,23 @@ impl ModelRoute {
     }
 
     pub fn build_client(&self, provider: &ProviderConfig) -> Client<OpenAIConfig> {
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(provider.base_url.clone())
-                .with_api_key(provider.api_key.clone()),
-        )
+        let effective_protocol = provider
+            .models
+            .get(&self.model)
+            .map(|model| model.protocol)
+            .unwrap_or(provider.protocol);
+        let mut config = OpenAIConfig::new()
+            .with_api_base(provider.base_url.clone())
+            .with_api_key(provider.api_key.clone());
+        if effective_protocol == ApiProtocol::Anthropic {
+            config = match provider.auth_mode {
+                ProviderAuthMode::ApiKey => config
+                    .with_header("x-api-key", provider.api_key.as_str())
+                    .expect("provider api key is a valid header value"),
+                ProviderAuthMode::Bearer => config,
+            };
+        }
+        Client::with_config(config)
     }
 }
 
@@ -461,6 +481,7 @@ pub struct McpRemoteServerConfig {
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
+    pub auth_mode: ProviderAuthMode,
     pub protocol: ApiProtocol,
     pub default_model: String,
     pub retry: Option<RetryConfig>,
@@ -486,6 +507,8 @@ impl ProviderConfig {
 pub struct ModelConfig {
     pub display_name: Option<String>,
     pub protocol: ApiProtocol,
+    pub anthropic_thinking: crate::request_builder::AnthropicThinkingConfig,
+    pub cache_control: bool,
     pub context_window: Option<u64>,
     pub effective_input_limit_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
@@ -518,6 +541,8 @@ impl ModelConfig {
             prompt_cache: self.prompt_cache.clone(),
             parallel_tool_calls: self.parallel_tool_calls,
             fast_mode: false,
+            anthropic_thinking: self.anthropic_thinking,
+            cache_control: self.cache_control,
         }
     }
 }
@@ -651,6 +676,7 @@ enum RawMcpServerKind {
 struct RawProviderConfig {
     base_url: Option<String>,
     api_key: Option<String>,
+    auth_mode: Option<ProviderAuthMode>,
     protocol: Option<ApiProtocol>,
     default_model: Option<String>,
     retry: Option<RawRetryConfig>,
@@ -664,6 +690,9 @@ struct RawModelConfig {
     #[serde(default, alias = "name")]
     display_name: Option<String>,
     protocol: Option<ApiProtocol>,
+    anthropic_thinking: Option<crate::request_builder::AnthropicThinkingConfig>,
+    #[serde(default)]
+    cache_control: bool,
     context_window: Option<u64>,
     effective_input_limit_tokens: Option<u64>,
     max_output_tokens: Option<u64>,
@@ -726,9 +755,25 @@ fn build_provider_config(
         Some(protocol) => protocol,
         None if name.eq_ignore_ascii_case("openai") => ApiProtocol::Responses,
         None => bail!(
-            "provider '{}' must set protocol to 'responses' or 'completions'",
+            "provider '{}' must set protocol to 'responses', 'completions', or 'anthropic'",
             name
         ),
+    };
+    let has_anthropic_model_override = raw
+        .models
+        .values()
+        .any(|model| model.protocol == Some(ApiProtocol::Anthropic));
+    let auth_mode = match raw.auth_mode {
+        Some(mode) => mode,
+        None if protocol == ApiProtocol::Anthropic => bail!(
+            "provider '{}' with protocol = 'anthropic' requires auth_mode = 'api-key' or 'bearer'",
+            name
+        ),
+        None if has_anthropic_model_override => bail!(
+            "provider '{}' with a model protocol = 'anthropic' requires auth_mode = 'api-key' or 'bearer'",
+            name
+        ),
+        None => ProviderAuthMode::Bearer,
     };
 
     let default_model = required_non_empty(
@@ -762,6 +807,7 @@ fn build_provider_config(
         ProviderConfig {
             base_url,
             api_key,
+            auth_mode,
             protocol,
             default_model,
             retry: raw
@@ -849,6 +895,33 @@ fn normalize_model_config(
     }
 
     let protocol = raw.protocol.unwrap_or(provider_protocol);
+    let anthropic_thinking = raw.anthropic_thinking.unwrap_or_default();
+    if anthropic_thinking.mode != crate::request_builder::AnthropicThinkingMode::Disabled {
+        if protocol != ApiProtocol::Anthropic {
+            bail!(
+                "providers.{provider_name}.models.{model_id}.anthropic_thinking is only supported for anthropic protocol"
+            );
+        }
+        if !supports_reasoning {
+            bail!(
+                "providers.{provider_name}.models.{model_id}.anthropic_thinking requires supports_reasoning = true"
+            );
+        }
+        if anthropic_thinking.mode == crate::request_builder::AnthropicThinkingMode::Budget {
+            let budget_path = format!(
+                "providers.{provider_name}.models.{model_id}.anthropic_thinking.budget_tokens"
+            );
+            let budget = optional_positive_u64(&budget_path, anthropic_thinking.budget_tokens)?;
+            if budget.is_none() {
+                bail!("{budget_path} is required when thinking mode is 'budget'");
+            }
+            if let Some(max_output_tokens) = raw.max_output_tokens
+                && budget >= Some(max_output_tokens)
+            {
+                bail!("{budget_path} must be less than max_output_tokens");
+            }
+        }
+    }
     let cache_path = format!("providers.{provider_name}.models.{model_id}.prompt_cache");
     let cache_enabled = raw.prompt_cache.enabled.unwrap_or(false);
     if !cache_enabled && raw.prompt_cache.retention.is_some() {
@@ -875,6 +948,8 @@ fn normalize_model_config(
         ModelConfig {
             display_name,
             protocol,
+            anthropic_thinking,
+            cache_control: raw.cache_control,
             context_window: raw.context_window,
             effective_input_limit_tokens,
             max_output_tokens: raw.max_output_tokens,
@@ -1479,6 +1554,46 @@ mod tests {
 
         assert!(default_config.providers["openai"].models["gpt-default"].parallel_tool_calls);
         assert!(!disabled_config.providers["openai"].models["gpt-disabled"].parallel_tool_calls);
+    }
+
+    #[test]
+    fn anthropic_model_override_requires_provider_auth_mode() {
+        let _guard = lock_env();
+        let missing_path = write_temp_config(
+            r#"
+            [providers.mixed]
+            api_key = "config-key"
+            base_url = "https://anthropic.invalid/v1"
+            protocol = "completions"
+
+            [providers.mixed.models."claude"]
+            protocol = "anthropic"
+            "#,
+        );
+        let error =
+            AppConfig::load_from_path(&missing_path).expect_err("config should be rejected");
+        assert!(error.to_string().contains(
+            "provider 'mixed' with a model protocol = 'anthropic' requires auth_mode = 'api-key' or 'bearer'"
+        ));
+
+        let configured_path = write_temp_config(
+            r#"
+            [providers.mixed]
+            api_key = "config-key"
+            base_url = "https://anthropic.invalid/v1"
+            protocol = "completions"
+            auth_mode = "api-key"
+
+            [providers.mixed.models."claude"]
+            protocol = "anthropic"
+            "#,
+        );
+        let config =
+            AppConfig::load_from_path(&configured_path).expect("configured override should load");
+        assert_eq!(
+            config.providers["mixed"].auth_mode,
+            ProviderAuthMode::ApiKey
+        );
     }
 
     #[test]

@@ -2649,6 +2649,17 @@ impl<C: Config> Agent<C> {
             ApiProtocol::Completions => {
                 protocol_stream::run_oai_comp_stream_async(
                     question_handler_guard.agent(),
+                    user_content.clone(),
+                    &user_input,
+                    on_delta,
+                    on_event,
+                    approve,
+                )
+                .await
+            }
+            ApiProtocol::Anthropic => {
+                protocol_stream::run_anthropic_stream_async(
+                    question_handler_guard.agent(),
                     user_content,
                     &user_input,
                     on_delta,
@@ -2834,18 +2845,20 @@ impl<C: Config> Agent<C> {
         turn_text: &str,
         tool_calls: &[HistoryToolCall],
     ) -> Result<()> {
-        self.append_assistant_tool_calls_with_reasoning_content(turn_text, None, tool_calls)
+        self.append_assistant_tool_calls_with_reasoning_content(turn_text, None, None, tool_calls)
     }
 
     fn append_assistant_tool_calls_with_reasoning_content(
         &mut self,
         turn_text: &str,
         reasoning_content: Option<&str>,
+        reasoning_wire: Option<&str>,
         tool_calls: &[HistoryToolCall],
     ) -> Result<()> {
         self.append_history_item(HistoryItem::AssistantToolCalls {
             text: (!turn_text.is_empty()).then(|| turn_text.to_string()),
             reasoning_content: reasoning_content.map(ToString::to_string),
+            reasoning_wire: reasoning_wire.map(ToString::to_string),
             calls: tool_calls.to_vec(),
         })
         .map_err(|error| anyhow!("assistant tool calls should remain protocol-compatible: {error}"))
@@ -4209,10 +4222,12 @@ pub(crate) fn protocol_frame_item_from_history_item(
         HistoryItem::AssistantToolCalls {
             text,
             reasoning_content,
+            reasoning_wire,
             calls,
         } => crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls {
             text: text.clone(),
             reasoning_content: reasoning_content.clone(),
+            reasoning_wire: reasoning_wire.clone(),
             calls: calls.clone(),
         },
         HistoryItem::ToolOutput {

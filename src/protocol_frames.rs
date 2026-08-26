@@ -42,6 +42,10 @@ pub enum ProtocolItem {
         text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        /// Provider-native reasoning state needed for exact replay (e.g. signed
+        /// Anthropic thinking blocks), stored as JSON. Never rendered as ordinary text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_wire: Option<String>,
         calls: Vec<ProtocolToolCall>,
     },
     ToolOutput {
@@ -139,12 +143,14 @@ impl ProtocolFrame {
             ProtocolFrameItem::AssistantToolCalls {
                 text,
                 reasoning_content,
+                reasoning_wire,
                 calls,
             } => format!(
-                "assistant_tool_calls:{}:{}:{}:{}",
+                "assistant_tool_calls:{}:{}:{}:{}:{}",
                 self.history_index,
                 text.clone().unwrap_or_default(),
                 reasoning_content.clone().unwrap_or_default(),
+                reasoning_wire.clone().unwrap_or_default(),
                 calls
                     .iter()
                     .map(|call| format!("{}:{}:{}", call.call_id, call.name, call.arguments_json))
@@ -443,6 +449,7 @@ impl ProtocolItem {
             ProtocolItem::AssistantToolCalls {
                 text,
                 reasoning_content,
+                reasoning_wire,
                 calls,
             } => {
                 out.push(0x04);
@@ -452,6 +459,10 @@ impl ProtocolItem {
                 }
                 match reasoning_content {
                     Some(text) => field!(0x02, text),
+                    None => out.push(0x00),
+                }
+                match reasoning_wire {
+                    Some(json) => field!(0x17, json),
                     None => out.push(0x00),
                 }
                 out.push(0x0f);
@@ -582,6 +593,7 @@ mod tests {
             HistoryItem::AssistantToolCalls {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![tool_call("call-1"), tool_call("call-2")],
             },
             HistoryItem::ToolOutput {
@@ -628,6 +640,7 @@ mod tests {
             HistoryItem::AssistantToolCalls {
                 text: Some("working".into()),
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![tool_call("call-1")],
             },
         ];
@@ -650,6 +663,7 @@ mod tests {
             HistoryItem::AssistantToolCalls {
                 text: None,
                 reasoning_content: None,
+                reasoning_wire: None,
                 calls: vec![tool_call("call-1")],
             },
         ];

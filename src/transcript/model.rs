@@ -309,6 +309,9 @@ pub enum TranscriptEvent {
         text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        /// Provider-native reasoning state needed for exact replay after restore.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_wire: Option<String>,
         calls: Vec<HistoryToolCall>,
     },
     ToolCallStarted {

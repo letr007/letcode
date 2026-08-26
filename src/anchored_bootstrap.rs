@@ -258,6 +258,7 @@ mod tests {
         HistoryItem::AssistantToolCalls {
             text: Some("calling".into()),
             reasoning_content: None,
+            reasoning_wire: None,
             calls: vec![],
         }
     }

@@ -1376,6 +1376,7 @@ mod tests {
     ) -> RunnerSubagentDelegate {
         let provider = crate::config::ProviderConfig {
             base_url: "http://127.0.0.1:9/v1".into(),
+            auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: crate::config::ApiProtocol::Completions,
             default_model: "shared".into(),
@@ -1385,6 +1386,8 @@ mod tests {
                 crate::config::ModelConfig {
                     display_name: None,
                     protocol: crate::config::ApiProtocol::Completions,
+                    anthropic_thinking: Default::default(),
+                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,

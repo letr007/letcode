@@ -71,6 +71,23 @@ impl ProviderRequestStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicThinkingMode {
+    #[default]
+    Disabled,
+    Adaptive,
+    Budget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AnthropicThinkingConfig {
+    #[serde(default)]
+    pub mode: AnthropicThinkingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelRequestMetadata {
     pub context_window: Option<u64>,
@@ -87,6 +104,8 @@ pub struct ModelRequestMetadata {
     pub prompt_cache: PromptCacheConfig,
     pub parallel_tool_calls: bool,
     pub fast_mode: bool,
+    pub anthropic_thinking: AnthropicThinkingConfig,
+    pub cache_control: bool,
 }
 
 pub const DEFAULT_REASONING_EFFORTS: [ModelReasoningEffort; 6] = [
@@ -432,6 +451,7 @@ pub enum BuiltRequest {
     ResponsesCompatible(Value),
     Completions(CreateChatCompletionRequest),
     CompletionsCompatible(Value),
+    Anthropic(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +578,26 @@ fn provider_request_without_units(build: &BuildResult) -> (Value, Value) {
         BuiltRequest::Completions(request) => {
             serde_json::to_value(request).expect("chat request serializes")
         }
+        BuiltRequest::Anthropic(request) => {
+            let mut request = request.clone();
+            if let Some(object) = request.as_object_mut() {
+                object.remove("system");
+                object.remove("messages");
+            }
+            let units = build
+                .prompt_plan
+                .segments
+                .iter()
+                .map(|segment| {
+                    serde_json::json!({
+                        "role": segment.role,
+                        "text": segment.text,
+                        "content": segment.content,
+                    })
+                })
+                .collect();
+            return (request, Value::Array(units));
+        }
     };
     let items = request
         .as_object_mut()
@@ -581,7 +621,7 @@ pub(crate) fn provider_unit_count_for_segment_prefix(
                 provider_serialization::prompt_segment_to_response_inputs(segment, strategy).len()
             })
             .sum(),
-        ApiProtocol::Completions => segments.len(),
+        ApiProtocol::Completions | ApiProtocol::Anthropic => segments.len(),
     }
 }
 
@@ -623,7 +663,9 @@ fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUni
                 )
             })
             .collect(),
-        BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => build
+        BuiltRequest::Completions(_)
+        | BuiltRequest::CompletionsCompatible(_)
+        | BuiltRequest::Anthropic(_) => build
             .prompt_plan
             .segments
             .iter()
@@ -884,6 +926,14 @@ pub(crate) fn build_request_from_selected_prompt(
             } else {
                 BuiltRequest::Responses(request)
             }
+        }
+        ApiProtocol::Anthropic => {
+            BuiltRequest::Anthropic(provider_serialization::build_anthropic_request(
+                input.model_id,
+                input.model.clone(),
+                &input.prompt_plan,
+                input.tools,
+            ))
         }
         ApiProtocol::Completions => {
             let request = build_completions_request(
