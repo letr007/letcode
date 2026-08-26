@@ -7,23 +7,32 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Client profiles supported by the fake request pipeline.
+/// Disguise mode selected by the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FakeClient {
+    /// Select the profile that matches the active provider protocol.
+    Auto,
+    /// Apply the Codex Responses wire profile.
     Codex,
+    /// Apply the Anthropic Messages transport profile.
+    Anthropic,
 }
 
 impl FakeClient {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Codex => "codex",
+            Self::Anthropic => "anthropic",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
             "codex" => Some(Self::Codex),
+            "anthropic" => Some(Self::Anthropic),
             _ => None,
         }
     }
@@ -245,6 +254,14 @@ fn synthetic_uuid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fake_client_parse_supports_all_modes() {
+        assert_eq!(FakeClient::parse("auto"), Some(FakeClient::Auto));
+        assert_eq!(FakeClient::parse("codex"), Some(FakeClient::Codex));
+        assert_eq!(FakeClient::parse("anthropic"), Some(FakeClient::Anthropic));
+        assert_eq!(FakeClient::parse("other"), None);
+    }
 
     #[test]
     fn codex_identity_uses_stable_session_ids_within_a_context() {

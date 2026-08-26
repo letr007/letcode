@@ -217,24 +217,8 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetFakeClient(client) => {
-                let protocol_supported = client.is_none()
-                    || matches!(
-                        agent.active_protocol(),
-                        crate::config::ApiProtocol::Responses
-                            | crate::config::ApiProtocol::Anthropic
-                    );
-                if !protocol_supported {
-                    let command = SessionCommand::SetFakeClient(client);
-                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
-                        command: command.clone(),
-                    });
-                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                        "Fake codex requires a Responses or Anthropic provider",
-                    )));
-                } else {
-                    agent.set_fake_client(client);
-                    let _ = event_tx.send(SessionTransportEvent::FakeClientChanged { client });
-                }
+                agent.set_fake_client(client);
+                let _ = event_tx.send(SessionTransportEvent::FakeClientChanged { client });
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetReasoningEffort(effort) => {

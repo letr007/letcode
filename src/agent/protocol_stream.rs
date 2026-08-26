@@ -491,7 +491,7 @@ where
     // Semantic recovery restarts the agent iteration; keep this budget outside
     // that loop so it applies to the complete Responses turn.
     let mut recovery_attempts = 0;
-    let fake_context = agent.fake_turn_context();
+    let fake_context = agent.fake_turn_context(crate::fake::FakeClient::Codex);
 
     let result = async {
         let mut iteration_count = 0;
@@ -2506,7 +2506,7 @@ where
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
     let mut recovery_attempts = 0;
-    let fake_context = agent.fake_turn_context();
+    let fake_context = agent.fake_turn_context(crate::fake::FakeClient::Anthropic);
     let result=async{
         let mut iteration_count=0;
         'agent_iteration:loop{

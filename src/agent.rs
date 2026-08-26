@@ -1282,10 +1282,18 @@ impl<C: Config> Agent<C> {
             client.map(|_| crate::fake::CodexIdentity::new(self.fake_installation_id.clone()));
     }
 
-    pub(crate) fn fake_turn_context(&self) -> Option<crate::fake::CodexRequestContext> {
-        self.fake_identity
-            .as_ref()
-            .map(|identity| identity.turn_context())
+    pub(crate) fn fake_turn_context(
+        &self,
+        profile: crate::fake::FakeClient,
+    ) -> Option<crate::fake::CodexRequestContext> {
+        (self.fake_client == Some(crate::fake::FakeClient::Auto)
+            || self.fake_client == Some(profile))
+        .then(|| {
+            self.fake_identity
+                .as_ref()
+                .map(|identity| identity.turn_context())
+        })
+        .flatten()
     }
 
     /// Enable the anchored bootstrap experiment. Fails fast when the alias

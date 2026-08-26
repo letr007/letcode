@@ -388,7 +388,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/fake",
         insert_text: "/fake ",
         description_key: "command.fake",
-        usage: "/fake [codex|off]",
+        usage: "/fake [auto|codex|anthropic|off]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -790,7 +790,9 @@ fn parse_fake(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
                 )),
             },
         },
-        ["/fake", ..] => Err(CommandParseError::new("Usage: /fake [codex|off]")),
+        ["/fake", ..] => Err(CommandParseError::new(
+            "Usage: /fake [auto|codex|anthropic|off]",
+        )),
         _ => unreachable!(),
     }
 }
@@ -1019,9 +1021,21 @@ mod tests {
             Ok(CommandIntent::Fake(FakeCommand::Show))
         );
         assert_eq!(
+            parse_command("/fake auto"),
+            Ok(CommandIntent::Fake(FakeCommand::Set(Some(
+                crate::fake::FakeClient::Auto
+            ))))
+        );
+        assert_eq!(
             parse_command("/fake codex"),
             Ok(CommandIntent::Fake(FakeCommand::Set(Some(
                 crate::fake::FakeClient::Codex
+            ))))
+        );
+        assert_eq!(
+            parse_command("/fake anthropic"),
+            Ok(CommandIntent::Fake(FakeCommand::Set(Some(
+                crate::fake::FakeClient::Anthropic
             ))))
         );
         assert_eq!(

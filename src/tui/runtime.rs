@@ -2663,9 +2663,19 @@ impl TuiRuntime {
                 Some("Use letcode's native request shape".into()),
             ),
             DialogItem::new(
+                "auto",
+                "Auto",
+                Some("Use Codex for Responses and Anthropic for Messages".into()),
+            ),
+            DialogItem::new(
                 "codex",
                 "Codex",
-                Some("Disguise Responses/Anthropic requests as Codex".into()),
+                Some("Use the Codex Responses wire profile".into()),
+            ),
+            DialogItem::new(
+                "anthropic",
+                "Anthropic",
+                Some("Use the Anthropic Messages transport profile".into()),
             ),
         ];
         let mut dialog = DialogState::new(

@@ -176,6 +176,47 @@ fn test_agent() -> Agent<OpenAIConfig> {
     Agent::new(client, "m1", 4, 4)
 }
 
+#[test]
+fn fake_modes_select_only_their_target_protocol() {
+    let mut agent = test_agent();
+
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Codex)
+            .is_some()
+    );
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Anthropic)
+            .is_none()
+    );
+
+    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Codex)
+            .is_none()
+    );
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Anthropic)
+            .is_some()
+    );
+
+    agent.set_fake_client(Some(crate::fake::FakeClient::Auto));
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Codex)
+            .is_some()
+    );
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Anthropic)
+            .is_some()
+    );
+}
+
 fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
     TokenUsageEstimate {
         used_tokens,
