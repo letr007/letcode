@@ -41,9 +41,7 @@ use crate::session::runner::ModelCatalogUpdatedEvent;
 use crate::session::{
     RunnerQuestionRequest, SessionEngine, SessionEngineIngress, SessionTransportEvent,
 };
-use assistant::{
-    AssistantDeltaStream, AssistantTypewriter, assistant_delta_event, assistant_delta_parts,
-};
+use assistant::{AssistantTypewriter, assistant_delta_event, assistant_delta_parts};
 #[path = "runtime/assistant.rs"]
 mod assistant;
 use branch_poller::BranchPoller;
@@ -186,7 +184,7 @@ pub trait RuntimeDrawer {
 
 #[derive(Debug, Clone)]
 struct OutputRateSample {
-    stream: AssistantDeltaStream,
+    child_session_id: Option<String>,
     started_at: Instant,
     streamed_bytes: u64,
 }
@@ -764,6 +762,7 @@ impl TuiRuntime {
         }
     }
 
+    #[cfg(test)]
     fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
         self.observe_output_rate_transport_event(&event, Instant::now());
         self.consume_observed_session_transport_event(event);
@@ -886,36 +885,70 @@ impl TuiRuntime {
         match event {
             SessionTransportEvent::UserMessage(_) => {
                 self.output_rate_samples
-                    .retain(|sample| sample.stream.child_session_id.is_some());
-                self.state.set_output_token_rate(None);
+                    .retain(|sample| sample.child_session_id.is_some());
             }
             SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
                 event: SessionEvent::UserMessage(_),
                 ..
             } => {
-                self.output_rate_samples.retain(|sample| {
-                    sample.stream.child_session_id.as_deref() != Some(child_session_id)
-                });
-                self.state
-                    .set_child_output_token_rate(child_session_id, None);
+                self.output_rate_samples
+                    .retain(|sample| sample.child_session_id.as_deref() != Some(child_session_id));
             }
-            _ => {
-                if let Some((stream, _, delta)) = assistant_delta_parts(event) {
-                    self.update_output_rate_sample(&stream, &delta, now);
-                } else {
-                    self.finish_output_rate_for_transport_event(event, now);
+            SessionTransportEvent::AssistantDelta(delta) => {
+                self.update_output_rate_sample(None, &delta.delta, now);
+            }
+            SessionTransportEvent::ReasoningDelta(delta) => {
+                self.update_output_rate_sample(None, &delta.delta, now);
+            }
+            SessionTransportEvent::ToolPending(tool) => {
+                self.update_output_rate_sample(None, &tool.name, now);
+            }
+            SessionTransportEvent::ToolStarted(tool) => {
+                if let Some(arguments) = tool.arguments.as_deref() {
+                    self.update_existing_output_rate_sample(None, arguments, now);
                 }
             }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::AssistantDelta(delta),
+                ..
+            } => {
+                self.update_output_rate_sample(Some(child_session_id), &delta.delta, now);
+            }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::ReasoningDelta(delta),
+                ..
+            } => {
+                self.update_output_rate_sample(Some(child_session_id), &delta.delta, now);
+            }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::ToolPending(tool),
+                ..
+            } => {
+                self.update_output_rate_sample(Some(child_session_id), &tool.name, now);
+            }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::ToolStarted(tool),
+                ..
+            } => {
+                if let Some(arguments) = tool.arguments.as_deref() {
+                    self.update_existing_output_rate_sample(Some(child_session_id), arguments, now);
+                }
+            }
+            _ => self.finish_output_rate_for_transport_event(event, now),
         }
     }
 
-    fn set_output_token_rate_for_stream(
+    fn set_output_token_rate_for_session(
         &mut self,
-        stream: &AssistantDeltaStream,
+        child_session_id: Option<&str>,
         rate: Option<u64>,
     ) {
-        if let Some(child_session_id) = stream.child_session_id.as_deref() {
+        if let Some(child_session_id) = child_session_id {
             self.state
                 .set_child_output_token_rate(child_session_id, rate);
         } else {
@@ -925,23 +958,41 @@ impl TuiRuntime {
 
     fn update_output_rate_sample(
         &mut self,
-        stream: &AssistantDeltaStream,
+        child_session_id: Option<&str>,
         delta: &str,
         now: Instant,
     ) {
         let sample_index = self
             .output_rate_samples
             .iter()
-            .position(|sample| sample.stream == *stream)
+            .position(|sample| sample.child_session_id.as_deref() == child_session_id)
             .unwrap_or_else(|| {
-                self.set_output_token_rate_for_stream(stream, None);
                 self.output_rate_samples.push(OutputRateSample {
-                    stream: stream.clone(),
+                    child_session_id: child_session_id.map(str::to_owned),
                     started_at: now,
                     streamed_bytes: 0,
                 });
                 self.output_rate_samples.len() - 1
             });
+        self.update_output_rate_sample_at(sample_index, delta, now);
+    }
+
+    fn update_existing_output_rate_sample(
+        &mut self,
+        child_session_id: Option<&str>,
+        delta: &str,
+        now: Instant,
+    ) {
+        if let Some(sample_index) = self
+            .output_rate_samples
+            .iter()
+            .position(|sample| sample.child_session_id.as_deref() == child_session_id)
+        {
+            self.update_output_rate_sample_at(sample_index, delta, now);
+        }
+    }
+
+    fn update_output_rate_sample_at(&mut self, sample_index: usize, delta: &str, now: Instant) {
         let sample = &mut self.output_rate_samples[sample_index];
         sample.streamed_bytes = sample.streamed_bytes.saturating_add(delta.len() as u64);
         let elapsed = now.saturating_duration_since(sample.started_at);
@@ -950,7 +1001,8 @@ impl TuiRuntime {
         }
         let estimated_tokens = sample.streamed_bytes.div_ceil(3);
         let rate = (estimated_tokens as f64 / elapsed.as_secs_f64()).round() as u64;
-        self.set_output_token_rate_for_stream(stream, Some(rate));
+        let child_session_id = sample.child_session_id.clone();
+        self.set_output_token_rate_for_session(child_session_id.as_deref(), Some(rate));
     }
 
     fn finish_output_rate_for_transport_event(
@@ -982,7 +1034,7 @@ impl TuiRuntime {
         let Some(sample_index) = self
             .output_rate_samples
             .iter()
-            .position(|sample| sample.stream.child_session_id.as_deref() == child_session_id)
+            .position(|sample| sample.child_session_id.as_deref() == child_session_id)
         else {
             return;
         };
@@ -992,7 +1044,7 @@ impl TuiRuntime {
             return;
         }
         let rate = (output_tokens as f64 / elapsed.as_secs_f64()).round() as u64;
-        self.set_output_token_rate_for_stream(&sample.stream, Some(rate));
+        self.set_output_token_rate_for_session(sample.child_session_id.as_deref(), Some(rate));
     }
 
     pub fn apply_session_transport_event(&mut self, event: SessionTransportEvent) {
@@ -1088,7 +1140,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::Done => {
                 self.output_rate_samples
-                    .retain(|sample| sample.stream.child_session_id.is_some());
+                    .retain(|sample| sample.child_session_id.is_some());
                 self.permission_lifecycle.clear_if_parent();
                 self.cancel_pending_question_if_parent("question cancelled because the turn ended");
                 self.interrupt_confirmation_pending = false;
@@ -1116,8 +1168,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::Error(_) => {
                 self.output_rate_samples
-                    .retain(|sample| sample.stream.child_session_id.is_some());
-                self.state.set_output_token_rate(None);
+                    .retain(|sample| sample.child_session_id.is_some());
                 self.interrupt_confirmation_pending = false;
                 self.session_resume_pending = false;
                 self.queued_prompt_lifecycle.record_error();
@@ -1236,8 +1287,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::Interrupted => {
                 self.output_rate_samples
-                    .retain(|sample| sample.stream.child_session_id.is_some());
-                self.state.set_output_token_rate(None);
+                    .retain(|sample| sample.child_session_id.is_some());
                 self.permission_lifecycle.clear_if_parent();
                 let _ = self
                     .cancel_pending_question("question cancelled because the turn was interrupted");
@@ -1391,6 +1441,7 @@ impl TuiRuntime {
                 // restore it when the in-flight handle is still live.
                 let pending_question = self.state.pending_question.take();
                 let parent_token_usage = self.state.model_token_usage.clone();
+                let parent_output_token_rate = self.state.output_token_rate;
                 let preserve_live_parent = self.session_turn_active
                     || self.state.phase == super::state::AppPhase::Running
                     || self.state.active_tool_call_id.is_some();
@@ -1444,6 +1495,7 @@ impl TuiRuntime {
                 } else if let Some(parent_token_usage) = parent_token_usage {
                     self.state.set_token_usage(parent_token_usage);
                 }
+                self.state.set_output_token_rate(parent_output_token_rate);
             }
             SessionTransportEvent::ContextBranchChanged { branch_id } => {
                 self.state.set_current_context_branch(branch_id.clone());
@@ -1569,12 +1621,8 @@ impl TuiRuntime {
                     SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
                 ) {
                     self.output_rate_samples.retain(|sample| {
-                        sample.stream.child_session_id.as_deref() != Some(child_session_id)
+                        sample.child_session_id.as_deref() != Some(child_session_id)
                     });
-                    if matches!(event, SessionEvent::Error(_) | SessionEvent::Interrupted) {
-                        self.state
-                            .set_child_output_token_rate(child_session_id, None);
-                    }
                 }
                 self.state
                     .merge_child_prompt_composition(child_session_id, &mut event);

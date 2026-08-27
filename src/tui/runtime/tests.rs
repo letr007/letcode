@@ -1475,6 +1475,33 @@ fn parent_view_refresh_without_usage_preserves_known_parent_usage() {
 }
 
 #[test]
+fn parent_view_refresh_preserves_output_token_rate() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_output_token_rate(Some(60));
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+        session_id: "parent-session".into(),
+        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+        records: vec![],
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("parent-session", 1),
+    });
+
+    assert_eq!(runtime.state().active_output_token_rate(), Some(60));
+}
+
+#[test]
 fn parent_view_refresh_preserves_confirmed_reasoning_effort() {
     let mut runtime = runtime();
     runtime
@@ -7114,19 +7141,10 @@ fn deferred_transport_events_are_bounded_per_drain() {
 #[test]
 fn output_token_rate_updates_during_streaming_and_uses_final_provider_usage() {
     let mut runtime = runtime();
-    let stream = AssistantDeltaStream {
-        child_session_id: None,
-        parent_tool_call_id: None,
-        message_id: None,
-    };
     let started_at = Instant::now();
 
-    runtime.update_output_rate_sample(&stream, "a", started_at);
-    runtime.update_output_rate_sample(
-        &stream,
-        &"a".repeat(179),
-        started_at + Duration::from_secs(2),
-    );
+    runtime.update_output_rate_sample(None, "a", started_at);
+    runtime.update_output_rate_sample(None, &"a".repeat(179), started_at + Duration::from_secs(2));
     assert_eq!(runtime.state().active_output_token_rate(), Some(30));
 
     runtime.finish_output_rate_for_transport_event(
@@ -7142,26 +7160,11 @@ fn output_token_rate_updates_during_streaming_and_uses_final_provider_usage() {
 fn output_token_rate_tracks_parent_and_child_streams_independently() {
     let mut runtime = runtime();
     let started_at = Instant::now();
-    let parent = AssistantDeltaStream {
-        child_session_id: None,
-        parent_tool_call_id: None,
-        message_id: None,
-    };
-    let child = AssistantDeltaStream {
-        child_session_id: Some("child".into()),
-        parent_tool_call_id: None,
-        message_id: None,
-    };
-
-    runtime.update_output_rate_sample(&parent, "a", started_at);
-    runtime.update_output_rate_sample(&child, "b", started_at);
+    runtime.update_output_rate_sample(None, "a", started_at);
+    runtime.update_output_rate_sample(Some("child"), "b", started_at);
+    runtime.update_output_rate_sample(None, &"a".repeat(179), started_at + Duration::from_secs(2));
     runtime.update_output_rate_sample(
-        &parent,
-        &"a".repeat(179),
-        started_at + Duration::from_secs(2),
-    );
-    runtime.update_output_rate_sample(
-        &child,
+        Some("child"),
         &"b".repeat(359),
         started_at + Duration::from_secs(2),
     );
@@ -7181,17 +7184,46 @@ fn output_token_rate_tracks_parent_and_child_streams_independently() {
 }
 
 #[test]
-fn child_user_message_clears_previous_output_token_rate() {
+fn output_token_rate_includes_reasoning_and_tool_call_model_output() {
+    let mut runtime = runtime();
+    let started_at = Instant::now();
+
+    runtime.observe_output_rate_transport_event(
+        &SessionTransportEvent::ReasoningDelta(crate::session::ReasoningDeltaEvent::at(
+            "reasoning",
+            "a".repeat(90),
+            started_at,
+        )),
+        started_at,
+    );
+    runtime.observe_output_rate_transport_event(
+        &SessionTransportEvent::ToolPending(crate::session::ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )),
+        started_at + Duration::from_secs(1),
+    );
+    runtime.observe_output_rate_transport_event(
+        &SessionTransportEvent::ToolStarted(crate::session::ToolStartedEvent {
+            call_id: "call-1".into(),
+            name: "shell__exec".into(),
+            summary: "run command".into(),
+            arguments: Some("b".repeat(78)),
+        }),
+        started_at + Duration::from_secs(2),
+    );
+
+    assert_eq!(runtime.state().active_output_token_rate(), Some(30));
+}
+
+#[test]
+fn child_user_message_keeps_previous_output_token_rate() {
     let mut runtime = runtime();
     runtime
         .state_mut()
         .set_child_output_token_rate("child", Some(60));
     runtime.output_rate_samples.push(super::OutputRateSample {
-        stream: AssistantDeltaStream {
-            child_session_id: Some("child".into()),
-            parent_tool_call_id: None,
-            message_id: None,
-        },
+        child_session_id: Some("child".into()),
         started_at: Instant::now(),
         streamed_bytes: 180,
     });
@@ -7214,7 +7246,7 @@ fn child_user_message_clears_previous_output_token_rate() {
         1,
         1,
     );
-    assert_eq!(runtime.state().active_output_token_rate(), None);
+    assert_eq!(runtime.state().active_output_token_rate(), Some(60));
     assert!(runtime.output_rate_samples.is_empty());
 }
 
