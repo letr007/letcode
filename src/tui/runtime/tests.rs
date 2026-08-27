@@ -7184,6 +7184,66 @@ fn output_token_rate_tracks_parent_and_child_streams_independently() {
 }
 
 #[test]
+fn output_token_rate_ignores_short_tool_call_spikes() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_output_token_rate(Some(60));
+    let started_at = Instant::now();
+
+    runtime.observe_output_rate_transport_event(
+        &SessionTransportEvent::ToolPending(crate::session::ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )),
+        started_at,
+    );
+    runtime.observe_output_rate_transport_event(
+        &SessionTransportEvent::ToolStarted(crate::session::ToolStartedEvent {
+            call_id: "call-1".into(),
+            name: "shell__exec".into(),
+            summary: "run command".into(),
+            arguments: Some("x".repeat(1_500)),
+        }),
+        started_at + Duration::from_millis(20),
+    );
+
+    assert_eq!(runtime.state().active_output_token_rate(), Some(60));
+}
+
+#[test]
+fn output_token_rate_limits_first_update_of_a_new_request() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_output_token_rate(Some(60));
+    let started_at = Instant::now();
+
+    runtime.update_output_rate_sample(None, "x", started_at);
+    runtime.update_output_rate_sample(
+        None,
+        &"x".repeat(1_499),
+        started_at + Duration::from_millis(500),
+    );
+
+    assert_eq!(runtime.state().active_output_token_rate(), Some(120));
+}
+
+#[test]
+fn output_token_rate_limits_sudden_increases() {
+    let mut runtime = runtime();
+    let started_at = Instant::now();
+
+    runtime.update_output_rate_sample(None, &"a".repeat(90), started_at);
+    runtime.update_output_rate_sample(None, "", started_at + Duration::from_secs(1));
+    assert_eq!(runtime.state().active_output_token_rate(), Some(30));
+
+    runtime.update_output_rate_sample(
+        None,
+        &"b".repeat(3_000),
+        started_at + Duration::from_millis(1_300),
+    );
+
+    assert_eq!(runtime.state().active_output_token_rate(), Some(60));
+}
+
+#[test]
 fn output_token_rate_includes_reasoning_and_tool_call_model_output() {
     let mut runtime = runtime();
     let started_at = Instant::now();
@@ -7213,7 +7273,7 @@ fn output_token_rate_includes_reasoning_and_tool_call_model_output() {
         started_at + Duration::from_secs(2),
     );
 
-    assert_eq!(runtime.state().active_output_token_rate(), Some(30));
+    assert_eq!(runtime.state().active_output_token_rate(), Some(33));
 }
 
 #[test]
@@ -7226,6 +7286,8 @@ fn child_user_message_keeps_previous_output_token_rate() {
         child_session_id: Some("child".into()),
         started_at: Instant::now(),
         streamed_bytes: 180,
+        displayed_rate: Some(60.0),
+        last_display_at: None,
     });
 
     let event = SessionTransportEvent::ChildSessionEvent {

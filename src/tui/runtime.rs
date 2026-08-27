@@ -187,6 +187,8 @@ struct OutputRateSample {
     child_session_id: Option<String>,
     started_at: Instant,
     streamed_bytes: u64,
+    displayed_rate: Option<f64>,
+    last_display_at: Option<Instant>,
 }
 
 pub struct TuiRuntime {
@@ -967,10 +969,19 @@ impl TuiRuntime {
             .iter()
             .position(|sample| sample.child_session_id.as_deref() == child_session_id)
             .unwrap_or_else(|| {
+                let displayed_rate = if let Some(child_session_id) = child_session_id {
+                    self.state
+                        .child_output_token_rate(child_session_id)
+                        .map(|rate| rate as f64)
+                } else {
+                    self.state.output_token_rate.map(|rate| rate as f64)
+                };
                 self.output_rate_samples.push(OutputRateSample {
                     child_session_id: child_session_id.map(str::to_owned),
                     started_at: now,
                     streamed_bytes: 0,
+                    displayed_rate,
+                    last_display_at: None,
                 });
                 self.output_rate_samples.len() - 1
             });
@@ -993,16 +1004,38 @@ impl TuiRuntime {
     }
 
     fn update_output_rate_sample_at(&mut self, sample_index: usize, delta: &str, now: Instant) {
+        const MIN_SAMPLE_DURATION: Duration = Duration::from_millis(500);
+        const MIN_DISPLAY_INTERVAL: Duration = Duration::from_millis(250);
+        const RATE_SMOOTHING: f64 = 0.25;
+        const MAX_RATE_INCREASE_FACTOR: f64 = 2.0;
+
         let sample = &mut self.output_rate_samples[sample_index];
         sample.streamed_bytes = sample.streamed_bytes.saturating_add(delta.len() as u64);
         let elapsed = now.saturating_duration_since(sample.started_at);
-        if elapsed.is_zero() {
+        if elapsed < MIN_SAMPLE_DURATION
+            || sample.last_display_at.is_some_and(|last_display_at| {
+                now.saturating_duration_since(last_display_at) < MIN_DISPLAY_INTERVAL
+            })
+        {
             return;
         }
         let estimated_tokens = sample.streamed_bytes.div_ceil(3);
-        let rate = (estimated_tokens as f64 / elapsed.as_secs_f64()).round() as u64;
+        let instantaneous_rate = estimated_tokens as f64 / elapsed.as_secs_f64();
+        let displayed_rate = match sample.displayed_rate {
+            Some(previous) => {
+                let smoothed =
+                    previous * (1.0 - RATE_SMOOTHING) + instantaneous_rate * RATE_SMOOTHING;
+                smoothed.min(previous * MAX_RATE_INCREASE_FACTOR)
+            }
+            None => instantaneous_rate,
+        };
+        sample.displayed_rate = Some(displayed_rate);
+        sample.last_display_at = Some(now);
         let child_session_id = sample.child_session_id.clone();
-        self.set_output_token_rate_for_session(child_session_id.as_deref(), Some(rate));
+        self.set_output_token_rate_for_session(
+            child_session_id.as_deref(),
+            Some(displayed_rate.round() as u64),
+        );
     }
 
     fn finish_output_rate_for_transport_event(

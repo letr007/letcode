@@ -1615,6 +1615,18 @@ impl TuiState {
         self.output_token_rate = rate;
     }
 
+    pub fn child_output_token_rate(&self, child_session_id: &str) -> Option<u64> {
+        self.child_timeline
+            .as_ref()
+            .filter(|child| child.session_id == child_session_id)
+            .and_then(|child| child.output_token_rate)
+            .or_else(|| {
+                self.child_timeline_cache
+                    .get(child_session_id)
+                    .and_then(|child| child.output_token_rate)
+            })
+    }
+
     pub fn clear_all_output_token_rates(&mut self) {
         self.output_token_rate = None;
         if let Some(child) = self.child_timeline.as_mut() {
