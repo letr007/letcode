@@ -418,6 +418,7 @@ pub(super) fn project_child_timeline_state(
         active_tool_call_id: None,
         pending_permission: None,
         model_token_usage: None,
+        output_token_rate: None,
         compaction_active: false,
         compaction_animation_start_frame: 0,
         ignore_late_tool_events: false,

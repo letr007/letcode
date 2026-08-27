@@ -41,7 +41,9 @@ use crate::session::runner::ModelCatalogUpdatedEvent;
 use crate::session::{
     RunnerQuestionRequest, SessionEngine, SessionEngineIngress, SessionTransportEvent,
 };
-use assistant::{AssistantTypewriter, assistant_delta_event, assistant_delta_parts};
+use assistant::{
+    AssistantDeltaStream, AssistantTypewriter, assistant_delta_event, assistant_delta_parts,
+};
 #[path = "runtime/assistant.rs"]
 mod assistant;
 use branch_poller::BranchPoller;
@@ -182,6 +184,13 @@ pub trait RuntimeDrawer {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
 }
 
+#[derive(Debug, Clone)]
+struct OutputRateSample {
+    stream: AssistantDeltaStream,
+    started_at: Instant,
+    streamed_bytes: u64,
+}
+
 pub struct TuiRuntime {
     state: TuiState,
     session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
@@ -200,6 +209,7 @@ pub struct TuiRuntime {
     /// One-shot background release check. Failures are logged and never interrupt the TUI.
     update_check_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Option<String>>>>,
     current_turn_output_tokens: u64,
+    output_rate_samples: Vec<OutputRateSample>,
     history_selection: Option<usize>,
     history_draft: Option<ComposerDraft>,
     available_models: Vec<AvailableModel>,
@@ -240,6 +250,7 @@ impl TuiRuntime {
             session_list_rx: None,
             update_check_rx: None,
             current_turn_output_tokens: 0,
+            output_rate_samples: Vec::new(),
             history_selection: None,
             history_draft: None,
             available_models,
@@ -648,6 +659,7 @@ impl TuiRuntime {
             match self.session_transport_rx.try_recv() {
                 Ok(event) => {
                     budget.receive();
+                    self.observe_output_rate_transport_event(&event, Instant::now());
                     enqueue_merged_event(&mut batch, event);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -662,7 +674,7 @@ impl TuiRuntime {
                 break;
             };
             budget.consume();
-            self.consume_session_transport_event(event);
+            self.consume_observed_session_transport_event(event);
         }
         // Preserve events that were received but could not be applied within this
         // frame. They remain ordered after already-deferred work and are handled by
@@ -753,6 +765,11 @@ impl TuiRuntime {
     }
 
     fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
+        self.observe_output_rate_transport_event(&event, Instant::now());
+        self.consume_observed_session_transport_event(event);
+    }
+
+    fn consume_observed_session_transport_event(&mut self, event: SessionTransportEvent) {
         if !self.deferred_session_events.is_empty() {
             self.enqueue_deferred_session_event(event);
             return;
@@ -865,6 +882,119 @@ impl TuiRuntime {
         }
     }
 
+    fn observe_output_rate_transport_event(&mut self, event: &SessionTransportEvent, now: Instant) {
+        match event {
+            SessionTransportEvent::UserMessage(_) => {
+                self.output_rate_samples
+                    .retain(|sample| sample.stream.child_session_id.is_some());
+                self.state.set_output_token_rate(None);
+            }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::UserMessage(_),
+                ..
+            } => {
+                self.output_rate_samples.retain(|sample| {
+                    sample.stream.child_session_id.as_deref() != Some(child_session_id)
+                });
+                self.state
+                    .set_child_output_token_rate(child_session_id, None);
+            }
+            _ => {
+                if let Some((stream, _, delta)) = assistant_delta_parts(event) {
+                    self.update_output_rate_sample(&stream, &delta, now);
+                } else {
+                    self.finish_output_rate_for_transport_event(event, now);
+                }
+            }
+        }
+    }
+
+    fn set_output_token_rate_for_stream(
+        &mut self,
+        stream: &AssistantDeltaStream,
+        rate: Option<u64>,
+    ) {
+        if let Some(child_session_id) = stream.child_session_id.as_deref() {
+            self.state
+                .set_child_output_token_rate(child_session_id, rate);
+        } else {
+            self.state.set_output_token_rate(rate);
+        }
+    }
+
+    fn update_output_rate_sample(
+        &mut self,
+        stream: &AssistantDeltaStream,
+        delta: &str,
+        now: Instant,
+    ) {
+        let sample_index = self
+            .output_rate_samples
+            .iter()
+            .position(|sample| sample.stream == *stream)
+            .unwrap_or_else(|| {
+                self.set_output_token_rate_for_stream(stream, None);
+                self.output_rate_samples.push(OutputRateSample {
+                    stream: stream.clone(),
+                    started_at: now,
+                    streamed_bytes: 0,
+                });
+                self.output_rate_samples.len() - 1
+            });
+        let sample = &mut self.output_rate_samples[sample_index];
+        sample.streamed_bytes = sample.streamed_bytes.saturating_add(delta.len() as u64);
+        let elapsed = now.saturating_duration_since(sample.started_at);
+        if elapsed.is_zero() {
+            return;
+        }
+        let estimated_tokens = sample.streamed_bytes.div_ceil(3);
+        let rate = (estimated_tokens as f64 / elapsed.as_secs_f64()).round() as u64;
+        self.set_output_token_rate_for_stream(stream, Some(rate));
+    }
+
+    fn finish_output_rate_for_transport_event(
+        &mut self,
+        event: &SessionTransportEvent,
+        now: Instant,
+    ) {
+        match event {
+            SessionTransportEvent::TokenUsage(usage) if usage.output_tokens > 0 => {
+                self.finish_output_rate_sample(None, usage.output_tokens, now);
+            }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::TokenUsage(usage),
+                ..
+            } if usage.output_tokens > 0 => {
+                self.finish_output_rate_sample(Some(child_session_id), usage.output_tokens, now);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_output_rate_sample(
+        &mut self,
+        child_session_id: Option<&str>,
+        output_tokens: u64,
+        now: Instant,
+    ) {
+        let Some(sample_index) = self
+            .output_rate_samples
+            .iter()
+            .position(|sample| sample.stream.child_session_id.as_deref() == child_session_id)
+        else {
+            return;
+        };
+        let sample = self.output_rate_samples.remove(sample_index);
+        let elapsed = now.saturating_duration_since(sample.started_at);
+        if elapsed.is_zero() {
+            return;
+        }
+        let rate = (output_tokens as f64 / elapsed.as_secs_f64()).round() as u64;
+        self.set_output_token_rate_for_stream(&sample.stream, Some(rate));
+    }
+
     pub fn apply_session_transport_event(&mut self, event: SessionTransportEvent) {
         let mut suppress_session_event = false;
 
@@ -957,6 +1087,8 @@ impl TuiRuntime {
                 self.permission_lifecycle.clear();
             }
             SessionTransportEvent::Done => {
+                self.output_rate_samples
+                    .retain(|sample| sample.stream.child_session_id.is_some());
                 self.permission_lifecycle.clear_if_parent();
                 self.cancel_pending_question_if_parent("question cancelled because the turn ended");
                 self.interrupt_confirmation_pending = false;
@@ -983,6 +1115,9 @@ impl TuiRuntime {
                 self.session_turn_active = false;
             }
             SessionTransportEvent::Error(_) => {
+                self.output_rate_samples
+                    .retain(|sample| sample.stream.child_session_id.is_some());
+                self.state.set_output_token_rate(None);
                 self.interrupt_confirmation_pending = false;
                 self.session_resume_pending = false;
                 self.queued_prompt_lifecycle.record_error();
@@ -1099,6 +1234,9 @@ impl TuiRuntime {
                 self.session_title = Some(title.clone());
             }
             SessionTransportEvent::Interrupted => {
+                self.output_rate_samples
+                    .retain(|sample| sample.stream.child_session_id.is_some());
+                self.state.set_output_token_rate(None);
                 self.permission_lifecycle.clear_if_parent();
                 let _ = self
                     .cancel_pending_question("question cancelled because the turn was interrupted");
@@ -1141,10 +1279,11 @@ impl TuiRuntime {
             SessionTransportEvent::TokenUsage(token_usage) => {
                 let mut token_usage = token_usage.clone();
                 self.state.merge_parent_prompt_composition(&mut token_usage);
-                if token_usage.output_tokens > 0 {
+                let request_output_tokens = token_usage.output_tokens;
+                if request_output_tokens > 0 {
                     self.current_turn_output_tokens = self
                         .current_turn_output_tokens
-                        .saturating_add(token_usage.output_tokens);
+                        .saturating_add(request_output_tokens);
                 }
                 token_usage.output_tokens = self.current_turn_output_tokens;
                 self.state
@@ -1204,6 +1343,8 @@ impl TuiRuntime {
                 }
                 self.state.clear_child_timeline_cache();
                 self.session_resume_pending = false;
+                self.output_rate_samples.clear();
+                self.state.clear_all_output_token_rates();
                 self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
                 self.session_title = session_title_from_records(records);
@@ -1348,6 +1489,8 @@ impl TuiRuntime {
                 runtime_context,
                 expert_models,
             } => {
+                self.output_rate_samples.clear();
+                self.state.clear_all_output_token_rates();
                 if let Err(error) = self
                     .state
                     .try_replace_session_timeline_from_records_with_runtime_context(
@@ -1420,6 +1563,18 @@ impl TuiRuntime {
                 event,
             } => {
                 let mut event = event.clone();
+                if matches!(
+                    event,
+                    SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
+                ) {
+                    self.output_rate_samples.retain(|sample| {
+                        sample.stream.child_session_id.as_deref() != Some(child_session_id)
+                    });
+                    if matches!(event, SessionEvent::Error(_) | SessionEvent::Interrupted) {
+                        self.state
+                            .set_child_output_token_rate(child_session_id, None);
+                    }
+                }
                 self.state
                     .merge_child_prompt_composition(child_session_id, &mut event);
                 if self.child_event_clears_pending_permission(child_session_id, &event) {

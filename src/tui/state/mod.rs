@@ -398,6 +398,7 @@ struct ChildTranscriptState {
     active_tool_call_id: Option<String>,
     pending_permission: Option<PermissionView>,
     model_token_usage: Option<ModelTokenUsage>,
+    output_token_rate: Option<u64>,
     compaction_active: bool,
     compaction_animation_start_frame: usize,
     ignore_late_tool_events: bool,
@@ -421,6 +422,7 @@ impl ChildTranscriptState {
             active_tool_call_id: None,
             pending_permission: None,
             model_token_usage: None,
+            output_token_rate: None,
             compaction_active: false,
             compaction_animation_start_frame: 0,
             ignore_late_tool_events: false,
@@ -1123,6 +1125,7 @@ pub struct TuiState {
     pub anchored_active: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
     pub sidebar_model_token_usage: Option<ModelTokenUsage>,
+    pub output_token_rate: Option<u64>,
     /// 上下文压缩进行中：footer 指示条改用开火车式往返扫描，隐藏过期的 token 数字。
     pub compaction_active: bool,
     /// 压缩动画相对于全局 spinner 的起始帧，确保每次都从左→右填充开始。
@@ -1219,6 +1222,7 @@ impl Default for TuiState {
             anchored_active: false,
             model_token_usage: None,
             sidebar_model_token_usage: None,
+            output_token_rate: None,
             compaction_active: false,
             compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
@@ -1594,6 +1598,49 @@ impl TuiState {
                 .and_then(|state| state.model_token_usage.as_ref())
         } else {
             self.model_token_usage.as_ref()
+        }
+    }
+
+    pub fn active_output_token_rate(&self) -> Option<u64> {
+        if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .and_then(|state| state.output_token_rate)
+        } else {
+            self.output_token_rate
+        }
+    }
+
+    pub fn set_output_token_rate(&mut self, rate: Option<u64>) {
+        self.output_token_rate = rate;
+    }
+
+    pub fn clear_all_output_token_rates(&mut self) {
+        self.output_token_rate = None;
+        if let Some(child) = self.child_timeline.as_mut() {
+            child.output_token_rate = None;
+        }
+        for child in self.child_timeline_cache.values_mut() {
+            child.output_token_rate = None;
+        }
+    }
+
+    pub fn set_child_output_token_rate(&mut self, child_session_id: &str, rate: Option<u64>) {
+        if self
+            .child_timeline
+            .as_ref()
+            .is_some_and(|child| child.session_id == child_session_id)
+        {
+            if let Some(child) = self.child_timeline.as_mut() {
+                child.output_token_rate = rate;
+            }
+            return;
+        }
+        if !self.child_timeline_cache.contains_key(child_session_id) {
+            self.cache_child_timeline(ChildTranscriptState::empty(child_session_id));
+        }
+        if let Some(child) = self.child_timeline_cache.get_mut(child_session_id) {
+            child.output_token_rate = rate;
         }
     }
 
@@ -2284,6 +2331,9 @@ impl TuiState {
         let mut child_state = project_child_timeline_state(records)?;
         let child_session_id = child_session_id.into();
         child_state.session_id = child_session_id.clone();
+        if let Some(cached) = self.child_timeline_cache.remove(&child_session_id) {
+            child_state.output_token_rate = cached.output_token_rate;
+        }
         self.active_session = true;
         self.clear_input();
         self.close_dialog();
@@ -2451,6 +2501,7 @@ impl TuiState {
             active_tool_call_id: None,
             pending_permission: None,
             model_token_usage: None,
+            output_token_rate: None,
             compaction_active: false,
             compaction_animation_start_frame: 0,
             ignore_late_tool_events: false,
@@ -2620,6 +2671,7 @@ impl TuiState {
         self.phase = AppPhase::Completed;
         self.model_token_usage = None;
         self.sidebar_model_token_usage = None;
+        self.output_token_rate = None;
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();

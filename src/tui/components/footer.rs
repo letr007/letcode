@@ -68,10 +68,21 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
         // 压缩中：指示条转为开火车式往返扫描，隐藏过期的 token 数字。
         let animation_frame = state.status_spinner_frame.wrapping_sub(start_frame);
         compaction_indicator_spans(animation_frame, theme)
-    } else if let Some(usage) = state.active_model_token_usage() {
-        token_budget_spans(usage, theme)
     } else {
-        Vec::new()
+        let mut spans = state
+            .active_model_token_usage()
+            .map(|usage| token_budget_spans(usage, theme))
+            .unwrap_or_default();
+        if let Some(rate) = state.active_output_token_rate() {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", footer_dim_style(theme)));
+            }
+            spans.push(Span::styled(
+                format!("{rate}t/s"),
+                output_token_rate_style(rate, theme),
+            ));
+        }
+        spans
     };
     let status_width = spans_width(&status);
     if status_width > max_width {
@@ -275,6 +286,16 @@ fn token_budget_spans(
         footer_muted_style(theme),
     ));
     spans
+}
+
+fn output_token_rate_style(rate: u64, theme: Theme) -> Style {
+    let color = match rate {
+        0..=19 => theme.error,
+        20..=39 => theme.approval,
+        40..=79 => theme.warning,
+        _ => theme.success,
+    };
+    Style::default().fg(color).bg(theme.root_bg)
 }
 
 fn token_budget_cache_hit_percent(input_tokens: u64, cached_input_tokens: u64) -> Option<f64> {
@@ -766,7 +787,7 @@ fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
 mod tests {
     use super::{
         TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_status_spans,
-        render_footer, token_budget_cache_hit_percent, token_budget_cell,
+        output_token_rate_style, render_footer, token_budget_cache_hit_percent, token_budget_cell,
         token_budget_segment_units, token_budget_spans,
     };
     use crate::{
@@ -840,6 +861,53 @@ mod tests {
         assert!(!rendered.contains(" "), "{rendered}");
         assert!(!rendered.contains("󰙅 "), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_appends_output_token_rate_after_context_status() {
+        let mut state = TuiState::default();
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            input_tokens: 600,
+            output_tokens: 100,
+            cached_tokens: 0,
+            used_tokens: 700,
+            context_window_tokens: 1_000,
+            cache_report: None,
+            prompt_composition: Vec::new(),
+        });
+        state.set_output_token_rate(Some(60));
+
+        let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("~70% · 60t/s"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_shows_output_token_rate_before_provider_usage_arrives() {
+        let mut state = TuiState::default();
+        state.set_output_token_rate(Some(60));
+
+        let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains(" · 60t/s"), "{rendered}");
+    }
+
+    #[test]
+    fn output_token_rate_color_scales_from_slow_to_fast() {
+        let theme = crate::tui::Theme::dark();
+
+        assert_eq!(output_token_rate_style(19, theme).fg, Some(theme.error));
+        assert_eq!(output_token_rate_style(20, theme).fg, Some(theme.approval));
+        assert_eq!(output_token_rate_style(39, theme).fg, Some(theme.approval));
+        assert_eq!(output_token_rate_style(40, theme).fg, Some(theme.warning));
+        assert_eq!(output_token_rate_style(79, theme).fg, Some(theme.warning));
+        assert_eq!(output_token_rate_style(80, theme).fg, Some(theme.success));
     }
 
     #[test]
