@@ -217,8 +217,16 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetFakeClient(client) => {
-                agent.set_fake_client(client);
-                let _ = event_tx.send(SessionTransportEvent::FakeClientChanged { client });
+                if let Err(error) = agent.set_fake_client(client) {
+                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
+                        command: SessionCommand::SetFakeClient(client),
+                    });
+                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                        error.to_string(),
+                    )));
+                } else {
+                    let _ = event_tx.send(SessionTransportEvent::FakeClientChanged { client });
+                }
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetReasoningEffort(effort) => {
@@ -584,6 +592,19 @@ impl SessionCoordinator {
             )) => {
                 agent.clear_session_reasoning_efforts();
                 apply_prepared_restored_route(agent, route);
+                if agent
+                    .fake_client()
+                    .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
+                {
+                    agent
+                        .set_fake_client(None)
+                        .expect("disabling fake mode is always supported");
+                    let _ =
+                        event_tx.send(SessionTransportEvent::FakeClientChanged { client: None });
+                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                        "Fake mode disabled: unsupported by the restored model protocol",
+                    )));
+                }
                 apply_restored_permission_mode(agent, snapshot.latest_permission_mode.as_deref());
                 let reasoning_notice = apply_restored_reasoning_effort(agent, &snapshot.records);
                 agent.install_validated_runtime_snapshot(runtime_snapshot);

@@ -67,10 +67,11 @@ log_file = "logs/combined.log"
 
 [global.retry]
 # enabled = true
-# max_attempts = 50
+# max_attempts = 50              # 包含首次请求
 # max_recovery_attempts = 3
-# initial_delay_secs = 1
-# backoff_multiplier = 2.0
+# initial_delay_secs = 1         # 固定间隔，或指数退避的初始间隔
+# exponential_backoff = true
+# backoff_multiplier = 2.0       # 仅 exponential_backoff = true 时使用
 # jitter_secs = 1
 
 [permissions]
@@ -107,7 +108,11 @@ api_key = "YOUR_API_KEY"
 base_url = "https://api.openai.com/v1"
 protocol = "responses" # responses | completions（provider 名不是 openai 时必填）
 default_model = "gpt-5.5"
-# [providers.openai.retry]        # 可选：按 provider 覆盖 retry
+# [providers.openai.retry]        # 可选：按 provider 独立覆盖任意 retry 字段
+# enabled = true
+# max_attempts = 10
+# initial_delay_secs = 3
+# exponential_backoff = false     # false 时每次固定等待 initial_delay_secs
 
 [providers.openai.models."gpt-5.5"]
 display_name = "GPT-5.5"          # 别名：name
@@ -150,6 +155,7 @@ text_verbosity = "medium"         # low|medium|high
   单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的
   `reviewer` expert 来回答审批。
+- `[providers.<name>.retry]` 从 `[global.retry]` 继承未填写字段。`enabled` 控制是否重试；`exponential_backoff = false` 时每次固定等待 `initial_delay_secs`（不叠加 jitter），`true` 时按 `backoff_multiplier` 指数增长并可叠加 `jitter_secs`。服务端有效的 `Retry-After` 仍优先。`max_attempts` 包含首次请求。
 
 ## Skills
 

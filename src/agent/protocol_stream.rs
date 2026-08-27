@@ -2759,7 +2759,13 @@ where
             match send_anthropic_messages_stream(client, &request, anthropic_betas, None).await {
                 Ok(response) => response,
                 Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
-                    tokio::time::sleep(retry_delay(retry_config, attempt)).await;
+                    let delay = match &error {
+                        ChatStreamCreationError::Status { headers, .. } => {
+                            retry_delay_from_headers(retry_config, attempt, headers)
+                        }
+                        _ => retry_delay(retry_config, attempt),
+                    };
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
                 }
@@ -2840,7 +2846,13 @@ where
         let response = match response {
             Ok(response) => response,
             Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
-                tokio::time::sleep(retry_delay(retry_config, attempt)).await;
+                let delay = match &error {
+                    ChatStreamCreationError::Status { headers, .. } => {
+                        retry_delay_from_headers(retry_config, attempt, headers)
+                    }
+                    _ => retry_delay(retry_config, attempt),
+                };
+                tokio::time::sleep(delay).await;
                 attempt += 1;
                 continue;
             }

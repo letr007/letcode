@@ -1329,6 +1329,22 @@ async fn run_engine_loop(
                                     ),
                                 ));
                             }
+                            if agent
+                                .fake_client()
+                                .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
+                            {
+                                agent
+                                    .set_fake_client(None)
+                                    .expect("disabling fake mode is always supported");
+                                let _ = session_transport_tx.send(
+                                    SessionTransportEvent::FakeClientChanged { client: None },
+                                );
+                                let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                    NoticeEvent::info(
+                                        "Fake mode disabled: unsupported by the selected model protocol",
+                                    ),
+                                ));
+                            }
                             agent.set_subagent_child_factory(Arc::new(expert_factory));
                             expert_model_routes = updated_expert_model_routes;
                             // A sticky reviewer session records its actual route. Drop it after a
@@ -2123,6 +2139,22 @@ async fn run_engine_loop(
                                 "Fast mode auto-disabled: current model is unavailable",
                             )));
                         }
+                        if agent
+                            .fake_client()
+                            .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
+                        {
+                            agent
+                                .set_fake_client(None)
+                                .expect("disabling fake mode is always supported");
+                            let _ = session_transport_tx.send(
+                                SessionTransportEvent::FakeClientChanged { client: None },
+                            );
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                NoticeEvent::info(
+                                    "Fake mode disabled: unsupported by the resumed model protocol",
+                                ),
+                            ));
+                        }
                         expert_model_routes = resumed_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));
                         sticky_auto_reviewer.clear_sticky_session();
@@ -2251,6 +2283,22 @@ async fn run_engine_loop(
                             continue;
                         }
                         agent.apply_prepared_route(prepared_route);
+                        if agent
+                            .fake_client()
+                            .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
+                        {
+                            agent
+                                .set_fake_client(None)
+                                .expect("disabling fake mode is always supported");
+                            let _ = session_transport_tx.send(
+                                SessionTransportEvent::FakeClientChanged { client: None },
+                            );
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                NoticeEvent::info(
+                                    "Fake mode disabled: unsupported by the new session model protocol",
+                                ),
+                            ));
+                        }
                         let new_session_model_id = agent.route_display_name();
                         expert_model_routes = new_session_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));

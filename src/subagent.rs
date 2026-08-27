@@ -483,6 +483,7 @@ mod tests {
                 max_attempts: 1,
                 max_recovery_attempts: 1,
                 initial_delay_secs: 1,
+                exponential_backoff: false,
                 backoff_multiplier: 1.0,
                 jitter_secs: 0,
             }),

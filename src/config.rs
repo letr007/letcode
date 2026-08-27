@@ -21,6 +21,16 @@ pub enum ApiProtocol {
     Anthropic,
 }
 
+impl ApiProtocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::Completions => "completions",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderAuthMode {
@@ -48,7 +58,7 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
-const MAX_RETRY_ATTEMPTS: usize = 50;
+const MAX_RETRY_ATTEMPTS: usize = 9_000;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
 mod persistence;
 
@@ -390,6 +400,7 @@ pub struct RetryConfig {
     pub max_attempts: usize,
     pub max_recovery_attempts: usize,
     pub initial_delay_secs: u64,
+    pub exponential_backoff: bool,
     pub backoff_multiplier: f32,
     pub jitter_secs: u64,
 }
@@ -401,6 +412,7 @@ impl Default for RetryConfig {
             max_attempts: 50,
             max_recovery_attempts: 3,
             initial_delay_secs: 1,
+            exponential_backoff: true,
             backoff_multiplier: 2.0,
             jitter_secs: 1,
         }
@@ -597,6 +609,7 @@ struct RawRetryConfig {
     max_attempts: Option<usize>,
     max_recovery_attempts: Option<usize>,
     initial_delay_secs: Option<u64>,
+    exponential_backoff: Option<bool>,
     backoff_multiplier: Option<f32>,
     jitter_secs: Option<u64>,
 }
@@ -1404,6 +1417,7 @@ fn build_retry_config_overlay(
         raw.initial_delay_secs.unwrap_or(base.initial_delay_secs),
     )?;
     let jitter_secs = raw.jitter_secs.unwrap_or(base.jitter_secs);
+    let exponential_backoff = raw.exponential_backoff.unwrap_or(base.exponential_backoff);
     let backoff_multiplier = raw.backoff_multiplier.unwrap_or(base.backoff_multiplier);
     validate_f32_range(
         &format!("{path}.backoff_multiplier"),
@@ -1417,6 +1431,7 @@ fn build_retry_config_overlay(
         max_attempts,
         max_recovery_attempts,
         initial_delay_secs,
+        exponential_backoff,
         backoff_multiplier,
         jitter_secs,
     })
@@ -1478,7 +1493,7 @@ pub struct ConfigValidationReport {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nexponential_backoff = true\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# exponential_backoff = true\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -1508,7 +1523,7 @@ mod tests {
         let path = write_temp_config(
             r#"
             [global.retry]
-            max_attempts = 51
+            max_attempts = 9001
 
             [providers.openai]
             api_key = "config-key"
@@ -1522,8 +1537,45 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("global.retry.max_attempts must be at most 50")
+                .contains("global.retry.max_attempts must be at most 9000")
         );
+    }
+
+    #[test]
+    fn provider_retry_can_override_backoff_mode_interval_and_attempts() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            enabled = true
+            max_attempts = 9
+            initial_delay_secs = 1
+            exponential_backoff = true
+            backoff_multiplier = 2.0
+            jitter_secs = 0
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.retry]
+            max_attempts = 4
+            initial_delay_secs = 7
+            exponential_backoff = false
+
+            [providers.openai.models.model]
+            "#,
+        );
+        let config = AppConfig::load_from_path(&path).expect("provider retry config loads");
+        let retry = config.providers["openai"]
+            .retry
+            .as_ref()
+            .expect("provider retry override");
+        assert!(retry.enabled);
+        assert_eq!(retry.max_attempts, 4);
+        assert_eq!(retry.initial_delay_secs, 7);
+        assert!(!retry.exponential_backoff);
+        assert_eq!(retry.backoff_multiplier, 2.0);
+        assert_eq!(retry.jitter_secs, 0);
     }
 
     #[test]

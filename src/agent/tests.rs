@@ -180,7 +180,9 @@ fn test_agent() -> Agent<OpenAIConfig> {
 fn fake_modes_select_only_their_target_protocol() {
     let mut agent = test_agent();
 
-    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses protocol supports codex fake");
     assert!(
         agent
             .fake_turn_context(crate::fake::FakeClient::Codex)
@@ -192,7 +194,10 @@ fn fake_modes_select_only_their_target_protocol() {
             .is_none()
     );
 
-    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
+    agent.set_default_protocol(ApiProtocol::Anthropic);
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
+        .expect("anthropic protocol supports anthropic fake");
     assert!(
         agent
             .fake_turn_context(crate::fake::FakeClient::Codex)
@@ -204,7 +209,9 @@ fn fake_modes_select_only_their_target_protocol() {
             .is_some()
     );
 
-    agent.set_fake_client(Some(crate::fake::FakeClient::Auto));
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Auto))
+        .expect("anthropic protocol supports auto fake");
     assert!(
         agent
             .fake_turn_context(crate::fake::FakeClient::Codex)
@@ -215,6 +222,14 @@ fn fake_modes_select_only_their_target_protocol() {
             .fake_turn_context(crate::fake::FakeClient::Anthropic)
             .is_some()
     );
+
+    agent.set_default_protocol(ApiProtocol::Completions);
+    let previous = agent.fake_client();
+    let error = agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect_err("completions protocol rejects fake modes");
+    assert!(error.to_string().contains("not supported"));
+    assert_eq!(agent.fake_client(), previous);
 }
 
 fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
@@ -1673,6 +1688,7 @@ fn test_retry_config() -> RetryConfig {
         max_attempts: 3,
         max_recovery_attempts: 3,
         initial_delay_secs: 1,
+        exponential_backoff: true,
         backoff_multiplier: 2.0,
         jitter_secs: 0,
     }

@@ -36,6 +36,17 @@ impl FakeClient {
             _ => None,
         }
     }
+
+    pub const fn supports_protocol(self, protocol: crate::config::ApiProtocol) -> bool {
+        match self {
+            Self::Auto => matches!(
+                protocol,
+                crate::config::ApiProtocol::Responses | crate::config::ApiProtocol::Anthropic
+            ),
+            Self::Codex => matches!(protocol, crate::config::ApiProtocol::Responses),
+            Self::Anthropic => matches!(protocol, crate::config::ApiProtocol::Anthropic),
+        }
+    }
 }
 
 /// Stable synthetic identity used for one fake-enabled agent session.
@@ -261,6 +272,19 @@ mod tests {
         assert_eq!(FakeClient::parse("codex"), Some(FakeClient::Codex));
         assert_eq!(FakeClient::parse("anthropic"), Some(FakeClient::Anthropic));
         assert_eq!(FakeClient::parse("other"), None);
+    }
+
+    #[test]
+    fn fake_modes_are_protocol_scoped() {
+        use crate::config::ApiProtocol;
+
+        assert!(FakeClient::Auto.supports_protocol(ApiProtocol::Responses));
+        assert!(FakeClient::Auto.supports_protocol(ApiProtocol::Anthropic));
+        assert!(!FakeClient::Auto.supports_protocol(ApiProtocol::Completions));
+        assert!(FakeClient::Codex.supports_protocol(ApiProtocol::Responses));
+        assert!(!FakeClient::Codex.supports_protocol(ApiProtocol::Anthropic));
+        assert!(FakeClient::Anthropic.supports_protocol(ApiProtocol::Anthropic));
+        assert!(!FakeClient::Anthropic.supports_protocol(ApiProtocol::Responses));
     }
 
     #[test]

@@ -237,10 +237,11 @@ fn error_chain_has_transient_message(error: &(dyn Error + 'static)) -> bool {
 }
 
 pub(crate) fn retry_delay(config: &RetryConfig, attempt: usize) -> Duration {
-    Duration::from_secs(
-        retry_backoff_delay_secs(config, attempt)
-            .saturating_add(retry_jitter_secs(config.jitter_secs)),
-    )
+    let jitter_secs = config
+        .exponential_backoff
+        .then(|| retry_jitter_secs(config.jitter_secs))
+        .unwrap_or(0);
+    Duration::from_secs(retry_backoff_delay_secs(config, attempt).saturating_add(jitter_secs))
 }
 
 pub(crate) fn retry_delay_from_headers(
@@ -262,6 +263,9 @@ pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
 }
 
 pub(crate) fn retry_backoff_delay_secs(config: &RetryConfig, attempt: usize) -> u64 {
+    if !config.exponential_backoff {
+        return config.initial_delay_secs;
+    }
     let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
     let delay =
         (config.initial_delay_secs as f64) * (config.backoff_multiplier as f64).powi(exponent);
@@ -291,6 +295,7 @@ mod tests {
             max_attempts: 3,
             max_recovery_attempts: 3,
             initial_delay_secs: 1,
+            exponential_backoff: true,
             backoff_multiplier: 2.0,
             jitter_secs: 0,
         }
@@ -317,6 +322,24 @@ mod tests {
 
         config.enabled = false;
         assert!(!can_retry_attempt(&config, 1));
+    }
+
+    #[test]
+    fn retry_delay_can_use_fixed_interval_without_exponential_backoff() {
+        let mut config = test_retry_config();
+        config.initial_delay_secs = 3;
+        config.exponential_backoff = false;
+        config.backoff_multiplier = 9.0;
+        config.jitter_secs = 10;
+
+        assert_eq!(retry_backoff_delay_secs(&config, 1), 3);
+        assert_eq!(retry_backoff_delay_secs(&config, 5), 3);
+        assert_eq!(retry_delay(&config, 5), Duration::from_secs(3));
+
+        config.exponential_backoff = true;
+        config.backoff_multiplier = 2.0;
+        assert_eq!(retry_backoff_delay_secs(&config, 1), 3);
+        assert_eq!(retry_backoff_delay_secs(&config, 3), 12);
     }
 
     #[test]

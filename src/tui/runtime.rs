@@ -1199,6 +1199,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::FakeClientChanged { client } => {
                 self.state.set_fake_client(*client);
+                self.persist_fake_selection(*client);
                 self.show_toast(
                     self.state.t_fmt(
                         "runtime.fake_changed",
@@ -2851,6 +2852,10 @@ impl TuiRuntime {
         &mut self,
         client: Option<crate::fake::FakeClient>,
     ) -> SubmittedCommand {
+        SubmittedCommand::Runtime(RuntimeCommand::SetFakeClient(client))
+    }
+
+    fn persist_fake_selection(&mut self, client: Option<crate::fake::FakeClient>) {
         let mut prefs = self.tui_preferences();
         prefs.fake_client = client;
         if client.is_some() {
@@ -2862,7 +2867,6 @@ impl TuiRuntime {
             self.state
                 .show_toast(self.state.t("runtime.fake_not_saved"), ToastKind::Info);
         }
-        SubmittedCommand::Runtime(RuntimeCommand::SetFakeClient(client))
     }
 
     fn show_theme_dialog(&mut self) {

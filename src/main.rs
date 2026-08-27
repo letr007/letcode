@@ -150,14 +150,7 @@ async fn main() -> Result<()> {
     agent.auto_disable_fast_mode_for_model(agent.model())?;
     let mut startup_preferences =
         tui::preferences::TuiPreferences::load_from_dir(&config.config_dir);
-    if let Some(fake_client) = startup_preferences.fake_client {
-        let installation_id = startup_preferences.ensure_fake_installation_id();
-        startup_preferences
-            .save_to_dir(&config.config_dir)
-            .map_err(|error| anyhow!("failed to persist fake installation id: {error}"))?;
-        agent.set_fake_installation_id(installation_id);
-        agent.set_fake_client(Some(fake_client));
-    }
+    let startup_fake_client = startup_preferences.fake_client;
     let workspace_dir = env::current_dir()?;
     agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
     agent.set_default_protocol(active_provider.protocol);
@@ -196,6 +189,21 @@ async fn main() -> Result<()> {
     ));
     let prepared_active_route = primary_route_factory.prepare_route(active_route.clone())?;
     agent.apply_prepared_route(prepared_active_route);
+    if let Some(fake_client) = startup_fake_client {
+        if fake_client.supports_protocol(agent.active_protocol()) {
+            let installation_id = startup_preferences.ensure_fake_installation_id();
+            startup_preferences
+                .save_to_dir(&config.config_dir)
+                .map_err(|error| anyhow!("failed to persist fake installation id: {error}"))?;
+            agent.set_fake_installation_id(installation_id);
+            agent.set_fake_client(Some(fake_client))?;
+        } else {
+            startup_preferences.fake_client = None;
+            startup_preferences
+                .save_to_dir(&config.config_dir)
+                .map_err(|error| anyhow!("failed to disable unsupported fake mode: {error}"))?;
+        }
+    }
     agent.set_primary_route_factory(primary_route_factory);
     install_expert_route_factory(&mut agent, &config)?;
     let skill_registry = Arc::new(SkillRegistry::load(&config.config_dir, &workspace_dir)?);
@@ -630,6 +638,7 @@ mod tests {
                 max_attempts: 1,
                 max_recovery_attempts: 1,
                 initial_delay_secs: 1,
+                exponential_backoff: false,
                 backoff_multiplier: 1.0,
                 jitter_secs: 0,
             }),

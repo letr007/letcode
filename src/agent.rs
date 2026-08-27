@@ -1276,10 +1276,33 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    pub(crate) fn set_fake_client(&mut self, client: Option<crate::fake::FakeClient>) {
+    pub(crate) fn set_fake_client(
+        &mut self,
+        client: Option<crate::fake::FakeClient>,
+    ) -> Result<()> {
+        if let Some(client) = client {
+            let protocol = self.active_protocol();
+            if !client.supports_protocol(protocol) {
+                bail!(
+                    "fake mode '{}' is not supported by the current model protocol '{}'; use {}",
+                    client.as_str(),
+                    protocol.as_str(),
+                    match protocol {
+                        ApiProtocol::Responses => "codex or auto",
+                        ApiProtocol::Anthropic => "anthropic or auto",
+                        ApiProtocol::Completions => "off",
+                    }
+                );
+            }
+        }
         self.fake_client = client;
         self.fake_identity =
             client.map(|_| crate::fake::CodexIdentity::new(self.fake_installation_id.clone()));
+        Ok(())
+    }
+
+    pub(crate) fn fake_client(&self) -> Option<crate::fake::FakeClient> {
+        self.fake_client
     }
 
     pub(crate) fn fake_turn_context(
