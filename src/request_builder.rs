@@ -625,6 +625,7 @@ fn provider_request_without_units(build: &BuildResult) -> (Value, Value) {
 }
 
 /// Identity of an exclusive plan prefix in its final provider-shaped form.
+#[cfg(test)]
 pub(crate) fn provider_unit_prefix_digest(build: &BuildResult, segment_count: usize) -> String {
     let segments =
         &build.prompt_plan.segments[..segment_count.min(build.prompt_plan.segments.len())];
@@ -748,6 +749,21 @@ pub fn effective_input_budget_tokens(model: ModelRequestMetadata, tools: &[ToolS
         0
     };
     effective_input_budget_tokens_for_tool_tokens(model, tools_tokens)
+}
+
+#[cfg(test)]
+pub(crate) fn request_value_for_test(build: &BuildResult) -> Value {
+    match &build.request {
+        BuiltRequest::Responses(request) => {
+            serde_json::to_value(request).expect("responses request serializes")
+        }
+        BuiltRequest::ResponsesCompatible(request)
+        | BuiltRequest::CompletionsCompatible(request)
+        | BuiltRequest::Anthropic(request) => request.clone(),
+        BuiltRequest::Completions(request) => {
+            serde_json::to_value(request).expect("completions request serializes")
+        }
+    }
 }
 
 fn effective_input_budget_tokens_for_tool_tokens(
@@ -1026,28 +1042,6 @@ pub(crate) fn build_request_from_selected_prompt(
         selected_evidence_ids: input.selected_evidence_ids,
         selected_evidence_message: input.selected_evidence_message,
         cache,
-    })
-}
-
-/// Re-serialize a canonical request-only plan adjustment through the provider
-/// serializers before the request is sent.
-pub(crate) fn rebuild_request_from_plan(
-    previous: &BuildResult,
-    model: ModelRequestMetadata,
-    tools: &[ToolSpec],
-    prompt_plan: PromptPlan,
-) -> Result<BuildResult> {
-    let model_id = prompt_plan.model_id.clone();
-    build_request_from_selected_prompt(SelectedPromptRequestInput {
-        protocol: prompt_plan.protocol,
-        strategy: previous.strategy,
-        model_id: &model_id,
-        model,
-        tools,
-        prompt_plan,
-        budget: previous.budget,
-        selected_evidence_ids: previous.selected_evidence_ids.clone(),
-        selected_evidence_message: previous.selected_evidence_message.clone(),
     })
 }
 

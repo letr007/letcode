@@ -237,10 +237,11 @@ fn error_chain_has_transient_message(error: &(dyn Error + 'static)) -> bool {
 }
 
 pub(crate) fn retry_delay(config: &RetryConfig, attempt: usize) -> Duration {
-    let jitter_secs = config
-        .exponential_backoff
-        .then(|| retry_jitter_secs(config.jitter_secs))
-        .unwrap_or(0);
+    let jitter_secs = if config.exponential_backoff {
+        retry_jitter_secs(config.jitter_secs)
+    } else {
+        0
+    };
     Duration::from_secs(retry_backoff_delay_secs(config, attempt).saturating_add(jitter_secs))
 }
 

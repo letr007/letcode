@@ -530,12 +530,6 @@ where
         protected_start_index = prepared.protected_start_index;
         let epoch_preview = prepared.epoch_preview;
         let build = prepared.build;
-        if agent.turn.frozen_evidence.is_none() {
-            agent.turn.frozen_evidence = Some(FrozenTurnEvidence {
-                message: build.selected_evidence_message.clone(),
-                selected_ids: build.selected_evidence_ids.clone(),
-            });
-        }
         let logical_observation = agent.preview_final_logical_request(&build);
         let cache_report = CacheUsageReport::from_build(&build);
         let iteration_span = langfuse_trace::llm_iteration_span(
@@ -1329,12 +1323,6 @@ where
         protected_start_index = prepared.protected_start_index;
         let epoch_preview = prepared.epoch_preview;
         let build = prepared.build;
-        if agent.turn.frozen_evidence.is_none() {
-            agent.turn.frozen_evidence = Some(FrozenTurnEvidence {
-                message: build.selected_evidence_message.clone(),
-                selected_ids: build.selected_evidence_ids.clone(),
-            });
-        }
         let logical_observation = agent.preview_final_logical_request(&build);
         let cache_report = CacheUsageReport::from_build(&build);
         let iteration_span = langfuse_trace::llm_iteration_span(
@@ -2551,7 +2539,6 @@ where
             protected_start_index=prepared.protected_start_index;
             let epoch_preview=prepared.epoch_preview;
             let build=prepared.build;
-            if agent.turn.frozen_evidence.is_none(){agent.turn.frozen_evidence=Some(FrozenTurnEvidence{message:build.selected_evidence_message.clone(),selected_ids:build.selected_evidence_ids.clone()});}
             let logical_observation=agent.preview_final_logical_request(&build);
             let cache_report=CacheUsageReport::from_build(&build);
             let iteration_span=langfuse_trace::llm_iteration_span(turn_id,"anthropic_messages",&agent.model,iteration,build.budget.retained_history_items,tool_call_count,tool_definitions.len());
@@ -2601,9 +2588,26 @@ where
                         if !emitted.is_empty(){stream_had_side_effect=true;for event in emitted{on_event(event).await?;}}
                     }
                 }
-                for event in finish_sse_data_events(&mut sse_buffer){let Some(data)=event else{continue};let raw=serde_json::from_str::<Value>(&data).with_context(||format!("failed to parse anthropic stream event: {data}"))?;let (emitted,text_delta)=state.handle_event(&raw,&item_id)?;if !text_delta.is_empty(){stream_had_side_effect=true;on_delta(&text_delta).await?;final_text.push_str(&text_delta);}if !emitted.is_empty(){stream_had_side_effect=true;for event in emitted{on_event(event).await?;}}}
+                for event in finish_sse_data_events(&mut sse_buffer) {
+                    let Some(data) = event else { continue };
+                    let raw = serde_json::from_str::<Value>(&data).with_context(|| {
+                        format!("failed to parse anthropic stream event: {data}")
+                    })?;
+                    let (emitted, text_delta) = state.handle_event(&raw, &item_id)?;
+                    if !text_delta.is_empty() {
+                        stream_had_side_effect = true;
+                        on_delta(&text_delta).await?;
+                        final_text.push_str(&text_delta);
+                    }
+                    if !emitted.is_empty() {
+                        stream_had_side_effect = true;
+                        for event in emitted {
+                            on_event(event).await?;
+                        }
+                    }
+                }
                 for event in state.finish_thinking(&item_id){stream_had_side_effect=true;on_event(event).await?;}
-                if let Some(usage)=state.provider_usage(build.budget.context_window_tokens){provider_usage=Some(usage.clone());prepared_telemetry.usage=provider_usage;prepared_telemetry.usage_completeness=ProviderUsageCompleteness::Complete;final_provider_usage_event=Some(AgentEvent::TokenUsageUpdated{used_tokens:usage.used_tokens,context_window_tokens:usage.context_window_tokens,input_tokens:usage.input_tokens,output_tokens:usage.output_tokens,cached_tokens:usage.cached_tokens,cache_report:Some(cache_report.clone().with_actual_cached_tokens(usage.cached_tokens))});}
+                if let Some(usage)=state.provider_usage(build.budget.context_window_tokens){provider_usage=Some(usage);prepared_telemetry.usage=provider_usage;prepared_telemetry.usage_completeness=ProviderUsageCompleteness::Complete;final_provider_usage_event=Some(AgentEvent::TokenUsageUpdated{used_tokens:usage.used_tokens,context_window_tokens:usage.context_window_tokens,input_tokens:usage.input_tokens,output_tokens:usage.output_tokens,cached_tokens:usage.cached_tokens,cache_report:Some(cache_report.clone().with_actual_cached_tokens(usage.cached_tokens))});}
                 let has_tool_calls=!state.tool_calls.is_empty();
                 if let Err(error)=state.validate_completion(has_tool_calls){
                     if stream_had_side_effect||!state.pending_tool_calls.is_empty(){emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","finish_validation",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;}

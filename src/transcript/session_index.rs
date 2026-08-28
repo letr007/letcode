@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{SessionSummary, TranscriptEvent, TranscriptRecord, summarize_text};
+use super::SessionSummary;
 
 const INDEX_FILE: &str = "sessions-index.json";
 const INDEX_VERSION: u32 = 1;
@@ -54,36 +54,6 @@ impl IndexedSession {
 
     fn matches_stamp(&self, size: u64, mtime_ms: u128) -> bool {
         self.size == size && self.mtime_ms == mtime_ms
-    }
-
-    fn apply_record(&mut self, record: &TranscriptRecord) {
-        self.record_count = self.record_count.saturating_add(1);
-        if self.first_timestamp_ms.is_none() {
-            self.first_timestamp_ms = Some(record.timestamp_ms);
-        }
-        self.last_timestamp_ms = Some(record.timestamp_ms);
-        match &record.event {
-            TranscriptEvent::SessionStarted { model } => self.model = Some(model.clone()),
-            TranscriptEvent::ModelChanged { new_model, .. } => self.model = Some(new_model.clone()),
-            TranscriptEvent::SessionTitle { title } => self.title = Some(title.clone()),
-            TranscriptEvent::UserMessage { content } => {
-                self.has_content = true;
-                self.last_user_summary = Some(summarize_text(&content.display_text()));
-            }
-            TranscriptEvent::AssistantMessage { content } => {
-                self.has_content = true;
-                self.last_assistant_summary = Some(summarize_text(content));
-            }
-            event if event.is_session_content() => self.has_content = true,
-            _ => {}
-        }
-    }
-
-    fn refresh_stamp(&mut self, path: &Path) {
-        if let Ok((size, mtime_ms)) = file_stamp(path) {
-            self.size = size;
-            self.mtime_ms = mtime_ms;
-        }
     }
 }
 
@@ -132,53 +102,6 @@ fn save_index(base_dir: &Path, index: &SessionsIndexFile) -> Result<()> {
     Ok(())
 }
 
-fn affects_session_index(event: &TranscriptEvent) -> bool {
-    matches!(
-        event,
-        TranscriptEvent::SessionStarted { .. }
-            | TranscriptEvent::ModelChanged { .. }
-            | TranscriptEvent::SessionTitle { .. }
-            | TranscriptEvent::UserMessage { .. }
-            | TranscriptEvent::AssistantMessage { .. }
-    ) || event.is_session_content()
-}
-
-/// Best-effort incremental update after a successful journal append.
-pub(super) fn upsert_from_record(transcript_path: &Path, record: &TranscriptRecord) {
-    if !affects_session_index(&record.event) {
-        return;
-    }
-    let Some(base_dir) = transcript_path.parent() else {
-        return;
-    };
-    let mut index = load_index(base_dir);
-    let entry = index.sessions.entry(record.session_id.clone()).or_default();
-    entry.apply_record(record);
-    entry.refresh_stamp(transcript_path);
-    let _ = save_index(base_dir, &index);
-}
-
-pub(super) fn upsert_from_records(transcript_path: &Path, records: &[TranscriptRecord]) {
-    let relevant = records
-        .iter()
-        .filter(|record| affects_session_index(&record.event))
-        .collect::<Vec<_>>();
-    if relevant.is_empty() {
-        return;
-    }
-    let Some(base_dir) = transcript_path.parent() else {
-        return;
-    };
-    let mut index = load_index(base_dir);
-    let session_id = relevant[0].session_id.clone();
-    let entry = index.sessions.entry(session_id).or_default();
-    for record in relevant {
-        entry.apply_record(record);
-    }
-    entry.refresh_stamp(transcript_path);
-    let _ = save_index(base_dir, &index);
-}
-
 pub(super) fn remove_session(base_dir: &Path, session_id: &str) {
     let mut index = load_index(base_dir);
     if index.sessions.remove(session_id).is_some() {
@@ -189,7 +112,7 @@ pub(super) fn remove_session(base_dir: &Path, session_id: &str) {
 /// List sessions using the sidecar index, rescanning only stale or missing rows.
 pub(super) fn list_sessions_with_index(
     base_dir: &Path,
-    summarize: impl Fn(&Path, String) -> Result<Option<SessionSummary>>,
+    mut summarize: impl FnMut(&Path, String) -> Result<Option<SessionSummary>>,
 ) -> Result<Vec<SessionSummary>> {
     let mut index = load_index(base_dir);
     let mut dirty = false;
@@ -220,34 +143,45 @@ pub(super) fn list_sessions_with_index(
 
         match summarize(&path, session_id.clone())? {
             Some(summary) => {
-                let mut indexed = IndexedSession {
-                    size,
-                    mtime_ms,
-                    record_count: summary.record_count,
-                    first_timestamp_ms: summary.first_timestamp_ms,
-                    last_timestamp_ms: summary.last_timestamp_ms,
-                    model: summary.model.clone(),
-                    title: summary.title.clone(),
-                    last_user_summary: summary.last_user_summary.clone(),
-                    last_assistant_summary: summary.last_assistant_summary.clone(),
-                    has_content: true,
-                };
-                // Re-stat after scan in case the file moved under us.
-                indexed.refresh_stamp(&path);
-                index.sessions.insert(session_id, indexed);
-                dirty = true;
+                let scanned_stamp = (size, mtime_ms);
+                let current_stamp = file_stamp(&path)?;
+                if current_stamp != scanned_stamp {
+                    index.sessions.remove(&session_id);
+                    dirty = true;
+                } else {
+                    let indexed = IndexedSession {
+                        size,
+                        mtime_ms,
+                        record_count: summary.record_count,
+                        first_timestamp_ms: summary.first_timestamp_ms,
+                        last_timestamp_ms: summary.last_timestamp_ms,
+                        model: summary.model.clone(),
+                        title: summary.title.clone(),
+                        last_user_summary: summary.last_user_summary.clone(),
+                        last_assistant_summary: summary.last_assistant_summary.clone(),
+                        has_content: true,
+                    };
+                    index.sessions.insert(session_id, indexed);
+                    dirty = true;
+                }
                 sessions.push(summary);
             }
             None => {
-                index.sessions.insert(
-                    session_id,
-                    IndexedSession {
-                        size,
-                        mtime_ms,
-                        has_content: false,
-                        ..IndexedSession::default()
-                    },
-                );
+                let scanned_stamp = (size, mtime_ms);
+                let current_stamp = file_stamp(&path)?;
+                if current_stamp != scanned_stamp {
+                    index.sessions.remove(&session_id);
+                } else {
+                    index.sessions.insert(
+                        session_id,
+                        IndexedSession {
+                            size,
+                            mtime_ms,
+                            has_content: false,
+                            ..IndexedSession::default()
+                        },
+                    );
+                }
                 dirty = true;
             }
         }

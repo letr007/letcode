@@ -67,8 +67,8 @@ pub(crate) use history::{
 };
 
 use history::{
-    active_turn_id_from_lifecycle_records, active_turn_segment_from_lifecycle_records,
-    checkpoint_spans_from_history, restore_history_projection,
+    active_turn_segment_from_lifecycle_records, checkpoint_spans_from_history,
+    restore_history_projection,
 };
 
 #[path = "transcript_projection/checkpoint.rs"]
@@ -234,14 +234,6 @@ pub(crate) fn context_compaction_validation_scope(
         resolved,
         actual_append_branch_id,
     })
-}
-
-pub(crate) fn active_turn_id_at_context_cursor(
-    records: Vec<TranscriptRecord>,
-    cursor: SessionContextCursor,
-) -> anyhow::Result<Option<u64>> {
-    let resolved = resolve_branch_context(records, cursor)?;
-    Ok(active_turn_id_from_lifecycle_records(&resolved.records))
 }
 
 pub(crate) fn build_session_context_snapshot(

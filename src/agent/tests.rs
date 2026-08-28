@@ -251,11 +251,14 @@ fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent<OpenAIConfig> {
     agent
 }
 
-fn replace_active_epoch_history(agent: &mut Agent<OpenAIConfig>, history: Vec<HistoryItem>) {
-    // Deliberately permissive: the owner may install protocol-invalid history
-    // (e.g. an orphan tool output) so later preview paths can reject it.
-    agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &history);
-    agent.runtime_snapshot.current_turn_id = Some(agent.turn.turn_id);
+fn append_active_epoch_history(agent: &mut Agent<OpenAIConfig>, history: Vec<HistoryItem>) {
+    let existing = agent.history_for_test();
+    assert!(history.starts_with(&existing));
+    for item in history.into_iter().skip(existing.len()) {
+        agent
+            .append_history_item(item)
+            .expect("history suffix is protocol-compatible");
+    }
 }
 
 fn active_epoch_tools() -> Vec<crate::request_builder::ToolSpec> {
@@ -313,9 +316,9 @@ fn active_epoch_appends_complete_groups_for_both_protocols() {
         let cold_cacheable_prefix = cold.build.budget.plan_cacheable_prefix_tokens;
         agent.commit_active_epoch(cold);
 
-        replace_active_epoch_history(&mut agent, active_epoch_history_with_complete_tool_group());
+        append_active_epoch_history(&mut agent, active_epoch_history_with_complete_tool_group());
         let append = agent
-            .preview_active_epoch(protocol, &[], &tools)
+            .resolved_epoch_preview_for_test(protocol, &[], &tools)
             .expect("complete tool group appends");
         assert!(matches!(
             append.transition,
@@ -351,12 +354,11 @@ fn active_epoch_appends_complete_groups_for_both_protocols() {
         );
         agent.commit_active_epoch(append);
 
-        let repeat = agent
-            .preview_active_epoch(protocol, &[], &tools)
-            .expect("exact repeat appends nothing");
         assert!(matches!(
-            repeat.transition,
-            ActiveEpochTransition::Append { added: 0 }
+            agent
+                .prepare_active_epoch(protocol, &[], &tools)
+                .expect("repeat preparation"),
+            ActiveEpochPreparation::ColdRequired(ColdRequiredReason::UnsupportedAppendShape)
         ));
     }
 }
@@ -371,9 +373,6 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
             .expect("cold preview");
         agent.commit_active_epoch(preview);
         let before = agent.active_epoch.clone();
-        // The epoch warm path reads protocol frames from the runtime snapshot
-        // (single source of truth), not the legacy cache. Simulate a non-append
-        // change by mutating the snapshot's active protocol stream directly.
         for frame in agent.runtime_snapshot.frames.iter_mut() {
             if frame.visibility == FrameVisibility::Active && frame.protocol.is_some() {
                 if mutation == "mutated" {
@@ -389,16 +388,39 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
                 break;
             }
         }
-        assert!(
+        assert!(matches!(
             agent
-                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
-                .is_err()
-        );
+                .prepare_active_epoch(ApiProtocol::Responses, &[], &tools)
+                .expect("non-append mutation requires cold planning"),
+            ActiveEpochPreparation::ColdRequired(_)
+        ));
         assert_eq!(agent.active_epoch, before);
     }
 
-    for item in [
-        HistoryItem::AssistantToolCalls {
+    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    let preview = agent
+        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+        .expect("cold preview");
+    agent.commit_active_epoch(preview);
+    let before = agent.active_epoch.clone();
+    assert!(
+        agent
+            .append_history_item(HistoryItem::ToolOutput {
+                call_id: "orphan".into(),
+                output_json: "{}".into(),
+                images: Vec::new(),
+            })
+            .is_err()
+    );
+    assert_eq!(agent.active_epoch, before);
+
+    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    let preview = agent
+        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+        .expect("cold preview");
+    agent.commit_active_epoch(preview);
+    agent
+        .append_history_item(HistoryItem::AssistantToolCalls {
             text: None,
             reasoning_content: None,
             reasoning_wire: None,
@@ -407,29 +429,14 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
                 name: "lookup".into(),
                 arguments_json: "{}".into(),
             }],
-        },
-        HistoryItem::ToolOutput {
-            call_id: "orphan".into(),
-            output_json: "{}".into(),
-            images: Vec::new(),
-        },
-    ] {
-        let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
-        let preview = agent
-            .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
-            .expect("cold preview");
-        agent.commit_active_epoch(preview);
-        let before = agent.active_epoch.clone();
-        let mut history = agent.history_for_test();
-        history.push(item);
-        replace_active_epoch_history(&mut agent, history);
-        assert!(
-            agent
-                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
-                .is_err()
-        );
-        assert_eq!(agent.active_epoch, before);
-    }
+        })
+        .expect("assistant tool call opens a valid group");
+    assert!(matches!(
+        agent
+            .prepare_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .expect("incomplete suffix requires cold planning"),
+        ActiveEpochPreparation::ColdRequired(ColdRequiredReason::SuffixValidationFailed)
+    ));
 }
 
 #[test]
@@ -474,6 +481,132 @@ fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
         .preview_active_epoch(ApiProtocol::Completions, &prelude, &changed_tools)
         .expect("evidence change rebuilds cold");
     assert!(matches!(envelope.transition, ActiveEpochTransition::Cold));
+}
+
+#[test]
+fn active_epoch_freezes_effective_evidence_and_allows_first_post_tool_warm_append() {
+    let tools = active_epoch_tools();
+    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    agent
+        .add_evidence(test_evidence("ev-before-request", 1))
+        .expect("seed evidence");
+    crate::request_builder::prompt_plan::reset_plan_call_count();
+    let preview = agent
+        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+        .expect("initial cold preview");
+    let selected_ids = preview.build.selected_evidence_ids.clone();
+    agent.commit_active_epoch(preview);
+    assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
+    assert_eq!(
+        agent
+            .turn
+            .frozen_evidence
+            .as_ref()
+            .expect("effective evidence frozen")
+            .selected_ids,
+        selected_ids
+    );
+
+    agent
+        .add_evidence(test_evidence("ev-after-request", 2))
+        .expect("tool evidence after freeze");
+    append_active_epoch_history(&mut agent, active_epoch_history_with_complete_tool_group());
+    let warm = agent
+        .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &tools)
+        .expect("first post-tool request remains warm");
+    assert!(matches!(
+        warm.transition,
+        ActiveEpochTransition::Append { added: 3 }
+    ));
+    assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
+}
+
+#[test]
+fn skill_tool_output_invalidates_warm_projection_and_cold_plan_includes_detached_material() {
+    let tools = active_epoch_tools();
+    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    let cold = agent
+        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+        .expect("initial cold preview");
+    agent.commit_active_epoch(cold);
+
+    let skill_content = "detached skill material must reach the provider";
+    agent
+        .append_history_item(HistoryItem::AssistantToolCalls {
+            text: None,
+            reasoning_content: None,
+            reasoning_wire: None,
+            calls: vec![HistoryToolCall {
+                call_id: "skill-call-1".into(),
+                name: "skill".into(),
+                arguments_json: r#"{\"name\":\"rust-audit\"}"#.into(),
+            }],
+        })
+        .expect("skill call frame appends");
+    agent
+        .append_history_item(HistoryItem::ToolOutput {
+            call_id: "skill-call-1".into(),
+            output_json: serde_json::to_string(&crate::tool::ToolResult::ok(
+                "skill",
+                json!({
+                    "name": "rust-audit",
+                    "content": skill_content,
+                }),
+            ))
+            .expect("skill output serializes"),
+            images: Vec::new(),
+        })
+        .expect("skill output frame appends");
+
+    agent
+        .reconcile_loaded_skill_material()
+        .expect("persisted skill output reconciles");
+
+    assert!(matches!(
+        agent
+            .prepare_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .expect("skill material change is classified"),
+        ActiveEpochPreparation::ColdRequired(ColdRequiredReason::NoActiveEpoch)
+    ));
+    let rebuilt = agent
+        .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &tools)
+        .expect("cold rebuild includes detached skill material");
+    assert!(
+        rebuilt
+            .build
+            .prompt_plan
+            .segments
+            .iter()
+            .any(|segment| segment.text.contains(skill_content))
+    );
+}
+
+#[test]
+fn active_epoch_falls_back_cold_when_suffix_requires_history_reselection() {
+    let tools = active_epoch_tools();
+    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    agent.set_model_catalog(HashMap::from([(
+        agent.model().to_string(),
+        ModelRequestMetadata {
+            context_window: Some(1_500),
+            max_output_tokens: Some(128),
+            supports_tools: true,
+            ..ModelRequestMetadata::default()
+        },
+    )]));
+    let preview = agent
+        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+        .expect("initial cold preview");
+    agent.commit_active_epoch(preview);
+    agent
+        .append_history_item(HistoryItem::assistant("x".repeat(12_000)))
+        .expect("append oversized protected suffix");
+    assert!(matches!(
+        agent
+            .prepare_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .expect("oversized warm suffix requires cold planning"),
+        ActiveEpochPreparation::ColdRequired(ColdRequiredReason::BudgetRequiresColdPlan)
+    ));
 }
 
 #[test]

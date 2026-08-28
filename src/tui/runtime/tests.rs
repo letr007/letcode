@@ -4139,6 +4139,32 @@ fn test_interrupt() -> InterruptRequest {
     InterruptRequest {
         parent_tool_calls: Vec::new(),
         visible_child_session_id: None,
+        turn_id: None,
+        transcript_revision: 0,
+        branch_id: None,
+    }
+}
+
+fn planned_interrupt(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    parent_tool_calls: Vec<(String, String)>,
+) -> InterruptRequest {
+    let recorder = transcript.lock().expect("lock transcript");
+    let (transcript_revision, branch_id, turn_id, _) =
+        recorder.interrupt_transcript_plan().unwrap_or_else(|_| {
+            (
+                0,
+                recorder.current_context_branch_id().map(str::to_string),
+                None,
+                Vec::new(),
+            )
+        });
+    InterruptRequest {
+        parent_tool_calls,
+        visible_child_session_id: None,
+        turn_id,
+        transcript_revision,
+        branch_id,
     }
 }
 
@@ -4427,7 +4453,10 @@ async fn test_session_executor_loop(
                             outcome @ (ActiveSessionOperation::Interrupted
                             | ActiveSessionOperation::Shutdown) => {
                                 let interrupt =
-                                    derive_interrupt_request(&transcript, &subagent_runtime);
+                                    derive_interrupt_request(&transcript, &subagent_runtime)
+                                        .expect(
+                                            "test harness transcript tracker should be available",
+                                        );
                                 let is_shutdown =
                                     matches!(outcome, ActiveSessionOperation::Shutdown);
                                 let settle_shutdown = if subagent_runtime.is_running() {
@@ -4482,8 +4511,10 @@ async fn test_session_executor_loop(
                 };
                 if let Some(interrupt) = interrupted {
                     subagent_runtime.cancel_active();
-                    record_interrupt_transcript(&transcript, &interrupt);
-                    let _ = rehydrate_agent_from_transcript(&mut agent, &transcript);
+                    record_interrupt_transcript(&transcript, &interrupt)
+                        .expect("interrupt transcript should persist");
+                    rehydrate_agent_from_transcript(&mut agent, &transcript)
+                        .expect("interrupted session should rehydrate");
                     send_subagent_interrupted(
                         &session_transport_tx,
                         interrupt.visible_child_session_id,
@@ -4540,7 +4571,8 @@ async fn test_session_executor_loop(
                         | ActiveSessionOperation::Shutdown) => {
                             shutdown = matches!(outcome, ActiveSessionOperation::Shutdown);
                             let interrupt =
-                                derive_interrupt_request(&transcript, &subagent_runtime);
+                                derive_interrupt_request(&transcript, &subagent_runtime)
+                                    .expect("test harness transcript tracker should be available");
                             child_started = subagent_runtime.is_running();
                             interrupted = true;
                             interrupted_child_session_id =
@@ -4548,7 +4580,8 @@ async fn test_session_executor_loop(
                             if child_started {
                                 subagent_runtime.cancel_active();
                             }
-                            record_interrupt_transcript(&transcript, &interrupt);
+                            record_interrupt_transcript(&transcript, &interrupt)
+                                .expect("test harness interrupt transcript should persist");
                             if child_started {
                                 let _ = delegate.await;
                             }
@@ -5817,12 +5850,16 @@ async fn background_child_events_outlive_parent_runner_channel() {
 
 #[tokio::test]
 async fn runner_existing_history_continuation_does_not_append_empty_user_message() {
-    let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
-        responses_sse_body("continued"),
-    )])
+    let mut server = spawn_controlled_sse_server(vec![
+        ControlledSseResponse::Immediate(responses_sse_tool_call_body(
+            "workflow__todos",
+            serde_json::json!({ "items": [] }),
+        )),
+        ControlledSseResponse::Immediate(responses_sse_body("continued")),
+    ])
     .await;
-    let agent = integration_agent(server.base_url.clone(), 32_000);
-    let (runner_event_tx, _runner_event_rx) = mpsc::unbounded_channel();
+    let agent = integration_agent_with_tools(server.base_url.clone(), 32_000, true);
+    let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
     let runner = AgentRunner::<OpenAIConfig>::with_transcript(
         runner_event_tx,
         Arc::new(StdMutex::new(
@@ -5842,6 +5879,30 @@ async fn runner_existing_history_continuation_does_not_append_empty_user_message
         .await
         .expect("continue existing history");
     server.expect_request(0).await;
+    server.expect_request(1).await;
+
+    let mut events = Vec::new();
+    while let Ok(event) = runner_event_rx.try_recv() {
+        events.push(event);
+    }
+    let finished = events
+        .iter()
+        .position(|event| matches!(event, SessionTransportEvent::ToolFinished(_)))
+        .expect("tool terminal event is emitted");
+    let context_updates = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event, SessionTransportEvent::RuntimeContextUpdated(_)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(context_updates.len(), 1, "one batch owns the context flush");
+    let batch_finished = events
+        .iter()
+        .position(|event| matches!(event, SessionTransportEvent::ToolBatchFinished))
+        .expect("tool batch boundary is emitted");
+    assert!(finished < context_updates[0]);
+    assert!(context_updates[0] < batch_finished);
 
     assert!(agent.history_for_test().iter().any(|item| matches!(
         item,
@@ -6677,6 +6738,23 @@ async fn session_delegate_interrupt_notifies_active_child() {
             ..
         }
     )));
+    let child_interrupted_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                SessionTransportEvent::ChildSessionEvent {
+                    event: SessionEvent::Interrupted,
+                    ..
+                }
+            )
+        })
+        .expect("child interrupt event is emitted");
+    let interrupted_index = events
+        .iter()
+        .position(|event| matches!(event, SessionTransportEvent::Interrupted))
+        .expect("interrupt terminal is emitted");
+    assert!(child_interrupted_index < interrupted_index);
     assert!(matches!(
         events.last(),
         Some(SessionTransportEvent::Interrupted)
@@ -6720,6 +6798,15 @@ async fn session_interrupt_records_the_unmatched_started_turn() {
         .send_interrupt(test_interrupt())
         .expect("session executor accepts prompt cancellation");
     let interrupted_events = session_transport_events_until_terminal(&mut harness).await;
+    let context_index = interrupted_events
+        .iter()
+        .position(|event| matches!(event, SessionTransportEvent::RuntimeContextUpdated(_)))
+        .expect("rehydrated runtime context is emitted");
+    let interrupted_index = interrupted_events
+        .iter()
+        .position(|event| matches!(event, SessionTransportEvent::Interrupted))
+        .expect("interrupt terminal is emitted");
+    assert!(context_index < interrupted_index);
     assert!(matches!(
         interrupted_events.last(),
         Some(SessionTransportEvent::Interrupted)
@@ -6817,11 +6904,9 @@ fn record_interrupt_transcript_scopes_active_turn_to_recorder_branch() {
 
     record_interrupt_transcript(
         &transcript,
-        &InterruptRequest {
-            parent_tool_calls: vec![("call-a".into(), "shell__exec".into())],
-            visible_child_session_id: None,
-        },
-    );
+        &planned_interrupt(&transcript, vec![("call-a".into(), "shell__exec".into())]),
+    )
+    .expect("interrupt transcript should persist");
 
     let after = records(&transcript);
     let interruptions = after
@@ -6889,11 +6974,9 @@ fn record_interrupt_transcript_pre_start_cancellation_does_not_interrupt_sibling
 
     record_interrupt_transcript(
         &transcript,
-        &InterruptRequest {
-            parent_tool_calls: vec![("call-a".into(), "shell__exec".into())],
-            visible_child_session_id: None,
-        },
-    );
+        &planned_interrupt(&transcript, vec![("call-a".into(), "shell__exec".into())]),
+    )
+    .expect("interrupt transcript should persist");
 
     let after = records(&transcript);
     assert!(
@@ -6921,7 +7004,8 @@ fn record_interrupt_transcript_normalizes_root_branch() {
             .expect("start root turn");
     }
 
-    record_interrupt_transcript(&transcript, &test_interrupt());
+    record_interrupt_transcript(&transcript, &planned_interrupt(&transcript, Vec::new()))
+        .expect("interrupt transcript should persist");
 
     let interruptions = records(&transcript)
         .into_iter()
@@ -6936,6 +7020,76 @@ fn record_interrupt_transcript_normalizes_root_branch() {
 }
 
 #[test]
+fn same_turn_stale_interrupt_plan_refreshes_parent_tool_calls() {
+    let (_, transcript) = test_transcript("same-turn-stale-interrupt-refresh", Vec::new());
+    {
+        let mut recorder = transcript.lock().expect("lock transcript");
+        recorder
+            .record_turn_started(turn_started(81))
+            .expect("start turn");
+        recorder
+            .record_tool_call_started("call-1", "shell__exec", serde_json::json!({}))
+            .expect("start first tool");
+    }
+    let mut plan = planned_interrupt(&transcript, vec![("call-1".into(), "shell__exec".into())]);
+    transcript
+        .lock()
+        .expect("lock transcript")
+        .record_tool_call_started("call-2", "fs__read", serde_json::json!({}))
+        .expect("start second tool in same turn");
+    assert_ne!(
+        transcript.lock().expect("lock transcript").sequence,
+        plan.transcript_revision
+    );
+    plan.parent_tool_calls = vec![
+        ("call-1".into(), "shell__exec".into()),
+        ("call-2".into(), "fs__read".into()),
+    ];
+    assert!(record_interrupt_transcript(&transcript, &plan).is_ok());
+}
+
+fn stale_interrupt_plan_with_different_identity_is_rejected(
+    name: &str,
+    turn_id: Option<u64>,
+    branch_id: Option<&str>,
+) {
+    let (_, transcript) = test_transcript(name, Vec::new());
+    {
+        let mut recorder = transcript.lock().expect("lock transcript");
+        recorder
+            .record_turn_started(turn_started(82))
+            .expect("start turn");
+    }
+    let mut plan = planned_interrupt(&transcript, Vec::new());
+    transcript
+        .lock()
+        .expect("lock transcript")
+        .record_user_message("advance transcript")
+        .expect("advance transcript");
+    plan.turn_id = turn_id;
+    plan.branch_id = branch_id.map(str::to_string);
+    assert!(record_interrupt_transcript(&transcript, &plan).is_err());
+}
+
+#[test]
+fn cross_turn_stale_interrupt_plan_is_rejected() {
+    stale_interrupt_plan_with_different_identity_is_rejected(
+        "cross-turn-stale-interrupt",
+        Some(999),
+        None,
+    );
+}
+
+#[test]
+fn cross_branch_stale_interrupt_plan_is_rejected() {
+    stale_interrupt_plan_with_different_identity_is_rejected(
+        "cross-branch-stale-interrupt",
+        Some(82),
+        Some("different-branch"),
+    );
+}
+
+#[test]
 fn record_interrupt_transcript_fails_closed_when_branch_projection_cannot_resolve() {
     let (_, transcript) = test_transcript("unresolvable-branch-interrupt", Vec::new());
     {
@@ -6947,17 +7101,27 @@ fn record_interrupt_transcript_fails_closed_when_branch_projection_cannot_resolv
     }
 
     let before = serde_json::to_value(records(&transcript)).expect("serialize transcript");
+    let stale_plan = InterruptRequest {
+        parent_tool_calls: vec![("call-missing".into(), "shell__exec".into())],
+        visible_child_session_id: None,
+        turn_id: Some(71),
+        transcript_revision: 0,
+        branch_id: Some("missing-branch".into()),
+    };
+    transcript
+        .lock()
+        .expect("lock transcript")
+        .record_user_message("changed after planning")
+        .expect("change transcript after planning");
 
-    record_interrupt_transcript(
-        &transcript,
-        &InterruptRequest {
-            parent_tool_calls: vec![("call-missing".into(), "shell__exec".into())],
-            visible_child_session_id: None,
-        },
-    );
+    assert!(record_interrupt_transcript(&transcript, &stale_plan).is_err());
 
     let after = serde_json::to_value(records(&transcript)).expect("serialize transcript");
-    assert_eq!(after, before);
+    assert_ne!(after, before);
+    assert!(matches!(
+        records(&transcript).last().map(|record| &record.event),
+        Some(TranscriptEvent::UserMessage { .. })
+    ));
 }
 
 #[tokio::test]

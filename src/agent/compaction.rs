@@ -290,7 +290,13 @@ fn pressure_successor_request<C: Config + Clone>(
     turn_prelude: &[PromptMessage],
     tool_definitions: &[crate::request_builder::ToolSpec],
 ) -> Result<PreparedRequestBuild> {
-    let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
+    let epoch_preview =
+        match agent.prepare_active_epoch(protocol, turn_prelude, tool_definitions)? {
+            super::ActiveEpochPreparation::Warm(preview) => preview,
+            super::ActiveEpochPreparation::ColdRequired(_) => {
+                agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?
+            }
+        };
     Ok(PreparedRequestBuild {
         protected_start_index: agent
             .turn
@@ -432,7 +438,13 @@ where
     if agent.prepare_fast_mode_for_request()? {
         on_event(AgentEvent::FastModeChanged { enabled: false }).await?;
     }
-    let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
+    let epoch_preview =
+        match agent.prepare_active_epoch(protocol, turn_prelude, tool_definitions)? {
+            super::ActiveEpochPreparation::Warm(preview) => preview,
+            super::ActiveEpochPreparation::ColdRequired(_) => {
+                agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?
+            }
+        };
     Ok(PreparedRequestBuild {
         protected_start_index,
         build: epoch_preview.build.clone(),

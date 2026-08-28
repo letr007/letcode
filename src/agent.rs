@@ -29,9 +29,9 @@ use crate::permission::{
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
-    PromptMessage, PromptMessageOrigin, ProtectedContextPolicy, RequestBuilderInput,
+    PromptMessage, PromptMessageOrigin, ProtectedContextPolicy, ProviderRequestStrategy,
+    RequestBuilderInput, SelectedPromptRequestInput, build_request_from_selected_prompt,
     build_request_with_policy, effective_input_budget_tokens, observe_logical_request,
-    rebuild_request_from_plan,
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, should_retry_http_status,
@@ -44,7 +44,7 @@ use crate::runtime_context::{
 };
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
-    reconcile_loaded_skill_material,
+    reconcile_loaded_skill_material as reconcile_snapshot_skill_material,
 };
 use crate::tool::{
     NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
@@ -175,20 +175,44 @@ struct LogicalRequestObservationTracker {
 
 /// Ephemeral authority for the active cache prefix. It deliberately stores
 /// only process-local identities, never prompt bytes or transcript data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ActiveEpoch {
     turn_id: u64,
     request_shape_digest: String,
-    kernel_identity: Option<String>,
-    envelope_identity: Option<String>,
     observation: crate::request_builder::LogicalRequestObservation,
     committed_plan: crate::request_builder::prompt_plan::PromptPlan,
     protocol_frontier_count: usize,
-    protocol_prefix_digest: String,
+    protocol_frontier_token: u64,
+    protocol_append_generation: u64,
+    projection_generation: u64,
+    budget: crate::request_builder::BudgetReport,
+    selected_evidence_ids: Vec<String>,
+    selected_evidence_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum ColdRequiredReason {
+    NoActiveEpoch,
+    TurnChanged,
+    RequestProjectionChanged,
+    ProtocolFrontierChanged,
+    TruncatedOrReselected,
+    EvidenceChanged,
+    UnsupportedAppendShape,
+    SuffixValidationFailed,
+    BudgetRequiresColdPlan,
 }
 
 #[derive(Debug, Clone)]
-struct ActiveEpochPreview {
+#[allow(dead_code)]
+pub(super) enum ActiveEpochPreparation {
+    Warm(ActiveEpochPreview),
+    ColdRequired(ColdRequiredReason),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ActiveEpochPreview {
     epoch: ActiveEpoch,
     build: crate::request_builder::BuildResult,
     #[cfg(test)]
@@ -222,31 +246,6 @@ fn protocol_prefix_digest(frames: &[crate::protocol_frames::ProtocolFrame]) -> S
         fingerprints.extend_from_slice(crate::request_builder::sha256_hex(&identity).as_bytes());
     }
     crate::request_builder::sha256_hex(&fingerprints)
-}
-
-fn normalize_prompt_plan(plan: &mut crate::request_builder::prompt_plan::PromptPlan) {
-    for (order, segment) in plan.segments.iter_mut().enumerate() {
-        segment.order = order as u32;
-        segment.source.order = order as u32;
-    }
-    for contributor in &mut plan.contributors {
-        contributor.segment_ids.clear();
-    }
-    for segment in &plan.segments {
-        if let Some(contributor) = plan
-            .contributors
-            .iter_mut()
-            .find(|contributor| contributor.id == segment.contributor_id)
-        {
-            contributor.segment_ids.push(segment.id.clone());
-        }
-    }
-    plan.contributors
-        .retain(|contributor| !contributor.segment_ids.is_empty());
-    for (order, contributor) in plan.contributors.iter_mut().enumerate() {
-        contributor.order = order as u32;
-    }
-    plan.recompute_cache_metadata();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,6 +642,7 @@ pub struct Agent<C: Config> {
     session_reasoning_efforts: HashMap<String, ModelReasoningEffort>,
     prelude: Vec<PromptMessage>,
     runtime_snapshot: RuntimeSnapshot,
+    protocol_append_state: crate::protocol_frames::ProtocolAppendState,
     tools: ToolRegistry,
     skill_registry: Option<Arc<SkillRegistry>>,
     skill_cards: Vec<SkillCard>,
@@ -667,6 +667,7 @@ pub struct Agent<C: Config> {
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
     provider_usage_anchor: Option<ProviderUsageAnchor>,
+    request_projection_generation: u64,
     // Summary agents must never recursively compact their own request. This
     // outlives their turn initialization, which replaces `TurnRuntimeState`.
     pressure_compaction_suppressed: bool,
@@ -848,6 +849,7 @@ impl AgentFactory {
             session_reasoning_efforts: parent.session_reasoning_efforts.clone(),
             prelude,
             runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&model),
+            protocol_append_state: crate::protocol_frames::ProtocolAppendState::empty(),
             tools: parent
                 .tools
                 .scoped(template.tool_scope)
@@ -882,6 +884,7 @@ impl AgentFactory {
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
+            request_projection_generation: 0,
             pressure_compaction_suppressed: false,
             fast_mode: parent.fast_mode.clone(),
             // Subagents always run with the full catalog and regular context;
@@ -914,6 +917,47 @@ impl<C: Config> Agent<C> {
         self.active_epoch = None;
     }
 
+    #[cfg(test)]
+    fn resolved_epoch_preview_for_test(
+        &self,
+        protocol: ApiProtocol,
+        turn_prelude: &[PromptMessage],
+        tools: &[crate::request_builder::ToolSpec],
+    ) -> Result<ActiveEpochPreview> {
+        match self.prepare_active_epoch(protocol, turn_prelude, tools)? {
+            ActiveEpochPreparation::Warm(preview) => Ok(preview),
+            ActiveEpochPreparation::ColdRequired(_) => {
+                self.preview_active_epoch(protocol, turn_prelude, tools)
+            }
+        }
+    }
+
+    fn invalidate_request_projection(&mut self) {
+        self.request_projection_generation = self.request_projection_generation.saturating_add(1);
+        self.clear_active_epoch();
+    }
+
+    fn frozen_evidence(&self) -> Option<crate::request_builder::FrozenEvidence> {
+        self.turn
+            .frozen_evidence
+            .as_ref()
+            .map(|evidence| crate::request_builder::FrozenEvidence {
+                message: evidence.message.clone(),
+                selected_ids: evidence.selected_ids.clone(),
+            })
+    }
+
+    fn effective_frozen_evidence_for_preview(
+        &self,
+        preview: &ActiveEpochPreview,
+    ) -> crate::request_builder::FrozenEvidence {
+        self.frozen_evidence()
+            .unwrap_or_else(|| crate::request_builder::FrozenEvidence {
+                message: preview.build.selected_evidence_message.clone(),
+                selected_ids: preview.build.selected_evidence_ids.clone(),
+            })
+    }
+
     fn clear_provider_usage_anchor(&mut self) {
         self.provider_usage_anchor = None;
     }
@@ -930,6 +974,55 @@ impl<C: Config> Agent<C> {
     /// of truth). Consumers must read protocol history here, not keep a mirror.
     pub(super) fn active_protocol_frames(&self) -> Vec<crate::protocol_frames::ProtocolFrame> {
         self.runtime_snapshot.active_protocol_frames()
+    }
+
+    pub(crate) fn runtime_context(&self) -> Result<crate::runtime_context::RuntimeActiveContext> {
+        crate::runtime_context::RuntimeActiveContext::try_from(&self.runtime_snapshot)
+    }
+
+    pub(crate) fn reconcile_loaded_skill_material(&mut self) -> Result<()> {
+        let before = self.runtime_snapshot.clone();
+        reconcile_snapshot_skill_material(&mut self.runtime_snapshot)?;
+        if self.runtime_snapshot != before {
+            self.invalidate_request_projection();
+        }
+        Ok(())
+    }
+
+    fn appended_protocol_frames(
+        &self,
+        previous: &ActiveEpoch,
+    ) -> Option<Vec<crate::protocol_frames::ProtocolFrame>> {
+        let appended_ids = self.protocol_append_state.appended_frame_ids(
+            previous.protocol_frontier_token,
+            previous.protocol_append_generation,
+            previous.protocol_frontier_count,
+        )?;
+        if appended_ids.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut suffix = Vec::with_capacity(appended_ids.len());
+        let mut next = 0usize;
+        for runtime_frame in &self.runtime_snapshot.frames {
+            if next == appended_ids.len() {
+                break;
+            }
+            if runtime_frame.id != appended_ids[next] {
+                continue;
+            }
+            if runtime_frame.visibility != FrameVisibility::Active {
+                return None;
+            }
+            let item = runtime_frame.protocol.clone()?;
+            suffix.push(crate::protocol_frames::ProtocolFrame {
+                runtime_frame_id: Some(runtime_frame.id),
+                source_provenance: Some(runtime_frame.provenance.clone()),
+                history_index: previous.protocol_frontier_count + next,
+                item,
+            });
+            next += 1;
+        }
+        (next == appended_ids.len()).then_some(suffix)
     }
 
     pub(super) fn active_history_items(&self) -> Vec<HistoryItem> {
@@ -972,27 +1065,94 @@ impl<C: Config> Agent<C> {
 
     /// Pure active-epoch preview. The returned token is committed only after the
     /// prepared telemetry callback succeeded and immediately before transport.
+    pub(super) fn prepare_active_epoch(
+        &self,
+        protocol: ApiProtocol,
+        _turn_prelude: &[PromptMessage],
+        tools: &[crate::request_builder::ToolSpec],
+    ) -> Result<ActiveEpochPreparation> {
+        let Some(previous) = self.active_epoch.as_ref() else {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::NoActiveEpoch,
+            ));
+        };
+        if previous.turn_id != self.turn.turn_id {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::TurnChanged,
+            ));
+        }
+        if previous.projection_generation != self.request_projection_generation {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::RequestProjectionChanged,
+            ));
+        }
+        if previous.budget.truncated {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::TruncatedOrReselected,
+            ));
+        }
+        let Some(suffix) = self.appended_protocol_frames(previous) else {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::ProtocolFrontierChanged,
+            ));
+        };
+        if suffix.is_empty() {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::UnsupportedAppendShape,
+            ));
+        }
+        if crate::protocol_frames::validate_history_items_complete(
+            &crate::protocol_frames::history_items_from_frames(&suffix),
+            None,
+        )
+        .is_err()
+        {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::SuffixValidationFailed,
+            ));
+        }
+        let suffix_tokens = suffix
+            .iter()
+            .map(|frame| {
+                crate::request_builder::estimate_history_item_tokens(&frame.to_history_item())
+            })
+            .sum::<u64>();
+        if previous
+            .budget
+            .estimated_request_tokens
+            .saturating_add(suffix_tokens)
+            > previous
+                .budget
+                .input_budget_tokens
+                .saturating_add(previous.budget.estimated_tools_tokens)
+        {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::BudgetRequiresColdPlan,
+            ));
+        }
+        match self.preview_warm_active_epoch(protocol, tools, previous, &suffix) {
+            Ok(preview) => Ok(ActiveEpochPreparation::Warm(preview)),
+            Err(_) => Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::UnsupportedAppendShape,
+            )),
+        }
+    }
+
     fn preview_active_epoch(
         &self,
         protocol: ApiProtocol,
         turn_prelude: &[PromptMessage],
         tools: &[crate::request_builder::ToolSpec],
     ) -> Result<ActiveEpochPreview> {
-        let history = self.active_history_items();
-        let frames = self.active_protocol_frames();
-        crate::protocol_frames::validate_history_items_complete(&history, None)?;
         let model = self.active_model_metadata();
-        let frozen = self.turn.frozen_evidence.as_ref().map(|evidence| {
-            crate::request_builder::FrozenEvidence {
-                message: evidence.message.clone(),
-                selected_ids: evidence.selected_ids.clone(),
-            }
-        });
+        let frozen = self.frozen_evidence();
         let policy = ProtectedContextPolicy::from_configured_reserve(
             None,
             effective_input_budget_tokens(model.clone(), tools),
         );
-        let built = build_request_with_policy(
+        let history = self.active_history_items();
+        crate::protocol_frames::validate_history_items_complete(&history, None)?;
+        let planned = build_request_with_policy(
             RequestBuilderInput {
                 protocol,
                 provider: self
@@ -1000,7 +1160,7 @@ impl<C: Config> Agent<C> {
                     .as_ref()
                     .map(|route| route.provider.as_str()),
                 model_id: &self.model,
-                model: model.clone(),
+                model,
                 prelude: turn_prelude,
                 snapshot: &self.runtime_snapshot,
                 tools,
@@ -1008,118 +1168,137 @@ impl<C: Config> Agent<C> {
             frozen.as_ref(),
             Some(policy),
         )?;
-        let kernel_identity = Some(crate::request_builder::provider_unit_prefix_digest(
-            &built,
-            built.prompt_plan.kernel_end_exclusive,
-        ));
-        let envelope_identity = Some(crate::request_builder::provider_unit_prefix_digest(
-            &built,
-            built.prompt_plan.envelope_end_exclusive,
-        ));
-        let cold = self.active_epoch.as_ref().is_none_or(|previous| {
-            previous.turn_id != self.turn.turn_id
-                || previous.request_shape_digest
-                    != observe_logical_request(&built).cohort.request_shape_digest
-                || previous.kernel_identity != kernel_identity
-                || previous.envelope_identity != envelope_identity
-        });
-        let (plan, transition) = if cold {
-            (built.prompt_plan.clone(), ActiveEpochTransition::Cold)
-        } else {
-            let previous = self.active_epoch.as_ref().expect("warm epoch exists");
-            ensure!(
-                frames.len() >= previous.protocol_frontier_count,
-                "active epoch protocol prefix was truncated"
-            );
-            ensure!(
-                protocol_prefix_digest(&frames[..previous.protocol_frontier_count])
-                    == previous.protocol_prefix_digest,
-                "active epoch protocol prefix was mutated or reordered"
-            );
-            let suffix = &frames[previous.protocol_frontier_count..];
-            crate::protocol_frames::validate_history_items_complete(
-                &crate::protocol_frames::history_items_from_frames(suffix),
-                None,
-            )
-            .context("active epoch protocol suffix is incomplete")?;
+        self.active_epoch_preview_from_build(planned, ActiveEpochTransition::Cold)
+    }
 
-            let mut used = HashSet::new();
-            let mut appended = Vec::with_capacity(suffix.len());
-            for frame in suffix {
-                let key = frame
-                    .runtime_frame_id
-                    .map(|id| id.as_u64().to_string())
-                    .or_else(|| Some(frame.stable_prompt_key()))
-                    .expect("protocol frame key exists");
-                let matches = built
-                    .prompt_plan
-                    .segments
-                    .iter()
-                    .filter(|segment| segment.source.source_key.as_deref() == Some(key.as_str()))
-                    .collect::<Vec<_>>();
-                ensure!(
-                    matches.len() == 1,
-                    "active epoch suffix frame cannot map uniquely to canonical prompt segment"
-                );
-                ensure!(
-                    used.insert(matches[0].id.clone()),
-                    "active epoch suffix maps a prompt segment twice"
-                );
-                appended.push((*matches[0]).clone());
-            }
-            let mut committed = previous.committed_plan.clone();
-            for segment in &mut committed.segments {
-                segment.stability =
-                    crate::request_builder::prompt_plan::PromptSegmentStability::Stable;
-            }
-            for segment in &mut appended {
-                segment.stability =
-                    crate::request_builder::prompt_plan::PromptSegmentStability::Volatile;
-            }
-            committed.segments.extend(appended);
-            normalize_prompt_plan(&mut committed);
-            (
-                committed,
-                ActiveEpochTransition::Append {
-                    added: suffix.len(),
-                },
-            )
-        };
-        let rebuilt = rebuild_request_from_plan(&built, model, tools, plan)?;
-        let observation = observe_logical_request(&rebuilt);
-        if let Some(previous) = &self.active_epoch
-            && matches!(transition, ActiveEpochTransition::Append { .. })
-        {
-            ensure!(
-                observation.units.len() >= previous.observation.units.len()
-                    && observation.units[..previous.observation.units.len()]
-                        == previous.observation.units[..],
-                "active epoch committed provider units are not an exact prefix"
-            );
-            ensure!(
-                observation.cohort.request_shape_digest == previous.request_shape_digest,
-                "active epoch request shape changed while rebuilding"
-            );
+    fn preview_warm_active_epoch(
+        &self,
+        protocol: ApiProtocol,
+        tools: &[crate::request_builder::ToolSpec],
+        previous: &ActiveEpoch,
+        suffix: &[crate::protocol_frames::ProtocolFrame],
+    ) -> Result<ActiveEpochPreview> {
+        let suffix_plan = crate::request_builder::prompt_plan::build_prompt_plan_suffix(
+            protocol,
+            &self.model,
+            &self.runtime_snapshot,
+            suffix,
+            previous.committed_plan.segments.len(),
+        );
+        let mut plan = previous.committed_plan.clone();
+        for segment in &mut plan.segments {
+            segment.stability = crate::request_builder::prompt_plan::PromptSegmentStability::Stable;
         }
-        let committed_plan = rebuilt.prompt_plan.clone();
+        for contributor in suffix_plan.contributors {
+            if let Some(existing) = plan
+                .contributors
+                .iter_mut()
+                .find(|existing| existing.id == contributor.id)
+            {
+                existing.segment_ids.extend(contributor.segment_ids);
+            } else {
+                plan.contributors.push(contributor);
+            }
+        }
+        plan.segments.extend(suffix_plan.segments);
+        for (order, contributor) in plan.contributors.iter_mut().enumerate() {
+            contributor.order = order as u32;
+        }
+        plan.recompute_cache_metadata();
+
+        let suffix_tokens = suffix
+            .iter()
+            .map(|frame| {
+                crate::request_builder::estimate_history_item_tokens(&frame.to_history_item())
+            })
+            .sum::<u64>();
+        let mut budget = previous.budget;
+        budget.original_history_items = budget.original_history_items.saturating_add(suffix.len());
+        budget.retained_history_items = budget.retained_history_items.saturating_add(suffix.len());
+        budget.estimated_retained_history_tokens = budget
+            .estimated_retained_history_tokens
+            .saturating_add(suffix_tokens);
+        budget.estimated_protected_tokens = budget
+            .estimated_protected_tokens
+            .saturating_add(suffix_tokens);
+        budget.estimated_unaddressable_protected_tokens = budget
+            .estimated_unaddressable_protected_tokens
+            .saturating_add(suffix_tokens);
+        budget.truncated = false;
+
+        let rebuilt = build_request_from_selected_prompt(SelectedPromptRequestInput {
+            protocol,
+            strategy: ProviderRequestStrategy::from_provider_and_model(
+                self.primary_route
+                    .as_ref()
+                    .map(|route| route.provider.as_str()),
+                &self.model,
+            ),
+            model_id: &self.model,
+            model: self.active_model_metadata(),
+            tools,
+            prompt_plan: plan,
+            budget,
+            selected_evidence_ids: previous.selected_evidence_ids.clone(),
+            selected_evidence_message: previous.selected_evidence_message.clone(),
+        })?;
+        let observation = observe_logical_request(&rebuilt);
+        ensure!(
+            observation.units.len() >= previous.observation.units.len()
+                && observation.units[..previous.observation.units.len()]
+                    == previous.observation.units[..],
+            "active epoch committed provider units are not an exact prefix"
+        );
+        ensure!(
+            observation.cohort.request_shape_digest == previous.request_shape_digest,
+            "active epoch request shape changed while rebuilding"
+        );
+        self.active_epoch_preview_from_build(
+            rebuilt,
+            ActiveEpochTransition::Append {
+                added: suffix.len(),
+            },
+        )
+    }
+
+    fn active_epoch_preview_from_build(
+        &self,
+        build: crate::request_builder::BuildResult,
+        _transition: ActiveEpochTransition,
+    ) -> Result<ActiveEpochPreview> {
+        let observation = observe_logical_request(&build);
+        let committed_plan = build.prompt_plan.clone();
+        let budget = build.budget;
+        let selected_evidence_ids = build.selected_evidence_ids.clone();
+        let selected_evidence_message = build.selected_evidence_message.clone();
         Ok(ActiveEpochPreview {
-            build: rebuilt,
+            build,
             epoch: ActiveEpoch {
                 turn_id: self.turn.turn_id,
                 request_shape_digest: observation.cohort.request_shape_digest.clone(),
-                kernel_identity,
-                envelope_identity,
                 committed_plan,
-                protocol_frontier_count: frames.len(),
-                protocol_prefix_digest: protocol_prefix_digest(&frames),
+                protocol_frontier_count: self.protocol_append_state.frame_count(),
+                protocol_frontier_token: self.protocol_append_state.frontier_token(),
+                protocol_append_generation: self.protocol_append_state.generation(),
                 observation,
+                projection_generation: self.request_projection_generation,
+                budget,
+                selected_evidence_ids,
+                selected_evidence_message,
             },
             #[cfg(test)]
-            transition,
+            transition: _transition,
         })
     }
 
     fn commit_active_epoch(&mut self, preview: ActiveEpochPreview) {
+        if self.turn.frozen_evidence.is_none() {
+            let frozen = self.effective_frozen_evidence_for_preview(&preview);
+            self.turn.frozen_evidence = Some(FrozenTurnEvidence {
+                message: frozen.message,
+                selected_ids: frozen.selected_ids,
+            });
+        }
         self.active_epoch = Some(preview.epoch);
     }
 
@@ -1143,6 +1322,7 @@ impl<C: Config> Agent<C> {
             session_reasoning_efforts: HashMap::new(),
             prelude: default_agent_prelude(),
             runtime_snapshot: Self::fresh_runtime_snapshot(&model),
+            protocol_append_state: crate::protocol_frames::ProtocolAppendState::empty(),
             tools: ToolRegistry::default_tools(),
             skill_registry: None,
             skill_cards: Vec::new(),
@@ -1169,6 +1349,7 @@ impl<C: Config> Agent<C> {
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
+            request_projection_generation: 0,
             pressure_compaction_suppressed: false,
             fast_mode: None,
             anchored: None,
@@ -1258,6 +1439,7 @@ impl<C: Config> Agent<C> {
             .with_context(|| format!("failed to read {}", path.display()))?;
         self.prelude
             .push(PromptMessage::system(format!("{marker}{content}")));
+        self.invalidate_request_projection();
         Ok(())
     }
 
@@ -1449,18 +1631,22 @@ impl<C: Config> Agent<C> {
 
     pub fn set_model_catalog(&mut self, catalog: HashMap<String, ModelRequestMetadata>) {
         self.model_catalog = catalog;
+        self.invalidate_request_projection();
     }
 
     pub fn set_default_protocol(&mut self, protocol: ApiProtocol) {
         self.default_protocol = protocol;
+        self.invalidate_request_projection();
     }
 
     pub fn set_model_protocols(&mut self, protocols: HashMap<String, ApiProtocol>) {
         self.model_protocols = protocols;
+        self.invalidate_request_projection();
     }
 
     pub fn set_compaction_config(&mut self, config: CompactionConfig) {
         self.compaction_config = config;
+        self.invalidate_request_projection();
     }
 
     pub(crate) fn compaction_config(&self) -> &CompactionConfig {
@@ -1490,6 +1676,7 @@ impl<C: Config> Agent<C> {
 
     pub fn set_retry_config(&mut self, config: RetryConfig) {
         self.retry_config = config;
+        self.invalidate_request_projection();
     }
 
     pub(crate) fn retry_config(&self) -> &RetryConfig {
@@ -1610,6 +1797,7 @@ impl<C: Config> Agent<C> {
 
     pub fn set_primary_route(&mut self, route: ModelRoute) {
         self.primary_route = Some(route);
+        self.invalidate_request_projection();
     }
 
     pub fn reasoning_effort(&self) -> Option<ModelReasoningEffort> {
@@ -1803,6 +1991,7 @@ impl<C: Config> Agent<C> {
         self.model = model.into();
         self.runtime_snapshot.latest_model = Some(self.model.clone());
         self.clear_provider_usage_anchor();
+        self.invalidate_request_projection();
     }
 
     #[allow(dead_code)]
@@ -1872,6 +2061,7 @@ impl<C: Config> Agent<C> {
         }
         self.session_reasoning_efforts
             .insert(self.active_reasoning_effort_key(), effort);
+        self.invalidate_request_projection();
         Ok(())
     }
 
@@ -1889,6 +2079,12 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = self
             .rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
             .expect("restored transcript messages should remain protocol-compatible");
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            None,
+        )
+        .expect("restored transcript protocol state is valid");
+        self.invalidate_request_projection();
         self.runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
         self.clear_resume_proc_local();
     }
@@ -1897,7 +2093,7 @@ impl<C: Config> Agent<C> {
     pub fn restore_evidence(&mut self, evidence: Vec<EvidenceRecord>) -> Result<()> {
         Self::validate_evidence_ids(&evidence)?;
         self.runtime_snapshot.set_evidence(evidence);
-        self.clear_active_epoch();
+        self.invalidate_request_projection();
         Ok(())
     }
 
@@ -1936,6 +2132,11 @@ impl<C: Config> Agent<C> {
         runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
 
         self.runtime_snapshot = runtime_snapshot;
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            None,
+        )?;
+        self.invalidate_request_projection();
         self.next_turn_id = max_turn_id;
         self.turn = TurnRuntimeState::default();
         self.clear_resume_proc_local();
@@ -1948,6 +2149,7 @@ impl<C: Config> Agent<C> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset_for_new_session(&mut self) {
         self.runtime_snapshot = Self::fresh_runtime_snapshot(&self.model);
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::empty();
         self.turn = TurnRuntimeState::default();
         self.next_turn_id = 0;
         self.clear_resume_proc_local();
@@ -1967,8 +2169,9 @@ impl<C: Config> Agent<C> {
         &self,
         mut runtime_snapshot: RuntimeSnapshot,
     ) -> Result<RuntimeSnapshot> {
-        reconcile_loaded_skill_material(&mut runtime_snapshot)?;
+        reconcile_snapshot_skill_material(&mut runtime_snapshot)?;
         Self::validate_evidence_ids(&runtime_snapshot.evidence)?;
+        ensure_active_protocol_source_spans(&mut runtime_snapshot);
 
         let frames = runtime_snapshot.active_protocol_frames();
         let history = crate::protocol_frames::history_items_from_frames(&frames);
@@ -1983,10 +2186,26 @@ impl<C: Config> Agent<C> {
     /// [`Self::validate_runtime_snapshot_restore`]. This mutation is infallible.
     pub fn install_validated_runtime_snapshot(&mut self, runtime_snapshot: RuntimeSnapshot) {
         let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
+        let current_turn_start_index =
+            Self::current_turn_start_index_for_snapshot(&runtime_snapshot);
         self.turn = TurnRuntimeState::default();
+        self.turn.current_turn_start_index = current_turn_start_index;
         self.runtime_snapshot = runtime_snapshot;
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            current_turn_start_index,
+        )
+        .expect("validated runtime snapshot protocol state is valid");
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_resume_proc_local();
+    }
+
+    fn current_turn_start_index_for_snapshot(snapshot: &RuntimeSnapshot) -> Option<usize> {
+        snapshot.active_protocol_frames().iter().position(|frame| {
+            frame
+                .runtime_frame_id
+                .is_some_and(|id| snapshot.compaction.turn_protected_frame_ids.contains(&id))
+        })
     }
 
     pub fn restore_runtime_snapshot(&mut self, runtime_snapshot: RuntimeSnapshot) -> Result<()> {
@@ -2036,10 +2255,11 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn add_evidence(&mut self, evidence: EvidenceRecord) -> Result<()> {
-        let mut candidate = self.runtime_snapshot.evidence.clone();
-        require_unique_evidence_id(&candidate, &evidence.id)?;
-        candidate.push(evidence);
-        self.runtime_snapshot.set_evidence(candidate);
+        require_unique_evidence_id(&self.runtime_snapshot.evidence, &evidence.id)?;
+        self.runtime_snapshot.evidence.push(evidence);
+        if self.turn.frozen_evidence.is_none() {
+            self.invalidate_request_projection();
+        }
         Ok(())
     }
 
@@ -2086,19 +2306,26 @@ impl<C: Config> Agent<C> {
         T: ToolHandler + 'static,
     {
         self.tools.register(tool);
+        self.invalidate_request_projection();
     }
 
     pub fn try_register_tool<T>(&mut self, tool: T) -> Result<()>
     where
         T: ToolHandler + 'static,
     {
-        self.tools.try_register(tool)
+        self.tools.try_register(tool)?;
+        self.invalidate_request_projection();
+        Ok(())
     }
 
     /// Unregister a dynamically owned tool, such as an MCP tool for a server
     /// that has just been disabled. Default tools are otherwise unchanged.
     pub fn unregister_tool(&mut self, name: &str) -> bool {
-        self.tools.remove(name)
+        let removed = self.tools.remove(name);
+        if removed {
+            self.invalidate_request_projection();
+        }
+        removed
     }
 
     pub fn register_skill_registry(&mut self, registry: Arc<SkillRegistry>) -> Result<()> {
@@ -2111,6 +2338,7 @@ impl<C: Config> Agent<C> {
             );
         }
         self.skill_registry = Some(registry.clone());
+        self.invalidate_request_projection();
         if registry.is_empty() {
             Ok(())
         } else {
@@ -2182,6 +2410,7 @@ impl<C: Config> Agent<C> {
 
     pub(crate) fn set_runtime_snapshot_provider(&mut self, provider: RuntimeSnapshotProvider) {
         self.runtime_snapshot_provider = Some(provider);
+        self.invalidate_request_projection();
     }
 
     pub(crate) fn has_runtime_snapshot_provider(&self) -> bool {
@@ -2190,6 +2419,7 @@ impl<C: Config> Agent<C> {
 
     pub(crate) fn clear_runtime_snapshot_provider(&mut self) {
         self.runtime_snapshot_provider = None;
+        self.invalidate_request_projection();
     }
 
     pub(crate) fn turn_continuation_provider_guard(
@@ -2240,8 +2470,9 @@ impl<C: Config> Agent<C> {
             anyhow!("canonical runtime reload requires a runtime snapshot provider")
         })?;
         let mut snapshot = provider().context("failed to project runtime snapshot for reload")?;
-        reconcile_loaded_skill_material(&mut snapshot)?;
+        reconcile_snapshot_skill_material(&mut snapshot)?;
         Self::validate_evidence_ids(&snapshot.evidence)?;
+        ensure_active_protocol_source_spans(&mut snapshot);
         let protocol_frames = snapshot.active_protocol_frames();
         let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&history, None)?;
@@ -2253,6 +2484,10 @@ impl<C: Config> Agent<C> {
         let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
 
         self.runtime_snapshot = snapshot;
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            current_turn_start_index,
+        )?;
         self.turn.current_turn_start_index = current_turn_start_index;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_resume_proc_local();
@@ -2268,7 +2503,8 @@ impl<C: Config> Agent<C> {
             anyhow!("successful context scope transition requires a runtime snapshot provider")
         })?;
         let mut snapshot = provider().context("failed to project replacement runtime snapshot")?;
-        reconcile_loaded_skill_material(&mut snapshot)?;
+        reconcile_snapshot_skill_material(&mut snapshot)?;
+        ensure_active_protocol_source_spans(&mut snapshot);
         let protocol_frames = snapshot.active_protocol_frames();
         let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&history, None)?;
@@ -2281,6 +2517,10 @@ impl<C: Config> Agent<C> {
 
         self.turn = TurnRuntimeState::default();
         self.runtime_snapshot = snapshot;
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            None,
+        )?;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_resume_proc_local();
         Ok(())
@@ -2298,6 +2538,11 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = self
             .rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])
             .expect("test-seeded history is protocol compatible");
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            self.turn.current_turn_start_index,
+        )
+        .expect("test-seeded protocol state is valid");
     }
 
     pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
@@ -2322,6 +2567,10 @@ impl<C: Config> Agent<C> {
         let frames = crate::protocol_frames::history_items_to_frames(&history);
         self.runtime_snapshot =
             self.rebuilt_runtime_snapshot_from_protocol_frames(&frames, 0, &[])?;
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            self.turn.current_turn_start_index,
+        )?;
         self.clear_resume_proc_local();
         Ok(())
     }
@@ -2338,42 +2587,53 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-    /// Append a derived protocol frame directly into the runtime snapshot (the
-    /// single source of truth). Validates the candidate stream, then rebuilds the
-    /// snapshot while preserving frame identity/provenance.
+    /// Append one protocol frame to the live runtime snapshot. Restore,
+    /// replacement, and compaction continue to use the cold rebuild below.
     fn append_protocol_frame_to_snapshot(
         &mut self,
         mut frame: crate::protocol_frames::ProtocolFrame,
         item: HistoryItem,
     ) -> Result<()> {
-        self.ensure_protocol_frame_append_allowed(&frame.item)?;
-        let mut active = self.runtime_snapshot.active_protocol_frames();
-        let mut candidate_history = crate::protocol_frames::history_items_from_frames(&active);
-        candidate_history.push(item.clone());
-        crate::protocol_frames::analyze_history_items(
-            &candidate_history,
-            self.turn.current_turn_start_index,
-        )?;
-        frame.item = protocol_frame_item_from_history_item(&item);
-        frame.history_index = active.len();
-        active.push(frame);
-        self.runtime_snapshot =
-            self.rebuilt_runtime_snapshot_from_protocol_frames(&active, 0, &[])?;
-        Ok(())
-    }
+        let active_protocol_frame_count = self
+            .runtime_snapshot
+            .frames
+            .iter()
+            .filter(|runtime_frame| {
+                runtime_frame.visibility == FrameVisibility::Active
+                    && runtime_frame.protocol.is_some()
+            })
+            .count();
+        let active_protocol_last_id = self
+            .runtime_snapshot
+            .frames
+            .iter()
+            .rev()
+            .find(|runtime_frame| {
+                runtime_frame.visibility == FrameVisibility::Active
+                    && runtime_frame.protocol.is_some()
+            })
+            .map(|runtime_frame| runtime_frame.id);
+        if !self.protocol_append_state.is_initialized()
+            || self.protocol_append_state.frame_count() != active_protocol_frame_count
+            || self.protocol_append_state.last_frame_id() != active_protocol_last_id
+        {
+            ensure_active_protocol_source_spans(&mut self.runtime_snapshot);
+            let active = self.runtime_snapshot.active_protocol_frames();
+            self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+                &active,
+                self.turn.current_turn_start_index,
+            )?;
+        }
 
-    fn ensure_protocol_frame_append_allowed(
-        &self,
-        next_item: &crate::protocol_frames::ProtocolFrameItem,
-    ) -> Result<()> {
-        let transcript = crate::protocol_frames::analyze_history_items(
-            &self.active_history_items(),
-            self.turn.current_turn_start_index,
-        )?;
-        if transcript.has_incomplete_tool_call_groups()
+        let next_item = protocol_frame_item_from_history_item(&item);
+        if self.protocol_append_state.has_incomplete_tool_call_groups()
             && !matches!(
-                next_item,
-                crate::protocol_frames::ProtocolFrameItem::ToolOutput { .. }
+                &next_item,
+                crate::protocol_frames::ProtocolFrameItem::ToolOutput { call_id, .. }
+                    if self
+                        .protocol_append_state
+                        .incomplete_tool_call_ids()
+                        .contains(call_id)
             )
         {
             bail!(
@@ -2381,6 +2641,38 @@ impl<C: Config> Agent<C> {
                 next_item
             );
         }
+
+        let history_index = self.protocol_append_state.frame_count();
+        frame.item = next_item;
+        frame.history_index = history_index;
+        let runtime_frame = runtime_frame_from_protocol_frame(&frame, history_index as u32);
+        let frame_id = runtime_frame.id;
+        self.protocol_append_state.append(
+            history_index,
+            frame_id,
+            &frame.item,
+            self.turn.current_turn_start_index,
+        )?;
+        self.runtime_snapshot.push_frame(runtime_frame);
+        if let Some(span) = self
+            .runtime_snapshot
+            .frames
+            .last()
+            .and_then(|frame| frame.provenance.source_span)
+        {
+            self.runtime_snapshot.leaf_sequence = Some(
+                self.runtime_snapshot
+                    .leaf_sequence
+                    .unwrap_or(0)
+                    .max(span.end_sequence),
+            );
+        }
+        let mut turn_protected_frame_ids =
+            self.protocol_append_state.protected_frame_ids().to_vec();
+        turn_protected_frame_ids.sort();
+        turn_protected_frame_ids.dedup();
+        self.runtime_snapshot
+            .set_turn_protected_frame_ids(turn_protected_frame_ids);
         Ok(())
     }
 
@@ -2513,6 +2805,7 @@ impl<C: Config> Agent<C> {
             session_reasoning_efforts: self.session_reasoning_efforts.clone(),
             prelude: vec![PromptMessage::system(SESSION_TITLE_PRELUDE)],
             runtime_snapshot: Self::fresh_runtime_snapshot(&self.model),
+            protocol_append_state: crate::protocol_frames::ProtocolAppendState::empty(),
             tools: ToolRegistry::new(),
             skill_registry: None,
             skill_cards: Vec::new(),
@@ -2537,6 +2830,7 @@ impl<C: Config> Agent<C> {
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
+            request_projection_generation: 0,
             pressure_compaction_suppressed: false,
             fast_mode: None,
             // Summary agents never run the anchored bootstrap.
@@ -3167,7 +3461,7 @@ impl<C: Config> Agent<C> {
             output_json,
             images: record.output.images.clone(),
         })?;
-        reconcile_loaded_skill_material(&mut self.runtime_snapshot)?;
+        self.reconcile_loaded_skill_material()?;
         if let Some(usage) = self.projected_token_usage() {
             on_event(AgentEvent::TokenUsageUpdated {
                 used_tokens: usage.used_tokens,
@@ -3323,7 +3617,7 @@ impl<C: Config> Agent<C> {
         selected_skills: &[String],
     ) -> Result<Vec<PromptMessage>> {
         let manual_skill_material = self.manual_skill_material_messages(selected_skills)?;
-        self.clear_active_epoch();
+        self.invalidate_request_projection();
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
@@ -3434,6 +3728,7 @@ impl<C: Config> Agent<C> {
                 })
                 .await?;
                 self.runtime_snapshot.workflow.todos = payload.items;
+                self.invalidate_request_projection();
             }
             "workflow__auto_continue" => {
                 let payload: WorkflowAutoContinuePayload = serde_json::from_value(args.clone())?;
@@ -3445,6 +3740,7 @@ impl<C: Config> Agent<C> {
                 })
                 .await?;
                 self.runtime_snapshot.workflow.auto_continue = next_state;
+                self.invalidate_request_projection();
                 if payload.enabled {
                     self.turn.auto_continue_active = true;
                 }
@@ -3597,6 +3893,10 @@ impl<C: Config> Agent<C> {
             &self.active_protocol_frames(),
             self.active_protocol_frames().len(),
             &self.active_history_items(),
+        )?;
+        self.protocol_append_state = crate::protocol_frames::ProtocolAppendState::from_frames(
+            &self.runtime_snapshot.active_protocol_frames(),
+            None,
         )?;
         self.runtime_snapshot.current_turn_id = None;
         self.clear_active_epoch();
@@ -4373,13 +4673,6 @@ fn next_protocol_source_sequence<C: Config>(agent: &Agent<C>) -> u64 {
         .frames
         .iter()
         .filter_map(|frame| frame.provenance.source_span.map(|span| span.end_sequence))
-        .chain(agent.active_protocol_frames().iter().filter_map(|frame| {
-            frame
-                .source_provenance
-                .as_ref()
-                .and_then(|provenance| provenance.source_span)
-                .map(|span| span.end_sequence)
-        }))
         .max()
         .unwrap_or(0);
     let from_leaf = agent.runtime_snapshot.leaf_sequence.unwrap_or(0);
@@ -4932,6 +5225,227 @@ impl ToolEffectKind {
             Self::Diagnostic => "diagnostic",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+#[cfg(test)]
+mod incremental_append_tests {
+    use super::*;
+
+    fn test_client() -> Client<OpenAIConfig> {
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        )
+    }
+
+    fn evidence(id: &str) -> EvidenceRecord {
+        EvidenceRecord {
+            id: id.into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            evidence_kind: crate::evidence::EvidenceKind::Decision,
+            title: "decision".into(),
+            summary: "preserve evidence".into(),
+            detail: Some("metadata".into()),
+            source: EvidenceSource::Transcript { sequence: 1 },
+            tags: vec!["phase1".into()],
+        }
+    }
+
+    #[test]
+    fn incremental_agent_append_matches_cold_rebuild_with_metadata_and_evidence() {
+        let base = vec![
+            HistoryItem::user("older request"),
+            HistoryItem::assistant("older answer"),
+        ];
+        let full_history = vec![
+            base[0].clone(),
+            base[1].clone(),
+            HistoryItem::user("current request"),
+            HistoryItem::AssistantToolCalls {
+                text: Some("working".into()),
+                reasoning_content: Some("reasoning".into()),
+                reasoning_wire: Some(r#"{"signature":"wire"}"#.into()),
+                calls: vec![
+                    HistoryToolCall {
+                        call_id: "call-1".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"a"}"#.into(),
+                    },
+                    HistoryToolCall {
+                        call_id: "call-2".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"b"}"#.into(),
+                    },
+                ],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-2".into(),
+                output_json: r#"{"result":"b"}"#.into(),
+                images: Vec::new(),
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: r#"{"result":"a"}"#.into(),
+                images: Vec::new(),
+            },
+            HistoryItem::assistant("done"),
+        ];
+
+        let mut incremental = Agent::new(test_client(), "m1", 4, 4);
+        incremental.set_history_for_test(base.clone());
+        incremental.runtime_snapshot.context_scope_revision = 7;
+        incremental.runtime_snapshot.current_segment_id = Some(11);
+        incremental.runtime_snapshot.current_turn_id = Some(3);
+        incremental.turn.current_turn_start_index = Some(base.len());
+        for item in full_history.iter().skip(base.len()) {
+            incremental
+                .append_history_item(item.clone())
+                .expect("incremental append should succeed");
+        }
+        incremental
+            .add_evidence(evidence("ev-1"))
+            .expect("evidence append should succeed");
+
+        let mut cold = Agent::new(test_client(), "m1", 4, 4);
+        cold.runtime_snapshot.context_scope_revision = 7;
+        cold.runtime_snapshot.current_segment_id = Some(11);
+        cold.runtime_snapshot.current_turn_id = Some(3);
+        cold.turn.current_turn_start_index = Some(base.len());
+        cold.set_history_for_test(full_history);
+        cold.add_evidence(evidence("ev-1"))
+            .expect("cold evidence append should succeed");
+
+        assert_eq!(incremental.runtime_snapshot, cold.runtime_snapshot);
+        assert_eq!(
+            incremental.active_history_items(),
+            cold.active_history_items()
+        );
+        assert_eq!(incremental.runtime_snapshot.leaf_sequence, Some(7));
+        assert_eq!(
+            incremental
+                .runtime_snapshot
+                .compaction
+                .turn_protected_frame_ids,
+            cold.runtime_snapshot.compaction.turn_protected_frame_ids
+        );
+        assert_eq!(incremental.evidence(), cold.evidence());
+    }
+
+    #[test]
+    fn warm_suffix_matches_cold_request_and_budget_for_all_protocols() {
+        for protocol in [
+            ApiProtocol::Responses,
+            ApiProtocol::Completions,
+            ApiProtocol::Anthropic,
+        ] {
+            let base = vec![
+                HistoryItem::user("old question"),
+                HistoryItem::assistant("old answer"),
+            ];
+            let suffix = vec![
+                HistoryItem::user("new question"),
+                HistoryItem::assistant("new answer"),
+            ];
+            let mut warm_agent = Agent::new(test_client(), "m1", 4, 4);
+            warm_agent.turn.current_turn_start_index = Some(base.len());
+            warm_agent.set_history_for_test(base.clone());
+            let cold_epoch = warm_agent
+                .resolved_epoch_preview_for_test(protocol, &[], &[])
+                .expect("initial epoch preview");
+            warm_agent.commit_active_epoch(cold_epoch);
+            for item in &suffix {
+                warm_agent
+                    .append_history_item(item.clone())
+                    .expect("suffix append");
+            }
+            let warm = warm_agent
+                .resolved_epoch_preview_for_test(protocol, &[], &[])
+                .expect("warm epoch preview");
+
+            let mut cold_agent = Agent::new(test_client(), "m1", 4, 4);
+            cold_agent.turn.current_turn_start_index = Some(base.len());
+            cold_agent.set_history_for_test(base.iter().chain(&suffix).cloned().collect());
+            let cold = cold_agent
+                .resolved_epoch_preview_for_test(protocol, &[], &[])
+                .expect("cold epoch preview");
+
+            let mut expected_plan = cold.build.prompt_plan.clone();
+            for segment in &mut expected_plan.segments[..base.len()] {
+                segment.stability =
+                    crate::request_builder::prompt_plan::PromptSegmentStability::Stable;
+            }
+            expected_plan.recompute_cache_metadata();
+            assert_eq!(
+                warm.build.prompt_plan, expected_plan,
+                "{protocol:?} warm PromptPlan differs from canonical cold structure"
+            );
+            assert_eq!(
+                crate::request_builder::request_value_for_test(&warm.build),
+                crate::request_builder::request_value_for_test(&cold.build),
+                "{protocol:?} warm request differs from canonical cold request"
+            );
+            assert_eq!(
+                warm.build.budget.context_window_tokens, cold.build.budget.context_window_tokens,
+                "{protocol:?} context window differs"
+            );
+            assert_eq!(
+                warm.build.budget.input_budget_tokens, cold.build.budget.input_budget_tokens,
+                "{protocol:?} input budget differs"
+            );
+            assert_eq!(
+                warm.build.budget.estimated_request_tokens,
+                cold.build.budget.estimated_request_tokens,
+                "{protocol:?} request token estimate differs"
+            );
+            assert_eq!(
+                warm.build.budget.plan_total_prompt_tokens,
+                cold.build.budget.plan_total_prompt_tokens,
+                "{protocol:?} prompt token total differs"
+            );
+            assert!(matches!(
+                warm.transition,
+                ActiveEpochTransition::Append { added: 2 }
+            ));
+        }
+    }
+
+    #[test]
+    fn warm_suffix_planning_does_not_reenter_full_planner() {
+        let history = (0..64)
+            .map(|index| {
+                if index % 2 == 0 {
+                    HistoryItem::user(format!("question-{index}"))
+                } else {
+                    HistoryItem::assistant(format!("answer-{index}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut agent = Agent::new(test_client(), "m1", 4, 4);
+        agent.set_history_for_test(history[..62].to_vec());
+        agent.turn.current_turn_start_index = Some(62);
+        crate::request_builder::prompt_plan::reset_plan_call_count();
+        let cold = agent
+            .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &[])
+            .expect("cold preview");
+        assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
+        agent.commit_active_epoch(cold);
+        agent
+            .append_history_item(history[62].clone())
+            .expect("first suffix append");
+        agent
+            .append_history_item(history[63].clone())
+            .expect("second suffix append");
+        let warm = agent
+            .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &[])
+            .expect("warm preview");
+        assert!(matches!(
+            warm.transition,
+            ActiveEpochTransition::Append { .. }
+        ));
+        assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
     }
 }
 

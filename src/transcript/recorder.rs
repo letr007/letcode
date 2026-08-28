@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -97,6 +98,67 @@ pub struct ContextScopeState {
     pub active_experiment: Option<ActiveContextExperiment>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ActiveTurnTracker {
+    pub(crate) turn_id: Option<u64>,
+    pub(crate) unfinished_tool_calls: Vec<(String, String)>,
+}
+
+impl ActiveTurnTracker {
+    fn apply(&mut self, event: &TranscriptEvent) {
+        match event {
+            TranscriptEvent::TurnStarted(event) => {
+                self.turn_id = Some(event.turn_id);
+                self.unfinished_tool_calls.clear();
+            }
+            TranscriptEvent::TurnInterrupted { turn_id }
+                if self.turn_id.is_none() || turn_id.is_none() || *turn_id == self.turn_id =>
+            {
+                self.turn_id = None;
+                self.unfinished_tool_calls.clear();
+            }
+            TranscriptEvent::TurnFinalized(event) if self.turn_id == Some(event.turn_id) => {
+                self.turn_id = None;
+                self.unfinished_tool_calls.clear();
+            }
+            TranscriptEvent::AssistantToolCallBatch { calls, .. } => {
+                for call in calls {
+                    if !self
+                        .unfinished_tool_calls
+                        .iter()
+                        .any(|(id, _)| id == &call.call_id)
+                    {
+                        self.unfinished_tool_calls
+                            .push((call.call_id.clone(), call.name.clone()));
+                    }
+                }
+            }
+            TranscriptEvent::ToolCallStarted { call_id, name, .. }
+                if !self
+                    .unfinished_tool_calls
+                    .iter()
+                    .any(|(id, _)| id == call_id) =>
+            {
+                self.unfinished_tool_calls
+                    .push((call_id.clone(), name.clone()));
+            }
+            TranscriptEvent::ToolCallFinished { call_id, .. }
+            | TranscriptEvent::ToolCallCancelled { call_id, .. } => {
+                self.unfinished_tool_calls.retain(|(id, _)| id != call_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn from_records(records: &[TranscriptRecord]) -> Self {
+        let mut tracker = Self::default();
+        for record in records {
+            tracker.apply(&record.event);
+        }
+        tracker
+    }
+}
+
 pub struct TranscriptRecorder {
     pub(crate) session_id: String,
     #[allow(dead_code)]
@@ -107,6 +169,7 @@ pub struct TranscriptRecorder {
     pub(crate) current_context_branch_id: Option<String>,
     pub(crate) context_scope_state: Arc<Mutex<ContextScopeState>>,
     pub(crate) reasoning_started_at: std::collections::HashMap<String, std::time::Instant>,
+    pub(crate) active_turn_trackers: HashMap<String, ActiveTurnTracker>,
 }
 
 impl TranscriptRecorder {
@@ -129,6 +192,10 @@ impl TranscriptRecorder {
             current_context_branch_id: None,
             context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
             reasoning_started_at: std::collections::HashMap::new(),
+            active_turn_trackers: HashMap::from([(
+                ROOT_CONTEXT_BRANCH_ID.to_string(),
+                ActiveTurnTracker::default(),
+            )]),
         })
     }
 
@@ -232,6 +299,8 @@ impl TranscriptRecorder {
         let file = OpenOptions::new().append(true).open(&file_path)?;
 
         let context_scope_state = Arc::new(Mutex::new(reconstruct_context_scope_state(records)?));
+        let (current_context_branch_id, active_turn_trackers) =
+            reconstruct_active_turn_trackers(session_id, records)?;
 
         Ok(Self {
             session_id: session_id.to_string(),
@@ -239,9 +308,10 @@ impl TranscriptRecorder {
             sink: Box::new(FileJournalSink(file)),
             sequence,
             health: RecorderHealth::Healthy,
-            current_context_branch_id: None,
+            current_context_branch_id,
             context_scope_state,
             reasoning_started_at: std::collections::HashMap::new(),
+            active_turn_trackers,
         })
     }
 
@@ -305,6 +375,46 @@ impl TranscriptRecorder {
 
     pub fn current_context_branch_id(&self) -> Option<&str> {
         self.current_context_branch_id.as_deref()
+    }
+
+    pub(crate) fn active_turn_id(&self) -> anyhow::Result<Option<u64>> {
+        Ok(self.current_active_turn_tracker()?.turn_id)
+    }
+
+    pub(crate) fn unfinished_tool_calls_in_active_turn(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(self.current_active_turn_tracker()?.unfinished_tool_calls)
+    }
+
+    pub(crate) fn interrupt_transcript_plan(
+        &self,
+    ) -> anyhow::Result<(u64, Option<String>, Option<u64>, Vec<(String, String)>)> {
+        Ok((
+            self.sequence,
+            self.current_context_branch_id.clone(),
+            self.active_turn_id()?,
+            self.unfinished_tool_calls_in_active_turn()?,
+        ))
+    }
+
+    fn active_branch_key(&self) -> String {
+        self.current_context_branch_id
+            .as_deref()
+            .unwrap_or(ROOT_CONTEXT_BRANCH_ID)
+            .to_string()
+    }
+
+    fn current_active_turn_tracker(&self) -> anyhow::Result<ActiveTurnTracker> {
+        self.active_turn_trackers
+            .get(&self.active_branch_key())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "active-turn tracker is unavailable for branch '{}'",
+                    self.active_branch_key()
+                )
+            })
     }
 
     /// Adopts a projected legacy branch as the ordinary append scope when a
@@ -1318,8 +1428,37 @@ impl TranscriptRecorder {
             return Err(error.into());
         }
         self.sequence = sequence;
-        session_index::upsert_from_record(&self.path, &envelope.record);
+        self.apply_active_turn_record(&envelope.record);
         Ok(())
+    }
+
+    fn apply_active_turn_record(&mut self, record: &TranscriptRecord) {
+        if let TranscriptEvent::ContextBranchCreated {
+            branch_id,
+            parent_branch_id,
+            ..
+        } = &record.event
+        {
+            let parent_tracker = self
+                .active_turn_trackers
+                .get(parent_branch_id)
+                .cloned()
+                .unwrap_or_default();
+            self.active_turn_trackers
+                .entry(branch_id.clone())
+                .or_insert(parent_tracker);
+            return;
+        }
+
+        let branch_id = record
+            .context_branch_id
+            .as_deref()
+            .unwrap_or(ROOT_CONTEXT_BRANCH_ID)
+            .to_string();
+        self.active_turn_trackers
+            .entry(branch_id)
+            .or_default()
+            .apply(&record.event);
     }
 
     fn prepare_transaction_buffer(
@@ -1409,7 +1548,9 @@ impl TranscriptRecorder {
             return Err(error.into());
         }
         self.sequence = resulting_revision;
-        session_index::upsert_from_records(&self.path, &index_records);
+        for record in &index_records {
+            self.apply_active_turn_record(record);
+        }
         Ok(())
     }
 }
@@ -1490,6 +1631,36 @@ fn optional_context_return_string(data: &Value, field: &str) -> Result<Option<St
             "context__return output field '{field}' must be string or null"
         )),
     }
+}
+
+fn reconstruct_active_turn_trackers(
+    session_id: &str,
+    records: &[TranscriptRecord],
+) -> Result<(Option<String>, HashMap<String, ActiveTurnTracker>)> {
+    let mut trackers = HashMap::new();
+    let mut branches = vec![ROOT_CONTEXT_BRANCH_ID.to_string()];
+    for record in records {
+        if let TranscriptEvent::ContextBranchCreated { branch_id, .. } = &record.event {
+            branches.push(branch_id.clone());
+        }
+    }
+    branches.sort();
+    branches.dedup();
+    for branch in branches {
+        let snapshot = transcript_projection::build_session_context_snapshot(
+            session_id.to_string(),
+            records.to_vec(),
+            transcript_projection::SessionContextCursor {
+                branch_id: Some(branch.clone()),
+                leaf_sequence: None,
+            },
+        )?;
+        trackers.insert(branch, ActiveTurnTracker::from_records(&snapshot.records));
+    }
+    let current_branch = transcript_projection::effective_branch_id_at_frontier(records)?;
+    let current_context_branch_id =
+        (current_branch != ROOT_CONTEXT_BRANCH_ID).then_some(current_branch);
+    Ok((current_context_branch_id, trackers))
 }
 
 fn reconstruct_context_scope_state(records: &[TranscriptRecord]) -> Result<ContextScopeState> {

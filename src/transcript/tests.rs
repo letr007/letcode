@@ -61,6 +61,10 @@ fn recorder_with_sink(sink: impl JournalSink + 'static) -> TranscriptRecorder {
         current_context_branch_id: None,
         context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
         reasoning_started_at: std::collections::HashMap::new(),
+        active_turn_trackers: std::collections::HashMap::from([(
+            ROOT_CONTEXT_BRANCH_ID.to_string(),
+            super::recorder::ActiveTurnTracker::default(),
+        )]),
     }
 }
 
@@ -384,6 +388,7 @@ fn transaction_io_failure_poison_does_not_advance_or_switch_scope() {
         );
         assert_eq!(recorder.sequence, 0);
         assert_eq!(recorder.current_context_branch_id(), Some("parent"));
+        assert_eq!(recorder.active_turn_trackers.get("parent"), None);
         assert_eq!(recorder.health, RecorderHealth::Poisoned);
         assert_eq!(
             *calls.lock().unwrap(),
@@ -394,6 +399,62 @@ fn transaction_io_failure_poison_does_not_advance_or_switch_scope() {
             }
         );
     }
+}
+
+#[test]
+fn interrupt_transaction_failure_leaves_sequence_events_and_tracker_unchanged() {
+    let base_dir = journal_test_dir("interrupt-transaction-atomicity");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_turn_started(TurnStartedEvent {
+            turn_id: 1,
+            intent: "interrupt".into(),
+            directive: "cancel active work".into(),
+            validation_reminder: String::new(),
+        })
+        .expect("start turn");
+    recorder
+        .record_tool_call_started("call-1", "shell__exec", json!({"command": "sleep 1"}))
+        .expect("start tool call");
+    let before_records = read_records(recorder.path()).expect("read records before failure");
+    let before_tracker = recorder
+        .unfinished_tool_calls_in_active_turn()
+        .expect("tracker should be available");
+    let before_sequence = recorder.sequence;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    recorder.replace_sink_for_test(Box::new(FailingSink {
+        fail: FailPoint::Write,
+        calls: Arc::clone(&calls),
+    }));
+
+    assert!(
+        recorder
+            .append_transaction(vec![
+                (
+                    TranscriptEvent::ToolCallCancelled {
+                        call_id: "call-1".into(),
+                        name: "shell__exec".into(),
+                    },
+                    None,
+                ),
+                (TranscriptEvent::TurnInterrupted { turn_id: Some(1) }, None,),
+            ])
+            .is_err()
+    );
+
+    assert_eq!(recorder.sequence, before_sequence);
+    assert_eq!(
+        recorder
+            .unfinished_tool_calls_in_active_turn()
+            .expect("tracker should remain available"),
+        before_tracker
+    );
+    let after_records = read_records(recorder.path()).expect("read records after failure");
+    assert_eq!(
+        serde_json::to_value(after_records).expect("serialize records after failure"),
+        serde_json::to_value(before_records).expect("serialize records before failure")
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["write"]);
 }
 
 #[test]
@@ -592,6 +653,9 @@ fn open_existing_with_records_preserves_sequence_and_context_scope() {
     let base_dir = journal_test_dir("open-with-records");
     let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
     recorder
+        .record_context_branch_created("branch-1", ROOT_CONTEXT_BRANCH_ID, 0, None)
+        .expect("create branch definition");
+    recorder
         .append_metadata(TranscriptEvent::ContextExperimentStarted {
             branch_id: "branch-1".into(),
             parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
@@ -638,7 +702,135 @@ fn open_existing_with_records_preserves_sequence_and_context_scope() {
             .iter()
             .map(|record| record.sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn checkout_to_root_reconstructs_root_tracker_after_reopen() {
+    let base_dir = journal_test_dir("checkout-root-tracker");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_turn_started(TurnStartedEvent {
+            turn_id: 1,
+            intent: "root".into(),
+            directive: "root turn".into(),
+            validation_reminder: String::new(),
+        })
+        .expect("start root turn");
+    recorder
+        .record_turn_finalized(TurnFinalizedEvent {
+            turn_id: 1,
+            outcome: "completed".into(),
+            tool_call_count: 0,
+            continuation_count: 0,
+            write_effects: 0,
+            validation_effects: 0,
+            failed_validation_effects: 0,
+            validation_advisory_emitted: false,
+        })
+        .expect("finish root turn");
+    let root_base = recorder.sequence;
+    recorder
+        .record_context_branch_created("branch-a", ROOT_CONTEXT_BRANCH_ID, root_base, None)
+        .expect("create branch");
+    recorder
+        .record_context_checkout("branch-a", root_base)
+        .expect("checkout branch");
+    recorder.set_current_context_branch_id(Some("branch-a".into()));
+    recorder
+        .record_turn_started(TurnStartedEvent {
+            turn_id: 2,
+            intent: "branch".into(),
+            directive: "branch turn".into(),
+            validation_reminder: String::new(),
+        })
+        .expect("start branch turn");
+    recorder
+        .record_context_checkout(ROOT_CONTEXT_BRANCH_ID, root_base)
+        .expect("checkout root");
+    recorder.set_current_context_branch_id(None);
+    recorder
+        .record_turn_started(TurnStartedEvent {
+            turn_id: 3,
+            intent: "root again".into(),
+            directive: "root turn after checkout".into(),
+            validation_reminder: String::new(),
+        })
+        .expect("start root turn after checkout");
+    recorder
+        .record_tool_call_started("root-call", "fs__read", json!({}))
+        .expect("start root tool");
+    let session_id = recorder.session_id().to_string();
+    drop(recorder);
+
+    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+        .expect("reopen root checkout transcript");
+    assert_eq!(reopened.current_context_branch_id(), None);
+    assert_eq!(
+        reopened
+            .unfinished_tool_calls_in_active_turn()
+            .expect("root tracker should be available"),
+        vec![("root-call".into(), "fs__read".into())]
+    );
+}
+
+#[test]
+fn open_reconstructs_metadata_only_branch_tracker_from_parent_projection() {
+    let base_dir = journal_test_dir("metadata-only-branch-tracker");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_turn_started(TurnStartedEvent {
+            turn_id: 1,
+            intent: "root".into(),
+            directive: "parent active turn".into(),
+            validation_reminder: String::new(),
+        })
+        .expect("start parent turn");
+    recorder
+        .record_tool_call_started("parent-call", "fs__read", json!({}))
+        .expect("start parent tool");
+    let base_sequence = recorder.sequence;
+    recorder
+        .record_context_branch_created("metadata-only", ROOT_CONTEXT_BRANCH_ID, base_sequence, None)
+        .expect("create metadata-only branch");
+    let session_id = recorder.session_id().to_string();
+    drop(recorder);
+
+    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+        .expect("reopen metadata-only branch transcript");
+    reopened.set_current_context_branch_id(Some("metadata-only".into()));
+    assert_eq!(
+        reopened
+            .unfinished_tool_calls_in_active_turn()
+            .expect("metadata-only tracker should be available"),
+        vec![("parent-call".into(), "fs__read".into())]
+    );
+}
+
+#[test]
+fn open_rejects_malformed_branch_projection_without_tracker_fallback() {
+    let base_dir = journal_test_dir("malformed-branch-projection");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .append_transaction(vec![(
+            TranscriptEvent::AssistantMessage {
+                content: "scoped without a branch definition".into(),
+            },
+            Some("missing-branch".into()),
+        )])
+        .expect("write malformed scoped record");
+    let session_id = recorder.session_id().to_string();
+    drop(recorder);
+
+    let error = match TranscriptRecorder::open_existing(&base_dir, &session_id) {
+        Ok(_) => panic!("malformed branch projection must fail open"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("branch")
+            || error.to_string().contains("projection")
+            || error.to_string().contains("scope")
     );
 }
 
@@ -2042,6 +2234,11 @@ fn list_sessions_persists_and_reuses_sidecar_index() {
         .record_session_title("Indexed")
         .expect("record title");
 
+    assert!(
+        !base_dir.join("sessions-index.json").exists(),
+        "append must not create the session index sidecar"
+    );
+
     let first = list_sessions(&base_dir).expect("first list");
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].title.as_deref(), Some("Indexed"));
@@ -2053,10 +2250,45 @@ fn list_sessions_persists_and_reuses_sidecar_index() {
     let second = list_sessions(&base_dir).expect("second list hits index");
     assert_eq!(first, second);
 
-    // Stale stamp forces a rescan; title written only into the jsonl via a new recorder
-    // path is covered by append updating the index — bump the transcript mtime and
-    // ensure listing still returns the session.
-    let path = recorder.path().to_path_buf();
+    std::fs::write(base_dir.join("sessions-index.json"), b"{}").expect("invalidate sidecar");
+    let appended_during_scan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let append_once = Arc::clone(&appended_during_scan);
+    let transcript_path = recorder.path().to_path_buf();
+    let during_scan =
+        super::session_index::list_sessions_with_index(&base_dir, |path, session_id| {
+            let summary = summarize_session_file(path, session_id)?;
+            if !append_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                recorder
+                    .record_session_title("Concurrent")
+                    .expect("append during sidecar rebuild");
+            }
+            Ok(summary)
+        })
+        .expect("list while transcript advances");
+    assert_eq!(during_scan[0].title.as_deref(), Some("Indexed"));
+    let after_concurrent_append =
+        list_sessions(&base_dir).expect("stale scan stamp forces rebuild");
+    assert_eq!(
+        after_concurrent_append[0].title.as_deref(),
+        Some("Concurrent")
+    );
+
+    let path = transcript_path;
+    let stale_index =
+        std::fs::read(base_dir.join("sessions-index.json")).expect("read existing sidecar");
+    recorder
+        .record_session_title("Updated")
+        .expect("append updated title");
+    assert_eq!(
+        std::fs::read(base_dir.join("sessions-index.json")).expect("read sidecar after append"),
+        stale_index,
+        "append must not update the session index sidecar"
+    );
+    let after_append = list_sessions(&base_dir).expect("list after append");
+    assert_eq!(after_append[0].title.as_deref(), Some("Updated"));
+
+    // Stale stamp forces a rescan when the transcript changes outside the recorder.
+
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)

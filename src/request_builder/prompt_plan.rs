@@ -14,6 +14,24 @@ use crate::runtime_context::{
 use crate::user_content::{UserImageAttachment, UserMessageContent};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static PLAN_CALL_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_plan_call_count() {
+    PLAN_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn plan_call_count() -> usize {
+    PLAN_CALL_COUNT.with(Cell::get)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PromptSegmentRole {
@@ -174,6 +192,8 @@ pub(crate) struct PlannedPrompt {
 
 impl PromptPlanner {
     pub(crate) fn plan(input: PromptPlannerInput<'_>) -> anyhow::Result<PlannedPrompt> {
+        #[cfg(test)]
+        PLAN_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         input.snapshot.validate_references()?;
         let active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
         let active_protected_start_index =
@@ -294,6 +314,7 @@ impl PromptPlanner {
             prelude: &effective_prelude,
             snapshot: input.snapshot,
             selected_frames: &frames,
+            segment_order_offset: 0,
             protected_suffix_len: effective_history
                 .len()
                 .saturating_sub(effective_protected_start_index.min(effective_history.len())),
@@ -618,6 +639,7 @@ pub(crate) struct PromptPlanBuildInput<'a> {
     pub prelude: &'a [PromptMessage],
     pub snapshot: &'a RuntimeSnapshot,
     pub selected_frames: &'a [ProtocolFrame],
+    pub segment_order_offset: usize,
     pub protected_suffix_len: usize,
     pub evidence_message: Option<&'a str>,
     pub selected_evidence_ids: &'a [String],
@@ -635,7 +657,40 @@ pub(crate) struct SelectedRuntimePromptMaterial {
 }
 
 pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
-    let mut builder = PromptPlanBuilder::new(input.protocol, input.model_id);
+    build_prompt_plan_with_runtime_material(input, true)
+}
+
+pub(crate) fn build_prompt_plan_suffix(
+    protocol: ApiProtocol,
+    model_id: &str,
+    snapshot: &RuntimeSnapshot,
+    selected_frames: &[ProtocolFrame],
+    segment_order_offset: usize,
+) -> PromptPlan {
+    let mut suffix = build_prompt_plan_with_runtime_material(
+        PromptPlanBuildInput {
+            protocol,
+            model_id,
+            prelude: &[],
+            snapshot,
+            selected_frames,
+            segment_order_offset,
+            protected_suffix_len: selected_frames.len(),
+            evidence_message: None,
+            selected_evidence_ids: &[],
+        },
+        false,
+    );
+    canonicalize_prompt_plan_preserving_offset(&mut suffix, segment_order_offset);
+    suffix
+}
+
+fn build_prompt_plan_with_runtime_material(
+    input: PromptPlanBuildInput<'_>,
+    include_runtime_material: bool,
+) -> PromptPlan {
+    let mut builder =
+        PromptPlanBuilder::new(input.protocol, input.model_id, input.segment_order_offset);
 
     for message in input.prelude {
         let classification = classify_prelude_message(message);
@@ -665,27 +720,31 @@ pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
         .iter()
         .filter_map(|frame| frame.runtime_frame_id)
         .collect::<std::collections::BTreeSet<_>>();
-    let prompt_material = input
-        .snapshot
-        .active_prompt_payload_contributors()
-        .into_iter()
-        .filter_map(|(contributor, frame)| {
-            let payload = frame.prompt_payload.as_ref()?;
-            (!contributor
-                .source_frame_ids
-                .iter()
-                .any(|id| selected_ids.contains(id)))
-            .then(|| SelectedRuntimePromptMaterial {
-                contributor_id: contributor.contributor_id.clone(),
-                contributor_kind: contributor.kind,
-                label: contributor.label.clone(),
-                provenance: frame.provenance.clone(),
-                frame_id: frame.id,
-                role: payload.role,
-                text: payload.text.clone(),
+    let prompt_material = if include_runtime_material {
+        input
+            .snapshot
+            .active_prompt_payload_contributors()
+            .into_iter()
+            .filter_map(|(contributor, frame)| {
+                let payload = frame.prompt_payload.as_ref()?;
+                (!contributor
+                    .source_frame_ids
+                    .iter()
+                    .any(|id| selected_ids.contains(id)))
+                .then(|| SelectedRuntimePromptMaterial {
+                    contributor_id: contributor.contributor_id.clone(),
+                    contributor_kind: contributor.kind,
+                    label: contributor.label.clone(),
+                    provenance: frame.provenance.clone(),
+                    frame_id: frame.id,
+                    role: payload.role,
+                    text: payload.text.clone(),
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     for material in &prompt_material {
         let role = match material.role {
             RuntimePromptRole::System => PromptSegmentRole::System,
@@ -795,6 +854,48 @@ pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
     builder.finish()
 }
 
+fn canonicalize_prompt_plan_preserving_offset(plan: &mut PromptPlan, order_offset: usize) {
+    let mut history = Vec::new();
+    let mut current = Vec::new();
+    for segment in plan.segments.drain(..) {
+        if segment.protection.current_turn
+            || segment.source.contributor_kind == PromptContributorKind::CurrentTurn
+        {
+            current.push(segment);
+        } else {
+            history.push(segment);
+        }
+    }
+    history.append(&mut current);
+    for (index, segment) in history.iter_mut().enumerate() {
+        let order = order_offset.saturating_add(index) as u32;
+        segment.order = order;
+        segment.source.order = order;
+        segment.stability = PromptSegmentStability::Volatile;
+    }
+    plan.segments = history;
+    plan.kernel_end_exclusive = 0;
+    plan.envelope_end_exclusive = 0;
+    for contributor in &mut plan.contributors {
+        contributor.segment_ids.clear();
+    }
+    for segment in &plan.segments {
+        if let Some(contributor) = plan
+            .contributors
+            .iter_mut()
+            .find(|contributor| contributor.id == segment.contributor_id)
+        {
+            contributor.segment_ids.push(segment.id.clone());
+        }
+    }
+    plan.contributors
+        .retain(|contributor| !contributor.segment_ids.is_empty());
+    for (index, contributor) in plan.contributors.iter_mut().enumerate() {
+        contributor.order = order_offset.saturating_add(index) as u32;
+    }
+    plan.recompute_cache_metadata();
+}
+
 /// Normalize the sole canonical prompt projection after selection.
 pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
     let mut kernel = Vec::new();
@@ -879,15 +980,17 @@ fn last_user_frame_index(frames: &[ProtocolFrame]) -> Option<usize> {
 struct PromptPlanBuilder {
     protocol: ApiProtocol,
     model_id: String,
+    segment_order_offset: usize,
     contributors: Vec<PromptContributor>,
     segments: Vec<PromptSegment>,
 }
 
 impl PromptPlanBuilder {
-    fn new(protocol: ApiProtocol, model_id: &str) -> Self {
+    fn new(protocol: ApiProtocol, model_id: &str, segment_order_offset: usize) -> Self {
         Self {
             protocol,
             model_id: model_id.to_string(),
+            segment_order_offset,
             contributors: Vec::new(),
             segments: Vec::new(),
         }
@@ -915,7 +1018,9 @@ impl PromptPlanBuilder {
                 id: id.clone(),
                 kind,
                 label,
-                order: self.contributors.len() as u32,
+                order: self
+                    .segment_order_offset
+                    .saturating_add(self.contributors.len()) as u32,
                 segment_ids: Vec::new(),
             });
         }
@@ -928,7 +1033,9 @@ impl PromptPlanBuilder {
             new_segment.contributor_label,
             new_segment.provenance.clone(),
         );
-        let order = self.segments.len() as u32;
+        let order = self
+            .segment_order_offset
+            .saturating_add(self.segments.len()) as u32;
         let segment_id = stable_hash_input(&format!(
             "segment:{}:{:?}:{:?}:{}:{}",
             order,
@@ -1443,6 +1550,7 @@ mod tests {
                 HistoryItem::assistant("older assistant"),
                 HistoryItem::user("latest user"),
             ]),
+            segment_order_offset: 0,
             protected_suffix_len: 1,
             evidence_message: Some(
                 "Relevant evidence:\n- [ev-1] file_excerpt src/main.rs — summary",
@@ -1490,6 +1598,7 @@ mod tests {
                     images: Vec::new(),
                 },
             ]),
+            segment_order_offset: 0,
             protected_suffix_len: 0,
             evidence_message: None,
             selected_evidence_ids: &[],
@@ -1558,6 +1667,7 @@ mod tests {
             prelude,
             snapshot: &RuntimeSnapshot::new("test"),
             selected_frames: &history_items_to_frames(history),
+            segment_order_offset: 0,
             protected_suffix_len,
             evidence_message: None,
             selected_evidence_ids: &[],

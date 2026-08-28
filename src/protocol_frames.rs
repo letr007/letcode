@@ -5,6 +5,7 @@ use crate::user_content::{UserMessageContent, UserMessagePart};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProtocolFrameKind {
@@ -234,6 +235,362 @@ pub(crate) struct ToolCallGroup {
 pub(crate) struct ProtocolTranscript {
     pub frames: Vec<ProtocolFrame>,
     pub tool_call_groups: Vec<ToolCallGroup>,
+}
+
+/// Incremental protocol validation state for the live append path. The durable
+/// snapshot remains the authority; this cache is rebuilt for restore/compaction
+/// and only avoids replaying the whole protocol stream for ordinary appends.
+static NEXT_APPEND_LINEAGE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtocolAppendState {
+    initialized: bool,
+    frontier_token: u64,
+    generation: u64,
+    frame_ids: Vec<RuntimeFrameId>,
+    completed_groups: Vec<IncrementalToolCallGroup>,
+    historical_incomplete_groups: Vec<IncrementalToolCallGroup>,
+    tail_open_group: Option<IncrementalToolCallGroup>,
+    next_group_order: usize,
+    current_turn_start_index: Option<usize>,
+    protected_frame_ids: Vec<RuntimeFrameId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncrementalToolCallGroup {
+    assistant_index: usize,
+    call_ids: Vec<String>,
+    pending_call_ids: BTreeSet<String>,
+    tool_output_indexes: Vec<usize>,
+    frame_ids: Vec<RuntimeFrameId>,
+    order: usize,
+}
+
+impl ProtocolAppendState {
+    pub(crate) fn empty() -> Self {
+        Self {
+            initialized: false,
+            frontier_token: 0,
+            generation: 0,
+            frame_ids: Vec::new(),
+            completed_groups: Vec::new(),
+            historical_incomplete_groups: Vec::new(),
+            tail_open_group: None,
+            next_group_order: 0,
+            current_turn_start_index: None,
+            protected_frame_ids: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_frames(
+        frames: &[ProtocolFrame],
+        current_turn_start_index: Option<usize>,
+    ) -> Result<Self> {
+        let mut state = Self::empty();
+        state.initialized = true;
+        state.frontier_token = NEXT_APPEND_LINEAGE.fetch_add(1, Ordering::Relaxed);
+        state.current_turn_start_index = current_turn_start_index;
+        for frame in frames {
+            let frame_id = frame.runtime_frame_id.ok_or_else(|| {
+                anyhow::anyhow!("incremental protocol state requires runtime frame identity")
+            })?;
+            state.append_internal(
+                frame.history_index,
+                frame_id,
+                &frame.item,
+                current_turn_start_index,
+                false,
+            )?;
+        }
+        state.recompute_protected_frame_ids();
+        Ok(state)
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frame_ids.len()
+    }
+
+    pub(crate) fn frontier_token(&self) -> u64 {
+        self.frontier_token
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn last_frame_id(&self) -> Option<RuntimeFrameId> {
+        self.frame_ids.last().copied()
+    }
+
+    pub(crate) fn current_turn_start_index(&self) -> Option<usize> {
+        self.current_turn_start_index
+    }
+
+    pub(crate) fn appended_frame_ids(
+        &self,
+        token: u64,
+        generation: u64,
+        frame_count: usize,
+    ) -> Option<&[RuntimeFrameId]> {
+        (self.initialized
+            && self.frontier_token == token
+            && self.generation >= generation
+            && self.frame_ids.len() >= frame_count)
+            .then_some(&self.frame_ids[frame_count..])
+    }
+
+    pub(crate) fn protected_frame_ids(&self) -> &[RuntimeFrameId] {
+        &self.protected_frame_ids
+    }
+
+    pub(crate) fn has_incomplete_tool_call_groups(&self) -> bool {
+        !self.historical_incomplete_groups.is_empty() || self.tail_open_group.is_some()
+    }
+
+    pub(crate) fn has_historical_incomplete_tool_call_groups(&self) -> bool {
+        !self.historical_incomplete_groups.is_empty()
+    }
+
+    pub(crate) fn incomplete_tool_call_ids(&self) -> BTreeSet<String> {
+        self.tail_open_group
+            .iter()
+            .flat_map(|group| group.pending_call_ids.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        history_index: usize,
+        frame_id: RuntimeFrameId,
+        item: &ProtocolFrameItem,
+        current_turn_start_index: Option<usize>,
+    ) -> Result<()> {
+        self.append_internal(
+            history_index,
+            frame_id,
+            item,
+            current_turn_start_index,
+            true,
+        )
+    }
+
+    fn append_internal(
+        &mut self,
+        history_index: usize,
+        frame_id: RuntimeFrameId,
+        item: &ProtocolFrameItem,
+        current_turn_start_index: Option<usize>,
+        enforce_incomplete_group_boundary: bool,
+    ) -> Result<()> {
+        if enforce_incomplete_group_boundary {
+            match item {
+                ProtocolFrameItem::ToolOutput { call_id, .. } => {
+                    let Some(group) = self.tail_open_group.as_ref() else {
+                        bail!(
+                            "orphan tool output at history index {} for call_id '{}'",
+                            history_index,
+                            call_id
+                        );
+                    };
+                    ensure!(
+                        group.pending_call_ids.contains(call_id),
+                        "orphan tool output at history index {} for call_id '{}'",
+                        history_index,
+                        call_id
+                    );
+                }
+                _ if self.has_incomplete_tool_call_groups() => {
+                    bail!(
+                        "cannot append {:?} while assistant tool call group is incomplete",
+                        item
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        match item {
+            ProtocolFrameItem::AssistantToolCalls { calls, .. } => {
+                ensure_unique_call_ids(history_index, calls)?;
+            }
+            ProtocolFrameItem::ToolOutput { call_id, .. } => {
+                ensure!(
+                    self.tail_open_group
+                        .as_ref()
+                        .is_some_and(|group| group.pending_call_ids.contains(call_id)),
+                    "orphan tool output at history index {} for call_id '{}'",
+                    history_index,
+                    call_id
+                );
+            }
+            _ => {}
+        }
+
+        self.initialized = true;
+        if self.current_turn_start_index != current_turn_start_index {
+            self.current_turn_start_index = current_turn_start_index;
+            self.generation = self.generation.saturating_add(1);
+            self.recompute_protected_frame_ids();
+        }
+
+        match item {
+            ProtocolFrameItem::AssistantToolCalls { calls, .. } => {
+                if let Some(group) = self.tail_open_group.take() {
+                    self.historical_incomplete_groups.push(group);
+                }
+                if !calls.is_empty() {
+                    let order = self.next_group_order;
+                    self.next_group_order = self.next_group_order.saturating_add(1);
+                    self.tail_open_group = Some(IncrementalToolCallGroup {
+                        assistant_index: history_index,
+                        call_ids: calls.iter().map(|call| call.call_id.clone()).collect(),
+                        pending_call_ids: calls.iter().map(|call| call.call_id.clone()).collect(),
+                        tool_output_indexes: Vec::new(),
+                        frame_ids: vec![frame_id],
+                        order,
+                    });
+                }
+            }
+            ProtocolFrameItem::ToolOutput { call_id, .. } => {
+                let group = self
+                    .tail_open_group
+                    .as_mut()
+                    .expect("tool output was validated against the tail-open group");
+                let removed = group.pending_call_ids.remove(call_id);
+                debug_assert!(removed, "tool output was validated against its group");
+                group.tool_output_indexes.push(history_index);
+                group.frame_ids.push(frame_id);
+                if group.pending_call_ids.is_empty() {
+                    let group = self
+                        .tail_open_group
+                        .take()
+                        .expect("tail-open group should exist");
+                    self.completed_groups.push(group);
+                }
+            }
+            _ => {
+                if let Some(group) = self.tail_open_group.take() {
+                    self.historical_incomplete_groups.push(group);
+                }
+            }
+        }
+        self.frame_ids.push(frame_id);
+        self.generation = self.generation.saturating_add(1);
+        self.update_protected_frame_ids(history_index, frame_id);
+        Ok(())
+    }
+
+    fn update_protected_frame_ids(&mut self, history_index: usize, frame_id: RuntimeFrameId) {
+        let Some(start) = self.current_turn_start_index else {
+            return;
+        };
+        if history_index >= start {
+            self.protect(frame_id);
+        }
+        let ids = self
+            .completed_groups
+            .iter()
+            .chain(self.historical_incomplete_groups.iter())
+            .filter(|group| {
+                group.assistant_index.ge(&start)
+                    || group
+                        .tool_output_indexes
+                        .iter()
+                        .any(|index| *index >= start)
+            })
+            .flat_map(|group| group.frame_ids.iter().copied())
+            .chain(self.tail_open_group.iter().flat_map(|group| {
+                group
+                    .frame_ids
+                    .iter()
+                    .copied()
+                    .filter(|_| group.assistant_index >= start)
+            }))
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.protect(id);
+        }
+    }
+
+    fn recompute_protected_frame_ids(&mut self) {
+        self.protected_frame_ids.clear();
+        let Some(start) = self.current_turn_start_index else {
+            return;
+        };
+        let frame_ids = self
+            .frame_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, id)| (index >= start).then_some(id))
+            .collect::<Vec<_>>();
+        for id in frame_ids {
+            self.protect(id);
+        }
+        let group_ids = self
+            .completed_groups
+            .iter()
+            .chain(self.historical_incomplete_groups.iter())
+            .chain(self.tail_open_group.iter())
+            .filter(|group| {
+                group.assistant_index >= start
+                    || group
+                        .tool_output_indexes
+                        .iter()
+                        .any(|index| *index >= start)
+            })
+            .flat_map(|group| group.frame_ids.iter().copied())
+            .collect::<Vec<_>>();
+        for id in group_ids {
+            self.protect(id);
+        }
+    }
+
+    fn protect(&mut self, id: RuntimeFrameId) {
+        if !self.protected_frame_ids.contains(&id) {
+            self.protected_frame_ids.push(id);
+        }
+    }
+
+    pub(crate) fn tool_call_groups(&self) -> Vec<ToolCallGroup> {
+        let mut groups = self
+            .completed_groups
+            .iter()
+            .chain(self.historical_incomplete_groups.iter())
+            .chain(self.tail_open_group.iter())
+            .collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.order);
+        groups
+            .into_iter()
+            .map(|group| {
+                let current_turn = self.current_turn_start_index.is_some_and(|start| {
+                    group.assistant_index >= start
+                        || group
+                            .tool_output_indexes
+                            .iter()
+                            .any(|index| *index >= start)
+                });
+                ToolCallGroup {
+                    assistant_index: group.assistant_index,
+                    tool_output_indexes: group.tool_output_indexes.clone(),
+                    call_ids: group.call_ids.clone(),
+                    status: if group.pending_call_ids.is_empty() {
+                        ToolCallGroupStatus::Complete
+                    } else {
+                        ToolCallGroupStatus::Incomplete
+                    },
+                    protection: ToolCallGroupProtection {
+                        current_turn,
+                        incomplete: !group.pending_call_ids.is_empty(),
+                    },
+                }
+            })
+            .collect()
+    }
 }
 
 impl ProtocolTranscript {
@@ -615,6 +972,205 @@ mod tests {
         assert_eq!(canonical_compaction_boundary(&history, 3).unwrap(), 1);
         assert_eq!(canonical_compaction_boundary(&history, 4).unwrap(), 4);
         assert_eq!(canonical_compaction_boundary(&history, 5).unwrap(), 5);
+    }
+
+    #[test]
+    fn incremental_append_cases_match_cold_analyzer_for_valid_tail_sequences() {
+        let cases = [
+            vec![
+                HistoryItem::user("question"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    reasoning_content: None,
+                    reasoning_wire: None,
+                    calls: vec![tool_call("case-1")],
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "case-1".into(),
+                    output_json: "{}".into(),
+                    images: Vec::new(),
+                },
+            ],
+            vec![
+                HistoryItem::assistant("before"),
+                HistoryItem::AssistantToolCalls {
+                    text: Some("tail".into()),
+                    reasoning_content: Some("reasoning".into()),
+                    reasoning_wire: None,
+                    calls: vec![tool_call("case-2")],
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "case-2".into(),
+                    output_json: "{}".into(),
+                    images: Vec::new(),
+                },
+                HistoryItem::assistant("after"),
+            ],
+        ];
+
+        for history in cases {
+            let full = analyze_history_items(&history, None).expect("full analysis");
+            let frames = history_items_to_frames(&history);
+            let mut incremental = ProtocolAppendState::empty();
+            for (index, frame) in frames.iter().enumerate() {
+                incremental
+                    .append(
+                        index,
+                        RuntimeFrameId::from_persisted(index as u64 + 1),
+                        &frame.item,
+                        None,
+                    )
+                    .expect("valid incremental append");
+            }
+            assert_eq!(incremental.tool_call_groups(), full.tool_call_groups);
+        }
+    }
+
+    #[test]
+    fn incremental_append_matches_full_analysis_for_long_tool_history() {
+        let mut history = Vec::new();
+        for index in 0..128 {
+            history.push(HistoryItem::user(format!("question-{index}")));
+            history.push(HistoryItem::assistant(format!("answer-{index}")));
+        }
+        history.extend([
+            HistoryItem::AssistantToolCalls {
+                text: Some("working".into()),
+                reasoning_content: Some("reasoning".into()),
+                reasoning_wire: Some(r#"{"signature":"wire"}"#.into()),
+                calls: vec![tool_call("call-1"), tool_call("call-2")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-2".into(),
+                output_json: r#"{"result":2}"#.into(),
+                images: Vec::new(),
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: r#"{"result":1}"#.into(),
+                images: Vec::new(),
+            },
+            HistoryItem::assistant("final"),
+        ]);
+
+        let current_turn_start = Some(history.len() - 4);
+        let full = analyze_history_items(&history, current_turn_start).expect("full analysis");
+        let frames = history_items_to_frames(&history);
+        let mut incremental = ProtocolAppendState::empty();
+        for (index, frame) in frames.iter().enumerate() {
+            incremental
+                .append(
+                    index,
+                    RuntimeFrameId::from_persisted(index as u64 + 1),
+                    &frame.item,
+                    current_turn_start,
+                )
+                .expect("incremental append");
+        }
+
+        assert_eq!(incremental.frame_count(), history.len());
+        assert_eq!(incremental.tool_call_groups(), full.tool_call_groups);
+        let mut expected_protected = (history.len() - 4..history.len())
+            .map(|index| RuntimeFrameId::from_persisted(index as u64 + 1))
+            .collect::<Vec<_>>();
+        expected_protected.sort();
+        assert_eq!(
+            incremental.protected_frame_ids(),
+            expected_protected.as_slice()
+        );
+        assert!(!incremental.has_incomplete_tool_call_groups());
+    }
+
+    #[test]
+    fn incremental_append_rejects_non_tail_incomplete_groups_and_accepts_matching_outputs() {
+        let history = vec![
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                reasoning_content: None,
+                reasoning_wire: None,
+                calls: vec![tool_call("historical-call")],
+            },
+            HistoryItem::assistant("legacy continuation"),
+            HistoryItem::AssistantToolCalls {
+                text: Some("tail working".into()),
+                reasoning_content: None,
+                reasoning_wire: None,
+                calls: vec![tool_call("tail-call")],
+            },
+        ];
+        let frames = history_items_to_frames(&history)
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut frame)| {
+                frame.runtime_frame_id = Some(RuntimeFrameId::from_persisted(index as u64 + 1));
+                frame
+            })
+            .collect::<Vec<_>>();
+        let mut incremental = ProtocolAppendState::from_frames(&frames, Some(2))
+            .expect("legacy incomplete group remains representable");
+
+        assert!(incremental.has_incomplete_tool_call_groups());
+        let before = incremental.clone();
+        let error = incremental
+            .append(
+                history.len(),
+                RuntimeFrameId::from_persisted(4),
+                &ProtocolFrameItem::assistant("must be rejected"),
+                Some(2),
+            )
+            .expect_err("non-ToolOutput append must remain blocked");
+        assert!(error.to_string().contains("incomplete"));
+        assert_eq!(incremental, before);
+
+        let error = incremental
+            .append(
+                history.len(),
+                RuntimeFrameId::from_persisted(4),
+                &ProtocolFrameItem::ToolOutput {
+                    call_id: "historical-call".into(),
+                    output_json: "{}".into(),
+                    images: Vec::new(),
+                },
+                Some(2),
+            )
+            .expect_err("historical incomplete groups cannot be repaired");
+        assert!(error.to_string().contains("orphan tool output"));
+        assert_eq!(incremental, before);
+
+        incremental
+            .append(
+                history.len(),
+                RuntimeFrameId::from_persisted(4),
+                &ProtocolFrameItem::ToolOutput {
+                    call_id: "tail-call".into(),
+                    output_json: "{}".into(),
+                    images: Vec::new(),
+                },
+                Some(2),
+            )
+            .expect("matching tail ToolOutput is accepted despite historical state");
+        assert!(incremental.has_historical_incomplete_tool_call_groups());
+        assert!(incremental.has_incomplete_tool_call_groups());
+        assert!(incremental.incomplete_tool_call_ids().is_empty());
+
+        let groups = incremental.tool_call_groups();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.call_ids[0].as_str())
+                .collect::<Vec<_>>(),
+            vec!["historical-call", "tail-call"]
+        );
+
+        let error = incremental
+            .append(
+                history.len() + 1,
+                RuntimeFrameId::from_persisted(5),
+                &ProtocolFrameItem::assistant("still rejected"),
+                Some(2),
+            )
+            .expect_err("historical incomplete state remains globally blocking");
+        assert!(error.to_string().contains("incomplete"));
     }
 
     #[test]

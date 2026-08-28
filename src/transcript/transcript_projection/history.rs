@@ -231,27 +231,6 @@ pub(super) fn restore_history_projection(
     history
 }
 
-/// Returns the unmatched lifecycle start visible at the selected branch leaf.
-/// Historical turn IDs are an allocation counter, not evidence of a live turn.
-pub(super) fn active_turn_id_from_lifecycle_records(records: &[TranscriptRecord]) -> Option<u64> {
-    let mut active_turn_id = None;
-    for record in records {
-        match &record.event {
-            TranscriptEvent::TurnStarted(event) => active_turn_id = Some(event.turn_id),
-            TranscriptEvent::TurnInterrupted { turn_id }
-                if active_turn_id.is_none() || turn_id.is_none() || *turn_id == active_turn_id =>
-            {
-                active_turn_id = None;
-            }
-            TranscriptEvent::TurnFinalized(event) if Some(event.turn_id) == active_turn_id => {
-                active_turn_id = None;
-            }
-            _ => {}
-        }
-    }
-    active_turn_id
-}
-
 pub(super) fn active_turn_segment_from_lifecycle_records(
     records: &[TranscriptRecord],
 ) -> Option<(u64, u64)> {

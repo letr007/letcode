@@ -35,7 +35,6 @@ use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCata
 use crate::session::{
     AgentRunner, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
     SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent,
-    unfinished_current_active_turn_tool_calls,
 };
 use crate::subagent::SubagentPool;
 use crate::tool::{ToolHandler, normalize_subagent_input};
@@ -44,9 +43,8 @@ mod config_reload;
 mod control;
 
 use crate::transcript::{
-    ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecorder, read_records,
-    read_records_allow_partial_tail, remove_empty_session_file, sync_recorder_branch,
-    transcript_projection,
+    TranscriptEvent, TranscriptRecorder, read_records, read_records_allow_partial_tail,
+    remove_empty_session_file, sync_recorder_branch, transcript_projection,
 };
 pub(crate) use config_reload::*;
 pub(crate) use control::*;
@@ -559,21 +557,44 @@ fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -
 pub(crate) struct InterruptRequest {
     pub(crate) parent_tool_calls: Vec<(String, String)>,
     pub(crate) visible_child_session_id: Option<String>,
+    pub(crate) turn_id: Option<u64>,
+    pub(crate) transcript_revision: u64,
+    pub(crate) branch_id: Option<String>,
 }
 
 pub(crate) fn derive_interrupt_request(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     subagent_runtime: &SubagentPool,
-) -> InterruptRequest {
+) -> Result<InterruptRequest> {
     let active_child_session_id = subagent_runtime
         .active_child()
         .map(|child| child.child_session_id);
-    let parent_tool_calls = unfinished_current_active_turn_tool_calls(transcript);
+    let (transcript_revision, branch_id, turn_id, parent_tool_calls) = transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?
+        .interrupt_transcript_plan()?;
 
-    InterruptRequest {
+    Ok(InterruptRequest {
         parent_tool_calls,
         visible_child_session_id: active_child_session_id,
-    }
+        turn_id,
+        transcript_revision,
+        branch_id,
+    })
+}
+
+fn send_rehydrated_runtime_context(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    agent: &Agent<async_openai::config::OpenAIConfig>,
+) -> Result<()> {
+    let context = agent.runtime_context()?;
+    let _ = session_transport_tx.send(SessionTransportEvent::RuntimeContextUpdated(
+        RuntimeContextUpdatedEvent {
+            context,
+            disposition: RuntimeContextDisposition::Advance,
+        },
+    ));
+    Ok(())
 }
 
 pub(crate) fn send_subagent_interrupted(
@@ -594,35 +615,53 @@ pub(crate) fn send_subagent_interrupted(
 pub(crate) fn record_interrupt_transcript(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     interrupt: &InterruptRequest,
-) {
-    let mut recorder = match transcript.lock() {
-        Ok(recorder) => recorder,
-        Err(_) => return,
-    };
-    let cursor = transcript_projection::SessionContextCursor {
-        branch_id: Some(
-            recorder
-                .current_context_branch_id()
-                .unwrap_or(ROOT_CONTEXT_BRANCH_ID)
-                .to_string(),
-        ),
-        leaf_sequence: None,
-    };
-
-    let turn_id = match read_records(recorder.path()).and_then(|records| {
-        transcript_projection::active_turn_id_at_context_cursor(records, cursor)
-    }) {
-        Ok(turn_id) => turn_id,
-        Err(_) => return,
-    };
-
-    for (call_id, name) in &interrupt.parent_tool_calls {
-        let _ = recorder.record_tool_call_cancelled(call_id.clone(), name.clone());
+) -> Result<()> {
+    let mut recorder = transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+    let active_turn_id = recorder.active_turn_id()?;
+    let identity_matches = recorder.current_context_branch_id().map(str::to_string)
+        == interrupt.branch_id
+        && active_turn_id == interrupt.turn_id;
+    if !identity_matches {
+        return Err(anyhow!(
+            "interrupt transcript plan targets a different branch or turn: expected branch {:?}, turn {:?}; found branch {:?}, turn {:?}",
+            interrupt.branch_id,
+            interrupt.turn_id,
+            recorder.current_context_branch_id(),
+            active_turn_id,
+        ));
     }
+    let parent_tool_calls = if recorder.sequence == interrupt.transcript_revision {
+        interrupt.parent_tool_calls.clone()
+    } else {
+        recorder.unfinished_tool_calls_in_active_turn()?
+    };
 
-    if let Some(turn_id) = turn_id {
-        let _ = recorder.record_turn_interrupted(Some(turn_id));
+    let mut events = parent_tool_calls
+        .iter()
+        .map(|(call_id, name)| {
+            (
+                TranscriptEvent::ToolCallCancelled {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                },
+                interrupt.branch_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some(turn_id) = interrupt.turn_id {
+        events.push((
+            TranscriptEvent::TurnInterrupted {
+                turn_id: Some(turn_id),
+            },
+            interrupt.branch_id.clone(),
+        ));
     }
+    if events.is_empty() {
+        return Ok(());
+    }
+    recorder.append_transaction(events)
 }
 
 pub(crate) fn rehydrate_agent_from_transcript<C>(
@@ -1774,9 +1813,9 @@ async fn run_engine_loop(
 
                         let (
                             interrupted,
-                            child_started,
                             interrupted_child_session_id,
                             shutdown,
+                            interrupt_failure,
                         ) = {
                             let delegate = subagent_runtime.run_named_governed(
                                 &agent,
@@ -1797,9 +1836,9 @@ async fn run_engine_loop(
 
                             tokio::pin!(delegate);
                             let mut interrupted = false;
-                            let mut child_started = false;
                             let mut interrupted_child_session_id = None;
                             let mut shutdown = false;
+                            let mut interrupt_failure = None;
 
                             loop {
                                 match select_active_session_operation(
@@ -1812,20 +1851,36 @@ async fn run_engine_loop(
                                     outcome @ (ActiveSessionOperation::Interrupted
                                     | ActiveSessionOperation::Shutdown) => {
                                         shutdown = matches!(outcome, ActiveSessionOperation::Shutdown);
-                                        let interrupt = derive_interrupt_request(
+                                        let interrupt = match derive_interrupt_request(
                                             &transcript,
                                             &subagent_runtime,
-                                        );
-                                        child_started = subagent_runtime.is_running();
+                                        ) {
+                                            Ok(interrupt) => interrupt,
+                                            Err(error) => {
+                                                subagent_runtime.cancel_active();
+                                                let settle_shutdown = wait_for_subagent_cancel_settle(
+                                                    &mut control_rx,
+                                                    &mut deferred_commands,
+                                                    delegate.as_mut(),
+                                                    &subagent_runtime,
+                                                )
+                                                .await;
+                                                shutdown = true;
+                                                let _ = settle_shutdown;
+                                                interrupt_failure = Some(format!(
+                                                    "failed to derive interrupt transcript plan: {error}"
+                                                ));
+                                                break;
+                                            }
+                                        };
                                         interrupted = true;
                                         interrupted_child_session_id = interrupt
                                             .visible_child_session_id
                                             .clone();
-                                        if child_started {
-                                            subagent_runtime.cancel_active();
-                                        }
-                                        record_interrupt_transcript(&transcript, &interrupt);
-                                        if child_started {
+                                        subagent_runtime.cancel_active();
+                                        if let Err(error) =
+                                            record_interrupt_transcript(&transcript, &interrupt)
+                                        {
                                             let settle_shutdown = wait_for_subagent_cancel_settle(
                                                 &mut control_rx,
                                                 &mut deferred_commands,
@@ -1834,7 +1889,20 @@ async fn run_engine_loop(
                                             )
                                             .await;
                                             shutdown |= settle_shutdown;
+                                            interrupt_failure = Some(format!(
+                                                "failed to record interrupt transcript: {error}"
+                                            ));
+                                            interrupted = false;
+                                            break;
                                         }
+                                        let settle_shutdown = wait_for_subagent_cancel_settle(
+                                            &mut control_rx,
+                                            &mut deferred_commands,
+                                            delegate.as_mut(),
+                                            &subagent_runtime,
+                                        )
+                                        .await;
+                                        shutdown |= settle_shutdown;
                                         break;
                                     }
                                     ActiveSessionOperation::Completed(result) => {
@@ -1920,22 +1988,50 @@ async fn run_engine_loop(
 
                             (
                                 interrupted,
-                                child_started,
                                 interrupted_child_session_id,
                                 shutdown,
+                                interrupt_failure,
                             )
                         };
 
+                        if let Some(error) = interrupt_failure {
+                            let _ = session_transport_tx
+                                .send(SessionTransportEvent::Error(ErrorEvent::new(error)));
+                            deferred_commands.clear();
+                            parked_commands.clear();
+                            break;
+                        }
                         if interrupted {
-                            if child_started
-                                && let Err(error) =
-                                    rehydrate_agent_from_transcript(&mut agent, &transcript)
-                                {
-                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                                        "failed to restore interrupted session context: {error}"
-                                    ))));
+                            match rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                                Ok(()) => {
+                                    if let Err(error) =
+                                        send_rehydrated_runtime_context(&session_transport_tx, &agent)
+                                    {
+                                        let _ = session_transport_tx.send(
+                                            SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                                "failed to emit interrupted runtime context: {error}"
+                                            ))),
+                                        );
+                                        deferred_commands.clear();
+                                        parked_commands.clear();
+                                        break;
+                                    }
+                                    send_subagent_interrupted(
+                                        &session_transport_tx,
+                                        interrupted_child_session_id,
+                                    );
                                 }
-                            send_subagent_interrupted(&session_transport_tx, interrupted_child_session_id);
+                                Err(error) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                        ErrorEvent::new(format!(
+                                            "failed to restore interrupted session context: {error}"
+                                        )),
+                                    ));
+                                    deferred_commands.clear();
+                                    parked_commands.clear();
+                                    break;
+                                }
+                            }
                         }
                         if shutdown {
                             deferred_commands.clear();
@@ -2373,7 +2469,7 @@ async fn run_engine_loop(
                         Some(control_tx.clone()),
                         Some(session_transport_tx.clone()),
                     );
-                let (interrupted, shutdown) = {
+                let (interrupted, shutdown, interrupt_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
                     > =
@@ -2392,6 +2488,7 @@ async fn run_engine_loop(
                     tokio::pin!(run);
                     let mut interrupted = None;
                     let mut shutdown = false;
+                    let mut interrupt_failure = None;
 
                     loop {
                         match select_active_session_operation_with_events(
@@ -2411,10 +2508,19 @@ async fn run_engine_loop(
                                 // reported. Then signal cancellation and poll the run
                                 // until the in-flight subagent's completion teardown
                                 // (cancelled terminal record, guard release) settles.
-                                let interrupt = derive_interrupt_request(
+                                let interrupt = match derive_interrupt_request(
                                     &transcript,
                                     &subagent_runtime,
-                                );
+                                ) {
+                                    Ok(interrupt) => interrupt,
+                                    Err(error) => {
+                                        interrupt_failure = Some(format!(
+                                            "failed to derive interrupt transcript plan: {error}"
+                                        ));
+                                        shutdown = true;
+                                        break;
+                                    }
+                                };
                                 interrupted = Some(interrupt);
                                 if is_shutdown && subagent_runtime.is_running() {
                                     subagent_runtime.cancel_active();
@@ -2587,9 +2693,15 @@ async fn run_engine_loop(
                         }
                     }
 
-                    (interrupted, shutdown)
+                    (interrupted, shutdown, interrupt_failure)
                 };
 
+                if let Some(error) = interrupt_failure {
+                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error)));
+                    deferred_commands.clear();
+                    parked_commands.clear();
+                    break;
+                }
                 if turn_continuation_queue
                     .lock()
                     .map(|queue| queue.preempted_by_user_prompt())
@@ -2601,15 +2713,84 @@ async fn run_engine_loop(
                             "failed to restore background completion before queued prompt: {error}"
                         )),
                     ));
+                    deferred_commands.clear();
+                    parked_commands.clear();
+                    break;
                 }
                 if let Some(interrupt) = interrupted {
-                    record_interrupt_transcript(&transcript, &interrupt);
-                    if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
-                        let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                            "failed to restore interrupted session context: {error}"
-                        ))));
+                    let persisted_interrupt = match record_interrupt_transcript(&transcript, &interrupt) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            let replanned = match
+                                derive_interrupt_request(&transcript, &subagent_runtime)
+                            {
+                                Ok(replanned) => replanned,
+                                Err(replan_error) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                        ErrorEvent::new(format!(
+                                            "failed to replan interrupt transcript: {replan_error}"
+                                        )),
+                                    ));
+                                    deferred_commands.clear();
+                                    parked_commands.clear();
+                                    break;
+                                }
+                            };
+                            if replanned.branch_id != interrupt.branch_id
+                                || replanned.turn_id != interrupt.turn_id
+                            {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(
+                                        "interrupt transcript plan changed branch or turn while refreshing",
+                                    ),
+                                ));
+                                false
+                            } else {
+                                match record_interrupt_transcript(&transcript, &replanned) {
+                                    Ok(()) => true,
+                                    Err(replan_error) => {
+                                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                            ErrorEvent::new(format!(
+                                                "failed to record interrupt transcript: {error}; replan failed: {replan_error}"
+                                            )),
+                                        ));
+                                        false
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if persisted_interrupt {
+                        if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                "failed to restore interrupted session context: {error}"
+                            ))));
+                            deferred_commands.clear();
+                            parked_commands.clear();
+                            break;
+                        } else {
+                            if let Err(error) =
+                                send_rehydrated_runtime_context(&session_transport_tx, &agent)
+                            {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(format!(
+                                        "failed to emit interrupted runtime context: {error}"
+                                    )),
+                                ));
+                                deferred_commands.clear();
+                                parked_commands.clear();
+                                break;
+                            }
+                            send_subagent_interrupted(
+                                &session_transport_tx,
+                                interrupt.visible_child_session_id,
+                            );
+                        }
+                    } else {
+                        deferred_commands.clear();
+                        parked_commands.clear();
+                        break;
                     }
-                    send_subagent_interrupted(&session_transport_tx, interrupt.visible_child_session_id);
                 }
                 if shutdown {
                     deferred_commands.clear();

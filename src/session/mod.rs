@@ -60,7 +60,6 @@ pub use event::{
     TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
     ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
-pub(crate) use interrupt::unfinished_current_active_turn_tool_calls;
 
 #[cfg(test)]
 pub use lifecycle::install_new_session_for_agent;

@@ -158,7 +158,7 @@ pub(super) fn canonical_cache_input(
                     .collect::<Vec<_>>(),
             )
             .expect("anthropic canonical input is serializable"),
-            serde_json::to_value(supports_tools.then(|| tools))
+            serde_json::to_value(supports_tools.then_some(tools))
                 .expect("anthropic tools are serializable"),
             Value::Null,
         ),

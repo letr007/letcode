@@ -47,6 +47,79 @@ use crate::session::{
 use crate::tool_format::format_tool_call;
 use formatting::{output_json, output_summary};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolBatchReconciliation {
+    active: bool,
+    disposition: RuntimeContextDisposition,
+}
+
+impl Default for ToolBatchReconciliation {
+    fn default() -> Self {
+        Self {
+            active: false,
+            disposition: RuntimeContextDisposition::Advance,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolBatchReconciliationAction {
+    None,
+    ProjectEvidence,
+    FinishBatch(RuntimeContextDisposition),
+}
+
+impl ToolBatchReconciliation {
+    fn observe_event(&mut self, event: &AgentEvent) {
+        if matches!(
+            event,
+            AgentEvent::ToolCallPending { .. }
+                | AgentEvent::ToolCallStarted { .. }
+                | AgentEvent::ToolCallFinished { .. }
+                | AgentEvent::ToolCallCancelled { .. }
+        ) {
+            self.active = true;
+        }
+    }
+
+    fn should_project_evidence(&self) -> bool {
+        !self.active
+    }
+
+    fn record_journal_effect(&mut self, effect: JournalEffect) {
+        if effect.context_projection == ContextProjection::ReplaceScope {
+            self.disposition = RuntimeContextDisposition::ReplaceScope;
+        }
+    }
+
+    fn finish(&mut self) -> RuntimeContextDisposition {
+        let disposition = self.disposition;
+        *self = Self::default();
+        disposition
+    }
+
+    fn reconcile(
+        &mut self,
+        event: &AgentEvent,
+        journal_effect: JournalEffect,
+    ) -> ToolBatchReconciliationAction {
+        let project_evidence =
+            matches!(event, AgentEvent::EvidenceRecorded(_)) && self.should_project_evidence();
+        if !matches!(event, AgentEvent::ToolCallBatchFinished) {
+            self.observe_event(event);
+        }
+        self.record_journal_effect(journal_effect);
+
+        if matches!(event, AgentEvent::ToolCallBatchFinished) {
+            ToolBatchReconciliationAction::FinishBatch(self.finish())
+        } else if project_evidence {
+            ToolBatchReconciliationAction::ProjectEvidence
+        } else {
+            ToolBatchReconciliationAction::None
+        }
+    }
+}
+
 pub(crate) struct AgentRunner<C: Config> {
     event_tx: Option<SessionTransportEventSender>,
     permission_event_tx: Option<SessionTransportEventSender>,
@@ -375,16 +448,30 @@ impl<C: Config> AgentRunner<C> {
                 {
                     let sender = self.event_tx.clone();
                     let transcript = self.transcript.clone();
+                    let reconciliation = Arc::new(tokio::sync::Mutex::new(
+                        ToolBatchReconciliation::default(),
+                    ));
                     move |event| {
                         let sender = sender.clone();
                         let transcript = transcript.clone();
+                        let reconciliation = Arc::clone(&reconciliation);
                         async move {
-                            if let Some(transcript) = transcript {
+                            let journal_effect = if let Some(transcript) = transcript.as_ref() {
                                 let mut recorder = transcript
                                     .lock()
                                     .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-                                let _ = persist_agent_event(&mut recorder, &event)?;
-                            }
+                                persist_agent_event(&mut recorder, &event)?
+                            } else {
+                                JournalEffect {
+                                    persisted: false,
+                                    context_projection: ContextProjection::None,
+                                    compaction_terminal: false,
+                                }
+                            };
+                            let reconciliation_action = {
+                                let mut state = reconciliation.lock().await;
+                                state.reconcile(&event, journal_effect)
+                            };
                             match event {
                                 AgentEvent::ToolCallStarted { call_id, name, args } => {
                                     send_optional_event(
@@ -420,6 +507,19 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::ToolCallBatchFinished => {
+                                    let ToolBatchReconciliationAction::FinishBatch(disposition) =
+                                        reconciliation_action
+                                    else {
+                                        unreachable!("tool batch boundary must finish reconciliation");
+                                    };
+                                    emit_context_projection_update(
+                                        &sender,
+                                        &transcript,
+                                        None,
+                                        None,
+                                        None,
+                                        disposition,
+                                    )?;
                                     send_optional_event(&sender, SessionTransportEvent::ToolBatchFinished)?;
                                 }
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
@@ -596,6 +696,8 @@ impl<C: Config> AgentRunner<C> {
         let child_session_id = self.child_session_id.clone();
         let agent_name = self.permission_origin.clone();
         let parent_tool_call_id = self.parent_tool_call_id.clone();
+        let tool_batch_state =
+            Arc::new(tokio::sync::Mutex::new(ToolBatchReconciliation::default()));
         let response = agent
             .run_stream_content_with_interactions_async(
                 prompt_content.clone(),
@@ -627,6 +729,7 @@ impl<C: Config> AgentRunner<C> {
                         let child_session_id = child_session_id.clone();
                         let agent_name = agent_name.clone();
                         let parent_tool_call_id = parent_tool_call_id.clone();
+                        let tool_batch_state = Arc::clone(&tool_batch_state);
                         async move {
                             let journal_effect = match transcript.as_ref() {
                                 None => JournalEffect {
@@ -639,23 +742,27 @@ impl<C: Config> AgentRunner<C> {
                                     .map_err(|_| anyhow!("transcript recorder poisoned"))
                                     .and_then(|mut recorder| persist_agent_event(&mut recorder, &event))
                                 {
-                                Ok(effect) => effect,
-                                Err(error)
-                                    if matches!(
-                                        event,
-                                        AgentEvent::TurnStarted(_)
-                                            | AgentEvent::ToolExecutionSummary(_)
-                                            | AgentEvent::TurnFinalized(_)
-                                    ) => {
-                                        warn!(error = %error, "failed to record agent audit event; continuing runner");
-                                        JournalEffect {
-                                            persisted: false,
-                                            context_projection: ContextProjection::None,
-                                            compaction_terminal: false,
+                                    Ok(effect) => effect,
+                                    Err(error)
+                                        if matches!(
+                                            event,
+                                            AgentEvent::TurnStarted(_)
+                                                | AgentEvent::ToolExecutionSummary(_)
+                                                | AgentEvent::TurnFinalized(_)
+                                        ) => {
+                                            warn!(error = %error, "failed to record agent audit event; continuing runner");
+                                            JournalEffect {
+                                                persisted: false,
+                                                context_projection: ContextProjection::None,
+                                                compaction_terminal: false,
+                                            }
                                         }
-                                    }
-                                Err(error) => return Err(error),
+                                    Err(error) => return Err(error),
                                 },
+                            };
+                            let reconciliation_action = {
+                                let mut state = tool_batch_state.lock().await;
+                                state.reconcile(&event, journal_effect)
                             };
                             match event {
                                 AgentEvent::ContextCompactionStarted { .. } => send_scoped_event(
@@ -773,7 +880,9 @@ impl<C: Config> AgentRunner<C> {
                                 AgentEvent::TurnStarted(event) => {
                                     let _ = event;
                                 }
-                                AgentEvent::EvidenceRecorded(_) => {
+                                AgentEvent::EvidenceRecorded(_)
+                                    if reconciliation_action
+                                        == ToolBatchReconciliationAction::ProjectEvidence => {
                                     emit_context_projection_updates(
                                         &sender,
                                         &transcript,
@@ -782,6 +891,7 @@ impl<C: Config> AgentRunner<C> {
                                         parent_tool_call_id.as_deref(),
                                     )?;
                                 }
+                                AgentEvent::EvidenceRecorded(_) => {}
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
                                     send_scoped_event(
                                         &sender,
@@ -880,14 +990,6 @@ impl<C: Config> AgentRunner<C> {
                                 } => {
                                     let finished =
                                         tool_finished_event(call_id, name, ok, output.clone());
-                                    let disposition = if matches!(
-                                        journal_effect.context_projection,
-                                        ContextProjection::ReplaceScope
-                                    ) {
-                                        RuntimeContextDisposition::ReplaceScope
-                                    } else {
-                                        RuntimeContextDisposition::Advance
-                                    };
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -895,8 +997,15 @@ impl<C: Config> AgentRunner<C> {
                                         parent_tool_call_id.as_deref(),
                                         SessionTransportEvent::ToolFinished(finished),
                                     )?;
-                                    // The durable terminal event is authoritative even if its
-                                    // subsequent projection cannot be rebuilt.
+                                    // The durable terminal event is authoritative; the completed
+                                    // batch owns the single projection flush.
+                                }
+                                AgentEvent::ToolCallBatchFinished => {
+                                    let ToolBatchReconciliationAction::FinishBatch(disposition) =
+                                        reconciliation_action
+                                    else {
+                                        unreachable!("tool batch boundary must finish reconciliation");
+                                    };
                                     emit_context_projection_update(
                                         &sender,
                                         &transcript,
@@ -905,8 +1014,6 @@ impl<C: Config> AgentRunner<C> {
                                         parent_tool_call_id.as_deref(),
                                         disposition,
                                     )?;
-                                }
-                                AgentEvent::ToolCallBatchFinished => {
                                     if child_session_id.is_none() {
                                         send_scoped_event(
                                             &sender,
@@ -1431,6 +1538,151 @@ mod tests {
             background_event_tx: None,
             background_child_started_tx: None,
         }
+    }
+
+    async fn drive_tool_batch_events(
+        events: Vec<(AgentEvent, JournalEffect)>,
+    ) -> Vec<&'static str> {
+        let state = Arc::new(tokio::sync::Mutex::new(ToolBatchReconciliation::default()));
+        let mut trace = Vec::new();
+        for (event, journal_effect) in events {
+            let event_name = match &event {
+                AgentEvent::ToolCallFinished { .. } => "tool_finished",
+                AgentEvent::EvidenceRecorded(_) => "evidence",
+                AgentEvent::ToolCallBatchFinished => "batch_finished",
+                AgentEvent::ToolCallCancelled { .. } => "tool_cancelled",
+                _ => "other",
+            };
+            if journal_effect.persisted {
+                trace.push(match event_name {
+                    "tool_finished" => "persist:tool_finished",
+                    "evidence" => "persist:evidence",
+                    "batch_finished" => "persist:batch_finished",
+                    "tool_cancelled" => "persist:tool_cancelled",
+                    _ => "persist:other",
+                });
+            }
+            tokio::task::yield_now().await;
+            let action = {
+                let mut state = state.lock().await;
+                state.reconcile(&event, journal_effect)
+            };
+            match action {
+                ToolBatchReconciliationAction::ProjectEvidence => trace.push("project"),
+                ToolBatchReconciliationAction::FinishBatch(_) => {
+                    trace.push("boundary:batch_finished");
+                    trace.push("project");
+                    trace.push("ui:batch_finished");
+                }
+                ToolBatchReconciliationAction::None => match event_name {
+                    "tool_finished" => trace.push("ui:tool_finished"),
+                    "tool_cancelled" => trace.push("ui:tool_cancelled"),
+                    _ => {}
+                },
+            }
+        }
+        trace
+    }
+
+    fn test_evidence() -> crate::evidence::EvidenceRecord {
+        crate::evidence::EvidenceRecord {
+            id: "evidence-1".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            evidence_kind: crate::evidence::EvidenceKind::CommandResult,
+            title: "command result".into(),
+            summary: "command completed".into(),
+            detail: None,
+            source: crate::evidence::EvidenceSource::Command {
+                command: "cargo check".into(),
+                status: Some(0),
+            },
+            tags: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_batch_event_orchestration_persists_before_ui_and_projects_once() {
+        let output = crate::tool::ToolResult::ok("shell__exec", json!({}));
+        let trace = drive_tool_batch_events(vec![
+            (
+                AgentEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output,
+                },
+                JournalEffect {
+                    persisted: true,
+                    context_projection: ContextProjection::Advance,
+                    compaction_terminal: false,
+                },
+            ),
+            (
+                AgentEvent::EvidenceRecorded(test_evidence()),
+                JournalEffect {
+                    persisted: true,
+                    context_projection: ContextProjection::Advance,
+                    compaction_terminal: false,
+                },
+            ),
+            (
+                AgentEvent::ToolCallBatchFinished,
+                JournalEffect {
+                    persisted: false,
+                    context_projection: ContextProjection::None,
+                    compaction_terminal: false,
+                },
+            ),
+        ])
+        .await;
+
+        assert_eq!(
+            trace,
+            vec![
+                "persist:tool_finished",
+                "ui:tool_finished",
+                "persist:evidence",
+                "boundary:batch_finished",
+                "project",
+                "ui:batch_finished",
+            ]
+        );
+        assert_eq!(trace.iter().filter(|entry| **entry == "project").count(), 1);
+    }
+
+    #[test]
+    fn tool_batch_reconciliation_defers_projection_until_batch_boundary() {
+        let mut reconciliation = ToolBatchReconciliation::default();
+        reconciliation.observe_event(&AgentEvent::ToolCallFinished {
+            call_id: "call-1".into(),
+            name: "shell__exec".into(),
+            ok: true,
+            output: crate::tool::ToolResult::ok("shell__exec", json!({})),
+        });
+
+        assert!(!reconciliation.should_project_evidence());
+
+        let disposition = reconciliation.finish();
+        assert_eq!(disposition, RuntimeContextDisposition::Advance);
+        assert!(reconciliation.should_project_evidence());
+    }
+
+    #[test]
+    fn tool_batch_reconciliation_keeps_non_tool_evidence_on_its_own_boundary() {
+        let mut reconciliation = ToolBatchReconciliation::default();
+        assert!(reconciliation.should_project_evidence());
+
+        reconciliation.record_journal_effect(JournalEffect {
+            persisted: true,
+            context_projection: ContextProjection::ReplaceScope,
+            compaction_terminal: false,
+        });
+        assert_eq!(
+            reconciliation.finish(),
+            RuntimeContextDisposition::ReplaceScope
+        );
+        assert!(reconciliation.should_project_evidence());
     }
 
     #[test]
