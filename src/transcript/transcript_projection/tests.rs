@@ -1374,7 +1374,7 @@ fn runtime_snapshot_workflow_respects_branch_and_leaf_cursor() {
 }
 
 #[test]
-fn runtime_snapshot_workflow_resets_at_next_turn() {
+fn runtime_snapshot_workflow_persists_at_next_turn() {
     let records = vec![
         record_at(
             1,
@@ -1414,7 +1414,9 @@ fn runtime_snapshot_workflow_resets_at_next_turn() {
     )
     .expect("runtime workflow reset projection");
 
-    assert!(projected.snapshot.workflow.is_empty());
+    assert_eq!(projected.snapshot.workflow.todos.len(), 1);
+    assert_eq!(projected.snapshot.workflow.todos[0].id, "stale");
+    assert!(!projected.snapshot.workflow.auto_continue.enabled);
 }
 
 #[test]

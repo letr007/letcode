@@ -48,7 +48,9 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             *projection.active_session = true;
             projection.timeline.push_user_message(message);
             *projection.latest_auto_continue = AutoContinueState::default();
-            *projection.latest_todo = None;
+            if let Some(todo) = projection.latest_todo.as_mut() {
+                todo.auto_continue = AutoContinueState::default();
+            }
             *projection.retry = None;
             *projection.phase = AppPhase::Running;
             *projection.active_tool_call_id = None;
@@ -157,7 +159,7 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
         }
         SessionEvent::TodoSnapshot(todo) => {
             let auto_continue = projection.latest_auto_continue.clone();
-            *projection.latest_todo = Some(TodoView {
+            *projection.latest_todo = (!todo.items.is_empty()).then_some(TodoView {
                 items: todo.items.clone(),
                 auto_continue: auto_continue.clone(),
             });
@@ -240,7 +242,9 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
             *projection.latest_auto_continue = AutoContinueState::default();
-            *projection.latest_todo = None;
+            if let Some(todo) = projection.latest_todo.as_mut() {
+                todo.auto_continue = AutoContinueState::default();
+            }
             *projection.ignore_late_tool_events = true;
             projection.timeline.cancel_foreground_subagent_waits();
             projection.timeline.cancel_active_tools();
@@ -261,7 +265,9 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
             *projection.latest_auto_continue = AutoContinueState::default();
-            *projection.latest_todo = None;
+            if let Some(todo) = projection.latest_todo.as_mut() {
+                todo.auto_continue = AutoContinueState::default();
+            }
             if had_retry {
                 // Drop the sticky retry toast so it cannot outlive the failed turn.
                 *projection.toast = None;

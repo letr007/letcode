@@ -3621,7 +3621,7 @@ impl<C: Config> Agent<C> {
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
-        self.runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
+        self.runtime_snapshot.workflow.auto_continue = AutoContinueState::default();
         if self.pressure_compaction_suppressed {
             self.turn.pressure_compaction.suppress();
         }

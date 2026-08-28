@@ -2324,7 +2324,23 @@ fn queued_prompt_preview_does_not_reset_active_turn_state_until_ack() {
     ));
 
     assert_eq!(runtime.state().active_tool_call_id, None);
-    assert!(runtime.state().latest_todo.is_none());
+    assert_eq!(
+        runtime
+            .state()
+            .latest_todo
+            .as_ref()
+            .map(|todo| todo.items.len()),
+        Some(1)
+    );
+    assert!(
+        !runtime
+            .state()
+            .latest_todo
+            .as_ref()
+            .unwrap()
+            .auto_continue
+            .enabled
+    );
     assert!(matches!(
         runtime.state().timeline.items().last(),
         Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
@@ -3841,6 +3857,45 @@ fn resumed_session_restores_latest_todo_state_from_records() {
     assert_eq!(todo.items.len(), 1);
     assert_eq!(todo.items[0].status, TodoStatus::InProgress);
     assert!(todo.auto_continue.enabled);
+}
+
+#[test]
+fn empty_todo_snapshot_clears_restored_todo_state() {
+    let mut runtime = runtime();
+    let records = vec![
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::TodoSnapshot {
+                items: vec![TodoItem {
+                    id: "t1".into(),
+                    content: "inspect".into(),
+                    status: TodoStatus::InProgress,
+                }],
+            },
+        },
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 2,
+            timestamp_ms: 1,
+            context_branch_id: None,
+            event: TranscriptEvent::TodoSnapshot { items: Vec::new() },
+        },
+    ];
+    runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
+        session_id: "s".into(),
+        branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+        messages: Vec::new(),
+        records,
+        evidence_count: 0,
+        model_id: None,
+        token_usage: None,
+        runtime_context: event_context("s", 2),
+        expert_models: indexmap::IndexMap::new(),
+    });
+    assert!(runtime.state().latest_todo.is_none());
 }
 
 const SESSION_ENGINE_INTEGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);

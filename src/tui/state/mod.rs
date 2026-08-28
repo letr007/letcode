@@ -1844,7 +1844,9 @@ impl TuiState {
 
     fn begin_user_turn_state(&mut self) {
         self.latest_auto_continue = AutoContinueState::default();
-        self.latest_todo = None;
+        if let Some(todo) = self.latest_todo.as_mut() {
+            todo.auto_continue = AutoContinueState::default();
+        }
         self.phase = AppPhase::Running;
         self.active_tool_call_id = None;
         self.pending_permission = None;
@@ -2261,10 +2263,12 @@ impl TuiState {
         self.context = context;
         self.child_timeline = None;
         self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
-        self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
-            items,
-            auto_continue: self.latest_auto_continue.clone(),
-        });
+        self.latest_todo = restore_latest_todo_snapshot(records)
+            .filter(|items| !items.is_empty())
+            .map(|items| TodoView {
+                items,
+                auto_continue: self.latest_auto_continue.clone(),
+            });
         self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
         self.reset_after_session_timeline_replace();
@@ -2289,10 +2293,12 @@ impl TuiState {
             crate::tui::events::RuntimeContextDisposition::ReplaceScope,
         );
         let latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
-        let latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
-            items,
-            auto_continue: latest_auto_continue.clone(),
-        });
+        let latest_todo = restore_latest_todo_snapshot(records)
+            .filter(|items| !items.is_empty())
+            .map(|items| TodoView {
+                items,
+                auto_continue: latest_auto_continue.clone(),
+            });
 
         self.cache_active_child_timeline();
         self.active_session = true;

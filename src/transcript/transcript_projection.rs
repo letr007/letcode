@@ -8,7 +8,7 @@ use crate::protocol_frames::history_items_to_frames;
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeSnapshot;
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
-use crate::workflow_state::WorkflowState;
+use crate::workflow_state::{AutoContinueState, WorkflowState};
 use anyhow::ensure;
 
 #[cfg(test)]
@@ -333,13 +333,12 @@ pub(crate) fn project_workflow_state(records: &[TranscriptRecord]) -> WorkflowPr
             | TranscriptEvent::TurnStarted(_)
             | TranscriptEvent::TurnInterrupted { .. }
             | TranscriptEvent::Error { .. } => {
-                projection.state = WorkflowState::default();
-                projection.has_todos = false;
+                projection.state.auto_continue = AutoContinueState::default();
                 projection.has_auto_continue = false;
             }
             TranscriptEvent::TodoSnapshot { items } => {
                 projection.state.todos = items.clone();
-                projection.has_todos = true;
+                projection.has_todos = !items.is_empty();
             }
             TranscriptEvent::AutoContinueChanged { state } => {
                 projection.state.auto_continue = state.clone();

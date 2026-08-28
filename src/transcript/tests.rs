@@ -1704,7 +1704,7 @@ fn duplicate_evidence_ids_fail_restore() {
 }
 
 #[test]
-fn restore_latest_workflow_state_resets_on_new_turn_and_error() {
+fn restore_latest_workflow_todos_persist_across_turns_and_errors() {
     let stale_todo = TodoItem {
         id: "stale".into(),
         content: "stale task".into(),
@@ -1740,7 +1740,10 @@ fn restore_latest_workflow_state_resets_on_new_turn_and_error() {
         },
     ];
 
-    assert!(restore_latest_todo_snapshot(&records).is_none());
+    assert_eq!(
+        restore_latest_todo_snapshot(&records),
+        Some(vec![stale_todo.clone()])
+    );
     assert!(restore_latest_auto_continue_state(&records).is_none());
 
     let mut records = records;
@@ -1750,7 +1753,7 @@ fn restore_latest_workflow_state_resets_on_new_turn_and_error() {
         timestamp_ms: 3,
         context_branch_id: None,
         event: TranscriptEvent::TodoSnapshot {
-            items: vec![stale_todo],
+            items: vec![stale_todo.clone()],
         },
     });
     records.push(TranscriptRecord {
@@ -1763,8 +1766,20 @@ fn restore_latest_workflow_state_resets_on_new_turn_and_error() {
         },
     });
 
-    assert!(restore_latest_todo_snapshot(&records).is_none());
+    assert_eq!(
+        restore_latest_todo_snapshot(&records),
+        Some(vec![stale_todo])
+    );
     assert!(restore_latest_auto_continue_state(&records).is_none());
+
+    records.push(TranscriptRecord {
+        session_id: "s".into(),
+        sequence: 6,
+        timestamp_ms: 5,
+        context_branch_id: None,
+        event: TranscriptEvent::TodoSnapshot { items: Vec::new() },
+    });
+    assert!(restore_latest_todo_snapshot(&records).is_none());
 }
 
 #[test]

@@ -33,6 +33,7 @@ impl TranscriptTimelineProjection {
     fn apply_record(&mut self, record: &TranscriptRecord) {
         match &record.event {
             TranscriptEvent::UserMessage { content } => {
+                self.current_auto_continue = AutoContinueState::default();
                 self.timeline
                     .push_user_message(UserMessageEvent::from_submission(
                         UserMessageSubmission::new(
@@ -178,14 +179,17 @@ impl TranscriptTimelineProjection {
                 );
             }
             TranscriptEvent::Error { message } => {
+                self.current_auto_continue = AutoContinueState::default();
                 self.timeline.push_error(ErrorEvent::new(message.clone()));
             }
             TranscriptEvent::TurnInterrupted { .. } => {
+                self.current_auto_continue = AutoContinueState::default();
                 self.timeline.cancel_foreground_subagent_waits();
                 self.timeline.cancel_active_tools();
             }
             TranscriptEvent::TurnFinalized(event) => {
                 if event.outcome == "interrupted" {
+                    self.current_auto_continue = AutoContinueState::default();
                     self.timeline.cancel_foreground_subagent_waits();
                     self.timeline.cancel_active_tools();
                 }

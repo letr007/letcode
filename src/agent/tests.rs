@@ -6625,7 +6625,7 @@ fn legacy_session_history_restore_clears_runtime_workflow_state() {
 }
 
 #[test]
-fn new_turn_resets_runtime_workflow_state() {
+fn new_turn_preserves_todos_and_resets_auto_continue() {
     let mut agent = test_agent();
     agent.runtime_snapshot.workflow.todos = vec![TodoItem {
         id: "stale".into(),
@@ -6636,7 +6636,9 @@ fn new_turn_resets_runtime_workflow_state() {
 
     agent.prepare_turn_prelude("start a new turn");
 
-    assert!(agent.runtime_snapshot.workflow.is_empty());
+    assert_eq!(agent.runtime_snapshot.workflow.todos.len(), 1);
+    assert_eq!(agent.runtime_snapshot.workflow.todos[0].id, "stale");
+    assert!(!agent.runtime_snapshot.workflow.auto_continue.enabled);
 }
 
 #[tokio::test]
