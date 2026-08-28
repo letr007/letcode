@@ -71,7 +71,10 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
     } else {
         let mut spans = state
             .active_model_token_usage()
-            .map(|usage| token_budget_spans(usage, theme))
+            .map(|usage| {
+                let cache_usage = state.active_sidebar_model_token_usage().unwrap_or(usage);
+                token_budget_spans_with_cache_usage(usage, cache_usage, theme)
+            })
             .unwrap_or_default();
         if let Some(rate) = state.active_output_token_rate() {
             if !spans.is_empty() {
@@ -229,13 +232,24 @@ fn token_budget_spans(
     usage: &crate::tui::state::ModelTokenUsage,
     theme: Theme,
 ) -> Vec<Span<'static>> {
+    token_budget_spans_with_cache_usage(usage, usage, theme)
+}
+
+fn token_budget_spans_with_cache_usage(
+    usage: &crate::tui::state::ModelTokenUsage,
+    cache_usage: &crate::tui::state::ModelTokenUsage,
+    theme: Theme,
+) -> Vec<Span<'static>> {
     const BAR_WIDTH: usize = 10;
 
     let cached_input_tokens = usage.cached_tokens.min(usage.input_tokens);
     let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
     let used_tokens = usage.used_tokens;
     let current_output_tokens = used_tokens.saturating_sub(usage.input_tokens);
-    let cache_hit_percent = token_budget_cache_hit_percent(usage.input_tokens, cached_input_tokens);
+    let cache_hit_percent = token_budget_cache_hit_percent(
+        cache_usage.input_tokens,
+        cache_usage.cached_tokens.min(cache_usage.input_tokens),
+    );
     let used_percent = token_budget_used_percent(usage.context_window_tokens, used_tokens);
 
     let [cache_units, input_units, output_units] = token_budget_segment_units(
@@ -861,6 +875,51 @@ mod tests {
         assert!(!rendered.contains(" "), "{rendered}");
         assert!(!rendered.contains("󰙅 "), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_keeps_last_cache_rate_until_provider_usage_arrives() {
+        let mut state = TuiState::default();
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
+            input_tokens: 120,
+            output_tokens: 20,
+            cached_tokens: 60,
+            used_tokens: 140,
+            context_window_tokens: 1_000,
+            cache_report: None,
+            prompt_composition: Vec::new(),
+        });
+        state.apply_live_token_usage(crate::tui::state::ModelTokenUsage {
+            input_tokens: 300,
+            output_tokens: 0,
+            cached_tokens: 0,
+            used_tokens: 300,
+            context_window_tokens: 1_000,
+            cache_report: None,
+            prompt_composition: Vec::new(),
+        });
+
+        let pending = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(pending.contains("50.00%"), "{pending}");
+
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
+            input_tokens: 300,
+            output_tokens: 10,
+            cached_tokens: 60,
+            used_tokens: 310,
+            context_window_tokens: 1_000,
+            cache_report: None,
+            prompt_composition: Vec::new(),
+        });
+        let committed = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(committed.contains("20.00%"), "{committed}");
+        assert!(!committed.contains("50.00%"), "{committed}");
     }
 
     #[test]
