@@ -63,14 +63,13 @@ pub use event::{
 
 #[cfg(test)]
 pub use lifecycle::install_new_session_for_agent;
-pub use lifecycle::{
-    install_prepared_new_session_for_agent, prepare_new_session_package, resolve_session_prefix,
-};
+#[cfg(test)]
+pub(crate) use lifecycle::install_prepared_new_session_for_agent;
+pub use lifecycle::{prepare_new_session_package, resolve_session_prefix};
 pub use ports::SessionCommandHandler;
-pub use restore::{
-    install_prepared_routed_resume_for_agent, prepare_resume_package,
-    project_runtime_restore_snapshot_with_children,
-};
+#[cfg(test)]
+pub(crate) use restore::install_prepared_routed_resume_for_agent;
+pub use restore::{prepare_resume_package, project_runtime_restore_snapshot_with_children};
 #[cfg(test)]
 pub(crate) use runner::PermissionResponse;
 pub(crate) use runner::{

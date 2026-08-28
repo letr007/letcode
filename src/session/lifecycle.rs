@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use async_openai::config::Config;
 
-use crate::agent::Agent;
-use crate::runtime_context::RuntimeActiveContext;
+use crate::agent::{Agent, PreparedPrimaryRoute};
+use crate::runtime_context::{RuntimeActiveContext, RuntimeSnapshot};
 use crate::session::context_scope::{apply_prepared_context_scope, prepare_context_scope};
 use crate::session::restore::project_runtime_restore_snapshot_with_children;
 use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
@@ -125,20 +125,98 @@ pub fn prepare_new_session_package(
 
 /// Install a prepared new session and clean a prior empty file.
 /// All fallible agent preparation completes before the recorder swap.
-pub fn install_prepared_new_session_for_agent<C: Config>(
+/// All fallible validation required for a new-session switch, completed before
+/// the caller cancels the outgoing session's subagents.
+pub struct PreparedNewSessionInstall<C: Config> {
+    pub(crate) prepared: PreparedNewSession,
+    prepared_scope: crate::session::context_scope::PreparedContextScope,
+    runtime_snapshot: RuntimeSnapshot,
+    prepared_route: Option<PreparedPrimaryRoute<C>>,
+    old_path: PathBuf,
+    new_path: PathBuf,
+}
+
+/// Prepare a new-session install without changing the agent or live recorder.
+#[allow(dead_code)]
+pub(crate) fn prepare_new_session_install<C: Config>(
+    agent: &Agent<C>,
+    live: &Arc<Mutex<TranscriptRecorder>>,
+    prepared: PreparedNewSession,
+) -> Result<PreparedNewSessionInstall<C>> {
+    prepare_new_session_install_with_route(agent, live, prepared, None)
+}
+
+/// Prepare a new-session install while retaining a route prepared for commit.
+pub(crate) fn prepare_new_session_install_with_route<C: Config>(
+    agent: &Agent<C>,
+    live: &Arc<Mutex<TranscriptRecorder>>,
+    prepared: PreparedNewSession,
+    prepared_route: Option<PreparedPrimaryRoute<C>>,
+) -> Result<PreparedNewSessionInstall<C>> {
+    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
+    let runtime_snapshot =
+        agent.validate_runtime_snapshot_restore(prepared.snapshot.snapshot.clone())?;
+    agent.prepare_new_session_permission_reset()?;
+    let old_path = live
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?
+        .path()
+        .to_path_buf();
+    let new_path = prepared.recorder.path().to_path_buf();
+    Ok(PreparedNewSessionInstall {
+        prepared,
+        prepared_scope,
+        runtime_snapshot,
+        prepared_route,
+        old_path,
+        new_path,
+    })
+}
+
+impl<C: Config> PreparedNewSessionInstall<C> {
+    pub(crate) fn session(&self) -> &PreparedNewSession {
+        &self.prepared
+    }
+
+    pub(crate) fn new_path(&self) -> &Path {
+        &self.new_path
+    }
+
+    /// Commit a successfully prepared new-session install.
+    ///
+    /// This contains no business-fallible operations. A poisoned lock or an
+    /// invalid validated snapshot is an internal invariant violation.
+    pub(crate) fn commit(self, agent: &mut Agent<C>, live: &Arc<Mutex<TranscriptRecorder>>) {
+        let Self {
+            prepared,
+            prepared_scope,
+            runtime_snapshot,
+            prepared_route,
+            old_path,
+            new_path,
+        } = self;
+        let old_path_at_commit = replace_live_transcript(live, prepared.recorder)
+            .expect("live transcript lock must remain healthy after preparation");
+        debug_assert_eq!(old_path_at_commit, old_path);
+        agent.clear_session_reasoning_efforts();
+        agent.install_new_session_runtime_snapshot(runtime_snapshot, prepared.snapshot.max_turn_id);
+        apply_prepared_context_scope(agent, prepared_scope);
+        if let Some(prepared_route) = prepared_route {
+            agent.apply_prepared_route(prepared_route);
+        }
+        let _ = cleanup_replaced_empty_session(old_path, &new_path);
+    }
+}
+
+/// Prepare and commit a new-session install for compatibility callers.
+#[allow(dead_code)]
+pub(crate) fn install_prepared_new_session_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedNewSession,
 ) -> Result<()> {
-    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
-    let runtime_snapshot = agent.validate_runtime_snapshot_restore(prepared.snapshot.snapshot)?;
-    agent.prepare_new_session_permission_reset()?;
-    let new_path = prepared.recorder.path().to_path_buf();
-    let old_path = replace_live_transcript(live, prepared.recorder)?;
-    agent.clear_session_reasoning_efforts();
-    agent.install_new_session_runtime_snapshot(runtime_snapshot, prepared.snapshot.max_turn_id);
-    apply_prepared_context_scope(agent, prepared_scope);
-    let _ = cleanup_replaced_empty_session(old_path, &new_path);
+    let prepared = prepare_new_session_install(agent, live, prepared)?;
+    prepared.commit(agent, live);
     Ok(())
 }
 
@@ -148,6 +226,7 @@ pub fn install_prepared_new_session_for_agent<C: Config>(
 /// [`install_prepared_new_session_for_agent`] so it can emit `SessionStarted`
 /// before the recorder moves.
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn install_new_session_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,

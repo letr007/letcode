@@ -59,10 +59,9 @@ impl FastMode {
 }
 
 impl PreparedFastModeDisable {
-    pub(crate) fn commit(self) -> Result<()> {
+    pub(crate) fn commit(self) {
         let mut state = self.mode.state.lock().expect("Fast Mode state poisoned");
         *state = false;
-        Ok(())
     }
 }
 

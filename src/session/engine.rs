@@ -1558,10 +1558,10 @@ async fn run_engine_loop(
                     if current_session_id.as_deref() != Some(parent_session_id.as_str()) {
                         continue;
                     }
-                    if result
-                        .as_ref()
-                        .is_ok_and(|result| subagent_runtime.is_foregrounded(&result.run_id))
-                    {
+                    if result.as_ref().is_ok_and(|result| {
+                        result.status == crate::subagent::SubagentStatus::Cancelled
+                            || subagent_runtime.is_foregrounded(&result.run_id)
+                    }) {
                         continue;
                     }
                     let prompt = match result {
@@ -2107,14 +2107,6 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::ResumeSession(prefix) => {
-                        if subagent_runtime.is_running() {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                                ErrorEvent::new(
-                                    "Wait for the active subagent to finish before resuming another session",
-                                ),
-                            ));
-                            continue;
-                        }
 
                         let session_id = match crate::session::resolve_session_prefix(
                             &sessions_dir,
@@ -2128,6 +2120,20 @@ async fn run_engine_loop(
                                 continue;
                             }
                         };
+                        let current_session_id = transcript
+                            .lock()
+                            .ok()
+                            .map(|recorder| recorder.session_id().to_string());
+                        if current_session_id.as_deref() == Some(session_id.as_str())
+                            && subagent_runtime.is_running()
+                        {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(
+                                    "Wait for the active subagent to finish before reloading the current session",
+                                ),
+                            ));
+                            continue;
+                        }
                         let prepared = match crate::session::prepare_resume_package(
                             &sessions_dir,
                             session_id,
@@ -2202,32 +2208,41 @@ async fn run_engine_loop(
                                 continue;
                             }
                         };
-                        let resumed_event_session_id = prepared.session_id.clone();
-                        let resumed_event_branch_id = prepared.snapshot.branch_id.clone();
+                        let prepared_install =
+                            match crate::session::restore::prepare_routed_resume_install(
+                                &agent,
+                                &transcript,
+                                prepared,
+                            ) {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                        ErrorEvent::new(format!(
+                                            "failed to prepare resumed session: {error}"
+                                        )),
+                                    ));
+                                    continue;
+                                }
+                            };
+                        let resumed_event_session_id = prepared_install.session().session_id.clone();
+                        let resumed_event_branch_id = prepared_install.session().snapshot.branch_id.clone();
                         let resumed_event_messages =
                             crate::session::restore::restored_messages_from_protocol_frames(
-                                &prepared.snapshot.snapshot.active_protocol_frames(),
+                                &prepared_install.session().snapshot.snapshot.active_protocol_frames(),
                             );
-                        let resumed_event_records = prepared.snapshot.records.clone();
-                        let resumed_event_evidence_count = prepared.snapshot.snapshot.evidence.len();
-                        let (fast_mode_auto_disabled, token_usage) = match crate::session::install_prepared_routed_resume_for_agent(
-                            &mut agent,
-                            &transcript,
-                            prepared,
-                        ) {
-                            Ok(result) => result,
-                            Err(error) => {
-                                if error.fast_mode_auto_disabled {
-                                    let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
-                                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                                        "Fast mode auto-disabled: current model is unavailable",
-                                    )));
-                                }
-                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                                    "failed to install resumed session: {error}"
-                                ))));
+                        let resumed_event_records = prepared_install.session().snapshot.records.clone();
+                        let resumed_event_evidence_count =
+                            prepared_install.session().snapshot.snapshot.evidence.len();
+                        let fast_mode_auto_disabled = prepared_install.fast_mode_auto_disabled();
+                        let token_usage = {
+                            subagent_runtime.cancel_active_run_ids();
+                            if !subagent_runtime.wait_until_idle().await {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new("failed to cancel active subagents before resuming session"),
+                                ));
                                 continue;
                             }
+                            prepared_install.commit(&mut agent, &transcript).1
                         };
                         if fast_mode_auto_disabled {
                             let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
@@ -2275,13 +2290,6 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::NewSession => {
-                        if subagent_runtime.is_running() {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                                "Wait for the active subagent to finish before starting a new session",
-                            )));
-                            continue;
-                        }
-
                         let prepared_route = match agent
                             .prepare_primary_route(new_session_default_route.clone())
                         {
@@ -2355,30 +2363,41 @@ async fn run_engine_loop(
                             ));
                             continue;
                         }
+                        let prepared_install =
+                            match crate::session::lifecycle::prepare_new_session_install_with_route(
+                                &agent,
+                                &transcript,
+                                prepared,
+                                Some(prepared_route),
+                            ) {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                        ErrorEvent::new(format!(
+                                            "failed to prepare new session: {error}"
+                                        )),
+                                    ));
+                                    continue;
+                                }
+                            };
                         let started_event = SessionTransportEvent::SessionStarted {
-                            session_id: prepared.session_id.clone(),
-                            records: prepared.snapshot.records.clone(),
-                            runtime_context: prepared.runtime_context.clone(),
+                            session_id: prepared_install.session().session_id.clone(),
+                            records: prepared_install.session().snapshot.records.clone(),
+                            runtime_context: prepared_install.session().runtime_context.clone(),
                             expert_models: new_session_expert_model_routes
                                 .iter()
                                 .map(|(name, route)| (name.clone(), route.display_name()))
                                 .collect(),
                         };
-                        let new_path = prepared.recorder.path().to_path_buf();
-                        if let Err(error) =
-                            crate::session::install_prepared_new_session_for_agent(
-                                &mut agent,
-                                &transcript,
-                                prepared,
-                            )
-                        {
-                            let _ = remove_empty_session_file(&new_path);
-                            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                                "failed to install new session: {error}"
-                            ))));
+                        subagent_runtime.cancel_active_run_ids();
+                        if !subagent_runtime.wait_until_idle().await {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new("failed to cancel active subagents before starting new session"),
+                            ));
+                            let _ = remove_empty_session_file(prepared_install.new_path());
                             continue;
                         }
-                        agent.apply_prepared_route(prepared_route);
+                        prepared_install.commit(&mut agent, &transcript);
                         if agent
                             .fake_client()
                             .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
@@ -2608,7 +2627,8 @@ async fn run_engine_loop(
                                         continue;
                                     }
                                     if result.as_ref().is_ok_and(|result| {
-                                        subagent_runtime.is_foregrounded(&result.run_id)
+                                        result.status == crate::subagent::SubagentStatus::Cancelled
+                                            || subagent_runtime.is_foregrounded(&result.run_id)
                                     }) {
                                         continue;
                                     }

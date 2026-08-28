@@ -132,6 +132,7 @@ enum RunPathAccess {
 #[derive(Debug)]
 struct ActiveSlot {
     cancel: Option<oneshot::Sender<()>>,
+    cancellation_requested: bool,
     child: ChildSessionSummary,
     path_access: RunPathAccess,
     takeover_child_session_id: Option<String>,
@@ -156,6 +157,11 @@ impl RunReservation {
             .ok_or_else(|| anyhow!("subagent run reservation disappeared"))?;
         slot.cancel = Some(cancel);
         slot.child = child;
+        if slot.cancellation_requested
+            && let Some(cancel) = slot.cancel.take()
+        {
+            let _ = cancel.send(());
+        }
         self.activated = true;
         drop(state);
         self.changed.notify_waiters();
@@ -291,17 +297,55 @@ impl SubagentPool {
     }
 
     pub fn cancel_active(&self) -> bool {
+        !self.cancel_active_run_ids().is_empty()
+    }
+
+    pub fn cancel_active_run_ids(&self) -> Vec<String> {
         let Ok(mut state) = self.state.lock() else {
-            return false;
+            return Vec::new();
         };
-        let mut cancelled = false;
-        for slot in state.active_by_run.values_mut() {
+        let mut run_ids = Vec::with_capacity(state.active_by_run.len());
+        for (run_id, slot) in &mut state.active_by_run {
+            run_ids.push(run_id.clone());
+            slot.cancellation_requested = true;
             if let Some(tx) = slot.cancel.take() {
                 let _ = tx.send(());
-                cancelled = true;
             }
         }
-        cancelled
+        if !run_ids.is_empty() {
+            self.changed.notify_waiters();
+        }
+        run_ids
+    }
+
+    pub async fn wait_until_idle(&self) -> bool {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
+        loop {
+            if !self.is_running() {
+                return true;
+            }
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_running() {
+                return true;
+            }
+            tokio::select! {
+                _ = &mut deadline => return !self.is_running(),
+                _ = notified => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn starting_reservation_for_test(&self) -> StartingReservationForTest {
+        let reservation = self
+            .reserve_run(RunPathAccess::Read(Vec::new()), None)
+            .expect("test reservation");
+        StartingReservationForTest {
+            reservation: Some(reservation),
+        }
     }
 
     pub fn cancel_run(&self, run_id: &str) -> bool {
@@ -447,6 +491,7 @@ impl SubagentPool {
             run_id.clone(),
             ActiveSlot {
                 cancel: None,
+                cancellation_requested: false,
                 child: ChildSessionSummary {
                     parent_session_id: String::new(),
                     parent_run_id: String::new(),
@@ -639,6 +684,28 @@ impl SubagentPool {
             },
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn complete_started_run_with_executor<C, F>(
+        &self,
+        started: StartedSubagentRun<C>,
+        exec: F,
+    ) -> Result<SubagentRunSummary>
+    where
+        C: Config + Clone + Send + Sync + 'static,
+        F: FnOnce(
+                Agent<C>,
+                String,
+                Arc<Mutex<TranscriptRecorder>>,
+                Option<SubagentEventSender<C>>,
+                String,
+                String,
+            ) -> BoxExecFuture
+            + Send
+            + 'static,
+    {
+        complete_started_run(started.run, started.task, exec).await
     }
 
     pub async fn run_with_executor<C, F>(
@@ -1081,6 +1148,39 @@ fn path_sets_overlap(left: &[PathBuf], right: &[PathBuf]) -> bool {
     })
 }
 
+#[cfg(test)]
+pub(crate) struct StartingReservationForTest {
+    reservation: Option<RunReservation>,
+}
+
+#[cfg(test)]
+impl StartingReservationForTest {
+    pub(crate) fn run_id(&self) -> &str {
+        &self.reservation.as_ref().expect("reservation held").run_id
+    }
+
+    pub(crate) fn activate(mut self) -> oneshot::Receiver<()> {
+        let reservation = self.reservation.take().expect("reservation held");
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        reservation
+            .activate(
+                cancel_tx,
+                ChildSessionSummary {
+                    parent_session_id: String::new(),
+                    parent_run_id: String::new(),
+                    child_session_id: String::new(),
+                    agent_name: String::new(),
+                    status: "starting".into(),
+                    summary: String::new(),
+                    timestamp_ms: current_timestamp_ms(),
+                    pool_ordinal: 0,
+                },
+            )
+            .expect("test activation");
+        cancel_rx
+    }
+}
+
 pub struct StartedSubagentRun<C: Config> {
     run_id: String,
     receipt: ChildSessionSummary,
@@ -1147,18 +1247,45 @@ where
         event_sender,
         child_transcript,
         child_agent,
-        cancel_rx,
+        mut cancel_rx,
     } = started;
 
-    let execution = exec(
-        child_agent,
-        task,
-        Arc::clone(&child_transcript),
-        event_sender.clone(),
-        child_session_id.clone(),
-        agent_name.clone(),
-    );
-    let summary = tokio::select! {
+    let cancellation_requested = cancel_rx.try_recv().is_ok();
+    let summary = if cancellation_requested {
+        build_runtime_summary(
+            &run_id,
+            &child_session_id,
+            &agent_name,
+            SubagentStatus::Cancelled,
+            format!("{} cancelled", agent_name),
+        )
+    } else {
+        let execution_child_transcript = Arc::clone(&child_transcript);
+        let execution_event_sender = event_sender.clone();
+        let execution_child_session_id = child_session_id.clone();
+        let execution_agent_name = agent_name.clone();
+        let mut exec = Some(exec);
+        let execution = async move {
+            exec.take()
+                .expect("subagent executor polled more than once")(
+                child_agent,
+                task,
+                execution_child_transcript,
+                execution_event_sender,
+                execution_child_session_id,
+                execution_agent_name,
+            )
+            .await
+        };
+        tokio::select! {
+        biased;
+        _ = &mut cancel_rx => build_runtime_summary(
+            &run_id,
+            &child_session_id,
+            &agent_name,
+            SubagentStatus::Cancelled,
+            format!("{} cancelled", agent_name),
+        ),
         result = async {
             match timeout_secs {
                 Some(timeout_secs) => match timeout(Duration::from_secs(timeout_secs), execution).await {
@@ -1199,14 +1326,8 @@ where
                     ),
                 },
             }
-        } => result,
-        _ = cancel_rx => build_runtime_summary(
-            &run_id,
-            &child_session_id,
-            &agent_name,
-            SubagentStatus::Cancelled,
-            format!("{} cancelled", agent_name),
-        )
+            } => result,
+        }
     };
 
     let mut summary = summary;

@@ -59,6 +59,7 @@ pub struct PreparedResume {
 #[derive(Debug)]
 pub struct ResumeInstallError {
     error: anyhow::Error,
+    #[allow(dead_code)]
     pub fast_mode_auto_disabled: bool,
 }
 
@@ -336,11 +337,22 @@ pub fn install_prepared_resume_for_agent<C: Config>(
 
 /// Apply prepared resume state to a provider-routed primary agent, swap the
 /// live recorder, then clean a prior empty file.
-pub fn install_prepared_routed_resume_for_agent(
-    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+pub struct PreparedRoutedResumeInstall {
+    prepared: PreparedResume,
+    route: Option<PreparedRestoredRoute<async_openai::config::OpenAIConfig>>,
+    runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
+    token_usage: crate::session::event::TokenUsageEvent,
+    prepared_scope: crate::session::context_scope::PreparedContextScope,
+    prepared_fast_mode_disable: Option<crate::fast_mode::PreparedFastModeDisable>,
+    old_path: std::path::PathBuf,
+    new_path: std::path::PathBuf,
+}
+
+pub fn prepare_routed_resume_install(
+    agent: &Agent<async_openai::config::OpenAIConfig>,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
-) -> std::result::Result<(bool, crate::session::event::TokenUsageEvent), ResumeInstallError> {
+) -> std::result::Result<PreparedRoutedResumeInstall, ResumeInstallError> {
     let route = prepare_restored_model_route(agent, prepared.snapshot.latest_model.as_deref())
         .map_err(|error| ResumeInstallError::new(error, false))?;
     let target_model = route
@@ -371,24 +383,77 @@ pub fn install_prepared_routed_resume_for_agent(
     let prepared_fast_mode_disable = agent
         .prepare_fast_mode_auto_disable(target_model)
         .map_err(|error| ResumeInstallError::new(error, false))?;
-    let fast_mode_auto_disabled = prepared_fast_mode_disable.is_some();
-    if let Some(prepared_fast_mode_disable) = prepared_fast_mode_disable {
-        prepared_fast_mode_disable
-            .commit()
-            .map_err(|error| ResumeInstallError::new(error, false))?;
-    }
+    let old_path = live
+        .lock()
+        .map_err(|_| {
+            ResumeInstallError::new(anyhow::anyhow!("transcript recorder poisoned"), false)
+        })?
+        .path()
+        .to_path_buf();
     let new_path = prepared.recorder.path().to_path_buf();
-    let old_path = replace_live_transcript(live, prepared.recorder)
-        .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
-    agent.clear_session_reasoning_efforts();
-    apply_prepared_restored_route(agent, route);
-    apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
-    let _ = apply_restored_reasoning_effort(agent, &prepared.snapshot.records);
-    agent.install_validated_runtime_snapshot(runtime_snapshot);
-    agent.restore_turn_sequence(prepared.snapshot.max_turn_id);
-    apply_prepared_context_scope(agent, prepared_scope);
-    let _ = cleanup_replaced_empty_session(old_path, &new_path);
-    Ok((fast_mode_auto_disabled, token_usage))
+    Ok(PreparedRoutedResumeInstall {
+        prepared,
+        route,
+        runtime_snapshot,
+        token_usage,
+        prepared_scope,
+        prepared_fast_mode_disable,
+        old_path,
+        new_path,
+    })
+}
+
+impl PreparedRoutedResumeInstall {
+    pub(crate) fn session(&self) -> &PreparedResume {
+        &self.prepared
+    }
+
+    pub(crate) fn fast_mode_auto_disabled(&self) -> bool {
+        self.prepared_fast_mode_disable.is_some()
+    }
+
+    pub(crate) fn commit(
+        self,
+        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        live: &Arc<Mutex<TranscriptRecorder>>,
+    ) -> (bool, crate::session::event::TokenUsageEvent) {
+        let Self {
+            prepared,
+            route,
+            runtime_snapshot,
+            token_usage,
+            prepared_scope,
+            prepared_fast_mode_disable,
+            old_path,
+            new_path,
+        } = self;
+        let fast_mode_auto_disabled = prepared_fast_mode_disable.is_some();
+        if let Some(prepared_fast_mode_disable) = prepared_fast_mode_disable {
+            prepared_fast_mode_disable.commit();
+        }
+        let old_path_at_commit = replace_live_transcript(live, prepared.recorder)
+            .expect("live transcript lock must remain healthy after preparation");
+        debug_assert_eq!(old_path_at_commit, old_path);
+        agent.clear_session_reasoning_efforts();
+        apply_prepared_restored_route(agent, route);
+        apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
+        let _ = apply_restored_reasoning_effort(agent, &prepared.snapshot.records);
+        agent.install_validated_runtime_snapshot(runtime_snapshot);
+        agent.restore_turn_sequence(prepared.snapshot.max_turn_id);
+        apply_prepared_context_scope(agent, prepared_scope);
+        let _ = cleanup_replaced_empty_session(old_path, &new_path);
+        (fast_mode_auto_disabled, token_usage)
+    }
+}
+
+#[cfg(test)]
+pub fn install_prepared_routed_resume_for_agent(
+    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    live: &Arc<Mutex<TranscriptRecorder>>,
+    prepared: PreparedResume,
+) -> std::result::Result<(bool, crate::session::event::TokenUsageEvent), ResumeInstallError> {
+    let prepared = prepare_routed_resume_install(agent, live, prepared)?;
+    Ok(prepared.commit(agent, live))
 }
 
 /// Timeline-facing conversation messages restored from protocol frames.

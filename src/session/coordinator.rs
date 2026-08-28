@@ -552,12 +552,7 @@ impl SessionCoordinator {
                 redo_stack.clone(),
             )?;
             if let Some(prepared_fast_mode_disable) = prepared_fast_mode_disable {
-                prepared_fast_mode_disable
-                    .commit()
-                    .map_err(|error| NavigationError {
-                        error,
-                        fast_mode_auto_disabled: false,
-                    })?;
+                prepared_fast_mode_disable.commit();
             }
             recorder
                 .record_history_navigation_transaction(

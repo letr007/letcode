@@ -39,6 +39,17 @@ use tokio::time::Duration;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_active_covers_starting_reservations() {
+        let runtime = SubagentPool::new();
+        let reservation = runtime.starting_reservation_for_test();
+        let run_id = reservation.run_id().to_string();
+        assert_eq!(runtime.cancel_active_run_ids(), vec![run_id]);
+        let cancel_rx = reservation.activate();
+        assert!(cancel_rx.blocking_recv().is_ok());
+    }
+
     use crate::config::ApiProtocol;
     use crate::session::SessionTransportEvent;
     use crate::transcript::{JournalSink, read_records};
@@ -82,6 +93,48 @@ mod tests {
                 background: false,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_executor_poll_does_not_execute_executor() {
+        let runtime = SubagentPool::new();
+        let started = runtime
+            .start_named_governed(
+                &test_agent(),
+                "explorer",
+                crate::agent::SubagentInvocation {
+                    prompt: "cancel before execution".into(),
+                    input: test_governance().input,
+                    model: None,
+                    parent_tool_call_id: None,
+                },
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                None,
+            )
+            .expect("run starts");
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_executions = Arc::clone(&executions);
+        assert!(!runtime.cancel_active_run_ids().is_empty());
+
+        let summary = runtime
+            .complete_started_run_with_executor(
+                started,
+                |_agent, _task, _transcript, _sender, _child, _name| {
+                    async move {
+                        observed_executions.fetch_add(1, Ordering::SeqCst);
+                        Ok("must not execute".into())
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .expect("cancelled run settles");
+
+        assert_eq!(summary.status, SubagentStatus::Cancelled);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
