@@ -228,6 +228,7 @@ fn truncate_spans_display_width(spans: Vec<Span<'static>>, max_width: usize) -> 
     truncated
 }
 
+#[cfg(test)]
 fn token_budget_spans(
     usage: &crate::tui::state::ModelTokenUsage,
     theme: Theme,

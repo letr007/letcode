@@ -7,6 +7,25 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-28
+
+### Added
+
+- 新增 Anthropic Messages 原生协议，支持流式文本与 thinking、工具调用、缓存用量统计，以及 API Key/Bearer 鉴权和模型级 beta header 配置。
+- 新增 `/fake [auto|codex|anthropic|off]` 请求兼容模式；可按当前协议自动选择客户端请求特征，并持久化会话外的选择。
+- Footer 新增实时输出速度显示，按当前父会话或子会话视图展示每秒输出 token 数。
+
+### Changed
+
+- OpenAI Responses 的静态规则改用原生 `instructions` 字段，Anthropic 使用顶层 `system`，避免将高权威指令降级为普通对话消息。
+- 重试配置支持固定间隔或指数退避，并允许 provider 覆盖重试次数与等待策略；配置热重载同步更新当前运行时策略。
+- 长上下文连续工具调用复用已验证的请求前缀和协议帧，减少重复构建、序列化与 transcript 扫描开销。
+
+### Fixed
+
+- Footer 输出速度在流式响应结束后保留最终值，并通过时间窗口平滑短时波动。
+- Footer 缓存命中率在下一次请求预估用量到达时保持上一次服务商结果，直到收到新的实际缓存数据后再更新。
+
 ## [0.8.0] - 2026-08-25
 
 ### Added
@@ -218,7 +237,9 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/letr007/letcode/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/letr007/letcode/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/letr007/letcode/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/letr007/letcode/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/letr007/letcode/compare/v0.5.2...v0.6.0
