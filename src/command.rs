@@ -68,14 +68,6 @@ impl ThoughtsDisplayMode {
             _ => None,
         }
     }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Compact => "Compact",
-            Self::Titles => "Titles",
-            Self::Full => "Full",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

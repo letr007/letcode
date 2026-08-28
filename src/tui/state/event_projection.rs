@@ -248,11 +248,6 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             *projection.ignore_late_tool_events = true;
             projection.timeline.cancel_foreground_subagent_waits();
             projection.timeline.cancel_active_tools();
-            *projection.toast = Some(ToastState::new(
-                "Interrupted by user",
-                ToastKind::Info,
-                ToastState::DEFAULT_TICKS,
-            ));
         }
         SessionEvent::Error(error) => {
             projection

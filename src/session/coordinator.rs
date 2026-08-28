@@ -194,19 +194,17 @@ impl SessionCoordinator {
                 match fast_mode.toggle(agent.model()) {
                     Ok(toggle) => {
                         let (enabled, notice) = match toggle {
-                            crate::fast_mode::FastModeToggle::Enabled => {
-                                (true, "Fast mode enabled")
-                            }
-                            crate::fast_mode::FastModeToggle::Disabled => {
-                                (false, "Fast mode disabled")
-                            }
+                            crate::fast_mode::FastModeToggle::Enabled => (true, None),
+                            crate::fast_mode::FastModeToggle::Disabled => (false, None),
                             crate::fast_mode::FastModeToggle::Unavailable => {
-                                (false, "Fast mode unavailable for current model")
+                                (false, Some("Fast mode unavailable for current model"))
                             }
                         };
                         let _ = event_tx.send(SessionTransportEvent::FastModeChanged { enabled });
-                        let _ =
-                            event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(notice)));
+                        if let Some(notice) = notice {
+                            let _ = event_tx
+                                .send(SessionTransportEvent::Notice(NoticeEvent::info(notice)));
+                        }
                     }
                     Err(error) => {
                         let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
@@ -859,10 +857,6 @@ mod tests {
         assert!(matches!(
             rx.try_recv().expect("toggle event"),
             SessionTransportEvent::FastModeChanged { enabled: true }
-        ));
-        assert!(matches!(
-            rx.try_recv().expect("toggle notice"),
-            SessionTransportEvent::Notice(_)
         ));
         assert!(rx.try_recv().is_err());
     }

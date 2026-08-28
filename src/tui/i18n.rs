@@ -15,13 +15,6 @@ impl Language {
         }
     }
 
-    pub const fn endonym(self) -> &'static str {
-        match self {
-            Self::En => "English",
-            Self::ZhCn => "简体中文",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         let normalized = value.trim().replace('_', "-").to_ascii_lowercase();
         match normalized.as_str() {
@@ -156,10 +149,6 @@ mod tests {
     #[test]
     fn translator_interpolates_and_falls_back_to_english() {
         let translator = Translator::new(Language::ZhCn);
-        assert_eq!(
-            translator.t_fmt("language.changed", &[("language", "简体中文")]),
-            "语言已切换为简体中文"
-        );
         assert_eq!(translator.t("command.help"), "显示可用的本地命令");
         assert_eq!(translator.t("unknown.key"), "unknown.key");
     }

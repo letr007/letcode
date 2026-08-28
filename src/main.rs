@@ -1057,10 +1057,7 @@ fn inspect_langfuse_tracing_status() -> LangfuseTracingStatus {
 
 fn langfuse_startup_toast(status: &LangfuseTracingStatus) -> Option<tui::StartupToast> {
     match status {
-        LangfuseTracingStatus::Disabled => None,
-        LangfuseTracingStatus::Enabled => {
-            Some(tui::StartupToast::success("Langfuse tracing enabled"))
-        }
+        LangfuseTracingStatus::Disabled | LangfuseTracingStatus::Enabled => None,
         LangfuseTracingStatus::MissingConfig(missing) => Some(tui::StartupToast::error(format!(
             "Langfuse missing: {}",
             missing

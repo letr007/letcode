@@ -3757,6 +3757,24 @@ mod tests {
     }
 
     #[test]
+    fn compaction_commit_preserves_unrelated_notice() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::CompactionStarted);
+        state.apply_event(SessionEvent::Notice(NoticeEvent::info(
+            "Fast mode auto-disabled: current model is unavailable",
+        )));
+
+        state.apply_event(SessionEvent::CompactionCommitted {
+            summary: Some("compacted".into()),
+        });
+
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Fast mode auto-disabled: current model is unavailable")
+        );
+    }
+
+    #[test]
     fn compaction_failure_and_interrupt_clear_active_flag() {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::CompactionStarted);

@@ -2052,9 +2052,11 @@ async fn run_engine_loop(
                             let _ = session_transport_tx
                                 .send(SessionTransportEvent::AnchoredChanged { active: after });
                         }
-                        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                            NoticeEvent::info(notice),
-                        ));
+                        if notice.contains("unavailable") {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                NoticeEvent::info(notice),
+                            ));
+                        }
                         continue;
                     }
                     SessionEngineCommand::Compact => {
@@ -3646,11 +3648,6 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(SessionTransportEvent::ModelCatalogUpdated(_))
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(SessionTransportEvent::Notice(notice))
-                if notice.message.starts_with("configuration reloaded")
         ));
         assert!(event_rx.try_recv().is_err());
 

@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_setting_dispatch_is_queued_with_pending_notice() {
+    async fn running_setting_dispatch_projects_pending_value_without_local_notice() {
         let mut runtime = runtime();
         runtime.session_turn_active = true;
         runtime.state.phase = AppPhase::Running;
@@ -108,11 +108,7 @@ mod tests {
                 crate::session::engine::SessionEngineCommand::SetModel(model)
             )) if model == "provider/model"
         ));
-        let expected = runtime.state().t("runtime.change_queued");
-        assert_eq!(
-            runtime.state().toast().map(|toast| toast.message.as_str()),
-            Some(expected.as_str())
-        );
+        assert!(runtime.state().toast().is_none());
         assert_eq!(
             runtime.state().pending_composer_settings.model,
             Some(("provider/model".into(), "provider/model".into()))

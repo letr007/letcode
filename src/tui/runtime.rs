@@ -134,13 +134,6 @@ pub struct StartupToast {
 }
 
 impl StartupToast {
-    pub fn success(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            kind: ToastKind::Success,
-        }
-    }
-
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -214,7 +207,6 @@ pub struct TuiRuntime {
     history_draft: Option<ComposerDraft>,
     available_models: Vec<AvailableModel>,
     available_experts: Vec<AvailableExpert>,
-    model_absence_notified_for: Option<String>,
     branch_poller: BranchPoller,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
@@ -255,7 +247,6 @@ impl TuiRuntime {
             history_draft: None,
             available_models,
             available_experts,
-            model_absence_notified_for: None,
             branch_poller: BranchPoller::new(),
             sessions_dir,
             preferences_dir,
@@ -353,7 +344,6 @@ impl TuiRuntime {
         self.state.pending_question = None;
         self.pending_question_handle = None;
         self.pending_question_child_session_id = None;
-        self.state.toast = None;
         if matches!(
             self.state.phase,
             super::state::AppPhase::WaitingForPermission
@@ -425,6 +415,7 @@ impl TuiRuntime {
 
         let response = question.build_response();
         let handle = self.pending_question_handle.take();
+        self.state.toast = None;
         self.clear_pending_question();
         if let Some(handle) = handle
             && let Err(error) = handle.answer(response)
@@ -1216,7 +1207,6 @@ impl TuiRuntime {
                 self.apply_restored_model(model_id.clone());
                 self.state.set_provider_label_from_model_route(model_id);
                 self.state.clear_pending_model_if(model_id);
-                self.show_toast(self.state.t("runtime.model_updated"), ToastKind::Success);
             }
             SessionTransportEvent::ExpertModelChanged {
                 agent_name,
@@ -1229,11 +1219,6 @@ impl TuiRuntime {
                 {
                     expert.route_id = model_id.clone();
                 }
-                self.show_toast(
-                    self.state
-                        .t_fmt("runtime.agent_model_updated", &[("agent", agent_name)]),
-                    ToastKind::Success,
-                );
             }
             SessionTransportEvent::ExpertAllowedModelsChanged {
                 agent_name,
@@ -1256,44 +1241,19 @@ impl TuiRuntime {
                         item.checked = model_ids.contains(&item.id);
                     }
                 }
-                self.show_toast(
-                    self.state.t_fmt(
-                        "runtime.agent_allowed_models_updated",
-                        &[("agent", agent_name)],
-                    ),
-                    ToastKind::Success,
-                );
             }
             SessionTransportEvent::PermissionModeChanged { mode } => {
                 self.state.set_permission_mode_label(mode.clone());
                 self.state.clear_pending_permission_mode_if(mode);
-                self.show_toast(
-                    format!("Permission mode updated · {mode}"),
-                    ToastKind::Success,
-                );
             }
             SessionTransportEvent::ReasoningEffortChanged { effort } => {
                 let label = reasoning_effort_status_label(Some(effort.clone()));
                 self.state.set_reasoning_effort_label(Some(label.clone()));
                 self.state.clear_pending_reasoning_effort_if(&label);
-                self.show_toast(
-                    self.state.t("runtime.reasoning_updated"),
-                    ToastKind::Success,
-                );
             }
             SessionTransportEvent::FakeClientChanged { client } => {
                 self.state.set_fake_client(*client);
                 self.persist_fake_selection(*client);
-                self.show_toast(
-                    self.state.t_fmt(
-                        "runtime.fake_changed",
-                        &[(
-                            "client",
-                            client.map(|client| client.as_str()).unwrap_or("off"),
-                        )],
-                    ),
-                    ToastKind::Success,
-                );
             }
             SessionTransportEvent::BackgroundSubagentCompleted {
                 parent_tool_call_id,
@@ -1319,6 +1279,14 @@ impl TuiRuntime {
                 self.session_title = Some(title.clone());
             }
             SessionTransportEvent::Interrupted => {
+                let interrupting_message = self.state.t("runtime.interrupting");
+                if self
+                    .state
+                    .toast()
+                    .is_some_and(|toast| toast.message == interrupting_message)
+                {
+                    self.state.toast = None;
+                }
                 self.output_rate_samples
                     .retain(|sample| sample.child_session_id.is_some());
                 self.permission_lifecycle.clear_if_parent();
@@ -1380,6 +1348,16 @@ impl TuiRuntime {
                 self.state.merge_parent_prompt_composition(&mut token_usage);
                 self.state.apply_live_token_usage(token_usage.into());
                 suppress_session_event = true;
+            }
+            SessionTransportEvent::CompactionCommitted { .. } => {
+                let compacting_message = self.state.t("runtime.compacting_context");
+                if self
+                    .state
+                    .toast()
+                    .is_some_and(|toast| toast.message == compacting_message)
+                {
+                    self.state.toast = None;
+                }
             }
             SessionTransportEvent::SessionTokenUsage(token_usage) => {
                 // A committed manual compaction replaces the request snapshot.
@@ -1452,11 +1430,17 @@ impl TuiRuntime {
                     self.state.set_permission_mode_label(mode);
                 }
                 self.state.set_current_context_branch(branch_id.clone());
+                let resuming_message = self.state.t("runtime.resuming_session");
+                if self
+                    .state
+                    .toast()
+                    .is_some_and(|toast| toast.message == resuming_message)
+                {
+                    self.state.toast = None;
+                }
                 if let Some(token_usage) = token_usage {
                     self.state.set_token_usage(token_usage.clone().into());
                 }
-                self.state
-                    .show_toast(self.state.t("runtime.session_resumed"), ToastKind::Info);
             }
             SessionTransportEvent::ParentSessionViewed {
                 session_id,
@@ -1613,8 +1597,6 @@ impl TuiRuntime {
                 self.state.active_session = false;
                 self.state
                     .set_current_context_branch(crate::transcript::ROOT_CONTEXT_BRANCH_ID);
-                self.state
-                    .show_toast(self.state.t("runtime.new_session_started"), ToastKind::Info);
             }
             SessionTransportEvent::McpToolsDiscovered(servers) => {
                 self.state.set_mcp_servers(servers.clone());
@@ -1958,6 +1940,7 @@ impl TuiRuntime {
                         question.stop_custom_edit();
                     }
                 } else {
+                    self.state.toast = None;
                     self.cancel_pending_question("question dismissed by user")?;
                 }
                 Ok(None)
@@ -2734,11 +2717,6 @@ impl TuiRuntime {
             self.tui_preferences()
                 .save_to_dir(&self.preferences_dir)
                 .map_err(|error| anyhow!("failed to save language preference: {error}"))?;
-            self.state.show_toast(
-                self.state
-                    .t_fmt("language.changed", &[("language", language.endonym())]),
-                ToastKind::Info,
-            );
         } else {
             let items = [
                 DialogItem::new("en", "English", None),
@@ -2777,14 +2755,13 @@ impl TuiRuntime {
 
         self.state.set_tool_output_expanded(mode.expanded());
         let prefs = self.tui_preferences();
-        if let Err(_error) = prefs.save_to_dir(&self.preferences_dir) {
-            self.state
-                .show_toast(self.state.t("runtime.tool_output_changed"), ToastKind::Info);
-            return Ok(Some(SubmittedCommand::LocalOnly));
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            tracing::warn!(%error, "failed to save tool output preference");
+            self.state.show_toast(
+                self.state.t("runtime.preference_not_saved"),
+                ToastKind::Info,
+            );
         }
-
-        self.state
-            .show_toast(self.state.t("runtime.tool_output_changed"), ToastKind::Info);
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -2801,9 +2778,11 @@ impl TuiRuntime {
     fn persist_sidebar_preference(&mut self) {
         if let Err(error) = self.tui_preferences().save_to_dir(&self.preferences_dir) {
             tracing::warn!(%error, "failed to save TUI preferences");
+            self.state.show_toast(
+                self.state.t("runtime.preference_not_saved"),
+                ToastKind::Info,
+            );
         }
-        self.state
-            .show_toast(self.state.t("runtime.sidebar_toggled"), ToastKind::Info);
     }
 
     fn handle_transcript_scrollbar_command(
@@ -2817,17 +2796,13 @@ impl TuiRuntime {
         };
         self.state.set_transcript_scrollbar_visible(visible);
         let prefs = self.tui_preferences();
-        if let Err(_error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            tracing::warn!(%error, "failed to save transcript scrollbar preference");
             self.state.show_toast(
-                self.state.t("runtime.transcript_scrollbar"),
+                self.state.t("runtime.preference_not_saved"),
                 ToastKind::Info,
             );
-            return SubmittedCommand::LocalOnly;
         }
-        self.state.show_toast(
-            self.state.t("runtime.transcript_scrollbar"),
-            ToastKind::Info,
-        );
         SubmittedCommand::LocalOnly
     }
 
@@ -2861,12 +2836,11 @@ impl TuiRuntime {
         let prefs = self.tui_preferences();
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
             tracing::warn!(%error, "failed to save TUI preferences");
+            self.state.show_toast(
+                self.state.t("runtime.preference_not_saved"),
+                ToastKind::Info,
+            );
         }
-        self.state.show_toast(
-            self.state
-                .t_fmt("runtime.thinking_display", &[("mode", mode.label())]),
-            ToastKind::Info,
-        );
     }
 
     fn handle_theme_command(&mut self, command: ThemeCommand) -> SubmittedCommand {
@@ -2992,12 +2966,6 @@ impl TuiRuntime {
             tracing::warn!(%error, "failed to save TUI preferences");
             self.state
                 .show_toast(self.state.t("runtime.theme_not_saved"), ToastKind::Info);
-        } else {
-            self.state.show_toast(
-                self.state
-                    .t_fmt("runtime.theme_changed", &[("theme", &self.state.theme_id)]),
-                ToastKind::Info,
-            );
         }
     }
 
@@ -3108,26 +3076,11 @@ impl TuiRuntime {
     }
 
     fn apply_model_catalog_update(&mut self, catalog: &ModelCatalogUpdatedEvent) {
-        let current_model_id = self.state.model_id.clone();
         self.available_models = catalog
             .models
             .iter()
             .map(AvailableModel::from_catalog_entry)
             .collect();
-
-        if self
-            .available_models
-            .iter()
-            .any(|model| model.id == current_model_id)
-        {
-            self.model_absence_notified_for = None;
-        } else if self.model_absence_notified_for.as_deref() != Some(&current_model_id) {
-            self.model_absence_notified_for = Some(current_model_id.clone());
-            self.show_toast(
-                format!("Current model is no longer available: {current_model_id}"),
-                ToastKind::Info,
-            );
-        }
 
         let items = self.model_dialog_items();
         let Some(dialog) = self.state.dialog_mut() else {
@@ -3734,14 +3687,9 @@ impl TuiRuntime {
             DialogKind::SkillPicker => {
                 let attached = self.state.add_composer_skill(selected.id);
                 self.state.close_dialog();
-                self.show_toast(
-                    if attached {
-                        "Skill attached"
-                    } else {
-                        "Skill already attached"
-                    },
-                    ToastKind::Success,
-                );
+                if !attached {
+                    self.show_toast("Skill already attached", ToastKind::Info);
+                }
                 Ok(None)
             }
             DialogKind::McpPicker => {
@@ -4076,7 +4024,6 @@ impl TuiRuntime {
                             data_url,
                         });
                         self.reset_history_navigation();
-                        self.show_toast(self.state.t("runtime.image_added"), ToastKind::Success);
                     }
                     ClipboardPasteChoice::Text => {
                         let action = map_paste_event(
@@ -4597,7 +4544,6 @@ pub async fn run_tui(
     if let Some(toast) = startup_toast {
         state.show_toast(toast.message, toast.kind);
     }
-
     let ingress = engine.take_ingress();
     let session_transport_rx = engine.take_event_egress().into_receiver();
     let mut exit_epilogue = None;

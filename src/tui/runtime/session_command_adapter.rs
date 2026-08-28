@@ -65,8 +65,6 @@ impl<'a> TuiSessionCommandAdapter<'a> {
         }
         if deferred {
             self.runtime.project_deferred_setting(&command);
-            let message = self.runtime.state().t("runtime.change_queued");
-            self.runtime.show_toast(message, ToastKind::Info);
         }
         Ok(())
     }

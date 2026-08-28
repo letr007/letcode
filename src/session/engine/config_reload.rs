@@ -338,9 +338,6 @@ pub(crate) fn apply_config_reload(
             model_ids,
         });
     }
-    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-        "configuration reloaded (supported runtime fields only; MCP, permissions, Fast Mode, max_iterations/max_tool_calls unchanged)",
-    )));
     Ok(())
 }
 

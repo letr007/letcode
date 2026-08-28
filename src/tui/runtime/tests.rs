@@ -506,7 +506,7 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
 }
 
 #[test]
-fn model_catalog_update_refreshes_open_picker_and_notifies_once_per_absence() {
+fn model_catalog_update_refreshes_open_picker_without_toast() {
     let mut runtime = runtime();
     let mut dialog = DialogState::new(
         DialogKind::ModelPicker,
@@ -538,10 +538,7 @@ fn model_catalog_update_refreshes_open_picker_and_notifies_once_per_absence() {
     assert_eq!(runtime.state().model_id, "gpt-5.5");
     assert_eq!(runtime.available_models().len(), 1);
     assert_eq!(runtime.available_models()[0].label, "GPT-4 refreshed");
-    assert_eq!(
-        runtime.state().toast().map(|toast| toast.message.as_str()),
-        Some("Current model is no longer available: gpt-5.5")
-    );
+    assert!(runtime.state().toast().is_none());
     assert_eq!(
         runtime.state().dialog().map(|dialog| dialog.query.as_str()),
         Some("gpt")
@@ -633,7 +630,7 @@ fn model_catalog_update_refreshes_open_picker_and_notifies_once_per_absence() {
             }],
         },
     ));
-    assert!(runtime.state().toast().is_some());
+    assert!(runtime.state().toast().is_none());
 }
 
 #[test]
@@ -1087,10 +1084,7 @@ fn child_interrupted_event_updates_child_view_without_touching_parent() {
     });
 
     assert!(runtime.state().timeline.items().is_empty());
-    assert_eq!(
-        runtime.state().toast().map(|toast| toast.message.as_str()),
-        Some("Interrupted by user")
-    );
+    assert!(runtime.state().toast().is_none());
 }
 
 #[test]
@@ -1614,6 +1608,22 @@ fn interrupted_session_transport_event_returns_to_prompt_ready_state() {
     assert!(runtime.state().pending_permission.is_none());
 }
 
+#[test]
+fn interrupted_clears_only_its_progress_toast() {
+    let mut runtime = runtime();
+    runtime.state.phase = AppPhase::Running;
+    runtime
+        .state_mut()
+        .show_toast("Setting changed; preference not saved", ToastKind::Info);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+
+    assert_eq!(
+        runtime.state().toast().map(|toast| toast.message.as_str()),
+        Some("Setting changed; preference not saved")
+    );
+}
+
 #[tokio::test]
 async fn interrupted_cancels_parent_question_and_clears_local_state() {
     let mut runtime = runtime();
@@ -1937,10 +1947,7 @@ fn slash_subagent_interrupt_terminalizes_parent_runtime_from_child_view() {
 
     assert!(!runtime.session_turn_active);
     assert_eq!(runtime.state().phase, AppPhase::Completed);
-    assert_eq!(
-        runtime.state().toast().map(|toast| toast.message.as_str()),
-        Some("Interrupted by user")
-    );
+    assert!(runtime.state().toast().is_none());
 }
 
 #[test]
