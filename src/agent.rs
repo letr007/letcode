@@ -98,10 +98,7 @@ pub use events::{
 pub(crate) use events::{CompactionCheckpoint, CompactionFileOperations};
 
 #[cfg(test)]
-use compaction::{
-    compaction_history_char_budget, default_preserve_recent_budget, describe_history_item,
-    render_bounded_compaction_history, render_compaction_prompt,
-};
+use compaction::{default_preserve_recent_budget, render_compaction_prompt};
 #[cfg(test)]
 use protocol_stream::{
     CompatibleChatCompletionStreamResponse, CompatibleChatCompletionStreamResponseDelta,
@@ -588,10 +585,7 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 - 每个 section 均必须存在；无内容写「无」。
 - 不得输出保留标记 `[retained-facts:v1]`。"#;
 const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
-const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
-const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
 const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [工具输出已为压缩而截断]";
-const COMPACTION_HISTORY_TRUNCATION_MARKER: &str = "… [较早历史已省略，以控制压缩提示词长度]";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;

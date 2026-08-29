@@ -712,6 +712,24 @@ pub(crate) fn canonical_compaction_boundary(
 /// transcript. The boundary only depends on tool-call group span indexes, so it
 /// is safe to reuse a transcript produced with any turn cursor — avoiding a
 /// second full pass that deep-clones every history item into a ProtocolFrame.
+pub(crate) fn is_canonical_compaction_boundary(
+    transcript: &ProtocolTranscript,
+    boundary: usize,
+) -> bool {
+    if boundary == 0 || boundary > transcript.frames.len() {
+        return false;
+    }
+    transcript.tool_call_groups.iter().all(|group| {
+        let group_end = group
+            .tool_output_indexes
+            .last()
+            .copied()
+            .map(|index| index + 1)
+            .unwrap_or(group.assistant_index + 1);
+        !(group.assistant_index < boundary && boundary < group_end)
+    })
+}
+
 pub(crate) fn canonical_compaction_boundary_with_transcript(
     transcript: &ProtocolTranscript,
     requested_boundary: usize,
@@ -941,6 +959,31 @@ mod tests {
             name: "fs__read".into(),
             arguments_json: r#"{"path":"src/main.rs"}"#.into(),
         }
+    }
+
+    #[test]
+    fn canonical_boundary_predicate_rejects_splits_inside_tool_groups() {
+        let history = vec![
+            HistoryItem::user("request"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                reasoning_content: None,
+                reasoning_wire: None,
+                calls: vec![tool_call("call-1")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: "{}".into(),
+                images: Vec::new(),
+            },
+            HistoryItem::assistant("done"),
+        ];
+        let transcript = analyze_history_items(&history, None).expect("history is valid");
+
+        assert!(is_canonical_compaction_boundary(&transcript, 1));
+        assert!(is_canonical_compaction_boundary(&transcript, 3));
+        assert!(is_canonical_compaction_boundary(&transcript, 4));
+        assert!(!is_canonical_compaction_boundary(&transcript, 2));
     }
 
     #[test]

@@ -1456,8 +1456,8 @@ fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenA
         },
     )]));
     let history = vec![
-        HistoryItem::user("historical request ".repeat(1_750)),
-        HistoryItem::assistant("historical reply ".repeat(1_750)),
+        HistoryItem::user("historical request ".repeat(700)),
+        HistoryItem::assistant("historical reply ".repeat(700)),
     ];
     agent
         .replace_history(history.clone())
@@ -1790,7 +1790,15 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
         agent.history_for_test().first(),
         Some(HistoryItem::ContextSummary { .. })
     ));
-    assert_eq!(agent.history_for_test().len(), 2);
+    let compacted_history = agent.history_for_test();
+    assert!(
+        compacted_history.len() <= protected_start + 1,
+        "pressure compaction must retire at least one pre-protected history item"
+    );
+    assert!(matches!(
+        compacted_history.last(),
+        Some(HistoryItem::UserMessage { content }) if content.text.starts_with("protected ")
+    ));
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
@@ -3944,24 +3952,6 @@ fn default_preserve_recent_budget_uses_reserve_aware_pi_style_20k_tail() {
 }
 
 #[test]
-fn compaction_history_char_budget_uses_effective_input_limit() {
-    let uncapped = compaction_history_char_budget(ModelRequestMetadata {
-        context_window: Some(128_000),
-        max_output_tokens: Some(4_096),
-        ..ModelRequestMetadata::default()
-    });
-    let capped = compaction_history_char_budget(ModelRequestMetadata {
-        context_window: Some(128_000),
-        effective_input_limit_tokens: Some(4_000),
-        max_output_tokens: Some(4_096),
-        ..ModelRequestMetadata::default()
-    });
-
-    assert!(capped < uncapped);
-    assert!(capped <= 4_000);
-}
-
-#[test]
 fn render_compaction_tool_output_caps_large_payloads() {
     let rendered = compaction::describe_history_item(&HistoryItem::ToolOutput {
         call_id: "call-big".into(),
@@ -4003,7 +3993,6 @@ fn render_compaction_prompt_preserves_complete_previous_summary() {
     let prompt = compaction::render_compaction_prompt(
         Some(&previous_summary),
         &[HistoryItem::assistant("new history")],
-        4_000,
     );
 
     assert!(previous_summary.chars().count() > 8_000);
@@ -4013,7 +4002,7 @@ fn render_compaction_prompt_preserves_complete_previous_summary() {
 }
 
 #[test]
-fn render_compaction_prompt_applies_total_history_cap() {
+fn render_compaction_prompt_includes_every_retired_history_item() {
     let items = (0..20)
         .map(|index| HistoryItem::ToolOutput {
             call_id: format!("call-{index}"),
@@ -4022,12 +4011,11 @@ fn render_compaction_prompt_applies_total_history_cap() {
         })
         .collect::<Vec<_>>();
 
-    let rendered = render_bounded_compaction_history(&items, 4_000);
+    let rendered = compaction::render_compaction_history(&items);
 
-    assert!(rendered.contains(COMPACTION_HISTORY_TRUNCATION_MARKER));
-    assert!(rendered.chars().count() <= 4_000);
+    assert!(rendered.contains("call-0"));
     assert!(rendered.contains("call-19"));
-    assert!(!rendered.contains("call-0"));
+    assert_eq!(rendered.lines().count(), items.len());
 }
 
 #[tokio::test]

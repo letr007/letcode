@@ -2658,25 +2658,13 @@ where
 /// Used by context compaction summaries: empty tools, reasoning forced off, and
 /// only content deltas are forwarded. Creation failures may retry; mid-stream
 /// failures after content is observed are not recovered into a new turn.
-pub(super) async fn stream_oneshot_text_async<C, F, Fut>(
-    client: &Client<C>,
+fn build_oneshot_text_request(
     model_id: &str,
     protocol: ApiProtocol,
-    mut model: ModelRequestMetadata,
-    retry_config: &RetryConfig,
+    model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
-    mut on_delta: F,
-) -> Result<String>
-where
-    C: Config,
-    F: FnMut(&str) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    model.supports_reasoning = false;
-    model.reasoning_effort = None;
-    model.supports_tools = false;
-
+) -> Result<crate::request_builder::BuildResult> {
     let mut snapshot = RuntimeSnapshot::new("compaction-summary");
     let frames = crate::protocol_frames::history_items_to_frames(&[HistoryItem::user(user_text)]);
     for (ordinal, frame) in frames.into_iter().enumerate() {
@@ -2701,19 +2689,53 @@ where
         snapshot.push_frame(runtime_frame);
     }
 
-    let build = build_request_with_policy(
+    build_request_with_policy(
         RequestBuilderInput {
             protocol,
             provider: None,
             model_id,
-            model: model.clone(),
+            model,
             prelude,
             snapshot: &snapshot,
             tools: &[],
         },
         None,
         Some(ProtectedContextPolicy { reserve_tokens: 0 }),
-    )?;
+    )
+}
+
+pub(super) fn preflight_oneshot_text_request(
+    model_id: &str,
+    protocol: ApiProtocol,
+    mut model: ModelRequestMetadata,
+    prelude: &[PromptMessage],
+    user_text: &str,
+) -> Result<crate::request_builder::BuildResult> {
+    model.supports_reasoning = false;
+    model.reasoning_effort = None;
+    model.supports_tools = false;
+    build_oneshot_text_request(model_id, protocol, model, prelude, user_text)
+}
+
+pub(super) async fn stream_oneshot_text_async<C, F, Fut>(
+    client: &Client<C>,
+    model_id: &str,
+    protocol: ApiProtocol,
+    mut model: ModelRequestMetadata,
+    retry_config: &RetryConfig,
+    prelude: &[PromptMessage],
+    user_text: &str,
+    mut on_delta: F,
+) -> Result<String>
+where
+    C: Config,
+    F: FnMut(&str) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    model.supports_reasoning = false;
+    model.reasoning_effort = None;
+    model.supports_tools = false;
+    let build = build_oneshot_text_request(model_id, protocol, model.clone(), prelude, user_text)?;
 
     match protocol {
         ApiProtocol::Completions => {

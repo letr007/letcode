@@ -126,7 +126,7 @@ where
                 ))
             }),
     };
-    let Some(cut) = super::history_compact::plan_turn_cut_with_transcript(
+    let Some(planned_cut) = super::history_compact::plan_turn_cut_with_transcript(
         &live_history,
         agent.turn.current_turn_start_index,
         preserve_recent_tokens,
@@ -138,9 +138,20 @@ where
             blockers: vec![CompactionBlocker::NoSafeBoundary],
         }));
     };
+    let Some(cut) = fit_compaction_cut_to_summary_budget(
+        agent,
+        &live_history,
+        &history_transcript,
+        &planned_cut,
+    )?
+    else {
+        return Ok(Err(CompactionNoProgress {
+            trigger,
+            blockers: vec![CompactionBlocker::ProtectedContext],
+        }));
+    };
 
-    // Pi treats an active-turn prefix like any other retired history: include
-    // its user message in the summary input, then retain only the raw tail.
+    // Every item retired by this event is present in this summarization request.
     let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
         &generate_context_summary(
             agent,
@@ -462,6 +473,86 @@ pub(super) fn is_recognized_request_budget_overflow(error: &anyhow::Error) -> bo
     })
 }
 
+fn fit_compaction_cut_to_summary_budget<C: Config>(
+    agent: &Agent<C>,
+    live_history: &[HistoryItem],
+    transcript: &crate::protocol_frames::ProtocolTranscript,
+    planned: &super::history_compact::TurnCut,
+) -> Result<Option<super::history_compact::TurnCut>> {
+    let base_start = planned.cut_end.saturating_sub(planned.prefix.len());
+    let boundaries = (base_start + 1..=planned.cut_end)
+        .filter(|boundary| {
+            crate::protocol_frames::is_canonical_compaction_boundary(transcript, *boundary)
+        })
+        .collect::<Vec<_>>();
+    if boundaries.is_empty() {
+        return Ok(None);
+    }
+
+    let workflow_facts = render_protected_workflow_facts(agent);
+    let (serialized_history, item_ends) = render_compaction_history_with_item_ends(&planned.prefix);
+    let prelude = [PromptMessage::system(CONTEXT_COMPACTION_PRELUDE)];
+    let mut low = 0usize;
+    let mut high = boundaries.len();
+    let mut best = None;
+    let mut last_error = None;
+
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let cut_end = boundaries[middle];
+        let item_count = cut_end - base_start;
+        let serialized_prefix = &serialized_history[..item_ends[item_count - 1]];
+        let split_active_turn = agent
+            .turn
+            .current_turn_start_index
+            .is_some_and(|index| index < cut_end);
+        let prompt = render_compaction_prompt_with_serialized_history(
+            planned.previous_summary.as_deref(),
+            serialized_prefix,
+            split_active_turn,
+            &workflow_facts,
+        );
+        match super::protocol_stream::preflight_oneshot_text_request(
+            agent.model(),
+            agent.active_protocol(),
+            agent.active_model_metadata(),
+            &prelude,
+            &prompt,
+        ) {
+            Ok(build) => {
+                let classification = build.budget.request_classification();
+                if build.budget.truncated || !classification.safe {
+                    last_error = Some(anyhow::anyhow!(
+                        "final prompt and tools exceed selected input budget"
+                    ));
+                    high = middle;
+                    continue;
+                }
+                best = Some((cut_end, split_active_turn));
+                low = middle + 1;
+            }
+            Err(error) if is_recognized_request_budget_overflow(&error) => {
+                last_error = Some(error);
+                high = middle;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let Some((cut_end, split_active_turn)) = best else {
+        if let Some(error) = last_error {
+            tracing::debug!(error = %error, "no compaction prefix fits the summary request budget");
+        }
+        return Ok(None);
+    };
+    Ok(Some(super::history_compact::TurnCut {
+        cut_end,
+        prefix: live_history[base_start..cut_end].to_vec(),
+        previous_summary: planned.previous_summary.clone(),
+        split_active_turn,
+    }))
+}
+
 async fn generate_context_summary<C>(
     agent: &Agent<C>,
     previous_summary: Option<&str>,
@@ -475,7 +566,6 @@ where
     let prompt = render_compaction_prompt_with_workflow_facts(
         previous_summary,
         head_for_summary,
-        compaction_history_char_budget(agent.active_model_metadata()),
         split_active_turn,
         &render_protected_workflow_facts(agent),
     );
@@ -567,26 +657,30 @@ fn render_protected_workflow_facts<C: Config>(agent: &Agent<C>) -> String {
 pub(super) fn render_compaction_prompt(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
-    history_char_budget: usize,
 ) -> String {
-    render_compaction_prompt_with_workflow_facts(
-        previous_summary,
-        head_for_summary,
-        history_char_budget,
-        false,
-        "无",
-    )
+    render_compaction_prompt_with_workflow_facts(previous_summary, head_for_summary, false, "无")
 }
 
 fn render_compaction_prompt_with_workflow_facts(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
-    history_char_budget: usize,
     split_active_turn: bool,
     workflow_facts: &str,
 ) -> String {
-    let serialized_history =
-        render_bounded_compaction_history(head_for_summary, history_char_budget);
+    render_compaction_prompt_with_serialized_history(
+        previous_summary,
+        &render_compaction_history(head_for_summary),
+        split_active_turn,
+        workflow_facts,
+    )
+}
+
+fn render_compaction_prompt_with_serialized_history(
+    previous_summary: Option<&str>,
+    serialized_history: &str,
+    split_active_turn: bool,
+    workflow_facts: &str,
+) -> String {
     let split_turn_instruction = split_active_turn.then_some(
         "本次是活动回合的前缀压缩：提供的历史（包括用户消息）都会退休并纳入摘要；仅 cut point 之后的原始尾部会被保留。",
     );
@@ -618,20 +712,6 @@ fn render_compaction_prompt_with_workflow_facts(
             serialized_history, common
         ),
     }
-}
-
-pub(super) fn compaction_history_char_budget(model: ModelRequestMetadata) -> usize {
-    let input_budget = effective_input_budget_tokens(model, &[]);
-    input_budget
-        .saturating_div(4)
-        .clamp(256, 16_000)
-        .saturating_mul(3)
-        .try_into()
-        .unwrap_or(COMPACTION_HISTORY_MAX_CHAR_BUDGET)
-        .clamp(
-            COMPACTION_HISTORY_MIN_CHAR_BUDGET,
-            COMPACTION_HISTORY_MAX_CHAR_BUDGET,
-        )
 }
 
 // Pi keeps enough capacity to build and answer the checkpoint request before
@@ -680,55 +760,21 @@ pub(super) fn describe_history_item(item: &HistoryItem) -> String {
     }
 }
 
-pub(super) fn render_bounded_compaction_history(
-    items: &[HistoryItem],
-    budget_chars: usize,
-) -> String {
-    let lines = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| format!("{}. {}", index + 1, describe_history_item(item)))
-        .collect::<Vec<_>>();
-    let full = lines.join("\n");
-    if full.chars().count() <= budget_chars {
-        return full;
-    }
+pub(super) fn render_compaction_history(items: &[HistoryItem]) -> String {
+    render_compaction_history_with_item_ends(items).0
+}
 
-    let marker_len = COMPACTION_HISTORY_TRUNCATION_MARKER.chars().count();
-    if budget_chars <= marker_len + 1 {
-        return truncate_for_compaction(
-            COMPACTION_HISTORY_TRUNCATION_MARKER,
-            budget_chars,
-            COMPACTION_HISTORY_TRUNCATION_MARKER,
-        );
-    }
-
-    let body_budget = budget_chars - marker_len - 1;
-    let mut selected = Vec::new();
-    let mut used = 0usize;
-    for line in lines.iter().rev() {
-        let line_len = line.chars().count();
-        let separator = usize::from(!selected.is_empty());
-        if used + separator + line_len <= body_budget {
-            selected.push(line.clone());
-            used += separator + line_len;
-            continue;
+fn render_compaction_history_with_item_ends(items: &[HistoryItem]) -> (String, Vec<usize>) {
+    let mut rendered = String::new();
+    let mut item_ends = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            rendered.push('\n');
         }
-        if selected.is_empty() {
-            selected.push(truncate_for_compaction(
-                line,
-                body_budget,
-                COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER,
-            ));
-        }
-        break;
+        rendered.push_str(&format!("{}. {}", index + 1, describe_history_item(item)));
+        item_ends.push(rendered.len());
     }
-    selected.reverse();
-    format!(
-        "{}\n{}",
-        COMPACTION_HISTORY_TRUNCATION_MARKER,
-        selected.join("\n")
-    )
+    (rendered, item_ends)
 }
 
 /// Cap on the raw JSON bytes we're willing to parse while summarizing a single
@@ -1042,13 +1088,104 @@ mod transaction_tests {
     }
 
     #[test]
+    fn summary_budget_fit_retires_only_the_visible_prefix() {
+        let mut agent = test_agent();
+        agent.set_default_protocol(ApiProtocol::Responses);
+        agent.set_model_catalog(std::collections::HashMap::from([(
+            "test-model".into(),
+            ModelRequestMetadata {
+                context_window: Some(12_000),
+                effective_input_limit_tokens: Some(8_000),
+                max_output_tokens: Some(128),
+                ..ModelRequestMetadata::default()
+            },
+        )]));
+        let history = vec![
+            HistoryItem::user("first ".repeat(1_000)),
+            HistoryItem::assistant("second ".repeat(1_000)),
+            HistoryItem::user("third ".repeat(1_000)),
+            HistoryItem::assistant("fourth ".repeat(1_000)),
+        ];
+        agent
+            .replace_history(history.clone())
+            .expect("history is protocol-valid");
+        let transcript = crate::protocol_frames::analyze_history_items(&history, None)
+            .expect("history analysis");
+        let planned = super::super::history_compact::plan_turn_cut_with_transcript(
+            &history,
+            None,
+            0,
+            &transcript,
+        )
+        .expect("cut planning")
+        .expect("history is compactable");
+
+        let fitted = fit_compaction_cut_to_summary_budget(&agent, &history, &transcript, &planned)
+            .expect("budget fitting")
+            .expect("a smaller prefix fits");
+
+        assert!(fitted.cut_end < planned.cut_end);
+        assert_eq!(fitted.prefix, history[..fitted.cut_end]);
+        let rendered = render_compaction_history(&fitted.prefix);
+        assert!(rendered.contains("first"));
+        assert!(!rendered.contains("fourth"));
+        assert_eq!(
+            super::super::history_compact::compose_with_summary(
+                "summary",
+                &history,
+                fitted.cut_end,
+            )
+            .expect("compose"),
+            std::iter::once(HistoryItem::context_summary("summary"))
+                .chain(history[fitted.cut_end..].iter().cloned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn summary_budget_fit_refuses_to_truncate_previous_checkpoint() {
+        let mut agent = test_agent();
+        agent.set_default_protocol(ApiProtocol::Responses);
+        agent.set_model_catalog(std::collections::HashMap::from([(
+            "test-model".into(),
+            ModelRequestMetadata {
+                context_window: Some(4_096),
+                effective_input_limit_tokens: Some(2_000),
+                max_output_tokens: Some(128),
+                ..ModelRequestMetadata::default()
+            },
+        )]));
+        let history = vec![
+            HistoryItem::context_summary("checkpoint ".repeat(2_000)),
+            HistoryItem::user("new history"),
+        ];
+        agent
+            .replace_history(history.clone())
+            .expect("history is protocol-valid");
+        let transcript = crate::protocol_frames::analyze_history_items(&history, None)
+            .expect("history analysis");
+        let planned = super::super::history_compact::plan_turn_cut_with_transcript(
+            &history,
+            None,
+            0,
+            &transcript,
+        )
+        .expect("cut planning")
+        .expect("new history is compactable");
+
+        let fitted = fit_compaction_cut_to_summary_budget(&agent, &history, &transcript, &planned)
+            .expect("budget fitting does not technically fail");
+
+        assert!(fitted.is_none());
+    }
+
+    #[test]
     fn protected_workflow_facts_omit_empty_sections() {
         let agent = test_agent();
         assert!(render_protected_workflow_facts(&agent).is_empty());
         let prompt = render_compaction_prompt_with_workflow_facts(
             None,
             &[HistoryItem::user("hi")],
-            1_000,
             false,
             "",
         );
