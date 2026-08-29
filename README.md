@@ -20,6 +20,8 @@
 
 It provides an `opencode`-style TUI based on Ratatui, and also keeps a REPL CLI mode.
 
+[Technical documentation](docs/index.md)
+
 ## Build and run
 
 ```sh

@@ -20,6 +20,8 @@
 
 提供基于 Ratatui 的仿 `opencode` 风格 TUI，也保留了 REPL CLI 模式。
 
+[技术文档](docs/index.md)
+
 ## 构建和运行
 
 ```sh
