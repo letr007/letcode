@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+use crate::protocol_frames::{ProtocolTranscript, canonical_compaction_boundary_with_transcript};
+
 use super::{
     BudgetReport, EvidenceBudgetReport, HistoryItem, ModelRequestMetadata, PromptMessage,
     ProtocolFrame, ToolSpec, effective_input_budget_tokens_for_tool_tokens,
@@ -163,27 +165,11 @@ fn retention_units(frames: &[ProtocolFrame]) -> Vec<&[ProtocolFrame]> {
     units
 }
 
-pub(super) fn expand_protected_start_to_group(
-    history: &[HistoryItem],
+pub(super) fn expand_protected_start_to_group_with_transcript(
+    transcript: &ProtocolTranscript,
     protected_start: usize,
 ) -> Result<usize> {
-    let transcript = validate_history_items_complete(history, Some(protected_start))?;
-    Ok(transcript
-        .tool_call_groups
-        .iter()
-        .fold(protected_start, |start, group| {
-            let group_end = group
-                .tool_output_indexes
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(group.assistant_index);
-            if group.assistant_index < start && group_end >= start {
-                group.assistant_index
-            } else {
-                start
-            }
-        }))
+    canonical_compaction_boundary_with_transcript(transcript, protected_start)
 }
 
 fn estimate_protocol_frame_tokens(frames: &[ProtocolFrame]) -> u64 {

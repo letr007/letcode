@@ -1083,13 +1083,6 @@ fn retain_history(
     )
 }
 
-fn expand_protected_start_to_group(
-    history: &[HistoryItem],
-    protected_start: usize,
-) -> Result<usize> {
-    history_budget::expand_protected_start_to_group(history, protected_start)
-}
-
 fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> String {
     history_budget::current_user_query(history, protected_start_index)
 }

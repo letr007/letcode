@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::ApiProtocol;
-use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
+use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem, ProtocolTranscript};
 use crate::request_builder::{
     BudgetReport, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
     PromptMessageOrigin, PromptRole, ProtectedContextPolicy, ToolSpec,
@@ -207,14 +207,12 @@ impl PromptPlanner {
         let effective_history_frames = effective.history_frames;
         let effective_history = super::history_items_from_frames(&effective_history_frames);
         let effective_protected_start_index = effective.protected_start_index;
-        super::validate_history_items_complete(
-            &effective_history,
-            Some(effective_protected_start_index),
-        )?;
-        let effective_protected_start_index = super::expand_protected_start_to_group(
-            &effective_history,
-            effective_protected_start_index,
-        )?;
+        let effective_transcript = effective.transcript;
+        let effective_protected_start_index =
+            super::history_budget::expand_protected_start_to_group_with_transcript(
+                &effective_transcript,
+                effective_protected_start_index,
+            )?;
 
         super::validate_model_metadata(input.model.clone())?;
         let context_window = input.model.context_window_tokens();
@@ -333,6 +331,7 @@ struct EffectiveRuntimePrompt {
     prelude: Vec<PromptMessage>,
     history_frames: Vec<ProtocolFrame>,
     protected_start_index: usize,
+    transcript: ProtocolTranscript,
 }
 
 fn select_history_with_required_fallbacks(
@@ -460,17 +459,16 @@ fn effective_runtime_prompt(
                 })
                 .cloned(),
         );
-        let active_protected_start_index = super::expand_protected_start_to_group(
-            &super::history_items_from_frames(active_history_frames),
-            active_protected_start_index,
-        )?
-        .min(active_history_frames.len());
-        let protected_start_index = active_protected_start_index;
+        let history = super::history_items_from_frames(active_history_frames);
+        let transcript =
+            super::validate_history_items_complete(&history, Some(active_protected_start_index))?;
+        let protected_start_index = active_protected_start_index.min(active_history_frames.len());
         let history_frames = active_history_frames.to_vec();
         Ok(EffectiveRuntimePrompt {
             prelude: stable_prelude,
             history_frames,
             protected_start_index,
+            transcript,
         })
     }
 }
