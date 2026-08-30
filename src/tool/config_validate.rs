@@ -55,25 +55,3 @@ impl ToolHandler for ConfigValidateTool {
         Ok(serde_json::to_value(report)?)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tool::ToolRegistry;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn write_temp_config(name: &str, body: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "letcode-config-validate-{name}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create dir");
-        let path = dir.join("letcode.toml");
-        fs::write(&path, body).expect("write config");
-        path
-    }
-}

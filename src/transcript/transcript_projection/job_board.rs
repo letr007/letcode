@@ -149,7 +149,6 @@ pub(crate) fn project_job_board(
                 entry.agent_name = agent_name.clone();
                 entry.status = status.clone();
                 entry.summary = summary.clone();
-                entry.terminal = true;
                 entry.active = false;
             }
             TranscriptEvent::Evidence {
@@ -243,7 +242,6 @@ fn hydrate_active_job_from_child_transcript(
             entry.summary = detail;
         }
         if is_terminal_subagent_status(&status) {
-            entry.terminal = true;
             entry.active = false;
         }
     }
@@ -266,5 +264,4 @@ struct JobBoardAccumulator {
     status: String,
     summary: String,
     active: bool,
-    terminal: bool,
 }
