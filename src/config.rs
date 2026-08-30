@@ -62,15 +62,10 @@ const MAX_RETRY_ATTEMPTS: usize = 9_000;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
 mod persistence;
 
-// Kept re-exported for API compatibility; persist_mcp_server_enabled is the
-// only one referenced by production code today.
 use persistence::acquire_config_read_lock;
 pub(crate) use persistence::replace_file;
 #[allow(unused_imports)]
-pub use persistence::{
-    persist_expert_allowed_models, persist_expert_model_route, persist_mcp_server_enabled,
-    persist_primary_model_route,
-};
+pub use persistence::{persist_expert_allowed_models, persist_mcp_server_enabled};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -2115,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_primary_and_expert_model_routes_without_rewriting_unrelated_config() {
+    fn persists_expert_allowed_models_without_rewriting_unrelated_config() {
         let path = write_temp_config(
             r#"# keep this comment
 active_provider = "primary"
@@ -2126,7 +2121,6 @@ api_key = "primary-key"
 protocol = "responses"
 default_model = "old"
 [providers.primary.models.old]
-[providers.primary.models.shared]
 
 [providers.expert]
 base_url = "https://expert.invalid/v1"
@@ -2135,16 +2129,12 @@ protocol = "responses"
 [providers.expert.models.shared]
 
 [agents.explorer]
-model = "shared"
+model = "old"
 
 # preserve this trailing comment
 "#,
         );
 
-        persist_primary_model_route(&path, &ModelRoute::new("expert", "shared"))
-            .expect("persist primary route");
-        persist_expert_model_route(&path, "explorer", &ModelRoute::new("primary", "shared"))
-            .expect("persist expert route");
         persist_expert_allowed_models(
             &path,
             "explorer",
@@ -2159,12 +2149,6 @@ model = "shared"
         assert!(written.contains("# keep this comment"));
         assert!(written.contains("# preserve this trailing comment"));
         let config = AppConfig::load_from_path(&path).expect("reload updated config");
-        assert_eq!(config.active_provider().0, "expert");
-        assert_eq!(config.active_provider().1.default_model, "shared");
-        assert_eq!(
-            config.model_route_for("explorer"),
-            Some(&ModelRoute::new("primary", "shared"))
-        );
         assert_eq!(
             config.agents.allowed_models_for("explorer"),
             Some(
