@@ -138,6 +138,7 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    #[cfg(test)]
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
         self.call_with_context(name, args, ToolExecutionContext::default())
             .await

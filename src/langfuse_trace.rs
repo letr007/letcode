@@ -4,12 +4,15 @@ use serde_json::json;
 use serde_json::{Map, Value};
 use tracing::{Span, field};
 
+#[cfg(test)]
+use crate::agent::CacheUsageReport;
 use crate::agent::LlmRequestTelemetry;
-use crate::agent::{CacheUsageReport, ToolEffectKind, ToolExecutionRecord, ToolExecutionStatus};
+use crate::agent::{ToolEffectKind, ToolExecutionRecord, ToolExecutionStatus};
 pub const TARGET: &str = "letcode::langfuse";
 
 /// The cache-specific Langfuse metadata for one request iteration.  This
 /// deliberately contains only scalar telemetry, never prompt material.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheMetadataProjection {
     pub configured: bool,
@@ -26,6 +29,7 @@ pub(crate) struct CacheMetadataProjection {
     pub actual_cached_tokens: Option<u64>,
 }
 
+#[cfg(test)]
 pub(crate) fn cache_metadata_projection(
     cache: &CacheUsageReport,
     first_volatile_index: Option<usize>,
@@ -55,8 +59,8 @@ fn bounded_metadata_string(value: &str) -> String {
     value.chars().take(128).collect()
 }
 
+#[cfg(test)]
 impl CacheMetadataProjection {
-    #[cfg(test)]
     fn values(&self) -> Map<String, Value> {
         let mut values = Map::new();
         values.insert("configured".into(), Value::Bool(self.configured));
