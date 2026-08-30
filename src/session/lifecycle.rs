@@ -70,8 +70,7 @@ pub fn cleanup_empty_session_file(path: PathBuf) -> Result<bool> {
 }
 
 /// Prepared new-session package for frontends that emit `SessionStarted` and
-/// install via restore-snapshot (TUI). CLI may use the simpler
-/// [`install_new_session_for_agent`] path instead.
+/// install via restore-snapshot.
 pub struct PreparedNewSession {
     pub session_id: String,
     pub recorder: TranscriptRecorder,
@@ -82,8 +81,7 @@ pub struct PreparedNewSession {
 /// Bootstrap a new transcript and project its empty/root restore snapshot.
 ///
 /// Does not mutate the agent or live recorder. On failure after bootstrap, the
-/// new empty transcript file is removed. Pair with
-/// [`install_prepared_new_session_for_agent`] after building any events.
+/// new empty transcript file is removed.
 pub fn prepare_new_session_package(
     sessions_dir: impl AsRef<Path>,
     model: impl Into<String>,
@@ -134,16 +132,6 @@ pub struct PreparedNewSessionInstall<C: Config> {
     prepared_route: Option<PreparedPrimaryRoute<C>>,
     old_path: PathBuf,
     new_path: PathBuf,
-}
-
-/// Prepare a new-session install without changing the agent or live recorder.
-#[allow(dead_code)]
-pub(crate) fn prepare_new_session_install<C: Config>(
-    agent: &Agent<C>,
-    live: &Arc<Mutex<TranscriptRecorder>>,
-    prepared: PreparedNewSession,
-) -> Result<PreparedNewSessionInstall<C>> {
-    prepare_new_session_install_with_route(agent, live, prepared, None)
 }
 
 /// Prepare a new-session install while retaining a route prepared for commit.
@@ -206,37 +194,6 @@ impl<C: Config> PreparedNewSessionInstall<C> {
         }
         let _ = cleanup_replaced_empty_session(old_path, &new_path);
     }
-}
-
-/// Prepare and commit a new-session install for compatibility callers.
-#[allow(dead_code)]
-pub(crate) fn install_prepared_new_session_for_agent<C: Config>(
-    agent: &mut Agent<C>,
-    live: &Arc<Mutex<TranscriptRecorder>>,
-    prepared: PreparedNewSession,
-) -> Result<()> {
-    let prepared = prepare_new_session_install(agent, live, prepared)?;
-    prepared.commit(agent, live);
-    Ok(())
-}
-
-/// Line-CLI new session: prepare package, install onto agent/live recorder.
-///
-/// TUI should call [`prepare_new_session_package`] then
-/// [`install_prepared_new_session_for_agent`] so it can emit `SessionStarted`
-/// before the recorder moves.
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn install_new_session_for_agent<C: Config>(
-    agent: &mut Agent<C>,
-    live: &Arc<Mutex<TranscriptRecorder>>,
-    sessions_dir: impl AsRef<Path>,
-) -> Result<String> {
-    let model = agent.route_display_name();
-    let prepared = prepare_new_session_package(sessions_dir, model)?;
-    let session_id = prepared.session_id.clone();
-    install_prepared_new_session_for_agent(agent, live, prepared)?;
-    Ok(session_id)
 }
 
 /// Failure modes for resolving a session id from a user-supplied prefix.

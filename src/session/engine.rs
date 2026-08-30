@@ -305,15 +305,6 @@ impl SessionEngine {
         }
     }
 
-    /// Request backend termination while retaining ownership for a later join.
-    #[cfg(test)]
-    pub fn request_shutdown(&self) -> Result<(), SessionEngineIngressError> {
-        self.ingress
-            .as_ref()
-            .ok_or(SessionEngineIngressError)?
-            .shutdown()
-    }
-
     /// Join backend-owned tasks and run transcript cleanup.
     ///
     /// Cleanup is attempted even if either task panics. Any join or cleanup
@@ -360,14 +351,6 @@ impl SessionEngine {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-
-    /// Compatibility lifecycle convenience for callers that have not yet
-    /// separated shutdown request from joining.
-    #[cfg(test)]
-    pub async fn shutdown(self) -> Result<()> {
-        self.request_shutdown()?;
-        self.join().await
     }
 
     #[cfg(test)]

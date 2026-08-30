@@ -877,10 +877,18 @@ mod tests {
             .expect("seed old turn sequence");
         let old_snapshot = agent.runtime_snapshot_for_test().clone();
 
-        assert!(
-            session::install_new_session_for_agent(&mut agent, &recorder, &invalid_sessions_dir)
-                .is_err()
-        );
+        let new_session = (|| {
+            let prepared = session::prepare_new_session_package(
+                &invalid_sessions_dir,
+                agent.route_display_name(),
+            )?;
+            let prepared = session::lifecycle::prepare_new_session_install_with_route(
+                &agent, &recorder, prepared, None,
+            )?;
+            prepared.commit(&mut agent, &recorder);
+            Ok::<(), anyhow::Error>(())
+        })();
+        assert!(new_session.is_err());
 
         assert_eq!(agent.runtime_snapshot_for_test(), &old_snapshot);
         assert_eq!(

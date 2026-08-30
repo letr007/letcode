@@ -61,10 +61,6 @@ pub use event::{
     ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
 
-#[cfg(test)]
-pub use lifecycle::install_new_session_for_agent;
-#[cfg(test)]
-pub(crate) use lifecycle::install_prepared_new_session_for_agent;
 pub use lifecycle::{prepare_new_session_package, resolve_session_prefix};
 pub use ports::SessionCommandHandler;
 #[cfg(test)]
