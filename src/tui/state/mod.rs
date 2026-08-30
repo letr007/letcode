@@ -309,6 +309,22 @@ pub enum DialogKind {
     SkillPicker,
 }
 
+impl DialogKind {
+    pub fn is_searchable(&self) -> bool {
+        matches!(
+            self,
+            Self::ModelPicker
+                | Self::ExpertModelPicker(_)
+                | Self::SessionPicker
+                | Self::HistoryTree
+                | Self::ContextPicker
+                | Self::McpPicker
+                | Self::McpToolsPicker
+                | Self::SkillPicker
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpDiscoveryState {
     #[default]
@@ -968,36 +984,62 @@ impl DialogState {
     }
 
     pub fn select_next(&mut self) {
-        let visible = self.visible_indices();
-        if visible.is_empty() {
-            self.selected = 0;
-            return;
-        }
+        let target = {
+            let selected = self.selected;
+            let mut first = None;
+            let mut second = None;
+            let mut selected_found = false;
+            let mut next = None;
 
-        let current = visible
-            .iter()
-            .position(|index| *index == self.selected)
-            .unwrap_or(0);
-        self.selected = visible[(current + 1) % visible.len()];
+            for (index, _) in self.visible_items() {
+                if first.is_none() {
+                    first = Some(index);
+                } else if second.is_none() {
+                    second = Some(index);
+                }
+                if selected_found {
+                    next = Some(index);
+                    break;
+                }
+                if index == selected {
+                    selected_found = true;
+                }
+            }
+
+            first.map(|first| {
+                if selected_found {
+                    next.unwrap_or(first)
+                } else {
+                    second.unwrap_or(first)
+                }
+            })
+        };
+
+        self.selected = target.unwrap_or(0);
         self.reset_detail_focus();
     }
 
     pub fn select_previous(&mut self) {
-        let visible = self.visible_indices();
-        if visible.is_empty() {
-            self.selected = 0;
-            return;
-        }
+        let target = {
+            let selected = self.selected;
+            let mut first = None;
+            let mut previous = None;
+            let mut last = None;
 
-        let current = visible
-            .iter()
-            .position(|index| *index == self.selected)
-            .unwrap_or(0);
-        self.selected = if current == 0 {
-            *visible.last().expect("visible indices should not be empty")
-        } else {
-            visible[current - 1]
+            for (index, _) in self.visible_items() {
+                if first.is_none() {
+                    first = Some(index);
+                }
+                if index == selected {
+                    previous = last;
+                }
+                last = Some(index);
+            }
+
+            first.map(|first| previous.or(last).unwrap_or(first))
         };
+
+        self.selected = target.unwrap_or(0);
         self.reset_detail_focus();
     }
 
@@ -1044,19 +1086,8 @@ impl DialogState {
             return;
         }
 
-        if let Some(index) = self.visible_indices().first().copied() {
-            self.selected = index;
-        } else {
-            self.selected = 0;
-        }
-    }
-
-    fn visible_indices(&self) -> Vec<usize> {
-        self.items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| self.item_matches_query(item).then_some(index))
-            .collect()
+        let first_visible = self.visible_items().next().map(|(index, _)| index);
+        self.selected = first_visible.unwrap_or(0);
     }
 
     fn item_matches_query_at(&self, index: usize) -> bool {
@@ -3473,6 +3504,91 @@ mod tests {
             state.effective_language(),
             crate::tui::i18n::system_language()
         );
+    }
+
+    fn dialog(items: &[(&str, &str, Option<&str>)]) -> DialogState {
+        DialogState::new(
+            DialogKind::ModelPicker,
+            "Pick",
+            None,
+            items
+                .iter()
+                .map(|(id, label, detail)| DialogItem::new(*id, *label, detail.map(str::to_string)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn dialog_visibility_and_selection_preserve_item_indices() {
+        let cases = [
+            ("", vec![0, 1, 2, 3], 0, 1, 3),
+            ("match", vec![1, 3], 0, 3, 3),
+            ("missing", Vec::new(), 2, 0, 0),
+        ];
+
+        for (query, expected_visible, initial, next, previous) in cases {
+            let mut state = dialog(&[
+                ("zero", "Zero", None),
+                ("match-one", "One", None),
+                ("other", "Other", None),
+                ("match-two", "Two", None),
+            ]);
+            state.query = query.into();
+            state.selected = initial;
+
+            let visible = state
+                .visible_items()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(visible, expected_visible, "query={query}");
+
+            state.select_next();
+            assert_eq!(state.selected, next, "next query={query}");
+            state.selected = initial;
+            state.select_previous();
+            assert_eq!(state.selected, previous, "previous query={query}");
+        }
+    }
+
+    #[test]
+    fn dialog_query_clamps_to_first_match_and_selected_item_uses_original_index() {
+        let mut state = dialog(&[
+            ("zero", "Zero", None),
+            ("target", "Target", None),
+            ("other", "Other", None),
+        ]);
+        state.selected = 2;
+        for ch in "tar".chars() {
+            state.insert_query_char(ch);
+        }
+
+        assert_eq!(state.selected, 1);
+        assert_eq!(
+            state.selected_item().map(|item| item.id.as_str()),
+            Some("target")
+        );
+        assert_eq!(
+            state
+                .visible_items()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn dialog_wraps_filtered_selection_in_both_directions() {
+        let mut state = dialog(&[
+            ("first", "First", None),
+            ("skip", "Skip", None),
+            ("last", "Last", None),
+        ]);
+        state.query = "st".into();
+        state.selected = 2;
+        state.select_next();
+        assert_eq!(state.selected, 0);
+        state.select_previous();
+        assert_eq!(state.selected, 2);
     }
 
     fn custom_edit_item(initial: &str) -> PendingQuestionItem {

@@ -252,20 +252,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     if state.dialog_is_open() {
         let search_dialog = state
             .dialog()
-            .map(|dialog| {
-                matches!(
-                    dialog.kind,
-                    DialogKind::ModelPicker
-                        | DialogKind::ExpertModelPicker(_)
-                        | DialogKind::SessionPicker
-                        | DialogKind::HistoryTree
-                        | DialogKind::ContextPicker
-                        | DialogKind::McpPicker
-                        | DialogKind::McpToolsPicker
-                        | DialogKind::SkillPicker
-                )
-            })
-            .unwrap_or(false);
+            .is_some_and(|dialog| dialog.kind.is_searchable());
 
         return if search_dialog {
             match key.code {
@@ -403,20 +390,7 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
     if state.dialog_is_open() {
         let search_dialog = state
             .dialog()
-            .map(|dialog| {
-                matches!(
-                    dialog.kind,
-                    DialogKind::ModelPicker
-                        | DialogKind::ExpertModelPicker(_)
-                        | DialogKind::SessionPicker
-                        | DialogKind::HistoryTree
-                        | DialogKind::ContextPicker
-                        | DialogKind::McpPicker
-                        | DialogKind::McpToolsPicker
-                        | DialogKind::SkillPicker
-                )
-            })
-            .unwrap_or(false);
+            .is_some_and(|dialog| dialog.kind.is_searchable());
         if search_dialog {
             return InputAction::DialogPaste(text);
         }
@@ -884,6 +858,55 @@ mod tests {
             map_key_event(&state, key(KeyCode::Esc)),
             InputAction::DialogCancel
         );
+    }
+
+    #[test]
+    fn dialog_searchability_is_shared_by_key_and_paste_mapping() {
+        let cases = [
+            (DialogKind::ModelPicker, true),
+            (DialogKind::ExpertModelPicker("explorer".into()), true),
+            (DialogKind::SessionPicker, true),
+            (DialogKind::HistoryTree, true),
+            (DialogKind::ContextPicker, true),
+            (DialogKind::McpPicker, true),
+            (DialogKind::McpToolsPicker, true),
+            (DialogKind::SkillPicker, true),
+            (DialogKind::AgentPicker, false),
+            (DialogKind::PermissionPicker, false),
+            (DialogKind::ReasoningPicker, false),
+            (DialogKind::ThoughtsPicker, false),
+            (DialogKind::ThemePicker, false),
+            (DialogKind::FakePicker, false),
+            (DialogKind::LanguagePicker, false),
+            (DialogKind::ContextDetail, false),
+        ];
+
+        for (kind, searchable) in cases {
+            let mut state = TuiState::default();
+            state.open_dialog(crate::tui::state::DialogState::new(
+                kind,
+                "Dialog",
+                None,
+                vec![crate::tui::state::DialogItem::new("item", "Item", None)],
+            ));
+
+            assert_eq!(
+                map_key_event(&state, key(KeyCode::Char('x'))),
+                if searchable {
+                    InputAction::DialogInsert('x')
+                } else {
+                    InputAction::NoOp
+                }
+            );
+            assert_eq!(
+                map_paste_event(&state, "x".into()),
+                if searchable {
+                    InputAction::DialogPaste("x".into())
+                } else {
+                    InputAction::Paste("x".into())
+                }
+            );
+        }
     }
 
     #[test]
