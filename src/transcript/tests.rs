@@ -2205,7 +2205,7 @@ fn non_checkpoint_tool_finished_does_not_switch_branch() {
         .expect("tool started");
 
     recorder
-        .record_tool_call_finished_and_apply_context_control(
+        .record_tool_call_finished(
             "call-1",
             "fs__read",
             true,

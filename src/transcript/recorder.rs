@@ -1052,19 +1052,6 @@ impl TranscriptRecorder {
         })
     }
 
-    #[cfg(test)]
-    pub fn record_tool_call_finished_and_apply_context_control(
-        &mut self,
-        call_id: impl Into<String>,
-        name: impl Into<String>,
-        ok: bool,
-        output: ToolResult,
-    ) -> Result<()> {
-        // Context-control tools are removed; this remains a compatibility alias
-        // for the ordinary tool-finished journal path.
-        self.record_tool_call_finished(call_id, name, ok, output)
-    }
-
     pub fn record_tool_call_cancelled(
         &mut self,
         call_id: impl Into<String>,
@@ -1074,16 +1061,6 @@ impl TranscriptRecorder {
             call_id: call_id.into(),
             name: name.into(),
         })
-    }
-
-    #[cfg(test)]
-    pub fn record_permission_decision(
-        &mut self,
-        tool: impl Into<String>,
-        args: Value,
-        allowed: bool,
-    ) -> Result<()> {
-        self.record_permission_decision_details(None, tool, args, allowed, None)
     }
 
     pub fn record_permission_decision_details(
