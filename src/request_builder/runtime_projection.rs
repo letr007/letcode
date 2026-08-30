@@ -1,21 +1,6 @@
 use crate::protocol_frames::ProtocolFrame;
 use crate::runtime_context::{FrameVisibility, RuntimeFrame, RuntimeSnapshot};
 
-use super::{HistoryAdapterProjection, HistoryItem};
-
-/// Provider prompt material is history-only.
-///
-/// ContextView and tree projections remain available for TUI and tool
-/// addressing, but they must not inject synthetic prelude or history
-/// prefix frames into the request planner.
-pub(super) fn runtime_context_history_adapter(
-    _snapshot: &RuntimeSnapshot,
-    _history: &[HistoryItem],
-    _protected_start_index: usize,
-) -> HistoryAdapterProjection {
-    HistoryAdapterProjection::default()
-}
-
 pub(super) fn provider_visible_protocol_frames(snapshot: &RuntimeSnapshot) -> Vec<ProtocolFrame> {
     snapshot
         .frames

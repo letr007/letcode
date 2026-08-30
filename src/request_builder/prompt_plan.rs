@@ -198,14 +198,8 @@ impl PromptPlanner {
         let active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
         let active_protected_start_index =
             super::protected_start_index_for_snapshot(input.snapshot, &active_history_frames);
-        let runtime_material = super::runtime_context_history_adapter(
-            input.snapshot,
-            &super::history_items_from_frames(&active_history_frames),
-            active_protected_start_index,
-        );
         let effective = effective_runtime_prompt(
             input.prelude,
-            &runtime_material,
             &active_history_frames,
             active_protected_start_index,
         )?;
@@ -435,7 +429,6 @@ fn select_history_with_required_fallbacks(
 /// Materializes provider-visible runtime material in canonical order.
 fn effective_runtime_prompt(
     input_prelude: &[PromptMessage],
-    runtime_material: &super::HistoryAdapterProjection,
     active_history_frames: &[ProtocolFrame],
     active_protected_start_index: usize,
 ) -> anyhow::Result<EffectiveRuntimePrompt> {
@@ -467,33 +460,13 @@ fn effective_runtime_prompt(
                 })
                 .cloned(),
         );
-        stable_prelude.extend(runtime_material.prelude.iter().cloned());
         let active_protected_start_index = super::expand_protected_start_to_group(
             &super::history_items_from_frames(active_history_frames),
             active_protected_start_index,
         )?
         .min(active_history_frames.len());
-        let mut history_frames = runtime_material
-            .history_prefix
-            .iter()
-            .filter(|frame| {
-                !matches!(&frame.item, ProtocolFrameItem::ContextSummary { text }
-                    if text.starts_with("[Context: Active Tail]")
-                        || text.starts_with("[Context: Opened Details]"))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let protected_start_index = history_frames.len() + active_protected_start_index;
-        history_frames.extend(
-            active_history_frames[..active_protected_start_index]
-                .iter()
-                .cloned(),
-        );
-        history_frames.extend(
-            active_history_frames[active_protected_start_index..]
-                .iter()
-                .cloned(),
-        );
+        let protected_start_index = active_protected_start_index;
+        let history_frames = active_history_frames.to_vec();
         Ok(EffectiveRuntimePrompt {
             prelude: stable_prelude,
             history_frames,

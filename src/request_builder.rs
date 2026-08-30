@@ -1,7 +1,4 @@
 use anyhow::Result;
-#[cfg(test)]
-#[path = "request_builder/context_view_adapter.rs"]
-mod context_view_adapter;
 #[path = "request_builder/history_budget.rs"]
 mod history_budget;
 #[path = "request_builder/prompt_cache.rs"]
@@ -13,8 +10,6 @@ mod provider_serialization;
 #[path = "request_builder/runtime_projection.rs"]
 mod runtime_projection;
 use crate::config::{ApiProtocol, PromptCacheConfig, PromptCacheRetention};
-#[cfg(test)]
-use crate::context_view::ContextViewProjection;
 #[cfg(test)]
 use crate::protocol_frames::ProtocolFrameItem;
 pub(crate) use crate::protocol_frames::history_items_from_frames;
@@ -351,9 +346,6 @@ pub(crate) struct FrozenEvidence {
 }
 
 /// Test-only fixture input that is converted to a runtime snapshot.
-///
-/// `history_adapter` / `context_view` are accepted for call-site stability but
-/// intentionally ignored: provider prompts are history-only.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct TestRequestBuilderInput<'a> {
@@ -365,8 +357,6 @@ pub(crate) struct TestRequestBuilderInput<'a> {
     pub protected_start_index: usize,
     pub tools: &'a [ToolSpec],
     pub evidence: &'a [EvidenceRecord],
-    pub history_adapter: Option<&'a HistoryAdapterProjection>,
-    pub context_view: Option<&'a ContextViewProjection>,
 }
 
 #[derive(Debug, Clone)]
@@ -730,12 +720,6 @@ pub struct PromptCacheReport {
     pub routing_key: Option<String>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct HistoryAdapterProjection {
-    prelude: Vec<PromptMessage>,
-    history_prefix: Vec<ProtocolFrame>,
-}
-
 const MIN_CONTEXT_WINDOW_TOKENS: u64 = 1024;
 const DEFAULT_FALLBACK_CONTEXT_WINDOW_TOKENS: u64 = 8 * 1024;
 const MIN_OUTPUT_RESERVE_TOKENS: u64 = 128;
@@ -844,12 +828,8 @@ fn build_request_with_frozen_and_policy(
 }
 
 /// Test-only fixture adapter. It always delegates to the canonical runtime path.
-///
-/// ContextView / history-adapter injection is deliberately not applied so tests
-/// exercise the same history-only prompt surface as production.
 #[cfg(test)]
 pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<BuildResult> {
-    let _ = (input.history_adapter, input.context_view);
     let prelude = input.prelude.to_vec();
     let frames = history_items_to_frames(input.history);
     let protected_start_index = input.protected_start_index;
@@ -1045,24 +1025,6 @@ pub(crate) fn build_request_from_selected_prompt(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn context_view_history_adapter(
-    context_view: &ContextViewProjection,
-    history: &[HistoryItem],
-    protected_start_index: usize,
-) -> HistoryAdapterProjection {
-    context_view_adapter::context_view_history_adapter(context_view, history, protected_start_index)
-}
-
-/// Materializes provider-visible context solely from the runtime snapshot.
-fn runtime_context_history_adapter(
-    snapshot: &RuntimeSnapshot,
-    history: &[HistoryItem],
-    protected_start_index: usize,
-) -> HistoryAdapterProjection {
-    runtime_projection::runtime_context_history_adapter(snapshot, history, protected_start_index)
-}
-
 pub(crate) fn provider_visible_protocol_frames(snapshot: &RuntimeSnapshot) -> Vec<ProtocolFrame> {
     runtime_projection::provider_visible_protocol_frames(snapshot)
 }
@@ -1072,15 +1034,6 @@ fn protected_start_index_for_snapshot(
     frames: &[ProtocolFrame],
 ) -> usize {
     runtime_projection::protected_start_index_for_snapshot(snapshot, frames)
-}
-
-#[cfg(test)]
-fn assemble_context_view_sections(
-    context_view: &ContextViewProjection,
-    history: &[HistoryItem],
-    protected_start_index: usize,
-) -> HistoryAdapterProjection {
-    context_view_history_adapter(context_view, history, protected_start_index)
 }
 
 fn ensure_protected_context_within_budget(

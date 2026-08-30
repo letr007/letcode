@@ -32,9 +32,9 @@ flowchart TD
 - source span 与 `snapshot.compaction.retired_source_spans` 重叠的 frame 会被排除；
 - 剩余 protocol item 被转换为 `ProtocolFrame`，保留稳定的 runtime ID 和 provenance，并重新分配 history index。
 
-`runtime_context_history_adapter` 返回空的 `HistoryAdapterProjection`（`src/request_builder/runtime_projection.rs:6-17`）。request planner 从 runtime snapshot 和 protocol history 获取 provider prompt material。`context_view_adapter` 提供 context-view 投影（`src/request_builder/context_view_adapter.rs:11-119`）。
+Request planner 仅从 runtime snapshot 中 provider-visible 的 protocol frame 获取 prompt material。ContextView 和 context tree 仍供 TUI 展示与工具寻址使用，但不会合成 prelude 或 history frame 注入 provider request。
 
-protected boundary 根据 runtime frame ID 计算：`protected_start_index_for_snapshot` 查找第一个 ID 位于 `snapshot.compaction.protected_frame_ids` 中的 provider-visible frame；如果没有匹配项，边界就是 frame 列表末尾（`src/request_builder/runtime_projection.rs:52-64`）。
+protected boundary 根据 runtime frame ID 计算：`protected_start_index_for_snapshot` 查找第一个 ID 位于 `snapshot.compaction.protected_frame_ids` 中的 provider-visible frame；如果没有匹配项，边界就是 frame 列表末尾（`src/request_builder/runtime_projection.rs:37-49`）。
 
 ## 提示计划
 

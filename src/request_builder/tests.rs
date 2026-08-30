@@ -28,12 +28,8 @@ fn evidence_budget_tokens_preserves_saturating_15_percent_clamp() {
 
 use crate::agent::{ToolExecutionSummaryEvent, ValidationAdvisory};
 use crate::context_tree::ContextNodeStatus;
-use crate::context_view::{
-    ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewStatus,
-    project_context_view,
-};
+use crate::context_view::{ContextBlockId, ContextViewStatus};
 use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
-use crate::protocol_frames::history_items_from_frames;
 use crate::runtime_context::RuntimeChildSession;
 use crate::tool::ToolResult;
 use crate::transcript::transcript_projection::{
@@ -100,94 +96,6 @@ fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord 
     }
 }
 
-fn adapter_summary_texts(adapter: &HistoryAdapterProjection) -> Vec<String> {
-    history_items_from_frames(&adapter.history_prefix)
-        .into_iter()
-        .filter_map(|item| match item {
-            HistoryItem::ContextSummary { text } => Some(text),
-            _ => None,
-        })
-        .collect()
-}
-
-fn sample_context_view(open_detail: bool) -> crate::context_view::ContextViewProjection {
-    let mut records = vec![
-        transcript_record(
-            1,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("Do not drop hard constraints"),
-            },
-        ),
-        transcript_record(
-            2,
-            TranscriptEvent::AssistantMessage {
-                content: "Pinned context note".into(),
-            },
-        ),
-        transcript_record(
-            3,
-            TranscriptEvent::ContextViewOperationMetadata {
-                operation: "pin".into(),
-                node_id: None,
-                block_id: Some("block-seq-2-note".into()),
-                detail: None,
-            },
-        ),
-        transcript_record(
-            4,
-            TranscriptEvent::ToolCallStarted {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-                args: json!({"command": "cargo test"}),
-            },
-        ),
-        transcript_record(
-            5,
-            TranscriptEvent::ToolCallFinished {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-                ok: true,
-                output: crate::tool::ToolResult::ok(
-                    "shell__exec",
-                    json!({
-                        "status": 0,
-                        "stdout": "x".repeat(5000),
-                        "stdout_truncated": false,
-                        "stderr": "",
-                        "stderr_truncated": false
-                    }),
-                ),
-            },
-        ),
-        transcript_record(
-            6,
-            TranscriptEvent::ContextSummaryArtifactMetadata {
-                node_id: "node-a".into(),
-                artifact_id: "sum-1".into(),
-                artifact_kind: "summary".into(),
-                version: Some(1),
-                summary: Some("Summary text".into()),
-                source_node_id: Some("node-a".into()),
-                source_block_id: Some("block-seq-2-note".into()),
-                source_start_sequence: Some(2),
-                source_end_sequence: Some(2),
-            },
-        ),
-    ];
-    if open_detail {
-        records.push(transcript_record(
-            7,
-            TranscriptEvent::ContextViewOperationMetadata {
-                operation: "open_detail".into(),
-                node_id: None,
-                block_id: Some("block-seq-2-note".into()),
-                detail: None,
-            },
-        ));
-    }
-    project_context_view(&records).expect("context view projection")
-}
-
 fn request_json(result: BuildResult) -> String {
     match result.request {
         BuiltRequest::Responses(request) => serde_json::to_string(&request).expect("serialize"),
@@ -227,8 +135,6 @@ fn cache_test_result(
         protected_start_index: 1,
         tools,
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("cache test request builds")
 }
@@ -288,8 +194,6 @@ fn deepseek_chat_compat_uses_legacy_roles_and_tokens_and_thinking() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("deepseek chat request builds");
     let request = request_value(&result);
@@ -318,8 +222,6 @@ fn instruction_hierarchy_uses_protocol_native_control_fields() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("responses request builds");
     let responses = request_value(&responses_build);
@@ -346,8 +248,6 @@ fn instruction_hierarchy_uses_protocol_native_control_fields() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("completions request builds");
     let completions = request_value(&completions);
@@ -366,8 +266,6 @@ fn instruction_hierarchy_uses_protocol_native_control_fields() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("anthropic request builds");
     let anthropic = request_value(&anthropic);
@@ -417,8 +315,6 @@ fn anthropic_messages_maps_tool_turn_and_replays_signed_thinking() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("anthropic request builds");
     let request = request_value(&result);
@@ -461,8 +357,6 @@ fn anthropic_logical_units_preserve_one_unit_per_prompt_segment() {
         protected_start_index: 2,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("anthropic request builds");
 
@@ -493,8 +387,6 @@ fn anthropic_messages_applies_adaptive_thinking_effort() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("anthropic adaptive request builds");
     let request = request_value(&result);
@@ -524,8 +416,6 @@ fn deepseek_completions_preserves_skill_material_across_developer_messages() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("deepseek chat request builds");
     let request = request_value(&result);
@@ -583,8 +473,6 @@ fn deepseek_chat_compat_preserves_empty_reasoning_content_for_tool_turns() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("deepseek tool replay builds");
     let request = request_value(&result);
@@ -626,8 +514,6 @@ fn deepseek_responses_replays_reasoning_before_tool_call() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("deepseek responses replay builds");
     let request = request_value(&result);
@@ -660,8 +546,6 @@ fn orphan_tool_outputs_fail_fast_when_building_chat_request() {
         protected_start_index: 2,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect_err("orphan tool output must fail");
     assert!(error.to_string().contains("orphan tool output"));
@@ -684,8 +568,6 @@ fn truncates_oldest_history_but_keeps_protected_items() {
         protected_start_index: 2,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("request builds");
 
@@ -732,8 +614,6 @@ fn responses_serializes_tool_output_images_as_input_image_content() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("responses request builds");
     let request = request_value(&result);
@@ -784,8 +664,6 @@ fn completions_rejects_tool_output_images_without_text_fallback() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect_err("chat completions must reject image tool outputs");
 
@@ -821,8 +699,6 @@ fn effective_input_limit_counts_tool_schema_tokens() {
         protected_start_index: 0,
         tools: &tools,
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("effective-input-limited request with tools builds");
 
@@ -863,8 +739,6 @@ fn evidence_is_dropped_when_current_turn_leaves_no_context_room() {
         protected_start_index: 0,
         tools: &[],
         evidence: &evidence,
-        history_adapter: None,
-        context_view: None,
     })
     .expect("request builds");
 
@@ -904,8 +778,6 @@ fn oversized_optional_evidence_is_dropped_instead_of_failing_protected_context()
         protected_start_index: 0,
         tools: &[],
         evidence: &evidence,
-        history_adapter: None,
-        context_view: None,
     })
     .expect("optional evidence should be dropped instead of failing protected context");
 
@@ -930,8 +802,6 @@ fn returns_error_when_protected_current_turn_exceeds_input_budget() {
         protected_start_index: 2,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect_err("protected current turn should fail fast");
 
@@ -955,8 +825,6 @@ fn returns_error_when_protected_current_turn_exceeds_effective_input_limit() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect_err("effective-input-limited protected current turn should fail fast");
 
@@ -979,8 +847,6 @@ fn rejects_zero_effective_input_limit_metadata() {
         protected_start_index: 0,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect_err("zero effective input limit should fail fast");
 
@@ -991,12 +857,11 @@ fn rejects_zero_effective_input_limit_metadata() {
 }
 
 #[test]
-fn protected_current_oversize_still_fails_with_context_view_present() {
+fn protected_current_oversize_still_fails() {
     let history = vec![
         HistoryItem::user("old"),
         HistoryItem::user("x".repeat(20_000)),
     ];
-    let context_view = sample_context_view(true);
     let err = build_test_request(TestRequestBuilderInput {
         protocol: ApiProtocol::Responses,
         model_id: "gpt-test",
@@ -1006,8 +871,6 @@ fn protected_current_oversize_still_fails_with_context_view_present() {
         protected_start_index: 1,
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: Some(&context_view),
     })
     .expect_err("protected current turn should still fail");
     assert!(
@@ -1017,7 +880,7 @@ fn protected_current_oversize_still_fails_with_context_view_present() {
 }
 
 #[test]
-fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_deleted_blocks() {
+fn restored_context_view_remains_separate_from_provider_prompt() {
     let large_stdout = "stdout-body-".repeat(1_000);
     let large_stderr = "stderr-body-".repeat(1_000);
     let records = vec![
@@ -1203,9 +1066,8 @@ fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_delet
     assert!(!snapshot.history.is_empty());
     let current_history = vec![HistoryItem::user("continue from restored context")];
 
-    // History-only prompt path: restored ContextView projection is retained for
-    // TUI/tool addressing assertions above, but the provider request is built
-    // solely from the supplied history frames.
+    // ContextView remains available for TUI/tool addressing, while provider
+    // requests are built solely from the supplied history frames.
     let result = build_test_request(TestRequestBuilderInput {
         protocol: ApiProtocol::Responses,
         model_id: "gpt-test",
@@ -1215,10 +1077,8 @@ fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_delet
         protected_start_index: 0,
         tools: &[],
         evidence: &snapshot.evidence,
-        history_adapter: None,
-        context_view: Some(&projection),
     })
-    .expect("request builds from restored projection");
+    .expect("request builds independently of restored projection");
     let json = request_json(result);
 
     assert!(json.contains("continue from restored context"));

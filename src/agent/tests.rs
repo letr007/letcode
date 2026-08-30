@@ -3145,8 +3145,6 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         protected_start_index: history.len().saturating_sub(1),
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("request builds");
     assert_eq!(b1.budget.context_window_tokens, 4096);
@@ -3163,8 +3161,6 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         protected_start_index: history.len().saturating_sub(1),
         tools: &[],
         evidence: &[],
-        history_adapter: None,
-        context_view: None,
     })
     .expect("request builds");
     assert!(b2.budget.context_window_tokens > b1.budget.context_window_tokens);
