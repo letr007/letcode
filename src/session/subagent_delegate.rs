@@ -34,6 +34,25 @@ pub(super) struct RunnerSubagentDelegate {
 }
 
 impl RunnerSubagentDelegate {
+    fn hard_failure_result(
+        tool_name: &str,
+        agent_name: &str,
+        child_session_id: Option<String>,
+        summary: String,
+    ) -> ToolResult {
+        let error_message = summary.clone();
+        let data = json!({
+            "agent_name": agent_name,
+            "child_session_id": child_session_id,
+            "status": SubagentStatus::Failed.as_str(),
+            "failure_kind": SubagentFailureKind::Hard.as_str(),
+            "summary": compact_subagent_summary(&summary),
+            "full_summary": summary,
+            "active": false,
+        });
+        ToolResult::err_with_data(tool_name, error_message, data)
+    }
+
     fn route_display_name(
         &self,
         parent: &Agent<async_openai::config::OpenAIConfig>,
@@ -312,17 +331,12 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
             {
                 Ok(route) => route,
                 Err(error) => {
-                    let summary = error.to_string();
-                    let data = json!({
-                        "agent_name": agent_name,
-                        "child_session_id": invocation.input.target_child_session_id,
-                        "status": SubagentStatus::Failed.as_str(),
-                        "failure_kind": SubagentFailureKind::Hard.as_str(),
-                        "summary": compact_subagent_summary(&summary),
-                        "full_summary": summary,
-                        "active": false,
-                    });
-                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                    return Ok(Self::hard_failure_result(
+                        tool_name,
+                        agent_name,
+                        invocation.input.target_child_session_id,
+                        error.to_string(),
+                    ));
                 }
             };
             if !self
@@ -383,17 +397,12 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
             let started = match started {
                 Ok(started) => started,
                 Err(error) => {
-                    let summary = error.to_string();
-                    let data = json!({
-                        "agent_name": agent_name,
-                        "child_session_id": target_child_session_id,
-                        "status": SubagentStatus::Failed.as_str(),
-                        "failure_kind": SubagentFailureKind::Hard.as_str(),
-                        "summary": compact_subagent_summary(&summary),
-                        "full_summary": summary,
-                        "active": false,
-                    });
-                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                    return Ok(Self::hard_failure_result(
+                        tool_name,
+                        agent_name,
+                        target_child_session_id,
+                        error.to_string(),
+                    ));
                 }
             };
 
@@ -440,17 +449,12 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
             let summary = match summary {
                 Ok(summary) => summary,
                 Err(error) => {
-                    let summary = error.to_string();
-                    let data = json!({
-                        "agent_name": agent_name,
-                        "child_session_id": target_child_session_id,
-                        "status": SubagentStatus::Failed.as_str(),
-                        "failure_kind": SubagentFailureKind::Hard.as_str(),
-                        "summary": compact_subagent_summary(&summary),
-                        "full_summary": summary,
-                        "active": false,
-                    });
-                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                    return Ok(Self::hard_failure_result(
+                        tool_name,
+                        agent_name,
+                        target_child_session_id,
+                        error.to_string(),
+                    ));
                 }
             };
 
@@ -477,5 +481,41 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
                 Ok(ToolResult::err_with_data(tool_name, summary_text, data))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_failure_result_preserves_compact_full_and_error_payloads() {
+        let summary = "first line\n".to_string() + &"detail ".repeat(40);
+        let result = RunnerSubagentDelegate::hard_failure_result(
+            "agent__explore",
+            "explorer",
+            Some("child-123".to_string()),
+            summary.clone(),
+        );
+
+        assert!(!result.ok);
+        assert_eq!(result.tool, "agent__explore");
+        assert_eq!(
+            result.error.as_ref().map(|error| &error.message),
+            Some(&summary)
+        );
+        assert_eq!(
+            result.error.as_ref().map(|error| error.recoverable),
+            Some(true)
+        );
+
+        let data = result.data.expect("hard failure data");
+        assert_eq!(data["agent_name"], "explorer");
+        assert_eq!(data["child_session_id"], "child-123");
+        assert_eq!(data["status"], "failed");
+        assert_eq!(data["failure_kind"], "hard");
+        assert_eq!(data["summary"], compact_subagent_summary(&summary));
+        assert_eq!(data["full_summary"], summary);
+        assert_eq!(data["active"], false);
     }
 }
