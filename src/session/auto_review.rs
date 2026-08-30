@@ -224,7 +224,7 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
                 };
                 self.record_decision(&request, &denied, "")?;
                 self.emit_resolution(&request, &denied, "");
-                return Ok(denied.into_resolution(String::new()));
+                return Ok(denied.into_resolution());
             }
 
             let goal = user_goal.or_else(|| self.latest_user_goal());
@@ -321,7 +321,7 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
                     let child_id = self.sticky_child_id();
                     self.record_decision(&request, &parsed, &child_id)?;
                     self.emit_resolution(&request, &parsed, &child_id);
-                    return Ok(parsed.into_resolution(child_id));
+                    return Ok(parsed.into_resolution());
                 }
             };
 
@@ -343,7 +343,7 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
             self.record_decision(&request, &parsed, &child_session_id)?;
             self.emit_resolution(&request, &parsed, &child_session_id);
 
-            Ok(parsed.into_resolution(child_session_id))
+            Ok(parsed.into_resolution())
         })
     }
 
@@ -401,8 +401,7 @@ impl ParsedReview {
         }
     }
 
-    fn into_resolution(self, reviewer_child_session_id: String) -> AutoReviewResolution {
-        let approval_label = self.approval_label();
+    fn into_resolution(self) -> AutoReviewResolution {
         AutoReviewResolution {
             approval: match self.response {
                 PermissionResponse::AllowOnce => crate::permission::PermissionApproval::AllowOnce,
@@ -412,9 +411,6 @@ impl ParsedReview {
                 PermissionResponse::Deny => crate::permission::PermissionApproval::Deny,
             },
             reason: self.rationale,
-            risk: self.risk,
-            approval_label,
-            reviewer_child_session_id,
         }
     }
 }

@@ -5469,7 +5469,6 @@ async fn default_and_safe_allow_once_authorize_external_writes() {
 struct MockAutoReviewService {
     approval: Mutex<PermissionApproval>,
     calls: AtomicUsize,
-    child_session_id: String,
 }
 
 struct CapturingAutoReviewService {
@@ -5493,9 +5492,6 @@ impl AutoReviewService<OpenAIConfig> for CapturingAutoReviewService {
             Ok(AutoReviewResolution {
                 approval: self.approval,
                 reason: "captured".into(),
-                risk: Some("low".into()),
-                approval_label: "once",
-                reviewer_child_session_id: "reviewer-child-capturing".into(),
             })
         })
     }
@@ -5515,17 +5511,14 @@ impl AutoReviewService<OpenAIConfig> for MockAutoReviewService {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let approval = *self.approval.lock().expect("approval lock");
-            let approval_label = match approval {
-                PermissionApproval::AllowOnce => "once",
-                PermissionApproval::AllowAlways => "always",
-                PermissionApproval::Deny => "deny",
+            let reason = match approval {
+                PermissionApproval::AllowOnce => "mock-once",
+                PermissionApproval::AllowAlways => "mock-always",
+                PermissionApproval::Deny => "mock-deny",
             };
             Ok(AutoReviewResolution {
                 approval,
-                reason: format!("mock-{approval_label}"),
-                risk: Some("low".into()),
-                approval_label,
-                reviewer_child_session_id: self.child_session_id.clone(),
+                reason: reason.into(),
             })
         })
     }
@@ -5540,7 +5533,6 @@ async fn auto_mode_child_inherits_reviewer_service() {
     let service = Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::AllowOnce),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-inherited".into(),
     });
     parent.set_auto_review_service(Some(service.clone()));
     let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
@@ -5580,7 +5572,6 @@ fn reviewer_child_does_not_inherit_auto_review_service() {
     parent.set_auto_review_service(Some(Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::AllowOnce),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-recursion-guard".into(),
     })));
 
     let reviewer = AgentFactory::create_child(&parent, &AgentTemplate::reviewer());
@@ -5954,7 +5945,6 @@ async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
     let service = Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::AllowOnce),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-1".into(),
     });
     agent.set_auto_review_service(Some(service.clone()));
 
@@ -6070,7 +6060,6 @@ async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
     let service = Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::Deny),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-scope".into(),
     });
     child.set_auto_review_service(Some(service.clone()));
 
@@ -6117,7 +6106,6 @@ async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
     let service = Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::AllowOnce),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-subagent".into(),
     });
     agent.set_auto_review_service(Some(service.clone()));
     agent.set_subagent_delegate(static_delegate(ToolResult::ok(
@@ -6165,7 +6153,6 @@ async fn auto_mode_deny_includes_reviewer_rationale() {
     let service = Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::Deny),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-deny".into(),
     });
     agent.set_auto_review_service(Some(service));
 
@@ -6205,7 +6192,6 @@ async fn auto_mode_does_not_reuse_allow_always_between_reviews() {
     let service = Arc::new(MockAutoReviewService {
         approval: Mutex::new(PermissionApproval::AllowAlways),
         calls: AtomicUsize::new(0),
-        child_session_id: "reviewer-child-sticky".into(),
     });
     agent.set_auto_review_service(Some(service.clone()));
 
