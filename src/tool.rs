@@ -515,16 +515,6 @@ impl ToolRegistry {
     }
 }
 
-#[allow(dead_code)]
-pub fn tool_definitions() -> Vec<ToolSpec> {
-    ToolRegistry::default_tools().specs()
-}
-
-#[allow(dead_code)]
-pub async fn call_tool(name: &str, args: Value) -> ToolResult {
-    ToolRegistry::default_tools().call(name, args).await
-}
-
 pub fn external_workspace_access_for_tool(
     name: &str,
     args: &Value,
