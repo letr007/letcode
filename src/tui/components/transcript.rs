@@ -351,112 +351,44 @@ fn cached_transcript_row_count_with_reflow(
     (rows, width_changed)
 }
 
-fn visible_cached_transcript_lines(
-    state: &mut TuiState,
-    theme: Theme,
-    width: usize,
-    visible_rows: u16,
-    top_scroll: usize,
-) -> Vec<Line<'static>> {
-    let visible_rows = visible_rows as usize;
-    if visible_rows == 0 || state.active_timeline().items().is_empty() {
-        return Vec::new();
-    }
-
-    let width_changed =
-        state
-            .transcript_render_cache
-            .prepare(width, theme, state.active_timeline().cache_id());
-    if width_changed {
-        state.on_timeline_changed();
-    }
-    if !transcript_row_metadata_is_current(state) {
-        cached_transcript_row_count(state, theme, width);
-    }
-
-    let start = top_scroll;
-    let end = start.saturating_add(visible_rows);
-    let mut visible = Vec::with_capacity(visible_rows);
-
-    let top_spacer_end = surface::TRANSCRIPT_TOP_SPACER.min(end);
-    for row in start..top_spacer_end {
-        if row < surface::TRANSCRIPT_TOP_SPACER {
-            visible.push(Line::from(""));
-        }
-    }
-
-    let item_count = state.active_timeline().items().len();
-    let first_item = state
-        .transcript_render_cache
-        .row_starts
-        .partition_point(|row_start| *row_start < start)
-        .saturating_sub(1);
-
-    for index in first_item..item_count {
-        let item_start = state.transcript_render_cache.row_starts[index];
-        let item_count = state.transcript_render_cache.row_counts[index];
-        let separator_rows = if timeline_item_needs_separator_before(
-            index,
-            state.active_timeline().items(),
-            state.thoughts_display,
-        ) {
-            1
-        } else {
-            0
-        };
-        let separator_start = item_start.saturating_sub(separator_rows);
-        let item_end = item_start.saturating_add(item_count);
-
-        if separator_start >= end || visible.len() >= visible_rows {
-            break;
-        }
-
-        if separator_rows > 0 && separator_start >= start && separator_start < end {
-            visible.push(Line::from(""));
-        }
-
-        if item_end <= start {
-            continue;
-        }
-
-        let line_start = start.saturating_sub(item_start).min(item_count);
-        let line_end = end.saturating_sub(item_start).min(item_count);
-        let lines = cached_item_lines(state, index, theme, width);
-        for line in &lines[line_start..line_end] {
-            visible.push(line.clone());
-            if visible.len() >= visible_rows {
-                break;
-            }
-        }
-    }
-
-    // 应用选择高亮
-    if let Some(selection) = &state.text_selection {
-        apply_selection_highlight(&mut visible, selection, state, theme, top_scroll);
-    }
-
-    visible
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptViewportRange {
+    Spacer {
+        start: usize,
+        end: usize,
+    },
+    Separator,
+    Item {
+        index: usize,
+        line_start: usize,
+        line_end: usize,
+    },
 }
 
-fn visible_document_lines(
+fn transcript_viewport_ranges(
     state: &TuiState,
     visible_rows: u16,
     top_scroll: usize,
-) -> Vec<Option<&RenderLine<Style>>> {
+) -> Vec<TranscriptViewportRange> {
     let visible_rows = visible_rows as usize;
     if visible_rows == 0 {
         return Vec::new();
     }
 
-    let start = top_scroll.min(state.transcript_render_cache.total_rows.unwrap_or(0));
-    let end = start
-        .saturating_add(visible_rows)
-        .min(state.transcript_render_cache.total_rows.unwrap_or(start));
-    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    let total_rows = state.transcript_render_cache.total_rows.unwrap_or(0);
+    let start = top_scroll.min(total_rows);
+    let end = start.saturating_add(visible_rows).min(total_rows);
+    if start >= end {
+        return Vec::new();
+    }
 
+    let mut ranges = Vec::new();
     let spacer_end = surface::TRANSCRIPT_TOP_SPACER.min(end);
     if start < spacer_end {
-        rows.extend((start..spacer_end).map(|_| None));
+        ranges.push(TranscriptViewportRange::Spacer {
+            start,
+            end: spacer_end,
+        });
     }
 
     let items = state.active_timeline().items();
@@ -475,27 +407,105 @@ fn visible_document_lines(
         ));
         let separator_start = item_start.saturating_sub(separator_rows);
         let item_end = item_start.saturating_add(item_count);
+
         if separator_start >= end {
             break;
         }
         if separator_rows > 0 && separator_start >= start {
-            rows.push(None);
+            ranges.push(TranscriptViewportRange::Separator);
         }
         if item_end <= start {
             continue;
         }
+
         let line_start = start.saturating_sub(item_start).min(item_count);
         let line_end = end.saturating_sub(item_start).min(item_count);
-        rows.extend(
-            state.transcript_render_cache.entries[index].document.lines[line_start..line_end]
-                .iter()
-                .map(Some),
-        );
-        if rows.len() >= visible_rows {
-            break;
+        if line_start < line_end {
+            ranges.push(TranscriptViewportRange::Item {
+                index,
+                line_start,
+                line_end,
+            });
         }
     }
-    rows.truncate(visible_rows);
+
+    ranges
+}
+
+fn visible_cached_transcript_lines(
+    state: &mut TuiState,
+    theme: Theme,
+    width: usize,
+    visible_rows: u16,
+    top_scroll: usize,
+) -> Vec<Line<'static>> {
+    if visible_rows == 0 || state.active_timeline().items().is_empty() {
+        return Vec::new();
+    }
+
+    let width_changed =
+        state
+            .transcript_render_cache
+            .prepare(width, theme, state.active_timeline().cache_id());
+    if width_changed {
+        state.on_timeline_changed();
+    }
+    if !transcript_row_metadata_is_current(state) {
+        cached_transcript_row_count(state, theme, width);
+    }
+
+    let ranges = transcript_viewport_ranges(state, visible_rows, top_scroll);
+    let mut visible = Vec::with_capacity(visible_rows as usize);
+    for range in ranges {
+        match range {
+            TranscriptViewportRange::Spacer { start, end } => {
+                visible.extend((start..end).map(|_| Line::from("")));
+            }
+            TranscriptViewportRange::Separator => visible.push(Line::from("")),
+            TranscriptViewportRange::Item {
+                index,
+                line_start,
+                line_end,
+            } => {
+                let lines = cached_item_lines(state, index, theme, width);
+                visible.extend(lines[line_start..line_end].iter().cloned());
+            }
+        }
+    }
+
+    // 应用选择高亮
+    if let Some(selection) = &state.text_selection {
+        apply_selection_highlight(&mut visible, selection, state, theme, top_scroll);
+    }
+
+    visible
+}
+
+fn visible_document_lines(
+    state: &TuiState,
+    visible_rows: u16,
+    top_scroll: usize,
+) -> Vec<Option<&RenderLine<Style>>> {
+    let ranges = transcript_viewport_ranges(state, visible_rows, top_scroll);
+    let mut rows = Vec::with_capacity(visible_rows as usize);
+    for range in ranges {
+        match range {
+            TranscriptViewportRange::Spacer { start, end } => {
+                rows.extend((start..end).map(|_| None));
+            }
+            TranscriptViewportRange::Separator => rows.push(None),
+            TranscriptViewportRange::Item {
+                index,
+                line_start,
+                line_end,
+            } => rows.extend(
+                state.transcript_render_cache.entries[index].document.lines[line_start..line_end]
+                    .iter()
+                    .map(Some),
+            ),
+        }
+    }
+    rows.truncate(visible_rows as usize);
     rows
 }
 
@@ -2004,7 +2014,8 @@ mod tests {
     use super::{
         cached_transcript_row_count, cached_transcript_row_count_with_reflow,
         render_timeline_item_document, render_transcript, transcript_lines, transcript_row_count,
-        try_render_reviewer_view_item, visible_cached_transcript_lines, visible_transcript_lines,
+        try_render_reviewer_view_item, visible_cached_transcript_lines, visible_document_lines,
+        visible_transcript_lines,
     };
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
@@ -2017,6 +2028,7 @@ mod tests {
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             measure::display_width,
             state::{ContextDetailTarget, TuiState},
+            surface,
             theme::{Theme, ThemeName},
             timeline::{
                 CompactionView, ErrorView, MessageRole, MessageView, PermissionPromptStatus,
@@ -2717,6 +2729,86 @@ mod tests {
         assert!(!compact.contains("First thought"), "{compact}");
         assert!(!compact.contains("Second thought"), "{compact}");
         assert!(compact.contains("Third thought"), "{compact}");
+    }
+
+    #[test]
+    fn cached_and_document_visible_windows_share_geometry() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new(
+            "first item with enough text to wrap across rows",
+        )));
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "second item with enough text to wrap across rows",
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent::new(
+            "call-tail",
+            "fs__list",
+            "tail item",
+        )));
+
+        let theme = Theme::dark();
+        let width = 18;
+        let total_rows = cached_transcript_row_count(&mut state, theme, width);
+        let item_rows = state.transcript_render_cache.row_counts.clone();
+        assert!(item_rows.iter().any(|count| *count > 1));
+        assert!(total_rows > surface::TRANSCRIPT_TOP_SPACER + 2);
+
+        for (scroll, rows) in [
+            (0, 2),
+            (surface::TRANSCRIPT_TOP_SPACER, 3),
+            (surface::TRANSCRIPT_TOP_SPACER + item_rows[0] + 1, 3),
+            (total_rows.saturating_sub(3), 3),
+            (total_rows + 100, 3),
+        ] {
+            let cached = visible_cached_transcript_lines(&mut state, theme, width, rows, scroll)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            let documents = visible_document_lines(&state, rows, scroll)
+                .into_iter()
+                .map(|line| {
+                    line.map(|line| {
+                        crate::tui::transcript_ratatui::line_to_ratatui(line).to_string()
+                    })
+                    .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cached, documents, "scroll={scroll}, rows={rows}");
+            assert!(cached.len() <= rows as usize);
+        }
+    }
+
+    #[test]
+    fn cached_visible_window_reuses_geometry_after_width_reflow() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "a deliberately long transcript item that reflows at a narrower width",
+        )));
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new(
+            "a second item follows the reflowed item",
+        )));
+
+        let theme = Theme::dark();
+        cached_transcript_row_count(&mut state, theme, 80);
+        let (total_rows, _) = cached_transcript_row_count_with_reflow(&mut state, theme, 20);
+        for scroll in [0, 2, total_rows.saturating_sub(4)] {
+            let cached = visible_cached_transcript_lines(&mut state, theme, 20, 4, scroll)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            let documents = visible_document_lines(&state, 4, scroll)
+                .into_iter()
+                .map(|line| {
+                    line.map(|line| {
+                        crate::tui::transcript_ratatui::line_to_ratatui(line).to_string()
+                    })
+                    .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cached, documents, "scroll={scroll}");
+        }
     }
 
     #[test]
