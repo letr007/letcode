@@ -101,37 +101,6 @@ pub struct EvidenceRecord {
 }
 
 impl EvidenceDraft {
-    #[allow(dead_code)]
-    pub fn from_tool_result(
-        call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        args: Value,
-        output: &ToolResult,
-    ) -> Self {
-        let call_id = call_id.into();
-        let tool_name = tool_name.into();
-        let source = evidence_source_for_tool(&call_id, &tool_name, &args, output);
-        let kind = evidence_kind_for_tool(&tool_name, output);
-        let title = evidence_title(&tool_name, output, &args);
-        let summary = truncate_chars(
-            &evidence_summary(&tool_name, output, &args),
-            MAX_EVIDENCE_SUMMARY_CHARS,
-        );
-        let detail = evidence_detail(output)
-            .map(|detail| truncate_bytes(&detail, MAX_EVIDENCE_DETAIL_BYTES));
-        let tags = evidence_tags(&tool_name, &args, output);
-
-        Self {
-            id: None,
-            evidence_kind: kind,
-            title,
-            summary,
-            detail,
-            source,
-            tags,
-        }
-    }
-
     pub fn from_tool_execution_record(record: &ToolExecutionRecord) -> Self {
         let args = record.arguments.clone().unwrap_or(Value::Null);
         let source = evidence_source_for_record(record, &args);
@@ -215,26 +184,6 @@ impl EvidenceRecord {
             }
         }
         line
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn prompt_provenance_label(&self) -> String {
-        format!(
-            "{}:{}",
-            self.evidence_kind.as_str(),
-            source_label(&self.source)
-        )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn prompt_stable_key(&self) -> String {
-        format!(
-            "evidence:{}:{}:{}:{}",
-            self.id,
-            self.sequence,
-            self.prompt_provenance_label(),
-            self.summary
-        )
     }
 }
 
@@ -455,27 +404,6 @@ fn is_stale_file_evidence(record: &EvidenceRecord, changes: &[(String, u64)]) ->
         .any(|(changed_path, sequence)| changed_path == path && *sequence > record.sequence)
 }
 
-#[allow(dead_code)]
-fn evidence_kind_for_tool(tool_name: &str, output: &ToolResult) -> EvidenceKind {
-    if !output.ok {
-        return EvidenceKind::Diagnostic;
-    }
-    match tool_name {
-        "fs__read" => EvidenceKind::FileExcerpt,
-        "search__rg" | "web__fetch" | "code__ast_search" => EvidenceKind::SearchResult,
-        "edit__apply_patch" | "fs__write" | "fs__append" | "fs__mkdir" => EvidenceKind::Change,
-        "shell__exec"
-            if command_text(output)
-                .as_deref()
-                .is_some_and(is_validation_command) =>
-        {
-            EvidenceKind::Validation
-        }
-        "shell__exec" => EvidenceKind::CommandResult,
-        _ => EvidenceKind::Decision,
-    }
-}
-
 fn evidence_kind_for_record(record: &ToolExecutionRecord) -> EvidenceKind {
     match record.effects.kind {
         ToolEffectKind::Read => match record.tool_name.as_str() {
@@ -489,32 +417,6 @@ fn evidence_kind_for_record(record: &ToolExecutionRecord) -> EvidenceKind {
         ToolEffectKind::Validation => EvidenceKind::Validation,
         ToolEffectKind::WorkflowControl | ToolEffectKind::Unknown => EvidenceKind::Decision,
         ToolEffectKind::Diagnostic => EvidenceKind::Diagnostic,
-    }
-}
-
-#[allow(dead_code)]
-fn evidence_source_for_tool(
-    call_id: &str,
-    tool_name: &str,
-    args: &Value,
-    output: &ToolResult,
-) -> EvidenceSource {
-    if let Some(path) = value_path(args).or_else(|| data_string(output, "path")) {
-        return EvidenceSource::File {
-            path,
-            start_line: data_u64(output, "start_line").or_else(|| data_u64(output, "offset")),
-            end_line: data_u64(output, "end_line"),
-        };
-    }
-    if let Some(command) = value_string(args, "command").or_else(|| command_text(output)) {
-        return EvidenceSource::Command {
-            command,
-            status: data_i64(output, "status").map(|status| status as i32),
-        };
-    }
-    EvidenceSource::ToolCall {
-        call_id: call_id.to_string(),
-        tool: tool_name.to_string(),
     }
 }
 
@@ -626,22 +528,6 @@ fn evidence_detail(output: &ToolResult) -> Option<String> {
         return Some(stderr.to_string());
     }
     serde_json::to_string(data).ok()
-}
-
-#[allow(dead_code)]
-fn evidence_tags(tool_name: &str, args: &Value, output: &ToolResult) -> Vec<String> {
-    let mut tags = vec![tool_name.to_string(), output.tool.clone()];
-    if let Some(path) = value_path(args).or_else(|| data_string(output, "path")) {
-        tags.push(path);
-    }
-    if let Some(pattern) = value_string(args, "pattern") {
-        tags.push(pattern);
-    }
-    tags.extend(edited_paths(output));
-    tags.sort();
-    tags.dedup();
-    tags.truncate(MAX_EVIDENCE_TAGS);
-    tags
 }
 
 fn evidence_tags_for_record(record: &ToolExecutionRecord, args: &Value) -> Vec<String> {
@@ -761,20 +647,6 @@ fn source_label(source: &EvidenceSource) -> String {
     }
 }
 
-#[allow(dead_code)]
-fn edited_paths(output: &ToolResult) -> Vec<String> {
-    output
-        .data
-        .as_ref()
-        .and_then(|data| data.get("edits"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|edit| edit.get("path").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
-}
-
 fn value_path(args: &Value) -> Option<String> {
     value_string(args, "path")
         .or_else(|| value_string(args, "file_path"))
@@ -831,13 +703,6 @@ fn tool_result_data_failed(output: &ToolResult) -> bool {
 
 fn command_text(output: &ToolResult) -> Option<String> {
     data_string(output, "command")
-}
-
-#[allow(dead_code)]
-fn is_validation_command(command: &str) -> bool {
-    ["test", "check", "clippy", "fmt"]
-        .iter()
-        .any(|needle| command.contains(needle))
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
