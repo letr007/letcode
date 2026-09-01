@@ -130,11 +130,11 @@ mod restore;
 pub use journal::read_records_with_fingerprint;
 #[cfg(test)]
 pub(crate) use journal::{
-    JOURNAL_SCHEMA_VERSION, JournalRecordEnvelope, JournalScope, JournalSink,
-    JournalTransactionCommit, LEGACY_JOURNAL_SCHEMA_VERSION,
-    content_tail_is_uncommitted_transaction, journal_scope_for, parse_records_content,
-    scan_transcript_content, serialize_journal_record, transcript_file_fingerprint,
-    transcript_records_match, validate_journal_entries,
+    JOURNAL_SCHEMA_VERSION, JOURNAL_TRANSACTION_COMMIT, JournalRecordEnvelope, JournalScope,
+    JournalSink, JournalTransactionCommit, LEGACY_JOURNAL_SCHEMA_VERSION,
+    content_tail_is_uncommitted_transaction, journal_payload_digest, journal_scope_for,
+    parse_records_content, scan_transcript_content, serialize_journal_record,
+    transcript_file_fingerprint, transcript_records_match, validate_journal_entries,
 };
 pub(crate) use journal::{
     ParsedJournalLine, parse_journal_line, repair_partial_tail, transaction_fields,

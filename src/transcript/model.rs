@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,6 +31,40 @@ pub struct TranscriptAssistantTurn {
     pub replay: Option<OpaqueReplayState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<HistoryToolCall>,
+}
+
+pub(crate) fn normalize_transcript_event_for_v2(event: TranscriptEvent) -> Result<TranscriptEvent> {
+    match event {
+        TranscriptEvent::AssistantMessage { content } => {
+            Ok(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: Some(content),
+                reasoning_content: None,
+                replay: None,
+                calls: Vec::new(),
+            }))
+        }
+        TranscriptEvent::AssistantToolCallBatch {
+            text,
+            reasoning_content,
+            reasoning_wire,
+            calls,
+        } => {
+            let replay = reasoning_wire
+                .as_deref()
+                .map(|wire| {
+                    OpaqueReplayState::from_anthropic_thinking_blocks_json(wire)
+                        .ok_or_else(|| anyhow!("invalid assistant replay state"))
+                })
+                .transpose()?;
+            Ok(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text,
+                reasoning_content,
+                replay,
+                calls,
+            }))
+        }
+        event => Ok(event),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

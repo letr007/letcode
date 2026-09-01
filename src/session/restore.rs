@@ -130,7 +130,7 @@ pub fn prepare_resume_package(
             )?;
         }
         recorder.record_turn_interrupted(Some(turn_id))?;
-        records = crate::transcript::read_records(recorder.path())?;
+        records = crate::transcript::read_resumable_records_with_fingerprint(recorder.path())?.0;
         snapshot = project_runtime_restore_snapshot_with_children(
             session_id.clone(),
             records.clone(),

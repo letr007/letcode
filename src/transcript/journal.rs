@@ -5,7 +5,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use super::model::{TranscriptEvent, TranscriptFileFingerprint, TranscriptRecord};
+use super::model::{
+    TranscriptEvent, TranscriptFileFingerprint, TranscriptRecord, normalize_transcript_event_for_v2,
+};
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
 pub const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
@@ -139,10 +141,17 @@ fn read_records_with_fingerprint_mode(
     let path = path.as_ref();
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
-    if require_current_schema {
-        ensure_resumable_schema(path, &content)?;
+    let translate_v1 = if require_current_schema {
+        ensure_resumable_schema(path, &content)?
+    } else {
+        false
+    };
+    let mut records = parse_records_content(path, &content, false)?;
+    if translate_v1 {
+        for record in &mut records {
+            record.event = normalize_transcript_event_for_v2(record.event.clone())?;
+        }
     }
-    let records = parse_records_content(path, &content, false)?;
     Ok((records, transcript_file_fingerprint(&content)))
 }
 
@@ -167,7 +176,7 @@ pub fn ensure_resumable_content(path: &Path, content: &str) -> Result<()> {
         "transcript {} is missing its append delimiter",
         path.display()
     );
-    ensure_resumable_schema(path, content)
+    ensure_resumable_schema(path, content).map(|_| ())
 }
 
 pub(crate) fn repair_partial_tail(path: &Path) -> Result<()> {
@@ -555,34 +564,54 @@ fn ensure_supported_discovery_schema(schema_version: u32) -> Result<()> {
     Ok(())
 }
 
-fn ensure_resumable_schema(path: &Path, content: &str) -> Result<()> {
+fn ensure_resumable_schema(path: &Path, content: &str) -> Result<bool> {
     let mut saw_record = false;
+    let mut has_v1 = false;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
         saw_record = true;
-        let version = if has_top_level_json_field(line, "journal_entry") {
-            serde_json::from_str::<JournalTransactionCommit>(line)?.schema_version
-        } else if has_top_level_json_field(line, "journal_schema_version")
-            || has_top_level_json_field(line, "schema_version")
-        {
-            parse_journal_envelope(line)?.schema_version
-        } else {
-            0
-        };
+        if has_top_level_json_field(line, "journal_entry") {
+            let version = serde_json::from_str::<JournalTransactionCommit>(line)?.schema_version;
+            ensure!(
+                matches!(
+                    version,
+                    LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+                ),
+                "transcript {} uses schema version {}; resume supports schema versions {} and {}",
+                path.display(),
+                version,
+                LEGACY_JOURNAL_SCHEMA_VERSION,
+                JOURNAL_SCHEMA_VERSION
+            );
+            has_v1 |= version == LEGACY_JOURNAL_SCHEMA_VERSION;
+            continue;
+        }
         ensure!(
-            version == JOURNAL_SCHEMA_VERSION,
-            "transcript {} uses schema version {}; resume requires schema version {}",
+            has_top_level_json_field(line, "journal_schema_version")
+                || has_top_level_json_field(line, "schema_version"),
+            "transcript {} uses an unenveloped legacy record; resume requires schema version {} or {}",
             path.display(),
-            version,
+            LEGACY_JOURNAL_SCHEMA_VERSION,
             JOURNAL_SCHEMA_VERSION
         );
-        if !has_top_level_json_field(line, "journal_entry") {
-            let record = parse_journal_envelope(line)?.record;
+        let envelope = parse_journal_envelope(line)?;
+        ensure!(
+            matches!(
+                envelope.schema_version,
+                LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+            ),
+            "transcript {} uses schema version {}; resume supports schema versions {} and {}",
+            path.display(),
+            envelope.schema_version,
+            LEGACY_JOURNAL_SCHEMA_VERSION,
+            JOURNAL_SCHEMA_VERSION
+        );
+        if envelope.schema_version == JOURNAL_SCHEMA_VERSION {
             ensure!(
                 !matches!(
-                    record.event,
+                    envelope.record.event,
                     TranscriptEvent::AssistantMessage { .. }
                         | TranscriptEvent::AssistantToolCallBatch { .. }
                 ),
@@ -590,15 +619,16 @@ fn ensure_resumable_schema(path: &Path, content: &str) -> Result<()> {
                 path.display(),
                 JOURNAL_SCHEMA_VERSION
             );
+        } else {
+            has_v1 = true;
         }
     }
     ensure!(
         saw_record,
-        "transcript {} contains no journal records; resume requires schema version {}",
-        path.display(),
-        JOURNAL_SCHEMA_VERSION
+        "transcript {} contains no resumable journal records",
+        path.display()
     );
-    Ok(())
+    Ok(has_v1)
 }
 
 fn has_top_level_json_field(line: &str, field: &str) -> bool {

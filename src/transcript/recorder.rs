@@ -29,6 +29,7 @@ use super::journal::{
     JournalSink, JournalTransactionCommit, journal_payload_digest, journal_scope_for,
     serialize_journal_record,
 };
+use super::model::normalize_transcript_event_for_v2;
 
 #[derive(Serialize)]
 struct CheckpointHeaderRenderer<'a> {
@@ -221,7 +222,10 @@ impl TranscriptRecorder {
             !journal::content_tail_is_uncommitted_transaction(&file_path, &content)?,
             "transcript has an uncommitted transaction tail and cannot safely accept new records"
         );
-        let records = journal::parse_records_content(&file_path, &content, false)?;
+        let mut records = journal::parse_records_content(&file_path, &content, false)?;
+        for record in &mut records {
+            record.event = normalize_transcript_event_for_v2(record.event.clone())?;
+        }
         Self::open_existing_with_validated_records(base_dir, session_id, &records)
     }
 
@@ -1564,42 +1568,6 @@ impl TranscriptRecorder {
             self.apply_active_turn_record(record);
         }
         Ok(())
-    }
-}
-
-fn normalize_transcript_event_for_v2(event: TranscriptEvent) -> Result<TranscriptEvent> {
-    match event {
-        TranscriptEvent::AssistantMessage { content } => {
-            Ok(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
-                text: Some(content),
-                reasoning_content: None,
-                replay: None,
-                calls: Vec::new(),
-            }))
-        }
-        TranscriptEvent::AssistantToolCallBatch {
-            text,
-            reasoning_content,
-            reasoning_wire,
-            calls,
-        } => {
-            let replay = reasoning_wire
-                .as_deref()
-                .map(|wire| {
-                    crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
-                        wire,
-                    )
-                    .ok_or_else(|| anyhow!("invalid assistant replay state"))
-                })
-                .transpose()?;
-            Ok(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
-                text,
-                reasoning_content,
-                replay,
-                calls,
-            }))
-        }
-        event => Ok(event),
     }
 }
 

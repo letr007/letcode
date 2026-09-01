@@ -76,7 +76,7 @@ Agent 的运行状态、resolved route authority、统一 turn orchestration、�
 
 ### [Transcript](components/transcript.md)
 
-Session 的 JSONL 记录、Recorder、Journal、上下文分支、运行状态投影、Session 索引和恢复数据。
+Session 的 schema v2 JSONL envelope、统一 `AssistantTurn`、事务提交、上下文分支、投影，以及 schema v1 resume 翻译。
 
 ### [Tools](components/tools.md)
 

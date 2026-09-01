@@ -98,6 +98,38 @@ fn v1_record(sequence: u64) -> JournalRecordEnvelope {
     }
 }
 
+fn journal_transaction_lines(
+    records: Vec<JournalRecordEnvelope>,
+    schema_version: u32,
+) -> Vec<String> {
+    let transaction_id = records[0].transaction_id.clone().unwrap();
+    let transaction_count = records.len();
+    let base_revision = records[0].base_revision;
+    let resulting_revision = records.last().unwrap().resulting_revision;
+    let mut payload = Vec::new();
+    let mut lines = Vec::new();
+    for record in &records {
+        let serialized = serialize_journal_record(record).unwrap();
+        payload.extend(&serialized);
+        payload.push(b'\n');
+        lines.push(String::from_utf8(serialized).unwrap());
+    }
+    lines.push(
+        serde_json::to_string(&JournalTransactionCommit {
+            schema_version,
+            journal_entry: JOURNAL_TRANSACTION_COMMIT.into(),
+            transaction_id,
+            transaction_count,
+            base_revision,
+            resulting_revision,
+            payload_length: payload.len(),
+            payload_digest: journal_payload_digest(&payload),
+        })
+        .unwrap(),
+    );
+    lines
+}
+
 #[test]
 fn journal_v2_round_trips_and_writes_envelope() {
     let base_dir = journal_test_dir("v2-roundtrip");
@@ -159,21 +191,13 @@ fn empty_transcript_is_not_resumable_or_appendable() {
         fs::write(&path, content).unwrap();
 
         let error = read_resumable_records_with_fingerprint(&path)
-            .expect_err("a resumable transcript must contain a v2 journal record");
-        assert!(
-            error
-                .to_string()
-                .contains("resume requires schema version 2")
-        );
+            .expect_err("a resumable transcript must contain a journal record");
+        assert!(error.to_string().contains("no resumable journal records"));
         let error = match TranscriptRecorder::open_existing(&base_dir, session_id) {
             Ok(_) => panic!("an empty transcript must not accept append"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .to_string()
-                .contains("resume requires schema version 2")
-        );
+        assert!(error.to_string().contains("no resumable journal records"));
     }
 }
 
@@ -216,20 +240,19 @@ fn partial_tail_repair_open_allows_only_the_empty_recovery_frontier() {
         format!("{}\n", serde_json::to_string(&v1_record(1)).unwrap()),
     )
     .unwrap();
-    let error = match TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "legacy") {
-        Ok(_) => panic!("the repair path must not bypass the v1 resume gate"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("resume requires schema version 2")
-    );
+    let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "legacy")
+        .expect("the repair path should accept a complete v1 frontier");
+    recorder
+        .record_session_title("translated")
+        .expect("append a v2 record after the v1 frontier");
+    let raw = fs::read_to_string(&v1_path).unwrap();
+    assert!(raw.lines().next().unwrap().contains("\"schema_version\":1"));
+    assert!(raw.lines().last().unwrap().contains("\"schema_version\":2"));
 }
 
 #[test]
-fn v1_transcript_is_discoverable_but_not_resumable() {
-    let base_dir = journal_test_dir("v1-discovery-only");
+fn v1_transcript_is_discoverable_resumable_and_appends_v2() {
+    let base_dir = journal_test_dir("v1-resume-translation");
     fs::create_dir_all(&base_dir).unwrap();
     let path = base_dir.join("legacy-session.jsonl");
     let mut record = v1_record(1);
@@ -238,13 +261,14 @@ fn v1_transcript_is_discoverable_but_not_resumable() {
     record.record.event = TranscriptEvent::AssistantMessage {
         content: "legacy answer".into(),
     };
-    fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string(&record).unwrap()),
-    )
-    .unwrap();
+    let original = format!("{}\n", serde_json::to_string(&record).unwrap());
+    fs::write(&path, &original).unwrap();
 
-    assert_eq!(read_records(&path).unwrap().len(), 1);
+    let discovery = read_records(&path).unwrap();
+    assert!(matches!(
+        discovery[0].event,
+        TranscriptEvent::AssistantMessage { .. }
+    ));
     let summaries = list_sessions(&base_dir).expect("legacy session remains discoverable");
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].session_id, "legacy-session");
@@ -252,31 +276,102 @@ fn v1_transcript_is_discoverable_but_not_resumable() {
         summaries[0].last_assistant_summary.as_deref(),
         Some("legacy answer")
     );
+
+    let records = read_resumable_records_with_fingerprint(&path)
+        .expect("v1 transcript should translate for resume")
+        .0;
+    assert!(matches!(
+        &records[0].event,
+        TranscriptEvent::AssistantTurn(turn)
+            if turn.text.as_deref() == Some("legacy answer")
+                && turn.calls.is_empty()
+    ));
+
+    let mut recorder = TranscriptRecorder::open_existing(&base_dir, "legacy-session")
+        .expect("v1 transcript should accept v2 append");
+    recorder
+        .record_assistant_message("continued")
+        .expect("append v2 assistant turn");
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.starts_with(&original));
+    let lines = raw.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("\"schema_version\":1"));
+    assert!(lines[1].contains("\"schema_version\":2"));
+    assert!(lines[1].contains("\"kind\":\"assistant_turn\""));
+
+    let prepared = crate::session::prepare_resume_package(&base_dir, "legacy-session")
+        .expect("mixed v1/v2 transcript should prepare resume");
+    assert_eq!(prepared.records.len(), 2);
+    assert!(
+        prepared
+            .records
+            .iter()
+            .all(|record| matches!(record.event, TranscriptEvent::AssistantTurn(_)))
+    );
+}
+
+#[test]
+fn v1_transaction_translates_and_allows_v2_append() {
+    let base_dir = journal_test_dir("v1-transaction-translation");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("legacy-transaction.jsonl");
+    let transaction_id = "legacy-transaction:1:100".to_string();
+    let mut first = v1_record(1);
+    first.record.session_id = "legacy-transaction".into();
+    first.event_id = "legacy-transaction:1".into();
+    first.transaction_id = Some(transaction_id.clone());
+    first.transaction_index = Some(0);
+    first.transaction_count = Some(2);
+    first.record.event = TranscriptEvent::AssistantMessage {
+        content: "legacy answer".into(),
+    };
+    let mut second = v1_record(2);
+    second.record.session_id = "legacy-transaction".into();
+    second.event_id = "legacy-transaction:2".into();
+    second.transaction_id = Some(transaction_id);
+    second.transaction_index = Some(1);
+    second.transaction_count = Some(2);
+    second.record.event = TranscriptEvent::SessionTitle {
+        title: "legacy title".into(),
+    };
+    let original = journal_transaction_lines(vec![first, second], LEGACY_JOURNAL_SCHEMA_VERSION)
+        .join("\n")
+        + "\n";
+    fs::write(&path, &original).unwrap();
+
+    let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
+    assert!(matches!(
+        records[0].event,
+        TranscriptEvent::AssistantTurn(_)
+    ));
+    assert!(matches!(
+        records[1].event,
+        TranscriptEvent::SessionTitle { .. }
+    ));
+
+    let mut recorder = TranscriptRecorder::open_existing(&base_dir, "legacy-transaction").unwrap();
+    recorder.record_session_title("continued").unwrap();
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.starts_with(&original));
+    assert!(raw.lines().last().unwrap().contains("\"schema_version\":2"));
+}
+
+#[test]
+fn unenveloped_legacy_transcript_remains_discovery_only() {
+    let base_dir = journal_test_dir("unenveloped-discovery-only");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("legacy.jsonl");
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&legacy_record(1)).unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(read_records(&path).unwrap().len(), 1);
     let error = read_resumable_records_with_fingerprint(&path)
-        .expect_err("v1 transcript must not be resumable");
-    assert!(
-        error
-            .to_string()
-            .contains("resume requires schema version 2")
-    );
-    let error = match TranscriptRecorder::open_existing(&base_dir, "legacy-session") {
-        Ok(_) => panic!("v1 transcript must not accept append"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("resume requires schema version 2")
-    );
-    let error = match crate::session::prepare_resume_package(&base_dir, "legacy-session") {
-        Ok(_) => panic!("v1 transcript must not prepare a resume package"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("resume requires schema version 2")
-    );
+        .expect_err("unenveloped legacy transcript must remain discovery-only");
+    assert!(error.to_string().contains("unenveloped legacy record"));
 }
 
 #[test]
@@ -322,6 +417,77 @@ fn v2_assistant_turn_round_trips_typed_replay_state() {
                         && state.producer.protocol_id.as_str() == "anthropic"
                 })
     ));
+}
+
+#[test]
+fn v1_tool_call_batch_translates_replay_for_resume() {
+    let base_dir = journal_test_dir("v1-tool-call-translation");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("legacy-tools.jsonl");
+    let mut record = v1_record(1);
+    record.record.session_id = "legacy-tools".into();
+    record.event_id = "legacy-tools:1".into();
+    record.record.event = TranscriptEvent::AssistantToolCallBatch {
+        text: Some("working".into()),
+        reasoning_content: Some("inspect".into()),
+        reasoning_wire: Some(
+            serde_json::json!([{
+                "type": "thinking",
+                "thinking": "inspect",
+                "signature": "signed"
+            }])
+            .to_string(),
+        ),
+        calls: vec![HistoryToolCall {
+            call_id: "call-1".into(),
+            name: "fs__read".into(),
+            arguments_json: "{}".into(),
+        }],
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
+    assert!(matches!(
+        &records[0].event,
+        TranscriptEvent::AssistantTurn(turn)
+            if turn.text.as_deref() == Some("working")
+                && turn.reasoning_content.as_deref() == Some("inspect")
+                && turn.calls.len() == 1
+                && turn.replay.as_ref().is_some_and(|state| {
+                    state.namespace == "anthropic.thinking_blocks"
+                        && state.producer.protocol_id.as_str() == "anthropic"
+                })
+    ));
+}
+
+#[test]
+fn invalid_v1_replay_state_fails_resume_translation() {
+    let base_dir = journal_test_dir("v1-invalid-replay");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("invalid.jsonl");
+    let mut record = v1_record(1);
+    record.record.session_id = "invalid".into();
+    record.event_id = "invalid:1".into();
+    record.record.event = TranscriptEvent::AssistantToolCallBatch {
+        text: None,
+        reasoning_content: None,
+        reasoning_wire: Some("not-json".into()),
+        calls: Vec::new(),
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(read_records(&path).unwrap().len(), 1);
+    let error = read_resumable_records_with_fingerprint(&path)
+        .expect_err("invalid replay state must not be silently discarded");
+    assert!(error.to_string().contains("invalid assistant replay state"));
 }
 
 #[test]

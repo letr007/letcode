@@ -72,7 +72,7 @@ assistant delta、reasoning、tool lifecycle、usage/prepared usage、compaction
 
 提交是一次受校验的 session swap：先验证恢复快照和 prepared route，再交换 live recorder，安装 runtime snapshot、turn sequence、context scope、permission/reasoning 状态和 resolved route，最后清理被替换的空会话文件。成功后发布 `SessionResumed`；失败不会用未校验的 recorder 或 route 覆盖 live session。
 
-普通 resume 只接受当前 journal schema 和当前 assistant payload 形态。legacy/v1 transcript 可以被发现、扫描和列入 session index，但不能作为普通 session resume 或 append 的来源；其 decode-only 记录不会恢复 live Agent state。
+普通 resume 接受 journal schema 1 和 2。schema 1 assistant payload 在读取时规范化为 `AssistantTurn`，原文件保持不变，后续 append 写 schema 2；无 envelope 的更早 legacy transcript 仍只用于发现、扫描和 session index，不恢复 live Agent state。
 
 ## Branch、history 与 child view
 
