@@ -72,4 +72,3 @@ pub(crate) use runner::{
     AgentRunner, RunnerPermissionRequest, RunnerQuestionRequest, SessionTransportEvent,
     subagent_event_sender,
 };
-pub(crate) use settings::apply_model_route_with;

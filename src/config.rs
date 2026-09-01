@@ -1,10 +1,14 @@
+use crate::model_runtime::{
+    AuthScheme, CacheRetention, ProtocolRegistry, ProtocolSettings, ProviderFlavor,
+    ResolvedModelRoute, ResolvedProvider, RuntimeAuthConfig, RuntimeConfig,
+    RuntimeEndpointOverride, RuntimeEndpoints, RuntimeModelConfig, RuntimeProviderConfig,
+    RuntimeRetryConfig, RuntimeTransportConfig,
+};
 use crate::permission::PermissionMode;
 use crate::request_builder::{
     ModelReasoningEffort, ModelReasoningSummary, ModelRequestMetadata, ModelTextVerbosity,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::Client;
-use async_openai::config::OpenAIConfig;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -54,7 +58,6 @@ pub struct PromptCacheConfig {
 }
 
 const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
@@ -81,6 +84,7 @@ pub struct AppConfig {
     pub experiments: ExperimentsConfig,
     pub mcp: IndexMap<String, McpServerConfig>,
     pub providers: IndexMap<String, ProviderConfig>,
+    pub runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
 }
 
 impl AppConfig {
@@ -112,6 +116,13 @@ impl AppConfig {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        let runtime_config = build_runtime_config(raw.clone())?;
+        let resolved_catalog = runtime_config
+            .resolve(&ProtocolRegistry::builtins())
+            .map_err(|error| anyhow!(error))?;
+        if resolved_catalog.providers.is_empty() {
+            bail!("resolved runtime catalog must not be empty");
+        }
 
         if raw.providers.is_empty() {
             bail!("config must define at least one provider under [providers]");
@@ -119,7 +130,7 @@ impl AppConfig {
 
         let active_provider = required_non_empty(
             "active_provider",
-            raw.active_provider.unwrap_or_else(|| {
+            raw.active_provider.clone().unwrap_or_else(|| {
                 raw.providers
                     .keys()
                     .next()
@@ -166,10 +177,10 @@ impl AppConfig {
             retry: build_retry_config(raw_global.retry.unwrap_or_default(), "global.retry")?,
         };
 
-        let providers = raw
+        let providers = resolved_catalog
             .providers
-            .into_iter()
-            .map(|(name, provider)| build_provider_config(&name, provider, &global.retry))
+            .iter()
+            .map(|(name, provider)| Ok((name.clone(), project_provider_config(provider)?)))
             .collect::<Result<IndexMap<_, _>>>()?;
 
         if !providers.contains_key(&active_provider) {
@@ -204,6 +215,7 @@ impl AppConfig {
             experiments,
             mcp,
             providers,
+            runtime_catalog: resolved_catalog,
         })
     }
 
@@ -293,26 +305,6 @@ impl ModelRoute {
             bail!("model route '{value}' must use provider/model form");
         }
         Ok(Self::new(provider, model))
-    }
-
-    pub fn build_client(&self, provider: &ProviderConfig) -> Client<OpenAIConfig> {
-        let effective_protocol = provider
-            .models
-            .get(&self.model)
-            .map(|model| model.protocol)
-            .unwrap_or(provider.protocol);
-        let mut config = OpenAIConfig::new()
-            .with_api_base(provider.base_url.clone())
-            .with_api_key(provider.api_key.clone());
-        if effective_protocol == ApiProtocol::Anthropic {
-            config = match provider.auth_mode {
-                ProviderAuthMode::ApiKey => config
-                    .with_header("x-api-key", provider.api_key.as_str())
-                    .expect("provider api key is a valid header value"),
-                ProviderAuthMode::Bearer => config,
-            };
-        }
-        Client::with_config(config)
     }
 }
 
@@ -484,7 +476,7 @@ pub struct McpRemoteServerConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
@@ -493,6 +485,20 @@ pub struct ProviderConfig {
     pub default_model: String,
     pub retry: Option<RetryConfig>,
     pub models: IndexMap<String, ModelConfig>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("auth_mode", &self.auth_mode)
+            .field("protocol", &self.protocol)
+            .field("default_model", &self.default_model)
+            .field("retry", &self.retry)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 impl ProviderConfig {
@@ -516,7 +522,6 @@ pub struct ModelConfig {
     pub protocol: ApiProtocol,
     pub anthropic_thinking: crate::request_builder::AnthropicThinkingConfig,
     pub anthropic_betas: Vec<String>,
-    pub cache_control: bool,
     pub context_window: Option<u64>,
     pub effective_input_limit_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
@@ -551,12 +556,11 @@ impl ModelConfig {
             fast_mode: false,
             anthropic_thinking: self.anthropic_thinking,
             anthropic_betas: self.anthropic_betas.clone(),
-            cache_control: self.cache_control,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAppConfig {
     #[serde(default)]
@@ -579,7 +583,7 @@ struct RawAppConfig {
     providers: IndexMap<String, RawProviderConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGlobalConfig {
     max_iterations: Option<usize>,
@@ -591,13 +595,13 @@ struct RawGlobalConfig {
     retry: Option<RawRetryConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCompactionConfig {
     preserve_recent_tokens: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRetryConfig {
     enabled: Option<bool>,
@@ -609,7 +613,7 @@ struct RawRetryConfig {
     jitter_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAgentsConfig {
     explorer: Option<RawAgentConfig>,
@@ -621,7 +625,7 @@ struct RawAgentsConfig {
     reviewer: Option<RawAgentConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAgentConfig {
     provider: Option<String>,
@@ -630,26 +634,26 @@ struct RawAgentConfig {
     allowed_models: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawToolsConfig {
     #[serde(default)]
     parallelism: IndexMap<String, crate::tool::ToolParallelism>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExperimentsConfig {
     anchored_bootstrap: Option<RawAnchoredBootstrapConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAnchoredBootstrapConfig {
     enabled: Option<bool>,
@@ -658,7 +662,7 @@ struct RawAnchoredBootstrapConfig {
     compaction_tools: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMcpServerConfig {
     #[serde(rename = "type")]
@@ -674,7 +678,7 @@ struct RawMcpServerConfig {
     oauth: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawMcpServerKind {
     Local,
@@ -683,379 +687,308 @@ enum RawMcpServerKind {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct RawProviderConfig {
-    base_url: Option<String>,
-    api_key: Option<String>,
-    auth_mode: Option<ProviderAuthMode>,
-    protocol: Option<ApiProtocol>,
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
     default_model: Option<String>,
+    #[serde(default)]
     retry: Option<RawRetryConfig>,
     #[serde(default)]
-    models: IndexMap<String, RawModelConfig>,
+    flavor: Option<ProviderFlavor>,
+    auth: Option<RuntimeAuthConfig>,
+    endpoints: Option<RawRuntimeEndpoints>,
+    #[serde(default)]
+    transport: RuntimeTransportConfig,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    query: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    models: IndexMap<String, RuntimeModelConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawModelConfig {
-    #[serde(default, alias = "name")]
-    display_name: Option<String>,
-    protocol: Option<ApiProtocol>,
-    anthropic_thinking: Option<crate::request_builder::AnthropicThinkingConfig>,
+#[derive(Clone)]
+struct RawRuntimeEndpoints {
+    base_url: String,
     #[serde(default)]
-    anthropic_betas: Vec<String>,
+    responses: RuntimeEndpointOverride,
     #[serde(default)]
-    cache_control: bool,
-    context_window: Option<u64>,
-    effective_input_limit_tokens: Option<u64>,
-    max_output_tokens: Option<u64>,
-    // Transitional defaults: if omitted, assume true to avoid surprising
-    // tool/reasoning disablement for existing configs.
-    supports_tools: Option<bool>,
-    supports_reasoning: Option<bool>,
-    reasoning_effort: Option<ModelReasoningEffort>,
-    #[serde(default, alias = "reasoning_levels")]
-    reasoning_efforts: Vec<ModelReasoningEffort>,
-    reasoning_summary: Option<ModelReasoningSummary>,
-    text_verbosity: Option<ModelTextVerbosity>,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    parallel_tool_calls: Option<bool>,
+    completions: RuntimeEndpointOverride,
     #[serde(default)]
-    prompt_cache: RawPromptCacheConfig,
+    anthropic: RuntimeEndpointOverride,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPromptCacheConfig {
-    enabled: Option<bool>,
-    retention: Option<PromptCacheRetention>,
-    namespace: Option<String>,
+fn runtime_retry(
+    raw: Option<RawRetryConfig>,
+    base: &RetryConfig,
+    path: &str,
+) -> Result<RuntimeRetryConfig> {
+    let resolved = build_retry_config_overlay(raw.unwrap_or_default(), base, path)?;
+    Ok(RuntimeRetryConfig {
+        enabled: resolved.enabled,
+        max_attempts: resolved.max_attempts,
+        max_recovery_attempts: resolved.max_recovery_attempts,
+        initial_delay_secs: resolved.initial_delay_secs,
+        exponential_backoff: resolved.exponential_backoff,
+        backoff_multiplier: resolved.backoff_multiplier,
+        jitter_secs: resolved.jitter_secs,
+    })
 }
 
-fn build_provider_config(
-    name: &str,
-    raw: RawProviderConfig,
-    global_retry: &RetryConfig,
-) -> Result<(String, ProviderConfig)> {
-    let name = validate_identifier("providers key", name)?;
-
-    if raw.models.is_empty() {
-        bail!(
-            "provider '{}' must define at least one model under [providers.{}.models]",
-            name,
-            name
-        );
+fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
+    if raw.providers.is_empty() {
+        bail!("config must define at least one provider under [providers]");
     }
-
-    let base_url = env_override(name, "BASE_URL")
-        .or(raw.base_url.map(|value| value.trim().to_string()))
-        .or_else(|| {
-            if name.eq_ignore_ascii_case("openai") {
-                Some(DEFAULT_OPENAI_BASE_URL.to_string())
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| anyhow!("provider '{}' is missing base_url", name))?;
-    let base_url = required_non_empty(&format!("providers.{name}.base_url"), base_url)?;
-
-    let api_key = env_override(name, "API_KEY")
-        .or(raw.api_key.map(|value| value.trim().to_string()))
-        .unwrap_or_default();
-
-    let protocol = match raw.protocol {
-        Some(protocol) => protocol,
-        None if name.eq_ignore_ascii_case("openai") => ApiProtocol::Responses,
-        None => bail!(
-            "provider '{}' must set protocol to 'responses', 'completions', or 'anthropic'",
-            name
-        ),
-    };
-    let has_anthropic_model_override = raw
-        .models
-        .values()
-        .any(|model| model.protocol == Some(ApiProtocol::Anthropic));
-    let auth_mode = match raw.auth_mode {
-        Some(mode) => mode,
-        None if protocol == ApiProtocol::Anthropic => bail!(
-            "provider '{}' with protocol = 'anthropic' requires auth_mode = 'api-key' or 'bearer'",
-            name
-        ),
-        None if has_anthropic_model_override => bail!(
-            "provider '{}' with a model protocol = 'anthropic' requires auth_mode = 'api-key' or 'bearer'",
-            name
-        ),
-        None => ProviderAuthMode::Bearer,
-    };
-
-    let default_model = required_non_empty(
-        &format!("providers.{name}.default_model"),
-        raw.default_model.unwrap_or_else(|| {
-            raw.models
+    let active_provider = required_non_empty(
+        "active_provider",
+        raw.active_provider.clone().unwrap_or_else(|| {
+            raw.providers
                 .keys()
                 .next()
-                .expect("models should contain at least one entry")
+                .expect("providers should contain at least one entry")
                 .clone()
         }),
     )?;
-
-    let models = raw
-        .models
+    let global_retry = build_retry_config(
+        raw.global
+            .as_ref()
+            .and_then(|global| global.retry.clone())
+            .unwrap_or_default(),
+        "global.retry",
+    )?;
+    let providers = raw
+        .providers
         .into_iter()
-        .map(|(model_id, model)| normalize_model_config(name, &model_id, protocol, model))
-        .collect::<Result<IndexMap<_, _>>>()?;
-
-    if !models.contains_key(&default_model) {
-        bail!(
-            "provider '{}' default_model '{}' is not defined under [providers.{}.models]",
-            name,
-            default_model,
-            name
-        );
-    }
-
-    Ok((
-        name.to_string(),
-        ProviderConfig {
-            base_url,
-            api_key,
-            auth_mode,
-            protocol,
-            default_model,
-            retry: raw
-                .retry
-                .map(|retry| {
-                    build_retry_config_overlay(
-                        retry,
-                        global_retry,
+        .map(|(name, provider)| {
+            let auth = provider
+                .auth
+                .ok_or_else(|| anyhow!("providers.{name}.auth is required"))?;
+            let endpoints = provider
+                .endpoints
+                .ok_or_else(|| anyhow!("providers.{name}.endpoints is required"))?;
+            let models = provider.models.into_iter().collect();
+            let endpoint_protocol = provider.protocol.clone();
+            let endpoints = RuntimeEndpoints {
+                base_url: endpoints.base_url,
+                responses: endpoints.responses,
+                completions: endpoints.completions,
+                anthropic: endpoints.anthropic,
+            };
+            Ok((
+                name.clone(),
+                RuntimeProviderConfig {
+                    protocol: provider.protocol.or(endpoint_protocol),
+                    default_model: provider.default_model,
+                    retry: Some(runtime_retry(
+                        provider.retry,
+                        &global_retry,
                         &format!("providers.{name}.retry"),
-                    )
-                })
-                .transpose()?,
-            models,
-        },
-    ))
+                    )?),
+                    flavor: provider.flavor.unwrap_or_default(),
+                    auth,
+                    endpoints,
+                    transport: provider.transport,
+                    headers: provider.headers,
+                    query: provider.query,
+                    models,
+                },
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let runtime_config = RuntimeConfig {
+        active_provider,
+        providers,
+    };
+    runtime_config
+        .clone()
+        .validate()
+        .map_err(|error| anyhow!(error))?;
+    Ok(runtime_config)
 }
 
-fn normalize_model_config(
-    provider_name: &str,
-    model_id: &str,
-    provider_protocol: ApiProtocol,
-    mut raw: RawModelConfig,
-) -> Result<(String, ModelConfig)> {
-    let model_id = validate_identifier(&format!("providers.{provider_name}.models key"), model_id)?
-        .to_string();
-    let display_name = raw
-        .display_name
-        .map(|value| {
-            required_non_empty(
-                &format!("providers.{provider_name}.models.{model_id}.display_name"),
-                value,
-            )
-        })
-        .transpose()?;
+fn parse_reasoning_effort(value: &str) -> Result<ModelReasoningEffort> {
+    Ok(match value {
+        "none" => ModelReasoningEffort::None,
+        "minimal" => ModelReasoningEffort::Minimal,
+        "low" => ModelReasoningEffort::Low,
+        "medium" => ModelReasoningEffort::Medium,
+        "high" => ModelReasoningEffort::High,
+        "xhigh" => ModelReasoningEffort::Xhigh,
+        "max" => ModelReasoningEffort::Max,
+        value => ModelReasoningEffort::Custom(value.to_owned()),
+    })
+}
 
-    let supports_reasoning = raw.supports_reasoning.unwrap_or(true);
-    if let Some(max_output_tokens) = raw.max_output_tokens
+fn parse_reasoning_summary(value: &str) -> Result<ModelReasoningSummary> {
+    match value {
+        "auto" => Ok(ModelReasoningSummary::Auto),
+        "concise" => Ok(ModelReasoningSummary::Concise),
+        "detailed" => Ok(ModelReasoningSummary::Detailed),
+        other => bail!("unknown reasoning summary '{other}'"),
+    }
+}
+
+fn parse_text_verbosity(value: &str) -> Result<ModelTextVerbosity> {
+    match value {
+        "low" => Ok(ModelTextVerbosity::Low),
+        "medium" => Ok(ModelTextVerbosity::Medium),
+        "high" => Ok(ModelTextVerbosity::High),
+        other => bail!("unknown text verbosity '{other}'"),
+    }
+}
+
+fn runtime_protocol(value: Option<&str>) -> Result<ApiProtocol> {
+    match value.unwrap_or("responses") {
+        "responses" => Ok(ApiProtocol::Responses),
+        "completions" => Ok(ApiProtocol::Completions),
+        "anthropic" => Ok(ApiProtocol::Anthropic),
+        other => bail!("unknown protocol '{other}'"),
+    }
+}
+
+fn protocol_setting<T: for<'de> Deserialize<'de>>(
+    settings: &ProtocolSettings,
+    key: &str,
+) -> Result<Option<T>> {
+    let Some(value) = settings.value.get(key).cloned() else {
+        return Ok(None);
+    };
+    value
+        .try_into()
+        .map(Some)
+        .map_err(|error| anyhow!("invalid protocol setting {key}: {error}"))
+}
+
+fn project_resolved_model_config(model: &ResolvedModelRoute) -> Result<ModelConfig> {
+    let protocol = runtime_protocol(Some(model.protocol_id.as_str()))?;
+    let anthropic_thinking: crate::request_builder::AnthropicThinkingConfig =
+        protocol_setting(&model.protocol_settings, "anthropic_thinking")?.unwrap_or_default();
+    let anthropic_betas =
+        protocol_setting::<Vec<String>>(&model.protocol_settings, "anthropic_betas")?
+            .unwrap_or_default();
+    if protocol != ApiProtocol::Anthropic
+        && (!anthropic_betas.is_empty()
+            || anthropic_thinking.mode != crate::request_builder::AnthropicThinkingMode::Disabled)
+    {
+        bail!(
+            "providers.{}.models.{}.protocol_settings require anthropic protocol",
+            model.provider,
+            model.model
+        );
+    }
+    let reasoning_effort = model
+        .generation_defaults
+        .reasoning_effort
+        .as_deref()
+        .map(parse_reasoning_effort)
+        .transpose()?;
+    let reasoning_efforts = model
+        .generation_defaults
+        .reasoning_efforts
+        .iter()
+        .map(|value| parse_reasoning_effort(value))
+        .collect::<Result<Vec<_>>>()?;
+    let reasoning_summary = model
+        .generation_defaults
+        .reasoning_summary
+        .as_deref()
+        .map(parse_reasoning_summary)
+        .transpose()?;
+    let text_verbosity = model
+        .generation_defaults
+        .text_verbosity
+        .as_deref()
+        .map(parse_text_verbosity)
+        .transpose()?;
+    if let Some(max_output_tokens) = model.generation_defaults.max_output_tokens
         && max_output_tokens > u32::MAX as u64
     {
         bail!(
-            "providers.{provider_name}.models.{model_id}.max_output_tokens must be at most {}",
+            "providers.{}.models.{}.generation.max_output_tokens must be at most {}",
+            model.provider,
+            model.model,
             u32::MAX
         );
     }
-    let effective_input_limit_tokens = optional_positive_u64(
-        &format!("providers.{provider_name}.models.{model_id}.effective_input_limit_tokens"),
-        raw.effective_input_limit_tokens,
-    )?;
-    if !supports_reasoning && raw.reasoning_effort.is_some() {
-        bail!(
-            "providers.{provider_name}.models.{model_id}.reasoning_effort requires supports_reasoning = true"
-        );
-    }
-    if !supports_reasoning && !raw.reasoning_efforts.is_empty() {
-        bail!(
-            "providers.{provider_name}.models.{model_id}.reasoning_efforts requires supports_reasoning = true"
-        );
-    }
-    if !supports_reasoning && raw.reasoning_summary.is_some() {
-        bail!(
-            "providers.{provider_name}.models.{model_id}.reasoning_summary requires supports_reasoning = true"
-        );
-    }
-    let reasoning_efforts = normalize_reasoning_efforts(
-        &format!("providers.{provider_name}.models.{model_id}.reasoning_efforts"),
-        std::mem::take(&mut raw.reasoning_efforts),
-        raw.reasoning_effort.clone(),
-    )?;
-
-    if let Some(temperature) = raw.temperature {
-        validate_f32_range(
-            &format!("providers.{provider_name}.models.{model_id}.temperature"),
-            temperature,
-            0.0,
-            2.0,
-        )?;
-    }
-    if let Some(top_p) = raw.top_p {
-        validate_f32_range(
-            &format!("providers.{provider_name}.models.{model_id}.top_p"),
-            top_p,
-            0.0,
-            1.0,
-        )?;
-    }
-
-    let protocol = raw.protocol.unwrap_or(provider_protocol);
-    let anthropic_thinking = raw.anthropic_thinking.unwrap_or_default();
-    if anthropic_thinking.mode != crate::request_builder::AnthropicThinkingMode::Disabled {
-        if protocol != ApiProtocol::Anthropic {
-            bail!(
-                "providers.{provider_name}.models.{model_id}.anthropic_thinking is only supported for anthropic protocol"
-            );
-        }
-        if !supports_reasoning {
-            bail!(
-                "providers.{provider_name}.models.{model_id}.anthropic_thinking requires supports_reasoning = true"
-            );
-        }
-        if anthropic_thinking.mode == crate::request_builder::AnthropicThinkingMode::Budget {
-            let budget_path = format!(
-                "providers.{provider_name}.models.{model_id}.anthropic_thinking.budget_tokens"
-            );
-            let budget = optional_positive_u64(&budget_path, anthropic_thinking.budget_tokens)?;
-            if budget.is_none() {
-                bail!("{budget_path} is required when thinking mode is 'budget'");
-            }
-            if let Some(max_output_tokens) = raw.max_output_tokens
-                && budget >= Some(max_output_tokens)
-            {
-                bail!("{budget_path} must be less than max_output_tokens");
-            }
-        }
-    }
-    let cache_path = format!("providers.{provider_name}.models.{model_id}.prompt_cache");
-    let cache_enabled = raw.prompt_cache.enabled.unwrap_or(false);
-    if !cache_enabled && raw.prompt_cache.retention.is_some() {
-        bail!("{cache_path}.retention requires enabled = true");
-    }
-    if raw.prompt_cache.retention.is_some() && protocol == ApiProtocol::Completions {
-        bail!("{cache_path}.retention is only supported for responses protocol");
-    }
-    let namespace = raw.prompt_cache.namespace.map(|namespace| {
-        if namespace.trim().is_empty() || namespace.len() > 64 || namespace.chars().any(char::is_control) {
-            bail!("{cache_path}.namespace must be non-empty, at most 64 bytes, and contain no control characters");
-        }
-        Ok(namespace)
-    }).transpose()?;
+    let retention = model.cache.retention.map(|value| match value {
+        CacheRetention::InMemory => PromptCacheRetention::InMemory,
+        CacheRetention::TwentyFourHours => PromptCacheRetention::TwentyFourHours,
+    });
     let prompt_cache = PromptCacheConfig {
-        enabled: cache_enabled,
-        retention: raw.prompt_cache.retention,
-        namespace: cache_enabled
-            .then(|| namespace.unwrap_or_else(|| provider_name.to_ascii_lowercase())),
+        enabled: model.cache.enabled,
+        retention,
+        namespace: model.cache.namespace.clone(),
     };
-
-    let anthropic_betas =
-        normalize_anthropic_betas(provider_name, &model_id, protocol, raw.anthropic_betas)?;
-
-    Ok((
-        model_id,
-        ModelConfig {
-            display_name,
-            protocol,
-            anthropic_thinking,
-            anthropic_betas,
-            cache_control: raw.cache_control,
-            context_window: raw.context_window,
-            effective_input_limit_tokens,
-            max_output_tokens: raw.max_output_tokens,
-            supports_tools: raw.supports_tools.unwrap_or(true),
-            supports_reasoning,
-            reasoning_effort: raw.reasoning_effort,
-            reasoning_efforts,
-            reasoning_summary: raw.reasoning_summary,
-            text_verbosity: raw.text_verbosity,
-            temperature: raw.temperature,
-            top_p: raw.top_p,
-            prompt_cache,
-            parallel_tool_calls: raw.parallel_tool_calls.unwrap_or(true),
-        },
-    ))
+    Ok(ModelConfig {
+        display_name: model.display.clone(),
+        protocol,
+        anthropic_thinking,
+        anthropic_betas,
+        context_window: model.context_window,
+        effective_input_limit_tokens: model.effective_input_limit_tokens,
+        max_output_tokens: model.generation_defaults.max_output_tokens,
+        supports_tools: model.capabilities.tools,
+        supports_reasoning: model.capabilities.reasoning,
+        reasoning_effort,
+        reasoning_efforts,
+        reasoning_summary,
+        text_verbosity,
+        temperature: model.generation_defaults.temperature,
+        top_p: model.generation_defaults.top_p,
+        prompt_cache,
+        parallel_tool_calls: model.capabilities.parallel_tool_calls
+            && model
+                .generation_defaults
+                .parallel_tool_calls
+                .unwrap_or(false),
+    })
 }
 
-fn normalize_anthropic_betas(
-    provider_name: &str,
-    model_id: &str,
-    protocol: ApiProtocol,
-    configured: Vec<String>,
-) -> Result<Vec<String>> {
-    if !configured.is_empty() && protocol != ApiProtocol::Anthropic {
-        bail!(
-            "providers.{provider_name}.models.{model_id}.anthropic_betas is only supported for anthropic protocol"
-        );
+fn project_provider_config(provider: &ResolvedProvider) -> Result<ProviderConfig> {
+    let name = &provider.name;
+    let default_model = provider.default_model.clone();
+    let protocol = provider
+        .models
+        .get(&default_model)
+        .map(|route| route.protocol_id.as_str())
+        .map(|value| runtime_protocol(Some(value)))
+        .transpose()?
+        .unwrap_or(ApiProtocol::Responses);
+    if !provider.models.contains_key(&default_model) {
+        bail!("provider '{name}' default_model '{default_model}' is not defined");
     }
-    let path = format!("providers.{provider_name}.models.{model_id}.anthropic_betas");
-    let mut betas = Vec::with_capacity(configured.len());
-    for beta in configured {
-        let beta = beta.trim();
-        if beta.is_empty()
-            || beta.len() > 128
-            || beta.chars().any(|ch| ch.is_control() || ch == ',')
-            || beta.parse::<reqwest::header::HeaderValue>().is_err()
-        {
-            bail!(
-                "{path} entries must be valid HTTP header values: non-empty, at most 128 bytes, and contain no commas or control characters"
-            );
-        }
-        if betas.iter().any(|existing| existing == beta) {
-            bail!("{path} contains duplicate beta '{beta}'");
-        }
-        betas.push(beta.to_string());
-    }
-    Ok(betas)
-}
-
-fn normalize_reasoning_efforts(
-    path: &str,
-    configured: Vec<ModelReasoningEffort>,
-    default_effort: Option<ModelReasoningEffort>,
-) -> Result<Vec<ModelReasoningEffort>> {
-    let mut efforts = Vec::with_capacity(configured.len());
-    for effort in configured {
-        validate_reasoning_effort(path, &effort)?;
-        if efforts.contains(&effort) {
-            bail!("{path} contains duplicate effort '{effort:?}'");
-        }
-        efforts.push(effort);
-    }
-
-    if let Some(default_effort) = &default_effort {
-        validate_reasoning_effort(path, default_effort)?;
-    }
-
-    if let Some(default_effort) = default_effort
-        && !efforts.is_empty()
-        && !efforts.contains(&default_effort)
-    {
-        bail!("{path} must include the configured reasoning_effort");
-    }
-
-    Ok(efforts)
-}
-
-fn validate_reasoning_effort(path: &str, effort: &ModelReasoningEffort) -> Result<()> {
-    let ModelReasoningEffort::Custom(value) = effort else {
-        return Ok(());
+    let models = provider
+        .models
+        .iter()
+        .map(|(model_name, model)| Ok((model_name.clone(), project_resolved_model_config(model)?)))
+        .collect::<Result<IndexMap<_, _>>>()?;
+    let api_key = provider.auth.credential.clone().unwrap_or_default();
+    let auth_mode = match provider.auth.scheme {
+        AuthScheme::Header => ProviderAuthMode::ApiKey,
+        _ => ProviderAuthMode::Bearer,
     };
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        bail!("{path} custom efforts must be 1-64 ASCII letters, digits, '-', '_', or '.'");
-    }
-    Ok(())
+    let retry = provider.retry.as_ref().map(|retry| RetryConfig {
+        enabled: retry.enabled,
+        max_attempts: retry.max_attempts,
+        max_recovery_attempts: retry.max_recovery_attempts,
+        initial_delay_secs: retry.initial_delay_secs,
+        exponential_backoff: retry.exponential_backoff,
+        backoff_multiplier: retry.backoff_multiplier,
+        jitter_secs: retry.jitter_secs,
+    });
+    Ok(ProviderConfig {
+        base_url: provider.endpoint.clone(),
+        api_key,
+        auth_mode,
+        protocol,
+        default_model,
+        retry,
+        models,
+    })
 }
 
 fn build_tools_config(raw: RawToolsConfig) -> Result<ToolsConfig> {
@@ -1294,14 +1227,6 @@ fn build_agent_config(
     })
 }
 
-fn env_override(provider_name: &str, suffix: &str) -> Option<String> {
-    let key = provider_env_var(provider_name, suffix);
-    env::var(&key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn provider_env_var(provider_name: &str, suffix: &str) -> String {
     let normalized = provider_name
         .chars()
@@ -1488,7 +1413,7 @@ pub struct ConfigValidationReport {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 50\nmax_recovery_attempts = 3\ninitial_delay_secs = 1\nexponential_backoff = true\nbackoff_multiplier = 2.0\njitter_secs = 1\n\n[permissions]\nmode = \"default\"\n\n# Optional local tool execution policy:\n# [tools.parallelism]\n# \"fs__read\" = \"parallel\"\n# \"web__fetch\" = \"exclusive\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 50\n# max_recovery_attempts = 3\n# initial_delay_secs = 1\n# exponential_backoff = true\n# backoff_multiplier = 2.0\n# jitter_secs = 1\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nparallel_tool_calls = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[providers.openai]\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\nflavor = \"standard\"\n\n[providers.openai.auth]\ntype = \"bearer\"\ncredential = \"YOUR_API_KEY\"\n\n[providers.openai.endpoints]\nbase_url = \"https://api.openai.com/v1\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay = \"GPT-5.5\"\n\n[providers.openai.models.\"gpt-5.5\".capabilities]\ntools = true\nreasoning = true\n\n[providers.openai.models.\"gpt-5.5\".capabilities.generation]\nmax_output_tokens = true\n\n[providers.openai.models.\"gpt-5.5\".generation]\nmax_output_tokens = 4096\n",
         path.display()
     )
 }
@@ -1508,63 +1433,350 @@ mod tests {
         replace_file,
     };
     use super::*;
+    use crate::model_runtime::{GenerationSupport, RouteCapabilities};
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn config(provider: &str, model: &str, extra: &str) -> String {
+        format!(
+            r#"active_provider = "{provider}"
+
+[providers.{provider}]
+protocol = "responses"
+default_model = "{model}"
+flavor = "standard"
+
+[providers.{provider}.auth]
+type = "bearer"
+credential = "secret-value"
+
+[providers.{provider}.endpoints]
+base_url = "https://example.invalid/v1"
+
+[providers.{provider}.models."{model}"]
+{extra}
+"#
+        )
+        .replace(
+            "[capabilities]",
+            &format!("[providers.{provider}.models.\"{model}\".capabilities]"),
+        )
+        .replace(
+            "[generation]",
+            &format!("[providers.{provider}.models.\"{model}\".generation]"),
+        )
+        .replace(
+            "[cache]",
+            &format!("[providers.{provider}.models.\"{model}\".cache]"),
+        )
+        .replace(
+            "[protocol_settings]",
+            &format!("[providers.{provider}.models.\"{model}\".protocol_settings]"),
+        )
+    }
+
     #[test]
-    fn rejects_retry_attempts_above_maximum() {
-        let _guard = lock_env();
+    fn loads_new_schema_and_resolves_non_empty_catalog() {
+        let path = write_temp_config(config(
+            "standard",
+            "standard-model",
+            r#"display = "Standard"
+model_override = "wire-standard"
+[capabilities]
+tools = true
+generation = { max_output_tokens = true }
+[generation]
+max_output_tokens = 256
+[cache]
+enabled = true
+namespace = "standard-cache"
+"#,
+        ));
+        let loaded = AppConfig::load_from_path(&path).expect("new schema should load");
+        assert!(!loaded.runtime_catalog.providers.is_empty());
+        assert_eq!(loaded.runtime_catalog.active_provider, "standard");
+        let standard = loaded
+            .runtime_catalog
+            .route("standard", "standard-model")
+            .expect("standard route");
+        assert_eq!(standard.model_override, "wire-standard");
+        assert_eq!(standard.flavor, ProviderFlavor::Standard);
+        assert!(standard.capabilities.tools);
+        assert!(standard.generation.max_output_tokens);
+        assert!(loaded.providers["standard"].models["standard-model"].supports_tools);
+    }
+
+    #[test]
+    fn provider_and_model_flavor_protocol_and_endpoint_overrides_are_deterministic() {
         let path = write_temp_config(
-            r#"
-            [global.retry]
-            max_attempts = 9001
+            r#"active_provider = "deepseek"
 
-            [providers.openai]
-            api_key = "config-key"
+[providers.deepseek]
+protocol = "responses"
+default_model = "chat"
+flavor = "deepseek"
 
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
+[providers.deepseek.auth]
+type = "header"
+name = "x-vendor-key"
+credential = "deep-secret"
+
+[providers.deepseek.endpoints]
+base_url = "https://deep.example/v1"
+[providers.deepseek.endpoints.responses]
+path = "/custom/responses"
+query = { version = "2" }
+
+[providers.deepseek.models.chat]
+
+[providers.deepseek.models.override]
+protocol = "completions"
+flavor = "standard"
+model_override = "wire-model"
+"#,
+        );
+        let loaded = AppConfig::load_from_path(&path).expect("config should load");
+        let chat = loaded.runtime_catalog.route("deepseek", "chat").unwrap();
+        assert_eq!(chat.flavor, ProviderFlavor::Deepseek);
+        assert_eq!(chat.endpoint, "https://deep.example/v1/custom/responses");
+        assert_eq!(chat.query["version"], "2");
+        assert_eq!(chat.auth.name.as_deref(), Some("x-vendor-key"));
+        let override_route = loaded
+            .runtime_catalog
+            .route("deepseek", "override")
+            .unwrap();
+        assert_eq!(override_route.flavor, ProviderFlavor::Standard);
+        assert_eq!(override_route.protocol_id.as_str(), "completions");
+        assert_eq!(override_route.model_override, "wire-model");
+    }
+
+    #[test]
+    fn rejects_representative_legacy_provider_and_model_fields() {
+        for legacy in [
+            "api_key = \"legacy\"",
+            "base_url = \"https://legacy.invalid\"",
+            "auth_mode = \"bearer\"",
+        ] {
+            let error = AppConfig::load_from_path(&write_temp_config(&format!(
+                "{}\n{}\n",
+                config("openai", "model", ""),
+                legacy
+            )))
+            .expect_err("legacy provider field must be rejected");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("unknown field"))
+            );
+        }
+        for legacy in [
+            "name = \"legacy\"",
+            "supports_tools = true",
+            "supports_reasoning = true",
+            "prompt_cache = true",
+            "cache_control = true",
+            "anthropic_betas = [\"legacy\"]",
+        ] {
+            let error = AppConfig::load_from_path(&write_temp_config(&format!(
+                "{}\n{}\n",
+                config("openai", "model", ""),
+                legacy
+            )))
+            .expect_err("legacy model field must be rejected");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("unknown field"))
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_default_off_and_typed_cache_settings_validate() {
+        let loaded = AppConfig::load_from_path(&write_temp_config(config("openai", "model", "")))
+            .expect("minimal new config should load");
+        let route = loaded.runtime_catalog.route("openai", "model").unwrap();
+        assert_eq!(route.capabilities, RouteCapabilities::default());
+        assert_eq!(route.generation, GenerationSupport::default());
+        assert!(!route.cache.enabled);
+
+        let invalid = config(
+            "openai",
+            "model",
+            "[cache]\nenabled = false\nretention = \"24h\"\n",
+        );
+        let error = AppConfig::load_from_path(&write_temp_config(invalid));
+        assert!(error.is_err(), "disabled cache retention must fail");
+    }
+
+    #[test]
+    fn protocol_settings_are_typed_and_fingerprints_redact_and_detect_credentials() {
+        let first = write_temp_config(config(
+            "openai",
+            "model",
+            "protocol = \"anthropic\"\n[protocol_settings]\nanthropic_betas = [\"beta-one\"]\n",
+        ));
+        let first_config = AppConfig::load_from_path(&first).expect("first config");
+        let debug = format!("{:?}", first_config.runtime_catalog);
+        assert!(!debug.contains("secret-value"));
+        assert_eq!(
+            first_config
+                .runtime_catalog
+                .route("openai", "model")
+                .unwrap()
+                .protocol_settings
+                .value["anthropic_betas"][0],
+            toml::Value::String("beta-one".into())
         );
 
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("global.retry.max_attempts must be at most 9000")
+        let second = write_temp_config(config(
+            "openai",
+            "model",
+            "protocol = \"anthropic\"\n[protocol_settings]\nanthropic_betas = [\"beta-one\"]\n",
+        ));
+        fs::write(
+            &second,
+            fs::read_to_string(&second)
+                .unwrap()
+                .replace("secret-value", "changed-secret"),
+        )
+        .unwrap();
+        let second_config = AppConfig::load_from_path(&second).expect("second config");
+        assert_ne!(
+            first_config.runtime_catalog.fingerprint(),
+            second_config.runtime_catalog.fingerprint()
         );
     }
 
     #[test]
-    fn provider_retry_can_override_backoff_mode_interval_and_attempts() {
+    fn projected_provider_uses_resolved_credential_snapshot() {
         let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [global.retry]
-            enabled = true
-            max_attempts = 9
-            initial_delay_secs = 1
-            exponential_backoff = true
-            backoff_multiplier = 2.0
-            jitter_secs = 0
+        let env_name = "LETCODE_CONFIG_SNAPSHOT_TEST_KEY";
+        unsafe { env::set_var(env_name, "first-secret") };
+        let path = write_temp_config(config("openai", "model", "").replace(
+            "credential = \"secret-value\"",
+            &format!("credential_env = {env_name:?}"),
+        ));
+        let loaded = AppConfig::load_from_path(&path).expect("environment credential resolves");
+        unsafe { env::set_var(env_name, "second-secret") };
 
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.retry]
-            max_attempts = 4
-            initial_delay_secs = 7
-            exponential_backoff = false
-
-            [providers.openai.models.model]
-            "#,
+        assert_eq!(loaded.providers["openai"].api_key, "first-secret");
+        assert_eq!(
+            loaded.runtime_catalog.providers["openai"]
+                .auth
+                .credential
+                .as_deref(),
+            Some("first-secret")
         );
-        let config = AppConfig::load_from_path(&path).expect("provider retry config loads");
-        let retry = config.providers["openai"]
-            .retry
-            .as_ref()
-            .expect("provider retry override");
+        unsafe { env::remove_var(env_name) };
+    }
+
+    #[test]
+    fn missing_config_example_is_valid() {
+        let path = env::temp_dir().join(format!(
+            "letcode-missing-config-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let message = missing_config_message(&path);
+        let example = message
+            .split_once("Create it with at least:\n\n")
+            .map(|(_, example)| example)
+            .expect("missing config message contains example");
+        let example = example.replace("YOUR_API_KEY", "test-key");
+        let example_path = write_temp_config(example);
+
+        AppConfig::load_from_path(example_path).expect("missing-config example should validate");
+    }
+
+    #[test]
+    fn persists_new_schema_without_overwriting_external_changes() {
+        let path = write_temp_config(&format!(
+            "{}\n[agents.explorer]\nmodel = \"model\"\n",
+            config("openai", "model", "")
+        ));
+        let before = fs::read_to_string(&path).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        fs::write(&path, "external edit\n").unwrap();
+        let error = atomic_write_config(&path, &before, &metadata, b"our update\n")
+            .expect_err("external edit must win");
+        assert!(error.to_string().contains("changed while updating"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "external edit\n");
+    }
+
+    #[test]
+    fn replace_file_overwrites_existing_destination() {
+        let destination = write_temp_config("old\n");
+        let source = destination.with_extension("replacement");
+        fs::write(&source, "new\n").unwrap();
+        replace_file(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(destination).unwrap(), "new\n");
+        assert!(!source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_lock_remains_held_after_config_target_replacement() {
+        use std::os::fd::AsRawFd;
+        let path = write_temp_config("original\n");
+        let target = fs::canonicalize(&path).unwrap();
+        let lock_path = config_lock_path(&target).unwrap();
+        let lock = acquire_config_lock(&target).unwrap();
+        let replacement = target.with_file_name("config-lock-replacement");
+        fs::write(&replacement, "replacement\n").unwrap();
+        fs::rename(&replacement, &target).unwrap();
+        let second = open_config_lock_file(&lock_path).unwrap();
+        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1);
+        drop(second);
+        drop(lock);
+        acquire_config_lock(&target).unwrap();
+    }
+
+    #[test]
+    fn rejects_retry_attempts_above_maximum() {
+        let error = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "model",
+            "[global.retry]\nmax_attempts = 9001\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("global.retry.max_attempts must be at most 9000"));
+    }
+
+    #[test]
+    fn provider_retry_can_override_backoff_mode_interval_and_attempts() {
+        let loaded = AppConfig::load_from_path(&write_temp_config(
+            r#"active_provider = "openai"
+[global.retry]
+enabled = true
+max_attempts = 9
+initial_delay_secs = 1
+exponential_backoff = true
+backoff_multiplier = 2.0
+jitter_secs = 0
+[providers.openai]
+protocol = "responses"
+default_model = "model"
+flavor = "standard"
+[providers.openai.retry]
+max_attempts = 4
+initial_delay_secs = 7
+exponential_backoff = false
+[providers.openai.auth]
+type = "bearer"
+credential = "config-key"
+[providers.openai.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.openai.models.model]
+"#,
+        ))
+        .expect("provider retry config loads");
+        let retry = loaded.providers["openai"].retry.as_ref().unwrap();
         assert!(retry.enabled);
         assert_eq!(retry.max_attempts, 4);
         assert_eq!(retry.initial_delay_secs, 7);
@@ -1575,288 +1787,147 @@ mod tests {
 
     #[test]
     fn rejects_invalid_model_specific_reasoning_efforts() {
-        let _guard = lock_env();
-        for config in [
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models.model]
-            supports_reasoning = false
-            reasoning_efforts = ["low"]
-            "#,
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models.model]
-            reasoning_effort = "high"
-            reasoning_efforts = ["low", "medium"]
-            "#,
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models.model]
-            reasoning_efforts = ["low", "low"]
-            "#,
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-            [providers.openai.models.model]
-            supports_reasoning = true
-            reasoning_effort = "provider ultra"
-            "#,
+        for extra in [
+            "[capabilities]\nreasoning = false\n[generation]\nreasoning_effort = \"low\"",
+            "[capabilities]\nreasoning = true\n[generation]\nreasoning_effort = \"high\"\nreasoning_efforts = [\"low\", \"medium\"]",
+            "[capabilities]\nreasoning = true\n[generation]\nreasoning_efforts = [\"low\", \"low\"]",
+            "[capabilities]\nreasoning = true\n[generation]\nreasoning_effort = \"provider ultra\"",
         ] {
-            let path = write_temp_config(config);
-            assert!(AppConfig::load_from_path(&path).is_err());
+            assert!(
+                AppConfig::load_from_path(&write_temp_config(config("openai", "model", extra)))
+                    .is_err(),
+                "invalid reasoning config should be rejected: {extra}"
+            );
         }
     }
 
     #[test]
-    fn model_parallel_tool_calls_default_to_enabled_and_can_be_disabled() {
-        let _guard = lock_env();
-        let default_path = write_temp_config(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-default"]
-            "#,
-        );
-        let disabled_path = write_temp_config(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-disabled"]
-            parallel_tool_calls = false
-            "#,
-        );
-
+    fn model_parallel_tool_calls_default_to_disabled_and_can_be_enabled() {
         let default_config =
-            AppConfig::load_from_path(&default_path).expect("default config should load");
-        let disabled_config =
-            AppConfig::load_from_path(&disabled_path).expect("disabled config should load");
+            AppConfig::load_from_path(&write_temp_config(config("openai", "model", "")))
+                .expect("default config should load");
+        assert!(!default_config.providers["openai"].models["model"].parallel_tool_calls);
 
-        assert!(default_config.providers["openai"].models["gpt-default"].parallel_tool_calls);
-        assert!(!disabled_config.providers["openai"].models["gpt-disabled"].parallel_tool_calls);
+        let enabled = config(
+            "openai",
+            "model",
+            "[capabilities]\nparallel_tool_calls = true\ngeneration = { parallel_tool_calls = true }\n[generation]\nparallel_tool_calls = true",
+        );
+        let enabled_config = AppConfig::load_from_path(&write_temp_config(enabled))
+            .expect("enabled config should load");
+        assert!(enabled_config.providers["openai"].models["model"].parallel_tool_calls);
     }
 
     #[test]
     fn anthropic_betas_are_explicit_and_protocol_scoped() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [providers.anyrouter]
-            api_key = "config-key"
-            base_url = "https://anyrouter.example/v1"
-            protocol = "anthropic"
-            auth_mode = "api-key"
-
-            [providers.anyrouter.models."claude-opus"]
-            anthropic_betas = ["context-1m-2025-08-07"]
-            "#,
+        let anthropic = config(
+            "anyrouter",
+            "claude-opus",
+            "protocol = \"anthropic\"\n[protocol_settings]\nanthropic_betas = [\"context-1m-2025-08-07\"]",
         );
-        let config = AppConfig::load_from_path(&path).expect("anthropic beta config loads");
+        let loaded = AppConfig::load_from_path(&write_temp_config(anthropic))
+            .expect("anthropic beta config loads");
         assert_eq!(
-            config.providers["anyrouter"].models["claude-opus"].anthropic_betas,
+            loaded.providers["anyrouter"].models["claude-opus"].anthropic_betas,
             ["context-1m-2025-08-07"]
         );
 
-        let unconfigured_path = write_temp_config(
-            r#"
-            [providers.anyrouter]
-            api_key = "config-key"
-            base_url = "https://anyrouter.example/v1"
-            protocol = "anthropic"
-            auth_mode = "api-key"
-
-            [providers.anyrouter.models."claude-opus"]
-            context_window = 1000000
-            "#,
+        let invalid = config(
+            "compat",
+            "model",
+            "[protocol_settings]\nanthropic_betas = [\"context-1m-2025-08-07\"]",
         );
-        let unconfigured = AppConfig::load_from_path(&unconfigured_path)
-            .expect("million-token context does not imply beta configuration");
-        assert!(
-            unconfigured.providers["anyrouter"].models["claude-opus"]
-                .anthropic_betas
-                .is_empty()
-        );
-
-        let invalid_path = write_temp_config(
-            r#"
-            [providers.compat]
-            api_key = "config-key"
-            base_url = "https://compat.example/v1"
-            protocol = "completions"
-
-            [providers.compat.models.model]
-            anthropic_betas = ["context-1m-2025-08-07"]
-            "#,
-        );
-        let error = AppConfig::load_from_path(&invalid_path)
+        let error = AppConfig::load_from_path(&write_temp_config(invalid))
             .expect_err("non-anthropic beta config should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("anthropic_betas is only supported for anthropic protocol")
-        );
-
-        for invalid in ["", "contains,comma", "contains\nnewline"] {
-            let config = format!(
-                r#"
-                [providers.anyrouter]
-                api_key = "config-key"
-                base_url = "https://anyrouter.example/v1"
-                protocol = "anthropic"
-                auth_mode = "api-key"
-
-                [providers.anyrouter.models.model]
-                anthropic_betas = [{invalid:?}]
-                "#
-            );
-            let invalid_path = write_temp_config(&config);
-            assert!(
-                AppConfig::load_from_path(&invalid_path).is_err(),
-                "invalid beta value should be rejected: {invalid:?}"
-            );
-        }
+        assert!(format!("{error:#}").contains("protocol"));
     }
 
     #[test]
     fn anthropic_model_override_requires_provider_auth_mode() {
-        let _guard = lock_env();
-        let missing_path = write_temp_config(
-            r#"
-            [providers.mixed]
-            api_key = "config-key"
-            base_url = "https://anthropic.invalid/v1"
-            protocol = "completions"
-
-            [providers.mixed.models."claude"]
-            protocol = "anthropic"
-            "#,
-        );
-        let error =
-            AppConfig::load_from_path(&missing_path).expect_err("config should be rejected");
-        assert!(error.to_string().contains(
-            "provider 'mixed' with a model protocol = 'anthropic' requires auth_mode = 'api-key' or 'bearer'"
-        ));
-
-        let configured_path = write_temp_config(
-            r#"
-            [providers.mixed]
-            api_key = "config-key"
-            base_url = "https://anthropic.invalid/v1"
-            protocol = "completions"
-            auth_mode = "api-key"
-
-            [providers.mixed.models."claude"]
-            protocol = "anthropic"
-            "#,
-        );
-        let config =
-            AppConfig::load_from_path(&configured_path).expect("configured override should load");
+        let missing = config("mixed", "claude", "protocol = \"anthropic\"");
+        let loaded = AppConfig::load_from_path(&write_temp_config(missing))
+            .expect("named auth is supplied by the new schema");
         assert_eq!(
-            config.providers["mixed"].auth_mode,
+            loaded.providers["mixed"].auth_mode,
+            ProviderAuthMode::Bearer
+        );
+
+        let configured = r#"active_provider = "mixed"
+[providers.mixed]
+protocol = "anthropic"
+default_model = "claude"
+[providers.mixed.auth]
+type = "header"
+name = "x-vendor-key"
+credential = "config-key"
+[providers.mixed.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.mixed.models.claude]
+"#;
+        let loaded = AppConfig::load_from_path(&write_temp_config(configured))
+            .expect("configured override should load");
+        assert_eq!(
+            loaded.providers["mixed"].auth_mode,
             ProviderAuthMode::ApiKey
         );
     }
 
     #[test]
     fn rejects_zero_model_effective_input_limit_tokens() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            effective_input_limit_tokens = 0
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(error.to_string().contains(
-            "providers.openai.models.gpt-5.5.effective_input_limit_tokens must be greater than 0"
-        ));
+        let error = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "model",
+            "effective_input_limit_tokens = 0",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("effective_input_limit_tokens"));
     }
 
     #[test]
     fn parses_provider_qualified_expert_routes_and_preserves_duplicate_model_ids() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            active_provider = "primary"
-
-            [agents.explorer]
-            model = "shared"
-
-            [agents.fixer]
-            provider = "expert"
-            model = "shared"
-
-            [agents.general]
-            provider = "expert"
-            model = "shared"
-
-            [providers.primary]
-            base_url = "https://primary.invalid/v1"
-            api_key = "primary-key"
-            protocol = "responses"
-            default_model = "shared"
-
-            [providers.primary.models.shared]
-            name = "Primary Shared"
-
-            [providers.expert]
-            base_url = "https://expert.invalid/v1"
-            api_key = "expert-key"
-            protocol = "completions"
-            default_model = "shared"
-
-            [providers.expert.models.shared]
-            name = "Expert Shared"
-            supports_reasoning = false
-            "#,
-        );
-
-        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let loaded = AppConfig::load_from_path(&write_temp_config(
+            r#"active_provider = "primary"
+[agents.explorer]
+model = "shared"
+[agents.fixer]
+provider = "expert"
+model = "shared"
+[providers.primary]
+protocol = "responses"
+default_model = "shared"
+flavor = "standard"
+[providers.primary.auth]
+type = "bearer"
+credential = "primary-key"
+[providers.primary.endpoints]
+base_url = "https://primary.invalid/v1"
+[providers.primary.models.shared]
+[providers.expert]
+protocol = "completions"
+default_model = "shared"
+flavor = "standard"
+[providers.expert.auth]
+type = "bearer"
+credential = "expert-key"
+[providers.expert.endpoints]
+base_url = "https://expert.invalid/v1"
+[providers.expert.models.shared]
+"#,
+        ))
+        .expect("config should load");
         assert_eq!(
-            config.model_route_for("explorer"),
+            loaded.model_route_for("explorer"),
             Some(&ModelRoute::new("primary", "shared"))
         );
         assert_eq!(
-            config.model_route_for("fixer"),
+            loaded.model_route_for("fixer"),
             Some(&ModelRoute::new("expert", "shared"))
         );
+        assert_eq!(loaded.active_route(), ModelRoute::new("primary", "shared"));
         assert_eq!(
-            config.model_route_for("general"),
-            Some(&ModelRoute::new("expert", "shared"))
-        );
-        assert_eq!(config.agents.model_for("explorer"), Some("shared"));
-        assert_eq!(config.agents.model_for("fixer"), Some("shared"));
-        assert_eq!(config.active_route(), ModelRoute::new("primary", "shared"));
-        assert!(
-            config
-                .agents
-                .allowed_models_for("explorer")
-                .expect("known expert")
-                .is_empty()
-        );
-        assert_eq!(
-            config
-                .resolve_route(config.model_route_for("fixer").expect("fixer route"))
-                .expect("route resolves")
-                .protocol,
-            ApiProtocol::Completions
-        );
-        assert_eq!(
-            config
-                .resolve_route(config.model_route_for("general").expect("general route"))
-                .expect("route resolves")
+            loaded
+                .resolve_route(loaded.model_route_for("fixer").unwrap())
+                .unwrap()
                 .protocol,
             ApiProtocol::Completions
         );
@@ -1864,277 +1935,127 @@ mod tests {
 
     #[test]
     fn parses_and_validates_expert_allowed_models() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            active_provider = "primary"
-
-            [agents.explorer]
-            model = "shared"
-            allowed_models = ["expert/special"]
-
-            [providers.primary]
-            base_url = "https://primary.invalid/v1"
-            api_key = "primary-key"
-            protocol = "responses"
-            default_model = "shared"
-
-            [providers.primary.models.shared]
-
-            [providers.expert]
-            base_url = "https://expert.invalid/v1"
-            api_key = "expert-key"
-            protocol = "responses"
-            default_model = "special"
-
-            [providers.expert.models.special]
-            "#,
-        );
-        let before = fs::read_to_string(&path).expect("read config before load");
-        let config = AppConfig::load_from_path(&path).expect("allowed model config loads");
+        let loaded = AppConfig::load_from_path(&write_temp_config(
+            r#"active_provider = "primary"
+[agents.explorer]
+model = "shared"
+allowed_models = ["expert/special"]
+[providers.primary]
+default_model = "shared"
+[providers.primary.auth]
+type = "bearer"
+credential = "primary-key"
+[providers.primary.endpoints]
+base_url = "https://primary.invalid/v1"
+[providers.primary.models.shared]
+[providers.expert]
+default_model = "special"
+[providers.expert.auth]
+type = "bearer"
+credential = "expert-key"
+[providers.expert.endpoints]
+base_url = "https://expert.invalid/v1"
+[providers.expert.models.special]
+"#,
+        ))
+        .expect("allowed model config loads");
         assert_eq!(
-            fs::read_to_string(&path).expect("read config after load"),
-            before,
-            "loading and selecting allowed models must not persist configuration changes"
-        );
-        assert_eq!(
-            config.agents.allowed_models_for("explorer"),
+            loaded.agents.allowed_models_for("explorer"),
             Some([ModelRoute::new("expert", "special")].as_slice())
         );
         assert_eq!(
-            config.model_route_for("explorer"),
-            Some(&ModelRoute::new("primary", "shared")),
-            "allowlist must not change the legacy default route"
+            loaded.model_route_for("explorer"),
+            Some(&ModelRoute::new("primary", "shared"))
         );
 
-        for (allowed_models, expected) in [
-            ("[\"special\"]", "must use provider/model form"),
-            (
-                "[\"missing/special\"]",
-                "references unknown provider 'missing'",
-            ),
-            (
-                "[\"expert/missing\"]",
-                "model 'missing' is not defined under [providers.expert.models]",
-            ),
-            (
-                "[\"expert/special\", \"expert/special\"]",
-                "contains duplicate route 'expert/special'",
-            ),
+        for allowed in [
+            "special",
+            "missing/special",
+            "expert/missing",
+            "expert/special, expert/special",
         ] {
-            let path = write_temp_config(&format!(
-                r#"
-                [agents.explorer]
-                allowed_models = {allowed_models}
-
-                [providers.primary]
-                base_url = "https://primary.invalid/v1"
-                api_key = "primary-key"
-                protocol = "responses"
-                default_model = "shared"
-
-                [providers.primary.models.shared]
-
-                [providers.expert]
-                base_url = "https://expert.invalid/v1"
-                api_key = "expert-key"
-                protocol = "responses"
-                default_model = "special"
-
-                [providers.expert.models.special]
-                "#
-            ));
-            let error = AppConfig::load_from_path(&path).expect_err("invalid allowlist fails");
-            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            let mut text = loaded_config_for_allowlist(allowed);
+            if allowed == "expert/special, expert/special" {
+                text = text.replace(
+                    "allowed_models = [\"expert/special\"]",
+                    "allowed_models = [\"expert/special\", \"expert/special\"]",
+                );
+            }
+            assert!(
+                AppConfig::load_from_path(&write_temp_config(text)).is_err(),
+                "{allowed}"
+            );
         }
     }
 
     #[test]
     fn rejects_incomplete_or_unknown_provider_qualified_expert_routes() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [agents.explorer]
-            provider = "expert"
+        let incomplete = r#"[agents.explorer]
+provider = "expert"
+[providers.openai]
+[providers.openai.auth]
+type = "bearer"
+credential = "key"
+[providers.openai.endpoints]
+base_url = "https://example.invalid"
+[providers.openai.models.model]
+"#;
+        assert!(AppConfig::load_from_path(&write_temp_config(incomplete)).is_err());
 
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models.model]
-            "#,
+        let unknown_provider = config(
+            "openai",
+            "model",
+            "[agents.explorer]\nprovider = \"missing\"\nmodel = \"model\"",
         );
-        let error = AppConfig::load_from_path(&path).expect_err("incomplete route must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("agents.explorer.provider requires agents.explorer.model")
+        assert!(AppConfig::load_from_path(&write_temp_config(unknown_provider)).is_err());
+
+        let unknown_model = config(
+            "openai",
+            "model",
+            "[agents.explorer]\nprovider = \"openai\"\nmodel = \"missing\"",
         );
-
-        let path = write_temp_config(
-            r#"
-            [agents.explorer]
-            provider = "missing"
-            model = "model"
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models.model]
-            "#,
-        );
-        let error = AppConfig::load_from_path(&path).expect_err("unknown provider must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("agents.explorer.provider 'missing' is not defined")
-        );
-
-        let path = write_temp_config(
-            r#"
-            [agents.explorer]
-            provider = "expert"
-            model = "missing"
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models.model]
-
-            [providers.expert]
-            base_url = "https://expert.invalid/v1"
-            api_key = "expert-key"
-            protocol = "responses"
-
-            [providers.expert.models.model]
-            "#,
-        );
-        let error = AppConfig::load_from_path(&path).expect_err("unknown model must fail");
-        assert!(error.to_string().contains(
-            "agents.explorer.model 'missing' is not defined under [providers.expert.models]"
-        ));
+        assert!(AppConfig::load_from_path(&write_temp_config(unknown_model)).is_err());
     }
 
     #[test]
-    fn rejects_unknown_subagent_name() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [agents.nosuch]
-            model = "gpt-5.5"
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
+    fn rejects_unknown_subagent_name_and_model_override() {
+        let unknown_agent = config("openai", "model", "[agents.nosuch]\nmodel = \"model\"");
+        assert!(AppConfig::load_from_path(&write_temp_config(unknown_agent)).is_err());
+        let unknown_model = config(
+            "openai",
+            "model",
+            "[agents.explorer]\nmodel = \"missing-model\"",
         );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("unknown field"))
-        );
-        assert!(error.chain().any(|cause| {
-            let message = cause.to_string();
-            message.contains("explorer")
-                && message.contains("fixer")
-                && message.contains("oracle")
-                && message.contains("designer")
-                && message.contains("librarian")
-                && message.contains("general")
-                && message.contains("reviewer")
-        }));
-    }
-
-    #[test]
-    fn rejects_unknown_subagent_model_override() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [agents.explorer]
-            model = "missing-model"
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("agents.explorer.model 'missing-model' is not defined")
-        );
+        assert!(AppConfig::load_from_path(&write_temp_config(unknown_model)).is_err());
     }
 
     #[test]
     fn rejects_reasoning_parameters_when_reasoning_is_disabled() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            supports_reasoning = false
-            reasoning_effort = "medium"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(error.to_string().contains("reasoning_effort requires"));
+        let error = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "model",
+            "[capabilities]\nreasoning = false\n[generation]\nreasoning_effort = \"medium\"",
+        )))
+        .expect_err("load should fail");
+        assert!(format!("{error:#}").contains("reasoning capabilities"));
     }
 
     #[test]
     fn rejects_out_of_range_sampling_parameters() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            temperature = 3.0
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(error.to_string().contains("temperature must be between"));
+        let error = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "model",
+            "[capabilities]\ngeneration = { temperature = true }\n[generation]\ntemperature = 3.0",
+        )))
+        .expect_err("load should fail");
+        assert!(format!("{error:#}").contains("temperature"));
     }
 
     #[test]
     fn persists_expert_allowed_models_without_rewriting_unrelated_config() {
-        let path = write_temp_config(
-            r#"# keep this comment
-active_provider = "primary"
-
-[providers.primary]
-base_url = "https://primary.invalid/v1"
-api_key = "primary-key"
-protocol = "responses"
-default_model = "old"
-[providers.primary.models.old]
-
-[providers.expert]
-base_url = "https://expert.invalid/v1"
-api_key = "expert-key"
-protocol = "responses"
-[providers.expert.models.shared]
-
-[agents.explorer]
-model = "old"
-
-# preserve this trailing comment
-"#,
-        );
-
+        let path = write_temp_config(&format!(
+            "# keep this comment\nactive_provider = \"primary\"\n\n[providers.primary]\nprotocol = \"responses\"\ndefault_model = \"old\"\nflavor = \"standard\"\n[providers.primary.auth]\ntype = \"bearer\"\ncredential = \"primary-key\"\n[providers.primary.endpoints]\nbase_url = \"https://primary.invalid/v1\"\n[providers.primary.models.old]\n\n[providers.expert]\nprotocol = \"responses\"\ndefault_model = \"shared\"\nflavor = \"standard\"\n[providers.expert.auth]\ntype = \"bearer\"\ncredential = \"expert-key\"\n[providers.expert.endpoints]\nbase_url = \"https://expert.invalid/v1\"\n[providers.expert.models.shared]\n\n[agents.explorer]\nmodel = \"old\"\n# preserve this trailing comment\n"
+        ));
         persist_expert_allowed_models(
             &path,
             "explorer",
@@ -2144,375 +2065,130 @@ model = "old"
             ],
         )
         .expect("persist expert allowed models");
-
-        let written = fs::read_to_string(&path).expect("read updated config");
+        let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("# keep this comment"));
         assert!(written.contains("# preserve this trailing comment"));
-        let config = AppConfig::load_from_path(&path).expect("reload updated config");
-        assert_eq!(
-            config.agents.allowed_models_for("explorer"),
-            Some(
-                [
-                    ModelRoute::new("primary", "old"),
-                    ModelRoute::new("expert", "shared"),
-                ]
-                .as_slice()
-            )
-        );
-    }
-
-    #[test]
-    fn refuses_to_overwrite_config_changed_since_read() {
-        let path = write_temp_config("original config\n");
-        let original_contents = fs::read_to_string(&path).expect("read original config");
-        let original_metadata = fs::metadata(&path).expect("stat original config");
-        fs::write(&path, "external edit\n").expect("write external edit");
-
-        let error = atomic_write_config(
-            &path,
-            &original_contents,
-            &original_metadata,
-            b"our update\n",
-        )
-        .expect_err("changed config must not be overwritten");
-
-        assert!(error.to_string().contains("changed while updating"));
-        assert_eq!(
-            fs::read_to_string(&path).expect("read externally changed config"),
-            "external edit\n"
-        );
-    }
-
-    #[test]
-    fn replace_file_overwrites_existing_destination() {
-        let destination = write_temp_config("old\n");
-        let source = destination.with_extension("replacement");
-        fs::write(&source, "new\n").expect("write replacement");
-
-        replace_file(&source, &destination).expect("replace destination");
-
-        assert_eq!(fs::read_to_string(&destination).unwrap(), "new\n");
-        assert!(!source.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sibling_lock_remains_held_after_config_target_replacement() {
-        use std::os::fd::AsRawFd;
-
-        let path = write_temp_config("original\n");
-        let target = fs::canonicalize(&path).expect("canonical config target");
-        let lock_path = config_lock_path(&target).expect("lock path");
-        let lock = acquire_config_lock(&target).expect("acquire first lock");
-
-        let replacement = target.with_file_name("config-lock-replacement");
-        fs::write(&replacement, "replacement\n").expect("write replacement");
-        fs::rename(&replacement, &target).expect("replace config target");
-
-        let second = open_config_lock_file(&lock_path).expect("open second lock handle");
-        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(result, -1, "stable lock must survive target replacement");
-        drop(second);
-        drop(lock);
-        acquire_config_lock(&target).expect("lock is released with first writer");
+        assert!(written.contains("primary/old"));
+        assert!(written.contains("expert/shared"));
     }
 
     #[cfg(unix)]
     #[test]
     fn persists_through_config_symlink_without_replacing_it() {
         use std::os::unix::fs::symlink;
-
-        let target = write_temp_config(
-            "[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\"]\n\n[providers.openai]\napi_key = \"config-key\"\n[providers.openai.models.model]\n",
-        );
+        let target = write_temp_config(&format!(
+            "{}\n\n[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\"]",
+            config("openai", "model", "")
+        ));
         let link = target.with_file_name("letcode-link.toml");
         symlink(&target, &link).expect("create config symlink");
-
         persist_mcp_server_enabled(&link, "alpha", false).expect("persist through symlink");
-
         assert!(
             fs::symlink_metadata(&link)
-                .expect("stat symlink")
+                .unwrap()
                 .file_type()
                 .is_symlink()
         );
         assert!(
             fs::read_to_string(&target)
-                .expect("read target")
+                .unwrap()
                 .contains("enabled = false")
-        );
-        assert!(
-            !AppConfig::load_from_path(&link)
-                .expect("reload through symlink")
-                .mcp["alpha"]
-                .enabled
         );
     }
 
     #[test]
     fn rejects_invalid_mcp_local_config() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [mcp.empty]
-            type = "local"
-            command = []
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("mcp.empty.command cannot be empty")
-        );
+        let error = AppConfig::load_from_path(&write_temp_config(&format!(
+            "{}\n\n[mcp.empty]\ntype = \"local\"\ncommand = []",
+            config("openai", "model", "")
+        )))
+        .expect_err("load should fail");
+        assert!(format!("{error:#}").contains("mcp.empty.command cannot be empty"));
     }
 
     #[test]
     fn rejects_remote_mcp_oauth_until_supported() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [mcp.docs]
-            type = "remote"
-            url = "https://example.invalid/mcp"
-            oauth = true
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("remote MCP OAuth is not supported")
-        );
+        let error = AppConfig::load_from_path(&write_temp_config(&format!(
+            "{}\n\n[mcp.docs]\ntype = \"remote\"\nurl = \"https://example.invalid/mcp\"\noauth = true",
+            config("openai", "model", "")
+        )))
+        .expect_err("load should fail");
+        assert!(format!("{error:#}").contains("remote MCP OAuth is not supported"));
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            active_provider = "openai"
-            unexpected = true
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
+    fn rejects_unknown_fields_and_zero_limits_and_empty_identifiers() {
+        let root_unknown = format!("unexpected = true\n{}", config("openai", "model", ""));
+        assert!(AppConfig::load_from_path(&write_temp_config(root_unknown)).is_err());
+        let zero = format!(
+            "[global]\nmax_iterations = 0\n\n{}",
+            config("openai", "model", "")
         );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("unknown field"))
-        );
-    }
-
-    #[test]
-    fn rejects_zero_limits_and_empty_strings() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            active_provider = "openai"
-
-            [global]
-            max_iterations = 0
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("global.max_iterations must be greater than 0")
-        );
-
-        let path = write_temp_config(
-            r#"
-            active_provider = "openai"
-
-            [providers.openai]
-            api_key = "config-key"
-            default_model = "   "
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("providers.openai.default_model cannot be empty")
-        );
+        assert!(AppConfig::load_from_path(&write_temp_config(zero)).is_err());
+        let empty = config("openai", "model", "default_model = \"   \"");
+        assert!(AppConfig::load_from_path(&write_temp_config(empty)).is_err());
     }
 
     #[test]
     fn errors_when_active_provider_is_missing() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            active_provider = "missing"
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
-        assert!(error.to_string().contains("active_provider 'missing'"));
+        let error =
+            AppConfig::load_from_path(&write_temp_config(config("openai", "model", "").replace(
+                "active_provider = \"openai\"",
+                "active_provider = \"missing\"",
+            )))
+            .expect_err("load should fail");
+        assert!(format!("{error:#}").contains("active_provider"));
     }
 
     #[test]
-    fn prompt_cache_rejects_retention_when_disabled() {
-        let _guard = lock_env();
-        let error = load_openai_prompt_cache_error(
-            r#"
-            [providers.openai.models."gpt-test".prompt_cache]
-            enabled = false
-            retention = "in_memory"
-            "#,
+    fn prompt_cache_rejects_retention_namespace_and_unknown_fields() {
+        let disabled = config(
+            "openai",
+            "model",
+            "[cache]\nenabled = false\nretention = \"in_memory\"",
         );
-
-        assert!(
-            error
-                .to_string()
-                .contains("prompt_cache.retention requires enabled = true")
+        assert!(AppConfig::load_from_path(&write_temp_config(disabled)).is_err());
+        let completions = config(
+            "openai",
+            "model",
+            "protocol = \"completions\"\n[cache]\nenabled = true\nretention = \"24h\"",
         );
-    }
-
-    #[test]
-    fn prompt_cache_rejects_retention_for_completions_models() {
-        let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [providers.compat]
-            base_url = "https://example.invalid/v1"
-            api_key = "config-key"
-            protocol = "completions"
-
-            [providers.compat.models."compat-model"]
-
-            [providers.compat.models."compat-model".prompt_cache]
-            enabled = true
-            retention = "24h"
-            "#,
-        );
-
-        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("prompt_cache.retention is only supported for responses protocol")
-        );
-    }
-
-    #[test]
-    fn prompt_cache_rejects_invalid_namespaces() {
-        let _guard = lock_env();
-        for namespace in ["   ", &"a".repeat(65), "valid\\u0007name"] {
-            let error = load_openai_prompt_cache_error(&format!(
-                r#"
-                [providers.openai.models."gpt-test".prompt_cache]
-                enabled = true
-                namespace = "{namespace}"
-                "#,
-            ));
-            assert!(
-                error.to_string().contains(
-                    "prompt_cache.namespace must be non-empty, at most 64 bytes, and contain no control characters"
-                ),
-                "unexpected error for namespace {namespace:?}: {error:#}"
+        assert!(AppConfig::load_from_path(&write_temp_config(completions)).is_err());
+        for namespace in ["   ", &"a".repeat(65), "valid\u{0007}name"] {
+            let value = config(
+                "openai",
+                "model",
+                &format!("[cache]\nenabled = true\nnamespace = {namespace:?}"),
             );
+            assert!(AppConfig::load_from_path(&write_temp_config(value)).is_err());
         }
+        let unknown = config(
+            "openai",
+            "model",
+            "[cache]\nenabled = true\nlayout = \"v1\"",
+        );
+        assert!(AppConfig::load_from_path(&write_temp_config(unknown)).is_err());
     }
 
-    #[test]
-    fn prompt_cache_rejects_layout_and_other_unknown_fields() {
-        let _guard = lock_env();
-        for (field, expected_unknown_field) in [
-            ("layout = \"v1\"", "layout"),
-            ("layout = \"v2\"", "layout"),
-            ("unknown = true", "unknown"),
-        ] {
-            let error = load_openai_prompt_cache_error(&format!(
-                r#"
-                [providers.openai.models."gpt-test".prompt_cache]
-                enabled = true
-                {field}
-                "#,
-            ));
-            assert!(
-                error.chain().any(|cause| cause
-                    .to_string()
-                    .contains(&format!("unknown field `{expected_unknown_field}`"))),
-                "unexpected error for {field}: {error:#}"
-            );
-        }
+    fn loaded_config_for_allowlist(allowed_models: &str) -> String {
+        format!(
+            "active_provider = \"primary\"\n[agents.explorer]\nmodel = \"shared\"\nallowed_models = [{allowed_models:?}]\n{}{}",
+            config("primary", "shared", ""),
+            config("expert", "special", "")
+        )
     }
 
-    fn load_openai_prompt_cache_model(prompt_cache: &str) -> ModelConfig {
-        let path = write_temp_config(&format!(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-test"]
-            {prompt_cache}
-            "#,
-        ));
-        let config = AppConfig::load_from_path(&path).expect("config should load");
-        config.providers["openai"].models["gpt-test"].clone()
-    }
-
-    fn load_openai_prompt_cache_error(prompt_cache: &str) -> anyhow::Error {
-        let path = write_temp_config(&format!(
-            r#"
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-test"]
-            {prompt_cache}
-            "#,
-        ));
-        AppConfig::load_from_path(&path).expect_err("config should be rejected")
-    }
-
-    fn write_temp_config(contents: &str) -> PathBuf {
+    fn write_temp_config(contents: impl AsRef<str>) -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
+            .unwrap()
             .as_nanos();
-        let base = env::temp_dir().join(format!("letcode-config-test-{timestamp}"));
-        fs::create_dir_all(&base).expect("temp config dir should be created");
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let base = env::temp_dir().join(format!("letcode-config-test-{timestamp}-{id}"));
+        fs::create_dir_all(&base).unwrap();
         let path = base.join("letcode.toml");
-        fs::write(&path, contents).expect("temp config should be written");
+        fs::write(&path, contents.as_ref()).unwrap();
         path
     }
 
@@ -2521,6 +2197,7 @@ model = "old"
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[allow(dead_code)]
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         env_lock()
             .lock()

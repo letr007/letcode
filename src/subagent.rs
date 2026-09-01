@@ -20,10 +20,6 @@ use crate::transcript::TranscriptRecorder;
 #[cfg(test)]
 use anyhow::Result;
 #[cfg(test)]
-use async_openai::Client;
-#[cfg(test)]
-use async_openai::config::OpenAIConfig;
-#[cfg(test)]
 use futures_util::FutureExt;
 #[cfg(test)]
 use pool::generate_run_id;
@@ -53,8 +49,6 @@ mod tests {
     use crate::config::ApiProtocol;
     use crate::session::SessionTransportEvent;
     use crate::transcript::{JournalSink, read_records};
-    use async_openai::Client;
-    use async_openai::config::OpenAIConfig;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::Barrier;
@@ -62,8 +56,8 @@ mod tests {
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn test_agent() -> Agent<OpenAIConfig> {
-        Agent::new(Client::with_config(OpenAIConfig::new()), "gpt-test", 2, 4)
+    fn test_agent() -> Agent {
+        Agent::new("gpt-test", 2, 4)
     }
 
     fn temp_sessions_dir() -> PathBuf {
@@ -71,7 +65,7 @@ mod tests {
         std::env::temp_dir().join(format!("{}-{id}", generate_run_id()))
     }
 
-    fn no_event_sender() -> Option<crate::subagent_events::SubagentEventSender<OpenAIConfig>> {
+    fn no_event_sender() -> Option<crate::subagent_events::SubagentEventSender> {
         None
     }
 
@@ -259,7 +253,6 @@ mod tests {
             display_name: None,
             anthropic_thinking: Default::default(),
             anthropic_betas: Vec::new(),
-            cache_control: false,
             protocol,
             context_window: None,
             effective_input_limit_tokens: None,
@@ -432,7 +425,6 @@ mod tests {
                     protocol: ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,
@@ -483,7 +475,6 @@ mod tests {
                     protocol: ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,
@@ -547,7 +538,6 @@ mod tests {
                     protocol: ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: Some(8_192),
                     effective_input_limit_tokens: Some(4_096),
                     max_output_tokens: Some(512),
@@ -906,7 +896,6 @@ mod tests {
                     protocol: ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,
@@ -1485,6 +1474,26 @@ mod tests {
         file: std::fs::File,
     }
 
+    struct MissingDelimiterParentSink {
+        file: std::fs::File,
+    }
+
+    impl JournalSink for MissingDelimiterParentSink {
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let partial_len = bytes.len().saturating_sub(1);
+            self.file.write_all(&bytes[..partial_len])?;
+            Err(io::Error::other("injected missing delimiter failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+
+        fn sync_data(&mut self) -> io::Result<()> {
+            self.file.sync_data()
+        }
+    }
+
     impl JournalSink for PartialFailParentSink {
         fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
             let partial_len = (bytes.len() / 2).max(1);
@@ -1600,6 +1609,71 @@ mod tests {
                 .status,
             SubagentStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn missing_parent_append_delimiter_is_repaired_before_terminal_job_publish() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let sessions_dir = temp_sessions_dir();
+        let parent_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&parent_dir).expect("create parent recorder"),
+        ));
+        let (parent_session_id, parent_path) = {
+            let recorder = parent_recorder.lock().expect("lock parent recorder");
+            (
+                recorder.session_id().to_string(),
+                recorder.path().to_path_buf(),
+            )
+        };
+        let partial_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent_path)
+            .expect("open parent transcript for delimiter failure");
+        parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .replace_sink_for_test(Box::new(MissingDelimiterParentSink { file: partial_file }));
+
+        let error = runtime
+            .run_with_executor(
+                &agent,
+                AgentTemplate::explorer(),
+                "inspect".into(),
+                test_governance(),
+                sessions_dir,
+                parent_session_id,
+                "turn-1".into(),
+                Some(parent_recorder),
+                no_event_sender(),
+                None,
+                |_agent, _task, _transcript, _tx, _child, _name| {
+                    async move { Ok("must not run".into()) }.boxed()
+                },
+            )
+            .await
+            .expect_err("parent start write fails after the complete JSON payload");
+        assert!(error.to_string().contains("missing delimiter failure"));
+
+        let records = read_records(&parent_path).expect("repaired transcript stays valid JSONL");
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            records[0].event,
+            crate::transcript::TranscriptEvent::SubagentStarted { .. }
+        ));
+        assert!(matches!(
+            records[1].event,
+            crate::transcript::TranscriptEvent::SubagentStarted { .. }
+        ));
+        assert!(matches!(
+            records[2].event,
+            crate::transcript::TranscriptEvent::SubagentResult { .. }
+        ));
+        assert!(matches!(
+            records[3].event,
+            crate::transcript::TranscriptEvent::Evidence { .. }
+        ));
     }
 
     #[tokio::test]

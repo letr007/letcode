@@ -35,6 +35,13 @@ pub(crate) fn unfinished_tool_calls_in_active_turn(
     let mut unfinished = Vec::new();
     for record in &records[start_index + 1..] {
         match &record.event {
+            TranscriptEvent::AssistantTurn(turn) => {
+                for call in &turn.calls {
+                    if !unfinished.iter().any(|(id, _)| id == &call.call_id) {
+                        unfinished.push((call.call_id.clone(), call.name.clone()));
+                    }
+                }
+            }
             TranscriptEvent::AssistantToolCallBatch { calls, .. } => {
                 for call in calls {
                     if !unfinished.iter().any(|(id, _)| id == &call.call_id) {
@@ -108,7 +115,7 @@ mod tests {
     use super::*;
     use crate::agent::TurnStartedEvent;
     use crate::request_builder::HistoryToolCall;
-    use crate::transcript::{ROOT_CONTEXT_BRANCH_ID, TranscriptEvent};
+    use crate::transcript::{ROOT_CONTEXT_BRANCH_ID, TranscriptAssistantTurn, TranscriptEvent};
     use serde_json::json;
 
     fn turn_started(turn_id: u64) -> TranscriptEvent {
@@ -152,6 +159,31 @@ mod tests {
         assert_eq!(
             unfinished_tool_calls_in_active_turn(&records),
             vec![("batch-call".into(), "agent__oracle".into())]
+        );
+    }
+
+    #[test]
+    fn v2_assistant_turn_without_started_audit_is_unfinished() {
+        let records = vec![
+            record(1, turn_started(1)),
+            record(
+                2,
+                TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                    text: Some("working".into()),
+                    reasoning_content: Some("inspect".into()),
+                    replay: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "v2-call".into(),
+                        name: "agent__oracle".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            unfinished_tool_calls_in_active_turn(&records),
+            vec![("v2-call".into(), "agent__oracle".into())]
         );
     }
 

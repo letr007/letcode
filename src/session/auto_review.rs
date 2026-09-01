@@ -6,7 +6,6 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use async_openai::config::OpenAIConfig;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -19,7 +18,6 @@ use crate::session::runner::{
 #[cfg(test)]
 use crate::subagent::SubagentStatus;
 use crate::subagent::{SubagentPool, SubagentRunGovernance, SubagentRunSummary};
-use crate::subagent_events::run_child_prompt;
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{TranscriptEvent, TranscriptRecorder, read_records_allow_partial_tail};
 use futures_util::FutureExt;
@@ -74,7 +72,7 @@ impl StickyAutoReviewer {
 
     fn resolve_route(
         &self,
-        parent: &Agent<OpenAIConfig>,
+        parent: &Agent,
         template: &AgentTemplate,
         takeover_child_session_id: Option<&str>,
     ) -> Result<crate::config::ModelRoute> {
@@ -104,11 +102,7 @@ impl StickyAutoReviewer {
         )
     }
 
-    fn route_has_api_key(
-        &self,
-        parent: &Agent<OpenAIConfig>,
-        route: &crate::config::ModelRoute,
-    ) -> Result<bool> {
+    fn route_has_api_key(&self, parent: &Agent, route: &crate::config::ModelRoute) -> Result<bool> {
         self.route_api_key_configured
             .lock()
             .map_err(|_| anyhow!("route credential state poisoned"))
@@ -195,10 +189,10 @@ impl StickyAutoReviewer {
     }
 }
 
-impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
+impl AutoReviewService for StickyAutoReviewer {
     fn review<'a>(
         &'a self,
-        parent: &'a Agent<OpenAIConfig>,
+        parent: &'a Agent,
         request: PermissionRequest,
         user_goal: Option<String>,
     ) -> std::pin::Pin<
@@ -286,20 +280,21 @@ impl AutoReviewService<OpenAIConfig> for StickyAutoReviewer {
                     move |agent,
                           prompt,
                           transcript,
-                          event_sender,
-                          child_session_id,
+                          _event_sender,
+                          _child_session_id,
                           _agent_name| {
                         let full_output = Arc::clone(&full_output_for_executor);
                         async move {
-                            let output = run_child_prompt(
-                                agent,
-                                prompt,
-                                transcript,
-                                event_sender,
-                                child_session_id,
-                                None,
-                            )
-                            .await?;
+                            {
+                                let mut recorder = transcript
+                                    .lock()
+                                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                                recorder.record_user_message(prompt.clone())?;
+                            }
+                            let output = agent
+                                .run_resolved_text_oneshot(&prompt)
+                                .await
+                                .map_err(|error| anyhow!("auto-review failed: {error:#}"))?;
                             *full_output
                                 .lock()
                                 .map_err(|_| anyhow!("auto-review output capture poisoned"))? =
@@ -536,14 +531,12 @@ fn one_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::Client;
 
     fn test_model_config(protocol: crate::config::ApiProtocol) -> crate::config::ModelConfig {
         crate::config::ModelConfig {
             display_name: None,
             anthropic_thinking: Default::default(),
             anthropic_betas: Vec::new(),
-            cache_control: false,
             protocol,
             context_window: None,
             effective_input_limit_tokens: None,
@@ -676,12 +669,7 @@ mod tests {
             )
             .expect("reviewer route factory"),
         );
-        let mut parent = Agent::new(
-            Client::with_config(OpenAIConfig::new()),
-            "parent-model",
-            1,
-            1,
-        );
+        let mut parent = Agent::new("parent-model", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "parent-model"));
         parent.set_subagent_child_factory(factory);
         let reviewer = StickyAutoReviewer::new(
@@ -774,12 +762,7 @@ mod tests {
             )
             .expect("reviewer route factory"),
         );
-        let mut parent = Agent::new(
-            Client::with_config(OpenAIConfig::new()),
-            "parent-model",
-            1,
-            1,
-        );
+        let mut parent = Agent::new("parent-model", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "parent-model"));
         parent.set_subagent_child_factory(factory);
 

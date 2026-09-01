@@ -9,14 +9,13 @@ use tracing::Instrument;
 use super::*;
 use crate::langfuse_trace;
 
-pub(super) async fn execute_tool_call<C, E, A, Efut, Afut>(
-    agent: &mut Agent<C>,
+pub(super) async fn execute_tool_call<E, A, Efut, Afut>(
+    agent: &mut Agent,
     call: &HistoryToolCall,
     on_event: &mut E,
     approve: &mut A,
 ) -> Result<ToolExecutionRecord>
 where
-    C: Config + Clone + Send + Sync + 'static,
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
@@ -44,7 +43,7 @@ where
         };
 
         agent.record_tool_effects(&record);
-        Agent::<C>::emit_audit_event(
+        Agent::emit_audit_event(
             on_event,
             AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(&record)),
             "tool_execution_summary",
@@ -59,13 +58,12 @@ where
     result
 }
 
-pub(super) async fn execute_parallel_tool_call_batch<C, E, Efut>(
-    agent: &mut Agent<C>,
+pub(super) async fn execute_parallel_tool_call_batch<E, Efut>(
+    agent: &mut Agent,
     calls: &[HistoryToolCall],
     on_event: &mut E,
 ) -> Result<Vec<ParallelBatchRecord>>
 where
-    C: Config,
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
@@ -279,13 +277,12 @@ pub(super) async fn cancel_parallel_calls_best_effort<E, Efut>(
     }
 }
 
-pub(super) async fn finalize_parallel_tool_call<C, E, Efut>(
-    agent: &mut Agent<C>,
+pub(super) async fn finalize_parallel_tool_call<E, Efut>(
+    agent: &mut Agent,
     record: &ToolExecutionRecord,
     on_event: &mut E,
 ) -> Result<()>
 where
-    C: Config,
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
@@ -304,7 +301,7 @@ where
     })
     .await?;
     agent.record_tool_effects(record);
-    Agent::<C>::emit_audit_event(
+    Agent::emit_audit_event(
         on_event,
         AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(record)),
         "tool_execution_summary",
@@ -422,14 +419,13 @@ fn finish_subagent_batch_spans_error(preflight: &[(ToolSpanCompletion, SubagentP
 
 /// Preflights a contiguous model-ordered subagent batch, then polls admitted
 /// delegate futures together without retaining mutable Agent or callback borrows.
-pub(super) async fn execute_subagent_tool_call_batch<C, E, A, Efut, Afut>(
-    agent: &mut Agent<C>,
+pub(super) async fn execute_subagent_tool_call_batch<E, A, Efut, Afut>(
+    agent: &mut Agent,
     calls: &[HistoryToolCall],
     on_event: &mut E,
     approve: &mut A,
 ) -> Result<Vec<SubagentBatchRecord>>
 where
-    C: Config + Clone + Send + Sync + 'static,
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
@@ -535,20 +531,19 @@ where
 /// Finalizes one completed subagent record in model order. Callers must record
 /// its history, token projection, evidence, and cancellation before finalizing
 /// the next record.
-pub(super) async fn finalize_subagent_tool_call<C, E, Efut>(
-    agent: &mut Agent<C>,
+pub(super) async fn finalize_subagent_tool_call<E, Efut>(
+    agent: &mut Agent,
     call: &HistoryToolCall,
     record: &ToolExecutionRecord,
     on_event: &mut E,
 ) -> Result<()>
 where
-    C: Config,
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
     emit_finished(on_event, call, record).await?;
     agent.record_tool_effects(record);
-    Agent::<C>::emit_audit_event(
+    Agent::emit_audit_event(
         on_event,
         AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(record)),
         "tool_execution_summary",
@@ -557,13 +552,12 @@ where
     Ok(())
 }
 
-async fn preflight_subagent_tool_call<C, A, Afut>(
-    agent: &mut Agent<C>,
+async fn preflight_subagent_tool_call<A, Afut>(
+    agent: &mut Agent,
     call: &HistoryToolCall,
     approve: &mut A,
 ) -> Result<SubagentPreflight>
 where
-    C: Config + Clone + Send + Sync + 'static,
     A: FnMut(PermissionRequest) -> Afut,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
@@ -716,15 +710,14 @@ where
     Ok(SubagentPreflight::Admitted(args))
 }
 
-async fn execute_with_arguments<C, E, A, Efut, Afut>(
-    agent: &mut Agent<C>,
+async fn execute_with_arguments<E, A, Efut, Afut>(
+    agent: &mut Agent,
     call: &HistoryToolCall,
     args: Value,
     on_event: &mut E,
     approve: &mut A,
 ) -> Result<ToolExecutionRecord>
 where
-    C: Config + Clone + Send + Sync + 'static,
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
@@ -1175,14 +1168,13 @@ fn timed_out_tool_result(tool_name: &str, timeout_secs: u64) -> ToolResult {
     )
 }
 
-async fn invalid_json_record<C, E, Efut>(
-    agent: &Agent<C>,
+async fn invalid_json_record<E, Efut>(
+    agent: &Agent,
     call: &HistoryToolCall,
     err: serde_json::Error,
     on_event: &mut E,
 ) -> Result<ToolExecutionRecord>
 where
-    C: Config,
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {

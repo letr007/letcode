@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::config::ModelRoute;
@@ -154,8 +153,8 @@ pub fn prepare_resume_package(
 /// Does **not** swap the live transcript recorder — callers still own that
 /// under their locking / cleanup rules.
 #[cfg(test)]
-pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
-    agent: &mut Agent<C>,
+pub(crate) fn apply_prepared_resume_to_agent(
+    agent: &mut Agent,
     prepared: &PreparedResume,
 ) -> Result<()> {
     agent.restore_new_session_runtime_snapshot(
@@ -173,15 +172,15 @@ pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
     Ok(())
 }
 
-pub(crate) enum PreparedRestoredRoute<C: Config> {
+pub(crate) enum PreparedRestoredRoute {
     Prepared {
         target_model: String,
-        route: crate::agent::PreparedPrimaryRoute<C>,
+        route: crate::agent::PreparedPrimaryRoute,
     },
     ModelOnly(String),
 }
 
-impl<C: Config> PreparedRestoredRoute<C> {
+impl PreparedRestoredRoute {
     pub(crate) fn target_model(&self) -> &str {
         match self {
             Self::Prepared { target_model, .. } => target_model,
@@ -191,7 +190,7 @@ impl<C: Config> PreparedRestoredRoute<C> {
 
     pub(crate) fn candidate_session_usage_with_composition(
         &self,
-        agent: &Agent<C>,
+        agent: &Agent,
         runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
     ) -> Result<(
         crate::agent::TokenUsageEstimate,
@@ -207,7 +206,7 @@ impl<C: Config> PreparedRestoredRoute<C> {
         }
     }
 
-    pub(crate) fn apply(self, agent: &mut Agent<C>) {
+    pub(crate) fn apply(self, agent: &mut Agent) {
         match self {
             Self::Prepared { route, .. } => agent.apply_prepared_route(route),
             Self::ModelOnly(model) => agent.set_model(model),
@@ -215,13 +214,10 @@ impl<C: Config> PreparedRestoredRoute<C> {
     }
 }
 
-pub(crate) fn prepare_restored_model_route<C>(
-    agent: &Agent<C>,
+pub(crate) fn prepare_restored_model_route(
+    agent: &Agent,
     latest_model: Option<&str>,
-) -> Result<Option<PreparedRestoredRoute<C>>>
-where
-    C: Config + Clone,
-{
+) -> Result<Option<PreparedRestoredRoute>> {
     let Some(model) = latest_model else {
         return Ok(None);
     };
@@ -267,23 +263,23 @@ where
     ))
 }
 
-pub(crate) fn apply_prepared_restored_route<C: Config>(
-    agent: &mut Agent<C>,
-    route: Option<PreparedRestoredRoute<C>>,
+pub(crate) fn apply_prepared_restored_route(
+    agent: &mut Agent,
+    route: Option<PreparedRestoredRoute>,
 ) {
     if let Some(route) = route {
         route.apply(agent);
     }
 }
 
-pub(crate) fn apply_restored_permission_mode<C: Config>(agent: &mut Agent<C>, mode: Option<&str>) {
+pub(crate) fn apply_restored_permission_mode(agent: &mut Agent, mode: Option<&str>) {
     if let Some(mode) = mode.and_then(PermissionMode::parse) {
         agent.set_permission_mode(mode);
     }
 }
 
-pub(crate) fn apply_restored_reasoning_effort<C: Config>(
-    agent: &mut Agent<C>,
+pub(crate) fn apply_restored_reasoning_effort(
+    agent: &mut Agent,
     records: &[TranscriptRecord],
 ) -> Option<String> {
     let model_id = agent.route_display_name();
@@ -300,7 +296,7 @@ pub(crate) fn apply_restored_reasoning_effort<C: Config>(
 
 #[cfg(test)]
 pub(crate) fn apply_restored_model_route(
-    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    agent: &mut Agent,
     latest_model: Option<&str>,
 ) -> Result<()> {
     let route = prepare_restored_model_route(agent, latest_model)?;
@@ -312,8 +308,8 @@ pub(crate) fn apply_restored_model_route(
 ///
 /// Build resume event payloads from `prepared` before this call (recorder is moved).
 #[cfg(test)]
-pub fn install_prepared_resume_for_agent<C: Config>(
-    agent: &mut Agent<C>,
+pub fn install_prepared_resume_for_agent(
+    agent: &mut Agent,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
 ) -> std::result::Result<bool, ResumeInstallError> {
@@ -339,7 +335,7 @@ pub fn install_prepared_resume_for_agent<C: Config>(
 /// live recorder, then clean a prior empty file.
 pub struct PreparedRoutedResumeInstall {
     prepared: PreparedResume,
-    route: Option<PreparedRestoredRoute<async_openai::config::OpenAIConfig>>,
+    route: Option<PreparedRestoredRoute>,
     runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
     token_usage: crate::session::event::TokenUsageEvent,
     prepared_scope: crate::session::context_scope::PreparedContextScope,
@@ -349,7 +345,7 @@ pub struct PreparedRoutedResumeInstall {
 }
 
 pub fn prepare_routed_resume_install(
-    agent: &Agent<async_openai::config::OpenAIConfig>,
+    agent: &Agent,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
 ) -> std::result::Result<PreparedRoutedResumeInstall, ResumeInstallError> {
@@ -414,7 +410,7 @@ impl PreparedRoutedResumeInstall {
 
     pub(crate) fn commit(
         self,
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        agent: &mut Agent,
         live: &Arc<Mutex<TranscriptRecorder>>,
     ) -> (bool, crate::session::event::TokenUsageEvent) {
         let Self {
@@ -448,7 +444,7 @@ impl PreparedRoutedResumeInstall {
 
 #[cfg(test)]
 pub fn install_prepared_routed_resume_for_agent(
-    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    agent: &mut Agent,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
 ) -> std::result::Result<(bool, crate::session::event::TokenUsageEvent), ResumeInstallError> {
@@ -481,13 +477,13 @@ pub fn restored_messages_from_protocol_frames(
                     content: text,
                 })
             }
-            crate::request_builder::HistoryItem::AssistantText { text } => {
-                Some(crate::agent::ConversationMessage {
-                    role: crate::agent::ConversationRole::Assistant,
-                    content: text,
-                })
-            }
-            crate::request_builder::HistoryItem::AssistantToolCalls { text, .. } => {
+            crate::request_builder::HistoryItem::AssistantTurn {
+                text: Some(text), ..
+            } => Some(crate::agent::ConversationMessage {
+                role: crate::agent::ConversationRole::Assistant,
+                content: text,
+            }),
+            crate::request_builder::HistoryItem::AssistantTurn { text, .. } => {
                 text.map(|content| crate::agent::ConversationMessage {
                     role: crate::agent::ConversationRole::Assistant,
                     content,
@@ -502,8 +498,8 @@ pub fn restored_messages_from_protocol_frames(
 ///
 /// Response and cache accounting are not persisted in transcripts, so they must
 /// not cross a session boundary (always zeroed here).
-pub fn restored_session_token_usage<C: Config>(
-    agent: &Agent<C>,
+pub fn restored_session_token_usage(
+    agent: &Agent,
     model_id: &str,
     runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
 ) -> Result<crate::session::event::TokenUsageEvent> {
@@ -542,7 +538,6 @@ fn session_resumed_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::{Client, config::OpenAIConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct RecordingRouteFactory {
@@ -550,22 +545,13 @@ mod tests {
         applied_route: Arc<Mutex<Option<ModelRoute>>>,
     }
 
-    impl crate::agent::PrimaryRouteFactory<OpenAIConfig> for RecordingRouteFactory {
-        fn prepare_route(
-            &self,
-            route: ModelRoute,
-        ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+    impl crate::agent::PrimaryRouteFactory for RecordingRouteFactory {
+        fn prepare_route(&self, route: ModelRoute) -> Result<crate::agent::PreparedPrimaryRoute> {
             if !self.accepted_routes.contains(&route) {
                 anyhow::bail!("route is not configured: {}", route.display_name());
             }
             *self.applied_route.lock().expect("capture route") = Some(route.clone());
-            let client = Client::with_config(
-                OpenAIConfig::new()
-                    .with_api_base("http://127.0.0.1:9/v1")
-                    .with_api_key("test-key"),
-            );
             Ok(crate::agent::PreparedPrimaryRoute::new(
-                client,
                 route,
                 crate::config::ApiProtocol::Responses,
                 std::collections::HashMap::new(),
@@ -585,11 +571,8 @@ mod tests {
         ))
     }
 
-    fn test_agent() -> Agent<OpenAIConfig> {
-        let config = OpenAIConfig::new()
-            .with_api_base("http://127.0.0.1:9/v1")
-            .with_api_key("test-key");
-        Agent::new(Client::with_config(config), "gpt-5.5", 1, 1)
+    fn test_agent() -> Agent {
+        Agent::new("gpt-5.5", 1, 1)
     }
 
     struct SelectiveRouteFactory {
@@ -597,11 +580,8 @@ mod tests {
         attempted_routes: Arc<Mutex<Vec<ModelRoute>>>,
     }
 
-    impl crate::agent::PrimaryRouteFactory<OpenAIConfig> for SelectiveRouteFactory {
-        fn prepare_route(
-            &self,
-            route: ModelRoute,
-        ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+    impl crate::agent::PrimaryRouteFactory for SelectiveRouteFactory {
+        fn prepare_route(&self, route: ModelRoute) -> Result<crate::agent::PreparedPrimaryRoute> {
             self.attempted_routes
                 .lock()
                 .expect("capture attempted route")
@@ -610,11 +590,6 @@ mod tests {
                 anyhow::bail!("route is not configured: {}", route.display_name());
             }
             Ok(crate::agent::PreparedPrimaryRoute::new(
-                Client::with_config(
-                    OpenAIConfig::new()
-                        .with_api_base("http://127.0.0.1:9/v1")
-                        .with_api_key("test-key"),
-                ),
                 route,
                 crate::config::ApiProtocol::Responses,
                 std::collections::HashMap::new(),

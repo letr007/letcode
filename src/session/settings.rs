@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::config::ModelRoute;
@@ -49,8 +48,8 @@ impl std::error::Error for ModelApplyError {
 }
 
 /// Apply a permission mode and record provenance when it changes.
-pub fn apply_permission_mode<C: Config>(
-    agent: &mut Agent<C>,
+pub fn apply_permission_mode(
+    agent: &mut Agent,
     transcript: &Arc<Mutex<TranscriptRecorder>>,
     mode: PermissionMode,
 ) -> Result<()> {
@@ -66,10 +65,10 @@ pub fn apply_permission_mode<C: Config>(
 }
 
 pub(crate) fn apply_model_route_with(
-    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    agent: &mut Agent,
     transcript: &Arc<Mutex<TranscriptRecorder>>,
     route: ModelRoute,
-    prepared_route: crate::agent::PreparedPrimaryRoute<async_openai::config::OpenAIConfig>,
+    prepared_route: crate::agent::PreparedPrimaryRoute,
 ) -> std::result::Result<bool, ModelApplyError> {
     let previous_route = agent.route_display_name();
     let new_route = route.display_name();
@@ -95,14 +94,44 @@ pub(crate) fn apply_model_route_with(
     Ok(fast_mode_auto_disabled)
 }
 
+pub(crate) fn apply_model_route_with_authority(
+    agent: &mut Agent,
+    transcript: &Arc<Mutex<TranscriptRecorder>>,
+    route: ModelRoute,
+    resolved_route: std::sync::Arc<crate::model_runtime::ResolvedModelRoute>,
+    prepared_route: crate::agent::PreparedPrimaryRoute,
+) -> std::result::Result<bool, ModelApplyError> {
+    let previous_route = agent.route_display_name();
+    let new_route = route.display_name();
+    let route_changed = previous_route != new_route;
+    let fast_mode_auto_disabled = agent
+        .auto_disable_fast_mode_for_model(&route.model)
+        .map_err(|error| ModelApplyError::new(error, false))?;
+    if route_changed {
+        transcript
+            .lock()
+            .map_err(|_| {
+                ModelApplyError::new(
+                    anyhow!("transcript recorder poisoned"),
+                    fast_mode_auto_disabled,
+                )
+            })?
+            .record_model_changed(previous_route, new_route)
+            .map_err(|error| ModelApplyError::new(error, fast_mode_auto_disabled))?;
+    }
+    agent.set_model_route_authority(route, resolved_route);
+    agent.apply_prepared_route(prepared_route);
+    Ok(fast_mode_auto_disabled)
+}
+
 /// Persist a primary-route selection before installing it. If the live route
 /// cannot be applied afterwards, restore the previous persisted selection.
 #[cfg(test)]
 pub(crate) fn persist_and_apply_model_route_with(
-    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    agent: &mut Agent,
     transcript: &Arc<Mutex<TranscriptRecorder>>,
     route: ModelRoute,
-    prepared_route: crate::agent::PreparedPrimaryRoute<async_openai::config::OpenAIConfig>,
+    prepared_route: crate::agent::PreparedPrimaryRoute,
     mut persist: impl FnMut(&ModelRoute) -> Result<()>,
 ) -> std::result::Result<bool, ModelApplyError> {
     let previous_route = agent.primary_route().cloned().ok_or_else(|| {
@@ -139,8 +168,8 @@ pub(crate) fn persist_and_apply_model_route_with(
 }
 
 /// Apply reasoning effort and record the session-local selection.
-pub fn apply_reasoning_effort<C: Config>(
-    agent: &mut Agent<C>,
+pub fn apply_reasoning_effort(
+    agent: &mut Agent,
     transcript: &Arc<Mutex<TranscriptRecorder>>,
     effort: ModelReasoningEffort,
 ) -> Result<()> {
@@ -158,7 +187,6 @@ pub fn apply_reasoning_effort<C: Config>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -175,14 +203,11 @@ mod tests {
         (base_dir, Arc::new(Mutex::new(recorder)), session_id)
     }
 
-    fn test_agent() -> Agent<OpenAIConfig> {
-        let config = OpenAIConfig::new()
-            .with_api_base("http://127.0.0.1:9/v1")
-            .with_api_key("test-key");
-        Agent::new(Client::with_config(config), "gpt-5.5", 1, 1)
+    fn test_agent() -> Agent {
+        Agent::new("gpt-5.5", 1, 1)
     }
 
-    fn configured_agent(fast_mode_path: &std::path::Path) -> Agent<OpenAIConfig> {
+    fn configured_agent(fast_mode_path: &std::path::Path) -> Agent {
         std::fs::write(
             fast_mode_path,
             r#"active_provider = "primary"
@@ -202,13 +227,8 @@ protocol = "responses"
         agent
     }
 
-    fn prepared_route(route: ModelRoute) -> crate::agent::PreparedPrimaryRoute<OpenAIConfig> {
+    fn prepared_route(route: ModelRoute) -> crate::agent::PreparedPrimaryRoute {
         crate::agent::PreparedPrimaryRoute::new(
-            Client::with_config(
-                OpenAIConfig::new()
-                    .with_api_base("http://127.0.0.1:9/v1")
-                    .with_api_key("expert-key"),
-            ),
             route,
             crate::config::ApiProtocol::Responses,
             std::collections::HashMap::new(),
@@ -338,11 +358,6 @@ protocol = "responses"
         agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
 
         let prepared_route = crate::agent::PreparedPrimaryRoute::new(
-            Client::with_config(
-                OpenAIConfig::new()
-                    .with_api_base("http://127.0.0.1:9/v1")
-                    .with_api_key("expert-key"),
-            ),
             ModelRoute::new("expert", "claude-4"),
             crate::config::ApiProtocol::Responses,
             std::collections::HashMap::new(),

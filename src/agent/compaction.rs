@@ -32,13 +32,12 @@ struct PreparedLocalCompaction {
     runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
 }
 
-pub(super) async fn compact_session_stream_async<C, E, Efut, S>(
-    agent: &mut Agent<C>,
+pub(super) async fn compact_session_stream_async<E, Efut, S>(
+    agent: &mut Agent,
     mut on_event: E,
     mut on_start: S,
 ) -> Result<ManualCompactionOutcome>
 where
-    C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
     S: FnMut() -> Result<()> + Send,
@@ -61,15 +60,14 @@ where
 /// The caller consumes its ephemeral frontier before entering this fallible
 /// operation; this function therefore never mutates live state before the
 /// durable callback acknowledges the compaction.
-pub(super) fn compact_for_request_pressure<'a, C, E, Efut>(
-    agent: &'a mut Agent<C>,
+pub(super) fn compact_for_request_pressure<'a, E, Efut>(
+    agent: &'a mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &'a [PromptMessage],
     tool_definitions: &'a [crate::request_builder::ToolSpec],
     on_event: &'a mut E,
 ) -> BoxFuture<'a, Result<PreparedRequestBuild>>
 where
-    C: Config + Clone + 'a,
     E: FnMut(AgentEvent) -> Efut + Send + 'a,
     Efut: Future<Output = Result<()>> + Send + 'a,
 {
@@ -88,13 +86,12 @@ where
 }
 
 /// Shared select → summarize → prepare path for pressure and manual compact.
-async fn prepare_compaction<C>(
-    agent: &mut Agent<C>,
+async fn prepare_compaction(
+    agent: &mut Agent,
     trigger: CompactionTrigger,
     on_event: &mut EventCallback<'_>,
 ) -> Result<Result<PreparedCompaction, CompactionNoProgress>>
 where
-    C: Config + Clone,
 {
     if agent.runtime_snapshot_provider.is_some() {
         agent.reload_runtime_snapshot_from_provider()?;
@@ -224,8 +221,8 @@ where
     }))
 }
 
-fn compacted_protocol_frames<C: Config>(
-    agent: &Agent<C>,
+fn compacted_protocol_frames(
+    agent: &Agent,
     candidate_frames: &[crate::protocol_frames::ProtocolFrame],
     cut: &super::history_compact::TurnCut,
 ) -> Result<Vec<crate::protocol_frames::ProtocolFrame>> {
@@ -265,23 +262,19 @@ fn inherit_protocol_identity(
     Ok(())
 }
 
-fn install_prepared_compaction<C: Config + Clone>(
-    agent: &mut Agent<C>,
-    prepared: PreparedLocalCompaction,
-) {
+fn install_prepared_compaction(agent: &mut Agent, prepared: PreparedLocalCompaction) {
     agent.turn.current_turn_start_index = prepared.current_turn_start_index;
     agent.runtime_snapshot = prepared.runtime_snapshot;
     agent.clear_active_epoch();
     agent.clear_provider_usage_anchor();
 }
 
-async fn commit_prepared_compaction<C>(
-    agent: &mut Agent<C>,
+async fn commit_prepared_compaction(
+    agent: &mut Agent,
     prepared: PreparedCompaction,
     on_event: &mut EventCallback<'_>,
 ) -> Result<()>
 where
-    C: Config + Clone,
 {
     on_event(AgentEvent::ContextCompacted(prepared.event)).await?;
     if agent.runtime_snapshot_provider.is_some() {
@@ -295,8 +288,8 @@ where
     Ok(())
 }
 
-fn pressure_successor_request<C: Config + Clone>(
-    agent: &mut Agent<C>,
+fn pressure_successor_request(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     tool_definitions: &[crate::request_builder::ToolSpec],
@@ -318,15 +311,14 @@ fn pressure_successor_request<C: Config + Clone>(
     })
 }
 
-async fn compact_for_request_pressure_with_callback<C>(
-    agent: &mut Agent<C>,
+pub(super) async fn compact_for_request_pressure_with_callback(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     tool_definitions: &[crate::request_builder::ToolSpec],
     on_event: &mut EventCallback<'_>,
 ) -> Result<PreparedRequestBuild>
 where
-    C: Config + Clone,
 {
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
@@ -398,13 +390,12 @@ where
     .await
 }
 
-async fn attempt_compaction<C>(
-    agent: &mut Agent<C>,
+async fn attempt_compaction(
+    agent: &mut Agent,
     trigger: CompactionTrigger,
     on_event: &mut EventCallback<'_>,
 ) -> Result<CompactionAttemptOutcome>
 where
-    C: Config + Clone,
 {
     async {
         let prepared = match prepare_compaction(agent, trigger, on_event).await? {
@@ -433,8 +424,8 @@ fn diagnostic_labels(blockers: &[CompactionBlocker]) -> String {
         .join(",")
 }
 
-pub(super) async fn prepare_request_build<C, E, Efut>(
-    agent: &mut Agent<C>,
+pub(super) async fn prepare_request_build<E, Efut>(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     protected_start_index: usize,
@@ -442,7 +433,6 @@ pub(super) async fn prepare_request_build<C, E, Efut>(
     on_event: &mut E,
 ) -> Result<PreparedRequestBuild>
 where
-    C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
@@ -473,8 +463,8 @@ pub(super) fn is_recognized_request_budget_overflow(error: &anyhow::Error) -> bo
     })
 }
 
-fn fit_compaction_cut_to_summary_budget<C: Config>(
-    agent: &Agent<C>,
+fn fit_compaction_cut_to_summary_budget(
+    agent: &Agent,
     live_history: &[HistoryItem],
     transcript: &crate::protocol_frames::ProtocolTranscript,
     planned: &super::history_compact::TurnCut,
@@ -512,9 +502,13 @@ fn fit_compaction_cut_to_summary_budget<C: Config>(
             split_active_turn,
             &workflow_facts,
         );
-        match super::protocol_stream::preflight_oneshot_text_request(
-            agent.model(),
-            agent.active_protocol(),
+        let Some(route) = agent.resolved_model_route() else {
+            return Err(anyhow::anyhow!(
+                "context compaction preflight requires an installed resolved model route"
+            ));
+        };
+        match super::protocol_stream::preflight_resolved_oneshot_text_request(
+            route,
             agent.active_model_metadata(),
             &prelude,
             &prompt,
@@ -553,15 +547,14 @@ fn fit_compaction_cut_to_summary_budget<C: Config>(
     }))
 }
 
-async fn generate_context_summary<C>(
-    agent: &Agent<C>,
+async fn generate_context_summary(
+    agent: &Agent,
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
     split_active_turn: bool,
     on_event: &mut EventCallback<'_>,
 ) -> Result<String>
 where
-    C: Config + Clone,
 {
     let prompt = render_compaction_prompt_with_workflow_facts(
         previous_summary,
@@ -575,12 +568,12 @@ where
     let emit_tx = delta_tx.clone();
     drop(delta_tx);
     let prelude = [PromptMessage::system(CONTEXT_COMPACTION_PRELUDE)];
-    let summary = super::protocol_stream::stream_oneshot_text_async(
-        &agent.client,
-        agent.model(),
-        agent.active_protocol(),
+    let route = agent.resolved_model_route().ok_or_else(|| {
+        anyhow::anyhow!("context compaction requires an installed resolved model route")
+    })?;
+    let summary = super::protocol_stream::stream_resolved_oneshot_text_async(
+        route,
         agent.active_model_metadata(),
-        &agent.retry_config,
         &prelude,
         &prompt,
         move |delta| {
@@ -611,7 +604,7 @@ where
     Ok(trimmed.to_string())
 }
 
-fn render_protected_workflow_facts<C: Config>(agent: &Agent<C>) -> String {
+fn render_protected_workflow_facts(agent: &Agent) -> String {
     let mut facts = Vec::new();
     let unfinished_todos = agent
         .runtime_snapshot
@@ -653,7 +646,6 @@ fn render_protected_workflow_facts<C: Config>(agent: &Agent<C>) -> String {
     facts.join("\n\n")
 }
 
-#[cfg(test)]
 pub(super) fn render_compaction_prompt(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
@@ -737,8 +729,21 @@ pub(super) fn describe_history_item(item: &HistoryItem) -> String {
         HistoryItem::ContextSummary { text } => format!("摘要: {text}"),
         HistoryItem::UserMessage { content } => format!("用户: {}", content.display_text()),
         HistoryItem::InternalContinuation { text } => format!("继续执行指令: {text}"),
-        HistoryItem::AssistantText { text } => format!("助手: {text}"),
-        HistoryItem::AssistantToolCalls { text, calls, .. } => format!(
+        HistoryItem::AssistantTurn {
+            text,
+            reasoning_content,
+            calls,
+            ..
+        } if calls.is_empty() => {
+            let text = text.as_deref().unwrap_or_default();
+            match reasoning_content {
+                Some(reasoning) if !reasoning.is_empty() => {
+                    format!("助手推理: {reasoning}\n助手: {text}")
+                }
+                _ => format!("助手: {text}"),
+            }
+        }
+        HistoryItem::AssistantTurn { text, calls, .. } => format!(
             "助手工具调用{}: {}",
             text.as_deref()
                 .map(|value| format!("（附言: {value}）"))
@@ -907,23 +912,37 @@ fn truncate_for_compaction(text: &str, max_chars: usize, marker: &str) -> String
 #[cfg(test)]
 mod transaction_tests {
     use super::*;
-    use async_openai::{Client, config::OpenAIConfig};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
 
-    fn test_agent() -> Agent<OpenAIConfig> {
-        Agent::new(
-            Client::with_config(
-                OpenAIConfig::new()
-                    .with_api_base("http://127.0.0.1:1")
-                    .with_api_key("test"),
-            ),
-            "test-model",
-            1,
-            1,
+    fn test_agent() -> Agent {
+        let mut agent = Agent::new("test-model", 1, 1);
+        let route = crate::model_runtime::RuntimeConfig::from_toml(
+            r#"active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "test-model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.test.models."test-model"]
+[providers.test.models."test-model".capabilities]
+generation = { max_output_tokens = true }
+[providers.test.models."test-model".generation]
+max_output_tokens = 128
+"#,
         )
+        .unwrap()
+        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+        .unwrap()
+        .route("test", "test-model")
+        .unwrap()
+        .clone();
+        agent.set_resolved_model_route(Some(Arc::new(route)));
+        agent
     }
 
     fn protocol_frames_with_spans(
@@ -951,7 +970,7 @@ mod transaction_tests {
             .collect()
     }
 
-    fn prepared(agent: &Agent<OpenAIConfig>, history: Vec<HistoryItem>) -> PreparedCompaction {
+    fn prepared(agent: &Agent, history: Vec<HistoryItem>) -> PreparedCompaction {
         let transcript = crate::protocol_frames::analyze_history_items(&history, None)
             .expect("candidate history is valid");
         let mut runtime_snapshot = agent

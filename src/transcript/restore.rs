@@ -142,6 +142,12 @@ pub(crate) fn append_history_item_from_transcript_record(
         TranscriptEvent::UserMessage { content } => {
             Some(HistoryItem::user_content(content.clone()))
         }
+        TranscriptEvent::AssistantTurn(turn) => Some(HistoryItem::AssistantTurn {
+            text: turn.text.clone(),
+            reasoning_content: turn.reasoning_content.clone(),
+            replay: turn.replay.clone(),
+            calls: turn.calls.clone(),
+        }),
         TranscriptEvent::AssistantMessage { content } => {
             Some(HistoryItem::assistant(content.clone()))
         }
@@ -153,20 +159,22 @@ pub(crate) fn append_history_item_from_transcript_record(
             reasoning_content,
             reasoning_wire,
             calls,
-        } => Some(HistoryItem::AssistantToolCalls {
+        } => Some(HistoryItem::AssistantTurn {
             text: text.clone(),
             reasoning_content: reasoning_content.clone(),
-            reasoning_wire: reasoning_wire.clone(),
+            replay: reasoning_wire.as_deref().and_then(
+                crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json,
+            ),
             calls: calls.clone(),
         }),
         TranscriptEvent::ToolCallStarted {
             call_id,
             name,
             args,
-        } => Some(HistoryItem::AssistantToolCalls {
+        } => Some(HistoryItem::AssistantTurn {
             text: None,
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![HistoryToolCall {
                 call_id: call_id.clone(),
                 name: name.clone(),
@@ -276,10 +284,14 @@ pub(crate) fn history_item_to_conversation_message(
             role: ConversationRole::User,
             content: text,
         }),
-        HistoryItem::AssistantText { text } => Some(ConversationMessage {
+        HistoryItem::AssistantTurn {
+            text: Some(text),
+            calls,
+            ..
+        } if calls.is_empty() => Some(ConversationMessage {
             role: ConversationRole::Assistant,
             content: text,
         }),
-        HistoryItem::AssistantToolCalls { .. } | HistoryItem::ToolOutput { .. } => None,
+        HistoryItem::AssistantTurn { .. } | HistoryItem::ToolOutput { .. } => None,
     }
 }

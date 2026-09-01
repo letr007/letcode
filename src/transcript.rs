@@ -38,7 +38,9 @@ mod model;
 mod session_index;
 
 pub(crate) use model::TranscriptFileFingerprint;
-pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
+pub use model::{
+    HistoryNavigationOperation, TranscriptAssistantTurn, TranscriptEvent, TranscriptRecord,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,8 +127,11 @@ mod recorder;
 mod restore;
 
 #[cfg(test)]
+pub use journal::read_records_with_fingerprint;
+#[cfg(test)]
 pub(crate) use journal::{
-    JOURNAL_SCHEMA_VERSION, JournalRecordV1, JournalScope, JournalSink, JournalTransactionCommitV1,
+    JOURNAL_SCHEMA_VERSION, JournalRecordEnvelope, JournalScope, JournalSink,
+    JournalTransactionCommit, LEGACY_JOURNAL_SCHEMA_VERSION,
     content_tail_is_uncommitted_transaction, journal_scope_for, parse_records_content,
     scan_transcript_content, serialize_journal_record, transcript_file_fingerprint,
     transcript_records_match, validate_journal_entries,
@@ -134,7 +139,9 @@ pub(crate) use journal::{
 pub(crate) use journal::{
     ParsedJournalLine, parse_journal_line, repair_partial_tail, transaction_fields,
 };
-pub use journal::{read_records, read_records_allow_partial_tail, read_records_with_fingerprint};
+pub use journal::{
+    read_records, read_records_allow_partial_tail, read_resumable_records_with_fingerprint,
+};
 pub use recorder::TranscriptRecorder;
 #[cfg(test)]
 pub(crate) use recorder::{ActiveContextExperiment, RecorderHealth};
@@ -277,6 +284,12 @@ fn fold_session_summary(acc: &mut SessionSummaryAcc, record: &TranscriptRecord) 
             acc.has_content = true;
             acc.last_user_summary = Some(summarize_text(&content.display_text()));
         }
+        TranscriptEvent::AssistantTurn(turn) => {
+            acc.has_content = true;
+            if let Some(text) = turn.text.as_deref() {
+                acc.last_assistant_summary = Some(summarize_text(text));
+            }
+        }
         TranscriptEvent::AssistantMessage { content } => {
             acc.has_content = true;
             acc.last_assistant_summary = Some(summarize_text(content));
@@ -303,7 +316,7 @@ fn summarize_session_file(path: &Path, session_id: String) -> Result<Option<Sess
 
         match parse_journal_line(&line) {
             Ok(ParsedJournalLine::Record(entry)) => {
-                let transactional = transaction_fields(&entry.v1)?.is_some();
+                let transactional = transaction_fields(&entry.envelope)?.is_some();
                 if transactional {
                     pending.get_or_insert_with(Vec::new).push(entry.record);
                 } else {
@@ -414,6 +427,7 @@ impl TranscriptEvent {
         matches!(
             self,
             Self::UserMessage { .. }
+                | Self::AssistantTurn(_)
                 | Self::AssistantMessage { .. }
                 | Self::ReasoningMessage { .. }
                 | Self::AssistantToolCallBatch { .. }
@@ -431,6 +445,7 @@ impl TranscriptEvent {
         matches!(
             self,
             Self::UserMessage { .. }
+                | Self::AssistantTurn(_)
                 | Self::AssistantMessage { .. }
                 | Self::ReasoningMessage { .. }
                 | Self::ToolCallStarted { .. }

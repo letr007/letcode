@@ -1,5 +1,4 @@
 use super::*;
-use crate::config::ApiProtocol;
 use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
 use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
 use crate::subagent::{StructuredSubagentResult, SubagentPool};
@@ -84,10 +83,10 @@ fn legacy_record(sequence: u64) -> TranscriptRecord {
     }
 }
 
-fn v1_record(sequence: u64) -> JournalRecordV1 {
+fn v1_record(sequence: u64) -> JournalRecordEnvelope {
     let record = legacy_record(sequence);
-    JournalRecordV1 {
-        schema_version: JOURNAL_SCHEMA_VERSION,
+    JournalRecordEnvelope {
+        schema_version: LEGACY_JOURNAL_SCHEMA_VERSION,
         event_id: format!("{}:{sequence}", record.session_id),
         scope: journal_scope_for(&record),
         base_revision: sequence - 1,
@@ -100,13 +99,13 @@ fn v1_record(sequence: u64) -> JournalRecordV1 {
 }
 
 #[test]
-fn journal_v1_round_trips_and_writes_envelope() {
-    let base_dir = journal_test_dir("v1-roundtrip");
+fn journal_v2_round_trips_and_writes_envelope() {
+    let base_dir = journal_test_dir("v2-roundtrip");
     let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
     recorder.record_user_message("hello").unwrap();
     let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
     let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.contains("\"schema_version\":1"));
+    assert!(raw.contains("\"schema_version\":2"));
     assert!(raw.contains("\"scope\":\"global\""));
     assert!(raw.contains("\"base_revision\":0"));
     assert!(raw.contains("\"resulting_revision\":1"));
@@ -148,6 +147,202 @@ fn journal_reader_accepts_legacy_and_legacy_to_v1_records() {
             .collect::<Vec<_>>(),
         [1, 2]
     );
+}
+
+#[test]
+fn empty_transcript_is_not_resumable_or_appendable() {
+    let base_dir = journal_test_dir("empty-not-resumable");
+    fs::create_dir_all(&base_dir).unwrap();
+
+    for (session_id, content) in [("empty", ""), ("whitespace", " \n\t\n")] {
+        let path = base_dir.join(format!("{session_id}.jsonl"));
+        fs::write(&path, content).unwrap();
+
+        let error = read_resumable_records_with_fingerprint(&path)
+            .expect_err("a resumable transcript must contain a v2 journal record");
+        assert!(
+            error
+                .to_string()
+                .contains("resume requires schema version 2")
+        );
+        let error = match TranscriptRecorder::open_existing(&base_dir, session_id) {
+            Ok(_) => panic!("an empty transcript must not accept append"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("resume requires schema version 2")
+        );
+    }
+}
+
+#[test]
+fn partial_tail_repair_open_allows_only_the_empty_recovery_frontier() {
+    let base_dir = journal_test_dir("partial-tail-recovery-open");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("recoverable.jsonl");
+    fs::write(&path, "{\"partial\":").unwrap();
+    repair_partial_tail(&path).expect("repair first partial record to an empty frontier");
+
+    let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "recoverable")
+        .expect("the bounded partial-write recovery path may reopen an empty frontier");
+    recorder
+        .record_session_title("recovered")
+        .expect("write first complete v2 record");
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("\"schema_version\":2"));
+
+    let complete_path = base_dir.join("complete.jsonl");
+    let mut complete = JournalRecordEnvelope {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        ..v1_record(1)
+    };
+    complete.record.session_id = "complete".into();
+    complete.event_id = "complete:1".into();
+    fs::write(&complete_path, serde_json::to_string(&complete).unwrap()).unwrap();
+    repair_partial_tail(&complete_path).expect("restore the missing append delimiter");
+    assert!(fs::read_to_string(&complete_path).unwrap().ends_with('\n'));
+    let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "complete")
+        .expect("reopen the delimiter-repaired transcript");
+    recorder
+        .record_session_title("next")
+        .expect("append a separate v2 record");
+    assert_eq!(read_records(&complete_path).unwrap().len(), 2);
+
+    let v1_path = base_dir.join("legacy.jsonl");
+    fs::write(
+        &v1_path,
+        format!("{}\n", serde_json::to_string(&v1_record(1)).unwrap()),
+    )
+    .unwrap();
+    let error = match TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "legacy") {
+        Ok(_) => panic!("the repair path must not bypass the v1 resume gate"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("resume requires schema version 2")
+    );
+}
+
+#[test]
+fn v1_transcript_is_discoverable_but_not_resumable() {
+    let base_dir = journal_test_dir("v1-discovery-only");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("legacy-session.jsonl");
+    let mut record = v1_record(1);
+    record.record.session_id = "legacy-session".into();
+    record.event_id = "legacy-session:1".into();
+    record.record.event = TranscriptEvent::AssistantMessage {
+        content: "legacy answer".into(),
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(read_records(&path).unwrap().len(), 1);
+    let summaries = list_sessions(&base_dir).expect("legacy session remains discoverable");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].session_id, "legacy-session");
+    assert_eq!(
+        summaries[0].last_assistant_summary.as_deref(),
+        Some("legacy answer")
+    );
+    let error = read_resumable_records_with_fingerprint(&path)
+        .expect_err("v1 transcript must not be resumable");
+    assert!(
+        error
+            .to_string()
+            .contains("resume requires schema version 2")
+    );
+    let error = match TranscriptRecorder::open_existing(&base_dir, "legacy-session") {
+        Ok(_) => panic!("v1 transcript must not accept append"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("resume requires schema version 2")
+    );
+    let error = match crate::session::prepare_resume_package(&base_dir, "legacy-session") {
+        Ok(_) => panic!("v1 transcript must not prepare a resume package"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("resume requires schema version 2")
+    );
+}
+
+#[test]
+fn v2_assistant_turn_round_trips_typed_replay_state() {
+    let base_dir = journal_test_dir("v2-assistant-turn");
+    let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+    let reasoning_wire = serde_json::json!([{
+        "type": "thinking",
+        "thinking": "inspect",
+        "signature": "signed"
+    }])
+    .to_string();
+    recorder
+        .record_assistant_tool_call_batch(
+            Some("working".into()),
+            Some("inspect".into()),
+            Some(reasoning_wire),
+            vec![HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                arguments_json: "{}".into(),
+            }],
+        )
+        .unwrap();
+    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("\"schema_version\":2"));
+    assert!(raw.contains("\"kind\":\"assistant_turn\""));
+    assert!(raw.contains("anthropic.thinking_blocks"));
+    assert!(!raw.contains("assistant_tool_call_batch"));
+    assert!(!raw.contains("reasoning_wire"));
+
+    let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
+    assert!(matches!(
+        &records[0].event,
+        TranscriptEvent::AssistantTurn(turn)
+            if turn.text.as_deref() == Some("working")
+                && turn.reasoning_content.as_deref() == Some("inspect")
+                && turn.calls.len() == 1
+                && turn.replay.as_ref().is_some_and(|state| {
+                    state.namespace == "anthropic.thinking_blocks"
+                        && state.version == 1
+                        && state.producer.protocol_id.as_str() == "anthropic"
+                })
+    ));
+}
+
+#[test]
+fn v2_envelope_rejects_legacy_assistant_payload_for_resume() {
+    let base_dir = journal_test_dir("v2-legacy-assistant-payload");
+    fs::create_dir_all(&base_dir).unwrap();
+    let path = base_dir.join("invalid.jsonl");
+    let mut envelope = v1_record(1);
+    envelope.schema_version = JOURNAL_SCHEMA_VERSION;
+    envelope.record.event = TranscriptEvent::AssistantMessage {
+        content: "legacy payload".into(),
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&envelope).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(read_records(&path).unwrap().len(), 1);
+    let error = read_resumable_records_with_fingerprint(&path)
+        .expect_err("legacy payload under v2 must fail resume");
+    assert!(error.to_string().contains("legacy assistant payload"));
 }
 
 #[test]
@@ -306,6 +501,24 @@ fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() 
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    assert!(lines[..lines.len() - 1].iter().all(|line| {
+        serde_json::from_str::<Value>(line).unwrap()["schema_version"]
+            == Value::from(JOURNAL_SCHEMA_VERSION)
+    }));
+    assert_eq!(
+        serde_json::from_str::<Value>(lines.last().unwrap()).unwrap()["schema_version"],
+        Value::from(JOURNAL_SCHEMA_VERSION)
+    );
+
+    let mut mismatched_schema_lines = lines.clone();
+    let mut mismatched_commit: Value =
+        serde_json::from_str(mismatched_schema_lines.last().unwrap()).unwrap();
+    mismatched_commit["schema_version"] = Value::from(LEGACY_JOURNAL_SCHEMA_VERSION);
+    *mismatched_schema_lines.last_mut().unwrap() =
+        serde_json::to_string(&mismatched_commit).unwrap();
+    fs::write(&path, mismatched_schema_lines.join("\n") + "\n").unwrap();
+    assert!(read_records(&path).is_err());
+
     let mut corrupt_commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
     corrupt_commit["payload_digest"] = Value::String("wrong".into());
     let mut corrupt_lines = lines.clone();
@@ -634,7 +847,7 @@ fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancell
     let history = restore_session_history(&records).expect("restore history");
     assert!(matches!(
         history.first(),
-        Some(HistoryItem::AssistantToolCalls { calls, .. })
+        Some(HistoryItem::AssistantTurn { calls, .. })
             if calls.len() == 1 && calls[0].call_id == "call-1"
     ));
     assert!(matches!(
@@ -1053,7 +1266,7 @@ fn restore_session_history_closes_dangling_user_turn_on_interrupt() {
     let history = restore_session_history(&records).expect("restore history");
     assert!(matches!(
         history.as_slice(),
-        [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
+        [HistoryItem::UserMessage { content }, HistoryItem::AssistantTurn { text: Some(assistant_text), .. }]
             if content.text == "unfinished" && assistant_text.is_empty()
     ));
 
@@ -1297,8 +1510,8 @@ fn context_view_remove_is_append_only_metadata_not_raw_purge() {
     assert_eq!(records.len(), 2);
     assert!(matches!(
         &records[0].event,
-        TranscriptEvent::AssistantMessage { content }
-            if content == "soft note that may be hidden from derived view"
+        TranscriptEvent::AssistantTurn(turn)
+            if turn.text.as_deref() == Some("soft note that may be hidden from derived view")
     ));
     assert!(matches!(
         &records[1].event,
@@ -1329,8 +1542,8 @@ fn context_view_remove_is_append_only_metadata_not_raw_purge() {
     assert_eq!(reopened_records.len(), 3);
     assert!(matches!(
         &reopened_records[0].event,
-        TranscriptEvent::AssistantMessage { content }
-            if content == "soft note that may be hidden from derived view"
+        TranscriptEvent::AssistantTurn(turn)
+            if turn.text.as_deref() == Some("soft note that may be hidden from derived view")
     ));
     assert!(matches!(
         &reopened_records[1].event,
@@ -1869,7 +2082,7 @@ fn recovery_ignores_an_uncommitted_logical_checkpoint_tail_and_keeps_legacy_proj
             content: UserMessageContent::from("legacy request"),
         },
     };
-    let checkpoint = JournalRecordV1 {
+    let checkpoint = JournalRecordEnvelope {
         schema_version: JOURNAL_SCHEMA_VERSION,
         event_id: "s:2".into(),
         scope: JournalScope::Branch,
@@ -2077,21 +2290,17 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
         supports_tools: true,
         ..Default::default()
     };
-    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-        assert!(
-            build_request(RequestBuilderInput {
-                protocol,
-                provider: None,
-                model_id: "gpt-test",
-                model: model.clone(),
-                prelude: &[],
-                snapshot: &live.snapshot,
-                tools: &[]
-            })
-            .is_err(),
-            "{protocol:?} must reject the incomplete batch"
-        );
-    }
+    assert!(
+        build_request(RequestBuilderInput {
+            model_id: "gpt-test",
+            model: model.clone(),
+            prelude: &[],
+            snapshot: &live.snapshot,
+            tools: &[]
+        })
+        .is_err(),
+        "the planner must reject the incomplete batch"
+    );
     assert_eq!(
         serde_json::to_value(&live_records).expect("serialize live records"),
         serde_json::to_value(&prefix).expect("serialize source prefix")
@@ -2124,18 +2333,14 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
             .expect("analyze completed group")
             .has_incomplete_tool_call_groups()
     );
-    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-        build_request(RequestBuilderInput {
-            protocol,
-            provider: None,
-            model_id: "gpt-test",
-            model: model.clone(),
-            prelude: &[],
-            snapshot: &complete.snapshot,
-            tools: &[],
-        })
-        .expect("complete batch builds for both protocols");
-    }
+    build_request(RequestBuilderInput {
+        model_id: "gpt-test",
+        model,
+        prelude: &[],
+        snapshot: &complete.snapshot,
+        tools: &[],
+    })
+    .expect("the planner accepts the complete batch");
 }
 
 #[test]
@@ -2225,7 +2430,7 @@ fn non_checkpoint_tool_finished_does_not_switch_branch() {
     ));
     assert!(matches!(
         records[3].event,
-        TranscriptEvent::AssistantMessage { .. }
+        TranscriptEvent::AssistantTurn(_)
     ));
     assert_eq!(records[3].context_branch_id, None);
     assert_eq!(recorder.current_context_branch_id(), None);
@@ -2544,7 +2749,7 @@ mod compaction_legacy_schema_tests {
         let restored = restore_session_history(&records).expect("modern compaction replays");
         assert!(matches!(
             restored.as_slice(),
-            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantText { text: kept }]
+            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantTurn { text: Some(kept), .. }]
                 if text == "summary" && kept == "kept"
         ));
     }
@@ -2586,7 +2791,7 @@ mod compaction_legacy_schema_tests {
         let restored = restore_session_history(&records).expect("legacy compaction replays");
         assert!(matches!(
             restored.as_slice(),
-            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantText { text: reply }]
+            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantTurn { text: Some(reply), .. }]
                 if text == "legacy summary" && reply == "reply"
         ));
     }

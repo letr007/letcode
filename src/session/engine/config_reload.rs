@@ -1,19 +1,20 @@
 //! Session engine configuration reload support.
 
 use super::*;
+use crate::agent::PrimaryRouteFactory;
 
 pub(crate) fn reload_has_runtime_delta(
-    providers_runtime_unchanged: bool,
+    runtime_fingerprint_unchanged: bool,
     maps_unchanged: bool,
     settings_unchanged: bool,
-    current_provider_runtime_unchanged: bool,
+    current_route_runtime_unchanged: bool,
     catalog_unchanged: bool,
     new_session_default_unchanged: bool,
 ) -> bool {
-    !(providers_runtime_unchanged
+    !(runtime_fingerprint_unchanged
         && maps_unchanged
         && settings_unchanged
-        && current_provider_runtime_unchanged
+        && current_route_runtime_unchanged
         && catalog_unchanged
         && new_session_default_unchanged)
 }
@@ -50,7 +51,7 @@ pub(crate) fn model_catalog_updated_event(config: &AppConfig) -> ModelCatalogUpd
 }
 
 pub(crate) fn apply_config_reload(
-    agent: &mut Agent<async_openai::config::OpenAIConfig>,
+    agent: &mut Agent,
     config_path: &std::path::Path,
     model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
     route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
@@ -62,10 +63,13 @@ pub(crate) fn apply_config_reload(
     global_retry: &mut RetryConfig,
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
     new_session_default_route: &mut ModelRoute,
+    runtime_catalog: &mut crate::model_runtime::ResolvedRuntimeCatalog,
     event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) -> Result<()> {
     let config = AppConfig::load_from_path(config_path)?;
     let catalog_event = model_catalog_updated_event(&config);
+    let next_runtime_catalog = config.runtime_catalog.clone();
+    let next_runtime_fingerprint = next_runtime_catalog.fingerprint().clone();
     let previous_active_route = agent
         .primary_route()
         .cloned()
@@ -73,9 +77,6 @@ pub(crate) fn apply_config_reload(
     let next_new_session_default_route = config.active_route();
     config.resolve_route(&next_new_session_default_route)?;
     let current_route_available = config.resolve_route(&previous_active_route).is_ok();
-    let primary_factory =
-        ConfiguredPrimaryRouteFactory::new(config.providers.clone(), config.global.retry.clone());
-
     let next_model_routes = config
         .providers
         .iter()
@@ -86,7 +87,7 @@ pub(crate) fn apply_config_reload(
             })
         })
         .collect::<indexmap::IndexMap<_, _>>();
-    let next_route_api_key_configured = config
+    let mut next_route_api_key_configured = config
         .providers
         .iter()
         .flat_map(|(provider_name, provider)| {
@@ -96,6 +97,20 @@ pub(crate) fn apply_config_reload(
             })
         })
         .collect::<indexmap::IndexMap<_, _>>();
+    for route in expert_model_routes.values() {
+        if !next_route_api_key_configured.contains_key(&route.display_name()) {
+            let configured = providers
+                .get(&route.provider)
+                .is_some_and(|provider| !provider.api_key.trim().is_empty());
+            next_route_api_key_configured.insert(route.display_name(), configured);
+        }
+    }
+    if !current_route_available {
+        let configured = providers
+            .get(&previous_active_route.provider)
+            .is_some_and(|provider| !provider.api_key.trim().is_empty());
+        next_route_api_key_configured.insert(previous_active_route.display_name(), configured);
+    }
     let next_new_session_default_expert_routes = crate::delegation::supported_agent_names()
         .filter_map(|name| {
             config
@@ -131,7 +146,7 @@ pub(crate) fn apply_config_reload(
             (
                 name.clone(),
                 format!(
-                    "Set providers.{name}.api_key in {} or set {}.",
+                    "Set [providers.{name}.auth].credential in {} or set {} environment variable.",
                     config.config_path.display(),
                     crate::config::provider_api_key_env_var(name)
                 ),
@@ -139,6 +154,42 @@ pub(crate) fn apply_config_reload(
         })
         .collect::<indexmap::IndexMap<_, _>>();
     let mut session_providers = config.providers.clone();
+    if !current_route_available {
+        let provider = providers
+            .get(&previous_active_route.provider)
+            .ok_or_else(|| {
+                anyhow!(
+                    "current route provider '{}' is unavailable during configuration reload",
+                    previous_active_route.provider
+                )
+            })?;
+        if !provider.has_model(&previous_active_route.model) {
+            bail!(
+                "current route '{}' is unavailable during configuration reload",
+                previous_active_route.display_name()
+            );
+        }
+        session_providers
+            .entry(previous_active_route.provider.clone())
+            .or_insert_with(|| provider.clone());
+        if let Some(session_provider) = session_providers.get_mut(&previous_active_route.provider)
+            && !session_provider.has_model(&previous_active_route.model)
+        {
+            let model = provider
+                .models
+                .get(&previous_active_route.model)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "current route '{}' is unavailable during configuration reload",
+                        previous_active_route.display_name()
+                    )
+                })?;
+            session_provider
+                .models
+                .insert(previous_active_route.model.clone(), model);
+        }
+    }
     for route in expert_model_routes.values() {
         if config.resolve_route(route).is_ok() {
             continue;
@@ -170,6 +221,16 @@ pub(crate) fn apply_config_reload(
             session_provider.models.insert(route.model.clone(), model);
         }
     }
+    let primary_factory = ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+        session_providers.clone(),
+        config.global.retry.clone(),
+        config.runtime_catalog.clone(),
+    );
+    let prepared_current_route = if current_route_available {
+        Some(primary_factory.prepare_route(previous_active_route.clone())?)
+    } else {
+        None
+    };
     let expert_factory = crate::subagent::ExpertRouteFactory::new_with_policies(
         crate::delegation::supported_agent_names().map(|name| {
             (
@@ -183,7 +244,8 @@ pub(crate) fn apply_config_reload(
         }),
         &session_providers,
         &config.global.retry,
-    )?;
+    )?
+    .with_runtime_catalog(config.runtime_catalog.clone());
     let next_global_retry = config.global.retry.clone();
     let current_provider = current_route_available
         .then(|| config.providers.get(&previous_active_route.provider))
@@ -203,7 +265,7 @@ pub(crate) fn apply_config_reload(
         .map(|(name, mode)| (name.clone(), *mode))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let providers_runtime_unchanged = providers_runtime_eq(providers, &session_providers);
+    let runtime_fingerprint_unchanged = runtime_catalog.fingerprint() == &next_runtime_fingerprint;
     let maps_unchanged = *model_routes == next_model_routes
         && *route_api_key_configured == next_route_api_key_configured
         && *new_session_default_expert_routes == next_new_session_default_expert_routes
@@ -215,14 +277,11 @@ pub(crate) fn apply_config_reload(
         && agent.tool_timeout_secs() == config.global.tool_timeout_secs
         && agent.retry_config() == &next_agent_retry
         && agent.tool_parallelism_overrides() == &next_parallelism;
-    let previous_provider = providers.get(&previous_active_route.provider);
-    let current_provider_runtime_unchanged = current_provider.is_none_or(|provider| {
-        previous_provider.is_some_and(|previous| {
-            previous.api_key == provider.api_key
-                && previous.base_url == provider.base_url
-                && previous.protocol == provider.protocol
-        })
-    });
+    let current_route_runtime_unchanged = route_runtime_fingerprint_eq(
+        runtime_catalog.fingerprint(),
+        &next_runtime_fingerprint,
+        &previous_active_route,
+    );
     let next_model_protocols = current_provider.map(|provider| {
         provider
             .models
@@ -252,17 +311,21 @@ pub(crate) fn apply_config_reload(
     let new_session_default_unchanged =
         *new_session_default_route == next_new_session_default_route;
     if !reload_has_runtime_delta(
-        providers_runtime_unchanged,
+        runtime_fingerprint_unchanged,
         maps_unchanged,
         settings_unchanged,
-        current_provider_runtime_unchanged,
+        current_route_runtime_unchanged,
         catalog_unchanged,
         new_session_default_unchanged,
     ) {
+        if agent.resolved_runtime_catalog().is_none() {
+            agent.set_resolved_runtime_catalog(Some(runtime_catalog.clone()));
+        }
         return Ok(());
     }
 
-    // Fallible mutator first; remaining updates below are infallible.
+    // Intentionally perform the only remaining fallible mutation first; all later
+    // agent mutations are infallible for these already validated inputs.
     agent.set_tool_parallelism(next_parallelism)?;
     if agent.compaction_config() != &config.global.compaction {
         agent.set_compaction_config(config.global.compaction.clone());
@@ -275,9 +338,10 @@ pub(crate) fn apply_config_reload(
     }
     agent.set_primary_route_factory(Arc::new(primary_factory));
     agent.set_subagent_child_factory(Arc::new(expert_factory));
-    if current_route_available && (!current_provider_runtime_unchanged || !catalog_unchanged) {
-        let prepared = agent.prepare_primary_route(previous_active_route.clone())?;
-        prepared.into_install().apply(agent);
+    if current_route_available && (!current_route_runtime_unchanged || !catalog_unchanged) {
+        if let Some(prepared) = prepared_current_route {
+            prepared.into_install().apply(agent);
+        }
         if agent
             .fake_client()
             .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
@@ -303,6 +367,14 @@ pub(crate) fn apply_config_reload(
             .is_some_and(|provider| !provider.api_key.trim().is_empty());
         route_api_key_configured
             .entry(route.display_name())
+            .or_insert(retained_credential);
+    }
+    if !current_route_available {
+        let retained_credential = providers
+            .get(&previous_active_route.provider)
+            .is_some_and(|provider| !provider.api_key.trim().is_empty());
+        route_api_key_configured
+            .entry(previous_active_route.display_name())
             .or_insert(retained_credential);
     }
     *new_session_default_expert_routes = next_new_session_default_expert_routes;
@@ -331,6 +403,8 @@ pub(crate) fn apply_config_reload(
     *providers = session_providers;
     *global_retry = next_global_retry;
     *new_session_default_route = next_new_session_default_route;
+    agent.set_resolved_runtime_catalog(Some(next_runtime_catalog.clone()));
+    *runtime_catalog = next_runtime_catalog;
     let _ = event_tx.send(SessionTransportEvent::ModelCatalogUpdated(catalog_event));
     for (agent_name, model_ids) in changed_expert_allowed_models {
         let _ = event_tx.send(SessionTransportEvent::ExpertAllowedModelsChanged {
@@ -341,24 +415,30 @@ pub(crate) fn apply_config_reload(
     Ok(())
 }
 
-/// Compare reloadable provider fields, ignoring `default_model` which is often
-/// rewritten by in-session model switches that already updated the live agent.
-fn providers_runtime_eq(
-    left: &indexmap::IndexMap<String, ProviderConfig>,
-    right: &indexmap::IndexMap<String, ProviderConfig>,
+pub(crate) fn route_runtime_fingerprint_eq(
+    left: &crate::model_runtime::RuntimeFingerprint,
+    right: &crate::model_runtime::RuntimeFingerprint,
+    route: &ModelRoute,
 ) -> bool {
-    if left.len() != right.len() {
-        return false;
+    let left_provider = left.providers.get(&route.provider);
+    let right_provider = right.providers.get(&route.provider);
+    if left_provider.is_none() && right_provider.is_none() {
+        return true;
     }
-    left.iter().all(|(name, left_provider)| {
-        right.get(name).is_some_and(|right_provider| {
-            left_provider.base_url == right_provider.base_url
-                && left_provider.api_key == right_provider.api_key
-                && left_provider.protocol == right_provider.protocol
-                && left_provider.retry == right_provider.retry
-                && left_provider.models == right_provider.models
-        })
-    })
+    let (Some(left_provider), Some(right_provider)) = (left_provider, right_provider) else {
+        return false;
+    };
+    left_provider.flavor == right_provider.flavor
+        && left_provider.auth_mode == right_provider.auth_mode
+        && left_provider.auth_name == right_provider.auth_name
+        && left_provider.credential_fingerprint == right_provider.credential_fingerprint
+        && left_provider.retry == right_provider.retry
+        && left_provider.endpoint == right_provider.endpoint
+        && left_provider.headers == right_provider.headers
+        && left_provider.query == right_provider.query
+        && left_provider.connect_timeout_secs == right_provider.connect_timeout_secs
+        && left_provider.no_proxy_loopback == right_provider.no_proxy_loopback
+        && left_provider.models.get(&route.model) == right_provider.models.get(&route.model)
 }
 
 pub(crate) fn create_config_watcher(
@@ -416,7 +496,7 @@ pub(crate) fn route_api_key_hint(
 }
 
 pub(crate) fn active_route_has_api_key(
-    agent: &Agent<async_openai::config::OpenAIConfig>,
+    agent: &Agent,
     route_api_key_configured: &indexmap::IndexMap<String, bool>,
 ) -> bool {
     route_api_key_configured
@@ -505,7 +585,6 @@ mod expert_route_switch_tests {
                             protocol: crate::config::ApiProtocol::Completions,
                             anthropic_thinking: Default::default(),
                             anthropic_betas: Vec::new(),
-                            cache_control: false,
                             context_window: None,
                             effective_input_limit_tokens: None,
                             max_output_tokens: None,

@@ -609,17 +609,14 @@ fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, St
             format!("internal-continuation:{text}"),
             text.clone(),
         )),
-        HistoryItem::AssistantText { text } => Some((
-            RuntimeFrameKind::Assistant,
-            format!("assistant:{text}"),
-            text.clone(),
-        )),
-        HistoryItem::AssistantToolCalls { text, calls, .. } => {
-            let stable_key = calls
-                .iter()
-                .map(|call| format!("{}:{}:{}", call.call_id, call.name, call.arguments_json))
-                .collect::<Vec<_>>()
-                .join("|");
+        HistoryItem::AssistantTurn {
+            text,
+            reasoning_content,
+            replay,
+            calls,
+        } => {
+            let identity = serde_json::to_string(&(text, reasoning_content, replay, calls))
+                .unwrap_or_default();
             let summary = text.clone().unwrap_or_else(|| {
                 calls
                     .iter()
@@ -627,7 +624,15 @@ fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, St
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-            Some((RuntimeFrameKind::ToolCall, stable_key, summary))
+            Some((
+                if calls.is_empty() {
+                    RuntimeFrameKind::Assistant
+                } else {
+                    RuntimeFrameKind::ToolCall
+                },
+                format!("assistant:{identity}"),
+                summary,
+            ))
         }
         HistoryItem::ToolOutput {
             call_id,

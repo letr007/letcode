@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use async_openai::config::Config;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::agent_event_journal::persist_agent_event;
@@ -13,9 +12,9 @@ use crate::transcript::{TranscriptRecorder, read_records_allow_partial_tail};
 type SubagentPromptFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 type EmitFn = Arc<dyn Fn(String) -> Result<()> + Send + Sync>;
 const HEADLESS_CHILD_PERMISSION_DENIED_REASON: &str = "Denied in headless child execution";
-type PromptFn<C> = Arc<
+type PromptFn = Arc<
     dyn Fn(
-            Agent<C>,
+            Agent,
             String,
             Arc<Mutex<TranscriptRecorder>>,
             String,
@@ -27,15 +26,15 @@ type PromptFn<C> = Arc<
 >;
 
 #[derive(Clone)]
-pub struct SubagentEventSender<C: Config> {
+pub struct SubagentEventSender {
     emit_status: EmitFn,
     emit_error: EmitFn,
-    run_prompt: PromptFn<C>,
+    run_prompt: PromptFn,
     parent_tool_call_id: Option<String>,
 }
 
-impl<C: Config> SubagentEventSender<C> {
-    pub fn new(emit_status: EmitFn, emit_error: EmitFn, run_prompt: PromptFn<C>) -> Self {
+impl SubagentEventSender {
+    pub fn new(emit_status: EmitFn, emit_error: EmitFn, run_prompt: PromptFn) -> Self {
         Self {
             emit_status,
             emit_error,
@@ -59,7 +58,7 @@ impl<C: Config> SubagentEventSender<C> {
 
     pub async fn run_child_prompt(
         &self,
-        agent: Agent<C>,
+        agent: Agent,
         prompt: String,
         transcript: Arc<Mutex<TranscriptRecorder>>,
         child_session_id: String,
@@ -77,17 +76,14 @@ impl<C: Config> SubagentEventSender<C> {
     }
 }
 
-pub async fn run_child_prompt<C>(
-    mut agent: Agent<C>,
+pub async fn run_child_prompt(
+    mut agent: Agent,
     prompt: String,
     transcript: Arc<Mutex<TranscriptRecorder>>,
-    sender: Option<SubagentEventSender<C>>,
+    sender: Option<SubagentEventSender>,
     child_session_id: String,
     permission_origin: Option<String>,
-) -> Result<String>
-where
-    C: Config + Clone + Send + Sync + 'static,
-{
+) -> Result<String> {
     if let Some(sender) = sender {
         return sender
             .run_child_prompt(
@@ -209,13 +205,13 @@ where
     }
 }
 
-pub fn emit_status<C: Config>(sender: &Option<SubagentEventSender<C>>, message: String) {
+pub fn emit_status(sender: &Option<SubagentEventSender>, message: String) {
     if let Some(sender) = sender {
         let _ = sender.emit_status(message);
     }
 }
 
-pub fn emit_error<C: Config>(sender: &Option<SubagentEventSender<C>>, message: String) {
+pub fn emit_error(sender: &Option<SubagentEventSender>, message: String) {
     if let Some(sender) = sender {
         let _ = sender.emit_error(message);
     }

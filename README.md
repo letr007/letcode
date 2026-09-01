@@ -142,45 +142,79 @@ mode = "default" # solo remains accepted as a yolo alias
 
 # Required: configure at least one provider with at least one model.
 [providers.openai]
-# Optional; OPENAI_API_KEY may be used instead.
-api_key = "YOUR_API_KEY"
-# Optional for the OpenAI provider; defaults to https://api.openai.com/v1.
-base_url = "https://api.openai.com/v1"
-# Optional for the OpenAI provider, where it defaults to responses; required for other providers.
-protocol = "responses" # responses | completions
-# Optional; defaults to the first model configured for this provider.
+protocol = "responses" # responses | completions | anthropic
+flavor = "standard" # standard | deepseek
+# Required; must reference a model configured for this provider.
 default_model = "gpt-5.5"
+
+[providers.openai.auth]
+type = "bearer" # bearer | header | query | none
+credential_env = "OPENAI_API_KEY"
+# credential = "YOUR_API_KEY" # use this instead of credential_env when appropriate
+
+[providers.openai.endpoints]
+base_url = "https://api.openai.com/v1"
+[providers.openai.endpoints.responses]
+path = "responses"
 
 # Required: each provider needs at least one model; every field inside the model is optional.
 [providers.openai.models."gpt-5.5"]
-display_name = "GPT-5.5"
+display = "GPT-5.5"
 # protocol = "completions" # overrides the provider protocol
+# flavor = "standard" # overrides the provider flavor; deepseek selects the explicit DeepSeek profile
 # context_window = 400000
 # effective_input_limit_tokens = 256000
-# max_output_tokens = 128000
-supports_tools = true # default: true
-parallel_tool_calls = true # default: true
-supports_reasoning = true # default: true
+
+# Capability flags default to false when omitted.
+[providers.openai.models."gpt-5.5".capabilities]
+tools = true
+parallel_tool_calls = true
+reasoning = true
+input_images = false
+tool_result_images = false
+prompt_cache = false
+priority_service = false
+[providers.openai.models."gpt-5.5".capabilities.generation]
+temperature = true
+top_p = true
+max_output_tokens = true
+reasoning = true
+reasoning_summary = true
+text_verbosity = true
+parallel_tool_calls = true
+
+[providers.openai.models."gpt-5.5".generation]
+temperature = 0.2
+top_p = 1.0
+max_output_tokens = 128000
 reasoning_effort = "medium"
 # Optional; restricts selectable reasoning levels and the TUI cycle order.
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto" # auto | concise | detailed
 text_verbosity = "medium" # low | medium | high
-# temperature = 0.2
-# top_p = 1.0
+parallel_tool_calls = true
 
-# Optional model-level prompt cache.
-# [providers.openai.models."gpt-5.5".prompt_cache]
-# enabled = true
-# retention = "in_memory" # in_memory | 24h
+[providers.openai.models."gpt-5.5".cache]
+enabled = false
+# retention = "in_memory" # in_memory | 24h; set when cache is enabled
 # namespace = "openai"
+
+# Adapter-specific settings are validated by the selected protocol binding.
+# Anthropic routes may set, for example:
+# anthropic_thinking = { mode = "adaptive" }
+# anthropic_betas = ["context-1m-2025-08-07"]
+[providers.openai.models."gpt-5.5".protocol_settings]
 ```
 
-Provider API keys and base URLs can also come from environment variables named from the provider, for example `OPENAI_API_KEY` / `OPENAI_BASE_URL`; for a provider named `compat`, use `COMPAT_API_KEY` / `COMPAT_BASE_URL`.
+Provider credentials can use `credential_env` or the default environment variable named from the provider, for example `OPENAI_API_KEY`; endpoint URLs and protocol-specific paths are configured under `endpoints`.
 
 Relative `sessions_dir` and `log_file` paths are resolved relative to the config file directory.
 
 Optional Langfuse/OpenTelemetry tracing is off by default. Enable it with `LETCODE_LANGFUSE_ENABLED=true`, and set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optional `LANGFUSE_HOST` (or the same variables in a local `.env`). Missing credentials leave tracing disabled without stopping the agent.
+
+## Model runtime architecture
+
+Configuration is resolved through an immutable `ProtocolRegistry` and `ResolvedRuntimeCatalog` into a `ResolvedModelRoute`. Each request is represented as a protocol-neutral `PromptPlan`. A route-bound `ProtocolBinding` owns wire encoding, cache behavior, and incremental response decoding, while all bindings share the incremental `reqwest` transport and `ModelRuntime`.
 
 ## Changelog
 

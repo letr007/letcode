@@ -1,26 +1,18 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use async_openai::Client;
-use async_openai::config::Config;
-use async_openai::error::OpenAIError;
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, CompletionUsage,
-    FinishReason,
-};
-use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent, ResponseUsage};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{Instrument, debug, error, info, trace, warn};
+use tracing::{Instrument, debug, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, ModelRoute, ProviderConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
+use crate::model_runtime::{ResolvedModelRoute, ResolvedRuntimeCatalog};
 #[cfg(test)]
 use crate::permission::ToolScope;
 use crate::permission::{
@@ -28,15 +20,10 @@ use crate::permission::{
     PermissionSessionState, restricted_by_directive_with_class,
 };
 use crate::request_builder::{
-    BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
-    PromptMessage, PromptMessageOrigin, ProtectedContextPolicy, ProviderRequestStrategy,
-    RequestBuilderInput, SelectedPromptRequestInput, build_request_from_selected_prompt,
-    build_request_with_policy, effective_input_budget_tokens, observe_logical_request,
-};
-use crate::retry::{
-    can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, should_retry_http_status,
-    should_retry_openai_stream_creation, should_retry_openai_stream_read,
-    should_retry_reqwest_error,
+    HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata, PromptMessage,
+    PromptMessageOrigin, ProtectedContextPolicy, RequestBuilderInput, SelectedPromptRequestInput,
+    build_request_from_selected_prompt, build_request_with_policy, effective_input_budget_tokens,
+    observe_logical_request,
 };
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
@@ -56,7 +43,6 @@ use crate::tool_format::format_tool_call;
 use crate::tool_names;
 use crate::transcript::{ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
-use async_openai::config::OpenAIConfig;
 use indexmap::IndexMap;
 
 #[path = "agent/auto_review.rs"]
@@ -99,12 +85,6 @@ pub(crate) use events::{CompactionCheckpoint, CompactionFileOperations};
 
 #[cfg(test)]
 use compaction::{default_preserve_recent_budget, render_compaction_prompt};
-#[cfg(test)]
-use protocol_stream::{
-    CompatibleChatCompletionStreamResponse, CompatibleChatCompletionStreamResponseDelta,
-    append_sse_chunk, drain_sse_data_events, is_ignorable_response_lifecycle_event,
-    project_response_stream_event, send_compatible_chat_completion_stream,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExecutionStatus {
@@ -212,7 +192,6 @@ pub(super) enum ActiveEpochPreparation {
 pub(super) struct ActiveEpochPreview {
     epoch: ActiveEpoch,
     build: crate::request_builder::BuildResult,
-    #[cfg(test)]
     transition: ActiveEpochTransition,
 }
 
@@ -321,10 +300,10 @@ impl LogicalRequestObservationTracker {
     }
 }
 
-pub trait SubagentChildFactory<C: Config>: Send + Sync {
+pub trait SubagentChildFactory: Send + Sync {
     fn resolve_route(
         &self,
-        parent: &Agent<C>,
+        parent: &Agent,
         template: &AgentTemplate,
         requested_route: Option<&ModelRoute>,
         takeover: bool,
@@ -332,15 +311,15 @@ pub trait SubagentChildFactory<C: Config>: Send + Sync {
 
     fn create_child(
         &self,
-        parent: &Agent<C>,
+        parent: &Agent,
         template: &AgentTemplate,
         route: &ModelRoute,
         max_tool_calls_override: Option<usize>,
-    ) -> Result<Agent<C>>;
+    ) -> Result<Agent>;
 }
 
-pub trait PrimaryRouteFactory<C: Config>: Send + Sync {
-    fn prepare_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute<C>>;
+pub trait PrimaryRouteFactory: Send + Sync {
+    fn prepare_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute>;
 }
 
 /// Provider-catalog factory used at startup and after configuration reload.
@@ -350,22 +329,34 @@ pub trait PrimaryRouteFactory<C: Config>: Send + Sync {
 pub struct ConfiguredPrimaryRouteFactory {
     providers: IndexMap<String, ProviderConfig>,
     global_retry: RetryConfig,
+    runtime_catalog: Option<ResolvedRuntimeCatalog>,
 }
 
 impl ConfiguredPrimaryRouteFactory {
+    #[allow(dead_code)]
     pub fn new(providers: IndexMap<String, ProviderConfig>, global_retry: RetryConfig) -> Self {
         Self {
             providers,
             global_retry,
+            runtime_catalog: None,
+        }
+    }
+
+    pub fn new_with_runtime_catalog(
+        providers: IndexMap<String, ProviderConfig>,
+        global_retry: RetryConfig,
+        runtime_catalog: ResolvedRuntimeCatalog,
+    ) -> Self {
+        Self {
+            providers,
+            global_retry,
+            runtime_catalog: Some(runtime_catalog),
         }
     }
 }
 
-impl PrimaryRouteFactory<async_openai::config::OpenAIConfig> for ConfiguredPrimaryRouteFactory {
-    fn prepare_route(
-        &self,
-        route: ModelRoute,
-    ) -> Result<PreparedPrimaryRoute<async_openai::config::OpenAIConfig>> {
+impl PrimaryRouteFactory for ConfiguredPrimaryRouteFactory {
+    fn prepare_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute> {
         let provider = self.providers.get(&route.provider).ok_or_else(|| {
             anyhow!(
                 "provider '{}' is not defined under [providers]",
@@ -379,8 +370,13 @@ impl PrimaryRouteFactory<async_openai::config::OpenAIConfig> for ConfiguredPrima
                 route.provider
             );
         }
-        Ok(PreparedPrimaryRoute::new(
-            route.clone().build_client(provider),
+        let runtime_route = self
+            .runtime_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.route(&route.provider, &route.model))
+            .cloned()
+            .map(Arc::new);
+        let prepared = PreparedPrimaryRoute::new_with_runtime_route(
             route.clone(),
             provider.protocol,
             provider
@@ -397,26 +393,38 @@ impl PrimaryRouteFactory<async_openai::config::OpenAIConfig> for ConfiguredPrima
                 .retry
                 .clone()
                 .unwrap_or_else(|| self.global_retry.clone()),
-        ))
+            runtime_route,
+        );
+        Ok(match self.runtime_catalog.clone() {
+            Some(catalog) => prepared.with_runtime_catalog(catalog),
+            None => prepared,
+        })
     }
 }
 
-pub struct PreparedPrimaryRoute<C: Config> {
-    client: Client<C>,
+pub struct PreparedPrimaryRoute {
     route: ModelRoute,
     default_protocol: ApiProtocol,
     model_protocols: HashMap<String, ApiProtocol>,
     model_catalog: HashMap<String, ModelRequestMetadata>,
     retry_config: RetryConfig,
+    runtime_route: Option<Arc<ResolvedModelRoute>>,
+    runtime_catalog: Option<ResolvedRuntimeCatalog>,
 }
 
-pub(crate) struct PreparedPrimaryRouteInstall<C: Config> {
-    route: PreparedPrimaryRoute<C>,
+pub(crate) struct PreparedPrimaryRouteInstall {
+    route: PreparedPrimaryRoute,
 }
 
-impl<C: Config> PreparedPrimaryRoute<C> {
+#[derive(Clone)]
+struct RetainedRoutePreparation {
+    runtime_route: Arc<ResolvedModelRoute>,
+    route_factory: Arc<dyn PrimaryRouteFactory>,
+}
+
+impl PreparedPrimaryRoute {
+    #[allow(dead_code)]
     pub fn new(
-        client: Client<C>,
         route: ModelRoute,
         default_protocol: ApiProtocol,
         model_protocols: HashMap<String, ApiProtocol>,
@@ -424,59 +432,101 @@ impl<C: Config> PreparedPrimaryRoute<C> {
         retry_config: RetryConfig,
     ) -> Self {
         Self {
-            client,
             route,
             default_protocol,
             model_protocols,
             model_catalog,
             retry_config,
+            runtime_route: None,
+            runtime_catalog: None,
         }
+    }
+
+    pub fn new_with_runtime_route(
+        route: ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+        runtime_route: Option<Arc<ResolvedModelRoute>>,
+    ) -> Self {
+        Self {
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+            runtime_route,
+            runtime_catalog: None,
+        }
+    }
+
+    pub fn with_runtime_catalog(mut self, runtime_catalog: ResolvedRuntimeCatalog) -> Self {
+        self.runtime_catalog = Some(runtime_catalog);
+        self
+    }
+
+    pub(crate) fn with_resolved_authority_from(
+        mut self,
+        agent: &Agent,
+        route: &ModelRoute,
+    ) -> Result<Self> {
+        let runtime_route = agent.resolved_model_route_for(route).ok_or_else(|| {
+            anyhow!(
+                "resolved runtime route is unavailable: {}",
+                route.display_name()
+            )
+        })?;
+        self.runtime_route = Some(runtime_route);
+        self.runtime_catalog = agent.resolved_runtime_catalog.clone();
+        Ok(self)
     }
 
     pub(crate) fn candidate_session_usage_with_composition(
         &self,
-        agent: &Agent<C>,
+        agent: &Agent,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
         agent.candidate_session_usage_with_route(
             &self.route,
-            self.default_protocol,
-            &self.model_protocols,
             &self.model_catalog,
+            self.runtime_route.as_deref(),
             runtime_snapshot,
         )
     }
 
-    pub(crate) fn into_install(self) -> PreparedPrimaryRouteInstall<C> {
+    pub(crate) fn into_install(self) -> PreparedPrimaryRouteInstall {
         PreparedPrimaryRouteInstall { route: self }
     }
 }
 
-impl<C: Config> PreparedPrimaryRouteInstall<C> {
-    pub(crate) fn apply(self, agent: &mut Agent<C>) {
+impl PreparedPrimaryRouteInstall {
+    pub(crate) fn apply(self, agent: &mut Agent) {
         let PreparedPrimaryRoute {
-            client,
             route,
             default_protocol,
             model_protocols,
             model_catalog,
             retry_config,
+            runtime_route,
+            runtime_catalog,
         } = self.route;
-        agent.apply_route(
-            client,
+        agent.apply_route_with_runtime_route(
             route,
             default_protocol,
             model_protocols,
             model_catalog,
             retry_config,
+            runtime_route,
+            runtime_catalog,
         );
     }
 }
 
-pub trait SubagentDelegate<C: Config>: Send + Sync {
+pub trait SubagentDelegate: Send + Sync {
     fn run_named<'a>(
         &'a self,
-        parent: &'a Agent<C>,
+        parent: &'a Agent,
         agent_name: &'a str,
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
@@ -625,8 +675,7 @@ pub(crate) struct PendingTurnContinuation {
 pub(crate) type TurnContinuationProvider =
     Arc<dyn Fn() -> Result<Vec<PendingTurnContinuation>> + Send + Sync>;
 
-pub struct Agent<C: Config> {
-    pub client: Client<C>,
+pub struct Agent {
     model: String,
     primary_route: Option<ModelRoute>,
     subagent_model_overrides: HashMap<String, String>,
@@ -640,11 +689,11 @@ pub struct Agent<C: Config> {
     tools: ToolRegistry,
     skill_registry: Option<Arc<SkillRegistry>>,
     skill_cards: Vec<SkillCard>,
-    subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
-    subagent_child_factory: Option<Arc<dyn SubagentChildFactory<C>>>,
-    primary_route_factory: Option<Arc<dyn PrimaryRouteFactory<C>>>,
+    subagent_delegate: Option<Arc<dyn SubagentDelegate>>,
+    subagent_child_factory: Option<Arc<dyn SubagentChildFactory>>,
+    primary_route_factory: Option<Arc<dyn PrimaryRouteFactory>>,
     question_handler: Option<QuestionCallback>,
-    auto_review_service: Option<Arc<dyn AutoReviewService<C>>>,
+    auto_review_service: Option<Arc<dyn AutoReviewService>>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     /// Run-local directory authorization for delegated children. Never inherited.
     subagent_path_scope: Option<Arc<SubagentPathScope>>,
@@ -677,23 +726,23 @@ pub struct Agent<C: Config> {
     fake_client: Option<crate::fake::FakeClient>,
     fake_installation_id: String,
     fake_identity: Option<crate::fake::CodexIdentity>,
+    resolved_model_route: Option<Arc<ResolvedModelRoute>>,
+    resolved_runtime_catalog: Option<ResolvedRuntimeCatalog>,
+    retained_route_preparations: HashMap<String, RetainedRoutePreparation>,
 }
 
 impl AgentFactory {
     #[cfg(test)]
-    pub fn create_child<C: Config + Clone>(
-        parent: &Agent<C>,
-        template: &AgentTemplate,
-    ) -> Agent<C> {
+    pub fn create_child(parent: &Agent, template: &AgentTemplate) -> Agent {
         Self::create_child_with_max_tool_calls(parent, template, None)
     }
 
     #[allow(dead_code)]
-    pub fn create_child_with_max_tool_calls<C: Config + Clone>(
-        parent: &Agent<C>,
+    pub fn create_child_with_max_tool_calls(
+        parent: &Agent,
         template: &AgentTemplate,
         max_tool_calls_override: Option<usize>,
-    ) -> Agent<C> {
+    ) -> Agent {
         Self::create_child_with_route_and_max_tool_calls(
             parent,
             template,
@@ -704,13 +753,13 @@ impl AgentFactory {
         .expect("default child route should be constructible")
     }
 
-    pub fn create_child_with_route_and_max_tool_calls<C: Config + Clone>(
-        parent: &Agent<C>,
+    pub fn create_child_with_route_and_max_tool_calls(
+        parent: &Agent,
         template: &AgentTemplate,
         requested_route: Option<ModelRoute>,
         takeover: bool,
         max_tool_calls_override: Option<usize>,
-    ) -> Result<Agent<C>> {
+    ) -> Result<Agent> {
         if let Some(factory) = &parent.subagent_child_factory {
             let route =
                 factory.resolve_route(parent, template, requested_route.as_ref(), takeover)?;
@@ -724,15 +773,21 @@ impl AgentFactory {
             .subagent_model_override(&template.name)
             .unwrap_or(parent.model())
             .to_string();
+        let inherited_runtime_route = parent
+            .subagent_model_override(&template.name)
+            .is_none()
+            .then(|| parent.resolved_model_route.clone())
+            .flatten();
         let mut child = Self::create_child_with_parts(
             parent,
             template,
-            parent.client.clone(),
             model,
             parent.default_protocol,
             parent.model_protocols.clone(),
             parent.model_catalog.clone(),
             parent.retry_config.clone(),
+            inherited_runtime_route,
+            parent.resolved_runtime_catalog.clone(),
             max_tool_calls_override,
         );
         if parent.subagent_model_override(&template.name).is_none()
@@ -744,7 +799,7 @@ impl AgentFactory {
     }
 
     pub fn resolve_subagent_route(
-        parent: &Agent<OpenAIConfig>,
+        parent: &Agent,
         template: &AgentTemplate,
         requested_route: Option<&ModelRoute>,
         takeover: bool,
@@ -764,44 +819,81 @@ impl AgentFactory {
     }
 
     pub fn create_prepared_routed_child_with_max_tool_calls(
-        parent: &Agent<OpenAIConfig>,
+        parent: &Agent,
         template: &AgentTemplate,
-        prepared: PreparedPrimaryRoute<OpenAIConfig>,
+        prepared: PreparedPrimaryRoute,
         max_tool_calls_override: Option<usize>,
-    ) -> Agent<OpenAIConfig> {
-        Self::create_routed_child_with_max_tool_calls(
+    ) -> Agent {
+        let PreparedPrimaryRoute {
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+            runtime_route,
+            runtime_catalog,
+        } = prepared;
+        Self::create_routed_child_with_runtime_route(
             parent,
             template,
-            prepared.client,
-            prepared.route,
-            prepared.default_protocol,
-            prepared.model_protocols,
-            prepared.model_catalog,
-            prepared.retry_config,
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+            runtime_route,
+            runtime_catalog,
             max_tool_calls_override,
         )
     }
 
+    #[allow(dead_code)]
     pub fn create_routed_child_with_max_tool_calls(
-        parent: &Agent<OpenAIConfig>,
+        parent: &Agent,
         template: &AgentTemplate,
-        client: Client<OpenAIConfig>,
         route: ModelRoute,
         default_protocol: ApiProtocol,
         model_protocols: HashMap<String, ApiProtocol>,
         model_catalog: HashMap<String, ModelRequestMetadata>,
         retry_config: RetryConfig,
         max_tool_calls_override: Option<usize>,
-    ) -> Agent<OpenAIConfig> {
+    ) -> Agent {
+        Self::create_routed_child_with_runtime_route(
+            parent,
+            template,
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+            None,
+            None,
+            max_tool_calls_override,
+        )
+    }
+
+    fn create_routed_child_with_runtime_route(
+        parent: &Agent,
+        template: &AgentTemplate,
+        route: ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+        runtime_route: Option<Arc<ResolvedModelRoute>>,
+        runtime_catalog: Option<ResolvedRuntimeCatalog>,
+        max_tool_calls_override: Option<usize>,
+    ) -> Agent {
         let mut child = Self::create_child_with_parts(
             parent,
             template,
-            client,
             route.model.clone(),
             default_protocol,
             model_protocols,
             model_catalog,
             retry_config,
+            runtime_route,
+            runtime_catalog,
             max_tool_calls_override,
         );
         child.set_primary_route(route);
@@ -809,17 +901,18 @@ impl AgentFactory {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_child_with_parts<C: Config + Clone>(
-        parent: &Agent<C>,
+    fn create_child_with_parts(
+        parent: &Agent,
         template: &AgentTemplate,
-        client: Client<C>,
         model: String,
         default_protocol: ApiProtocol,
         model_protocols: HashMap<String, ApiProtocol>,
         model_catalog: HashMap<String, ModelRequestMetadata>,
         retry_config: RetryConfig,
+        runtime_route: Option<Arc<ResolvedModelRoute>>,
+        runtime_catalog: Option<ResolvedRuntimeCatalog>,
         max_tool_calls_override: Option<usize>,
-    ) -> Agent<C> {
+    ) -> Agent {
         let mut prelude = parent.prelude.clone();
         prelude.push(PromptMessage::system(template.system_prompt.clone()));
 
@@ -833,7 +926,6 @@ impl AgentFactory {
         }
 
         Agent {
-            client,
             model: model.clone(),
             primary_route: None,
             subagent_model_overrides: parent.subagent_model_overrides.clone(),
@@ -842,7 +934,7 @@ impl AgentFactory {
             model_catalog,
             session_reasoning_efforts: parent.session_reasoning_efforts.clone(),
             prelude,
-            runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&model),
+            runtime_snapshot: Agent::fresh_runtime_snapshot(&model),
             protocol_append_state: crate::protocol_frames::ProtocolAppendState::empty(),
             tools: parent
                 .tools
@@ -889,11 +981,15 @@ impl AgentFactory {
             fake_client: parent.fake_client,
             fake_installation_id: parent.fake_installation_id.clone(),
             fake_identity: parent.fake_identity.clone(),
+            resolved_model_route: runtime_route,
+            resolved_runtime_catalog: runtime_catalog
+                .or_else(|| parent.resolved_runtime_catalog.clone()),
+            retained_route_preparations: parent.retained_route_preparations.clone(),
         }
     }
 }
 
-impl<C: Config> Agent<C> {
+impl Agent {
     fn preview_final_logical_request(
         &self,
         build: &crate::request_builder::BuildResult,
@@ -902,9 +998,18 @@ impl<C: Config> Agent<C> {
             .preview(crate::request_builder::observe_logical_request(build))
     }
 
-    fn commit_final_logical_request(&mut self, build: &crate::request_builder::BuildResult) {
-        self.logical_request_observations
-            .commit(crate::request_builder::observe_logical_request(build));
+    fn preview_logical_observation(
+        &self,
+        observation: crate::request_builder::LogicalRequestObservation,
+    ) -> AdjacentRequestObservation {
+        self.logical_request_observations.preview(observation)
+    }
+
+    fn commit_logical_observation(
+        &mut self,
+        observation: crate::request_builder::LogicalRequestObservation,
+    ) {
+        self.logical_request_observations.commit(observation);
     }
 
     fn clear_active_epoch(&mut self) {
@@ -1134,7 +1239,7 @@ impl<C: Config> Agent<C> {
 
     fn preview_active_epoch(
         &self,
-        protocol: ApiProtocol,
+        _protocol: ApiProtocol,
         turn_prelude: &[PromptMessage],
         tools: &[crate::request_builder::ToolSpec],
     ) -> Result<ActiveEpochPreview> {
@@ -1148,11 +1253,6 @@ impl<C: Config> Agent<C> {
         crate::protocol_frames::validate_history_items_complete(&history, None)?;
         let planned = build_request_with_policy(
             RequestBuilderInput {
-                protocol,
-                provider: self
-                    .primary_route
-                    .as_ref()
-                    .map(|route| route.provider.as_str()),
                 model_id: &self.model,
                 model,
                 prelude: turn_prelude,
@@ -1167,13 +1267,12 @@ impl<C: Config> Agent<C> {
 
     fn preview_warm_active_epoch(
         &self,
-        protocol: ApiProtocol,
-        tools: &[crate::request_builder::ToolSpec],
+        _protocol: ApiProtocol,
+        _tools: &[crate::request_builder::ToolSpec],
         previous: &ActiveEpoch,
         suffix: &[crate::protocol_frames::ProtocolFrame],
     ) -> Result<ActiveEpochPreview> {
         let suffix_plan = crate::request_builder::prompt_plan::build_prompt_plan_suffix(
-            protocol,
             &self.model,
             &self.runtime_snapshot,
             suffix,
@@ -1221,32 +1320,24 @@ impl<C: Config> Agent<C> {
         budget.truncated = false;
 
         let rebuilt = build_request_from_selected_prompt(SelectedPromptRequestInput {
-            protocol,
-            strategy: ProviderRequestStrategy::from_provider_and_model(
-                self.primary_route
-                    .as_ref()
-                    .map(|route| route.provider.as_str()),
-                &self.model,
-            ),
-            model_id: &self.model,
-            model: self.active_model_metadata(),
-            tools,
             prompt_plan: plan,
             budget,
             selected_evidence_ids: previous.selected_evidence_ids.clone(),
             selected_evidence_message: previous.selected_evidence_message.clone(),
         })?;
         let observation = observe_logical_request(&rebuilt);
-        ensure!(
-            observation.units.len() >= previous.observation.units.len()
-                && observation.units[..previous.observation.units.len()]
-                    == previous.observation.units[..],
-            "active epoch committed provider units are not an exact prefix"
-        );
-        ensure!(
-            observation.cohort.request_shape_digest == previous.request_shape_digest,
-            "active epoch request shape changed while rebuilding"
-        );
+        if self.resolved_model_route.is_none() {
+            ensure!(
+                observation.units.len() >= previous.observation.units.len()
+                    && observation.units[..previous.observation.units.len()]
+                        == previous.observation.units[..],
+                "active epoch committed provider units are not an exact prefix"
+            );
+            ensure!(
+                observation.cohort.request_shape_digest == previous.request_shape_digest,
+                "active epoch request shape changed while rebuilding"
+            );
+        }
         self.active_epoch_preview_from_build(
             rebuilt,
             ActiveEpochTransition::Append {
@@ -1280,7 +1371,6 @@ impl<C: Config> Agent<C> {
                 selected_evidence_ids,
                 selected_evidence_message,
             },
-            #[cfg(test)]
             transition: _transition,
         })
     }
@@ -1296,8 +1386,32 @@ impl<C: Config> Agent<C> {
         self.active_epoch = Some(preview.epoch);
     }
 
+    fn commit_resolved_active_epoch(
+        &mut self,
+        mut preview: ActiveEpochPreview,
+        observation: crate::request_builder::LogicalRequestObservation,
+    ) -> Result<()> {
+        if matches!(preview.transition, ActiveEpochTransition::Append { .. })
+            && let Some(previous) = self.active_epoch.as_ref()
+        {
+            ensure!(
+                observation.units.len() >= previous.observation.units.len()
+                    && observation.units[..previous.observation.units.len()]
+                        == previous.observation.units[..],
+                "active epoch committed resolved wire units are not an exact prefix"
+            );
+            ensure!(
+                observation.cohort.request_shape_digest == previous.request_shape_digest,
+                "active epoch resolved request shape changed while rebuilding"
+            );
+        }
+        preview.epoch.request_shape_digest = observation.cohort.request_shape_digest.clone();
+        preview.epoch.observation = observation;
+        self.commit_active_epoch(preview);
+        Ok(())
+    }
+
     pub fn new(
-        client: Client<C>,
         model: impl Into<String>,
         max_iterations: impl Into<Option<usize>>,
         max_tool_calls: impl Into<Option<usize>>,
@@ -1306,7 +1420,6 @@ impl<C: Config> Agent<C> {
         let max_tool_calls = max_tool_calls.into();
         let model = model.into();
         Self {
-            client,
             model: model.clone(),
             primary_route: None,
             subagent_model_overrides: HashMap::new(),
@@ -1315,7 +1428,7 @@ impl<C: Config> Agent<C> {
             model_catalog: HashMap::new(),
             session_reasoning_efforts: HashMap::new(),
             prelude: default_agent_prelude(),
-            runtime_snapshot: Self::fresh_runtime_snapshot(&model),
+            runtime_snapshot: Agent::fresh_runtime_snapshot(&model),
             protocol_append_state: crate::protocol_frames::ProtocolAppendState::empty(),
             tools: ToolRegistry::default_tools(),
             skill_registry: None,
@@ -1333,6 +1446,9 @@ impl<C: Config> Agent<C> {
             fake_client: None,
             fake_installation_id: crate::fake::CodexIdentity::new("letcode").installation_id,
             fake_identity: None,
+            resolved_model_route: None,
+            resolved_runtime_catalog: None,
+            retained_route_preparations: HashMap::new(),
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations,
@@ -1784,6 +1900,11 @@ impl<C: Config> Agent<C> {
         self.primary_route.as_ref()
     }
 
+    #[allow(dead_code)]
+    pub fn resolved_model_route(&self) -> Option<&Arc<ResolvedModelRoute>> {
+        self.resolved_model_route.as_ref()
+    }
+
     pub fn route_display_name(&self) -> String {
         self.primary_route()
             .map_or_else(|| self.model().to_string(), ModelRoute::display_name)
@@ -1792,6 +1913,38 @@ impl<C: Config> Agent<C> {
     pub fn set_primary_route(&mut self, route: ModelRoute) {
         self.primary_route = Some(route);
         self.invalidate_request_projection();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_resolved_model_route(&mut self, route: Option<Arc<ResolvedModelRoute>>) {
+        self.resolved_model_route = route;
+    }
+
+    pub(crate) fn resolved_runtime_catalog(&self) -> Option<&ResolvedRuntimeCatalog> {
+        self.resolved_runtime_catalog.as_ref()
+    }
+
+    pub(crate) fn resolved_model_route_for(
+        &self,
+        route: &ModelRoute,
+    ) -> Option<Arc<ResolvedModelRoute>> {
+        if self.primary_route.as_ref() == Some(route) {
+            return self.resolved_model_route.clone();
+        }
+        self.resolved_runtime_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.route(&route.provider, &route.model))
+            .cloned()
+            .map(Arc::new)
+            .or_else(|| {
+                self.retained_route_preparations
+                    .get(&route.display_name())
+                    .map(|retained| Arc::clone(&retained.runtime_route))
+            })
+    }
+
+    pub(crate) fn set_resolved_runtime_catalog(&mut self, catalog: Option<ResolvedRuntimeCatalog>) {
+        self.resolved_runtime_catalog = catalog;
     }
 
     pub fn reasoning_effort(&self) -> Option<ModelReasoningEffort> {
@@ -1811,7 +1964,15 @@ impl<C: Config> Agent<C> {
         model_id: &str,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
-        let build = self.build_candidate_session_request(model_id, runtime_snapshot)?;
+        let (build, tools) = self.build_candidate_session_request(model_id, runtime_snapshot)?;
+        if let Some(route) = self.resolved_model_route.as_deref() {
+            self.validate_resolved_candidate_request(
+                route,
+                self.active_model_metadata(),
+                &tools,
+                &build,
+            )?;
+        }
         let usage = TokenUsageEstimate {
             used_tokens: build.budget.estimated_request_tokens,
             context_window_tokens: build.budget.context_window_tokens,
@@ -1839,19 +2000,23 @@ impl<C: Config> Agent<C> {
     fn candidate_session_usage_with_route(
         &self,
         route: &ModelRoute,
-        default_protocol: ApiProtocol,
-        model_protocols: &HashMap<String, ApiProtocol>,
         model_catalog: &HashMap<String, ModelRequestMetadata>,
+        runtime_route: Option<&ResolvedModelRoute>,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
-        let build = self.build_candidate_session_request_with_route(
-            &route.provider,
+        let (build, tools) = self.build_candidate_session_request_with_route(
             &route.model,
-            default_protocol,
-            model_protocols,
             model_catalog,
             runtime_snapshot,
         )?;
+        if let Some(runtime_route) = runtime_route {
+            self.validate_resolved_candidate_request(
+                runtime_route,
+                model_catalog.get(&route.model).cloned().unwrap_or_default(),
+                &tools,
+                &build,
+            )?;
+        }
         let usage = TokenUsageEstimate {
             used_tokens: build.budget.estimated_request_tokens,
             context_window_tokens: build.budget.context_window_tokens,
@@ -1865,20 +2030,37 @@ impl<C: Config> Agent<C> {
         Ok((usage, composition))
     }
 
+    fn validate_resolved_candidate_request(
+        &self,
+        route: &ResolvedModelRoute,
+        model: ModelRequestMetadata,
+        tools: &[crate::request_builder::ToolSpec],
+        build: &crate::request_builder::BuildResult,
+    ) -> Result<()> {
+        let input = crate::model_runtime::projection::model_request_from_prompt_plan(
+            route,
+            &model,
+            &build.prompt_plan,
+            tools,
+        )
+        .map_err(anyhow::Error::msg)?;
+        route
+            .binding
+            .prepare_request(&input)
+            .map_err(|failure| anyhow!(failure.to_string()))?;
+        Ok(())
+    }
+
     fn build_candidate_session_request(
         &self,
         model_id: &str,
         runtime_snapshot: &RuntimeSnapshot,
-    ) -> Result<crate::request_builder::BuildResult> {
-        let provider = self
-            .primary_route
-            .as_ref()
-            .map(|route| route.provider.as_str());
+    ) -> Result<(
+        crate::request_builder::BuildResult,
+        Vec<crate::request_builder::ToolSpec>,
+    )> {
         self.build_candidate_session_request_with_route(
-            provider.unwrap_or_default(),
             model_id,
-            self.default_protocol,
-            &self.model_protocols,
             &self.model_catalog,
             runtime_snapshot,
         )
@@ -1886,13 +2068,13 @@ impl<C: Config> Agent<C> {
 
     fn build_candidate_session_request_with_route(
         &self,
-        provider: &str,
         model_id: &str,
-        default_protocol: ApiProtocol,
-        model_protocols: &HashMap<String, ApiProtocol>,
         model_catalog: &HashMap<String, ModelRequestMetadata>,
         runtime_snapshot: &RuntimeSnapshot,
-    ) -> Result<crate::request_builder::BuildResult> {
+    ) -> Result<(
+        crate::request_builder::BuildResult,
+        Vec<crate::request_builder::ToolSpec>,
+    )> {
         let model = model_catalog
             .get(model_id)
             .cloned()
@@ -1948,13 +2130,8 @@ impl<C: Config> Agent<C> {
             }
             prelude
         };
-        build_request_with_policy(
+        let build = build_request_with_policy(
             RequestBuilderInput {
-                protocol: model_protocols
-                    .get(model_id)
-                    .cloned()
-                    .unwrap_or(default_protocol),
-                provider: (!provider.is_empty()).then_some(provider),
                 model_id,
                 model,
                 prelude: &prelude,
@@ -1963,7 +2140,8 @@ impl<C: Config> Agent<C> {
             },
             None,
             Some(policy),
-        )
+        )?;
+        Ok((build, tools))
     }
 
     #[cfg(test)]
@@ -1988,22 +2166,53 @@ impl<C: Config> Agent<C> {
         self.invalidate_request_projection();
     }
 
+    pub(crate) fn set_model_route_authority(
+        &mut self,
+        route: ModelRoute,
+        resolved_route: Arc<ResolvedModelRoute>,
+    ) {
+        self.primary_route = Some(route.clone());
+        self.resolved_model_route = Some(Arc::clone(&resolved_route));
+        self.set_model(route.model);
+    }
+
     #[allow(dead_code)]
     pub fn apply_route(
         &mut self,
-        client: Client<C>,
         route: ModelRoute,
         default_protocol: ApiProtocol,
         model_protocols: HashMap<String, ApiProtocol>,
         model_catalog: HashMap<String, ModelRequestMetadata>,
         retry_config: RetryConfig,
     ) {
-        self.client = client;
+        self.apply_route_with_runtime_route(
+            route,
+            default_protocol,
+            model_protocols,
+            model_catalog,
+            retry_config,
+            None,
+            None,
+        );
+    }
+
+    fn apply_route_with_runtime_route(
+        &mut self,
+        route: ModelRoute,
+        default_protocol: ApiProtocol,
+        model_protocols: HashMap<String, ApiProtocol>,
+        model_catalog: HashMap<String, ModelRequestMetadata>,
+        retry_config: RetryConfig,
+        runtime_route: Option<Arc<ResolvedModelRoute>>,
+        runtime_catalog: Option<ResolvedRuntimeCatalog>,
+    ) {
         self.default_protocol = default_protocol;
         self.model_protocols = model_protocols;
         self.model_catalog = model_catalog;
         self.retry_config = retry_config;
         self.primary_route = Some(route.clone());
+        self.resolved_model_route = runtime_route;
+        self.resolved_runtime_catalog = runtime_catalog;
         self.set_model(route.model);
     }
 
@@ -2342,11 +2551,11 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    pub fn set_subagent_delegate(&mut self, delegate: Arc<dyn SubagentDelegate<C>>) {
+    pub fn set_subagent_delegate(&mut self, delegate: Arc<dyn SubagentDelegate>) {
         self.subagent_delegate = Some(delegate);
     }
 
-    pub fn set_auto_review_service(&mut self, service: Option<Arc<dyn AutoReviewService<C>>>) {
+    pub fn set_auto_review_service(&mut self, service: Option<Arc<dyn AutoReviewService>>) {
         self.auto_review_service = service;
     }
 
@@ -2354,37 +2563,67 @@ impl<C: Config> Agent<C> {
         &self,
         request: PermissionRequest,
         user_goal: Option<String>,
-    ) -> Result<AutoReviewResolution>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+    ) -> Result<AutoReviewResolution> {
         let Some(service) = self.auto_review_service.as_ref() else {
             bail!("auto permission mode requires a reviewer service");
         };
         service.review(self, request, user_goal).await
     }
 
-    pub fn set_subagent_child_factory(&mut self, factory: Arc<dyn SubagentChildFactory<C>>) {
+    pub fn set_subagent_child_factory(&mut self, factory: Arc<dyn SubagentChildFactory>) {
         self.subagent_child_factory = Some(factory);
     }
 
-    pub fn set_primary_route_factory(&mut self, factory: Arc<dyn PrimaryRouteFactory<C>>) {
+    pub fn set_primary_route_factory(&mut self, factory: Arc<dyn PrimaryRouteFactory>) {
+        if let (Some(previous_factory), Some(catalog)) = (
+            self.primary_route_factory.as_ref(),
+            self.resolved_runtime_catalog.as_ref(),
+        ) {
+            for provider in catalog.providers.values() {
+                for route in provider.models.values() {
+                    self.retained_route_preparations.insert(
+                        format!("{}/{}", route.provider, route.model),
+                        RetainedRoutePreparation {
+                            runtime_route: Arc::new(route.clone()),
+                            route_factory: Arc::clone(previous_factory),
+                        },
+                    );
+                }
+            }
+        }
         self.primary_route_factory = Some(factory);
     }
 
-    pub fn prepare_primary_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute<C>> {
-        let factory = self
-            .primary_route_factory
-            .clone()
-            .ok_or_else(|| anyhow!("primary route switching is not configured"))?;
-        factory.prepare_route(route)
+    pub fn prepare_primary_route(&self, route: ModelRoute) -> Result<PreparedPrimaryRoute> {
+        if self
+            .resolved_runtime_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.route(&route.provider, &route.model))
+            .is_some()
+        {
+            let factory = self
+                .primary_route_factory
+                .clone()
+                .ok_or_else(|| anyhow!("primary route switching is not configured"))?;
+            return factory
+                .prepare_route(route.clone())?
+                .with_resolved_authority_from(self, &route);
+        }
+        let retained = self
+            .retained_route_preparations
+            .get(&route.display_name())
+            .ok_or_else(|| anyhow!("model route is not available: {}", route.display_name()))?;
+        let mut prepared = retained.route_factory.prepare_route(route.clone())?;
+        prepared.runtime_route = Some(Arc::clone(&retained.runtime_route));
+        prepared.runtime_catalog = self.resolved_runtime_catalog.clone();
+        Ok(prepared)
     }
 
-    pub(crate) fn apply_prepared_primary_route(&mut self, route: PreparedPrimaryRouteInstall<C>) {
+    pub(crate) fn apply_prepared_primary_route(&mut self, route: PreparedPrimaryRouteInstall) {
         route.apply(self);
     }
 
-    pub(crate) fn apply_prepared_route(&mut self, route: PreparedPrimaryRoute<C>) {
+    pub(crate) fn apply_prepared_route(&mut self, route: PreparedPrimaryRoute) {
         self.apply_prepared_primary_route(route.into_install());
     }
 
@@ -2419,7 +2658,7 @@ impl<C: Config> Agent<C> {
     pub(crate) fn turn_continuation_provider_guard(
         &mut self,
         provider: TurnContinuationProvider,
-    ) -> TurnContinuationProviderGuard<'_, C> {
+    ) -> TurnContinuationProviderGuard<'_> {
         TurnContinuationProviderGuard::install(self, Some(provider))
     }
 
@@ -2455,7 +2694,6 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    // Kept temporarily for the out-of-scope session runner's legacy restore cleanup.
     // The Agent retains no checkpoint candidate or production control state.
     pub(crate) fn clear_logical_checkpoint_candidate_provider(&mut self) {}
 
@@ -2784,12 +3022,8 @@ impl<C: Config> Agent<C> {
         Some(self.retry_config.max_recovery_attempts.saturating_add(1))
     }
 
-    pub fn session_title_agent(&self) -> Agent<C>
-    where
-        C: Clone,
-    {
+    pub fn session_title_agent(&self) -> Agent {
         Agent {
-            client: self.client.clone(),
             model: self.model.clone(),
             primary_route: None,
             subagent_model_overrides: HashMap::new(),
@@ -2834,29 +3068,42 @@ impl<C: Config> Agent<C> {
             fake_client: None,
             fake_installation_id: self.fake_installation_id.clone(),
             fake_identity: None,
+            resolved_model_route: self.resolved_model_route.clone(),
+            resolved_runtime_catalog: self.resolved_runtime_catalog.clone(),
+            retained_route_preparations: self.retained_route_preparations.clone(),
         }
     }
 
-    pub async fn generate_session_title(&mut self, user_input: &str) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
-        let raw = self
-            .run_stream(
-                user_input,
-                |_| Ok(()),
-                |_| Ok(()),
-                |_| Ok(PermissionApproval::Deny),
-            )
-            .await?;
+    pub(crate) async fn run_resolved_text_oneshot(&self, user_input: &str) -> Result<String> {
+        let route = self
+            .resolved_model_route()
+            .ok_or_else(|| anyhow!("helper requires an installed resolved model route"))?;
+        protocol_stream::execute_resolved_text_oneshot(
+            route,
+            self.active_model_metadata(),
+            &self.prelude,
+            user_input,
+        )
+        .await
+    }
+
+    pub async fn generate_session_title(&mut self, user_input: &str) -> Result<String> {
+        let route = self
+            .resolved_model_route()
+            .ok_or_else(|| anyhow!("helper requires an installed resolved model route"))?;
+        let raw = protocol_stream::execute_resolved_text_oneshot(
+            route,
+            self.active_model_metadata(),
+            &self.prelude,
+            user_input,
+        )
+        .await
+        .map_err(|error| anyhow!("session title generation failed: {error:#}"))?;
         normalize_session_title(&raw)
     }
 
     #[allow(dead_code)]
-    pub async fn run(&mut self, user_input: &str) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+    pub async fn run(&mut self, user_input: &str) -> Result<String> {
         self.run_stream(
             user_input,
             |_| Ok(()),
@@ -2874,13 +3121,12 @@ impl<C: Config> Agent<C> {
         approve: A,
     ) -> Result<String>
     where
-        F: FnMut(&str) -> Dfut,
+        F: FnMut(&str) -> Dfut + Send,
         E: FnMut(AgentEvent) -> Efut + Send,
-        A: FnMut(PermissionRequest) -> Afut,
-        Dfut: Future<Output = Result<()>>,
+        A: FnMut(PermissionRequest) -> Afut + Send,
+        Dfut: Future<Output = Result<()>> + Send,
         Efut: Future<Output = Result<()>> + Send,
-        Afut: Future<Output = Result<PermissionApproval>>,
-        C: Clone + Send + Sync + 'static,
+        Afut: Future<Output = Result<PermissionApproval>> + Send,
     {
         self.run_stream_content_with_interactions_async(
             UserMessageContent::new(user_input.to_string(), Vec::new()),
@@ -2906,13 +3152,12 @@ impl<C: Config> Agent<C> {
         approve: A,
     ) -> Result<String>
     where
-        F: FnMut(&str) -> Dfut,
+        F: FnMut(&str) -> Dfut + Send,
         E: FnMut(AgentEvent) -> Efut + Send,
-        A: FnMut(PermissionRequest) -> Afut,
-        Dfut: Future<Output = Result<()>>,
+        A: FnMut(PermissionRequest) -> Afut + Send,
+        Dfut: Future<Output = Result<()>> + Send,
         Efut: Future<Output = Result<()>> + Send,
-        Afut: Future<Output = Result<PermissionApproval>>,
-        C: Clone + Send + Sync + 'static,
+        Afut: Future<Output = Result<PermissionApproval>> + Send,
     {
         self.run_stream_content_with_interactions_async(
             user_content,
@@ -2938,56 +3183,39 @@ impl<C: Config> Agent<C> {
         ask_question: Q,
     ) -> Result<String>
     where
-        F: FnMut(&str) -> Dfut,
+        F: FnMut(&str) -> Dfut + Send,
         E: FnMut(AgentEvent) -> Efut + Send,
-        A: FnMut(PermissionRequest) -> Afut,
+        A: FnMut(PermissionRequest) -> Afut + Send,
         Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
-        Dfut: Future<Output = Result<()>>,
+        Dfut: Future<Output = Result<()>> + Send,
         Efut: Future<Output = Result<()>> + Send,
-        Afut: Future<Output = Result<PermissionApproval>>,
+        Afut: Future<Output = Result<PermissionApproval>> + Send,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
-        C: Clone + Send + Sync + 'static,
     {
         let mut question_handler_guard =
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
 
         let user_input = user_content.text.clone();
 
-        match question_handler_guard.agent().active_protocol() {
-            ApiProtocol::Responses => {
-                protocol_stream::run_responses_stream_async(
-                    question_handler_guard.agent(),
-                    user_content.clone(),
-                    &user_input,
-                    on_delta,
-                    on_event,
-                    approve,
-                )
-                .await
-            }
-            ApiProtocol::Completions => {
-                protocol_stream::run_oai_comp_stream_async(
-                    question_handler_guard.agent(),
-                    user_content.clone(),
-                    &user_input,
-                    on_delta,
-                    on_event,
-                    approve,
-                )
-                .await
-            }
-            ApiProtocol::Anthropic => {
-                protocol_stream::run_anthropic_stream_async(
-                    question_handler_guard.agent(),
-                    user_content,
-                    &user_input,
-                    on_delta,
-                    on_event,
-                    approve,
-                )
-                .await
-            }
+        if question_handler_guard
+            .agent()
+            .resolved_model_route()
+            .is_some()
+        {
+            return protocol_stream::run_resolved_turn_async(
+                question_handler_guard.agent(),
+                user_content,
+                &user_input,
+                on_delta,
+                on_event,
+                approve,
+            )
+            .await;
         }
+
+        Err(anyhow!(
+            "normal agent turns require an installed resolved model route"
+        ))
     }
 
     fn wrap_question_handler<Q, Qfut>(ask_question: Q) -> QuestionCallback
@@ -3012,7 +3240,6 @@ impl<C: Config> Agent<C> {
         approve: &mut A,
     ) -> Result<ToolExecutionRecord>
     where
-        C: Clone + Send + Sync + 'static,
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
@@ -3113,7 +3340,7 @@ impl<C: Config> Agent<C> {
     /// estimation paths recompute the phase for the candidate model.
     fn tool_definitions_for(&self, model_id: &str) -> Vec<crate::request_builder::ToolSpec> {
         let mut specs = self.tools.specs();
-        // ToolRegistry retains a pair of legacy subagent handlers for validation and
+        // ToolRegistry retains a pair of subagent handlers for validation and
         // scope compatibility. Catalog tools are advertised only when their delegate
         // is executable, exactly as they are checked at execution time.
         specs.retain(|spec| !is_subagent_tool_name(&spec.name));
@@ -3140,24 +3367,6 @@ impl<C: Config> Agent<C> {
         specs
     }
 
-    fn ensure_tool_call_budget(&self, current_count: usize, requested_count: usize) -> Result<()> {
-        let total_count = current_count + requested_count;
-        if self.turn.auto_continue_active {
-            return Ok(());
-        }
-        if let Some(limit) = self.max_tool_calls
-            && total_count > limit
-        {
-            return Err(anyhow!(
-                "stopped: too many tool calls ({} requested, max {})",
-                total_count,
-                limit
-            ));
-        }
-
-        Ok(())
-    }
-
     #[allow(dead_code)]
     fn append_assistant_tool_calls(
         &mut self,
@@ -3171,13 +3380,15 @@ impl<C: Config> Agent<C> {
         &mut self,
         turn_text: &str,
         reasoning_content: Option<&str>,
-        reasoning_wire: Option<&str>,
+        replay: Option<&str>,
         tool_calls: &[HistoryToolCall],
     ) -> Result<()> {
-        self.append_history_item(HistoryItem::AssistantToolCalls {
+        self.append_history_item(HistoryItem::AssistantTurn {
             text: (!turn_text.is_empty()).then(|| turn_text.to_string()),
             reasoning_content: reasoning_content.map(ToString::to_string),
-            reasoning_wire: reasoning_wire.map(ToString::to_string),
+            replay: replay.and_then(
+                crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json,
+            ),
             calls: tool_calls.to_vec(),
         })
         .map_err(|error| anyhow!("assistant tool calls should remain protocol-compatible: {error}"))
@@ -3190,7 +3401,6 @@ impl<C: Config> Agent<C> {
         approve: &mut A,
     ) -> Result<()>
     where
-        C: Clone + Send + Sync + 'static,
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
@@ -3261,7 +3471,6 @@ impl<C: Config> Agent<C> {
         approve: &mut A,
     ) -> Result<()>
     where
-        C: Clone + Send + Sync + 'static,
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
@@ -3525,10 +3734,9 @@ impl<C: Config> Agent<C> {
         mut approve: A,
     ) -> Result<String>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(&str) -> Result<()> + Send,
         E: FnMut(AgentEvent) -> Result<()> + Send,
-        A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
-        C: Clone + Send + Sync + 'static,
+        A: FnMut(PermissionRequest) -> Result<PermissionApproval> + Send,
     {
         self.run_stream_async(
             user_input,
@@ -3547,7 +3755,6 @@ impl<C: Config> Agent<C> {
     where
         E: FnMut(AgentEvent) -> Efut + Send,
         Efut: Future<Output = Result<()>> + Send,
-        C: Clone,
     {
         compaction::compact_session_stream_async(self, on_event, || Ok(())).await
     }
@@ -3561,37 +3768,8 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Efut + Send,
         Efut: Future<Output = Result<()>> + Send,
         S: FnMut() -> Result<()> + Send,
-        C: Clone,
     {
         compaction::compact_session_stream_async(self, on_event, on_start).await
-    }
-
-    #[cfg(test)]
-    async fn run_oai_comp_stream_async<F, E, A, Dfut, Efut, Afut>(
-        &mut self,
-        user_input: &str,
-        on_delta: F,
-        on_event: E,
-        approve: A,
-    ) -> Result<String>
-    where
-        F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut + Send,
-        A: FnMut(PermissionRequest) -> Afut,
-        Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>> + Send,
-        Afut: Future<Output = Result<PermissionApproval>>,
-        C: Clone + Send + Sync + 'static,
-    {
-        protocol_stream::run_oai_comp_stream_async(
-            self,
-            UserMessageContent::new(user_input.to_string(), Vec::new()),
-            user_input,
-            on_delta,
-            on_event,
-            approve,
-        )
-        .await
     }
 
     #[cfg(test)]
@@ -4095,47 +4273,47 @@ impl<C: Config> Agent<C> {
     }
 }
 
-pub(crate) struct TurnContinuationProviderGuard<'a, C: Config> {
-    agent: &'a mut Agent<C>,
+pub(crate) struct TurnContinuationProviderGuard<'a> {
+    agent: &'a mut Agent,
     previous: Option<TurnContinuationProvider>,
 }
 
-impl<'a, C: Config> TurnContinuationProviderGuard<'a, C> {
-    fn install(agent: &'a mut Agent<C>, replacement: Option<TurnContinuationProvider>) -> Self {
+impl<'a> TurnContinuationProviderGuard<'a> {
+    fn install(agent: &'a mut Agent, replacement: Option<TurnContinuationProvider>) -> Self {
         let previous = agent.turn_continuation_provider.take();
         agent.turn_continuation_provider = replacement;
         Self { agent, previous }
     }
 
-    pub(crate) fn agent(&mut self) -> &mut Agent<C> {
+    pub(crate) fn agent(&mut self) -> &mut Agent {
         self.agent
     }
 }
 
-impl<C: Config> Drop for TurnContinuationProviderGuard<'_, C> {
+impl Drop for TurnContinuationProviderGuard<'_> {
     fn drop(&mut self) {
         self.agent.turn_continuation_provider = self.previous.take();
     }
 }
 
-struct QuestionHandlerGuard<'a, C: Config> {
-    agent: &'a mut Agent<C>,
+struct QuestionHandlerGuard<'a> {
+    agent: &'a mut Agent,
     previous: Option<QuestionCallback>,
 }
 
-impl<'a, C: Config> QuestionHandlerGuard<'a, C> {
-    fn install(agent: &'a mut Agent<C>, replacement: Option<QuestionCallback>) -> Self {
+impl<'a> QuestionHandlerGuard<'a> {
+    fn install(agent: &'a mut Agent, replacement: Option<QuestionCallback>) -> Self {
         let previous = agent.question_handler.take();
         agent.question_handler = replacement;
         Self { agent, previous }
     }
 
-    fn agent(&mut self) -> &mut Agent<C> {
+    fn agent(&mut self) -> &mut Agent {
         self.agent
     }
 }
 
-impl<C: Config> Drop for QuestionHandlerGuard<'_, C> {
+impl Drop for QuestionHandlerGuard<'_> {
     fn drop(&mut self) {
         self.agent.question_handler = self.previous.take();
     }
@@ -4152,7 +4330,7 @@ fn permission_class_for_tool_call(
 /// subagent tool backed by an installed delegate. Keep this shared predicate in
 /// step with tool advertisement so a model cannot request a virtual tool that
 /// will only fail after approval.
-fn is_executable_tool<C: Config>(agent: &Agent<C>, tool_name: &str) -> bool {
+fn is_executable_tool(agent: &Agent, tool_name: &str) -> bool {
     if is_subagent_control_tool_name(tool_name) {
         return agent.subagent_delegate.is_some();
     }
@@ -4541,18 +4719,15 @@ pub(crate) fn protocol_frame_item_from_history_item(
         HistoryItem::InternalContinuation { text } => {
             crate::protocol_frames::ProtocolFrameItem::InternalContinuation { text: text.clone() }
         }
-        HistoryItem::AssistantText { text } => {
-            crate::protocol_frames::ProtocolFrameItem::AssistantText { text: text.clone() }
-        }
-        HistoryItem::AssistantToolCalls {
+        HistoryItem::AssistantTurn {
             text,
             reasoning_content,
-            reasoning_wire,
+            replay,
             calls,
-        } => crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls {
+        } => crate::protocol_frames::ProtocolFrameItem::AssistantTurn {
             text: text.clone(),
             reasoning_content: reasoning_content.clone(),
-            reasoning_wire: reasoning_wire.clone(),
+            replay: replay.clone(),
             calls: calls.clone(),
         },
         HistoryItem::ToolOutput {
@@ -4587,15 +4762,14 @@ fn runtime_frame_from_protocol_frame(
             format!("internal-continuation:{}", frame.history_index),
             Some(text.clone()),
         ),
-        crate::protocol_frames::ProtocolFrameItem::AssistantText { text } => (
-            RuntimeFrameKind::Assistant,
-            format!("assistant:{}", frame.history_index),
-            Some(text.clone()),
-        ),
-        crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls { text, calls, .. } => (
-            RuntimeFrameKind::ToolCall,
+        crate::protocol_frames::ProtocolFrameItem::AssistantTurn { text, calls, .. } => (
+            if calls.is_empty() {
+                RuntimeFrameKind::Assistant
+            } else {
+                RuntimeFrameKind::ToolCall
+            },
             format!(
-                "assistant-tool-calls:{}:{}",
+                "assistant:{}:{}",
                 frame.history_index,
                 calls
                     .iter()
@@ -4661,7 +4835,7 @@ fn protocol_item_default_provenance(
     }
 }
 
-fn next_protocol_source_sequence<C: Config>(agent: &Agent<C>) -> u64 {
+fn next_protocol_source_sequence(agent: &Agent) -> u64 {
     let from_frames = agent
         .runtime_snapshot
         .frames
@@ -4717,7 +4891,7 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
 }
 
 // Rebuild helpers treat history as the sole protocol authority for the open
-// session; RuntimeSnapshot only mirrors it for legacy consumers.
+// session; RuntimeSnapshot mirrors the active session state.
 
 /// Copy non-protocol runtime surfaces from `source` onto `target` without
 /// touching active protocol payloads. Used when rebuilding protocol shells.
@@ -5226,14 +5400,6 @@ impl ToolEffectKind {
 mod incremental_append_tests {
     use super::*;
 
-    fn test_client() -> Client<OpenAIConfig> {
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base("https://api.openai.com/v1")
-                .with_api_key("test"),
-        )
-    }
-
     fn evidence(id: &str) -> EvidenceRecord {
         EvidenceRecord {
             id: id.into(),
@@ -5249,6 +5415,20 @@ mod incremental_append_tests {
     }
 
     #[test]
+    fn assistant_turn_conversion_preserves_reasoning_and_replay_without_tool_calls() {
+        let item = HistoryItem::AssistantTurn {
+            text: Some("answer".into()),
+            reasoning_content: Some("reasoning".into()),
+            replay: crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
+                r#"[{"type":"thinking","signature":"signed"}]"#,
+            ),
+            calls: Vec::new(),
+        };
+
+        assert_eq!(protocol_frame_item_from_history_item(&item), item);
+    }
+
+    #[test]
     fn incremental_agent_append_matches_cold_rebuild_with_metadata_and_evidence() {
         let base = vec![
             HistoryItem::user("older request"),
@@ -5258,10 +5438,13 @@ mod incremental_append_tests {
             base[0].clone(),
             base[1].clone(),
             HistoryItem::user("current request"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: Some("working".into()),
                 reasoning_content: Some("reasoning".into()),
-                reasoning_wire: Some(r#"{"signature":"wire"}"#.into()),
+                replay:
+                    crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
+                        r#"{"signature":"wire"}"#,
+                    ),
                 calls: vec![
                     HistoryToolCall {
                         call_id: "call-1".into(),
@@ -5288,7 +5471,7 @@ mod incremental_append_tests {
             HistoryItem::assistant("done"),
         ];
 
-        let mut incremental = Agent::new(test_client(), "m1", 4, 4);
+        let mut incremental = Agent::new("m1", 4, 4);
         incremental.set_history_for_test(base.clone());
         incremental.runtime_snapshot.context_scope_revision = 7;
         incremental.runtime_snapshot.current_segment_id = Some(11);
@@ -5303,7 +5486,7 @@ mod incremental_append_tests {
             .add_evidence(evidence("ev-1"))
             .expect("evidence append should succeed");
 
-        let mut cold = Agent::new(test_client(), "m1", 4, 4);
+        let mut cold = Agent::new("m1", 4, 4);
         cold.runtime_snapshot.context_scope_revision = 7;
         cold.runtime_snapshot.current_segment_id = Some(11);
         cold.runtime_snapshot.current_turn_id = Some(3);
@@ -5343,7 +5526,7 @@ mod incremental_append_tests {
                 HistoryItem::user("new question"),
                 HistoryItem::assistant("new answer"),
             ];
-            let mut warm_agent = Agent::new(test_client(), "m1", 4, 4);
+            let mut warm_agent = Agent::new("m1", 4, 4);
             warm_agent.turn.current_turn_start_index = Some(base.len());
             warm_agent.set_history_for_test(base.clone());
             let cold_epoch = warm_agent
@@ -5359,7 +5542,7 @@ mod incremental_append_tests {
                 .resolved_epoch_preview_for_test(protocol, &[], &[])
                 .expect("warm epoch preview");
 
-            let mut cold_agent = Agent::new(test_client(), "m1", 4, 4);
+            let mut cold_agent = Agent::new("m1", 4, 4);
             cold_agent.turn.current_turn_start_index = Some(base.len());
             cold_agent.set_history_for_test(base.iter().chain(&suffix).cloned().collect());
             let cold = cold_agent
@@ -5375,11 +5558,6 @@ mod incremental_append_tests {
             assert_eq!(
                 warm.build.prompt_plan, expected_plan,
                 "{protocol:?} warm PromptPlan differs from canonical cold structure"
-            );
-            assert_eq!(
-                crate::request_builder::request_value_for_test(&warm.build),
-                crate::request_builder::request_value_for_test(&cold.build),
-                "{protocol:?} warm request differs from canonical cold request"
             );
             assert_eq!(
                 warm.build.budget.context_window_tokens, cold.build.budget.context_window_tokens,
@@ -5417,7 +5595,7 @@ mod incremental_append_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let mut agent = Agent::new(test_client(), "m1", 4, 4);
+        let mut agent = Agent::new("m1", 4, 4);
         agent.set_history_for_test(history[..62].to_vec());
         agent.turn.current_turn_start_index = Some(62);
         crate::request_builder::prompt_plan::reset_plan_call_count();
@@ -5510,290 +5688,4 @@ fn utc_date_from_unix_days(days: i64) -> String {
     let year = y + if month <= 2 { 1 } else { 0 };
 
     format!("{year:04}-{month:02}-{day:02}")
-}
-
-fn reasoning_summary_text(item: &OutputItem) -> String {
-    match item {
-        OutputItem::Reasoning(reasoning) => reasoning
-            .summary
-            .iter()
-            .map(|part| match part {
-                async_openai::types::responses::SummaryPart::SummaryText(content) => {
-                    content.text.clone()
-                }
-            })
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        _ => String::new(),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StreamTextPart {
-    Visible(String),
-    ReasoningDelta { item_id: String, delta: String },
-    ReasoningDone { item_id: String, text: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InlineReasoningMode {
-    Visible,
-    Reasoning,
-}
-
-#[derive(Debug, Clone)]
-struct InlineReasoningExtractor {
-    item_id: String,
-    mode: InlineReasoningMode,
-    buffer: String,
-    reasoning_text: String,
-}
-
-impl InlineReasoningExtractor {
-    fn new(item_id: impl Into<String>) -> Self {
-        Self {
-            item_id: item_id.into(),
-            mode: InlineReasoningMode::Visible,
-            buffer: String::new(),
-            reasoning_text: String::new(),
-        }
-    }
-
-    fn push(&mut self, text: &str) -> Vec<StreamTextPart> {
-        self.buffer.push_str(text);
-        self.drain(false)
-    }
-
-    fn finish(&mut self) -> Vec<StreamTextPart> {
-        self.drain(true)
-    }
-
-    fn drain(&mut self, finishing: bool) -> Vec<StreamTextPart> {
-        let mut parts = Vec::new();
-
-        loop {
-            match self.mode {
-                InlineReasoningMode::Visible => {
-                    if let Some((start, len)) = find_open_reasoning_tag(&self.buffer) {
-                        let visible = self.buffer[..start].to_string();
-                        if !visible.is_empty() {
-                            parts.push(StreamTextPart::Visible(visible));
-                        }
-                        self.buffer.drain(..start + len);
-                        self.mode = InlineReasoningMode::Reasoning;
-                        continue;
-                    }
-
-                    let emit_len = if finishing {
-                        self.buffer.len()
-                    } else {
-                        safe_emit_len_without_partial_tag(&self.buffer, OPEN_REASONING_TAGS)
-                    };
-                    if emit_len == 0 {
-                        break;
-                    }
-                    let visible = self.buffer[..emit_len].to_string();
-                    self.buffer.drain(..emit_len);
-                    parts.push(StreamTextPart::Visible(visible));
-                }
-                InlineReasoningMode::Reasoning => {
-                    if let Some((start, len)) = find_close_reasoning_tag(&self.buffer) {
-                        let delta = self.buffer[..start].to_string();
-                        if !delta.is_empty() {
-                            self.reasoning_text.push_str(&delta);
-                            parts.push(StreamTextPart::ReasoningDelta {
-                                item_id: self.item_id.clone(),
-                                delta,
-                            });
-                        }
-                        self.buffer.drain(..start + len);
-                        parts.push(StreamTextPart::ReasoningDone {
-                            item_id: self.item_id.clone(),
-                            text: self.reasoning_text.clone(),
-                        });
-                        self.mode = InlineReasoningMode::Visible;
-                        continue;
-                    }
-
-                    let emit_len = if finishing {
-                        self.buffer.len()
-                    } else {
-                        safe_emit_len_without_partial_tag(&self.buffer, CLOSE_REASONING_TAGS)
-                    };
-                    if emit_len == 0 {
-                        break;
-                    }
-                    let delta = self.buffer[..emit_len].to_string();
-                    self.buffer.drain(..emit_len);
-                    self.reasoning_text.push_str(&delta);
-                    parts.push(StreamTextPart::ReasoningDelta {
-                        item_id: self.item_id.clone(),
-                        delta,
-                    });
-                }
-            }
-        }
-
-        if finishing && matches!(self.mode, InlineReasoningMode::Reasoning) {
-            parts.push(StreamTextPart::ReasoningDone {
-                item_id: self.item_id.clone(),
-                text: self.reasoning_text.clone(),
-            });
-            self.mode = InlineReasoningMode::Visible;
-        }
-
-        parts
-    }
-}
-
-const OPEN_REASONING_TAGS: &[&str] = &["<think>", "<thinking>"];
-const CLOSE_REASONING_TAGS: &[&str] = &["</think>", "</thinking>"];
-
-fn find_open_reasoning_tag(text: &str) -> Option<(usize, usize)> {
-    find_earliest_tag(text, OPEN_REASONING_TAGS)
-}
-
-fn find_close_reasoning_tag(text: &str) -> Option<(usize, usize)> {
-    find_earliest_tag(text, CLOSE_REASONING_TAGS)
-}
-
-fn find_earliest_tag(text: &str, tags: &[&str]) -> Option<(usize, usize)> {
-    tags.iter()
-        .filter_map(|tag| text.find(tag).map(|index| (index, tag.len())))
-        .min_by_key(|(index, _)| *index)
-}
-
-fn safe_emit_len_without_partial_tag(text: &str, tags: &[&str]) -> usize {
-    for hold in (1..=max_tag_len(tags).saturating_sub(1)).rev() {
-        if text.len() >= hold {
-            let suffix_start = next_char_boundary(text, text.len() - hold);
-            let suffix = &text[suffix_start..];
-            if tags.iter().any(|tag| tag.starts_with(suffix)) {
-                return suffix_start;
-            }
-        }
-    }
-    text.len()
-}
-
-fn max_tag_len(tags: &[&str]) -> usize {
-    tags.iter().map(|tag| tag.len()).max().unwrap_or(0)
-}
-
-fn next_char_boundary(text: &str, index: usize) -> usize {
-    if text.is_char_boundary(index) {
-        return index;
-    }
-    text.char_indices()
-        .map(|(i, _)| i)
-        .find(|i| *i > index)
-        .unwrap_or(text.len())
-}
-
-fn validate_chat_finish_reasons(reasons: &[FinishReason], has_tool_calls: bool) -> Result<()> {
-    if reasons.is_empty() {
-        return Err(anyhow!(
-            "completions stream ended without finish_reason; cannot determine completion status"
-        ));
-    }
-
-    for reason in reasons {
-        match (reason, has_tool_calls) {
-            (FinishReason::Stop, false) => {}
-            (FinishReason::ToolCalls, true) | (FinishReason::FunctionCall, true) => {}
-            (FinishReason::Length, _) => {
-                return Err(anyhow!(
-                    "completions response incomplete: finish_reason=length"
-                ));
-            }
-            (FinishReason::ContentFilter, _) => {
-                return Err(anyhow!(
-                    "completions response filtered: finish_reason=content_filter"
-                ));
-            }
-            (reason, _) => {
-                return Err(anyhow!(
-                    "unexpected completions finish_reason {:?} for {} response",
-                    reason,
-                    if has_tool_calls { "tool-call" } else { "text" }
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_chat_tool_calls(tool_calls: &[ChatCompletionMessageToolCall]) -> Result<()> {
-    for (index, call) in tool_calls.iter().enumerate() {
-        if call.id.trim().is_empty() {
-            return Err(anyhow!(
-                "invalid completions tool call at index {index}: missing id"
-            ));
-        }
-        if call.function.name.trim().is_empty() {
-            return Err(anyhow!(
-                "invalid completions tool call at index {index}: missing function name"
-            ));
-        }
-        if call.function.arguments.trim().is_empty() {
-            return Err(anyhow!(
-                "invalid completions tool call at index {index}: missing function arguments"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn compact_indexed_chat_tool_calls(
-    tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall>,
-) -> Vec<ChatCompletionMessageToolCall> {
-    tool_calls.into_values().collect()
-}
-
-async fn emit_tool_call_pending_if_ready<E, Efut>(
-    emitted_pending_tool_calls: &mut HashSet<String>,
-    call_id: &str,
-    name: &str,
-    on_event: &mut E,
-) -> Result<bool>
-where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    if call_id.trim().is_empty() || name.trim().is_empty() {
-        return Ok(false);
-    }
-
-    if emitted_pending_tool_calls.insert(call_id.to_string()) {
-        on_event(AgentEvent::ToolCallPending {
-            call_id: call_id.to_string(),
-            name: name.to_string(),
-        })
-        .await?;
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-fn merge_chat_tool_call_chunk(
-    tool_calls: &mut BTreeMap<usize, ChatCompletionMessageToolCall>,
-    chunk: ChatCompletionMessageToolCallChunk,
-) {
-    let index = chunk.index as usize;
-    let tool_call = tool_calls.entry(index).or_default();
-    if let Some(id) = chunk.id.filter(|id| !id.trim().is_empty()) {
-        tool_call.id = id;
-    }
-    if let Some(function) = chunk.function {
-        if let Some(name) = function.name.filter(|name| !name.trim().is_empty()) {
-            tool_call.function.name = name;
-        }
-        if let Some(arguments) = function.arguments {
-            tool_call.function.arguments.push_str(&arguments);
-        }
-    }
 }

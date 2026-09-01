@@ -1,21 +1,21 @@
 use anyhow::Result;
 #[path = "request_builder/history_budget.rs"]
 mod history_budget;
-#[path = "request_builder/prompt_cache.rs"]
-mod prompt_cache;
 #[path = "request_builder/prompt_plan.rs"]
 pub(crate) mod prompt_plan;
-#[path = "request_builder/provider_serialization.rs"]
-mod provider_serialization;
 #[path = "request_builder/runtime_projection.rs"]
 mod runtime_projection;
-use crate::config::{ApiProtocol, PromptCacheConfig, PromptCacheRetention};
+use crate::config::PromptCacheConfig;
 #[cfg(test)]
 use crate::protocol_frames::ProtocolFrameItem;
 pub(crate) use crate::protocol_frames::history_items_from_frames;
 use crate::protocol_frames::{ProtocolFrame, validate_history_items_complete};
 pub use crate::protocol_frames::{
     ProtocolItem as HistoryItem, ProtocolToolCall as HistoryToolCall,
+};
+use crate::request_builder::prompt_plan::{
+    PlannedPrompt, PromptPlan, PromptPlanner, PromptPlannerInput, PromptSegmentContent,
+    PromptSegmentRole,
 };
 #[cfg(test)]
 use crate::runtime_context::RuntimeFrameKind;
@@ -24,6 +24,7 @@ use crate::runtime_context::{
     FrameVisibility, RuntimeFrame, RuntimeFrameProvenance, RuntimeSource,
 };
 use crate::runtime_context::{PromptContributorKind, RuntimeSnapshot};
+
 #[cfg(test)]
 use crate::user_content::{UserImageAttachment, UserMessageContent};
 #[cfg(test)]
@@ -31,40 +32,11 @@ use crate::{
     evidence::EvidenceRecord, protocol_frames::history_items_to_frames,
     runtime_context::RuntimeFrameIdSeed,
 };
-#[cfg(test)]
-use async_openai::types::chat::ChatCompletionRequestMessage;
-use async_openai::types::chat::CreateChatCompletionRequest;
-use async_openai::types::responses::CreateResponse;
-use prompt_plan::{
-    PlannedPrompt, PromptPlan, PromptPlanner, PromptPlannerInput, PromptSegmentContent,
-    PromptSegmentRole,
-};
-#[cfg(test)]
-use prompt_plan::{PromptPlanBuildInput, build_prompt_plan};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderRequestStrategy {
-    OpenAiCompatible,
-    DeepSeekV4,
-}
-
-impl ProviderRequestStrategy {
-    pub(crate) fn from_provider_and_model(provider: Option<&str>, model_id: &str) -> Self {
-        let provider = provider.unwrap_or_default().to_ascii_lowercase();
-        let model = model_id.to_ascii_lowercase();
-        if (provider == "deepseek" && model.contains("v4")) || model.contains("deepseek-v4") {
-            Self::DeepSeekV4
-        } else {
-            Self::OpenAiCompatible
-        }
-    }
-
-    pub(crate) fn is_deepseek_v4(self) -> bool {
-        matches!(self, Self::DeepSeekV4)
-    }
-}
+#[cfg(test)]
+use crate::request_builder::prompt_plan::{PromptPlanBuildInput, build_prompt_plan};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -101,7 +73,6 @@ pub struct ModelRequestMetadata {
     pub fast_mode: bool,
     pub anthropic_thinking: AnthropicThinkingConfig,
     pub anthropic_betas: Vec<String>,
-    pub cache_control: bool,
 }
 
 pub const DEFAULT_REASONING_EFFORTS: [ModelReasoningEffort; 6] = [
@@ -179,10 +150,6 @@ impl ModelReasoningEffort {
             Self::Max => "max",
             Self::Custom(value) => value,
         }
-    }
-
-    fn requires_compatible_request(&self) -> bool {
-        matches!(self, Self::Max | Self::Custom(_))
     }
 }
 
@@ -302,8 +269,6 @@ impl PromptMessage {
 
 #[derive(Debug, Clone)]
 pub struct RequestBuilderInput<'a> {
-    pub protocol: ApiProtocol,
-    pub provider: Option<&'a str>,
     pub model_id: &'a str,
     pub model: ModelRequestMetadata,
     pub prelude: &'a [PromptMessage],
@@ -313,7 +278,7 @@ pub struct RequestBuilderInput<'a> {
 
 /// Configuration-normalized policy for provider-only current-turn pressure relief.
 /// The dynamic default reserves 20% of the input budget, bounded to 256..65,536
-/// tokens; zero explicitly preserves the legacy reactive-only behavior.
+/// tokens; zero explicitly selects reactive-only pressure handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProtectedContextPolicy {
     pub reserve_tokens: u64,
@@ -349,7 +314,6 @@ pub(crate) struct FrozenEvidence {
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct TestRequestBuilderInput<'a> {
-    pub protocol: ApiProtocol,
     pub model_id: &'a str,
     pub model: ModelRequestMetadata,
     pub prelude: &'a [PromptMessage],
@@ -360,12 +324,7 @@ pub(crate) struct TestRequestBuilderInput<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SelectedPromptRequestInput<'a> {
-    pub protocol: ApiProtocol,
-    pub strategy: ProviderRequestStrategy,
-    pub model_id: &'a str,
-    pub model: ModelRequestMetadata,
-    pub tools: &'a [ToolSpec],
+pub(crate) struct SelectedPromptRequestInput {
     pub prompt_plan: PromptPlan,
     pub budget: BudgetReport,
     pub selected_evidence_ids: Vec<String>,
@@ -437,25 +396,13 @@ impl BudgetReport {
 }
 
 #[derive(Debug, Clone)]
-pub enum BuiltRequest {
-    Responses(CreateResponse),
-    ResponsesCompatible(Value),
-    Completions(CreateChatCompletionRequest),
-    CompletionsCompatible(Value),
-    Anthropic(Value),
-}
-
-#[derive(Debug, Clone)]
 pub struct BuildResult {
-    pub strategy: ProviderRequestStrategy,
-    pub request: BuiltRequest,
     pub budget: BudgetReport,
     #[allow(dead_code)]
     pub prompt_plan: PromptPlan,
     #[allow(dead_code)]
     pub selected_evidence_ids: Vec<String>,
     pub selected_evidence_message: Option<String>,
-    pub cache: PromptCacheReport,
 }
 
 /// Process-local, complete logical units used only to compare adjacent final
@@ -492,6 +439,7 @@ pub(crate) enum LogicalRequestUnitCategory {
     ToolCall,
     ToolOutput,
     Evidence,
+    Composite,
 }
 
 /// The first non-shared boundary between two comparable provider requests.
@@ -521,167 +469,119 @@ impl LogicalRequestUnitCategory {
             Self::ToolCall => "tool_call",
             Self::ToolOutput => "tool_output",
             Self::Evidence => "evidence",
+            Self::Composite => "composite",
         }
     }
 }
 
-/// Produces one unit for each input/message item emitted by the actual protocol
-/// serializer. Digests and serialized byte counts remain process-local.
-pub(crate) fn observe_logical_request(build: &BuildResult) -> LogicalRequestObservation {
-    let (request, items) = provider_request_without_units(build);
-    let items = items.as_array().cloned().unwrap_or_default();
-    let categories = logical_request_unit_categories(build);
-    assert_eq!(
-        items.len(),
-        categories.len(),
-        "prompt segments must categorize every serialized provider input item"
-    );
-    let units = items
-        .into_iter()
-        .zip(categories)
-        .map(|(item, category)| {
-            let serialized = serde_json::to_vec(&item).expect("provider input item serializes");
-            LogicalRequestUnit {
+/// Converts protocol-owned prepared-wire inspection into semantic adjacent-request units.
+/// The request builder never parses protocol fields from the wire body.
+pub(crate) fn observe_prepared_model_request(
+    inspection: &crate::model_runtime::PreparedRequestInspection,
+    prompt_plan: &PromptPlan,
+) -> Result<LogicalRequestObservation> {
+    let semantic_categories = prompt_plan
+        .segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), prompt_segment_category(segment)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let units = inspection
+        .prompt_units
+        .iter()
+        .map(|unit| {
+            let categories = unit
+                .semantic_segment_ids
+                .iter()
+                .map(|id| {
+                    semantic_categories
+                        .get(id.as_str())
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "prepared request references unknown prompt segment '{id}'"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let category = match categories.first().copied() {
+                None => anyhow::bail!("prepared request unit has no semantic prompt origin"),
+                Some(category) if categories.iter().all(|candidate| *candidate == category) => {
+                    category
+                }
+                Some(_) => LogicalRequestUnitCategory::Composite,
+            };
+            Ok(LogicalRequestUnit {
                 category,
-                estimated_tokens: (serialized.len() as u64).div_ceil(4),
+                estimated_tokens: (unit.identity.len() as u64).div_ceil(4),
+                byte_count: unit.identity.len() as u64,
+                digest: sha256_hex(&unit.identity),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LogicalRequestObservation {
+        cohort: LogicalRequestCohort {
+            request_shape_digest: sha256_hex(&inspection.request_shape),
+        },
+        units,
+    })
+}
+
+pub(crate) fn observe_logical_request(build: &BuildResult) -> LogicalRequestObservation {
+    observe_prompt_segments(&build.prompt_plan.segments)
+}
+
+fn observe_prompt_segments(segments: &[prompt_plan::PromptSegment]) -> LogicalRequestObservation {
+    let units = segments
+        .iter()
+        .map(|segment| {
+            let serialized = serde_json::to_vec(&serde_json::json!({
+                "role": segment.role,
+                "content": segment.content,
+                "source": segment.source.contributor_kind,
+            }))
+            .expect("prompt segment serializes");
+            LogicalRequestUnit {
+                category: prompt_segment_category(segment),
+                estimated_tokens: segment.tokens.budget_input_tokens.unwrap_or(0),
                 byte_count: serialized.len() as u64,
                 digest: sha256_hex(&serialized),
             }
         })
         .collect();
+    let shape = segments
+        .iter()
+        .map(|segment| {
+            serde_json::json!({
+                "role": segment.role,
+                "content_kind": match &segment.content {
+                    PromptSegmentContent::Text { .. } => "text",
+                    PromptSegmentContent::UserContent { .. } => "user_content",
+                    PromptSegmentContent::AssistantToolCalls { .. } => "assistant_tool_calls",
+                    PromptSegmentContent::ToolOutput { .. } => "tool_output",
+                },
+            })
+        })
+        .collect::<Vec<_>>();
     LogicalRequestObservation {
         cohort: LogicalRequestCohort {
             request_shape_digest: sha256_hex(
-                &serde_json::to_vec(&request).expect("provider request shape serializes"),
+                &serde_json::to_vec(&shape).expect("prompt shape serializes"),
             ),
         },
         units,
     }
 }
 
-fn provider_request_without_units(build: &BuildResult) -> (Value, Value) {
-    let mut request = match &build.request {
-        BuiltRequest::Responses(request) => {
-            serde_json::to_value(request).expect("responses request serializes")
-        }
-        BuiltRequest::ResponsesCompatible(request)
-        | BuiltRequest::CompletionsCompatible(request) => request.clone(),
-        BuiltRequest::Completions(request) => {
-            serde_json::to_value(request).expect("chat request serializes")
-        }
-        BuiltRequest::Anthropic(request) => {
-            let mut request = request.clone();
-            if let Some(object) = request.as_object_mut() {
-                object.remove("system");
-                object.remove("messages");
-            }
-            let units = build
-                .prompt_plan
-                .segments
-                .iter()
-                .map(|segment| {
-                    serde_json::json!({
-                        "role": segment.role,
-                        "text": segment.text,
-                        "content": segment.content,
-                    })
-                })
-                .collect();
-            return (request, Value::Array(units));
-        }
-    };
-    let items = request
-        .as_object_mut()
-        .and_then(|object| object.remove("input").or_else(|| object.remove("messages")));
-    let mut items = items.unwrap_or(Value::Array(Vec::new()));
-    if build.prompt_plan.protocol == ApiProtocol::Responses
-        && let Some(instructions) = request
-            .as_object_mut()
-            .and_then(|object| object.remove("instructions"))
-        && !instructions.is_null()
-    {
-        let items = items
-            .as_array_mut()
-            .expect("response provider units serialize as an array");
-        items.insert(
-            0,
-            serde_json::json!({
-                "type": "instructions",
-                "content": instructions,
-            }),
-        );
-    }
-    (request, items)
-}
-
-/// Identity of an exclusive plan prefix in its final provider-shaped form.
 #[cfg(test)]
 pub(crate) fn provider_unit_prefix_digest(build: &BuildResult, segment_count: usize) -> String {
-    let segments =
-        &build.prompt_plan.segments[..segment_count.min(build.prompt_plan.segments.len())];
-    let items = match build.prompt_plan.protocol {
-        ApiProtocol::Responses => {
-            let mut items = Vec::new();
-            if let Some(instructions) = provider_serialization::response_instructions(segments) {
-                items.push(serde_json::json!({
-                    "type": "instructions",
-                    "content": instructions,
-                }));
-            }
-            items.extend(segments.iter().flat_map(|segment| {
-                provider_serialization::prompt_segment_to_response_inputs(segment, build.strategy)
-                    .into_iter()
-                    .map(|item| serde_json::to_value(item).expect("response input serializes"))
-            }));
-            items
-        }
-        ApiProtocol::Completions | ApiProtocol::Anthropic => {
-            let (_, items) = provider_request_without_units(build);
-            let unit_count = segments.len();
-            items
-                .as_array()
-                .expect("provider units serialize as an array")[..unit_count]
-                .to_vec()
-        }
-    };
-    let mut bytes = Vec::new();
-    for item in items {
-        let serialized = serde_json::to_vec(&item).expect("provider unit serializes");
-        bytes.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&serialized);
-    }
-    sha256_hex(&bytes)
-}
-
-fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUnitCategory> {
-    match &build.request {
-        BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
-            let mut categories = Vec::new();
-            if provider_serialization::response_instructions(&build.prompt_plan.segments).is_some()
-            {
-                categories.push(LogicalRequestUnitCategory::StableKernel);
-            }
-            categories.extend(build.prompt_plan.segments.iter().flat_map(|segment| {
-                std::iter::repeat_n(
-                    prompt_segment_category(segment),
-                    provider_serialization::prompt_segment_to_response_inputs(
-                        segment,
-                        build.strategy,
-                    )
-                    .len(),
-                )
-            }));
-            categories
-        }
-        BuiltRequest::Completions(_)
-        | BuiltRequest::CompletionsCompatible(_)
-        | BuiltRequest::Anthropic(_) => build
-            .prompt_plan
-            .segments
-            .iter()
-            .map(prompt_segment_category)
-            .collect(),
-    }
+    let end = segment_count.min(build.prompt_plan.segments.len());
+    observe_prompt_segments(&build.prompt_plan.segments[..end])
+        .units
+        .into_iter()
+        .fold(String::new(), |mut digest, unit| {
+            digest.push_str(&unit.digest);
+            digest
+        })
 }
 
 fn prompt_segment_category(segment: &prompt_plan::PromptSegment) -> LogicalRequestUnitCategory {
@@ -696,7 +596,9 @@ fn prompt_segment_category(segment: &prompt_plan::PromptSegment) -> LogicalReque
         PromptContributorKind::TranscriptFrame
         | PromptContributorKind::CurrentTurn
         | PromptContributorKind::Other => match &segment.content {
-            PromptSegmentContent::AssistantToolCalls { .. } => LogicalRequestUnitCategory::ToolCall,
+            PromptSegmentContent::AssistantToolCalls { calls, .. } if !calls.is_empty() => {
+                LogicalRequestUnitCategory::ToolCall
+            }
             PromptSegmentContent::ToolOutput { .. } => LogicalRequestUnitCategory::ToolOutput,
             _ => match segment.role {
                 PromptSegmentRole::User => LogicalRequestUnitCategory::User,
@@ -708,16 +610,6 @@ fn prompt_segment_category(segment: &prompt_plan::PromptSegment) -> LogicalReque
             },
         },
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PromptCacheReport {
-    pub local_prefix_segments: usize,
-    pub configured: bool,
-    pub hint_serialized: bool,
-    pub retention_sent: Option<PromptCacheRetention>,
-    pub local_prefix_fingerprint: Option<String>,
-    pub routing_key: Option<String>,
 }
 
 const MIN_CONTEXT_WINDOW_TOKENS: u64 = 1024;
@@ -733,21 +625,6 @@ pub fn effective_input_budget_tokens(model: ModelRequestMetadata, tools: &[ToolS
         0
     };
     effective_input_budget_tokens_for_tool_tokens(model, tools_tokens)
-}
-
-#[cfg(test)]
-pub(crate) fn request_value_for_test(build: &BuildResult) -> Value {
-    match &build.request {
-        BuiltRequest::Responses(request) => {
-            serde_json::to_value(request).expect("responses request serializes")
-        }
-        BuiltRequest::ResponsesCompatible(request)
-        | BuiltRequest::CompletionsCompatible(request)
-        | BuiltRequest::Anthropic(request) => request.clone(),
-        BuiltRequest::Completions(request) => {
-            serde_json::to_value(request).expect("completions request serializes")
-        }
-    }
 }
 
 fn effective_input_budget_tokens_for_tool_tokens(
@@ -798,7 +675,6 @@ fn build_request_with_frozen_and_policy(
         )
     });
     let planner_input = PromptPlannerInput {
-        protocol: input.protocol,
         model: input.model.clone(),
         model_id: input.model_id,
         prelude: input.prelude,
@@ -815,11 +691,6 @@ fn build_request_with_frozen_and_policy(
     } = PromptPlanner::plan(planner_input)?;
     let prompt_plan = prompt_plan::canonicalize_prompt_plan(prompt_plan);
     build_request_from_selected_prompt(SelectedPromptRequestInput {
-        protocol: input.protocol,
-        strategy: ProviderRequestStrategy::from_provider_and_model(input.provider, input.model_id),
-        model_id: input.model_id,
-        model: input.model,
-        tools: input.tools,
         prompt_plan,
         budget,
         selected_evidence_ids,
@@ -860,8 +731,6 @@ pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<B
         snapshot.push_frame(runtime_frame);
     }
     build_request(RequestBuilderInput {
-        protocol: input.protocol,
-        provider: None,
         model_id: input.model_id,
         model: input.model,
         prelude: &prelude,
@@ -876,16 +745,17 @@ fn runtime_frame_kind(item: &ProtocolFrameItem) -> RuntimeFrameKind {
         ProtocolFrameItem::ContextSummary { .. } => RuntimeFrameKind::Summary,
         ProtocolFrameItem::UserMessage { .. } => RuntimeFrameKind::User,
         ProtocolFrameItem::InternalContinuation { .. } => RuntimeFrameKind::Reasoning,
-        ProtocolFrameItem::AssistantText { .. } => RuntimeFrameKind::Assistant,
-        ProtocolFrameItem::AssistantToolCalls { .. } => RuntimeFrameKind::ToolCall,
+        ProtocolFrameItem::AssistantTurn { calls, .. } if calls.is_empty() => {
+            RuntimeFrameKind::Assistant
+        }
+        ProtocolFrameItem::AssistantTurn { .. } => RuntimeFrameKind::ToolCall,
         ProtocolFrameItem::ToolOutput { .. } => RuntimeFrameKind::ToolOutput,
     }
 }
 
 pub(crate) fn build_request_from_selected_prompt(
-    mut input: SelectedPromptRequestInput<'_>,
+    mut input: SelectedPromptRequestInput,
 ) -> Result<BuildResult> {
-    validate_prompt_plan_protocol(input.protocol, &input.prompt_plan)?;
     let plan_tokens = input.prompt_plan.token_report();
     input.budget.plan_total_prompt_tokens = plan_tokens.total_prompt_tokens;
     input.budget.plan_stable_prompt_tokens = plan_tokens.stable_prompt_tokens;
@@ -903,125 +773,11 @@ pub(crate) fn build_request_from_selected_prompt(
     {
         anyhow::bail!("final prompt and tools exceed selected input budget");
     }
-    let request = match input.protocol {
-        ApiProtocol::Responses => {
-            let request = build_responses_request(
-                input.strategy,
-                input.model_id,
-                input.model.clone(),
-                &input.prompt_plan,
-                input.tools,
-            );
-            if input
-                .model
-                .reasoning_effort
-                .as_ref()
-                .is_some_and(ModelReasoningEffort::requires_compatible_request)
-            {
-                let mut request = serde_json::to_value(request)
-                    .expect("CreateResponse should always serialize to JSON");
-                let fields = request
-                    .as_object_mut()
-                    .expect("CreateResponse should serialize to an object");
-                if let Some(effort) = input
-                    .model
-                    .reasoning_effort
-                    .as_ref()
-                    .filter(|effort| effort.requires_compatible_request())
-                {
-                    let reasoning = fields
-                        .entry("reasoning")
-                        .or_insert_with(|| serde_json::json!({}));
-                    let reasoning = reasoning
-                        .as_object_mut()
-                        .expect("reasoning configuration should serialize as an object");
-                    reasoning.insert("effort".into(), Value::String(effort.as_str().into()));
-                }
-                BuiltRequest::ResponsesCompatible(request)
-            } else {
-                BuiltRequest::Responses(request)
-            }
-        }
-        ApiProtocol::Anthropic => {
-            BuiltRequest::Anthropic(provider_serialization::build_anthropic_request(
-                input.model_id,
-                input.model.clone(),
-                &input.prompt_plan,
-                input.tools,
-            ))
-        }
-        ApiProtocol::Completions => {
-            let request = build_completions_request(
-                input.strategy,
-                input.model_id,
-                input.model.clone(),
-                &input.prompt_plan,
-                input.tools,
-            )?;
-            let needs_reasoning_content = input.prompt_plan.segments.iter().any(|segment| {
-                matches!(
-                    segment.content,
-                    prompt_plan::PromptSegmentContent::AssistantToolCalls {
-                        reasoning_content: Some(_),
-                        ..
-                    }
-                )
-            });
-            if input.strategy.is_deepseek_v4()
-                || input
-                    .model
-                    .reasoning_effort
-                    .as_ref()
-                    .is_some_and(ModelReasoningEffort::requires_compatible_request)
-                || needs_reasoning_content
-            {
-                let mut request = serde_json::to_value(request)
-                    .expect("CreateChatCompletionRequest should always serialize to JSON");
-                if let Some(effort) = input
-                    .model
-                    .reasoning_effort
-                    .as_ref()
-                    .filter(|effort| effort.requires_compatible_request())
-                {
-                    request["reasoning_effort"] = Value::String(effort.as_str().into());
-                }
-                if input.strategy.is_deepseek_v4() {
-                    provider_serialization::apply_deepseek_chat_compat(
-                        &mut request,
-                        &input.model,
-                        &input.prompt_plan,
-                    );
-                } else {
-                    provider_serialization::apply_chat_reasoning_content(
-                        &mut request,
-                        &input.prompt_plan,
-                    );
-                }
-                BuiltRequest::CompletionsCompatible(request)
-            } else {
-                BuiltRequest::Completions(request)
-            }
-        }
-    };
-
-    let cache = prompt_cache_report(
-        input.strategy,
-        input.protocol,
-        input.model_id,
-        &input.model.prompt_cache,
-        &input.prompt_plan,
-        input.tools,
-        input.model.supports_tools,
-        input.model.parallel_tool_calls,
-    );
     Ok(BuildResult {
-        strategy: input.strategy,
-        request,
         budget: input.budget,
         prompt_plan: input.prompt_plan,
         selected_evidence_ids: input.selected_evidence_ids,
         selected_evidence_message: input.selected_evidence_message,
-        cache,
     })
 }
 
@@ -1089,95 +845,6 @@ fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> 
 
 fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
     history_budget::evidence_budget_tokens(context_window_tokens)
-}
-
-fn build_responses_request(
-    strategy: ProviderRequestStrategy,
-    model_id: &str,
-    model: ModelRequestMetadata,
-    prompt_plan: &PromptPlan,
-    tools: &[ToolSpec],
-) -> CreateResponse {
-    provider_serialization::build_responses_request(strategy, model_id, model, prompt_plan, tools)
-}
-
-struct CacheRequestFields {
-    key: Option<String>,
-    retention: Option<PromptCacheRetention>,
-}
-
-fn cache_request_fields(
-    strategy: ProviderRequestStrategy,
-    protocol: ApiProtocol,
-    model_id: &str,
-    config: &PromptCacheConfig,
-    plan: &PromptPlan,
-    tools: &[ToolSpec],
-    supports_tools: bool,
-    parallel_tool_calls: bool,
-) -> CacheRequestFields {
-    prompt_cache::cache_request_fields(
-        strategy,
-        protocol,
-        model_id,
-        config,
-        plan,
-        tools,
-        supports_tools,
-        parallel_tool_calls,
-    )
-}
-
-fn prompt_cache_report(
-    strategy: ProviderRequestStrategy,
-    protocol: ApiProtocol,
-    model_id: &str,
-    config: &PromptCacheConfig,
-    plan: &PromptPlan,
-    tools: &[ToolSpec],
-    supports_tools: bool,
-    parallel_tool_calls: bool,
-) -> PromptCacheReport {
-    prompt_cache::prompt_cache_report(
-        strategy,
-        protocol,
-        model_id,
-        config,
-        plan,
-        tools,
-        supports_tools,
-        parallel_tool_calls,
-    )
-}
-
-/// Provider-visible cache identity. Values are serialized through the same
-/// protocol conversion helpers used to construct the final request.
-#[cfg(test)]
-pub(crate) fn canonical_cache_input(
-    strategy: ProviderRequestStrategy,
-    namespace: &str,
-    protocol: ApiProtocol,
-    model_id: &str,
-    prefix: &[prompt_plan::PromptSegment],
-    tools: &[ToolSpec],
-    supports_tools: bool,
-    parallel_tool_calls: bool,
-) -> Value {
-    prompt_cache::canonical_cache_input(
-        strategy,
-        namespace,
-        protocol,
-        model_id,
-        prefix,
-        tools,
-        supports_tools,
-        parallel_tool_calls,
-    )
-}
-
-#[cfg(test)]
-fn canonical_bytes(value: &Value) -> Vec<u8> {
-    prompt_cache::canonical_bytes(value)
 }
 
 /// Small local SHA-256 implementation to keep fingerprinting dependency-free.
@@ -1251,26 +918,6 @@ pub(crate) fn sha256_hex(input: &[u8]) -> String {
         }
     }
     h.iter().map(|word| format!("{word:08x}")).collect()
-}
-
-fn validate_prompt_plan_protocol(protocol: ApiProtocol, prompt_plan: &PromptPlan) -> Result<()> {
-    if prompt_plan.protocol != protocol {
-        anyhow::bail!(
-            "selected prompt plan protocol mismatch: request={protocol:?} prompt_plan={:?}",
-            prompt_plan.protocol
-        );
-    }
-    Ok(())
-}
-
-fn build_completions_request(
-    strategy: ProviderRequestStrategy,
-    model_id: &str,
-    model: ModelRequestMetadata,
-    prompt_plan: &PromptPlan,
-    tools: &[ToolSpec],
-) -> Result<CreateChatCompletionRequest> {
-    provider_serialization::build_completions_request(strategy, model_id, model, prompt_plan, tools)
 }
 
 pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {

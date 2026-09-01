@@ -55,7 +55,7 @@ impl RunnerSubagentDelegate {
 
     fn route_display_name(
         &self,
-        parent: &Agent<async_openai::config::OpenAIConfig>,
+        parent: &Agent,
         agent_name: &str,
         invocation: &SubagentInvocation,
     ) -> Result<String> {
@@ -216,7 +216,7 @@ fn merge_live_jobs(
     jobs.sort_by_key(|job| (job.pool_ordinal, job.run_id.clone()));
 }
 
-impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDelegate {
+impl SubagentDelegate for RunnerSubagentDelegate {
     fn control<'a>(
         &'a self,
         tool_name: &'a str,
@@ -320,7 +320,7 @@ impl SubagentDelegate<async_openai::config::OpenAIConfig> for RunnerSubagentDele
 
     fn run_named<'a>(
         &'a self,
-        parent: &'a Agent<async_openai::config::OpenAIConfig>,
+        parent: &'a Agent,
         agent_name: &'a str,
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {

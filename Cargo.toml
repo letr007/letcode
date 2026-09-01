@@ -13,7 +13,6 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-async-openai = { version = "0.38", features = ["_api", "byot", "response-types", "responses", "chat-completion"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -37,7 +36,7 @@ sys-locale = "0.3"
 unicode-segmentation = "1"
 pulldown-cmark = "0.13"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
 self_update = { version = "0.44", default-features = false, features = [
     "reqwest",
     "rustls",

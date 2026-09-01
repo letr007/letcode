@@ -80,7 +80,7 @@ fn is_compaction_pruned_tool_output(output_json: &str) -> bool {
 pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) -> Result<()> {
     let mut skill_calls = BTreeSet::new();
     for frame in &snapshot.frames {
-        if let Some(ProtocolFrameItem::AssistantToolCalls { calls, .. }) = &frame.protocol {
+        if let Some(ProtocolFrameItem::AssistantTurn { calls, .. }) = &frame.protocol {
             skill_calls.extend(
                 calls
                     .iter()
@@ -1163,10 +1163,10 @@ mod tests {
                 source_span: Some(span),
             },
         )
-        .with_protocol(ProtocolFrameItem::AssistantToolCalls {
+        .with_protocol(ProtocolFrameItem::AssistantTurn {
             text: None,
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![HistoryToolCall {
                 call_id: call_id.into(),
                 name: "skill".into(),

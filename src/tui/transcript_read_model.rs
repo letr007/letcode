@@ -42,6 +42,12 @@ impl TranscriptTimelineProjection {
                         ),
                     ))
             }
+            TranscriptEvent::AssistantTurn(turn) => {
+                if let Some(content) = turn.text.clone() {
+                    self.timeline
+                        .push_restored_message(MessageRole::Assistant, content);
+                }
+            }
             TranscriptEvent::AssistantMessage { content } => self
                 .timeline
                 .push_restored_message(MessageRole::Assistant, content.clone()),
@@ -244,6 +250,7 @@ impl TranscriptTimelineProjection {
 mod tests {
     use super::*;
     use crate::agent::ContextCompactionEvent;
+    use crate::transcript::TranscriptAssistantTurn;
     use crate::tui::timeline::{TimelineItem, ToolExecutionStatus};
     use crate::user_content::{UserImageAttachment, UserMessageContent};
     use serde_json::json;
@@ -256,6 +263,24 @@ mod tests {
             context_branch_id: None,
             event,
         }
+    }
+
+    #[test]
+    fn restored_v2_assistant_turn_projects_text_without_tool_metadata_noise() {
+        let timeline = timeline_from_transcript_records(&[record(
+            1,
+            TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: Some("final answer".into()),
+                reasoning_content: Some("private reasoning".into()),
+                replay: None,
+                calls: Vec::new(),
+            }),
+        )]);
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Assistant(message)] if message.text == "final answer"
+        ));
     }
 
     #[test]

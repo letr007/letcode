@@ -3,7 +3,7 @@ use crate::agent_event_journal::persist_agent_event;
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{ContextBlockId, ContextViewProjection};
 use crate::protocol_frames::ProtocolFrameItem;
-use crate::request_builder::{TestRequestBuilderInput, build_test_request};
+use crate::request_builder::{ModelRequestMetadata, TestRequestBuilderInput, build_test_request};
 use crate::runtime_context::{
     FrameVisibility, PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
     RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource,
@@ -17,7 +17,6 @@ use crate::transcript::{
     ActiveContextExperiment, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
     TranscriptRecorder, read_records, restore_runtime_snapshot, restore_session_history,
 };
-use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fs;
@@ -167,13 +166,8 @@ fn test_skill_registry() -> Arc<SkillRegistry> {
     )
 }
 
-fn test_agent() -> Agent<OpenAIConfig> {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    Agent::new(client, "m1", 4, 4)
+fn test_agent() -> Agent {
+    Agent::new("m1", 4, 4)
 }
 
 #[test]
@@ -232,6 +226,25 @@ fn fake_modes_select_only_their_target_protocol() {
     assert_eq!(agent.fake_client(), previous);
 }
 
+#[test]
+fn fake_context_is_stable_for_a_turn_and_has_no_provider_secret() {
+    let mut agent = test_agent();
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses protocol supports codex fake");
+    let first = agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("fake context is available");
+    let second = agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("fake context remains available");
+    assert_eq!(first.session_id, second.session_id);
+    assert_ne!(first.turn_id, second.turn_id);
+    let metadata = first.turn_metadata_json().to_string();
+    assert!(!metadata.contains("api_key"));
+    assert!(!metadata.contains("Authorization"));
+}
+
 fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
     TokenUsageEstimate {
         used_tokens,
@@ -242,7 +255,7 @@ fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
     }
 }
 
-fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent<OpenAIConfig> {
+fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent {
     let mut agent = test_agent();
     agent.set_history_for_test(history.clone());
     agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &history);
@@ -251,7 +264,7 @@ fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent<OpenAIConfig> {
     agent
 }
 
-fn append_active_epoch_history(agent: &mut Agent<OpenAIConfig>, history: Vec<HistoryItem>) {
+fn append_active_epoch_history(agent: &mut Agent, history: Vec<HistoryItem>) {
     let existing = agent.history_for_test();
     assert!(history.starts_with(&existing));
     for item in history.into_iter().skip(existing.len()) {
@@ -273,10 +286,10 @@ fn active_epoch_tools() -> Vec<crate::request_builder::ToolSpec> {
 fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
     vec![
         HistoryItem::user("seed"),
-        HistoryItem::AssistantToolCalls {
+        HistoryItem::AssistantTurn {
             text: Some("calling tools".into()),
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![
                 crate::protocol_frames::ProtocolToolCall {
                     call_id: "call-1".into(),
@@ -420,10 +433,10 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
         .expect("cold preview");
     agent.commit_active_epoch(preview);
     agent
-        .append_history_item(HistoryItem::AssistantToolCalls {
+        .append_history_item(HistoryItem::AssistantTurn {
             text: None,
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![crate::protocol_frames::ProtocolToolCall {
                 call_id: "call-1".into(),
                 name: "lookup".into(),
@@ -532,10 +545,10 @@ fn skill_tool_output_invalidates_warm_projection_and_cold_plan_includes_detached
 
     let skill_content = "detached skill material must reach the provider";
     agent
-        .append_history_item(HistoryItem::AssistantToolCalls {
+        .append_history_item(HistoryItem::AssistantTurn {
             text: None,
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![HistoryToolCall {
                 call_id: "skill-call-1".into(),
                 name: "skill".into(),
@@ -765,12 +778,7 @@ fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord 
 
 #[test]
 fn agent_iteration_limit_allows_tool_budget_plus_final_round() {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    let agent = Agent::new(client, "m1", 64, 128);
+    let agent = Agent::new("m1", 64, 128);
 
     assert_eq!(agent.max_tool_calls_limit(), Some(128));
     assert_eq!(agent.max_iterations_limit(), Some(64));
@@ -839,6 +847,496 @@ async fn spawn_chat_completion_server(
         }
     });
     (format!("http://{addr}"), count, handle)
+}
+
+async fn spawn_capturing_server(
+    responses: Vec<&'static str>,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener.local_addr().expect("test server has local addr");
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_count = count.clone();
+    let server_requests = requests.clone();
+    let handle = tokio::spawn(async move {
+        for response in responses {
+            let (mut socket, _) = listener.accept().await.expect("server accepts request");
+            let request = read_complete_http_request(&mut socket).await;
+            server_requests
+                .lock()
+                .expect("request capture lock")
+                .push(request);
+            server_count.fetch_add(1, Ordering::SeqCst);
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("server writes response");
+            socket.shutdown().await.expect("server closes response");
+        }
+    });
+    (format!("http://{addr}"), count, requests, handle)
+}
+
+fn captured_request_headers(request: &[u8]) -> String {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("request has headers");
+    String::from_utf8(request[..header_end].to_vec()).expect("request headers are UTF-8")
+}
+
+fn captured_request_target(request: &[u8]) -> &str {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("request has headers");
+    std::str::from_utf8(&request[..header_end])
+        .expect("request headers are UTF-8")
+        .lines()
+        .next()
+        .expect("request has request line")
+}
+
+fn captured_request_body(request: &[u8]) -> serde_json::Value {
+    let body_start = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("request has headers")
+        + 4;
+    serde_json::from_slice(&request[body_start..]).expect("request body is JSON")
+}
+
+fn install_resolved_test_route(agent: &mut Agent, protocol: ApiProtocol, base_url: &str) {
+    let protocol_name = protocol.as_str();
+    let anthropic_settings = if protocol == ApiProtocol::Anthropic {
+        "\n[providers.vendor.models.model.protocol_settings]\nanthropic_thinking = { mode = \"disabled\" }"
+    } else {
+        ""
+    };
+    let config = format!(
+        r#"active_provider = "vendor"
+[providers.vendor]
+protocol = "{protocol_name}"
+default_model = "model"
+flavor = "standard"
+[providers.vendor.auth]
+type = "bearer"
+credential = "resolved-key"
+[providers.vendor.endpoints]
+base_url = "{base_url}"
+[providers.vendor.retry]
+enabled = true
+max_attempts = 3
+max_recovery_attempts = 1
+initial_delay_secs = 1
+exponential_backoff = false
+backoff_multiplier = 1.0
+jitter_secs = 0
+[providers.vendor.models.model]
+[providers.vendor.models.model.capabilities]
+tools = true
+prompt_cache = true
+generation = {{ max_output_tokens = true }}
+[providers.vendor.models.model.generation]
+max_output_tokens = 256
+[providers.vendor.models.model.cache]
+enabled = true
+namespace = "test"
+{anthropic_settings}
+"#
+    );
+    let route = crate::model_runtime::RuntimeConfig::from_toml(&config)
+        .expect("resolved test route config")
+        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+        .expect("resolved test route")
+        .route("vendor", "model")
+        .expect("resolved model route")
+        .clone();
+
+    agent.set_primary_route(ModelRoute::new("vendor", "model"));
+    agent.set_model("model");
+    agent.set_default_protocol(protocol);
+    agent.set_model_catalog(HashMap::from([(
+        "model".into(),
+        ModelRequestMetadata {
+            context_window: Some(8_192),
+            max_output_tokens: Some(256),
+            supports_tools: false,
+            prompt_cache: crate::config::PromptCacheConfig {
+                enabled: true,
+                namespace: Some("test".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )]));
+    agent.set_resolved_model_route(Some(Arc::new(route)));
+}
+
+fn lifecycle_event_names(events: &[AgentEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TurnStarted(_) => Some("started"),
+            AgentEvent::TurnContinuationBoundary => Some("boundary"),
+            AgentEvent::TurnFinalized(_) => Some("finalized"),
+            _ => None,
+        })
+        .collect()
+}
+
+fn resolved_responses_final_sse(text: &str) -> &'static str {
+    let delta = serde_json::to_string(&json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "item_id": "message-1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": text,
+    }))
+    .expect("responses delta serializes");
+    let completed = serde_json::to_string(&json!({
+        "type": "response.completed",
+        "sequence_number": 2,
+        "response": {
+            "id": "response-1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "background": false,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "model",
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": {},
+            "store": true,
+            "temperature": 1,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1,
+            "truncation": "disabled",
+            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
+            "user": null,
+            "metadata": {}
+        }
+    }))
+    .expect("responses completion serializes");
+    sse_response(format!(
+        "data: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n"
+    ))
+}
+
+fn anthropic_final_sse(text: &str) -> &'static str {
+    let text = serde_json::to_string(text).expect("anthropic text serializes");
+    sse_response(format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg-final\",\"model\":\"model\",\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    ))
+}
+
+async fn run_resolved_normal_turn(
+    protocol: ApiProtocol,
+    response: &'static str,
+) -> (
+    String,
+    Vec<AgentEvent>,
+    Vec<HistoryItem>,
+    Vec<Vec<u8>>,
+    usize,
+) {
+    let (base_url, request_count, requests, server) = spawn_capturing_server(vec![response]).await;
+    let mut agent = Agent::new("model", 2, 0);
+    install_resolved_test_route(&mut agent, protocol, &format!("{base_url}/v1"));
+    assert!(agent.resolved_model_route().is_some());
+    let mut events = Vec::new();
+
+    let text = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("resolved normal turn completes");
+
+    server.await.expect("capturing server completes");
+    let requests = Arc::try_unwrap(requests)
+        .expect("request captures have one owner")
+        .into_inner()
+        .expect("request capture lock");
+    (
+        text,
+        events,
+        agent.history_for_test(),
+        requests,
+        request_count.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn resolved_production_path_normal_turns_cover_all_protocols() {
+    let cases = [
+        (
+            ApiProtocol::Responses,
+            resolved_responses_final_sse("responses reply"),
+            "/responses",
+        ),
+        (
+            ApiProtocol::Completions,
+            chat_final_sse("completions reply"),
+            "/chat/completions",
+        ),
+        (
+            ApiProtocol::Anthropic,
+            anthropic_final_sse("anthropic reply"),
+            "/messages",
+        ),
+    ];
+
+    for (protocol, response, endpoint_path) in cases {
+        let (text, events, history, requests, request_count) =
+            run_resolved_normal_turn(protocol, response).await;
+        let expected_text = match protocol {
+            ApiProtocol::Responses => "responses reply",
+            ApiProtocol::Completions => "completions reply",
+            ApiProtocol::Anthropic => "anthropic reply",
+        };
+        assert_eq!(text, expected_text);
+        assert!(history.iter().any(|item| matches!(
+            item,
+            HistoryItem::AssistantTurn { text: Some(text), calls, .. }
+                if text == expected_text && calls.is_empty()
+        )));
+        assert_eq!(request_count, 1);
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let headers = captured_request_headers(request);
+        assert!(captured_request_target(request).contains(endpoint_path));
+        assert!(headers.contains("POST "));
+        assert!(headers.contains("content-type: application/json"));
+        assert!(headers.contains("accept: text/event-stream"));
+        let body = captured_request_body(request);
+        assert_eq!(body["model"], "model");
+        assert_eq!(body["stream"], true);
+        if protocol == ApiProtocol::Anthropic {
+            assert!(headers.contains("anthropic-version: 2023-06-01"));
+            assert!(body["messages"].is_array());
+        }
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::TurnStarted(_),
+                ..,
+                AgentEvent::TurnContinuationBoundary,
+                AgentEvent::TurnFinalized(_)
+            ]
+        ));
+        assert_eq!(
+            lifecycle_event_names(&events),
+            vec!["started", "boundary", "finalized"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolved_production_path_persists_assistant_turn() {
+    let (text, events, history, requests, request_count) = run_resolved_normal_turn(
+        ApiProtocol::Responses,
+        resolved_responses_final_sse("persisted reply"),
+    )
+    .await;
+    assert_eq!(text, "persisted reply");
+    assert_eq!(request_count, 1);
+    assert_eq!(requests.len(), 1);
+    assert!(history.iter().any(|item| matches!(item, HistoryItem::AssistantTurn { text: Some(text), calls, .. } if text == "persisted reply" && calls.is_empty())));
+    assert!(events.iter().any(|event| matches!(event, AgentEvent::AssistantMessage { content } if content == "persisted reply")));
+}
+
+#[tokio::test]
+async fn resolved_production_path_retries_before_finalizing() {
+    let first = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (base_url, request_count, requests, server) =
+        spawn_capturing_server(vec![first, resolved_responses_final_sse("after retry")]).await;
+    let mut agent = Agent::new("model", 2, 0);
+    install_resolved_test_route(
+        &mut agent,
+        ApiProtocol::Responses,
+        &format!("{base_url}/v1"),
+    );
+    let mut events = Vec::new();
+    let text = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("resolved retry completes");
+    server.await.expect("retry server completes");
+
+    assert_eq!(text, "after retry");
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(requests.lock().expect("request captures lock").len(), 2);
+    let retry_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::LlmRetryScheduled(_) => Some("scheduled"),
+            AgentEvent::LlmRetryStarted(_) => Some("started"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retry_events, vec!["scheduled", "started"]);
+    let scheduled = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::LlmRetryScheduled(_)))
+        .expect("retry scheduled event");
+    let started = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::LlmRetryStarted(_)))
+        .expect("retry started event");
+    let boundary = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TurnContinuationBoundary))
+        .expect("retry turn boundary");
+    let finalized = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TurnFinalized(_)))
+        .expect("retry turn finalized");
+    assert!(scheduled < started && started < boundary && boundary < finalized);
+    let completed = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::LlmRequestTelemetry(telemetry)
+                if telemetry.phase == LlmRequestTelemetryPhase::Completed =>
+            {
+                Some(telemetry)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].attempt, 2);
+    assert_eq!(
+        completed[0].provider_response_id.as_deref(),
+        Some("response-1")
+    );
+}
+
+#[tokio::test]
+async fn resolved_production_path_cache_usage_and_wire_report_are_truthful() {
+    let body = sse_response(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"cached\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-cache\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":3}}}}\n\n".to_string(),
+    );
+    let (base_url, _, requests, server) = spawn_capturing_server(vec![body]).await;
+    let mut agent = Agent::new("model", 2, 0);
+    install_resolved_test_route(
+        &mut agent,
+        ApiProtocol::Responses,
+        &format!("{base_url}/v1"),
+    );
+    let mut events = Vec::new();
+    let text = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("cache turn completes");
+    server.await.expect("cache server completes");
+    assert_eq!(text, "cached");
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TokenUsageUpdated {
+                cached_tokens,
+                cache_report: Some(report),
+                ..
+            } => Some((*cached_tokens, report)),
+            _ => None,
+        })
+        .expect("usage event");
+    assert_eq!(usage.0, 4);
+    assert!(usage.1.hint_serialized);
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::LlmRequestTelemetry(telemetry)
+                if telemetry.phase == LlmRequestTelemetryPhase::Completed =>
+            {
+                Some(telemetry)
+            }
+            _ => None,
+        })
+        .expect("completed telemetry");
+    assert_eq!(completed.cache_write_tokens, Some(3));
+    assert_eq!(
+        completed.provider_response_id.as_deref(),
+        Some("response-cache")
+    );
+    let requests = requests.lock().expect("request captures lock");
+    let request_body = captured_request_body(&requests[0]);
+    assert!(request_body["prompt_cache_key"].is_string());
+}
+
+#[tokio::test]
+async fn resolved_production_path_fake_decoration_adds_request_metadata() {
+    let (base_url, request_count, requests, server) =
+        spawn_capturing_server(vec![resolved_responses_final_sse("fake reply")]).await;
+    let mut agent = Agent::new("model", 2, 0);
+    install_resolved_test_route(
+        &mut agent,
+        ApiProtocol::Responses,
+        &format!("{base_url}/v1"),
+    );
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses fake decoration is supported");
+    let text = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("fake-decorated resolved turn completes");
+    server.await.expect("fake server completes");
+
+    assert_eq!(text, "fake reply");
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    let requests = requests.lock().expect("request captures lock");
+    let headers = captured_request_headers(&requests[0]);
+    let body = captured_request_body(&requests[0]);
+    assert!(headers.contains("originator: codex_exec"));
+    assert!(headers.contains("x-codex-turn-metadata:"));
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["store"], false);
+    assert!(body["client_metadata"]["thread_id"].is_string());
+    assert!(body["client_metadata"]["x-codex-installation-id"].is_string());
 }
 
 fn sse_response(body: String) -> &'static str {
@@ -1063,56 +1561,10 @@ fn chat_multiple_usage_sse() -> &'static str {
 }
 
 #[tokio::test]
-async fn chat_stream_emits_one_final_usage_event_for_multiple_usage_snapshots() {
-    let (base_url, _, server) = spawn_chat_completion_server(vec![chat_multiple_usage_sse()]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 0);
-    let mut events = Vec::new();
-
-    agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("chat stream completes");
-
-    let usage_events = events
-        .iter()
-        .filter(|event| matches!(event, AgentEvent::TokenUsageUpdated { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(usage_events.len(), 1);
-    assert!(matches!(
-        usage_events[0],
-        AgentEvent::TokenUsageUpdated {
-            used_tokens: 14,
-            input_tokens: 10,
-            output_tokens: 4,
-            ..
-        }
-    ));
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
 async fn responses_installs_provider_anchor_after_assistant_frame() {
     let (base_url, _, server) =
         spawn_chat_completion_server(vec![responses_final_sse("final reply")]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 0);
+    let mut agent = Agent::new("m1", 1, 0);
 
     let result = agent
         .run_stream_async(
@@ -1134,82 +1586,6 @@ async fn responses_installs_provider_anchor_after_assistant_frame() {
     };
     assert_eq!(agent.provider_usage_anchor_for_test(), Some(expected));
     assert_eq!(agent.projected_token_usage(), Some(expected));
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn chat_tool_calls_round_trip_reasoning_content_in_follow_up_request() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let base_url = format!(
-        "http://{}",
-        listener.local_addr().expect("server has address")
-    );
-    let server = tokio::spawn(async move {
-        let (mut first_socket, _) = listener
-            .accept()
-            .await
-            .expect("server accepts first request");
-        let _ = read_complete_http_request(&mut first_socket).await;
-        first_socket
-            .write_all(
-                chat_tool_batch_sse("workflow__todos", "call-1", r#"{"items":[]}"#.into())
-                    .as_bytes(),
-            )
-            .await
-            .expect("server writes first response");
-        first_socket
-            .shutdown()
-            .await
-            .expect("server closes first response");
-
-        let (mut second_socket, _) = listener
-            .accept()
-            .await
-            .expect("server accepts second request");
-        let second_request = read_complete_http_request(&mut second_socket).await;
-        let body_start = second_request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("request has headers")
-            + 4;
-        let body: serde_json::Value =
-            serde_json::from_slice(&second_request[body_start..]).expect("request body is JSON");
-        let assistant = body["messages"]
-            .as_array()
-            .expect("request has messages")
-            .iter()
-            .find(|message| message["role"] == "assistant")
-            .expect("follow-up request has assistant tool-call message");
-        assert_eq!(assistant["reasoning_content"], "inspect then call the tool");
-        second_socket
-            .write_all(chat_final_sse("done").as_bytes())
-            .await
-            .expect("server writes second response");
-        second_socket
-            .shutdown()
-            .await
-            .expect("server closes second response");
-    });
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 2, 1);
-
-    let result = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("chat stream completes");
-
-    assert_eq!(result, "done");
     server.await.expect("server task should finish");
 }
 
@@ -1284,12 +1660,7 @@ async fn responses_tool_calls_preserve_reasoning_in_live_event_and_follow_up_req
             .await
             .expect("server closes second response");
     });
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "deepseek-v4-flash", 2, 1);
+    let mut agent = Agent::new("deepseek-v4-flash", 2, 1);
     let reasoning_batches = Arc::new(Mutex::new(Vec::new()));
     let observed_batches = reasoning_batches.clone();
 
@@ -1335,12 +1706,7 @@ async fn responses_completed_finalizes_with_unfinished_todos_when_auto_continue_
     })]);
     let (base_url, request_count, server) =
         spawn_chat_completion_server(vec![todo_response, responses_final_sse("done")]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 2, 1);
+    let mut agent = Agent::new("m1", 2, 1);
     let mut internal_continuations = 0;
     let mut scheduled_continuations = 0;
     let mut finalized_outcomes = Vec::new();
@@ -1372,77 +1738,8 @@ async fn responses_completed_finalizes_with_unfinished_todos_when_auto_continue_
     server.await.expect("server task should finish");
 }
 
-#[tokio::test]
-async fn chat_tool_call_pending_waits_for_complete_descriptor_and_follows_text_delta() {
-    #[derive(Debug, PartialEq, Eq)]
-    enum Observation {
-        Text(String),
-        ToolCallPending { call_id: String, name: String },
-    }
-
-    let (base_url, _, server) =
-        spawn_chat_completion_server(vec![chat_tool_call_fragment_sse(), chat_final_sse("done")])
-            .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 2, 1);
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let delta_observations = observations.clone();
-    let event_observations = observations.clone();
-
-    let result = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            move |delta| {
-                delta_observations
-                    .lock()
-                    .expect("observation lock")
-                    .push(Observation::Text(delta.to_string()));
-                std::future::ready(Ok(()))
-            },
-            move |event| {
-                if let AgentEvent::ToolCallPending { call_id, name } = event {
-                    event_observations
-                        .lock()
-                        .expect("observation lock")
-                        .push(Observation::ToolCallPending { call_id, name });
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("chat stream completes");
-
-    assert_eq!(result, "same deltadone");
-    let observations = Arc::try_unwrap(observations)
-        .expect("all observation callbacks have completed")
-        .into_inner()
-        .expect("observation lock is not poisoned");
-    assert_eq!(
-        observations,
-        vec![
-            Observation::Text("same delta".into()),
-            Observation::ToolCallPending {
-                call_id: "call-8".into(),
-                name: "workflow__todos".into(),
-            },
-            Observation::Text("done".into()),
-        ]
-    );
-    server.await.expect("server task should finish");
-}
-
-fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenAIConfig> {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent {
+    let mut agent = Agent::new("m1", 4, 4);
     agent.set_default_protocol(protocol);
     agent.set_model_catalog(HashMap::from([(
         "m1".into(),
@@ -1502,20 +1799,7 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
                 )
                 .await
         }
-        ApiProtocol::Completions => {
-            agent
-                .run_oai_comp_stream_async(
-                    "current user",
-                    |_| std::future::ready(Ok(())),
-                    |event| {
-                        events.push(event.clone());
-                        compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-                        std::future::ready(Ok(()))
-                    },
-                    |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-                )
-                .await
-        }
+        ApiProtocol::Completions => unreachable!("legacy chat loop was removed"),
         ApiProtocol::Anthropic => unreachable!("pressure test does not use Anthropic"),
     }
     .expect("pressure compaction successor should complete");
@@ -1538,13 +1822,6 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
         .position(|event| matches!(event, AgentEvent::ContextCompacted(_)))
         .expect("pressure compaction completes");
     assert!(started_at < compacted_at);
-    if protocol == ApiProtocol::Completions {
-        assert!(
-            events[started_at..compacted_at]
-                .iter()
-                .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
-        );
-    }
     assert_eq!(
         requests.load(Ordering::SeqCst),
         2,
@@ -1702,10 +1979,10 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
         .append_history_item(HistoryItem::user("current user"))
         .expect("current message appends");
     agent
-        .append_history_item(HistoryItem::AssistantToolCalls {
+        .append_history_item(HistoryItem::AssistantTurn {
             text: None,
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![HistoryToolCall {
                 call_id: "pending".into(),
                 name: "fs__read".into(),
@@ -1809,12 +2086,7 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
 
 #[test]
 fn helper_agents_allow_one_iteration_plus_semantic_recovery_attempts() {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut agent = Agent::new("m1", 4, 4);
     let mut retry = test_retry_config();
     retry.max_recovery_attempts = 2;
     agent.set_retry_config(retry);
@@ -2438,10 +2710,10 @@ struct CapturingSubagentDelegate {
     fixer_tasks: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-impl SubagentDelegate<OpenAIConfig> for StaticSubagentDelegate {
+impl SubagentDelegate for StaticSubagentDelegate {
     fn run_named<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         _agent_name: &'a str,
         _invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
@@ -2450,10 +2722,10 @@ impl SubagentDelegate<OpenAIConfig> for StaticSubagentDelegate {
     }
 }
 
-impl SubagentDelegate<OpenAIConfig> for RecordingControlDelegate {
+impl SubagentDelegate for RecordingControlDelegate {
     fn run_named<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         agent_name: &'a str,
         _invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
@@ -2479,10 +2751,10 @@ impl SubagentDelegate<OpenAIConfig> for RecordingControlDelegate {
     }
 }
 
-impl SubagentDelegate<OpenAIConfig> for CapturingSubagentDelegate {
+impl SubagentDelegate for CapturingSubagentDelegate {
     fn run_named<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         agent_name: &'a str,
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
@@ -2517,10 +2789,10 @@ struct CountingSubagentDelegate {
     max_active: Arc<AtomicUsize>,
 }
 
-impl SubagentDelegate<OpenAIConfig> for CountingSubagentDelegate {
+impl SubagentDelegate for CountingSubagentDelegate {
     fn run_named<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         agent_name: &'a str,
         _invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
@@ -2540,10 +2812,10 @@ impl SubagentDelegate<OpenAIConfig> for CountingSubagentDelegate {
     }
 }
 
-impl SubagentDelegate<OpenAIConfig> for PollCountingSubagentDelegate {
+impl SubagentDelegate for PollCountingSubagentDelegate {
     fn run_named<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         agent_name: &'a str,
         _invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
@@ -2559,10 +2831,10 @@ impl SubagentDelegate<OpenAIConfig> for PollCountingSubagentDelegate {
     }
 }
 
-impl SubagentDelegate<OpenAIConfig> for OverlapSubagentDelegate {
+impl SubagentDelegate for OverlapSubagentDelegate {
     fn run_named<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         agent_name: &'a str,
         _invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
@@ -2585,7 +2857,7 @@ impl SubagentDelegate<OpenAIConfig> for OverlapSubagentDelegate {
     }
 }
 
-fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate<OpenAIConfig>> {
+fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate> {
     Arc::new(StaticSubagentDelegate { result })
 }
 
@@ -2615,7 +2887,7 @@ fn parent_with_delegate_advertises_subagent_control_tools() {
 fn capturing_delegate(
     result: ToolResult,
 ) -> (
-    Arc<dyn SubagentDelegate<OpenAIConfig>>,
+    Arc<dyn SubagentDelegate>,
     Arc<std::sync::Mutex<Vec<String>>>,
     Arc<std::sync::Mutex<Vec<String>>>,
 ) {
@@ -2809,19 +3081,6 @@ async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
             "call-agent__fixer"
         ]
     );
-}
-
-#[test]
-fn child_agent_applies_runtime_max_tool_call_override() {
-    let agent = test_agent();
-    let child =
-        AgentFactory::create_child_with_max_tool_calls(&agent, &AgentTemplate::fixer(), Some(1));
-
-    assert_eq!(child.max_tool_calls_limit(), Some(1));
-    let error = child
-        .ensure_tool_call_budget(0, 2)
-        .expect_err("tool-call budget should be enforced");
-    assert!(error.to_string().contains("too many tool calls"));
 }
 
 #[test]
@@ -3101,12 +3360,7 @@ async fn wait_and_background_delivery_apply_subagent_effects_once_per_turn() {
 
 #[test]
 fn model_switch_uses_new_metadata_for_next_request_build() {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 1);
+    let mut agent = Agent::new("m1", 1, 1);
 
     let mut catalog = HashMap::new();
     catalog.insert(
@@ -3137,7 +3391,6 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         .expect("history append succeeds");
     let history = agent.history_items();
     let b1 = build_test_request(TestRequestBuilderInput {
-        protocol: ApiProtocol::Responses,
         model_id: agent.model(),
         model: agent.active_model_metadata(),
         prelude: &agent.prelude,
@@ -3153,7 +3406,6 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
     agent.set_model("m2");
     let history = agent.history_items();
     let b2 = build_test_request(TestRequestBuilderInput {
-        protocol: ApiProtocol::Responses,
         model_id: agent.model(),
         model: agent.active_model_metadata(),
         prelude: &agent.prelude,
@@ -3201,34 +3453,16 @@ fn reasoning_effort_selection_is_scoped_to_each_model() {
 }
 
 #[test]
-fn compatible_chat_delta_reads_native_reasoning_fields() {
-    for (field, expected) in [
-        ("reasoning_content", "plan"),
-        ("reasoning", "think"),
-        ("thinking", "ponder"),
-    ] {
-        let raw = serde_json::json!({
-            "content": null,
-            field: expected,
-        });
-        let delta: CompatibleChatCompletionStreamResponseDelta =
-            serde_json::from_value(raw).expect("delta deserializes");
-
-        assert_eq!(delta.reasoning_delta().as_deref(), Some(expected));
-    }
-}
-
-#[test]
 fn protocol_frames_remain_authoritative_for_history_cache() {
     let mut agent = test_agent();
     agent
         .append_history_item(HistoryItem::user("hello"))
         .expect("user append succeeds");
     agent
-        .append_history_item(HistoryItem::AssistantToolCalls {
+        .append_history_item(HistoryItem::AssistantTurn {
             text: Some("working".into()),
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
         })
         .expect("tool call append succeeds");
@@ -3253,7 +3487,7 @@ fn protocol_frames_remain_authoritative_for_history_cache() {
 /// Phase 0 baseline: pin the live in-memory consistency of the three protocol
 /// representations (history / protocol_frames / snapshot.active_protocol_frames)
 /// before the event-sourcing refactor. Item-wise, not just length.
-fn assert_three_way_protocol_consistency(agent: &Agent<OpenAIConfig>) {
+fn assert_three_way_protocol_consistency(agent: &Agent) {
     let frames = agent.protocol_frames_for_test();
     let history = agent.history_for_test();
     let active = agent.runtime_snapshot.active_protocol_frames();
@@ -3280,10 +3514,10 @@ fn session_state_consistency_live_append_three_way() {
         .append_history_item(HistoryItem::user("hello"))
         .expect("user append");
     agent
-        .append_history_item(HistoryItem::AssistantToolCalls {
+        .append_history_item(HistoryItem::AssistantTurn {
             text: Some("working".into()),
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
         })
         .expect("tool call append");
@@ -3338,7 +3572,7 @@ fn resume_clears_proc_local_identity_and_observation_state() {
             .expect("cold preview");
         agent.commit_active_epoch(preview.clone());
         agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
-        agent.commit_final_logical_request(&preview.build);
+        agent.commit_logical_observation(observe_logical_request(&preview.build));
         agent
     };
 
@@ -3378,16 +3612,7 @@ async fn session_state_consistency_after_manual_compaction_three_way() {
     let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new(
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(base_url)
-                .with_api_key("test"),
-        ),
-        "m1",
-        8,
-        8,
-    );
+    let mut agent = Agent::new("m1", 8, 8);
     agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
@@ -3664,26 +3889,17 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
     let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new(
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(base_url)
-                .with_api_key("test"),
-        ),
-        "m1",
-        8,
-        8,
-    );
+    let mut agent = Agent::new("m1", 8, 8);
     agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
             HistoryItem::user("older turn"),
             HistoryItem::assistant("older answer"),
             HistoryItem::user("active request"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![HistoryToolCall {
                     call_id: "call-pending".into(),
                     name: "fs__read".into(),
@@ -3738,7 +3954,7 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
     assert_eq!(agent.turn.current_turn_start_index, None);
     assert!(matches!(
         agent.history_for_test().get(1),
-        Some(HistoryItem::AssistantToolCalls { .. })
+        Some(HistoryItem::AssistantTurn { .. })
     ));
     server.await.expect("server task should finish");
 }
@@ -3747,16 +3963,7 @@ async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_
     let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new(
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(base_url)
-                .with_api_key("test"),
-        ),
-        "m1",
-        8,
-        8,
-    );
+    let mut agent = Agent::new("m1", 8, 8);
     agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
@@ -3792,25 +3999,16 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
     let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new(
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(base_url)
-                .with_api_key("test"),
-        ),
-        "m1",
-        8,
-        8,
-    );
+    let mut agent = Agent::new("m1", 8, 8);
     agent.set_default_protocol(ApiProtocol::Completions);
     let history = vec![
         HistoryItem::user("older turn"),
         HistoryItem::assistant("older answer"),
         HistoryItem::user("active request"),
-        HistoryItem::AssistantToolCalls {
+        HistoryItem::AssistantTurn {
             text: None,
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![HistoryToolCall {
                 call_id: "call-pending".into(),
                 name: "fs__read".into(),
@@ -3854,16 +4052,7 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
     let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new(
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(base_url)
-                .with_api_key("test"),
-        ),
-        "m1",
-        8,
-        8,
-    );
+    let mut agent = Agent::new("m1", 8, 8);
     agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
@@ -3892,12 +4081,7 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
 async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![sse_response("data: [DONE]\n\n".into())]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut agent = Agent::new("m1", 4, 4);
     agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
@@ -4035,18 +4219,16 @@ async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
     .await
     .expect("ordinary request builds from the installed runtime snapshot");
 
-    let request = match prepared.build.request {
-        BuiltRequest::Responses(request) => serde_json::to_value(request),
-        BuiltRequest::ResponsesCompatible(request) => Ok(request),
-        BuiltRequest::Anthropic(_) => panic!("expected responses request"),
-        BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
-            panic!("expected responses request")
-        }
-    };
-    let request = request.expect("request serializes");
-    let json = serde_json::to_string(&request).expect("request serializes");
-    assert!(json.contains("INSTALLED-RUNTIME-SNAPSHOT-CONTENT"));
-    assert!(!json.contains("EXTERNAL-TRANSCRIPT-CONTENT"));
+    let rendered = prepared
+        .build
+        .prompt_plan
+        .segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("INSTALLED-RUNTIME-SNAPSHOT-CONTENT"));
+    assert!(!rendered.contains("EXTERNAL-TRANSCRIPT-CONTENT"));
 }
 
 #[tokio::test]
@@ -4057,12 +4239,7 @@ async fn responses_stream_recovers_from_response_error_after_visible_output() {
     );
     let (base_url, request_count, server) =
         spawn_chat_completion_server(vec![interrupted, responses_final_sse("continued")]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut agent = Agent::new("m1", 4, 4);
     agent.set_retry_config(test_retry_config());
     let mut deltas = Vec::new();
     let mut issues = Vec::new();
@@ -4099,12 +4276,7 @@ async fn responses_stream_does_not_semantically_recover_hard_failure_after_visib
             .into(),
     );
     let (base_url, request_count, server) = spawn_chat_completion_server(vec![failed]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut agent = Agent::new("m1", 4, 4);
     agent.set_retry_config(test_retry_config());
     let mut issues = Vec::new();
 
@@ -4137,12 +4309,7 @@ async fn responses_stream_exhausts_semantic_recovery_budget_across_iterations() 
     );
     let (base_url, request_count, server) =
         spawn_chat_completion_server(vec![interrupted, interrupted]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut agent = Agent::new("m1", 4, 4);
     let mut retry = test_retry_config();
     retry.max_recovery_attempts = 1;
     agent.set_retry_config(retry);
@@ -4173,12 +4340,7 @@ async fn responses_stream_preserves_recovery_state_when_iteration_budget_is_exha
             .into(),
     );
     let (base_url, request_count, server) = spawn_chat_completion_server(vec![interrupted]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 4);
+    let mut agent = Agent::new("m1", 1, 4);
     let mut issues = 0;
     let mut recovery_continuations = 0;
     let mut assistant_messages = Vec::new();
@@ -4218,477 +4380,13 @@ async fn responses_stream_preserves_recovery_state_when_iteration_budget_is_exha
         agent
             .history_for_test()
             .iter()
-            .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "partial"))
+            .any(|item| matches!(item, HistoryItem::AssistantTurn { text: Some(text), .. } if text == "partial"))
     );
     assert!(
         agent
             .history_for_test()
             .iter()
             .any(|item| matches!(item, HistoryItem::InternalContinuation { .. }))
-    );
-    assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_retries_read_error_before_visible_output() {
-    let body = r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let first_response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
-    let second_response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .into_boxed_str(),
-        );
-    let (base_url, request_count, server) =
-        spawn_chat_completion_server(vec![first_response, second_response]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(2_000),
-            supports_tools: true,
-            supports_reasoning: false,
-            ..Default::default()
-        },
-    )]));
-    agent.set_retry_config(test_retry_config());
-    let mut deltas = Vec::new();
-    let mut audit_telemetry = Vec::new();
-
-    let result = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |delta| {
-                deltas.push(delta.to_string());
-                std::future::ready(Ok(()))
-            },
-            |event| {
-                if let AgentEvent::LlmRequestTelemetry(telemetry) = event {
-                    audit_telemetry.push(telemetry);
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("pre-output stream read failure should retry");
-
-    assert_eq!(result, "ok");
-    assert_eq!(deltas, vec!["ok"]);
-    assert_eq!(
-        audit_telemetry
-            .iter()
-            .map(|telemetry| (telemetry.phase, telemetry.attempt))
-            .collect::<Vec<_>>(),
-        vec![
-            (LlmRequestTelemetryPhase::Prepared, 1),
-            (LlmRequestTelemetryPhase::Failed, 1),
-            (LlmRequestTelemetryPhase::Prepared, 2),
-            (LlmRequestTelemetryPhase::Completed, 2),
-        ]
-    );
-    assert_request_telemetry_is_terminal_once(&audit_telemetry);
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_preserves_recovery_state_when_iteration_budget_is_exhausted() {
-    let interrupted = sse_response(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\ndata: {malformed}\n\n"
-            .into(),
-    );
-    let (base_url, request_count, server) = spawn_chat_completion_server(vec![interrupted]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 4);
-    let mut issues = 0;
-    let mut recovery_continuations = 0;
-    let mut assistant_messages = Vec::new();
-    let mut deltas = Vec::new();
-
-    let error = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |delta| {
-                deltas.push(delta.to_string());
-                std::future::ready(Ok(()))
-            },
-            |event| {
-                match event {
-                    AgentEvent::AssistantMessage { content } => assistant_messages.push(content),
-                    AgentEvent::ModelStreamIssue { .. } => issues += 1,
-                    AgentEvent::InternalContinuation { .. } => recovery_continuations += 1,
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("the next model request should be rejected by the existing iteration gate");
-
-    assert!(
-        error
-            .to_string()
-            .contains("stopped: too many agent iterations (max 1)")
-    );
-    assert_eq!(deltas, vec!["partial"]);
-    assert_eq!(assistant_messages, vec!["partial"]);
-    assert_eq!(issues, 1);
-    assert_eq!(recovery_continuations, 1);
-    assert!(
-        agent
-            .history_for_test()
-            .iter()
-            .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "partial"))
-    );
-    assert!(
-        agent
-            .history_for_test()
-            .iter()
-            .any(|item| matches!(item, HistoryItem::InternalContinuation { .. }))
-    );
-    assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_shares_retry_budget_across_creation_and_read() {
-    let body = r#"data: {"choices":[{"index":0,"delta":{"content":"too-late"},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let third_response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .into_boxed_str(),
-        );
-    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 9\r\nConnection: close\r\n\r\ntransient",
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
-            third_response,
-        ])
-        .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut retry_config = test_retry_config();
-    retry_config.max_attempts = 2;
-    let mut agent = Agent::new(client, "m1", 4, 4);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(2_000),
-            supports_tools: true,
-            supports_reasoning: false,
-            ..Default::default()
-        },
-    )]));
-    agent.set_retry_config(retry_config);
-    let mut deltas = Vec::new();
-
-    let error = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |delta| {
-                deltas.push(delta.to_string());
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("read retry should not exceed shared max_attempts budget");
-
-    assert!(
-        !error.to_string().trim().is_empty(),
-        "unexpected empty error message: {error:?}"
-    );
-    assert!(deltas.is_empty());
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    server.abort();
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_recovers_read_error_after_visible_text() {
-    let body = r#"data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
-
-"#;
-    let first_response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{body}"
-            )
-            .into_boxed_str(),
-        );
-    let second_body = r#"data: {"choices":[{"index":0,"delta":{"content":" continuation"},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let second_response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second_body}",
-                second_body.len()
-            )
-            .into_boxed_str(),
-        );
-    let (base_url, request_count, server) =
-        spawn_chat_completion_server(vec![first_response, second_response]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(2_000),
-            supports_tools: true,
-            supports_reasoning: false,
-            ..Default::default()
-        },
-    )]));
-    agent.set_retry_config(test_retry_config());
-    let mut deltas = Vec::new();
-    let mut stream_issues = Vec::new();
-    let mut finalized_outcomes = Vec::new();
-
-    let result = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |delta| {
-                deltas.push(delta.to_string());
-                std::future::ready(Ok(()))
-            },
-            |event| {
-                match event {
-                    AgentEvent::TurnFinalized(event) => finalized_outcomes.push(event.outcome),
-                    AgentEvent::ModelStreamIssue { message, .. } => stream_issues.push(message),
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("post-output stream read failure should continue with a fresh iteration");
-
-    let expected = "partial continuation".to_string();
-    assert_eq!(result, expected);
-    assert_eq!(deltas, vec!["partial", " continuation"]);
-    assert_eq!(stream_issues, vec!["Model stream interrupted"]);
-    assert_eq!(finalized_outcomes, vec!["completed"]);
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    assert!(
-        agent
-            .history_for_test()
-            .iter()
-            .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "partial"))
-    );
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_cancels_pending_tool_call_on_invalid_finish_reason() {
-    let first_body = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-interrupted","type":"function","function":{"name":"shell__exec","arguments":""}}]},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let second_body = r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let first_response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first_body}",
-                first_body.len()
-            )
-            .into_boxed_str(),
-        );
-    let second_response = Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second_body}",
-                second_body.len()
-            )
-            .into_boxed_str(),
-        );
-    let (base_url, request_count, server) =
-        spawn_chat_completion_server(vec![first_response, second_response]).await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(2_000),
-            supports_tools: true,
-            supports_reasoning: false,
-            ..Default::default()
-        },
-    )]));
-    agent.set_retry_config(test_retry_config());
-    let mut cancelled_calls = Vec::new();
-    let mut started_calls = Vec::new();
-    let mut finished_calls = Vec::new();
-    let mut stream_issues = Vec::new();
-
-    let result = agent
-        .run_oai_comp_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                match event {
-                    AgentEvent::ToolCallCancelled { call_id, name } => {
-                        cancelled_calls.push((call_id, name));
-                    }
-                    AgentEvent::ToolCallStarted { call_id, .. } => started_calls.push(call_id),
-                    AgentEvent::ToolCallFinished { call_id, .. } => finished_calls.push(call_id),
-                    AgentEvent::ModelStreamIssue { message, .. } => stream_issues.push(message),
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("invalid finish reason with pending tool should cancel and continue");
-
-    assert_eq!(result, "ok");
-    assert_eq!(
-        cancelled_calls,
-        vec![("call-interrupted".to_string(), "shell__exec".to_string())]
-    );
-    assert!(started_calls.is_empty());
-    assert!(finished_calls.is_empty());
-    assert_eq!(stream_issues, vec!["Model stream interrupted"]);
-    assert!(!agent.history_for_test().iter().any(|item| matches!(
-        item,
-        HistoryItem::AssistantToolCalls { calls, .. }
-            if calls.iter().any(|call| call.call_id == "call-interrupted")
-    )));
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_does_not_recover_terminal_finish_reason_errors() {
-    for (finish_reason, expected_error) in [
-        ("length", "finish_reason=length"),
-        ("content_filter", "finish_reason=content_filter"),
-    ] {
-        let body = format!(
-            r#"data: {{"choices":[{{"index":0,"delta":{{"content":"partial"}},"finish_reason":"{finish_reason}"}}]}}
-
-data: [DONE]
-
-"#
-        );
-        let response = Box::leak(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .into_boxed_str(),
-            );
-        let (base_url, request_count, server) = spawn_chat_completion_server(vec![response]).await;
-        let client = Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(base_url)
-                .with_api_key("test"),
-        );
-        let mut agent = Agent::new(client, "m1", 4, 4);
-        agent.set_model_catalog(HashMap::from([(
-            "m1".into(),
-            ModelRequestMetadata {
-                context_window: Some(32_000),
-                max_output_tokens: Some(2_000),
-                supports_tools: true,
-                supports_reasoning: false,
-                ..Default::default()
-            },
-        )]));
-        agent.set_retry_config(test_retry_config());
-        let mut deltas = Vec::new();
-
-        let error = agent
-            .run_oai_comp_stream_async(
-                "hello",
-                |delta| {
-                    deltas.push(delta.to_string());
-                    std::future::ready(Ok(()))
-                },
-                |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-            )
-            .await
-            .expect_err("terminal finish_reason errors should fail explicitly");
-
-        assert!(
-            error.to_string().contains(expected_error),
-            "unexpected error for {finish_reason}: {error:?}"
-        );
-        assert_eq!(deltas, vec!["partial"]);
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        assert!(
-            !agent
-                .history_for_test()
-                .iter()
-                .any(|item| matches!(item, HistoryItem::AssistantText { .. }))
-        );
-        server.await.expect("server task should finish");
-    }
-}
-
-#[tokio::test]
-async fn compatible_chat_stream_does_not_retry_bad_request() {
-    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request",
-    ])
-    .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let request = json!({"model": "m1", "stream": true, "messages": []});
-    let error = send_compatible_chat_completion_stream(&client, &request)
-        .await
-        .expect_err("400 should fail fast");
-
-    assert!(
-        error
-            .to_string()
-            .contains("chat completions request failed with status 400 Bad Request")
     );
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
     server.await.expect("server task should finish");
@@ -4731,12 +4429,7 @@ async fn auto_continue_runs_past_agent_limits_until_llm_disables_it() {
         responses_final_sse("final"),
     ])
     .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 1);
+    let mut agent = Agent::new("m1", 1, 1);
 
     let result = agent
         .run_stream_async(
@@ -5477,10 +5170,10 @@ struct CapturingAutoReviewService {
     last_request: Mutex<Option<PermissionRequest>>,
 }
 
-impl AutoReviewService<OpenAIConfig> for CapturingAutoReviewService {
+impl AutoReviewService for CapturingAutoReviewService {
     fn review<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         request: PermissionRequest,
         _user_goal: Option<String>,
     ) -> std::pin::Pin<
@@ -5499,10 +5192,10 @@ impl AutoReviewService<OpenAIConfig> for CapturingAutoReviewService {
     fn clear_sticky(&self) {}
 }
 
-impl AutoReviewService<OpenAIConfig> for MockAutoReviewService {
+impl AutoReviewService for MockAutoReviewService {
     fn review<'a>(
         &'a self,
-        _parent: &'a Agent<OpenAIConfig>,
+        _parent: &'a Agent,
         _request: PermissionRequest,
         _user_goal: Option<String>,
     ) -> std::pin::Pin<
@@ -6758,12 +6451,7 @@ fn selected_skill_injects_exact_turn_scoped_material() {
 
 #[tokio::test]
 async fn execute_tool_call_blocks_write_tools_under_read_only_directive() {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 1);
+    let mut agent = Agent::new("m1", 1, 1);
     agent.turn = TurnRuntimeState::new(
         1,
         WorkflowTurnState::from_user_input("Read-only: inspect and report only."),
@@ -6822,12 +6510,7 @@ async fn execute_tool_call_blocks_write_tools_under_read_only_directive() {
 
 #[tokio::test]
 async fn execute_tool_call_blocks_non_read_only_commands_under_read_only_directive() {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 1);
+    let mut agent = Agent::new("m1", 1, 1);
     agent.turn = TurnRuntimeState::new(
         1,
         WorkflowTurnState::from_user_input("Read only. Analyze and report."),
@@ -6860,12 +6543,7 @@ async fn execute_tool_call_blocks_non_read_only_commands_under_read_only_directi
 
 #[tokio::test]
 async fn execute_tool_call_emits_finished_event_for_user_denial_of_high_risk_command() {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base("https://api.openai.com/v1")
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 1, 1);
+    let mut agent = Agent::new("m1", 1, 1);
     let call = HistoryToolCall {
         call_id: "call-denied".into(),
         name: "shell__exec".into(),

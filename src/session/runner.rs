@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use async_openai::config::Config;
 use tokio::sync::oneshot;
 use tracing::warn;
 
@@ -120,7 +119,7 @@ impl ToolBatchReconciliation {
     }
 }
 
-pub(crate) struct AgentRunner<C: Config> {
+pub(crate) struct AgentRunner {
     event_tx: Option<SessionTransportEventSender>,
     permission_event_tx: Option<SessionTransportEventSender>,
     session_title_event_tx: Option<SessionTransportEventSender>,
@@ -129,11 +128,10 @@ pub(crate) struct AgentRunner<C: Config> {
     child_session_id: Option<String>,
     permission_origin: Option<String>,
     parent_tool_call_id: Option<String>,
-    subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
-    _config: std::marker::PhantomData<C>,
+    subagent_delegate: Option<Arc<dyn SubagentDelegate>>,
 }
 
-impl AgentRunner<async_openai::config::OpenAIConfig> {
+impl AgentRunner {
     pub fn with_subagent_runtime(
         self,
         runtime: SubagentPool,
@@ -229,17 +227,14 @@ impl AgentRunner<async_openai::config::OpenAIConfig> {
     }
 
     #[cfg(test)]
-    pub(crate) fn install_subagent_delegate_for_test(
-        &self,
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
-    ) {
+    pub(crate) fn install_subagent_delegate_for_test(&self, agent: &mut Agent) {
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
     }
 }
 
-impl<C: Config> AgentRunner<C> {
+impl AgentRunner {
     #[cfg(test)]
     pub fn new(event_tx: SessionTransportEventSender) -> Self {
         Self {
@@ -252,7 +247,6 @@ impl<C: Config> AgentRunner<C> {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
-            _config: std::marker::PhantomData,
         }
     }
 
@@ -270,7 +264,6 @@ impl<C: Config> AgentRunner<C> {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
-            _config: std::marker::PhantomData,
         }
     }
 
@@ -294,7 +287,6 @@ impl<C: Config> AgentRunner<C> {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
-            _config: std::marker::PhantomData,
         }
     }
 
@@ -313,7 +305,6 @@ impl<C: Config> AgentRunner<C> {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
-            _config: std::marker::PhantomData,
         }
     }
 
@@ -334,18 +325,15 @@ impl<C: Config> AgentRunner<C> {
             permission_origin: Some(permission_origin.into()),
             parent_tool_call_id,
             subagent_delegate: None,
-            _config: std::marker::PhantomData,
         }
     }
 
     pub async fn run_prompt(
         &self,
-        agent: &mut Agent<C>,
+        agent: &mut Agent,
         prompt: UserMessageSubmission,
     ) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+where {
         let queue = Arc::new(Mutex::new(crate::agent::TurnContinuationQueue::default()));
         self.run_prompt_with_continuations(agent, prompt, queue)
             .await
@@ -353,13 +341,11 @@ impl<C: Config> AgentRunner<C> {
 
     pub(crate) async fn run_prompt_with_continuations(
         &self,
-        agent: &mut Agent<C>,
+        agent: &mut Agent,
         prompt: UserMessageSubmission,
         turn_continuation_queue: Arc<Mutex<crate::agent::TurnContinuationQueue>>,
     ) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+where {
         let continuation_queue = Arc::clone(&turn_continuation_queue);
         let mut continuation_guard = agent.turn_continuation_provider_guard(Arc::new(move || {
             let mut queue = continuation_queue
@@ -372,20 +358,16 @@ impl<C: Config> AgentRunner<C> {
     }
 
     #[cfg(test)]
-    pub async fn continue_session(&self, agent: &mut Agent<C>) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+    pub async fn continue_session(&self, agent: &mut Agent) -> Result<String>
+where {
         let queue = Arc::new(Mutex::new(crate::agent::TurnContinuationQueue::default()));
         self.run_existing_history_with_continuations(agent, queue)
             .await
     }
 
     #[cfg(test)]
-    pub(crate) async fn run_existing_history(&self, agent: &mut Agent<C>) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+    pub(crate) async fn run_existing_history(&self, agent: &mut Agent) -> Result<String>
+where {
         let queue = Arc::new(Mutex::new(crate::agent::TurnContinuationQueue::default()));
         self.run_existing_history_with_continuations(agent, queue)
             .await
@@ -393,12 +375,10 @@ impl<C: Config> AgentRunner<C> {
 
     pub(crate) async fn run_existing_history_with_continuations(
         &self,
-        agent: &mut Agent<C>,
+        agent: &mut Agent,
         turn_continuation_queue: Arc<Mutex<crate::agent::TurnContinuationQueue>>,
     ) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+where {
         if let Some(transcript) = self.transcript.clone() {
             agent.clear_logical_checkpoint_candidate_provider();
             agent.set_runtime_snapshot_provider(Arc::new(move || {
@@ -588,13 +568,11 @@ impl<C: Config> AgentRunner<C> {
 
     async fn run_prompt_with_options(
         &self,
-        agent: &mut Agent<C>,
+        agent: &mut Agent,
         prompt: UserMessageSubmission,
         record_user_prompt: bool,
     ) -> Result<String>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
+where {
         let prompt_content = prompt.content.clone();
         let prompt_text = prompt_content.text.clone();
         if let Some(transcript) = self.transcript.clone() {
@@ -1344,12 +1322,10 @@ impl<C: Config> AgentRunner<C> {
 
     fn pending_session_title(
         &self,
-        agent: &Agent<C>,
+        agent: &Agent,
         record_user_prompt: bool,
-    ) -> Result<Option<(String, Agent<C>)>>
-    where
-        C: Clone,
-    {
+    ) -> Result<Option<(String, Agent)>>
+where {
         if !record_user_prompt || self.child_session_id.is_some() {
             return Ok(None);
         }
@@ -1375,9 +1351,7 @@ impl<C: Config> AgentRunner<C> {
     }
 }
 
-pub(crate) fn subagent_event_sender(
-    event_tx: SessionTransportEventSender,
-) -> SubagentEventSender<async_openai::config::OpenAIConfig> {
+pub(crate) fn subagent_event_sender(event_tx: SessionTransportEventSender) -> SubagentEventSender {
     let status_tx = event_tx.clone();
     let error_tx = event_tx.clone();
     SubagentEventSender::new(
@@ -1396,22 +1370,21 @@ pub(crate) fn subagent_event_sender(
                   child_session_id,
                   permission_origin,
                   parent_tool_call_id| {
-                let runner: AgentRunner<async_openai::config::OpenAIConfig> =
-                    if let Some(permission_origin) = permission_origin {
-                        AgentRunner::child_streaming_with_permission_passthrough(
-                            transcript,
-                            event_tx.clone(),
-                            child_session_id,
-                            permission_origin,
-                            parent_tool_call_id,
-                        )
-                    } else {
-                        AgentRunner::child_streaming_with_transcript(
-                            transcript,
-                            event_tx.clone(),
-                            child_session_id,
-                        )
-                    };
+                let runner: AgentRunner = if let Some(permission_origin) = permission_origin {
+                    AgentRunner::child_streaming_with_permission_passthrough(
+                        transcript,
+                        event_tx.clone(),
+                        child_session_id,
+                        permission_origin,
+                        parent_tool_call_id,
+                    )
+                } else {
+                    AgentRunner::child_streaming_with_transcript(
+                        transcript,
+                        event_tx.clone(),
+                        child_session_id,
+                    )
+                };
                 Box::pin(async move {
                     let mut agent = agent;
                     runner
@@ -1439,7 +1412,6 @@ mod tests {
     use crate::permission::PermissionRequest;
     use crate::session::{PermissionDecision, SessionEvent};
     use crate::transcript::TranscriptRecorder;
-    use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1477,7 +1449,7 @@ mod tests {
     }
 
     fn credential_delegate(
-        parent: &mut Agent<OpenAIConfig>,
+        parent: &mut Agent,
         default_route: crate::config::ModelRoute,
         allowed_models: Vec<crate::config::ModelRoute>,
     ) -> RunnerSubagentDelegate {
@@ -1495,7 +1467,6 @@ mod tests {
                     protocol: crate::config::ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: None,
                     effective_input_limit_tokens: None,
                     max_output_tokens: None,
@@ -1708,7 +1679,7 @@ mod tests {
 
     #[test]
     fn tool_driven_invalid_override_is_reported_before_credential_lookup() {
-        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        let mut parent = Agent::new("shared", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
         let selected = crate::config::ModelRoute::new("expert", "shared");
         let delegate = credential_delegate(
@@ -1748,7 +1719,7 @@ mod tests {
 
     #[test]
     fn tool_driven_expert_delegation_requires_its_route_credential() {
-        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        let mut parent = Agent::new("shared", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
         let delegate = credential_delegate(
             &mut parent,
@@ -1795,7 +1766,7 @@ mod tests {
 
     #[test]
     fn retained_current_expert_route_keeps_its_session_credential() {
-        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        let mut parent = Agent::new("shared", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
         let retained = crate::config::ModelRoute::new("expert", "shared");
         let mut delegate = credential_delegate(&mut parent, retained.clone(), Vec::new());
@@ -1821,7 +1792,7 @@ mod tests {
 
     #[test]
     fn tool_driven_override_credential_check_uses_the_requested_route() {
-        let mut parent = Agent::new(Client::with_config(OpenAIConfig::new()), "shared", 1, 1);
+        let mut parent = Agent::new("shared", 1, 1);
         parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
         let selected = crate::config::ModelRoute::new("expert", "shared");
         let delegate = credential_delegate(

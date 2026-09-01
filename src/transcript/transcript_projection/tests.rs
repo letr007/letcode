@@ -588,7 +588,7 @@ fn explicit_leaf_truncates_future_records() {
     );
     assert!(matches!(
         snapshot.history.as_slice(),
-        [HistoryItem::UserMessage { .. }, HistoryItem::AssistantText { text }] if text == "visible"
+        [HistoryItem::UserMessage { .. }, HistoryItem::AssistantTurn { text: Some(text), .. }] if text == "visible"
     ));
 }
 
@@ -1087,6 +1087,51 @@ fn session_protocol_frames_restore_history_compatibly() {
 }
 
 #[test]
+fn legacy_tool_start_does_not_merge_into_preceding_text_assistant_turn() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::AssistantMessage {
+                content: "answer".into(),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                args: json!({"path": "src/main.rs"}),
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                ok: true,
+                output: ToolResult::ok("fs__read", json!({"content": "ok"})),
+            },
+        ),
+    ];
+
+    let restored = restore_session_history_projection(&records);
+    assert!(matches!(
+        restored.as_slice(),
+        [
+            HistoryItem::AssistantTurn { text: Some(text), calls: text_calls, .. },
+            HistoryItem::AssistantTurn { calls, .. },
+            HistoryItem::ToolOutput { call_id, .. },
+        ] if text == "answer"
+            && text_calls.is_empty()
+            && calls.len() == 1
+            && calls[0].call_id == "call-1"
+            && call_id == "call-1"
+    ));
+    crate::protocol_frames::validate_history_items_complete(&restored, None)
+        .expect("legacy tool start remains a separate complete group");
+}
+
+#[test]
 fn legacy_incomplete_tool_group_is_removed_before_a_new_turn_is_appended() {
     let records = vec![
         record_at(
@@ -1184,7 +1229,7 @@ fn cancelled_durable_multi_call_batch_restores_every_terminal_output() {
 
     let restored = restore_session_history_projection(&records);
     assert!(
-        matches!(restored.first(), Some(HistoryItem::AssistantToolCalls { calls, .. }) if calls.len() == 2)
+        matches!(restored.first(), Some(HistoryItem::AssistantTurn { calls, .. }) if calls.len() == 2)
     );
     assert_eq!(
         restored
@@ -2181,7 +2226,7 @@ fn checkpoint_and_compaction_preserve_active_frames_and_retire_closed_artifacts(
         .map(|frame| frame.runtime_frame_id)
         .collect::<Vec<_>>();
     assert!(before.snapshot.active_history_items().iter().any(
-        |item| matches!(item, HistoryItem::AssistantText { text } if text == "active segment")
+        |item| matches!(item, HistoryItem::AssistantTurn { text: Some(text), .. } if text == "active segment")
     ));
     assert_eq!(
         active_ids,
@@ -2657,10 +2702,7 @@ fn modern_active_turn_compaction_retires_current_user_with_prefix() {
         &history[0],
         HistoryItem::ContextSummary { text } if text == "summary"
     ));
-    assert!(matches!(
-        &history[1],
-        HistoryItem::AssistantToolCalls { .. }
-    ));
+    assert!(matches!(&history[1], HistoryItem::AssistantTurn { .. }));
     assert!(matches!(&history[2], HistoryItem::ToolOutput { .. }));
 }
 

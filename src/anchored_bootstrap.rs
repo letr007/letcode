@@ -83,11 +83,21 @@ impl AnchoredBootstrap {
         let mode = self.config.promote_on;
         history.iter().any(|item| match (mode, item) {
             (PromoteOn::ToolCall, HistoryItem::ToolOutput { .. }) => true,
-            (PromoteOn::AssistantMessage, HistoryItem::AssistantText { text }) => !text.is_empty(),
-            (PromoteOn::AssistantMessage, HistoryItem::AssistantToolCalls { .. }) => true,
+            (
+                PromoteOn::AssistantMessage,
+                HistoryItem::AssistantTurn {
+                    text: Some(text), ..
+                },
+            ) => !text.is_empty(),
+            (PromoteOn::AssistantMessage, HistoryItem::AssistantTurn { .. }) => true,
             (PromoteOn::Either, HistoryItem::ToolOutput { .. }) => true,
-            (PromoteOn::Either, HistoryItem::AssistantText { text }) => !text.is_empty(),
-            (PromoteOn::Either, HistoryItem::AssistantToolCalls { .. }) => true,
+            (
+                PromoteOn::Either,
+                HistoryItem::AssistantTurn {
+                    text: Some(text), ..
+                },
+            ) => !text.is_empty(),
+            (PromoteOn::Either, HistoryItem::AssistantTurn { .. }) => true,
             _ => false,
         })
     }
@@ -255,10 +265,10 @@ mod tests {
     }
 
     fn tool_calls() -> HistoryItem {
-        HistoryItem::AssistantToolCalls {
+        HistoryItem::AssistantTurn {
             text: Some("calling".into()),
             reasoning_content: None,
-            reasoning_wire: None,
+            replay: None,
             calls: vec![],
         }
     }

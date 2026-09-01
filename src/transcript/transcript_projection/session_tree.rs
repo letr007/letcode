@@ -180,6 +180,17 @@ fn entry_details(
             content.display_text(),
             Some(content.clone()),
         ),
+        TranscriptEvent::AssistantTurn(turn) => (
+            SessionHistoryEntryKind::Assistant,
+            turn.text.clone().unwrap_or_else(|| {
+                if turn.calls.is_empty() {
+                    "Assistant turn".into()
+                } else {
+                    "Tool calls".into()
+                }
+            }),
+            None,
+        ),
         TranscriptEvent::AssistantMessage { content } => {
             (SessionHistoryEntryKind::Assistant, content.clone(), None)
         }

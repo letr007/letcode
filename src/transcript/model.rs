@@ -7,6 +7,7 @@ use crate::agent::{
 };
 use crate::context_tree::{ContextBlockRef, ContextNodeStatus, ContextSourceRef};
 use crate::evidence::{EvidenceKind, EvidenceSource};
+use crate::model_runtime::OpaqueReplayState;
 use crate::request_builder::{HistoryToolCall, ModelReasoningEffort};
 use crate::tool::ToolResult;
 use crate::user_content::UserMessageContent;
@@ -17,6 +18,18 @@ fn default_usage_completeness() -> String {
     // Records written before completeness existed cannot distinguish an absent
     // provider usage object from an older schema.
     "legacy_unknown".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptAssistantTurn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<OpaqueReplayState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<HistoryToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +309,8 @@ pub enum TranscriptEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_write_tokens: Option<u64>,
     },
+    AssistantTurn(TranscriptAssistantTurn),
+    /// Decode-only compatibility for legacy/v1 transcripts.
     AssistantMessage {
         content: String,
     },
@@ -304,6 +319,7 @@ pub enum TranscriptEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+    /// Decode-only compatibility for legacy/v1 transcripts.
     AssistantToolCallBatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,

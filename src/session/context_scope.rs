@@ -6,11 +6,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
-use async_openai::config::Config;
-
 use crate::agent::Agent;
 use crate::transcript::{ContextScopeState, TranscriptRecorder};
+use anyhow::Result;
 
 /// Prepared context-scope state ready to apply onto an agent.
 pub struct PreparedContextScope {
@@ -26,16 +24,13 @@ pub fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedCo
 }
 
 /// Apply a prepared context-scope package onto the agent.
-pub fn apply_prepared_context_scope<C: Config>(
-    agent: &mut Agent<C>,
-    prepared: PreparedContextScope,
-) {
+pub fn apply_prepared_context_scope(agent: &mut Agent, prepared: PreparedContextScope) {
     agent.set_context_scope_state(prepared.state);
 }
 
 /// Prepare from the recorder and apply in one step.
-pub fn sync_agent_context_scope_from_recorder<C: Config>(
-    agent: &mut Agent<C>,
+pub fn sync_agent_context_scope_from_recorder(
+    agent: &mut Agent,
     recorder: &TranscriptRecorder,
 ) -> Result<()> {
     let prepared = prepare_context_scope(recorder)?;

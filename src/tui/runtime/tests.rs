@@ -42,7 +42,6 @@ use crate::tui::{
     PermissionResolutionEvent, SessionEvent, TimelineItem, ToolFinishedEvent, ToolOutcome,
     ToolStartedEvent, UserMessageEvent,
 };
-use async_openai::{Client, config::OpenAIConfig};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::{BTreeMap, HashMap};
@@ -755,17 +754,8 @@ fn clipboard_paste_permission_is_text_first() {
     );
 }
 
-fn test_agent() -> Agent<OpenAIConfig> {
-    Agent::new(
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base("https://api.openai.com/v1")
-                .with_api_key("test"),
-        ),
-        "gpt-test",
-        4,
-        4,
-    )
+fn test_agent() -> Agent {
+    Agent::new("gpt-test", 4, 4)
 }
 
 #[test]
@@ -1774,7 +1764,7 @@ fn interrupt_rehydrates_agent_from_transcript() {
 
     assert!(matches!(
         &agent.history_for_test()[..],
-        [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
+        [HistoryItem::UserMessage { content }, HistoryItem::AssistantTurn { text: Some(assistant_text), .. }]
             if content.text == "unfinished" && assistant_text.is_empty()
     ));
 }
@@ -4119,7 +4109,7 @@ fn test_transcript(
     (sessions_dir, Arc::new(StdMutex::new(recorder)))
 }
 
-fn integration_agent(base_url: String, m1_input_limit_tokens: u64) -> Agent<OpenAIConfig> {
+fn integration_agent(base_url: String, m1_input_limit_tokens: u64) -> Agent {
     integration_agent_with_tools(base_url, m1_input_limit_tokens, false)
 }
 
@@ -4127,13 +4117,8 @@ fn integration_agent_with_tools(
     base_url: String,
     m1_input_limit_tokens: u64,
     supports_tools: bool,
-) -> Agent<OpenAIConfig> {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url.clone())
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
+) -> Agent {
+    let mut agent = Agent::new("m1", 4, 4);
     let metadata = |input_limit_tokens: u64| ModelRequestMetadata {
         context_window: Some(input_limit_tokens.saturating_add(1_000)),
         effective_input_limit_tokens: Some(input_limit_tokens),
@@ -4164,7 +4149,6 @@ fn integration_agent_with_tools(
                     protocol: crate::config::ApiProtocol::Responses,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: Some(m1_input_limit_tokens.saturating_add(1_000)),
                     effective_input_limit_tokens: Some(m1_input_limit_tokens),
                     max_output_tokens: Some(128),
@@ -4242,7 +4226,7 @@ fn turn_started(turn_id: u64) -> TurnStartedEvent {
 struct SessionExecutorHarness {
     ingress: Option<crate::session::SessionEngineIngress>,
     event_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
-    task: JoinHandle<Agent<OpenAIConfig>>,
+    task: JoinHandle<Agent>,
 }
 
 impl SessionExecutorHarness {
@@ -4277,7 +4261,7 @@ struct SessionExecutorPollGate {
 }
 
 fn start_session_executor_harness(
-    agent: Agent<OpenAIConfig>,
+    agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
 ) -> SessionExecutorHarness {
@@ -4285,7 +4269,7 @@ fn start_session_executor_harness(
 }
 
 fn start_session_executor_harness_with_poll_gate(
-    agent: Agent<OpenAIConfig>,
+    agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
     poll_gate: Option<SessionExecutorPollGate>,
@@ -4313,7 +4297,7 @@ fn start_session_executor_harness_with_poll_gate(
 }
 
 async fn start_paused_session_executor_harness(
-    agent: Agent<OpenAIConfig>,
+    agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
 ) -> (SessionExecutorHarness, oneshot::Sender<()>) {
@@ -4336,7 +4320,7 @@ async fn start_paused_session_executor_harness(
 }
 
 async fn test_session_executor_loop(
-    mut agent: Agent<OpenAIConfig>,
+    mut agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
@@ -4344,7 +4328,7 @@ async fn test_session_executor_loop(
     control_tx: mpsc::UnboundedSender<SessionEngineControl>,
     mut background_control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
     poll_gate: Option<SessionExecutorPollGate>,
-) -> Agent<OpenAIConfig> {
+) -> Agent {
     let subagent_runtime = SubagentPool::new();
     let mut deferred_commands = VecDeque::new();
     let mut background_control_open = true;
@@ -4439,10 +4423,7 @@ async fn test_session_executor_loop(
             }
             SessionEngineCommand::ContinueSession => {
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
-                let runner = AgentRunner::<OpenAIConfig>::with_transcript(
-                    runner_event_tx,
-                    Arc::clone(&transcript),
-                );
+                let runner = AgentRunner::with_transcript(runner_event_tx, Arc::clone(&transcript));
                 let run = runner.continue_session(&mut agent);
                 tokio::pin!(run);
                 loop {
@@ -4486,20 +4467,17 @@ async fn test_session_executor_loop(
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
                 let route_api_key_configured =
                     indexmap::IndexMap::from([(agent.route_display_name(), true)]);
-                let runner = AgentRunner::<OpenAIConfig>::with_transcript(
-                    runner_event_tx,
-                    Arc::clone(&transcript),
-                )
-                .with_subagent_runtime(
-                    subagent_runtime.clone(),
-                    sessions_dir.clone(),
-                    indexmap::IndexMap::new(),
-                    route_api_key_configured,
-                    indexmap::IndexMap::new(),
-                    String::new(),
-                    Some(control_tx.clone()),
-                    Some(session_transport_tx.clone()),
-                );
+                let runner = AgentRunner::with_transcript(runner_event_tx, Arc::clone(&transcript))
+                    .with_subagent_runtime(
+                        subagent_runtime.clone(),
+                        sessions_dir.clone(),
+                        indexmap::IndexMap::new(),
+                        route_api_key_configured,
+                        indexmap::IndexMap::new(),
+                        String::new(),
+                        Some(control_tx.clone()),
+                        Some(session_transport_tx.clone()),
+                    );
                 let (interrupted, shutdown) = {
                     let run = runner.run_prompt(&mut agent, prompt);
                     tokio::pin!(run);
@@ -4773,7 +4751,7 @@ async fn inspect_session_history(harness: &SessionExecutorHarness) -> Vec<Histor
         .expect("session executor dropped history inspection reply")
 }
 
-async fn finish_session_executor_harness(harness: SessionExecutorHarness) -> Agent<OpenAIConfig> {
+async fn finish_session_executor_harness(harness: SessionExecutorHarness) -> Agent {
     let SessionExecutorHarness {
         ingress,
         event_rx,
@@ -5384,7 +5362,7 @@ async fn session_manual_compaction_cancel_before_persistence_rehydrates_and_drai
 
     let agent = finish_session_executor_harness(harness).await;
     assert!(agent.history_for_test().iter().any(|item| {
-        matches!(item, HistoryItem::AssistantText { text } if text == "follow-up survives")
+        matches!(item, HistoryItem::AssistantTurn { text: Some(text), .. } if text == "follow-up survives")
     }));
     server.finish().await;
 }
@@ -5773,19 +5751,18 @@ async fn background_child_events_outlive_parent_runner_channel() {
     let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let runtime = SubagentPool::new();
-    let runner =
-        AgentRunner::<OpenAIConfig>::with_transcript(transient_tx, Arc::clone(&transcript))
-            .with_subagent_runtime_test_hooks(
-                runtime.clone(),
-                sessions_dir,
-                indexmap::IndexMap::new(),
-                indexmap::IndexMap::from([(route, true)]),
-                indexmap::IndexMap::new(),
-                String::new(),
-                Some(completion_tx),
-                Some(durable_tx),
-                started_tx,
-            );
+    let runner = AgentRunner::with_transcript(transient_tx, Arc::clone(&transcript))
+        .with_subagent_runtime_test_hooks(
+            runtime.clone(),
+            sessions_dir,
+            indexmap::IndexMap::new(),
+            indexmap::IndexMap::from([(route, true)]),
+            indexmap::IndexMap::new(),
+            String::new(),
+            Some(completion_tx),
+            Some(durable_tx),
+            started_tx,
+        );
     runner.install_subagent_delegate_for_test(&mut parent);
 
     let receipt = parent
@@ -5922,7 +5899,7 @@ async fn runner_existing_history_continuation_does_not_append_empty_user_message
     .await;
     let agent = integration_agent_with_tools(server.base_url.clone(), 32_000, true);
     let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
-    let runner = AgentRunner::<OpenAIConfig>::with_transcript(
+    let runner = AgentRunner::with_transcript(
         runner_event_tx,
         Arc::new(StdMutex::new(
             TranscriptRecorder::create(std::env::temp_dir()).expect("transcript"),

@@ -414,12 +414,13 @@ mod tests {
         let records = read_records(recorder.path()).expect("read records");
         assert!(matches!(
             &records[0].event,
-            TranscriptEvent::AssistantToolCallBatch {
-                reasoning_content: Some(reasoning_content),
-                reasoning_wire: Some(reasoning_wire),
-                ..
-            } if reasoning_content == "inspect the requested file"
-                && reasoning_wire.contains("\"signature\":\"signed\"")
+            TranscriptEvent::AssistantTurn(turn)
+                if turn.reasoning_content.as_deref() == Some("inspect the requested file")
+                    && turn
+                        .replay
+                        .as_ref()
+                        .and_then(crate::model_runtime::OpaqueReplayState::payload_json)
+                        .is_some_and(|wire| wire.contains("\"signature\":\"signed\""))
         ));
         let old: TranscriptEvent =
             serde_json::from_str(r#"{"kind":"assistant_tool_call_batch","text":null,"calls":[]}"#)
@@ -435,14 +436,16 @@ mod tests {
         assert!(matches!(
             restore_session_history(&records).expect("restore history").as_slice(),
             [
-                crate::request_builder::HistoryItem::AssistantToolCalls {
+                crate::request_builder::HistoryItem::AssistantTurn {
                     reasoning_content: Some(reasoning_content),
-                    reasoning_wire: Some(reasoning_wire),
+                    replay: Some(replay),
                     ..
                 },
                 crate::request_builder::HistoryItem::ToolOutput { .. }
             ] if reasoning_content == "inspect the requested file"
-                && reasoning_wire.contains("\"signature\":\"signed\"")
+                && replay
+                    .payload_json()
+                    .is_some_and(|wire| wire.contains("\"signature\":\"signed\""))
         ));
     }
 

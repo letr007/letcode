@@ -561,6 +561,38 @@ pub(crate) fn index_context_blocks(
                     }
                 }
             }
+            TranscriptEvent::AssistantTurn(turn)
+                if turn
+                    .text
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty()) =>
+            {
+                let content = turn.text.as_deref().expect("guarded assistant text");
+                insert_block(
+                    &mut blocks,
+                    block_id(record.sequence, "note"),
+                    ContextBlockKind::Note,
+                    "Session note".into(),
+                    content.to_string(),
+                    transcript_source(record.sequence),
+                    Some(record.sequence),
+                    Vec::new(),
+                    None,
+                );
+                for (index, hash) in extract_commit_hashes(content).into_iter().enumerate() {
+                    insert_block(
+                        &mut blocks,
+                        block_id(record.sequence, &format!("commit-{index}")),
+                        ContextBlockKind::CommitHash,
+                        "Commit hash".into(),
+                        hash,
+                        transcript_source(record.sequence),
+                        Some(record.sequence),
+                        vec![ProtectedReason::CommitHash],
+                        None,
+                    );
+                }
+            }
             TranscriptEvent::AssistantMessage { content } if !content.trim().is_empty() => {
                 insert_block(
                     &mut blocks,

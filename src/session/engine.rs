@@ -20,7 +20,6 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use async_openai::config::Config;
 use serde_json::json;
 use tokio::task::JoinHandle;
 
@@ -170,6 +169,7 @@ pub struct SessionEngineConfig {
     pub api_key_hint: String,
     pub mcp_config_path: PathBuf,
     pub mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
+    pub runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
 }
 
 /// Initial presentation data projected while the engine takes ownership.
@@ -210,7 +210,7 @@ impl SessionEngine {
 
     /// Start the backend control loop and transfer all execution resources into it.
     pub fn start(
-        agent: Agent<async_openai::config::OpenAIConfig>,
+        agent: Agent,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         model_label: String,
         config: SessionEngineConfig,
@@ -264,6 +264,7 @@ impl SessionEngine {
             config.api_key_hint,
             config.mcp_config_path,
             config.mcp_config,
+            config.runtime_catalog,
             mcp_tools_rx,
             reload_rx,
             control_rx,
@@ -400,7 +401,7 @@ impl SessionEngine {
 }
 
 fn delegated_route_display_name(
-    agent: &Agent<async_openai::config::OpenAIConfig>,
+    agent: &Agent,
     expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
     agent_name: &str,
 ) -> String {
@@ -410,7 +411,7 @@ fn delegated_route_display_name(
 }
 
 fn delegated_route_for_takeover(
-    agent: &Agent<async_openai::config::OpenAIConfig>,
+    agent: &Agent,
     expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
     sessions_dir: &std::path::Path,
     parent_transcript: &Arc<StdMutex<TranscriptRecorder>>,
@@ -568,7 +569,7 @@ pub(crate) fn derive_interrupt_request(
 
 fn send_rehydrated_runtime_context(
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
-    agent: &Agent<async_openai::config::OpenAIConfig>,
+    agent: &Agent,
 ) -> Result<()> {
     let context = agent.runtime_context()?;
     let _ = session_transport_tx.send(SessionTransportEvent::RuntimeContextUpdated(
@@ -647,12 +648,11 @@ pub(crate) fn record_interrupt_transcript(
     recorder.append_transaction(events)
 }
 
-pub(crate) fn rehydrate_agent_from_transcript<C>(
-    agent: &mut Agent<C>,
+pub(crate) fn rehydrate_agent_from_transcript(
+    agent: &mut Agent,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<()>
 where
-    C: Config,
 {
     let path = transcript
         .lock()
@@ -685,9 +685,8 @@ where
     Ok(())
 }
 
-pub(crate) fn manual_compaction_session_token_usage<C>(agent: &Agent<C>) -> Result<TokenUsageEvent>
+pub(crate) fn manual_compaction_session_token_usage(agent: &Agent) -> Result<TokenUsageEvent>
 where
-    C: Config,
 {
     let usage = agent.session_token_usage()?;
     Ok(TokenUsageEvent::with_breakdown(
@@ -699,15 +698,14 @@ where
     ))
 }
 
-pub(crate) async fn run_manual_compaction<C>(
-    agent: &mut Agent<C>,
+pub(crate) async fn run_manual_compaction(
+    agent: &mut Agent,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
 ) -> bool
 where
-    C: Config + Clone,
 {
     let transcript = Arc::clone(transcript);
     // main/runner already install an equivalent transcript→snapshot provider.
@@ -997,7 +995,7 @@ async fn refresh_visible_child_session_view(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_engine_loop(
-    agent: Agent<async_openai::config::OpenAIConfig>,
+    agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
     model_routes: indexmap::IndexMap<String, ModelRoute>,
@@ -1013,6 +1011,7 @@ async fn run_engine_loop(
     api_key_hint: String,
     mcp_config_path: PathBuf,
     mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
+    mut runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
     mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
     mut reload_rx: mpsc::UnboundedReceiver<()>,
     mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
@@ -1047,10 +1046,9 @@ async fn run_engine_loop(
             Arc::clone(&provider_api_key_hints),
             api_key_hint.clone(),
         ));
-    agent.set_auto_review_service(Some(sticky_auto_reviewer.clone()
-        as std::sync::Arc<
-            dyn crate::agent::AutoReviewService<async_openai::config::OpenAIConfig>,
-        >));
+    agent.set_auto_review_service(Some(
+        sticky_auto_reviewer.clone() as std::sync::Arc<dyn crate::agent::AutoReviewService>
+    ));
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
     let mut visible_child_session_id = None;
@@ -1086,6 +1084,7 @@ async fn run_engine_loop(
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()),
                     &mut new_session_default_route,
+                    &mut runtime_catalog,
                     &session_transport_tx,
                 ) {
                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
@@ -1161,7 +1160,7 @@ async fn run_engine_loop(
                         &providers,
                         &global_retry,
                     ) {
-                        Ok(factory) => factory,
+                        Ok(factory) => factory.with_runtime_catalog(runtime_catalog.clone()),
                         Err(error) => {
                             send_setting_change_failed(
                                 &session_transport_tx,
@@ -1234,7 +1233,7 @@ async fn run_engine_loop(
                         &providers,
                         &global_retry,
                     ) {
-                        Ok(factory) => factory,
+                        Ok(factory) => factory.with_runtime_catalog(runtime_catalog.clone()),
                         Err(error) => {
                             let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                 ErrorEvent::new(format!("failed to set expert model: {error}")),
@@ -1311,7 +1310,7 @@ async fn run_engine_loop(
                         &providers,
                         &global_retry,
                     ) {
-                        Ok(factory) => factory,
+                        Ok(factory) => factory.with_runtime_catalog(runtime_catalog.clone()),
                         Err(error) => {
                             send_setting_change_failed(
                                 &session_transport_tx,
@@ -1319,6 +1318,17 @@ async fn run_engine_loop(
                                 format!(
                                     "failed to set model because expert routes could not be rebuilt: {error}"
                                 ),
+                            );
+                            continue;
+                        }
+                    };
+                    let resolved_route = match agent.resolved_model_route_for(&route) {
+                        Some(resolved_route) => resolved_route,
+                        None => {
+                            send_setting_change_failed(
+                                &session_transport_tx,
+                                crate::session::SessionCommand::SetModel(model.clone()),
+                                format!("resolved runtime route is unavailable: {}", route.display_name()),
                             );
                             continue;
                         }
@@ -1334,10 +1344,11 @@ async fn run_engine_loop(
                             continue;
                         }
                     };
-                    match crate::session::apply_model_route_with(
+                    match crate::session::settings::apply_model_route_with_authority(
                         &mut agent,
                         &transcript,
                         route.clone(),
+                        resolved_route,
                         prepared_route,
                     ) {
                         Ok(fast_mode_auto_disabled) => {
@@ -1495,7 +1506,8 @@ async fn run_engine_loop(
                                             }),
                                             &providers,
                                             &global_retry,
-                                        )?;
+                                        )?
+                                        .with_runtime_catalog(runtime_catalog.clone());
                                     *prepared_history_routes.borrow_mut() = Some(restored_routes);
                                     *prepared_history_factory.borrow_mut() = Some(factory);
                                     Ok(())
@@ -2183,7 +2195,7 @@ async fn run_engine_loop(
                             &providers,
                             &global_retry,
                         ) {
-                            Ok(factory) => factory,
+                            Ok(factory) => factory.with_runtime_catalog(runtime_catalog.clone()),
                             Err(error) => {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     ErrorEvent::new(format!(
@@ -2308,7 +2320,7 @@ async fn run_engine_loop(
                             &providers,
                             &global_retry,
                         ) {
-                            Ok(factory) => factory,
+                            Ok(factory) => factory.with_runtime_catalog(runtime_catalog.clone()),
                             Err(error) => {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     ErrorEvent::new(format!(
@@ -2452,7 +2464,7 @@ async fn run_engine_loop(
                     crate::agent::TurnContinuationQueue::default(),
                 ));
                 let (runner_event_tx, mut runner_event_rx) = mpsc::unbounded_channel();
-                let runner = AgentRunner::<async_openai::config::OpenAIConfig>::with_transcript(
+                let runner = AgentRunner::with_transcript(
                     runner_event_tx,
                     transcript.clone(),
                 )
@@ -2867,10 +2879,7 @@ async fn run_engine_loop(
     }
 }
 
-fn background_subagent_result_already_delivered<C>(agent: &Agent<C>, run_id: &str) -> bool
-where
-    C: Config,
-{
+fn background_subagent_result_already_delivered(agent: &Agent, run_id: &str) -> bool {
     agent.evidence().iter().any(|evidence| {
         matches!(
             &evidence.source,
@@ -2901,7 +2910,6 @@ pub(crate) fn format_background_subagent_completion(
 mod tests {
     use super::*;
     use crate::request_builder::ModelReasoningEffort;
-    use async_openai::{Client, config::OpenAIConfig};
     use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2990,16 +2998,7 @@ mod tests {
             ("primary/shared".into(), true),
             ("expert/shared".into(), false),
         ]);
-        let mut agent = Agent::new(
-            async_openai::Client::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_base("http://127.0.0.1:9/v1")
-                    .with_api_key("primary-key"),
-            ),
-            "shared",
-            1,
-            1,
-        );
+        let mut agent = Agent::new("shared", 1, 1);
         agent.set_primary_route(ModelRoute::new("expert", "shared"));
 
         assert!(
@@ -3045,12 +3044,7 @@ mod tests {
         drop(child);
         assert!(child_path.exists());
 
-        let agent = Agent::new(
-            async_openai::Client::with_config(async_openai::config::OpenAIConfig::new()),
-            "shared",
-            1,
-            1,
-        );
+        let agent = Agent::new("shared", 1, 1);
         let route = delegated_route_for_takeover(
             &agent,
             &indexmap::IndexMap::from([("explorer".into(), ModelRoute::new("primary", "shared"))]),
@@ -3105,18 +3099,29 @@ mod tests {
             active_provider = "primary"
 
             [providers.primary]
-            base_url = "https://example.invalid/v1"
-            api_key = "old-key"
             protocol = "responses"
+            default_model = "old"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "old-key"
+            [providers.primary.endpoints]
+            base_url = "https://example.invalid/v1"
 
             [providers.primary.models.old]
+            [providers.primary.models.new]
             "#;
         let bad_contents = r#"
             active_provider = "primary"
 
             [providers.primary]
-            api_key = "new-key"
+            unknown = true
             protocol = "responses"
+            default_model = "new"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "new-key"
+            [providers.primary.endpoints]
+            base_url = "https://example.invalid/v1"
 
             [providers.primary.models.new]
             "#;
@@ -3124,7 +3129,7 @@ mod tests {
         fs::write(&bad_path, bad_contents).expect("write invalid reload config");
         let old_config = AppConfig::load_from_path(&old_path).expect("old config should load");
         let route = ModelRoute::new("primary", "old");
-        let mut agent = Agent::new(Client::with_config(OpenAIConfig::new()), "old", 1, 1);
+        let mut agent = Agent::new("old", 1, 1);
         agent.set_primary_route(route.clone());
 
         let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
@@ -3132,7 +3137,9 @@ mod tests {
         let mut expert_model_routes =
             indexmap::IndexMap::from([(String::from("explorer"), route.clone())]);
         let mut new_session_default_expert_routes = expert_model_routes.clone();
-        let mut expert_allowed_models = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
         let mut legacy_expert_models =
             indexmap::IndexMap::from([(String::from("explorer"), String::from("old"))]);
         let mut providers = old_config.providers.clone();
@@ -3140,6 +3147,7 @@ mod tests {
         let mut provider_api_key_hints =
             indexmap::IndexMap::from([(String::from("primary"), String::from("old hint"))]);
         let mut new_session_default_route = route.clone();
+        let mut runtime_catalog = old_config.runtime_catalog.clone();
         let old_model_routes = model_routes.clone();
         let old_route_api_key_configured = route_api_key_configured.clone();
         let old_expert_model_routes = expert_model_routes.clone();
@@ -3164,6 +3172,7 @@ mod tests {
                 &mut global_retry,
                 &mut provider_api_key_hints,
                 &mut new_session_default_route,
+                &mut runtime_catalog,
                 &event_tx,
             )
             .is_err()
@@ -3189,6 +3198,10 @@ mod tests {
         assert_eq!(global_retry, old_global_retry);
         assert_eq!(provider_api_key_hints, old_provider_api_key_hints);
         assert_eq!(new_session_default_route, old_new_session_default_route);
+        assert_eq!(
+            runtime_catalog.fingerprint(),
+            old_config.runtime_catalog.fingerprint()
+        );
         assert!(event_rx.try_recv().is_err());
 
         let _ = fs::remove_file(old_path);
@@ -3215,15 +3228,21 @@ mod tests {
             enabled = true
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
-            supports_reasoning = true
-            reasoning_effort = "medium"
-            reasoning_efforts = ["medium", "high"]
+            [providers.primary.models.primary-model.capabilities]
+            reasoning = true
+            [providers.primary.models.primary-model.capabilities.generation]
+            reasoning = true
+            [providers.primary.models.primary-model.generation]
+            reasoning_effort = "high"
             "#,
         )
         .expect("write initial config");
@@ -3233,7 +3252,7 @@ mod tests {
         let provider = config
             .provider_for_route(&route)
             .expect("active provider is configured");
-        let mut agent = Agent::new(route.build_client(provider), route.model.clone(), 1, 1);
+        let mut agent = Agent::new(route.model.clone(), 1, 1);
         agent.set_primary_route(route.clone());
         agent.set_default_protocol(provider.protocol);
         agent.set_model_protocols(
@@ -3288,7 +3307,7 @@ mod tests {
                 (
                     name.clone(),
                     format!(
-                        "Set providers.{name}.api_key in {} or set {}.",
+                        "Set [providers.{name}.auth].credential in {} or set {} environment variable.",
                         config.config_path.display(),
                         crate::config::provider_api_key_env_var(name)
                     ),
@@ -3296,6 +3315,7 @@ mod tests {
             })
             .collect();
         let mut new_session_default_route = route;
+        let mut runtime_catalog = config.runtime_catalog.clone();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         crate::config::persist_mcp_server_enabled(&path, "alpha", false)
@@ -3313,6 +3333,7 @@ mod tests {
             &mut global_retry,
             &mut provider_api_key_hints,
             &mut new_session_default_route,
+            &mut runtime_catalog,
             &event_tx,
         )
         .expect("non-reloadable config write should preserve session settings");
@@ -3341,10 +3362,13 @@ mod tests {
             active_provider = "primary"
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
             [providers.primary.models.session-model]
@@ -3354,24 +3378,22 @@ mod tests {
 
         let current_route = ModelRoute::new("primary", "session-model");
         let default_route = ModelRoute::new("primary", "primary-model");
-        let mut agent = Agent::new(
-            Client::with_config(OpenAIConfig::new()),
-            current_route.model.clone(),
-            1,
-            1,
-        );
+        let mut agent = Agent::new(current_route.model.clone(), 1, 1);
         agent.set_primary_route(current_route.clone());
         let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
         let mut model_routes = indexmap::IndexMap::new();
         let mut route_api_key_configured = indexmap::IndexMap::new();
         let mut expert_model_routes = indexmap::IndexMap::new();
         let mut new_session_default_expert_routes = indexmap::IndexMap::new();
-        let mut expert_allowed_models = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
         let mut legacy_expert_models = indexmap::IndexMap::new();
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
         let mut provider_api_key_hints = indexmap::IndexMap::new();
         let mut new_session_default_route = current_route.clone();
+        let mut runtime_catalog = initial_config.runtime_catalog.clone();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         fs::write(
@@ -3380,10 +3402,13 @@ mod tests {
             active_provider = "primary"
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
             "#,
@@ -3403,12 +3428,18 @@ mod tests {
             &mut global_retry,
             &mut provider_api_key_hints,
             &mut new_session_default_route,
+            &mut runtime_catalog,
             &event_tx,
         )
         .expect("catalog reload should keep the current route alive");
 
         assert_eq!(agent.primary_route(), Some(&current_route));
         assert_eq!(new_session_default_route, default_route);
+        assert_eq!(
+            route_api_key_configured.get(&current_route.display_name()),
+            Some(&true),
+            "the retained current route keeps its credential state"
+        );
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| matches!(
             event,
@@ -3426,6 +3457,151 @@ mod tests {
                 .any(|event| matches!(event, SessionTransportEvent::ModelChanged { .. }))
         );
 
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &mut runtime_catalog,
+            &event_tx,
+        )
+        .expect("duplicate removed-route reload should be a no-op");
+        assert!(event_rx.try_recv().is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_keeps_current_route_when_its_provider_leaves_the_catalog() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-removed-current-provider-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        let initial = r#"
+            active_provider = "primary"
+            [providers.primary]
+            protocol = "responses"
+            default_model = "session-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
+            [providers.primary.models.session-model]
+            [providers.secondary]
+            protocol = "responses"
+            default_model = "secondary-model"
+            [providers.secondary.auth]
+            type = "bearer"
+            credential = "secondary-key"
+            [providers.secondary.endpoints]
+            base_url = "https://secondary.example.invalid/v1"
+            [providers.secondary.models.secondary-model]
+        "#;
+        fs::write(&path, initial).expect("write initial config");
+        let initial_config = AppConfig::load_from_path(&path).expect("load initial config");
+        let current_route = ModelRoute::new("primary", "session-model");
+        let next_default = ModelRoute::new("secondary", "secondary-model");
+        let provider = initial_config.provider_for_route(&current_route).unwrap();
+        let mut agent = Agent::new(current_route.model.clone(), 1, 1);
+        agent.set_primary_route(current_route.clone());
+        let mut model_routes = indexmap::IndexMap::from([
+            (current_route.display_name(), current_route.clone()),
+            (next_default.display_name(), next_default.clone()),
+        ]);
+        let mut route_api_key_configured = indexmap::IndexMap::from([
+            (current_route.display_name(), true),
+            (next_default.display_name(), true),
+        ]);
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let mut new_session_default_route = current_route.clone();
+        let mut runtime_catalog = initial_config.runtime_catalog.clone();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let changed = r#"
+            active_provider = "secondary"
+            [providers.secondary]
+            protocol = "responses"
+            default_model = "secondary-model"
+            [providers.secondary.auth]
+            type = "bearer"
+            credential = "secondary-key"
+            [providers.secondary.endpoints]
+            base_url = "https://secondary.example.invalid/v1"
+            [providers.secondary.models.secondary-model]
+        "#;
+        fs::write(&path, changed).expect("remove current provider");
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &mut runtime_catalog,
+            &event_tx,
+        )
+        .expect("removed provider reload keeps live route");
+
+        assert_eq!(agent.primary_route(), Some(&current_route));
+        assert_eq!(new_session_default_route, next_default);
+        assert!(providers.get("primary").is_some_and(|provider| {
+            provider.has_model("session-model") && !provider.api_key.is_empty()
+        }));
+        assert!(!model_routes.contains_key(&current_route.display_name()));
+        assert_eq!(
+            route_api_key_configured.get(&current_route.display_name()),
+            Some(&true)
+        );
+        while event_rx.try_recv().is_ok() {}
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &mut runtime_catalog,
+            &event_tx,
+        )
+        .expect("duplicate removed-provider reload should be a no-op");
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(
+            route_api_key_configured.get(&current_route.display_name()),
+            Some(&true)
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -3444,10 +3620,13 @@ mod tests {
             active_provider = "primary"
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
             [providers.primary.models.expert-model]
@@ -3457,12 +3636,7 @@ mod tests {
 
         let primary_route = ModelRoute::new("primary", "primary-model");
         let expert_route = ModelRoute::new("primary", "expert-model");
-        let mut agent = Agent::new(
-            Client::with_config(OpenAIConfig::new()),
-            primary_route.model.clone(),
-            1,
-            1,
-        );
+        let mut agent = Agent::new(primary_route.model.clone(), 1, 1);
         agent.set_primary_route(primary_route.clone());
         let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
         let mut model_routes = indexmap::IndexMap::new();
@@ -3470,13 +3644,16 @@ mod tests {
         let mut expert_model_routes =
             indexmap::IndexMap::from([("explorer".into(), expert_route.clone())]);
         let mut new_session_default_expert_routes = indexmap::IndexMap::new();
-        let mut expert_allowed_models = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
         let mut legacy_expert_models = indexmap::IndexMap::new();
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
         let mut provider_api_key_hints = indexmap::IndexMap::new();
         let mut new_session_default_route = primary_route.clone();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut runtime_catalog = initial_config.runtime_catalog.clone();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         fs::write(
             &path,
@@ -3484,10 +3661,13 @@ mod tests {
             active_provider = "primary"
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
             "#,
@@ -3507,6 +3687,7 @@ mod tests {
             &mut global_retry,
             &mut provider_api_key_hints,
             &mut new_session_default_route,
+            &mut runtime_catalog,
             &event_tx,
         )
         .expect("catalog reload should keep the current expert route alive");
@@ -3526,7 +3707,256 @@ mod tests {
             Some(&true),
             "the retained session route keeps the credential state of its live provider"
         );
+        while event_rx.try_recv().is_ok() {}
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &mut runtime_catalog,
+            &event_tx,
+        )
+        .expect("duplicate removed-expert reload should be a no-op");
+        assert!(event_rx.try_recv().is_err());
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_runtime_change_updates_fingerprint_and_reinstalls_current_route() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-runtime-change-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        let initial = r#"
+            active_provider = "primary"
+            [providers.primary]
+            protocol = "responses"
+            default_model = "model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "key"
+            [providers.primary.endpoints]
+            base_url = "https://old.example.invalid/v1"
+            [providers.primary.models.model]
+        "#;
+        fs::write(&path, initial).expect("write initial config");
+        let initial_config = AppConfig::load_from_path(&path).expect("load initial config");
+        let route = initial_config.active_route();
+        let provider = initial_config.active_provider().1;
+        let mut agent = Agent::new(route.model.clone(), 1, 1);
+        agent.set_primary_route(route.clone());
+        agent.set_default_protocol(provider.protocol);
+        agent.set_model_protocols(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+        );
+        agent.set_model_catalog(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+        );
+        agent.install_provider_usage_anchor_for_test(crate::agent::TokenUsageEstimate {
+            used_tokens: 10,
+            context_window_tokens: 1_000,
+            input_tokens: 8,
+            output_tokens: 2,
+            cached_tokens: 0,
+        });
+
+        let mut model_routes = indexmap::IndexMap::from([(route.display_name(), route.clone())]);
+        let mut route_api_key_configured = indexmap::IndexMap::from([(route.display_name(), true)]);
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let mut new_session_default_route = route.clone();
+        let mut runtime_catalog = initial_config.runtime_catalog.clone();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        let changed = initial.replace(
+            "https://old.example.invalid/v1",
+            "https://new.example.invalid/v1",
+        );
+        fs::write(&path, changed).expect("write changed config");
+        let expected = AppConfig::load_from_path(&path)
+            .expect("load changed config")
+            .runtime_catalog
+            .fingerprint()
+            .clone();
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &mut runtime_catalog,
+            &event_tx,
+        )
+        .expect("runtime change reload succeeds");
+
+        assert_eq!(runtime_catalog.fingerprint(), &expected);
+        assert_eq!(agent.primary_route(), Some(&route));
+        assert!(
+            agent.provider_usage_anchor_for_test().is_none(),
+            "reinstalling a changed route clears provider-local usage state"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn default_model_only_reload_updates_defaults_without_reinstalling_active_route() {
+        let path = std::env::temp_dir().join(format!(
+            "letcode-engine-reload-default-only-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ));
+        let initial = r#"
+            active_provider = "primary"
+            [providers.primary]
+            protocol = "responses"
+            default_model = "a"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "key"
+            [providers.primary.endpoints]
+            base_url = "https://example.invalid/v1"
+            [providers.primary.models.a]
+            [providers.primary.models.b]
+        "#;
+        fs::write(&path, initial).expect("write initial config");
+        let initial_config = AppConfig::load_from_path(&path).expect("load initial config");
+        let active_route = ModelRoute::new("primary", "a");
+        let next_default = ModelRoute::new("primary", "b");
+        let provider = initial_config.active_provider().1;
+        let mut agent = Agent::new(active_route.model.clone(), 1, 1);
+        agent.set_primary_route(active_route.clone());
+        agent.set_default_protocol(provider.protocol);
+        agent.set_model_protocols(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.protocol))
+                .collect(),
+        );
+        agent.set_model_catalog(
+            provider
+                .models
+                .iter()
+                .map(|(id, model)| (id.clone(), model.request_metadata()))
+                .collect(),
+        );
+        let usage = crate::agent::TokenUsageEstimate {
+            used_tokens: 10,
+            context_window_tokens: 1_000,
+            input_tokens: 8,
+            output_tokens: 2,
+            cached_tokens: 0,
+        };
+        agent.install_provider_usage_anchor_for_test(usage);
+
+        let mut model_routes = initial_config
+            .providers
+            .iter()
+            .flat_map(|(provider_name, provider)| {
+                provider.models.keys().map(move |model| {
+                    let route = ModelRoute::new(provider_name, model);
+                    (route.display_name(), route)
+                })
+            })
+            .collect();
+        let mut route_api_key_configured = indexmap::IndexMap::from([
+            (active_route.display_name(), true),
+            (next_default.display_name(), true),
+        ]);
+        let mut expert_model_routes = indexmap::IndexMap::new();
+        let mut new_session_default_expert_routes = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
+        let mut legacy_expert_models = indexmap::IndexMap::new();
+        let mut providers = initial_config.providers.clone();
+        let mut global_retry = initial_config.global.retry.clone();
+        let mut provider_api_key_hints = indexmap::IndexMap::new();
+        let mut new_session_default_route = active_route.clone();
+        let mut runtime_catalog = initial_config.runtime_catalog.clone();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        fs::write(
+            &path,
+            initial.replace("default_model = \"a\"", "default_model = \"b\""),
+        )
+        .expect("write default-only config");
+        let expected = AppConfig::load_from_path(&path)
+            .expect("load default-only config")
+            .runtime_catalog
+            .fingerprint()
+            .clone();
+
+        apply_config_reload(
+            &mut agent,
+            &path,
+            &mut model_routes,
+            &mut route_api_key_configured,
+            &mut expert_model_routes,
+            &mut new_session_default_expert_routes,
+            &mut expert_allowed_models,
+            &mut legacy_expert_models,
+            &mut providers,
+            &mut global_retry,
+            &mut provider_api_key_hints,
+            &mut new_session_default_route,
+            &mut runtime_catalog,
+            &event_tx,
+        )
+        .expect("default-only reload succeeds");
+
+        assert_eq!(runtime_catalog.fingerprint(), &expected);
+        assert_eq!(new_session_default_route, next_default);
+        assert_eq!(agent.primary_route(), Some(&active_route));
+        assert_eq!(agent.provider_usage_anchor_for_test(), Some(usage));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SessionTransportEvent::ModelCatalogUpdated(_)))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionTransportEvent::ModelChanged { .. }))
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -3545,18 +3975,24 @@ mod tests {
             active_provider = "primary"
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
 
             [providers.secondary]
-            base_url = "https://secondary.example.invalid/v1"
-            api_key = "secondary-key"
             protocol = "responses"
             default_model = "secondary-model"
+            [providers.secondary.auth]
+            type = "bearer"
+            credential = "secondary-key"
+            [providers.secondary.endpoints]
+            base_url = "https://secondary.example.invalid/v1"
 
             [providers.secondary.models.secondary-model]
             "#,
@@ -3565,24 +4001,22 @@ mod tests {
 
         let primary_route = ModelRoute::new("primary", "primary-model");
         let secondary_route = ModelRoute::new("secondary", "secondary-model");
-        let mut agent = Agent::new(
-            Client::with_config(OpenAIConfig::new()),
-            primary_route.model.clone(),
-            1,
-            1,
-        );
+        let mut agent = Agent::new(primary_route.model.clone(), 1, 1);
         agent.set_primary_route(primary_route.clone());
         let initial_config = AppConfig::load_from_path(&path).expect("initial config should load");
         let mut model_routes = indexmap::IndexMap::new();
         let mut route_api_key_configured = indexmap::IndexMap::new();
         let mut expert_model_routes = indexmap::IndexMap::new();
         let mut new_session_default_expert_routes = indexmap::IndexMap::new();
-        let mut expert_allowed_models = indexmap::IndexMap::new();
+        let mut expert_allowed_models = crate::delegation::supported_agent_names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
         let mut legacy_expert_models = indexmap::IndexMap::new();
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
         let mut provider_api_key_hints = indexmap::IndexMap::new();
         let mut new_session_default_route = primary_route.clone();
+        let mut runtime_catalog = initial_config.runtime_catalog.clone();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         fs::write(
@@ -3591,18 +4025,24 @@ mod tests {
             active_provider = "secondary"
 
             [providers.primary]
-            base_url = "https://primary.example.invalid/v1"
-            api_key = "primary-key"
             protocol = "responses"
             default_model = "primary-model"
+            [providers.primary.auth]
+            type = "bearer"
+            credential = "primary-key"
+            [providers.primary.endpoints]
+            base_url = "https://primary.example.invalid/v1"
 
             [providers.primary.models.primary-model]
 
             [providers.secondary]
-            base_url = "https://secondary.example.invalid/v1"
-            api_key = "secondary-key"
             protocol = "responses"
             default_model = "secondary-model"
+            [providers.secondary.auth]
+            type = "bearer"
+            credential = "secondary-key"
+            [providers.secondary.endpoints]
+            base_url = "https://secondary.example.invalid/v1"
 
             [providers.secondary.models.secondary-model]
             "#,
@@ -3622,6 +4062,7 @@ mod tests {
             &mut global_retry,
             &mut provider_api_key_hints,
             &mut new_session_default_route,
+            &mut runtime_catalog,
             &event_tx,
         )
         .expect("active route config should reload");

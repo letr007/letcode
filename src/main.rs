@@ -26,6 +26,7 @@ mod fast_mode;
 mod langfuse_trace;
 mod mcp;
 mod memory;
+pub(crate) mod model_runtime;
 mod permission;
 mod process_tree;
 mod protocol_frames;
@@ -48,7 +49,6 @@ mod workflow_state;
 use agent::{Agent, ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
 use anchored_bootstrap::AnchoredBootstrap;
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::config::OpenAIConfig;
 use config::AppConfig;
 use delegation::supported_agent_names;
 use fast_mode::FastMode;
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     let active_route = config.active_route();
     let active_provider_label = active_provider_name.to_string();
     let api_key_hint = format!(
-        "Set api_key for the selected provider in {}.",
+        "Set [providers.<name>.auth].credential in {} or set <NAME>_API_KEY environment variable.",
         config.config_path.display(),
     );
     let provider_api_key_hints = config
@@ -133,9 +133,7 @@ async fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
     memory::set_memory_sessions_dir(config.global.sessions_dir.clone());
-    let client = active_route.build_client(active_provider);
     let mut agent = Agent::new(
-        client,
         active_route.model.clone(),
         config.global.max_iterations,
         config.global.max_tool_calls,
@@ -183,9 +181,10 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| config.global.retry.clone()),
     );
     agent.set_permission_mode(config.permissions.mode);
-    let primary_route_factory = Arc::new(ConfiguredPrimaryRouteFactory::new(
+    let primary_route_factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
         config.providers.clone(),
         config.global.retry.clone(),
+        config.runtime_catalog.clone(),
     ));
     let prepared_active_route = primary_route_factory.prepare_route(active_route.clone())?;
     agent.apply_prepared_route(prepared_active_route);
@@ -358,6 +357,7 @@ fn session_engine_config(
         api_key_hint,
         mcp_config_path: config.config_path.clone(),
         mcp_config: config.mcp.clone(),
+        runtime_catalog: config.runtime_catalog.clone(),
     }
 }
 
@@ -530,7 +530,7 @@ fn run_config_validate(path: Option<String>) -> Result<()> {
     }
 }
 
-fn install_expert_route_factory(agent: &mut Agent<OpenAIConfig>, config: &AppConfig) -> Result<()> {
+fn install_expert_route_factory(agent: &mut Agent, config: &AppConfig) -> Result<()> {
     let policies = supported_agent_names().map(|agent_name| {
         (
             agent_name.to_string(),
@@ -543,20 +543,21 @@ fn install_expert_route_factory(agent: &mut Agent<OpenAIConfig>, config: &AppCon
         )
     });
     let factory =
-        ExpertRouteFactory::new_with_policies(policies, &config.providers, &config.global.retry)?;
+        ExpertRouteFactory::new_with_policies(policies, &config.providers, &config.global.retry)?
+            .with_runtime_catalog(config.runtime_catalog.clone());
     agent.set_subagent_child_factory(Arc::new(factory));
     Ok(())
 }
 
-fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
+fn sync_agent_context_scope_from_recorder(
+    agent: &mut Agent,
     recorder: &TranscriptRecorder,
 ) -> Result<()> {
     session::sync_agent_context_scope_from_recorder(agent, recorder)
 }
 
-fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
+fn configure_agent_runtime_snapshot_provider(
+    agent: &mut Agent,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
 ) {
     let runtime_recorder = Arc::clone(recorder);
@@ -586,7 +587,7 @@ fn provider_api_key_env_var(provider_name: &str) -> String {
 
 fn provider_api_key_hint(config: &AppConfig, provider_name: &str) -> String {
     format!(
-        "Set providers.{provider_name}.api_key in {} or set {}.",
+        "Set [providers.{provider_name}.auth].credential in {} or set {} environment variable.",
         config.config_path.display(),
         provider_api_key_env_var(provider_name)
     )
@@ -596,7 +597,6 @@ fn provider_api_key_hint(config: &AppConfig, provider_name: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::ProviderConfig;
-    use async_openai::Client;
     use serde_json::json;
     use std::fs;
     use std::io::Write;
@@ -612,17 +612,8 @@ mod tests {
         base_dir
     }
 
-    fn test_agent() -> Agent<OpenAIConfig> {
-        Agent::new(
-            Client::with_config(
-                OpenAIConfig::new()
-                    .with_api_base("https://api.openai.com/v1")
-                    .with_api_key("test"),
-            ),
-            "test-model",
-            1,
-            1,
-        )
+    fn test_agent() -> Agent {
+        Agent::new("test-model", 1, 1)
     }
 
     #[test]
@@ -649,7 +640,6 @@ mod tests {
                     protocol: config::ApiProtocol::Completions,
                     anthropic_thinking: Default::default(),
                     anthropic_betas: Vec::new(),
-                    cache_control: false,
                     context_window: Some(8_192),
                     effective_input_limit_tokens: Some(4_096),
                     max_output_tokens: Some(512),
@@ -945,8 +935,8 @@ fn init_tracing(log_path: &Path) -> TracingGuards {
         }
     };
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("letcode=info,async_openai=warn"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("letcode=info"));
     let (langfuse_provider, langfuse_status) = init_langfuse_provider();
     let langfuse_layer = langfuse_provider.as_ref().map(|provider| {
         let tracer = provider.tracer("letcode-langfuse");

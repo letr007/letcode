@@ -77,7 +77,7 @@ impl SessionCoordinator {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dispatch_idle_command(
         command: SessionCommand,
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        agent: &mut Agent,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
@@ -94,7 +94,7 @@ impl SessionCoordinator {
 
     pub(crate) fn dispatch_idle_command_with_history_prepare<F>(
         command: SessionCommand,
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        agent: &mut Agent,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
@@ -269,7 +269,7 @@ impl SessionCoordinator {
     }
 
     fn navigate_undo<F>(
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        agent: &mut Agent,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         prepare_history: &mut F,
@@ -360,7 +360,7 @@ impl SessionCoordinator {
     }
 
     fn navigate_redo<F>(
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        agent: &mut Agent,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         prepare_history: &mut F,
@@ -425,7 +425,7 @@ impl SessionCoordinator {
     }
 
     fn navigate_history<F>(
-        agent: &mut Agent<async_openai::config::OpenAIConfig>,
+        agent: &mut Agent,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         target_sequence: u64,
@@ -799,7 +799,6 @@ mod tests {
     use super::*;
     use crate::permission::PermissionMode;
     use crate::request_builder::ModelReasoningEffort;
-    use async_openai::{Client, config::OpenAIConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_transcript() -> Arc<Mutex<TranscriptRecorder>> {
@@ -815,11 +814,8 @@ mod tests {
         ))
     }
 
-    fn test_agent() -> Agent<OpenAIConfig> {
-        let config = OpenAIConfig::new()
-            .with_api_base("http://127.0.0.1:9/v1")
-            .with_api_key("test-key");
-        Agent::new(Client::with_config(config), "gpt-5.5", 1, 1)
+    fn test_agent() -> Agent {
+        Agent::new("gpt-5.5", 1, 1)
     }
 
     #[test]
@@ -861,11 +857,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    fn history_navigation_with_unsupported_model() -> (
-        Arc<Mutex<TranscriptRecorder>>,
-        Agent<OpenAIConfig>,
-        std::path::PathBuf,
-    ) {
+    fn history_navigation_with_unsupported_model()
+    -> (Arc<Mutex<TranscriptRecorder>>, Agent, std::path::PathBuf) {
         let transcript = temp_transcript();
         {
             let mut recorder = transcript.lock().expect("recorder");
@@ -1068,7 +1061,7 @@ protocol = "responses"
 
     fn dispatch_navigation(
         command: SessionCommand,
-        agent: &mut Agent<OpenAIConfig>,
+        agent: &mut Agent,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         rx: &mut mpsc::UnboundedReceiver<SessionTransportEvent>,

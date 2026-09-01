@@ -1,13 +1,12 @@
 use super::*;
-use crate::langfuse_trace;
-use crate::retry::{is_retryable_provider_error_fields, retry_delay_from_headers};
+use crate::model_runtime::projection::model_request_from_prompt_plan;
+use crate::model_runtime::runtime::{
+    AttemptOutcome, CompletedToolCall, ModelAttemptResult, ModelAttemptSnapshot, ModelRuntime,
+    TurnContinuationDecision, TurnDriver, TurnLimits, TurnOrchestrator,
+};
+use crate::model_runtime::{ModelEvent, ModelFailure, ModelMessage, ModelRequestInput};
 use crate::user_content::UserMessageContent;
-use tracing::Instrument;
-
-#[cfg(test)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(test)]
-use tokio::net::TcpListener;
+use std::collections::BTreeMap;
 
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
@@ -38,259 +37,768 @@ fn llm_request_telemetry(
     )
 }
 
-async fn emit_attempt_terminal<E, Efut>(
-    error_class: LlmRequestErrorClass,
-    prepared: &LlmRequestTelemetry,
-    iteration_span: &tracing::Span,
-    on_event: &mut E,
-) -> Result<()>
-where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    let telemetry = prepared.failed(error_class);
-    on_event(AgentEvent::LlmRequestTelemetry(telemetry.clone())).await?;
-    langfuse_trace::record_llm_request_telemetry(iteration_span, &telemetry);
-    Ok(())
+fn resolved_protocol(route: &crate::model_runtime::ResolvedModelRoute) -> Result<ApiProtocol> {
+    match route.protocol_id.as_str() {
+        "responses" => Ok(ApiProtocol::Responses),
+        "completions" => Ok(ApiProtocol::Completions),
+        "anthropic" => Ok(ApiProtocol::Anthropic),
+        value => Err(anyhow!("unsupported resolved protocol '{value}'")),
+    }
 }
 
-async fn emit_retry_scheduled<E, Efut>(
-    attempt: usize,
-    max_attempts: usize,
-    delay: std::time::Duration,
+fn runtime_failure(
+    phase: crate::model_runtime::FailurePhase,
     error: impl std::fmt::Display,
-    on_event: &mut E,
-) -> Result<LlmRetryLifecycle>
+) -> crate::model_runtime::ModelFailure {
+    crate::model_runtime::ModelFailure::new(phase, crate::model_runtime::FailureKind::Internal)
+        .with_detail(error.to_string())
+}
+
+fn failure_error_class(failure: &ModelFailure) -> LlmRequestErrorClass {
+    match failure.phase {
+        crate::model_runtime::FailurePhase::Prepare | crate::model_runtime::FailurePhase::Bind => {
+            LlmRequestErrorClass::RequestCreation
+        }
+        crate::model_runtime::FailurePhase::Transport => LlmRequestErrorClass::StreamRead,
+        crate::model_runtime::FailurePhase::Decode | crate::model_runtime::FailurePhase::Finish => {
+            if matches!(
+                failure.kind,
+                crate::model_runtime::FailureKind::Authentication
+                    | crate::model_runtime::FailureKind::RateLimited
+                    | crate::model_runtime::FailureKind::Http
+            ) {
+                LlmRequestErrorClass::ProviderTerminal
+            } else {
+                LlmRequestErrorClass::ProtocolValidation
+            }
+        }
+    }
+}
+
+/// Executes a normal Agent turn through the installed provider-neutral route.
+pub(super) async fn run_resolved_turn_async<F, E, A, Dfut, Efut, Afut>(
+    agent: &mut Agent,
+    user_content: UserMessageContent,
+    user_input: &str,
+    mut on_delta: F,
+    mut on_event: E,
+    mut approve: A,
+) -> Result<String>
 where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
+    F: FnMut(&str) -> Dfut + Send,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    A: FnMut(PermissionRequest) -> Afut + Send,
+    Dfut: Future<Output = Result<()>> + Send,
+    Efut: Future<Output = Result<()>> + Send,
+    Afut: Future<Output = Result<PermissionApproval>> + Send,
 {
-    let retry = LlmRetryLifecycle {
-        attempt: attempt.saturating_add(1),
-        max_attempts,
-        delay_secs: delay.as_secs(),
-        error: error.to_string(),
+    let route = agent
+        .resolved_model_route()
+        .cloned()
+        .ok_or_else(|| anyhow!("normal Agent turn requires an installed resolved model route"))?;
+    let protocol = resolved_protocol(&route)?;
+    let turn_prelude =
+        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
+    let protected_start_index = agent.active_history_items().len();
+    let previous_turn_start_index = agent.turn.current_turn_start_index;
+    agent.turn.current_turn_start_index = Some(protected_start_index);
+    if !user_content.has_no_parts()
+        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
+    {
+        agent.turn.current_turn_start_index = previous_turn_start_index;
+        return Err(error);
+    }
+    Agent::emit_audit_event(
+        &mut on_event,
+        AgentEvent::TurnStarted(agent.turn_started_event()),
+        "turn_started",
+    )
+    .await;
+
+    let limits = TurnLimits {
+        max_iterations: agent.max_iterations.unwrap_or(usize::MAX),
+        max_tool_calls: agent.max_tool_calls,
     };
-    on_event(AgentEvent::LlmRetryScheduled(retry.clone())).await?;
-    Ok(retry)
-}
-
-async fn wait_for_retry<E, Efut>(
-    attempt: usize,
-    max_attempts: usize,
-    delay: std::time::Duration,
-    error: impl std::fmt::Display,
-    on_event: &mut E,
-) -> Result<()>
-where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    let retry = emit_retry_scheduled(attempt, max_attempts, delay, error, on_event).await?;
-    tokio::time::sleep(delay).await;
-    on_event(AgentEvent::LlmRetryStarted(retry)).await
-}
-
-async fn emit_attempt_interrupted<E, Efut>(
-    error_class: LlmRequestErrorClass,
-    prepared: &LlmRequestTelemetry,
-    iteration_span: &tracing::Span,
-    on_event: &mut E,
-) -> Result<()>
-where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    let telemetry = prepared.interrupted(error_class);
-    on_event(AgentEvent::LlmRequestTelemetry(telemetry.clone())).await?;
-    langfuse_trace::record_llm_request_telemetry(iteration_span, &telemetry);
-    Ok(())
-}
-
-enum ResponseStreamRequest {
-    Typed(async_openai::types::responses::CreateResponse),
-    Compatible(Value),
-    FakeCodex(Value, crate::fake::CodexRequestContext),
-}
-
-enum CompletionStreamRequest {
-    Typed(async_openai::types::chat::CreateChatCompletionRequest),
-    Compatible(Value),
-}
-
-#[derive(Debug)]
-pub(super) enum ChatStreamCreationError {
-    Setup(String),
-    Transport(reqwest::Error),
-    Status {
-        status: reqwest::StatusCode,
-        headers: reqwest::header::HeaderMap,
-        message: String,
-    },
-}
-
-impl std::fmt::Display for ChatStreamCreationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Setup(error) => write!(f, "failed to create streamed chat completion: {error}"),
-            Self::Transport(error) => {
-                write!(f, "failed to create streamed chat completion: {error}")
-            }
-            Self::Status {
-                status, message, ..
-            } => {
-                write!(
-                    f,
-                    "chat completions request failed with status {status}: {message}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ChatStreamCreationError {}
-
-fn should_retry_chat_stream_creation(
-    config: &crate::config::RetryConfig,
-    attempt: usize,
-    error: &ChatStreamCreationError,
-) -> bool {
-    match error {
-        ChatStreamCreationError::Setup(_) => false,
-        ChatStreamCreationError::Transport(error) => {
-            should_retry_reqwest_error(config, attempt, error)
-        }
-        ChatStreamCreationError::Status { status, .. } => {
-            should_retry_http_status(config, attempt, *status)
-        }
-    }
-}
-
-async fn create_response_stream<C: Config>(
-    client: &Client<C>,
-    request: &ResponseStreamRequest,
-) -> Result<async_openai::types::stream::StreamResponse<Value>, OpenAIError> {
-    match request {
-        ResponseStreamRequest::Typed(request) => {
-            client.responses().create_stream_byot(request.clone()).await
-        }
-        ResponseStreamRequest::Compatible(request) => {
-            client.responses().create_stream_byot(request.clone()).await
-        }
-        ResponseStreamRequest::FakeCodex(request, context) => {
-            create_fake_codex_stream(client, request, context).await
-        }
-    }
-}
-
-async fn create_fake_codex_stream<C: Config>(
-    client: &Client<C>,
-    request: &Value,
-    context: &crate::fake::CodexRequestContext,
-) -> Result<async_openai::types::stream::StreamResponse<Value>, OpenAIError> {
-    use async_openai::config::OpenAIConfig;
-    use reqwest::header::{HeaderName, HeaderValue};
-
-    use secrecy::ExposeSecret;
-
-    let mut config = OpenAIConfig::new()
-        .with_api_base(client.config().api_base().to_string())
-        .with_api_key(client.config().api_key().expose_secret());
-    for (name, value) in context.headers() {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-            OpenAIError::InvalidArgument(format!("invalid fake header name: {error}"))
-        })?;
-        let value = HeaderValue::from_str(&value).map_err(|error| {
-            OpenAIError::InvalidArgument(format!("invalid fake header value: {error}"))
-        })?;
-        let value = value
-            .to_str()
-            .map_err(|error| {
-                OpenAIError::InvalidArgument(format!("invalid fake header value: {error}"))
-            })?
-            .to_string();
-        config = config.with_header(name, value.as_str())?;
-    }
-
-    Client::with_config(config)
-        .responses()
-        .create_stream_byot(request.clone())
+    let fake_decorator = agent.fake_client().and_then(|client| {
+        let profile = match route.protocol_id.as_str() {
+            "responses" => crate::fake::FakeClient::Codex,
+            "anthropic" => crate::fake::FakeClient::Anthropic,
+            _ => return None,
+        };
+        agent.fake_turn_context(profile).and_then(|context| {
+            crate::model_runtime::decorator::FakeRequestDecorator::new(
+                client,
+                &route.protocol_id,
+                context,
+            )
+            .ok()
+        })
+    });
+    let mut driver = ResolvedTurnDriver {
+        agent,
+        route: route.clone(),
+        protocol,
+        turn_prelude: &turn_prelude,
+        protected_start_index,
+        on_delta: &mut on_delta,
+        on_event: &mut on_event,
+        approve: &mut approve,
+        tool_call_count: 0,
+        continuation_count: 0,
+        final_text: String::new(),
+        prepared: None,
+        usage: None,
+        response_id: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cache_details_present: false,
+        current_attempt: 1,
+        scheduled_retry: None,
+        fake_decorator,
+    };
+    TurnOrchestrator::new(ModelRuntime::default(), limits)
+        .run(&route, &mut driver)
         .await
+        .map_err(|failure| anyhow!(failure.to_string()))?;
+    Ok(if driver.final_text.is_empty() {
+        "No response content".to_string()
+    } else {
+        driver.final_text
+    })
 }
 
-/// Filters the validated provider side-band event and normalizes response payloads
-/// for strict SDK deserialization.
-pub(super) fn project_response_stream_event(
-    raw: &Value,
-) -> std::result::Result<Option<ResponseStreamEvent>, serde_json::Error> {
-    let Some(projected) = project_response_stream_event_value(raw)? else {
-        return Ok(None);
-    };
-    serde_json::from_value(projected).map(Some)
+struct PreparedResolvedIteration {
+    build: crate::request_builder::BuildResult,
+    epoch_preview: crate::agent::ActiveEpochPreview,
+    telemetry: LlmRequestTelemetry,
+    observation: crate::request_builder::LogicalRequestObservation,
 }
 
-fn project_response_stream_event_value(
-    raw: &Value,
-) -> std::result::Result<Option<Value>, serde_json::Error> {
-    if raw.get("type").and_then(Value::as_str) == Some("response.metadata") {
-        let valid_extension = raw.get("response_id").is_some_and(Value::is_string)
-            && raw
-                .get("sequence_number")
-                .is_some_and(|value| value.as_u64().is_some())
-            && raw.get("metadata").is_some_and(Value::is_object);
-        if valid_extension {
-            return Ok(None);
-        }
-        return Err(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "malformed response.metadata stream event",
-        )));
-    }
-
-    let mut projected = raw.clone();
-    if let Some(response) = projected.get_mut("response").and_then(Value::as_object_mut) {
-        response.remove("reasoning");
-        if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
-            usage
-                .entry("input_tokens_details".to_owned())
-                .or_insert_with(|| serde_json::json!({ "cached_tokens": 0 }));
-            usage
-                .entry("output_tokens_details".to_owned())
-                .or_insert_with(|| serde_json::json!({ "reasoning_tokens": 0 }));
-        }
-    }
-    Ok(Some(projected))
+struct ResolvedTurnDriver<'a, F, E, A> {
+    agent: &'a mut Agent,
+    route: std::sync::Arc<crate::model_runtime::ResolvedModelRoute>,
+    protocol: ApiProtocol,
+    turn_prelude: &'a [PromptMessage],
+    protected_start_index: usize,
+    on_delta: &'a mut F,
+    on_event: &'a mut E,
+    approve: &'a mut A,
+    tool_call_count: usize,
+    continuation_count: usize,
+    final_text: String,
+    prepared: Option<PreparedResolvedIteration>,
+    usage: Option<TokenUsageEstimate>,
+    response_id: Option<String>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    cache_details_present: bool,
+    current_attempt: usize,
+    scheduled_retry: Option<LlmRetryLifecycle>,
+    fake_decorator: Option<crate::model_runtime::decorator::FakeRequestDecorator>,
 }
 
-pub(super) fn is_ignorable_response_lifecycle_event(raw: &Value) -> bool {
-    matches!(
-        raw.get("type").and_then(Value::as_str),
-        Some("response.created" | "response.in_progress")
-    ) && raw
-        .get("response")
-        .and_then(Value::as_object)
-        .is_some_and(|response| !response.contains_key("model"))
-}
-
-fn log_prepared_request_metadata(build: &crate::request_builder::BuildResult) {
-    if build.budget.truncated {
-        debug!(
-            original_history_items = build.budget.original_history_items,
-            retained_history_items = build.budget.retained_history_items,
-            dropped_history_items = build.budget.dropped_history_items,
-            context_window_tokens = build.budget.context_window_tokens,
-            input_budget_tokens = build.budget.input_budget_tokens,
-            estimated_request_tokens = build.budget.estimated_request_tokens,
-            prompt_segments = build.prompt_plan.segments.len(),
-            prompt_stable_prefix_hash = build.prompt_plan.stable_prefix_hash(),
-            "request history truncated to fit budget"
+#[async_trait::async_trait]
+impl<'a, F, E, A, Dfut, Efut, Afut> TurnDriver for ResolvedTurnDriver<'a, F, E, A>
+where
+    F: FnMut(&str) -> Dfut + Send,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    A: FnMut(PermissionRequest) -> Afut + Send,
+    Dfut: Future<Output = Result<()>> + Send,
+    Efut: Future<Output = Result<()>> + Send,
+    Afut: Future<Output = Result<PermissionApproval>> + Send,
+{
+    async fn prepare_iteration(
+        &mut self,
+        iteration: usize,
+    ) -> std::result::Result<ModelRequestInput, ModelFailure> {
+        let tools = self.agent.tool_definitions();
+        let prepared = prepare_protocol_stream_request(
+            self.agent,
+            self.protocol,
+            self.turn_prelude,
+            &mut self.protected_start_index,
+            &tools,
+            self.on_event,
+        )
+        .await
+        .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+        self.protected_start_index = prepared.protected_start_index;
+        let input = model_request_from_prompt_plan(
+            &self.route,
+            &self.agent.active_model_metadata(),
+            &prepared.build.prompt_plan,
+            &tools,
+        )
+        .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+        let planned_observation = self.agent.preview_final_logical_request(&prepared.build);
+        let telemetry = llm_request_telemetry(
+            &format!("turn-{}-iteration-{iteration}", self.agent.turn.turn_id),
+            self.agent.turn.turn_id,
+            iteration,
+            1,
+            &self.route.model_override,
+            self.protocol,
+            &prepared.build,
+            self.tool_call_count,
+            tools.len(),
+            planned_observation,
         );
+        self.usage = None;
+        self.response_id = None;
+        self.cache_read_tokens = None;
+        self.cache_write_tokens = None;
+        self.cache_details_present = false;
+        self.current_attempt = 1;
+        self.prepared = Some(PreparedResolvedIteration {
+            build: prepared.build,
+            epoch_preview: prepared.epoch_preview,
+            telemetry,
+            observation: crate::request_builder::LogicalRequestObservation {
+                cohort: crate::request_builder::LogicalRequestCohort {
+                    request_shape_digest: String::new(),
+                },
+                units: Vec::new(),
+            },
+        });
+        Ok(input)
+    }
+
+    fn bypass_iteration_limit(&self) -> bool {
+        self.agent.turn.auto_continue_active
+    }
+
+    fn bypass_tool_limit(&self) -> bool {
+        self.agent.turn.auto_continue_active
+    }
+
+    async fn decorate_request(
+        &mut self,
+        request: crate::model_runtime::PreparedHttpRequest,
+    ) -> std::result::Result<crate::model_runtime::PreparedHttpRequest, ModelFailure> {
+        let request = match &self.fake_decorator {
+            Some(decorator) => decorator.decorate(&self.route.protocol_id, request)?,
+            None => request,
+        };
+        if let Some(prepared) = self.prepared.as_mut() {
+            let stable_request =
+                if let Some(stable_end) = prepared.build.prompt_plan.stable_prefix_end {
+                    let mut stable_plan = prepared.build.prompt_plan.clone();
+                    stable_plan.segments.truncate(stable_end + 1);
+                    stable_plan.recompute_cache_metadata();
+                    let stable_input = model_request_from_prompt_plan(
+                        &self.route,
+                        &self.agent.active_model_metadata(),
+                        &stable_plan,
+                        &self.agent.tool_definitions(),
+                    )
+                    .map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Prepare, error)
+                    })?;
+                    let stable_request = self.route.binding.prepare_request(&stable_input)?;
+                    let stable_request = match &self.fake_decorator {
+                        Some(decorator) => {
+                            decorator.decorate(&self.route.protocol_id, stable_request)?
+                        }
+                        None => stable_request,
+                    };
+                    Some(stable_request)
+                } else {
+                    None
+                };
+            let inspection = self
+                .route
+                .binding
+                .inspect_prepared_request(&request, stable_request.as_ref())?;
+            prepared.observation = crate::request_builder::observe_prepared_model_request(
+                &inspection,
+                &prepared.build.prompt_plan,
+            )
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+            let adjacent = self
+                .agent
+                .preview_logical_observation(prepared.observation.clone());
+            prepared.telemetry.cache_configured = self.route.cache.enabled;
+            prepared.telemetry.cache_hint_serialized = inspection.cache.hint_serialized;
+            prepared.telemetry.cache_retention_sent =
+                inspection.cache.retention_sent.map(|value| match value {
+                    crate::model_runtime::CacheRetention::InMemory => {
+                        crate::config::PromptCacheRetention::InMemory
+                    }
+                    crate::model_runtime::CacheRetention::TwentyFourHours => {
+                        crate::config::PromptCacheRetention::TwentyFourHours
+                    }
+                });
+            prepared.telemetry.cache_stable_prefix_segments = prepared
+                .build
+                .prompt_plan
+                .stable_prefix_end
+                .map_or(0, |index| index + 1);
+            prepared.telemetry.local_prefix_fingerprint = inspection.cache.local_prefix_fingerprint;
+            prepared.telemetry.routing_key = inspection.cache.routing_key;
+            prepared.telemetry.adjacent_lcp_units =
+                adjacent.cohort_comparable.then_some(adjacent.lcp_units);
+            prepared.telemetry.adjacent_lcp_bytes =
+                adjacent.cohort_comparable.then_some(adjacent.lcp_bytes);
+            prepared.telemetry.adjacent_lcp_estimated_tokens = adjacent
+                .cohort_comparable
+                .then_some(adjacent.lcp_estimated_tokens);
+            prepared.telemetry.current_unit_count = adjacent.current_unit_count;
+            prepared.telemetry.first_breaker = adjacent.first_breaker;
+            prepared.telemetry.cohort_comparable = adjacent.cohort_comparable;
+            prepared.telemetry.cohort_changed = adjacent.cohort_changed;
+        }
+        Ok(request)
+    }
+
+    async fn attempt_started(
+        &mut self,
+        _iteration: usize,
+        attempt: usize,
+    ) -> std::result::Result<(), ModelFailure> {
+        let Some(prepared) = &self.prepared else {
+            return Ok(());
+        };
+        self.current_attempt = attempt;
+        self.usage = None;
+        self.response_id = None;
+        self.cache_read_tokens = None;
+        self.cache_write_tokens = None;
+        self.cache_details_present = false;
+        let mut telemetry = prepared.telemetry.clone();
+        telemetry.attempt = attempt;
+        if attempt > 1 {
+            telemetry.adjacent_lcp_units = None;
+            telemetry.adjacent_lcp_bytes = None;
+            telemetry.adjacent_lcp_estimated_tokens = None;
+            telemetry.first_breaker = None;
+        }
+        (self.on_event)(AgentEvent::LlmRequestTelemetry(telemetry))
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Transport, error))
+    }
+
+    async fn commit_before_first_send(
+        &mut self,
+        _iteration: usize,
+    ) -> std::result::Result<(), ModelFailure> {
+        let Some(prepared) = &self.prepared else {
+            return Ok(());
+        };
+        self.agent
+            .commit_resolved_active_epoch(
+                prepared.epoch_preview.clone(),
+                prepared.observation.clone(),
+            )
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+        self.agent
+            .commit_logical_observation(prepared.observation.clone());
+        Ok(())
+    }
+
+    async fn attempt_finished(
+        &mut self,
+        _iteration: usize,
+        _attempt: usize,
+        outcome: &AttemptOutcome,
+    ) -> std::result::Result<(), ModelFailure> {
+        let Some(prepared) = &self.prepared else {
+            return Ok(());
+        };
+        let mut base = prepared.telemetry.clone();
+        base.attempt = self.current_attempt;
+        let telemetry = match outcome {
+            AttemptOutcome::Completed { .. } => return Ok(()),
+            AttemptOutcome::Failed {
+                failure,
+                side_effects,
+            } => {
+                let error_class = failure_error_class(failure);
+                if side_effects.observable() {
+                    base.interrupted(error_class)
+                } else {
+                    base.failed(error_class)
+                }
+            }
+        };
+        (self.on_event)(AgentEvent::LlmRequestTelemetry(telemetry))
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Transport, error))
+    }
+
+    async fn retry_scheduled(
+        &mut self,
+        _iteration: usize,
+        _attempt: usize,
+        next_attempt: usize,
+        delay: std::time::Duration,
+        failure: &ModelFailure,
+    ) -> std::result::Result<(), ModelFailure> {
+        let retry = LlmRetryLifecycle {
+            attempt: next_attempt,
+            max_attempts: self
+                .route
+                .retry
+                .as_ref()
+                .map_or(1, |retry| retry.max_attempts),
+            delay_secs: delay.as_secs(),
+            error: failure.to_string(),
+        };
+        (self.on_event)(AgentEvent::LlmRetryScheduled(retry.clone()))
+            .await
+            .map_err(|error| {
+                runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+            })?;
+        self.scheduled_retry = Some(retry);
+        Ok(())
+    }
+
+    async fn retry_started(
+        &mut self,
+        _iteration: usize,
+        _attempt: usize,
+    ) -> std::result::Result<(), ModelFailure> {
+        if let Some(retry) = self.scheduled_retry.take() {
+            (self.on_event)(AgentEvent::LlmRetryStarted(retry))
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn observe_event(&mut self, event: &ModelEvent) -> std::result::Result<(), ModelFailure> {
+        match event {
+            ModelEvent::TextDelta { text } => {
+                (self.on_delta)(text).await.map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
+                self.final_text.push_str(text);
+            }
+            ModelEvent::ReasoningDelta { item_id, text } => {
+                (self.on_event)(AgentEvent::ReasoningDelta {
+                    item_id: item_id.clone(),
+                    delta: text.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
+            }
+            ModelEvent::ReasoningDone { item_id, text, .. } => {
+                (self.on_event)(AgentEvent::ReasoningDone {
+                    item_id: item_id.clone(),
+                    text: text.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
+            }
+            ModelEvent::ToolStarted { id, name } => {
+                (self.on_event)(AgentEvent::ToolCallPending {
+                    call_id: id.clone(),
+                    name: name.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
+            }
+            ModelEvent::Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cached_input_tokens,
+                ..
+            } => {
+                let Some(prepared) = &self.prepared else {
+                    return Ok(());
+                };
+                let cached_tokens = cached_input_tokens.unwrap_or(0);
+                self.cache_details_present |= cached_input_tokens.is_some();
+                let usage = TokenUsageEstimate {
+                    used_tokens: *total_tokens,
+                    context_window_tokens: prepared.build.budget.context_window_tokens,
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    cached_tokens: self.cache_read_tokens.unwrap_or(cached_tokens),
+                };
+                self.usage = Some(usage);
+            }
+            ModelEvent::ResponseMetadata { response_id } => {
+                self.response_id = Some(response_id.clone());
+            }
+            ModelEvent::Cache {
+                read_tokens,
+                write_tokens,
+                ..
+            } => {
+                self.cache_read_tokens = Some(*read_tokens);
+                self.cache_write_tokens = Some(*write_tokens);
+                self.cache_details_present = true;
+                if let Some(usage) = self.usage.as_mut() {
+                    usage.cached_tokens = *read_tokens;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn persist_assistant(
+        &mut self,
+        assistant: &ModelMessage,
+    ) -> std::result::Result<(), ModelFailure> {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut replay = None;
+        let mut calls = Vec::new();
+        for part in &assistant.content {
+            match part {
+                crate::model_runtime::ContentPart::Text(value) => text.push_str(value),
+                crate::model_runtime::ContentPart::Reasoning {
+                    text: value,
+                    replay: value_replay,
+                    ..
+                } => {
+                    reasoning.push_str(value);
+                    replay = value_replay.clone();
+                }
+                crate::model_runtime::ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => calls.push(HistoryToolCall {
+                    call_id: id.clone(),
+                    name: name.clone(),
+                    arguments_json: arguments.to_string(),
+                }),
+                _ => {}
+            }
+        }
+        self.agent
+            .append_history_item(HistoryItem::AssistantTurn {
+                text: (!text.is_empty()).then_some(text.clone()),
+                reasoning_content: (!reasoning.is_empty()).then_some(reasoning.clone()),
+                replay: replay.clone(),
+                calls: calls.clone(),
+            })
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        if let Some(prepared) = &self.prepared {
+            if let Some(usage) = self.usage {
+                let mut cache_report = CacheUsageReport::from_build(&prepared.build);
+                if self.cache_details_present {
+                    cache_report = cache_report.with_actual_cached_tokens(usage.cached_tokens);
+                }
+                cache_report.configured = prepared.telemetry.cache_configured;
+                cache_report.hint_serialized = prepared.telemetry.cache_hint_serialized;
+                cache_report.retention_sent = prepared.telemetry.cache_retention_sent;
+                cache_report.stable_prefix_segments =
+                    prepared.telemetry.cache_stable_prefix_segments;
+                cache_report.local_prefix_fingerprint =
+                    prepared.telemetry.local_prefix_fingerprint.clone();
+                cache_report.routing_key = prepared.telemetry.routing_key.clone();
+                (self.on_event)(AgentEvent::TokenUsageUpdated {
+                    used_tokens: usage.used_tokens,
+                    context_window_tokens: usage.context_window_tokens,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_tokens: usage.cached_tokens,
+                    cache_report: Some(cache_report),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
+            }
+            let mut completed = prepared.telemetry.completed(
+                self.usage,
+                self.response_id.clone(),
+                if self.usage.is_none() {
+                    ProviderUsageCompleteness::UsageMissing
+                } else if self.cache_details_present {
+                    ProviderUsageCompleteness::Complete
+                } else {
+                    ProviderUsageCompleteness::CacheDetailsMissing
+                },
+            );
+            completed.attempt = self.current_attempt;
+            completed.cache_write_tokens = self.cache_write_tokens;
+            (self.on_event)(AgentEvent::LlmRequestTelemetry(completed))
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
+        }
+        if let Some(usage) = self.usage {
+            self.agent.install_provider_usage_anchor(usage);
+        }
+        if calls.is_empty() {
+            if !text.is_empty() {
+                (self.on_event)(AgentEvent::AssistantMessage { content: text })
+                    .await
+                    .map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                    })?;
+            }
+        } else {
+            (self.on_event)(AgentEvent::AssistantToolCallBatch {
+                text: (!text.is_empty()).then_some(text),
+                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                reasoning_wire: replay.and_then(|value| value.payload_json()),
+                calls,
+            })
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        }
+        Ok(())
+    }
+
+    async fn execute_tools(
+        &mut self,
+        tools: &[CompletedToolCall],
+    ) -> std::result::Result<(), ModelFailure> {
+        let calls = tools
+            .iter()
+            .map(|tool| HistoryToolCall {
+                call_id: tool.id.clone(),
+                name: tool.name.clone(),
+                arguments_json: tool.arguments.to_string(),
+            })
+            .collect::<Vec<_>>();
+        self.tool_call_count = self.tool_call_count.saturating_add(calls.len());
+        self.agent
+            .execute_tool_calls_and_record(&calls, self.on_event, self.approve)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        (self.on_event)(AgentEvent::ToolCallBatchFinished)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        (self.on_event)(AgentEvent::TurnContinuationBoundary)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        let _ = self
+            .agent
+            .drain_turn_continuations(self.on_event)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        Ok(())
+    }
+
+    async fn recover_iteration(
+        &mut self,
+        partial: &ModelAttemptSnapshot,
+        _failure: &ModelFailure,
+    ) -> std::result::Result<(), ModelFailure> {
+        let pending = partial
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::ToolStarted { id, name } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        emit_pending_tool_call_cancellations(&pending, self.on_event)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut replay = None;
+        for part in &partial.assistant.content {
+            match part {
+                crate::model_runtime::ContentPart::Text(value) => text.push_str(value),
+                crate::model_runtime::ContentPart::Reasoning {
+                    text: value,
+                    replay: value_replay,
+                    ..
+                } => {
+                    reasoning.push_str(value);
+                    replay = value_replay.clone();
+                }
+                _ => {}
+            }
+        }
+        if !text.is_empty() || !reasoning.is_empty() || replay.is_some() {
+            self.agent
+                .append_history_item(HistoryItem::AssistantTurn {
+                    text: (!text.is_empty()).then_some(text.clone()),
+                    reasoning_content: (!reasoning.is_empty()).then_some(reasoning.clone()),
+                    replay,
+                    calls: Vec::new(),
+                })
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
+            if !text.is_empty() {
+                (self.on_event)(AgentEvent::AssistantMessage {
+                    content: text.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
+            }
+        }
+        let continuation = build_stream_interrupt_continuation(&text, &pending);
+        self.agent
+            .append_history_item(HistoryItem::internal_continuation(continuation.clone()))
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        (self.on_event)(AgentEvent::ModelStreamIssue {
+            message: STREAM_INTERRUPT_MESSAGE.into(),
+            detail: Some("The model stream was interrupted; partial output was preserved.".into()),
+            action: STREAM_INTERRUPT_ACTION.into(),
+        })
+        .await
+        .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        (self.on_event)(AgentEvent::InternalContinuation {
+            text: continuation,
+            source: crate::transcript::InternalContinuationSource::StreamRecovery,
+        })
+        .await
+        .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        Ok(())
+    }
+
+    async fn after_assistant_persisted(
+        &mut self,
+        _result: &ModelAttemptResult,
+    ) -> std::result::Result<TurnContinuationDecision, ModelFailure> {
+        (self.on_event)(AgentEvent::TurnContinuationBoundary)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        if self
+            .agent
+            .drain_turn_continuations(self.on_event)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?
+        {
+            return Ok(TurnContinuationDecision::Continue);
+        }
+        let mut count = self.continuation_count;
+        if self
+            .agent
+            .continue_or_finalize_no_tool_reply(self.on_event, self.tool_call_count, &mut count)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?
+        {
+            self.continuation_count = count;
+            Ok(TurnContinuationDecision::Continue)
+        } else {
+            Ok(TurnContinuationDecision::Finalize)
+        }
+    }
+
+    async fn finalize(
+        &mut self,
+        _result: &ModelAttemptResult,
+    ) -> std::result::Result<(), ModelFailure> {
+        Ok(())
     }
 }
 
-/// Prepares the sole provider request for an outer LLM iteration.
-async fn prepare_protocol_stream_request<C, E, Efut>(
-    agent: &mut Agent<C>,
+async fn prepare_protocol_stream_request<E, Efut>(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     protected_start_index: &mut usize,
@@ -298,7 +806,6 @@ async fn prepare_protocol_stream_request<C, E, Efut>(
     on_event: &mut E,
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
-    C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
 {
@@ -313,9 +820,8 @@ where
     .await
 }
 
-/// Canonical preparation path with deterministic preflight and compaction admission.
-async fn prepare_canonical_protocol_stream_request<C, E, Efut>(
-    agent: &mut Agent<C>,
+async fn prepare_canonical_protocol_stream_request<E, Efut>(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     protected_start_index: &mut usize,
@@ -323,7 +829,6 @@ async fn prepare_canonical_protocol_stream_request<C, E, Efut>(
     on_event: &mut E,
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
-    C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
 {
@@ -351,11 +856,6 @@ where
         }
         Err(error) => return Err(error),
     };
-    // Soft watermark triggers *proactive* compaction once per turn. Hard limit
-    // remains the admission gate. After a successful pressure compact this turn,
-    // soft re-entry is skipped so we do not spin compact→still-above-watermark
-    // when the protected tail cannot shrink further (OpenCode-style: prune + one
-    // overflow recovery, not repeated soft pressure).
     let classification = prepared.build.budget.request_classification();
     let Some(projected_usage) = agent.projected_token_usage() else {
         return Ok(prepared);
@@ -380,8 +880,8 @@ where
 }
 
 #[cfg(test)]
-pub(super) async fn prepare_canonical_protocol_stream_request_for_test<C, E, Efut>(
-    agent: &mut Agent<C>,
+pub(super) async fn prepare_canonical_protocol_stream_request_for_test<E, Efut>(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     protected_start_index: &mut usize,
@@ -389,7 +889,6 @@ pub(super) async fn prepare_canonical_protocol_stream_request_for_test<C, E, Efu
     on_event: &mut E,
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
-    C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
 {
@@ -404,8 +903,8 @@ where
     .await
 }
 
-async fn compact_for_request_pressure<C, E, Efut>(
-    agent: &mut Agent<C>,
+async fn compact_for_request_pressure<E, Efut>(
+    agent: &mut Agent,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     protected_start_index: &mut usize,
@@ -413,7 +912,6 @@ async fn compact_for_request_pressure<C, E, Efut>(
     on_event: &mut E,
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
-    C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
 {
@@ -423,9 +921,6 @@ where
         protocol_prefix_digest: protocol_prefix_digest(&frames),
     };
     agent.turn.pressure_compaction.mark_attempted(frontier)?;
-    // Consume the frontier before every fallible validation or selection step.
-    // `compact_for_request_pressure` emits Started before validating so a
-    // malformed protocol receives the same failed lifecycle terminal.
     let successor = compaction::compact_for_request_pressure(
         agent,
         protocol,
@@ -436,2236 +931,16 @@ where
     .await?;
     agent.turn.pressure_compaction.compacted_this_turn = true;
     *protected_start_index = successor.protected_start_index;
-    // Successor is whatever prepare_request_build returns after compact. No cold
-    // epoch / soft-unsafe post-checks: the hard budget gate lives in admission.
     Ok(successor)
 }
-pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
-    agent: &mut Agent<C>,
-    user_content: UserMessageContent,
-    user_input: &str,
-    mut on_delta: F,
-    mut on_event: E,
-    mut approve: A,
-) -> Result<String>
-where
-    C: Config + Clone + Send + Sync + 'static,
-    F: FnMut(&str) -> Dfut,
-    E: FnMut(AgentEvent) -> Efut + Send,
-    A: FnMut(PermissionRequest) -> Afut,
-    Dfut: Future<Output = Result<()>>,
-    Efut: Future<Output = Result<()>> + Send,
-    Afut: Future<Output = Result<PermissionApproval>>,
-{
-    let turn_prelude =
-        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
-    let mut protected_start_index = agent.active_history_items().len();
-    let previous_turn_start_index = agent.turn.current_turn_start_index;
-    agent.turn.current_turn_start_index = Some(protected_start_index);
-    if !user_content.has_no_parts()
-        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
-    {
-        agent.turn.current_turn_start_index = previous_turn_start_index;
-        return Err(error);
-    }
-    Agent::<C>::emit_audit_event(
-        &mut on_event,
-        AgentEvent::TurnStarted(agent.turn_started_event()),
-        "turn_started",
-    )
-    .await;
-    debug!(
-        user_input_len = user_input.len(),
-        history_len = agent.active_history_items().len(),
-        "user message added to history"
-    );
 
-    let turn_id = agent.turn.turn_id;
-    let turn_span = langfuse_trace::llm_turn_span(
-        turn_id,
-        "responses",
-        &agent.model,
-        agent.max_iterations,
-        agent.max_tool_calls,
-        user_input.chars().count(),
-        agent.active_history_items().len(),
-    );
-    let mut final_text = String::new();
-    let mut tool_call_count = 0;
-    let mut continuation_count = 0;
-    // Semantic recovery restarts the agent iteration; keep this budget outside
-    // that loop so it applies to the complete Responses turn.
-    let mut recovery_attempts = 0;
-    let fake_context = agent.fake_turn_context(crate::fake::FakeClient::Codex);
-
-    let result = async {
-        let mut iteration_count = 0;
-        'agent_iteration: loop {
-            ensure_iteration_budget(
-                agent.max_iterations,
-                iteration_count,
-                agent.turn.auto_continue_active,
-            )?;
-            let iteration = iteration_count;
-            iteration_count += 1;
-        debug!(
-            iteration,
-            model = %agent.model,
-            history_len = agent.active_history_items().len(),
-            tool_call_count,
-            max_tool_calls = agent.max_tool_calls,
-            "creating streamed response"
-        );
-
-        let tool_definitions = agent.tool_definitions();
-        let prepared = prepare_protocol_stream_request(
-            agent,
-            ApiProtocol::Responses,
-            &turn_prelude,
-            &mut protected_start_index,
-            &tool_definitions,
-            &mut on_event,
-        )
-        .await?;
-        protected_start_index = prepared.protected_start_index;
-        let epoch_preview = prepared.epoch_preview;
-        let build = prepared.build;
-        let logical_observation = agent.preview_final_logical_request(&build);
-        let cache_report = CacheUsageReport::from_build(&build);
-        let iteration_span = langfuse_trace::llm_iteration_span(
-            turn_id,
-            "responses",
-            &agent.model,
-            iteration,
-            build.budget.retained_history_items,
-            tool_call_count,
-            tool_definitions.len(),
-        );
-        log_prepared_request_metadata(&build);
-        let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
-
-        let response_request = match build.request.clone() {
-            BuiltRequest::Responses(request) => {
-                let mut request = serde_json::to_value(request)
-                    .expect("CreateResponse should always serialize to JSON");
-                if let Some(context) = &fake_context {
-                    crate::fake::apply_codex_response_shape(&mut request, context);
-                    ResponseStreamRequest::FakeCodex(request, context.clone())
-                } else {
-                    ResponseStreamRequest::Typed(
-                        serde_json::from_value(request)
-                            .expect("serialized Responses request should round-trip"),
-                    )
-                }
-            }
-            BuiltRequest::ResponsesCompatible(mut request) => {
-                if let Some(context) = &fake_context {
-                    crate::fake::apply_codex_response_shape(&mut request, context);
-                    ResponseStreamRequest::FakeCodex(request, context.clone())
-                } else {
-                    ResponseStreamRequest::Compatible(request)
-                }
-            }
-            BuiltRequest::Anthropic(_) => {
-                return Err(anyhow!("request builder returned non-responses request"));
-            }
-            BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
-                return Err(anyhow!("request builder returned non-responses request"));
-            }
-        };
-
-        let mut attempt = 1;
-        let (
-            response,
-            mut turn_text,
-            completed_reasoning_ids,
-            streamed_reasoning,
-            prepared_telemetry,
-        ) = 'retry_response_stream: loop {
-            let mut prepared_telemetry = llm_request_telemetry(
-                &logical_request_id, turn_id, iteration, attempt, &agent.model,
-                ApiProtocol::Responses, &build, tool_call_count, tool_definitions.len(), logical_observation,
-            );
-            if attempt > 1 {
-                // Adjacent LCP is a logical-request scalar, persisted only by
-                // the physical attempt that establishes this baseline.
-                prepared_telemetry.adjacent_lcp_units = None;
-                prepared_telemetry.adjacent_lcp_bytes = None;
-                prepared_telemetry.adjacent_lcp_estimated_tokens = None;
-                prepared_telemetry.first_breaker = None;
-            }
-            on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
-            langfuse_trace::record_llm_request_telemetry(&iteration_span, &prepared_telemetry);
-            if attempt == 1 {
-                // Commit only after all prepared telemetry callbacks succeed,
-                // immediately before the first physical transport send.
-                agent.commit_final_logical_request(&build);
-                agent.commit_active_epoch(epoch_preview.clone());
-            }
-            let mut stream = match create_response_stream(
-                &agent.client,
-                &response_request,
-            )
-            .await
-            {
-                Ok(stream) => stream,
-                Err(error)
-                    if should_retry_openai_stream_creation(
-                        &agent.retry_config,
-                        attempt,
-                        &error,
-                    ) =>
-                {
-                    let delay = retry_delay(&agent.retry_config, attempt);
-                    warn!(
-                        attempt,
-                        max_attempts = agent.retry_config.max_attempts,
-                        delay_secs = delay.as_secs(),
-                        error = %error,
-                        "retrying streamed response creation"
-                    );
-                    emit_attempt_terminal(
-                        LlmRequestErrorClass::RequestCreation,
-                        &prepared_telemetry,
-                        &iteration_span,
-                        &mut on_event,
-                    )
-                    .await?;
-                    wait_for_retry(
-                        attempt,
-                        agent.retry_config.max_attempts,
-                        delay,
-                        &error,
-                        &mut on_event,
-                    )
-                    .await?;
-                    attempt += 1;
-                    continue 'retry_response_stream;
-                }
-                Err(error) => {
-                    emit_attempt_terminal(
-                        LlmRequestErrorClass::RequestCreation,
-                        &prepared_telemetry,
-                        &iteration_span,
-                        &mut on_event,
-                    )
-                    .await?;
-                    return Err(anyhow!(error).context(request_creation_failure_context(
-                        "streamed response",
-                        &agent.model,
-                        agent.active_model_metadata(),
-                        &build.budget,
-                    )));
-                }
-            };
-
-            let mut completed_response: Option<Response> = None;
-            let mut completed_reasoning_ids = HashSet::new();
-            let mut streamed_reasoning = BTreeMap::<String, String>::new();
-            let mut emitted_pending_tool_calls = HashSet::new();
-            let mut pending_tool_calls = BTreeMap::new();
-            let mut turn_text = String::new();
-            let mut stream_had_side_effect = false;
-
-            while let Some(event) = stream.next().await {
-                let raw = match event {
-                    Ok(event) => event,
-                    Err(error)
-                        if !stream_had_side_effect
-                            && should_retry_openai_stream_read(
-                                &agent.retry_config,
-                                attempt,
-                                &error,
-                            ) =>
-                    {
-                        let delay = retry_delay(&agent.retry_config, attempt);
-                        warn!(
-                            attempt,
-                            max_attempts = agent.retry_config.max_attempts,
-                            delay_secs = delay.as_secs(),
-                            error = %error,
-                            "retrying streamed response read before side effects"
-                        );
-                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        wait_for_retry(
-                            attempt,
-                            agent.retry_config.max_attempts,
-                            delay,
-                            &error,
-                            &mut on_event,
-                        )
-                        .await?;
-                        attempt += 1;
-                        continue 'retry_response_stream;
-                    }
-                    Err(error) if stream_had_side_effect => {
-                        warn!(
-                            protocol = "responses",
-                            phase = "stream_read",
-                            error = %error,
-                            text_len = turn_text.len(),
-                            tool_count = pending_tool_calls.len(),
-                            "recovering interrupted responses stream after side effects"
-                        );
-                        emit_attempt_interrupted(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        recover_stream_interrupt(
-                            agent,
-                            &turn_text,
-                            &pending_tool_calls,
-                            "responses",
-                            "stream_read",
-                            &mut recovery_attempts,
-                            agent.retry_config.max_recovery_attempts,
-                            &mut on_event,
-                        )
-                        .await?;
-                        continue 'agent_iteration;
-                    }
-                    Err(error) => {
-                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(error.into());
-                    }
-                };
-                let event = match project_response_stream_event(&raw) {
-                    Ok(Some(event)) => event,
-                    Ok(None) => continue,
-                    Err(error) if is_ignorable_response_lifecycle_event(&raw) => {
-                        warn!(error = %error, "ignored response lifecycle stream event without model");
-                        continue;
-                    }
-                    Err(error) => {
-                        if stream_had_side_effect {
-                            warn!(
-                                protocol = "responses",
-                                phase = "event_projection",
-                                error = %error,
-                                text_len = turn_text.len(),
-                                tool_count = pending_tool_calls.len(),
-                                "recovering responses stream after event projection failure following side effects"
-                            );
-                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            recover_stream_interrupt(
-                                agent,
-                                &turn_text,
-                                &pending_tool_calls,
-                                "responses",
-                                "event_projection",
-                                &mut recovery_attempts,
-                                agent.retry_config.max_recovery_attempts,
-                                &mut on_event,
-                            )
-                            .await?;
-                            continue 'agent_iteration;
-                        }
-                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(anyhow!(error).context("failed to deserialize responses stream event"));
-                    }
-                };
-
-                match event {
-                    ResponseStreamEvent::ResponseOutputTextDelta(event) => {
-                        stream_had_side_effect = true;
-                        trace!(delta_len = event.delta.len(), "received text delta");
-                        on_delta(&event.delta).await?;
-                        turn_text.push_str(&event.delta);
-                        final_text.push_str(&event.delta);
-                    }
-                    ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
-                        stream_had_side_effect = true;
-                        streamed_reasoning
-                            .entry(event.item_id.clone())
-                            .or_default()
-                            .push_str(&event.delta);
-                        on_event(AgentEvent::ReasoningDelta {
-                            item_id: event.item_id,
-                            delta: event.delta,
-                        })
-                        .await?;
-                    }
-                    ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => {
-                        stream_had_side_effect = true;
-                        completed_reasoning_ids.insert(event.item_id.clone());
-                        streamed_reasoning.insert(event.item_id.clone(), event.text.clone());
-                        on_event(AgentEvent::ReasoningDone {
-                            item_id: event.item_id,
-                            text: event.text,
-                        })
-                        .await?;
-                    }
-                    ResponseStreamEvent::ResponseReasoningTextDelta(event) => {
-                        stream_had_side_effect = true;
-                        streamed_reasoning
-                            .entry(event.item_id.clone())
-                            .or_default()
-                            .push_str(&event.delta);
-                        on_event(AgentEvent::ReasoningDelta {
-                            item_id: event.item_id,
-                            delta: event.delta,
-                        })
-                        .await?;
-                    }
-                    ResponseStreamEvent::ResponseReasoningTextDone(event) => {
-                        stream_had_side_effect = true;
-                        completed_reasoning_ids.insert(event.item_id.clone());
-                        streamed_reasoning.insert(event.item_id.clone(), event.text.clone());
-                        on_event(AgentEvent::ReasoningDone {
-                            item_id: event.item_id,
-                            text: event.text,
-                        })
-                        .await?;
-                    }
-                    ResponseStreamEvent::ResponseOutputItemAdded(event) => {
-                        if let OutputItem::FunctionCall(call) = event.item
-                            && emit_tool_call_pending_if_ready(
-                                &mut emitted_pending_tool_calls,
-                                &call.call_id,
-                                &call.name,
-                                &mut on_event,
-                            )
-                            .await?
-                            {
-                                stream_had_side_effect = true;
-                                pending_tool_calls.insert(call.call_id.clone(), call.name.clone());
-                            }
-                    }
-                    ResponseStreamEvent::ResponseCompleted(event) => {
-                        debug!(
-                            response_id = %event.response.id,
-                            output_items = event.response.output.len(),
-                            "streamed response completed"
-                        );
-                        if let Some(usage) = &event.response.usage {
-                            on_event(token_usage_event_from_response_usage(
-                                usage,
-                                build.budget.context_window_tokens,
-                                &cache_report,
-                            ))
-                            .await?;
-                        }
-                        completed_response = Some(event.response);
-                    }
-                    ResponseStreamEvent::ResponseFailed(event) => {
-                        let error = provider_response_terminal_error("response failed", &event.response);
-                        let retryable = is_retryable_provider_response(&event.response);
-                        if stream_had_side_effect && retryable {
-                            warn!(
-                                protocol = "responses",
-                                phase = "response_failed",
-                                text_len = turn_text.len(),
-                                tool_count = pending_tool_calls.len(),
-                                response = ?event.response,
-                                "recovering failed responses stream after side effects"
-                            );
-                            emit_attempt_interrupted(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            recover_stream_interrupt(
-                                agent,
-                                &turn_text,
-                                &pending_tool_calls,
-                                "responses",
-                                "response_failed",
-                                &mut recovery_attempts,
-                                agent.retry_config.max_recovery_attempts,
-                                &mut on_event,
-                            )
-                            .await?;
-                            continue 'agent_iteration;
-                        }
-                        if can_retry_attempt(&agent.retry_config, attempt) && retryable
-                        {
-                            let delay = retry_delay(&agent.retry_config, attempt);
-                            emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            wait_for_retry(
-                                attempt,
-                                agent.retry_config.max_attempts,
-                                delay,
-                                &error,
-                                &mut on_event,
-                            )
-                            .await?;
-                            attempt += 1;
-                            continue 'retry_response_stream;
-                        }
-                        error!(response = ?event.response, "response failed");
-                        emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(anyhow!(error));
-                    }
-                    ResponseStreamEvent::ResponseError(event) => {
-                        let error = provider_error_event_terminal_error(&event);
-                        let retryable = is_retryable_provider_error_event(&event);
-                        if stream_had_side_effect && retryable {
-                            warn!(
-                                protocol = "responses",
-                                phase = "response_error",
-                                text_len = turn_text.len(),
-                                tool_count = pending_tool_calls.len(),
-                                code = ?event.code,
-                                message = %event.message,
-                                "recovering response error after side effects"
-                            );
-                            emit_attempt_interrupted(
-                                LlmRequestErrorClass::ProviderTerminal,
-                                &prepared_telemetry,
-                                &iteration_span,
-                                &mut on_event,
-                            )
-                            .await?;
-                            recover_stream_interrupt(
-                                agent,
-                                &turn_text,
-                                &pending_tool_calls,
-                                "responses",
-                                "response_error",
-                                &mut recovery_attempts,
-                                agent.retry_config.max_recovery_attempts,
-                                &mut on_event,
-                            )
-                            .await?;
-                            continue 'agent_iteration;
-                        }
-                        if can_retry_attempt(&agent.retry_config, attempt) && retryable
-                        {
-                            let delay = retry_delay(&agent.retry_config, attempt);
-                            emit_attempt_terminal(
-                                LlmRequestErrorClass::ProviderTerminal,
-                                &prepared_telemetry,
-                                &iteration_span,
-                                &mut on_event,
-                            )
-                            .await?;
-                            wait_for_retry(
-                                attempt,
-                                agent.retry_config.max_attempts,
-                                delay,
-                                &error,
-                                &mut on_event,
-                            )
-                            .await?;
-                            attempt += 1;
-                            continue 'retry_response_stream;
-                        }
-                        error!(code = ?event.code, message = %event.message, "response error");
-                        emit_attempt_terminal(
-                            LlmRequestErrorClass::ProviderTerminal,
-                            &prepared_telemetry,
-                            &iteration_span,
-                            &mut on_event,
-                        )
-                        .await?;
-                        return Err(anyhow!(error));
-                    }
-                    ResponseStreamEvent::ResponseIncomplete(event) => {
-                        let error =
-                            provider_response_terminal_error("response incomplete", &event.response);
-                        let retryable = is_retryable_provider_response(&event.response);
-                        if stream_had_side_effect && retryable {
-                            warn!(
-                                protocol = "responses",
-                                phase = "response_incomplete",
-                                text_len = turn_text.len(),
-                                tool_count = pending_tool_calls.len(),
-                                response = ?event.response,
-                                "recovering incomplete responses stream after side effects"
-                            );
-                            emit_attempt_interrupted(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            recover_stream_interrupt(
-                                agent,
-                                &turn_text,
-                                &pending_tool_calls,
-                                "responses",
-                                "response_incomplete",
-                                &mut recovery_attempts,
-                                agent.retry_config.max_recovery_attempts,
-                                &mut on_event,
-                            )
-                            .await?;
-                            continue 'agent_iteration;
-                        }
-                        if can_retry_attempt(&agent.retry_config, attempt) && retryable
-                        {
-                            let delay = retry_delay(&agent.retry_config, attempt);
-                            emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            wait_for_retry(
-                                attempt,
-                                agent.retry_config.max_attempts,
-                                delay,
-                                &error,
-                                &mut on_event,
-                            )
-                            .await?;
-                            attempt += 1;
-                            continue 'retry_response_stream;
-                        }
-                        warn!(response = ?event.response, "response incomplete");
-                        emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(anyhow!(error));
-                    }
-                    _ => {}
-                }
-                if completed_response.is_some() {
-                    break;
-                }
-            }
-
-            let response = match completed_response {
-                Some(response) => response,
-                None if !stream_had_side_effect
-                    && can_retry_attempt(&agent.retry_config, attempt) =>
-                {
-                    let delay = retry_delay(&agent.retry_config, attempt);
-                    warn!(
-                        attempt,
-                        max_attempts = agent.retry_config.max_attempts,
-                        delay_secs = delay.as_secs(),
-                        "retrying streamed response after early end before side effects"
-                    );
-                    emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                    wait_for_retry(
-                        attempt,
-                        agent.retry_config.max_attempts,
-                        delay,
-                        "stream ended before response.completed",
-                        &mut on_event,
-                    )
-                    .await?;
-                    attempt += 1;
-                    continue 'retry_response_stream;
-                }
-                None if stream_had_side_effect => {
-                    warn!(
-                        protocol = "responses",
-                        phase = "early_end",
-                        text_len = turn_text.len(),
-                        tool_count = pending_tool_calls.len(),
-                        "recovering responses stream end without response.completed after side effects"
-                    );
-                    emit_attempt_interrupted(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                    recover_stream_interrupt(
-                        agent,
-                        &turn_text,
-                        &pending_tool_calls,
-                        "responses",
-                        "early_end",
-                        &mut recovery_attempts,
-                        agent.retry_config.max_recovery_attempts,
-                        &mut on_event,
-                    )
-                    .await?;
-                    continue 'agent_iteration;
-                }
-                None => {
-                    emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                    return Err(anyhow!("stream ended without response.completed"));
-                }
-            };
-            break 'retry_response_stream (
-                response,
-                turn_text,
-                completed_reasoning_ids,
-                streamed_reasoning,
-                prepared_telemetry,
-            );
-        };
-
-        for (index, item) in response.output.iter().enumerate() {
-            if let OutputItem::Reasoning(reasoning) = item {
-                let item_id = reasoning
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("reasoning-{iteration}-{index}"));
-                if completed_reasoning_ids.contains(&item_id) {
-                    continue;
-                }
-
-                let text = response_reasoning_text(item)
-                    .or_else(|| streamed_reasoning.get(&item_id).cloned())
-                    .unwrap_or_else(|| reasoning_summary_text(item));
-                if !text.is_empty() {
-                    on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
-                }
-            }
-        }
-
-        let tool_calls = response
-            .output
-            .iter()
-            .filter_map(|item| match item {
-                OutputItem::FunctionCall(call) => Some(HistoryToolCall {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    arguments_json: call.arguments.clone(),
-                }),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        let response_usage = response.usage.as_ref().map(|usage| TokenUsageEstimate {
-            used_tokens: usage.total_tokens as u64,
-            context_window_tokens: build.budget.context_window_tokens,
-            input_tokens: usage.input_tokens as u64,
-            output_tokens: usage.output_tokens as u64,
-            cached_tokens: usage.input_tokens_details.cached_tokens as u64,
-        });
-        let completed_telemetry = prepared_telemetry.completed(
-            response_usage,
-            Some(response.id.clone()),
-            if response.usage.is_some() {
-                ProviderUsageCompleteness::Complete
-            } else {
-                ProviderUsageCompleteness::UsageMissing
-            },
-        );
-        on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;
-        langfuse_trace::record_llm_request_telemetry(&iteration_span, &completed_telemetry);
-
-        agent.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
-        tool_call_count += tool_calls.len();
-
-        if tool_calls.is_empty() {
-            if turn_text.is_empty() {
-                turn_text = response
-                    .output_text()
-                    .unwrap_or_else(|| "No response content".to_string());
-                final_text.push_str(&turn_text);
-            }
-
-            agent
-                .append_history_item(HistoryItem::assistant(turn_text.clone()))?;
-            if let Some(usage) = response_usage {
-                agent.install_provider_usage_anchor(usage);
-            }
-            on_event(AgentEvent::AssistantMessage {
-                content: turn_text.clone(),
-            })
-            .await?;
-
-            langfuse_trace::finish_llm_iteration_span(
-                &iteration_span,
-                turn_text.chars().count(),
-                0,
-                response.output.len(),
-                None,
-            );
-            drop(iteration_span);
-
-            on_event(AgentEvent::TurnContinuationBoundary).await?;
-            if agent.drain_turn_continuations(&mut on_event).await?
-                || agent
-                    .continue_or_finalize_no_tool_reply(
-                        &mut on_event,
-                        tool_call_count,
-                        &mut continuation_count,
-                    )
-                    .await?
-            {
-                continue;
-            }
-
-            info!(
-                output_chars = final_text.chars().count(),
-                history_len = agent.active_history_items().len(),
-                "final answer completed"
-            );
-
-            return Ok(final_text);
-        }
-
-        langfuse_trace::finish_llm_iteration_span(
-            &iteration_span,
-            turn_text.chars().count(),
-            tool_calls.len(),
-            response.output.len(),
-            None,
-        );
-        drop(iteration_span);
-
-        let reasoning_content = response_reasoning_content(&response, &streamed_reasoning);
-        agent.append_assistant_tool_calls_with_reasoning_content(
-            &turn_text,
-            reasoning_content.as_deref(),
-            None,
-            &tool_calls,
-        )?;
-        if let Some(usage) = response_usage {
-            agent.install_provider_usage_anchor(usage);
-        }
-        on_event(AgentEvent::AssistantToolCallBatch {
-            text: (!turn_text.is_empty()).then(|| turn_text.clone()),
-            reasoning_content: reasoning_content.clone(),
-            reasoning_wire: None,
-            calls: tool_calls.clone(),
-        })
-        .await?;
-
-        debug!(
-            iteration,
-            tool_calls = tool_calls.len(),
-            tool_call_count,
-            history_len = agent.active_history_items().len(),
-            "response tool calls appended to history"
-        );
-
-        for call in &tool_calls {
-            info!(tool_name = %call.name, call_id = %call.call_id, "tool call requested");
-            debug!(
-                tool_name = %call.name,
-                call_id = %call.call_id,
-                arguments = %call.arguments_json,
-                "tool call arguments"
-            );
-        }
-        agent
-            .execute_tool_calls_and_record(&tool_calls, &mut on_event, &mut approve)
-            .await?;
-        on_event(AgentEvent::ToolCallBatchFinished).await?;
-        on_event(AgentEvent::TurnContinuationBoundary).await?;
-        let _ = agent.drain_turn_continuations(&mut on_event).await?;
-    }
-    }
-    .instrument(turn_span.clone())
-    .await;
-    langfuse_trace::finish_llm_turn_span(
-        &turn_span,
-        &result,
-        tool_call_count,
-        continuation_count,
-        agent.active_history_items().len(),
-    );
-    agent.turn.pressure_compaction.reset_for_turn_end();
-    result
-}
-
-pub(super) async fn run_oai_comp_stream_async<C, F, E, A, Dfut, Efut, Afut>(
-    agent: &mut Agent<C>,
-    user_content: UserMessageContent,
-    user_input: &str,
-    mut on_delta: F,
-    mut on_event: E,
-    mut approve: A,
-) -> Result<String>
-where
-    C: Config + Clone + Send + Sync + 'static,
-    F: FnMut(&str) -> Dfut,
-    E: FnMut(AgentEvent) -> Efut + Send,
-    A: FnMut(PermissionRequest) -> Afut,
-    Dfut: Future<Output = Result<()>>,
-    Efut: Future<Output = Result<()>> + Send,
-    Afut: Future<Output = Result<PermissionApproval>>,
-{
-    let turn_prelude =
-        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
-    let mut protected_start_index = agent.active_history_items().len();
-    let previous_turn_start_index = agent.turn.current_turn_start_index;
-    agent.turn.current_turn_start_index = Some(protected_start_index);
-    if !user_content.has_no_parts()
-        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
-    {
-        agent.turn.current_turn_start_index = previous_turn_start_index;
-        return Err(error);
-    }
-    Agent::<C>::emit_audit_event(
-        &mut on_event,
-        AgentEvent::TurnStarted(agent.turn_started_event()),
-        "turn_started",
-    )
-    .await;
-    debug!(
-        user_input_len = user_input.len(),
-        history_len = agent.active_history_items().len(),
-        "user message added to history"
-    );
-
-    let turn_id = agent.turn.turn_id;
-    let turn_span = langfuse_trace::llm_turn_span(
-        turn_id,
-        "chat_completions",
-        &agent.model,
-        agent.max_iterations,
-        agent.max_tool_calls,
-        user_input.chars().count(),
-        agent.active_history_items().len(),
-    );
-    let mut final_text = String::new();
-    let mut tool_call_count = 0;
-    let mut continuation_count = 0;
-    // Semantic recovery restarts the agent iteration; keep this budget outside
-    // that loop so it applies to the complete chat-completions turn.
-    let mut recovery_attempts = 0;
-
-    let result = async {
-        let mut iteration_count = 0;
-        'agent_iteration: loop {
-            ensure_iteration_budget(
-                agent.max_iterations,
-                iteration_count,
-                agent.turn.auto_continue_active,
-            )?;
-            let iteration = iteration_count;
-            iteration_count += 1;
-        debug!(
-            iteration,
-            model = %agent.model,
-            history_len = agent.active_history_items().len(),
-            tool_call_count,
-            max_tool_calls = agent.max_tool_calls,
-            "creating streamed chat completion"
-        );
-
-        let tool_definitions = agent.tool_definitions();
-        let prepared = prepare_protocol_stream_request(
-            agent,
-            ApiProtocol::Completions,
-            &turn_prelude,
-            &mut protected_start_index,
-            &tool_definitions,
-            &mut on_event,
-        )
-        .await?;
-        protected_start_index = prepared.protected_start_index;
-        let epoch_preview = prepared.epoch_preview;
-        let build = prepared.build;
-        let logical_observation = agent.preview_final_logical_request(&build);
-        let cache_report = CacheUsageReport::from_build(&build);
-        let iteration_span = langfuse_trace::llm_iteration_span(
-            turn_id,
-            "chat_completions",
-            &agent.model,
-            iteration,
-            build.budget.retained_history_items,
-            tool_call_count,
-            tool_definitions.len(),
-        );
-        log_prepared_request_metadata(&build);
-        let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
-        let completion_request = match build.request.clone() {
-            BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request),
-            BuiltRequest::CompletionsCompatible(request) => CompletionStreamRequest::Compatible(request),
-            BuiltRequest::Anthropic(_) => {
-                return Err(anyhow!("request builder returned non-completions request"));
-            }
-            BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
-                return Err(anyhow!("request builder returned non-completions request"));
-            }
-        };
-
-        let mut attempt = 1;
-        'retry_chat_stream: loop {
-            let mut prepared_telemetry = llm_request_telemetry(
-                &logical_request_id, turn_id, iteration, attempt, &agent.model,
-                ApiProtocol::Completions, &build, tool_call_count, tool_definitions.len(), logical_observation,
-            );
-            if attempt > 1 {
-                // Retries share the logical request; only its primary attempt
-                // records adjacent LCP scalars in the durable transcript.
-                prepared_telemetry.adjacent_lcp_units = None;
-                prepared_telemetry.adjacent_lcp_bytes = None;
-                prepared_telemetry.adjacent_lcp_estimated_tokens = None;
-                prepared_telemetry.first_breaker = None;
-            }
-            on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
-            langfuse_trace::record_llm_request_telemetry(&iteration_span, &prepared_telemetry);
-            if attempt == 1 {
-                agent.commit_final_logical_request(&build);
-                agent.commit_active_epoch(epoch_preview.clone());
-            }
-            let response = match &completion_request {
-                CompletionStreamRequest::Typed(request) => {
-                    send_compatible_chat_completion_stream(
-                        &agent.client,
-                        request,
-                    )
-                    .await
-                }
-                CompletionStreamRequest::Compatible(request) => {
-                    send_compatible_chat_completion_stream(
-                        &agent.client,
-                        request,
-                    )
-                    .await
-                }
-            };
-            let response = match response {
-                Ok(response) => response,
-                Err(error)
-                    if should_retry_chat_stream_creation(&agent.retry_config, attempt, &error) =>
-                {
-                    emit_attempt_terminal(
-                        LlmRequestErrorClass::RequestCreation, &prepared_telemetry, &iteration_span, &mut on_event,
-                    ).await?;
-                    let delay = match &error {
-                        ChatStreamCreationError::Status { headers, .. } => {
-                            retry_delay_from_headers(&agent.retry_config, attempt, headers)
-                        }
-                        _ => retry_delay(&agent.retry_config, attempt),
-                    };
-                    wait_for_retry(
-                        attempt,
-                        agent.retry_config.max_attempts,
-                        delay,
-                        &error,
-                        &mut on_event,
-                    )
-                    .await?;
-                    attempt += 1;
-                    continue 'retry_chat_stream;
-                }
-                Err(error) => {
-                    emit_attempt_terminal(
-                        LlmRequestErrorClass::RequestCreation,
-                        &prepared_telemetry,
-                        &iteration_span,
-                        &mut on_event,
-                    )
-                    .await?;
-                    return Err(error).with_context(|| request_creation_failure_context(
-                        "streamed chat completion",
-                        &agent.model,
-                        agent.active_model_metadata(),
-                        &build.budget,
-                    ));
-                }
-            };
-            let mut byte_stream = response.bytes_stream();
-            let mut sse_buffer = String::new();
-            let mut turn_text = String::new();
-            let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> = BTreeMap::new();
-            let mut emitted_pending_tool_calls = HashSet::new();
-            let mut pending_tool_calls: BTreeMap<String, String> = BTreeMap::new();
-            let mut finish_reasons: Vec<FinishReason> = Vec::new();
-            let mut reasoning =
-                InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
-            let mut native_reasoning =
-                NativeReasoningAccumulator::new(format!("chat-native-reasoning-{iteration}"));
-            let mut provider_usage: Option<TokenUsageEstimate> = None;
-            let mut provider_cache_details_present = false;
-            let mut provider_response_id: Option<String> = None;
-            let mut final_provider_usage_event: Option<AgentEvent> = None;
-
-            let mut stream_had_side_effect = false;
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(error)
-                        if !stream_had_side_effect
-                            && should_retry_reqwest_error(&agent.retry_config, attempt, &error) =>
-                    {
-                        let delay = retry_delay(&agent.retry_config, attempt);
-                        warn!(
-                            attempt,
-                            max_attempts = agent.retry_config.max_attempts,
-                            delay_secs = delay.as_secs(),
-                            error = %error,
-                            "retrying chat completions stream read before side effects"
-                        );
-                        emit_attempt_terminal(
-                            LlmRequestErrorClass::StreamRead, &prepared_telemetry,
-                            &iteration_span, &mut on_event,
-                        )
-                        .await?;
-                        wait_for_retry(
-                            attempt,
-                            agent.retry_config.max_attempts,
-                            delay,
-                            &error,
-                            &mut on_event,
-                        )
-                        .await?;
-                        attempt += 1;
-                        continue 'retry_chat_stream;
-                    }
-                    Err(error) if stream_had_side_effect => {
-                        warn!(
-                            protocol = "chat_completions",
-                            phase = "stream_read",
-                            error = %error,
-                            text_len = turn_text.len(),
-                            tool_count = pending_tool_calls.len(),
-                            "recovering interrupted chat stream after side effects"
-                        );
-                        emit_attempt_interrupted(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        recover_stream_interrupt(
-                            agent,
-                            &turn_text,
-                            &pending_tool_calls,
-                            "chat_completions",
-                            "stream_read",
-                            &mut recovery_attempts,
-                            agent.retry_config.max_recovery_attempts,
-                            &mut on_event,
-                        )
-                        .await?;
-                        continue 'agent_iteration;
-                    }
-                    Err(error) => {
-                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(error.into());
-                    }
-                };
-                append_sse_chunk(&mut sse_buffer, &chunk);
-                let events = drain_sse_data_events(&mut sse_buffer);
-                for event in events {
-                    let Some(data) = event else {
-                        continue;
-                    };
-                    let response: CompatibleChatCompletionStreamResponse = match serde_json::from_str(&data) {
-                        Ok(response) => response,
-                        Err(error)
-                            if !stream_had_side_effect
-                                && can_retry_attempt(&agent.retry_config, attempt)
-                                && is_retryable_json_deserialize_error(&error, &data) =>
-                        {
-                            let delay = retry_delay(&agent.retry_config, attempt);
-                            warn!(
-                                protocol = "chat_completions",
-                                phase = "event_parse",
-                                attempt,
-                                max_attempts = agent.retry_config.max_attempts,
-                                delay_secs = delay.as_secs(),
-                                error = %error,
-                                "retrying chat completions stream after transient event parse failure before side effects"
-                            );
-                            emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            wait_for_retry(
-                                attempt,
-                                agent.retry_config.max_attempts,
-                                delay,
-                                &error,
-                                &mut on_event,
-                            )
-                            .await?;
-                            attempt += 1;
-                            continue 'retry_chat_stream;
-                        }
-                        Err(error) if stream_had_side_effect => {
-                            warn!(
-                                protocol = "chat_completions",
-                                phase = "event_parse",
-                                error = %error,
-                                text_len = turn_text.len(),
-                                tool_count = pending_tool_calls.len(),
-                                "recovering chat stream after event parse failure following side effects"
-                            );
-                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            recover_stream_interrupt(
-                                agent,
-                                &turn_text,
-                                &pending_tool_calls,
-                                "chat_completions",
-                                "event_parse",
-                                &mut recovery_attempts,
-                                agent.retry_config.max_recovery_attempts,
-                                &mut on_event,
-                            )
-                            .await?;
-                            continue 'agent_iteration;
-                        }
-                        Err(error) => {
-                            emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            return Err(error).with_context(|| {
-                                format!("failed to parse chat completions stream event: {data}")
-                            });
-                        }
-                    };
-                    if let Some(usage) = &response.usage {
-                        stream_had_side_effect = true;
-                        final_provider_usage_event = Some(token_usage_event_from_completion_usage(
-                            usage,
-                            build.budget.context_window_tokens,
-                            &cache_report,
-                        ));
-                        provider_cache_details_present = usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).is_some();
-                        provider_usage = Some(TokenUsageEstimate { used_tokens: usage.total_tokens as u64, context_window_tokens: build.budget.context_window_tokens, input_tokens: usage.prompt_tokens as u64, output_tokens: usage.completion_tokens as u64, cached_tokens: usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).unwrap_or(0) as u64 });
-                        prepared_telemetry.usage = provider_usage;
-                        prepared_telemetry.usage_completeness = completion_usage_completeness(provider_usage, provider_cache_details_present);
-                    }
-                    provider_response_id = response.id.clone().or(provider_response_id);
-                    for choice in response.choices {
-                        if choice.index != 0 {
-                            emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            return Err(anyhow!(
-                                "completions returned unexpected choice index {}; only n=1/index 0 is supported",
-                                choice.index
-                            ));
-                        }
-
-                        if let Some(delta) = choice.delta {
-                            if let Some(reasoning_delta) = delta.reasoning_delta()
-                                && let Some(event) = native_reasoning.push(reasoning_delta) {
-                                    stream_had_side_effect = true;
-                                    on_event(event).await?;
-                                }
-
-                            if let Some(content_delta) = delta.content {
-                                trace!(delta_len = content_delta.len(), "received chat text delta");
-                                for part in reasoning.push(&content_delta) {
-                                    match part {
-                                        StreamTextPart::Visible(text) => {
-                                            stream_had_side_effect = true;
-                                            on_delta(&text).await?;
-                                            turn_text.push_str(&text);
-                                            final_text.push_str(&text);
-                                        }
-                                        StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                            stream_had_side_effect = true;
-                                            on_event(AgentEvent::ReasoningDelta { item_id, delta })
-                                                .await?;
-                                        }
-                                        StreamTextPart::ReasoningDone { item_id, text } => {
-                                            stream_had_side_effect = true;
-                                            on_event(AgentEvent::ReasoningDone { item_id, text })
-                                                .await?;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(chunks) = delta.tool_calls {
-                                for chunk in chunks {
-                                    let index = chunk.index as usize;
-                                    merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                    if let Some(call) = tool_calls.get(&index)
-                                        && emit_tool_call_pending_if_ready(
-                                            &mut emitted_pending_tool_calls,
-                                            &call.id,
-                                            &call.function.name,
-                                            &mut on_event,
-                                        )
-                                        .await?
-                                        {
-                                            stream_had_side_effect = true;
-                                            pending_tool_calls.insert(
-                                                call.id.clone(),
-                                                call.function.name.clone(),
-                                            );
-                                        }
-                                }
-                            }
-                        }
-
-                        if let Some(reason) = choice.finish_reason {
-                            finish_reasons.push(reason);
-                        }
-                    }
-                }
-            }
-
-            let events = finish_sse_data_events(&mut sse_buffer);
-            for event in events {
-                let Some(data) = event else {
-                    continue;
-                };
-                let response: CompatibleChatCompletionStreamResponse = match serde_json::from_str(&data) {
-                    Ok(response) => response,
-                    Err(error)
-                        if !stream_had_side_effect
-                            && can_retry_attempt(&agent.retry_config, attempt)
-                            && is_retryable_json_deserialize_error(&error, &data) =>
-                    {
-                        let delay = retry_delay(&agent.retry_config, attempt);
-                        warn!(
-                            protocol = "chat_completions",
-                            phase = "finish_event_parse",
-                            attempt,
-                            max_attempts = agent.retry_config.max_attempts,
-                            delay_secs = delay.as_secs(),
-                            error = %error,
-                            "retrying chat completions stream after transient final event parse failure before side effects"
-                        );
-                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        wait_for_retry(
-                            attempt,
-                            agent.retry_config.max_attempts,
-                            delay,
-                            &error,
-                            &mut on_event,
-                        )
-                        .await?;
-                        attempt += 1;
-                        continue 'retry_chat_stream;
-                    }
-                    Err(error) if stream_had_side_effect => {
-                        warn!(
-                            protocol = "chat_completions",
-                            phase = "finish_event_parse",
-                            error = %error,
-                            text_len = turn_text.len(),
-                            tool_count = pending_tool_calls.len(),
-                            "recovering chat stream after final event parse failure following side effects"
-                        );
-                        emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        recover_stream_interrupt(
-                            agent,
-                            &turn_text,
-                            &pending_tool_calls,
-                            "chat_completions",
-                            "finish_event_parse",
-                            &mut recovery_attempts,
-                            agent.retry_config.max_recovery_attempts,
-                            &mut on_event,
-                        )
-                        .await?;
-                        continue 'agent_iteration;
-                    }
-                    Err(error) => {
-                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(error).with_context(|| {
-                            format!("failed to parse chat completions stream event: {data}")
-                        });
-                    }
-                };
-                if let Some(usage) = &response.usage {
-                    stream_had_side_effect = true;
-                    final_provider_usage_event = Some(token_usage_event_from_completion_usage(
-                        usage,
-                        build.budget.context_window_tokens,
-                        &cache_report,
-                    ));
-                    provider_cache_details_present = usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).is_some();
-                    provider_usage = Some(TokenUsageEstimate { used_tokens: usage.total_tokens as u64, context_window_tokens: build.budget.context_window_tokens, input_tokens: usage.prompt_tokens as u64, output_tokens: usage.completion_tokens as u64, cached_tokens: usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).unwrap_or(0) as u64 });
-                    prepared_telemetry.usage = provider_usage;
-                    prepared_telemetry.usage_completeness = completion_usage_completeness(provider_usage, provider_cache_details_present);
-                }
-                provider_response_id = response.id.clone().or(provider_response_id);
-                for choice in response.choices {
-                    if choice.index != 0 {
-                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(anyhow!(
-                            "completions returned unexpected choice index {}; only n=1/index 0 is supported",
-                            choice.index
-                        ));
-                    }
-
-                    if let Some(delta) = choice.delta {
-                        if let Some(reasoning_delta) = delta.reasoning_delta()
-                            && let Some(event) = native_reasoning.push(reasoning_delta) {
-                                stream_had_side_effect = true;
-                                on_event(event).await?;
-                            }
-
-                        if let Some(content_delta) = delta.content {
-                            trace!(delta_len = content_delta.len(), "received chat text delta");
-                            for part in reasoning.push(&content_delta) {
-                                match part {
-                                    StreamTextPart::Visible(text) => {
-                                        stream_had_side_effect = true;
-                                        on_delta(&text).await?;
-                                        turn_text.push_str(&text);
-                                        final_text.push_str(&text);
-                                    }
-                                    StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                        stream_had_side_effect = true;
-                                        on_event(AgentEvent::ReasoningDelta { item_id, delta })
-                                            .await?;
-                                    }
-                                    StreamTextPart::ReasoningDone { item_id, text } => {
-                                        stream_had_side_effect = true;
-                                        on_event(AgentEvent::ReasoningDone { item_id, text })
-                                            .await?;
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(chunks) = delta.tool_calls {
-                            for chunk in chunks {
-                                let index = chunk.index as usize;
-                                merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                if let Some(call) = tool_calls.get(&index)
-                                    && emit_tool_call_pending_if_ready(
-                                        &mut emitted_pending_tool_calls,
-                                        &call.id,
-                                        &call.function.name,
-                                        &mut on_event,
-                                    )
-                                    .await?
-                                    {
-                                        stream_had_side_effect = true;
-                                        pending_tool_calls
-                                            .insert(call.id.clone(), call.function.name.clone());
-                                    }
-                            }
-                        }
-                    }
-
-                    if let Some(reason) = choice.finish_reason {
-                        finish_reasons.push(reason);
-                    }
-                }
-            }
-
-            for part in reasoning.finish() {
-                match part {
-                    StreamTextPart::Visible(text) => {
-                        stream_had_side_effect = true;
-                        on_delta(&text).await?;
-                        turn_text.push_str(&text);
-                        final_text.push_str(&text);
-                    }
-                    StreamTextPart::ReasoningDelta { item_id, delta } => {
-                        stream_had_side_effect = true;
-                        on_event(AgentEvent::ReasoningDelta { item_id, delta }).await?;
-                    }
-                    StreamTextPart::ReasoningDone { item_id, text } => {
-                        stream_had_side_effect = true;
-                        on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
-                    }
-                }
-            }
-            let reasoning_content = native_reasoning.text().map(ToString::to_string);
-            if let Some(event) = native_reasoning.finish() {
-                stream_had_side_effect = true;
-                on_event(event).await?;
-            }
-
-            let has_tool_calls = !tool_calls.is_empty();
-            if finish_reasons.is_empty()
-                && !stream_had_side_effect
-                && can_retry_attempt(&agent.retry_config, attempt)
-            {
-                let delay = retry_delay(&agent.retry_config, attempt);
-                warn!(
-                    attempt,
-                    max_attempts = agent.retry_config.max_attempts,
-                    delay_secs = delay.as_secs(),
-                    "retrying chat completions stream after early end before side effects"
-                );
-                emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                wait_for_retry(
-                    attempt,
-                    agent.retry_config.max_attempts,
-                    delay,
-                    "stream ended before a completion finish reason",
-                    &mut on_event,
-                )
-                .await?;
-                attempt += 1;
-                continue 'retry_chat_stream;
-            }
-            if finish_reasons.is_empty() && (stream_had_side_effect || has_tool_calls) {
-                warn!(
-                    protocol = "chat_completions",
-                    phase = "finish_reason_validation",
-                    text_len = turn_text.len(),
-                    tool_count = pending_tool_calls.len(),
-                    "recovering interrupted chat stream after missing finish state"
-                );
-                emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                recover_stream_interrupt(
-                    agent,
-                    &turn_text,
-                    &pending_tool_calls,
-                    "chat_completions",
-                    "finish_reason_validation",
-                    &mut recovery_attempts,
-                    agent.retry_config.max_recovery_attempts,
-                    &mut on_event,
-                )
-                .await?;
-                continue 'agent_iteration;
-            }
-            if let Err(error) = validate_chat_finish_reasons(&finish_reasons, has_tool_calls) {
-                if !pending_tool_calls.is_empty() {
-                    if finish_reasons.iter().any(|reason| {
-                        matches!(reason, FinishReason::Length | FinishReason::ContentFilter)
-                    }) {
-                        emit_pending_tool_call_cancellations(&pending_tool_calls, &mut on_event)
-                            .await?;
-                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(error);
-                    }
-                    warn!(
-                        protocol = "chat_completions",
-                        phase = "finish_reason_validation",
-                        error = %error,
-                        text_len = turn_text.len(),
-                        tool_count = pending_tool_calls.len(),
-                        "recovering interrupted chat stream with incomplete pending tool call"
-                    );
-                    emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                    recover_stream_interrupt(
-                        agent,
-                        &turn_text,
-                        &pending_tool_calls,
-                        "chat_completions",
-                        "finish_reason_validation",
-                        &mut recovery_attempts,
-                        agent.retry_config.max_recovery_attempts,
-                        &mut on_event,
-                    )
-                    .await?;
-                    continue 'agent_iteration;
-                }
-                emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                return Err(error);
-            }
-            let finish_reasons_label = format!("{finish_reasons:?}");
-
-            if let Some(event) = final_provider_usage_event {
-                on_event(event).await?;
-            }
-
-            if !has_tool_calls {
-                let completed_telemetry = prepared_telemetry.completed(
-                    provider_usage,
-                    provider_response_id,
-                    completion_usage_completeness(provider_usage, provider_cache_details_present),
-                );
-                on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;
-                langfuse_trace::record_llm_request_telemetry(&iteration_span, &completed_telemetry);
-                if final_text.is_empty() {
-                    final_text = "No response content".to_string();
-                }
-
-                agent
-                    .append_history_item(HistoryItem::assistant(turn_text.clone()))?;
-                if let Some(usage) = provider_usage {
-                    agent.install_provider_usage_anchor(usage);
-                }
-                on_event(AgentEvent::AssistantMessage {
-                    content: turn_text.clone(),
-                })
-                .await?;
-
-                langfuse_trace::finish_llm_iteration_span(
-                    &iteration_span,
-                    turn_text.chars().count(),
-                    0,
-                    0,
-                    Some(&finish_reasons_label),
-                );
-                drop(iteration_span);
-
-                on_event(AgentEvent::TurnContinuationBoundary).await?;
-                if agent.drain_turn_continuations(&mut on_event).await?
-                    || agent
-                        .continue_or_finalize_no_tool_reply(
-                            &mut on_event,
-                            tool_call_count,
-                            &mut continuation_count,
-                        )
-                        .await?
-                {
-                    continue 'agent_iteration;
-                }
-
-                info!(
-                    output_chars = final_text.chars().count(),
-                    history_len = agent.active_history_items().len(),
-                    "final chat completion answer completed"
-                );
-
-                return Ok(final_text);
-            }
-
-            let tool_calls = compact_indexed_chat_tool_calls(tool_calls);
-            if let Err(error) = validate_chat_tool_calls(&tool_calls) {
-                if stream_had_side_effect || !pending_tool_calls.is_empty() {
-                    warn!(
-                        protocol = "chat_completions",
-                        phase = "tool_call_validation",
-                        error = %error,
-                        text_len = turn_text.len(),
-                        tool_count = pending_tool_calls.len(),
-                        "recovering interrupted chat stream with incomplete tool call"
-                    );
-                    emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                    recover_stream_interrupt(
-                        agent,
-                        &turn_text,
-                        &pending_tool_calls,
-                        "chat_completions",
-                        "tool_call_validation",
-                        &mut recovery_attempts,
-                        agent.retry_config.max_recovery_attempts,
-                        &mut on_event,
-                    )
-                    .await?;
-                    continue 'agent_iteration;
-                }
-                emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                return Err(error);
-            }
-            let tool_calls = tool_calls
-                .into_iter()
-                .map(|call| HistoryToolCall {
-                    call_id: call.id,
-                    name: call.function.name,
-                    arguments_json: call.function.arguments,
-                })
-                .collect::<Vec<_>>();
-
-            let completed_telemetry = prepared_telemetry.completed(
-                provider_usage,
-                provider_response_id,
-                completion_usage_completeness(provider_usage, provider_cache_details_present),
-            );
-            on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;
-            langfuse_trace::record_llm_request_telemetry(&iteration_span, &completed_telemetry);
-
-            agent.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
-
-            tool_call_count += tool_calls.len();
-            langfuse_trace::finish_llm_iteration_span(
-                &iteration_span,
-                turn_text.chars().count(),
-                tool_calls.len(),
-                tool_calls.len(),
-                Some(&finish_reasons_label),
-            );
-            drop(iteration_span);
-            agent.append_assistant_tool_calls_with_reasoning_content(
-                &turn_text,
-                reasoning_content.as_deref(),
-                None,
-                &tool_calls,
-            )?;
-            if let Some(usage) = provider_usage {
-                agent.install_provider_usage_anchor(usage);
-            }
-            on_event(AgentEvent::AssistantToolCallBatch {
-                text: (!turn_text.is_empty()).then(|| turn_text.clone()),
-                reasoning_content: reasoning_content.clone(),
-                reasoning_wire: None,
-                calls: tool_calls.clone(),
-            })
-            .await?;
-
-            for call in &tool_calls {
-                info!(tool_name = %call.name, call_id = %call.call_id, "chat tool call requested");
-                debug!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    arguments = %call.arguments_json,
-                    "chat tool call arguments"
-                );
-            }
-            agent
-                .execute_tool_calls_and_record(&tool_calls, &mut on_event, &mut approve)
-                .await?;
-            on_event(AgentEvent::ToolCallBatchFinished).await?;
-            on_event(AgentEvent::TurnContinuationBoundary).await?;
-            let _ = agent.drain_turn_continuations(&mut on_event).await?;
-            break 'retry_chat_stream;
-        }
-    }
-    }
-    .instrument(turn_span.clone())
-    .await;
-    langfuse_trace::finish_llm_turn_span(
-        &turn_span,
-        &result,
-        tool_call_count,
-        continuation_count,
-        agent.active_history_items().len(),
-    );
-    agent.turn.pressure_compaction.reset_for_turn_end();
-    result
-}
-
-#[derive(Debug, Default)]
-struct AnthropicStreamState {
-    text: String,
-    thinking: Vec<Value>,
-    thinking_positions: BTreeMap<u64, usize>,
-    finished_thinking: HashSet<u64>,
-    block_types: BTreeMap<u64, String>,
-    tool_calls: BTreeMap<u64, HistoryToolCall>,
-    emitted_pending_tool_calls: HashSet<String>,
-    pending_tool_calls: BTreeMap<String, String>,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cached_tokens: Option<u64>,
-    stop_reason: Option<String>,
-    completed: bool,
-}
-
-fn merge_anthropic_beta_values(configured: &[String], fake_value: Option<&str>) -> Vec<String> {
-    let mut merged = configured.to_vec();
-    if let Some(value) = fake_value {
-        for beta in value
-            .split(',')
-            .map(str::trim)
-            .filter(|beta| !beta.is_empty())
-        {
-            if !merged.iter().any(|existing| existing == beta) {
-                merged.push(beta.to_string());
-            }
-        }
-    }
-    merged
-}
-
-impl AnthropicStreamState {
-    fn merge_usage(&mut self, usage: &Value) {
-        if let Some(value) = usage.get("input_tokens").and_then(Value::as_u64) {
-            self.input_tokens = Some(value);
-        }
-        if let Some(value) = usage.get("output_tokens").and_then(Value::as_u64) {
-            self.output_tokens = Some(value);
-        }
-        if let Some(value) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-            self.cached_tokens = Some(value);
-        }
-    }
-
-    fn provider_usage(&self, context_window_tokens: u64) -> Option<TokenUsageEstimate> {
-        let input_tokens = self.input_tokens?;
-        let output_tokens = self.output_tokens?;
-        Some(TokenUsageEstimate {
-            used_tokens: input_tokens.saturating_add(output_tokens),
-            context_window_tokens,
-            input_tokens,
-            output_tokens,
-            cached_tokens: self.cached_tokens.unwrap_or(0),
-        })
-    }
-
-    fn append_thinking_delta(&mut self, index: u64, delta: &str) {
-        let Some(position) = self.thinking_positions.get(&index).copied() else {
-            return;
-        };
-        let Some(block) = self.thinking.get_mut(position) else {
-            return;
-        };
-        let current = block["thinking"].as_str().unwrap_or_default();
-        block["thinking"] = Value::String(current.to_string() + delta);
-    }
-
-    fn append_thinking_signature(&mut self, index: u64, signature: &str) {
-        let Some(position) = self.thinking_positions.get(&index).copied() else {
-            return;
-        };
-        let Some(block) = self.thinking.get_mut(position) else {
-            return;
-        };
-        let current = block["signature"].as_str().unwrap_or_default();
-        block["signature"] = Value::String(current.to_string() + signature);
-    }
-
-    fn handle_event(&mut self, event: &Value, item_id: &str) -> Result<(Vec<AgentEvent>, String)> {
-        let mut events = Vec::new();
-        let mut text_delta = String::new();
-        match event.get("type").and_then(Value::as_str) {
-            Some("message_start") => {
-                if let Some(usage) = event.pointer("/message/usage") {
-                    self.merge_usage(usage);
-                }
-            }
-            Some("content_block_start") => {
-                let index = event
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("anthropic content_block_start missing index"))?;
-                let block = event.get("content_block").ok_or_else(|| {
-                    anyhow!("anthropic content_block_start missing content_block")
-                })?;
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        self.block_types.insert(index, "text".to_string());
-                        if let Some(text) = block.get("text").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            self.text.push_str(text);
-                            text_delta.push_str(text);
-                        }
-                    }
-                    Some("thinking") => {
-                        self.block_types.insert(index, "thinking".to_string());
-                        self.thinking.push(serde_json::json!({
-                            "type": "thinking",
-                            "thinking": String::new(),
-                        }));
-                        self.thinking_positions
-                            .insert(index, self.thinking.len() - 1);
-                        if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
-                            && !thinking.is_empty()
-                        {
-                            events.push(AgentEvent::ReasoningDelta {
-                                item_id: item_id.to_string(),
-                                delta: thinking.to_string(),
-                            });
-                            self.append_thinking_delta(index, thinking);
-                        }
-                    }
-                    Some("tool_use") => {
-                        self.block_types.insert(index, "tool_use".to_string());
-                        let call_id = block
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let name = block
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let initial = block
-                            .get("input")
-                            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
-                            .map(Value::to_string)
-                            .unwrap_or_default();
-                        self.tool_calls.insert(
-                            index,
-                            HistoryToolCall {
-                                call_id: call_id.clone(),
-                                name: name.clone(),
-                                arguments_json: initial,
-                            },
-                        );
-                        if !call_id.is_empty()
-                            && self.emitted_pending_tool_calls.insert(call_id.clone())
-                        {
-                            self.pending_tool_calls
-                                .insert(call_id.clone(), name.clone());
-                            events.push(AgentEvent::ToolCallPending { call_id, name });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("content_block_delta") => {
-                let index = event
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("anthropic content_block_delta missing index"))?;
-                let delta = event
-                    .get("delta")
-                    .ok_or_else(|| anyhow!("anthropic content_block_delta missing delta"))?;
-                match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        let text = delta
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !text.is_empty() {
-                            self.text.push_str(text);
-                            text_delta.push_str(text);
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        let thinking = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !thinking.is_empty() {
-                            if !self.thinking_positions.contains_key(&index) {
-                                self.thinking.push(
-                                    serde_json::json!({"type":"thinking","thinking":String::new()}),
-                                );
-                                self.thinking_positions
-                                    .insert(index, self.thinking.len() - 1);
-                            }
-                            self.append_thinking_delta(index, thinking);
-                            events.push(AgentEvent::ReasoningDelta {
-                                item_id: item_id.to_string(),
-                                delta: thinking.to_string(),
-                            });
-                        }
-                    }
-                    Some("signature_delta") => {
-                        let signature = delta
-                            .get("signature")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !signature.is_empty() {
-                            self.append_thinking_signature(index, signature);
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        let partial = delta
-                            .get("partial_json")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if let Some(call) = self.tool_calls.get_mut(&index) {
-                            call.arguments_json.push_str(partial);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("content_block_stop") => {
-                let index = event
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("anthropic content_block_stop missing index"))?;
-                if self.block_types.get(&index) == Some(&"thinking".to_string()) {
-                    let text = self
-                        .thinking_positions
-                        .get(&index)
-                        .copied()
-                        .and_then(|position| self.thinking.get(position))
-                        .and_then(|block| block.get("thinking"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if !text.is_empty() && self.finished_thinking.insert(index) {
-                        events.push(AgentEvent::ReasoningDone {
-                            item_id: item_id.to_string(),
-                            text: text.to_string(),
-                        });
-                    }
-                }
-            }
-            Some("message_delta") => {
-                if let Some(usage) = event.get("usage") {
-                    self.merge_usage(usage);
-                }
-                if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    self.stop_reason = Some(reason.to_string());
-                }
-            }
-            Some("message_stop") => {
-                self.completed = true;
-            }
-            Some("error") => {
-                let message = event
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown Anthropic error");
-                return Err(anyhow!("anthropic stream error: {message}"));
-            }
-            _ => {}
-        }
-        Ok((events, text_delta))
-    }
-
-    fn finish_thinking(&mut self, item_id: &str) -> Vec<AgentEvent> {
-        self.thinking_positions
-            .iter()
-            .filter_map(|(index, position)| {
-                if self.finished_thinking.contains(index) {
-                    return None;
-                }
-                self.finished_thinking.insert(*index);
-                let text = self.thinking.get(*position)?.get("thinking")?.as_str()?;
-                (!text.is_empty()).then(|| AgentEvent::ReasoningDone {
-                    item_id: item_id.to_string(),
-                    text: text.to_string(),
-                })
-            })
-            .collect()
-    }
-
-    fn reasoning_wire(&self) -> Option<String> {
-        if self.thinking.is_empty() {
-            return None;
-        }
-        serde_json::to_string(&self.thinking).ok()
-    }
-
-    fn reasoning_content(&self) -> Option<String> {
-        let text = self
-            .thinking
-            .iter()
-            .filter_map(|b| b.get("thinking"))
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join("");
-        (!text.is_empty()).then_some(text)
-    }
-
-    fn tool_calls(&self) -> Result<Vec<HistoryToolCall>> {
-        let mut calls = Vec::new();
-        for (index, call) in &self.tool_calls {
-            if call.call_id.trim().is_empty() {
-                return Err(anyhow!(
-                    "invalid anthropic tool call at index {index}: missing id"
-                ));
-            }
-            if call.name.trim().is_empty() {
-                return Err(anyhow!(
-                    "invalid anthropic tool call at index {index}: missing name"
-                ));
-            }
-            let raw_arguments = call.arguments_json.trim();
-            let arguments = if raw_arguments.is_empty() {
-                Value::Object(Default::default())
-            } else {
-                serde_json::from_str::<Value>(raw_arguments)
-                    .with_context(|| format!("invalid anthropic tool arguments at index {index}"))?
-            };
-            if !arguments.is_object() {
-                return Err(anyhow!(
-                    "invalid anthropic tool arguments at index {index}: expected an object"
-                ));
-            }
-            calls.push(HistoryToolCall {
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-                arguments_json: arguments.to_string(),
-            });
-        }
-        Ok(calls)
-    }
-
-    fn validate_completion(&self, has_tool_calls: bool) -> Result<()> {
-        if !self.completed {
-            return Err(anyhow!("anthropic stream ended before message_stop"));
-        }
-        match self.stop_reason.as_deref() {
-            Some("max_tokens") => Err(anyhow!(
-                "anthropic response incomplete: stop_reason=max_tokens"
-            )),
-            Some("tool_use") if !has_tool_calls => Err(anyhow!(
-                "anthropic reported stop_reason=tool_use without a tool_use block"
-            )),
-            Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn" | "refusal") => Ok(()),
-            Some(reason) => Err(anyhow!("unexpected anthropic stop_reason {reason}")),
-            None => Err(anyhow!("anthropic stream ended without stop_reason")),
-        }
-    }
-}
-
-async fn send_anthropic_messages_stream<C: Config>(
-    client: &Client<C>,
-    request: &Value,
-    anthropic_betas: &[String],
-    fake_context: Option<&crate::fake::CodexRequestContext>,
-) -> std::result::Result<reqwest::Response, ChatStreamCreationError> {
-    use reqwest::header::{HeaderName, HeaderValue};
-
-    let config = client.config();
-    let url = config.url("/messages");
-    let http = reqwest_client_for_url(&url)
-        .map_err(|error| ChatStreamCreationError::Setup(error.to_string()))?;
-    let mut request_builder = http
-        .post(url.clone())
-        .query(&config.query())
-        .headers(config.headers())
-        .header("anthropic-version", "2023-06-01")
-        .header(reqwest::header::ACCEPT, "text/event-stream");
-    let fake_headers = fake_context.map(|context| context.anthropic_headers());
-    let fake_betas = fake_headers
-        .as_ref()
-        .and_then(|headers| headers.iter().find(|(name, _)| name == "anthropic-beta"))
-        .map(|(_, value)| value.as_str());
-    let merged_betas = merge_anthropic_beta_values(anthropic_betas, fake_betas);
-    if !merged_betas.is_empty() {
-        request_builder = request_builder.header("anthropic-beta", merged_betas.join(","));
-    }
-    if let Some(headers) = fake_headers {
-        for (name, value) in headers {
-            if name == "anthropic-beta" {
-                continue;
-            }
-            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
-                return Err(ChatStreamCreationError::Setup(format!(
-                    "invalid fake header name: {name}"
-                )));
-            };
-            let Ok(value) = HeaderValue::from_str(&value) else {
-                return Err(ChatStreamCreationError::Setup(format!(
-                    "invalid fake header value: {value}"
-                )));
-            };
-            request_builder = request_builder.header(name, value);
-        }
-    }
-    let response = request_builder.json(request).send().await;
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => return Err(ChatStreamCreationError::Transport(error)),
-    };
-    let status = response.status();
-    let headers = response.headers().clone();
-    if status.is_success() {
-        return Ok(response);
-    }
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-    Err(ChatStreamCreationError::Status {
-        status,
-        headers,
-        message,
-    })
-}
-
-pub(super) async fn run_anthropic_stream_async<C, F, Dfut, E, Efut, A, Afut>(
-    agent: &mut Agent<C>,
-    user_content: UserMessageContent,
-    user_input: &str,
-    mut on_delta: F,
-    mut on_event: E,
-    mut approve: A,
-) -> Result<String>
-where
-    C: Config + Clone + Send + Sync + 'static,
-    F: FnMut(&str) -> Dfut,
-    E: FnMut(AgentEvent) -> Efut + Send,
-    A: FnMut(PermissionRequest) -> Afut,
-    Dfut: Future<Output = Result<()>>,
-    Efut: Future<Output = Result<()>> + Send,
-    Afut: Future<Output = Result<PermissionApproval>>,
-{
-    let turn_prelude =
-        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
-    let mut protected_start_index = agent.active_history_items().len();
-    let previous_turn_start_index = agent.turn.current_turn_start_index;
-    agent.turn.current_turn_start_index = Some(protected_start_index);
-    if !user_content.has_no_parts()
-        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
-    {
-        agent.turn.current_turn_start_index = previous_turn_start_index;
-        return Err(error);
-    }
-    Agent::<C>::emit_audit_event(
-        &mut on_event,
-        AgentEvent::TurnStarted(agent.turn_started_event()),
-        "turn_started",
-    )
-    .await;
-    let turn_id = agent.turn.turn_id;
-    let turn_span = langfuse_trace::llm_turn_span(
-        turn_id,
-        "anthropic_messages",
-        &agent.model,
-        agent.max_iterations,
-        agent.max_tool_calls,
-        user_input.chars().count(),
-        agent.active_history_items().len(),
-    );
-    let mut final_text = String::new();
-    let mut tool_call_count = 0;
-    let mut continuation_count = 0;
-    let mut recovery_attempts = 0;
-    let fake_context = agent.fake_turn_context(crate::fake::FakeClient::Anthropic);
-    let result=async{
-        let mut iteration_count=0;
-        'agent_iteration:loop{
-            ensure_iteration_budget(agent.max_iterations,iteration_count,agent.turn.auto_continue_active)?;
-            let iteration=iteration_count;iteration_count+=1;
-            let tool_definitions=agent.tool_definitions();
-            let prepared=prepare_protocol_stream_request(agent,ApiProtocol::Anthropic,&turn_prelude,&mut protected_start_index,&tool_definitions,&mut on_event).await?;
-            protected_start_index=prepared.protected_start_index;
-            let epoch_preview=prepared.epoch_preview;
-            let build=prepared.build;
-            let logical_observation=agent.preview_final_logical_request(&build);
-            let cache_report=CacheUsageReport::from_build(&build);
-            let iteration_span=langfuse_trace::llm_iteration_span(turn_id,"anthropic_messages",&agent.model,iteration,build.budget.retained_history_items,tool_call_count,tool_definitions.len());
-            log_prepared_request_metadata(&build);
-            let logical_request_id=format!("turn-{turn_id}-iteration-{iteration}");
-            let request=match build.request.clone(){BuiltRequest::Anthropic(request)=>request,_=>return Err(anyhow!("request builder returned non-anthropic request"))};
-            let mut attempt=1;
-            'retry_anthropic_stream:loop{
-                let mut prepared_telemetry=llm_request_telemetry(&logical_request_id,turn_id,iteration,attempt,&agent.model,ApiProtocol::Anthropic,&build,tool_call_count,tool_definitions.len(),logical_observation);
-                if attempt>1{prepared_telemetry.adjacent_lcp_units=None;prepared_telemetry.adjacent_lcp_bytes=None;prepared_telemetry.adjacent_lcp_estimated_tokens=None;prepared_telemetry.first_breaker=None;}
-                on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
-                langfuse_trace::record_llm_request_telemetry(&iteration_span,&prepared_telemetry);
-                if attempt==1{agent.commit_final_logical_request(&build);agent.commit_active_epoch(epoch_preview.clone());}
-                let response=send_anthropic_messages_stream(
-                    &agent.client,
-                    &request,
-                    &agent.active_model_metadata().anthropic_betas,
-                    fake_context.as_ref(),
-                ).await;
-                let response=match response{Ok(response)=>response,Err(error) if should_retry_chat_stream_creation(&agent.retry_config,attempt,&error)=>{
-                    emit_attempt_terminal(LlmRequestErrorClass::RequestCreation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
-                    let delay=match &error{ChatStreamCreationError::Status{headers,..}=>retry_delay_from_headers(&agent.retry_config,attempt,headers),_=>retry_delay(&agent.retry_config,attempt)};
-                    wait_for_retry(attempt,agent.retry_config.max_attempts,delay,&error,&mut on_event).await?;attempt+=1;continue 'retry_anthropic_stream;
-                },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::RequestCreation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(anyhow!(error).context(request_creation_failure_context("streamed anthropic messages","anthropic_messages",agent.active_model_metadata(),&build.budget)));}};
-                let mut byte_stream=response.bytes_stream();let mut sse_buffer=String::new();let mut state=AnthropicStreamState::default();
-                let item_id=format!("anthropic-reasoning-{iteration}");let mut stream_had_side_effect=false;let mut provider_usage:Option<TokenUsageEstimate>=None;let mut final_provider_usage_event:Option<AgentEvent>=None;
-                while let Some(chunk)=byte_stream.next().await{
-                    let chunk=match chunk{Ok(chunk)=>chunk,Err(error) if !stream_had_side_effect&&should_retry_reqwest_error(&agent.retry_config,attempt,&error)=>{
-                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead,&prepared_telemetry,&iteration_span,&mut on_event).await?;
-                        let delay=retry_delay(&agent.retry_config,attempt);wait_for_retry(attempt,agent.retry_config.max_attempts,delay,&error,&mut on_event).await?;attempt+=1;continue 'retry_anthropic_stream;
-                    },Err(_error) if stream_had_side_effect=>{
-                        emit_attempt_interrupted(LlmRequestErrorClass::StreamRead,&prepared_telemetry,&iteration_span,&mut on_event).await?;
-                        recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","stream_read",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;
-                    },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::StreamRead,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error.into());}};
-                    append_sse_chunk(&mut sse_buffer,&chunk);
-                    for event in drain_sse_data_events(&mut sse_buffer){
-                        let Some(data)=event else{continue};
-                        let raw=match serde_json::from_str::<Value>(&data){Ok(raw)=>raw,Err(_error) if stream_had_side_effect=>{
-                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
-                            recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","event_parse",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;
-                        },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error).with_context(||format!("failed to parse anthropic stream event: {data}"));}};
-                        let (emitted,text_delta)=match state.handle_event(&raw,&item_id){Ok((events,text_delta))=>(events,text_delta),Err(_error) if stream_had_side_effect||!state.pending_tool_calls.is_empty()=>{
-                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;
-                            recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","event_parse",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;
-                        },Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error);}};
-                        if !text_delta.is_empty(){stream_had_side_effect=true;on_delta(&text_delta).await?;final_text.push_str(&text_delta);}
-                        if !emitted.is_empty(){stream_had_side_effect=true;for event in emitted{on_event(event).await?;}}
-                    }
-                }
-                for event in finish_sse_data_events(&mut sse_buffer) {
-                    let Some(data) = event else { continue };
-                    let raw = serde_json::from_str::<Value>(&data).with_context(|| {
-                        format!("failed to parse anthropic stream event: {data}")
-                    })?;
-                    let (emitted, text_delta) = state.handle_event(&raw, &item_id)?;
-                    if !text_delta.is_empty() {
-                        stream_had_side_effect = true;
-                        on_delta(&text_delta).await?;
-                        final_text.push_str(&text_delta);
-                    }
-                    if !emitted.is_empty() {
-                        stream_had_side_effect = true;
-                        for event in emitted {
-                            on_event(event).await?;
-                        }
-                    }
-                }
-                for event in state.finish_thinking(&item_id){stream_had_side_effect=true;on_event(event).await?;}
-                if let Some(usage)=state.provider_usage(build.budget.context_window_tokens){provider_usage=Some(usage);prepared_telemetry.usage=provider_usage;prepared_telemetry.usage_completeness=ProviderUsageCompleteness::Complete;final_provider_usage_event=Some(AgentEvent::TokenUsageUpdated{used_tokens:usage.used_tokens,context_window_tokens:usage.context_window_tokens,input_tokens:usage.input_tokens,output_tokens:usage.output_tokens,cached_tokens:usage.cached_tokens,cache_report:Some(cache_report.clone().with_actual_cached_tokens(usage.cached_tokens))});}
-                let has_tool_calls=!state.tool_calls.is_empty();
-                if let Err(error)=state.validate_completion(has_tool_calls){
-                    if stream_had_side_effect||!state.pending_tool_calls.is_empty(){emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","finish_validation",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;}
-                    emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error);
-                }
-                let tool_calls=match state.tool_calls(){Ok(calls)=>calls,Err(_error) if stream_had_side_effect||!state.pending_tool_calls.is_empty()=>{emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;recover_stream_interrupt(agent,&state.text,&state.pending_tool_calls,"anthropic_messages","tool_validation",&mut recovery_attempts,agent.retry_config.max_recovery_attempts,&mut on_event).await?;continue 'agent_iteration;},Err(error)=>{emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation,&prepared_telemetry,&iteration_span,&mut on_event).await?;return Err(error);}};
-                if let Some(event)=final_provider_usage_event{on_event(event).await?;}
-                let turn_text=state.text.clone();let reasoning_content=state.reasoning_content();let reasoning_wire=state.reasoning_wire();
-                if !has_tool_calls{
-                    let completed_telemetry=prepared_telemetry.completed(provider_usage,None,ProviderUsageCompleteness::Complete);
-                    on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;langfuse_trace::record_llm_request_telemetry(&iteration_span,&completed_telemetry);
-                    if final_text.is_empty(){final_text="No response content".to_string();}
-                    agent.append_history_item(HistoryItem::assistant(turn_text.clone()))?;
-                    if let Some(usage)=provider_usage{agent.install_provider_usage_anchor(usage);}
-                    on_event(AgentEvent::AssistantMessage{content:turn_text.clone()}).await?;
-                    langfuse_trace::finish_llm_iteration_span(&iteration_span,turn_text.chars().count(),0,0,Some(state.stop_reason.as_deref().unwrap_or("unknown")));drop(iteration_span);
-                    on_event(AgentEvent::TurnContinuationBoundary).await?;
-                    if agent.drain_turn_continuations(&mut on_event).await?||agent.continue_or_finalize_no_tool_reply(&mut on_event,tool_call_count,&mut continuation_count).await?{continue 'agent_iteration;}
-                    return Ok(final_text);
-                }
-                let completed_telemetry=prepared_telemetry.completed(provider_usage,None,ProviderUsageCompleteness::Complete);
-                on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;langfuse_trace::record_llm_request_telemetry(&iteration_span,&completed_telemetry);
-                agent.ensure_tool_call_budget(tool_call_count,tool_calls.len())?;tool_call_count+=tool_calls.len();
-                langfuse_trace::finish_llm_iteration_span(&iteration_span,turn_text.chars().count(),tool_calls.len(),tool_calls.len(),Some(state.stop_reason.as_deref().unwrap_or("unknown")));drop(iteration_span);
-                agent.append_assistant_tool_calls_with_reasoning_content(&turn_text,reasoning_content.as_deref(),reasoning_wire.as_deref(),&tool_calls)?;
-                if let Some(usage)=provider_usage{agent.install_provider_usage_anchor(usage);}
-                on_event(AgentEvent::AssistantToolCallBatch{text:(!turn_text.is_empty()).then(||turn_text.clone()),reasoning_content,reasoning_wire,calls:tool_calls.clone()}).await?;
-                for call in &tool_calls{info!(tool_name=%call.name,call_id=%call.call_id,"anthropic tool call requested");}
-                agent.execute_tool_calls_and_record(&tool_calls,&mut on_event,&mut approve).await?;
-                on_event(AgentEvent::ToolCallBatchFinished).await?;on_event(AgentEvent::TurnContinuationBoundary).await?;let _=agent.drain_turn_continuations(&mut on_event).await?;
-                break 'retry_anthropic_stream;
-            }
-        }
-    }.instrument(turn_span.clone()).await;
-    langfuse_trace::finish_llm_turn_span(
-        &turn_span,
-        &result,
-        tool_call_count,
-        continuation_count,
-        agent.active_history_items().len(),
-    );
-    agent.turn.pressure_compaction.reset_for_turn_end();
-    result
-}
-
-/// Stream a single text completion without opening a full agent turn.
-///
-/// Used by context compaction summaries: empty tools, reasoning forced off, and
-/// only content deltas are forwarded. Creation failures may retry; mid-stream
-/// failures after content is observed are not recovered into a new turn.
 fn build_oneshot_text_request(
     model_id: &str,
-    protocol: ApiProtocol,
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
 ) -> Result<crate::request_builder::BuildResult> {
-    let mut snapshot = RuntimeSnapshot::new("compaction-summary");
+    let mut snapshot = RuntimeSnapshot::new("helper-oneshot");
     let frames = crate::protocol_frames::history_items_to_frames(&[HistoryItem::user(user_text)]);
     for (ordinal, frame) in frames.into_iter().enumerate() {
         let stable_key = frame.stable_prompt_key();
@@ -2688,11 +963,8 @@ fn build_oneshot_text_request(
             .push(runtime_frame.id);
         snapshot.push_frame(runtime_frame);
     }
-
     build_request_with_policy(
         RequestBuilderInput {
-            protocol,
-            provider: None,
             model_id,
             model,
             prelude,
@@ -2704,785 +976,73 @@ fn build_oneshot_text_request(
     )
 }
 
-pub(super) fn preflight_oneshot_text_request(
-    model_id: &str,
-    protocol: ApiProtocol,
+pub(super) fn preflight_resolved_oneshot_text_request(
+    route: &crate::model_runtime::ResolvedModelRoute,
     mut model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
 ) -> Result<crate::request_builder::BuildResult> {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
+    model.reasoning_summary = None;
     model.supports_tools = false;
-    build_oneshot_text_request(model_id, protocol, model, prelude, user_text)
+    model.parallel_tool_calls = false;
+    model.fast_mode = false;
+    let build =
+        build_oneshot_text_request(&route.model_override, model.clone(), prelude, user_text)?;
+    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+        .map_err(anyhow::Error::msg)?;
+    route
+        .binding
+        .prepare_request(&input)
+        .map_err(|failure| anyhow!(failure.to_string()))?;
+    Ok(build)
 }
 
-pub(super) async fn stream_oneshot_text_async<C, F, Fut>(
-    client: &Client<C>,
-    model_id: &str,
-    protocol: ApiProtocol,
+pub(super) async fn stream_resolved_oneshot_text_async<F, Fut>(
+    route: &crate::model_runtime::ResolvedModelRoute,
     mut model: ModelRequestMetadata,
-    retry_config: &RetryConfig,
     prelude: &[PromptMessage],
     user_text: &str,
     mut on_delta: F,
 ) -> Result<String>
 where
-    C: Config,
-    F: FnMut(&str) -> Fut,
-    Fut: Future<Output = Result<()>>,
+    F: FnMut(&str) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
 {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
+    model.reasoning_summary = None;
     model.supports_tools = false;
-    let build = build_oneshot_text_request(model_id, protocol, model.clone(), prelude, user_text)?;
-
-    match protocol {
-        ApiProtocol::Completions => {
-            stream_oneshot_completions(client, &build, retry_config, &mut on_delta).await
-        }
-        ApiProtocol::Responses => {
-            stream_oneshot_responses(client, &build, retry_config, &mut on_delta).await
-        }
-        ApiProtocol::Anthropic => {
-            stream_oneshot_anthropic(
-                client,
-                &build,
-                &model.anthropic_betas,
-                retry_config,
-                &mut on_delta,
-            )
-            .await
-        }
-    }
-}
-
-async fn stream_oneshot_anthropic<C, F, Fut>(
-    client: &Client<C>,
-    build: &crate::request_builder::BuildResult,
-    anthropic_betas: &[String],
-    retry_config: &RetryConfig,
-    on_delta: &mut F,
-) -> Result<String>
-where
-    C: Config,
-    F: FnMut(&str) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    let request = match &build.request {
-        BuiltRequest::Anthropic(request) => request.clone(),
-        BuiltRequest::Responses(_)
-        | BuiltRequest::ResponsesCompatible(_)
-        | BuiltRequest::Completions(_)
-        | BuiltRequest::CompletionsCompatible(_) => {
-            bail!("request builder returned non-anthropic request for oneshot summary")
-        }
-    };
-
-    let mut attempt = 1;
-    loop {
-        let response =
-            match send_anthropic_messages_stream(client, &request, anthropic_betas, None).await {
-                Ok(response) => response,
-                Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
-                    let delay = match &error {
-                        ChatStreamCreationError::Status { headers, .. } => {
-                            retry_delay_from_headers(retry_config, attempt, headers)
-                        }
-                        _ => retry_delay(retry_config, attempt),
-                    };
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                Err(error) => {
-                    return Err(anyhow!(error).context(request_creation_failure_context(
-                        "streamed anthropic messages",
-                        "oneshot",
-                        ModelRequestMetadata::default(),
-                        &build.budget,
-                    )));
-                }
-            };
-
-        let mut byte_stream = response.bytes_stream();
-        let mut sse_buffer = String::new();
-        let mut state = AnthropicStreamState::default();
-        while let Some(chunk) = byte_stream.next().await {
-            let chunk = chunk.context("failed to read oneshot anthropic stream")?;
-            append_sse_chunk(&mut sse_buffer, &chunk);
-            for event in drain_sse_data_events(&mut sse_buffer) {
-                let Some(data) = event else { continue };
-                let raw: Value = serde_json::from_str(&data)
-                    .context("failed to deserialize oneshot anthropic delta")?;
-                let (_, text_delta) = state.handle_event(&raw, "anthropic-oneshot")?;
-                if !text_delta.is_empty() {
-                    on_delta(&text_delta).await?;
-                }
+    model.parallel_tool_calls = false;
+    model.fast_mode = false;
+    let build =
+        build_oneshot_text_request(&route.model_override, model.clone(), prelude, user_text)?;
+    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+        .map_err(anyhow::Error::msg)?;
+    ModelRuntime::default()
+        .execute_text_oneshot(route, &input, move |delta| {
+            let future = on_delta(delta);
+            async move {
+                future.await.map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })
             }
-        }
-        for event in finish_sse_data_events(&mut sse_buffer) {
-            let Some(data) = event else { continue };
-            let raw: Value = serde_json::from_str(&data)
-                .context("failed to deserialize oneshot anthropic trailer")?;
-            let (_, text_delta) = state.handle_event(&raw, "anthropic-oneshot")?;
-            if !text_delta.is_empty() {
-                on_delta(&text_delta).await?;
-            }
-        }
-        state.validate_completion(false)?;
-        return Ok(state.text);
-    }
-}
-
-async fn stream_oneshot_completions<C, F, Fut>(
-    client: &Client<C>,
-    build: &crate::request_builder::BuildResult,
-    retry_config: &RetryConfig,
-    on_delta: &mut F,
-) -> Result<String>
-where
-    C: Config,
-    F: FnMut(&str) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    let completion_request = match &build.request {
-        BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request.clone()),
-        BuiltRequest::CompletionsCompatible(request) => {
-            CompletionStreamRequest::Compatible(request.clone())
-        }
-        BuiltRequest::Anthropic(_) => {
-            bail!("request builder returned non-completions request for oneshot summary")
-        }
-        BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
-            bail!("request builder returned non-completions request for oneshot summary")
-        }
-    };
-
-    let mut attempt = 1;
-    loop {
-        let response = match &completion_request {
-            CompletionStreamRequest::Typed(request) => {
-                send_compatible_chat_completion_stream(client, request).await
-            }
-            CompletionStreamRequest::Compatible(request) => {
-                send_compatible_chat_completion_stream(client, request).await
-            }
-        };
-        let response = match response {
-            Ok(response) => response,
-            Err(error) if should_retry_chat_stream_creation(retry_config, attempt, &error) => {
-                let delay = match &error {
-                    ChatStreamCreationError::Status { headers, .. } => {
-                        retry_delay_from_headers(retry_config, attempt, headers)
-                    }
-                    _ => retry_delay(retry_config, attempt),
-                };
-                tokio::time::sleep(delay).await;
-                attempt += 1;
-                continue;
-            }
-            Err(error) => {
-                return Err(anyhow!(error).context(request_creation_failure_context(
-                    "streamed chat completion",
-                    "oneshot",
-                    ModelRequestMetadata::default(),
-                    &build.budget,
-                )));
-            }
-        };
-
-        let mut byte_stream = response.bytes_stream();
-        let mut sse_buffer = String::new();
-        let mut text = String::new();
-        while let Some(chunk) = byte_stream.next().await {
-            let chunk = chunk.context("failed to read oneshot chat completion stream")?;
-            append_sse_chunk(&mut sse_buffer, &chunk);
-            for event in drain_sse_data_events(&mut sse_buffer) {
-                let Some(data) = event else {
-                    continue;
-                };
-                let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
-                    .context("failed to deserialize oneshot chat completion delta")?;
-                for choice in response.choices {
-                    if let Some(delta) = choice.delta.and_then(|delta| delta.content)
-                        && !delta.is_empty()
-                    {
-                        on_delta(&delta).await?;
-                        text.push_str(&delta);
-                    }
-                }
-            }
-        }
-        for event in finish_sse_data_events(&mut sse_buffer) {
-            let Some(data) = event else {
-                continue;
-            };
-            let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
-                .context("failed to deserialize oneshot chat completion trailer")?;
-            for choice in response.choices {
-                if let Some(delta) = choice.delta.and_then(|delta| delta.content)
-                    && !delta.is_empty()
-                {
-                    on_delta(&delta).await?;
-                    text.push_str(&delta);
-                }
-            }
-        }
-        return Ok(text);
-    }
-}
-
-async fn stream_oneshot_responses<C, F, Fut>(
-    client: &Client<C>,
-    build: &crate::request_builder::BuildResult,
-    retry_config: &RetryConfig,
-    on_delta: &mut F,
-) -> Result<String>
-where
-    C: Config,
-    F: FnMut(&str) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    let response_request = match &build.request {
-        BuiltRequest::Responses(request) => ResponseStreamRequest::Typed(request.clone()),
-        BuiltRequest::ResponsesCompatible(request) => {
-            ResponseStreamRequest::Compatible(request.clone())
-        }
-        BuiltRequest::Anthropic(_) => {
-            bail!("request builder returned non-responses request for oneshot summary")
-        }
-        BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
-            bail!("request builder returned non-responses request for oneshot summary")
-        }
-    };
-
-    let mut attempt = 1;
-    loop {
-        let mut stream = match create_response_stream(client, &response_request).await {
-            Ok(stream) => stream,
-            Err(error) if should_retry_openai_stream_creation(retry_config, attempt, &error) => {
-                tokio::time::sleep(retry_delay(retry_config, attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            Err(error) => {
-                return Err(anyhow!(error).context(request_creation_failure_context(
-                    "streamed response",
-                    "oneshot",
-                    ModelRequestMetadata::default(),
-                    &build.budget,
-                )));
-            }
-        };
-
-        let mut text = String::new();
-        while let Some(event) = stream.next().await {
-            let raw = event.context("failed to read oneshot responses stream")?;
-            let event = match project_response_stream_event(&raw) {
-                Ok(Some(event)) => event,
-                Ok(None) => continue,
-                Err(error) if is_ignorable_response_lifecycle_event(&raw) => {
-                    warn!(error = %error, "ignored oneshot response lifecycle stream event");
-                    continue;
-                }
-                Err(error) => {
-                    return Err(
-                        anyhow!(error).context("failed to deserialize oneshot responses event")
-                    );
-                }
-            };
-            match event {
-                ResponseStreamEvent::ResponseOutputTextDelta(event) if !event.delta.is_empty() => {
-                    on_delta(&event.delta).await?;
-                    text.push_str(&event.delta);
-                }
-                ResponseStreamEvent::ResponseFailed(event) => {
-                    bail!(
-                        "oneshot responses stream failed: {}",
-                        provider_response_terminal_error("failed", &event.response)
-                    );
-                }
-                ResponseStreamEvent::ResponseError(event) => {
-                    bail!(
-                        "oneshot responses stream error: {}",
-                        provider_error_event_terminal_error(&event)
-                    );
-                }
-                ResponseStreamEvent::ResponseIncomplete(event) => {
-                    bail!(
-                        "oneshot responses stream incomplete: {}",
-                        provider_response_terminal_error("incomplete", &event.response)
-                    );
-                }
-                ResponseStreamEvent::ResponseCompleted(event) => {
-                    // Test mocks and some providers only emit the completed payload.
-                    if text.is_empty()
-                        && let Some(completed) = event.response.output_text()
-                        && !completed.is_empty()
-                    {
-                        on_delta(&completed).await?;
-                        text.push_str(&completed);
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
-        return Ok(text);
-    }
-}
-
-pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
-    client: &Client<C>,
-    request: &impl Serialize,
-) -> std::result::Result<reqwest::Response, ChatStreamCreationError> {
-    let config = client.config();
-    let url = config.url("/chat/completions");
-    let http = reqwest_client_for_url(&url)
-        .map_err(|error| ChatStreamCreationError::Setup(error.to_string()))?;
-
-    let response = match http
-        .post(url.clone())
-        .query(&config.query())
-        .headers(config.headers())
-        .json(request)
-        .send()
+        })
         .await
-    {
-        Ok(response) => response,
-        Err(error) => return Err(ChatStreamCreationError::Transport(error)),
-    };
+        .map_err(|failure| anyhow!(failure.to_string()))
+}
 
-    let status = response.status();
-    let headers = response.headers().clone();
-    if status.is_success() {
-        return Ok(response);
-    }
-
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-    Err(ChatStreamCreationError::Status {
-        status,
-        headers,
-        message,
+pub(super) async fn execute_resolved_text_oneshot(
+    route: &crate::model_runtime::ResolvedModelRoute,
+    model: ModelRequestMetadata,
+    prelude: &[PromptMessage],
+    user_text: &str,
+) -> Result<String> {
+    stream_resolved_oneshot_text_async(route, model, prelude, user_text, |_| {
+        std::future::ready(Ok(()))
     })
-}
-
-fn request_creation_failure_context(
-    operation: &str,
-    model: &str,
-    metadata: crate::request_builder::ModelRequestMetadata,
-    budget: &crate::request_builder::BudgetReport,
-) -> String {
-    format!(
-        "failed to create {operation} (model={model}, estimated_request_tokens={}, input_budget_tokens={}, context_window_tokens={}, effective_input_limit_tokens={}, prelude_tokens={}, protected_tokens={}, retained_history_tokens={}, tools_tokens={}, evidence_tokens={}, retained_history_items={}, dropped_history_items={}, selected_evidence_items={}, dropped_evidence_items={})",
-        budget.estimated_request_tokens,
-        budget.input_budget_tokens,
-        budget.context_window_tokens,
-        metadata
-            .effective_input_limit_tokens()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".into()),
-        budget.estimated_prelude_tokens,
-        budget.estimated_protected_tokens,
-        budget.estimated_retained_history_tokens,
-        budget.estimated_tools_tokens,
-        budget.estimated_evidence_tokens,
-        budget.retained_history_items,
-        budget.dropped_history_items,
-        budget.selected_evidence_items,
-        budget.dropped_evidence_items,
-    )
-}
-
-fn reqwest_client_for_url(url: &str) -> Result<reqwest::Client> {
-    let builder = reqwest::Client::builder();
-    let builder = if is_loopback_url(url) {
-        builder.no_proxy()
-    } else {
-        builder
-    };
-    builder
-        .build()
-        .context("failed to build chat completions HTTP client")
-}
-
-fn is_loopback_url(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|addr| addr.is_loopback())
-        })
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct CompatibleChatCompletionStreamResponse {
-    pub(super) id: Option<String>,
-    pub(super) choices: Vec<CompatibleChatChoiceStream>,
-    pub(super) usage: Option<CompletionUsage>,
-}
-
-pub(super) fn token_usage_event_from_response_usage(
-    usage: &ResponseUsage,
-    context_window_tokens: u64,
-    cache_report: &CacheUsageReport,
-) -> AgentEvent {
-    let cached_tokens = usage.input_tokens_details.cached_tokens as u64;
-    AgentEvent::TokenUsageUpdated {
-        used_tokens: usage.total_tokens as u64,
-        context_window_tokens,
-        input_tokens: usage.input_tokens as u64,
-        output_tokens: usage.output_tokens as u64,
-        cached_tokens,
-        cache_report: Some(cache_report.with_actual_cached_tokens(cached_tokens)),
-    }
-}
-
-pub(super) fn token_usage_event_from_completion_usage(
-    usage: &CompletionUsage,
-    context_window_tokens: u64,
-    cache_report: &CacheUsageReport,
-) -> AgentEvent {
-    let cached_tokens = usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| details.cached_tokens)
-        .unwrap_or(0) as u64;
-    let cache_report = match usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| details.cached_tokens)
-    {
-        Some(_) => cache_report.with_actual_cached_tokens(cached_tokens),
-        None => cache_report.clone(),
-    };
-    AgentEvent::TokenUsageUpdated {
-        used_tokens: usage.total_tokens as u64,
-        context_window_tokens,
-        input_tokens: usage.prompt_tokens as u64,
-        output_tokens: usage.completion_tokens as u64,
-        cached_tokens,
-        cache_report: Some(cache_report),
-    }
-}
-
-fn completion_usage_completeness(
-    usage: Option<TokenUsageEstimate>,
-    cache_details_present: bool,
-) -> ProviderUsageCompleteness {
-    if usage.is_none() {
-        ProviderUsageCompleteness::UsageMissing
-    } else if cache_details_present {
-        ProviderUsageCompleteness::Complete
-    } else {
-        ProviderUsageCompleteness::CacheDetailsMissing
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct CompatibleChatChoiceStream {
-    pub(super) index: u32,
-    pub(super) delta: Option<CompatibleChatCompletionStreamResponseDelta>,
-    pub(super) finish_reason: Option<FinishReason>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct CompatibleChatCompletionStreamResponseDelta {
-    pub(super) content: Option<String>,
-    pub(super) tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
-    pub(super) reasoning_content: Option<CompatibleReasoningDelta>,
-    pub(super) reasoning: Option<CompatibleReasoningDelta>,
-    pub(super) thinking: Option<CompatibleReasoningDelta>,
-}
-
-impl CompatibleChatCompletionStreamResponseDelta {
-    pub(super) fn reasoning_delta(&self) -> Option<String> {
-        [
-            self.reasoning_content.as_ref(),
-            self.reasoning.as_ref(),
-            self.thinking.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|reasoning| reasoning.to_text().filter(|text| !text.is_empty()))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(super) enum CompatibleReasoningDelta {
-    Text(String),
-    Object {
-        content: Option<String>,
-        text: Option<String>,
-        summary: Option<String>,
-    },
-    Array(Vec<CompatibleReasoningDelta>),
-}
-
-impl CompatibleReasoningDelta {
-    fn to_text(&self) -> Option<String> {
-        match self {
-            Self::Text(text) => Some(text.clone()),
-            Self::Object {
-                content,
-                text,
-                summary,
-            } => content
-                .as_ref()
-                .or(text.as_ref())
-                .or(summary.as_ref())
-                .cloned(),
-            Self::Array(parts) => {
-                let text = parts.iter().filter_map(Self::to_text).collect::<String>();
-                (!text.is_empty()).then_some(text)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct NativeReasoningAccumulator {
-    item_id: String,
-    text: String,
-}
-
-impl NativeReasoningAccumulator {
-    fn new(item_id: impl Into<String>) -> Self {
-        Self {
-            item_id: item_id.into(),
-            text: String::new(),
-        }
-    }
-
-    fn push(&mut self, delta: String) -> Option<AgentEvent> {
-        if delta.is_empty() {
-            return None;
-        }
-        self.text.push_str(&delta);
-        Some(AgentEvent::ReasoningDelta {
-            item_id: self.item_id.clone(),
-            delta,
-        })
-    }
-
-    fn text(&self) -> Option<&str> {
-        (!self.text.is_empty()).then_some(self.text.as_str())
-    }
-
-    fn finish(self) -> Option<AgentEvent> {
-        (!self.text.is_empty()).then_some(AgentEvent::ReasoningDone {
-            item_id: self.item_id,
-            text: self.text,
-        })
-    }
-}
-
-pub(super) fn append_sse_chunk(buffer: &mut String, chunk: &[u8]) {
-    buffer.push_str(&String::from_utf8_lossy(chunk));
-}
-
-pub(super) fn drain_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
-    let mut events = Vec::new();
-    while let Some((index, len)) = find_sse_event_boundary(buffer) {
-        let raw = buffer[..index].to_string();
-        buffer.drain(..index + len);
-        if let Some(event) = parse_sse_data_event(&raw) {
-            events.push(event);
-        }
-    }
-    events
-}
-
-fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
-    let mut events = drain_sse_data_events(buffer);
-    if !buffer.trim().is_empty() {
-        let raw = std::mem::take(buffer);
-        if let Some(event) = parse_sse_data_event(&raw) {
-            events.push(event);
-        }
-    }
-    events
-}
-
-fn response_reasoning_text(item: &OutputItem) -> Option<String> {
-    let OutputItem::Reasoning(reasoning) = item else {
-        return None;
-    };
-    let content = reasoning.content.as_ref()?;
-    let text = content
-        .iter()
-        .map(|part| match part {
-            async_openai::types::responses::ReasoningItemContent::ReasoningText(content) => {
-                content.text.clone()
-            }
-        })
-        .collect::<String>();
-    (!text.is_empty()).then_some(text)
-}
-
-fn response_reasoning_content(
-    response: &Response,
-    streamed_reasoning: &BTreeMap<String, String>,
-) -> Option<String> {
-    let mut content = Vec::new();
-    let mut represented_ids = HashSet::new();
-
-    for item in &response.output {
-        let OutputItem::Reasoning(reasoning) = item else {
-            continue;
-        };
-        let item_id = reasoning.id.as_deref();
-        let text = response_reasoning_text(item)
-            .or_else(|| item_id.and_then(|id| streamed_reasoning.get(id).cloned()));
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            if let Some(item_id) = item_id {
-                represented_ids.insert(item_id.to_string());
-            }
-            content.push(text);
-        }
-    }
-
-    content.extend(
-        streamed_reasoning
-            .iter()
-            .filter(|(item_id, text)| !represented_ids.contains(*item_id) && !text.is_empty())
-            .map(|(_, text)| text.clone()),
-    );
-
-    (!content.is_empty()).then(|| content.join("\n\n"))
-}
-
-fn provider_response_terminal_error(prefix: &str, response: &Response) -> String {
-    let fields = [
-        response
-            .error
-            .as_ref()
-            .map(|error| format!("code={}", error.code)),
-        response
-            .error
-            .as_ref()
-            .map(|error| format!("message={}", error.message)),
-        response
-            .incomplete_details
-            .as_ref()
-            .map(|details| format!("reason={}", details.reason)),
-    ];
-    let detail = fields.into_iter().flatten().collect::<Vec<_>>().join(", ");
-    if detail.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}: {detail}")
-    }
-}
-
-fn provider_error_event_terminal_error(
-    event: &async_openai::types::responses::ResponseErrorEvent,
-) -> String {
-    match event.code.as_deref() {
-        Some(code) => format!("response error: code={code}, message={}", event.message),
-        None => format!("response error: message={}", event.message),
-    }
-}
-
-fn is_retryable_provider_error_event(
-    event: &async_openai::types::responses::ResponseErrorEvent,
-) -> bool {
-    is_retryable_provider_error_fields(None, event.code.as_deref(), Some(event.message.as_str()))
-}
-
-fn is_retryable_provider_response(response: &Response) -> bool {
-    let retryable_error = is_retryable_provider_error_fields(
-        None,
-        response.error.as_ref().map(|error| error.code.as_str()),
-        response.error.as_ref().map(|error| error.message.as_str()),
-    );
-    let retryable_incomplete_reason = is_retryable_provider_error_fields(
-        None,
-        None,
-        response
-            .incomplete_details
-            .as_ref()
-            .map(|details| details.reason.as_str()),
-    );
-    retryable_error || retryable_incomplete_reason
-}
-
-async fn recover_stream_interrupt<C, E, Efut>(
-    agent: &mut Agent<C>,
-    turn_text: &str,
-    pending_tool_calls: &BTreeMap<String, String>,
-    protocol: &str,
-    phase: &str,
-    recovery_attempts: &mut usize,
-    max_recovery_attempts: usize,
-    on_event: &mut E,
-) -> Result<()>
-where
-    C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    if *recovery_attempts >= max_recovery_attempts {
-        return Err(anyhow!(
-            "stream recovery budget exhausted after {max_recovery_attempts} attempts"
-        ));
-    }
-    *recovery_attempts += 1;
-    emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
-
-    if !turn_text.is_empty() {
-        agent.append_history_item(HistoryItem::assistant(turn_text.to_string()))?;
-        on_event(AgentEvent::AssistantMessage {
-            content: turn_text.to_string(),
-        })
-        .await?;
-    }
-
-    let detail = if pending_tool_calls.is_empty() {
-        if turn_text.is_empty() {
-            format!(
-                "The {protocol} stream was interrupted during {phase}. The next model iteration will continue from the latest turn state."
-            )
-        } else {
-            format!(
-                "The {protocol} stream was interrupted during {phase}. Partial assistant output was preserved."
-            )
-        }
-    } else {
-        format!(
-            "The {protocol} stream was interrupted during {phase}. {} incomplete tool call(s) were cancelled{}.",
-            pending_tool_calls.len(),
-            if turn_text.is_empty() {
-                ""
-            } else {
-                "; partial assistant output was preserved"
-            }
-        )
-    };
-    on_event(AgentEvent::ModelStreamIssue {
-        message: STREAM_INTERRUPT_MESSAGE.to_string(),
-        detail: Some(detail),
-        action: STREAM_INTERRUPT_ACTION.to_string(),
-    })
-    .await?;
-
-    let text = build_stream_interrupt_continuation(turn_text, pending_tool_calls);
-    agent.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
-    on_event(AgentEvent::InternalContinuation {
-        text,
-        source: crate::transcript::InternalContinuationSource::StreamRecovery,
-    })
-    .await?;
-
-    Ok(())
+    .await
 }
 
 fn build_stream_interrupt_continuation(
@@ -3519,654 +1079,4 @@ where
         .await?;
     }
     Ok(())
-}
-
-fn ensure_iteration_budget(
-    limit: Option<usize>,
-    iteration_count: usize,
-    auto_continue_enabled: bool,
-) -> Result<()> {
-    if auto_continue_enabled {
-        return Ok(());
-    }
-    if let Some(limit) = limit
-        && iteration_count >= limit
-    {
-        return Err(anyhow!(
-            "stopped: too many agent iterations (max {})",
-            limit
-        ));
-    }
-    Ok(())
-}
-
-fn find_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
-    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
-        (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
-        (Some(lf), _) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
-    }
-}
-
-fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
-    let data = raw
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if data.is_empty() {
-        return None;
-    }
-    if data.trim() == "[DONE]" {
-        return Some(None);
-    }
-    Some(Some(data))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_openai::config::OpenAIConfig;
-    use serde_json::{Value, json};
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    async fn capture_anthropic_request(
-        anthropic_betas: &[String],
-        fake_context: Option<&crate::fake::CodexRequestContext>,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test server should bind");
-        let addr = listener.local_addr().expect("test server has local addr");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("server accepts request");
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0_u8; 4096];
-                let read = socket
-                    .read(&mut buffer)
-                    .await
-                    .expect("server reads request");
-                assert_ne!(read, 0, "client closed before sending the complete request");
-                request.extend_from_slice(&buffer[..read]);
-                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = std::str::from_utf8(&request[..header_end])
-                    .expect("client sends UTF-8 request headers");
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':')
-                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("server writes response");
-            String::from_utf8(request).expect("client sends UTF-8 request headers")
-        });
-        let client = Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(format!("http://{addr}"))
-                .with_api_key("test"),
-        );
-        send_anthropic_messages_stream(
-            &client,
-            &json!({"model":"test"}),
-            anthropic_betas,
-            fake_context,
-        )
-        .await
-        .expect("anthropic request succeeds");
-        server.await.expect("test server completes")
-    }
-
-    #[tokio::test]
-    async fn anthropic_betas_are_sent_only_as_http_header() {
-        let request = capture_anthropic_request(
-            &[
-                "context-1m-2025-08-07".to_string(),
-                "interleaved-thinking-2025-05-14".to_string(),
-            ],
-            None,
-        )
-        .await;
-        let (headers, body) = request
-            .split_once("\r\n\r\n")
-            .expect("request separates headers and body");
-        assert!(headers.lines().any(|line| {
-            line.eq_ignore_ascii_case(
-                "anthropic-beta: context-1m-2025-08-07,interleaved-thinking-2025-05-14",
-            )
-        }));
-        assert!(!body.contains("anthropic_beta"));
-        assert!(!body.contains("anthropic-beta"));
-    }
-
-    #[tokio::test]
-    async fn unconfigured_anthropic_betas_send_no_header() {
-        let request = capture_anthropic_request(&[], None).await;
-        let headers = request
-            .split_once("\r\n\r\n")
-            .map(|(headers, _)| headers)
-            .expect("request separates headers and body");
-        assert!(
-            !headers
-                .lines()
-                .any(|line| line.to_ascii_lowercase().starts_with("anthropic-beta:"))
-        );
-    }
-
-    #[tokio::test]
-    async fn anthropic_oneshot_forwards_configured_beta_header() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test server should bind");
-        let addr = listener.local_addr().expect("test server has local addr");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("server accepts request");
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0_u8; 4096];
-                let read = socket
-                    .read(&mut buffer)
-                    .await
-                    .expect("server reads request");
-                assert_ne!(read, 0, "client closed before sending request headers");
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let body = concat!(
-                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
-                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"summary\"}}\n\n",
-                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
-                "data: {\"type\":\"message_stop\"}\n\n",
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("server writes response");
-            String::from_utf8(request).expect("client sends UTF-8 request headers")
-        });
-        let client = Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base(format!("http://{addr}"))
-                .with_api_key("test"),
-        );
-        let model = ModelRequestMetadata {
-            anthropic_betas: vec!["context-1m-2025-08-07".to_string()],
-            ..Default::default()
-        };
-        let output = stream_oneshot_text_async(
-            &client,
-            "test",
-            ApiProtocol::Anthropic,
-            model,
-            &RetryConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            &[],
-            "summarize",
-            |_| std::future::ready(Ok(())),
-        )
-        .await
-        .expect("oneshot anthropic request succeeds");
-        assert_eq!(output, "summary");
-        let request = server.await.expect("test server completes");
-        let headers = request
-            .split_once("\r\n\r\n")
-            .map(|(headers, _)| headers)
-            .expect("request separates headers and body");
-        assert!(
-            headers
-                .lines()
-                .any(|line| { line.eq_ignore_ascii_case("anthropic-beta: context-1m-2025-08-07") })
-        );
-    }
-
-    #[tokio::test]
-    async fn fake_anthropic_headers_keep_one_configured_beta_header() {
-        let fake_context = crate::fake::CodexIdentity::new("installation").turn_context();
-        let request =
-            capture_anthropic_request(&["context-1m-2025-08-07".to_string()], Some(&fake_context))
-                .await;
-        let headers = request
-            .split_once("\r\n\r\n")
-            .map(|(headers, _)| headers)
-            .expect("request separates headers and body");
-        assert_eq!(
-            headers
-                .lines()
-                .filter(|line| line.to_ascii_lowercase().starts_with("anthropic-beta:"))
-                .count(),
-            1
-        );
-        assert!(
-            headers
-                .lines()
-                .any(|line| { line.eq_ignore_ascii_case("anthropic-beta: context-1m-2025-08-07") })
-        );
-        assert!(
-            headers
-                .lines()
-                .any(|line| line.eq_ignore_ascii_case("originator: codex_exec"))
-        );
-    }
-
-    #[test]
-    fn anthropic_beta_values_merge_without_duplicates() {
-        let configured = vec!["context-1m-2025-08-07".to_string()];
-        assert_eq!(
-            merge_anthropic_beta_values(
-                &configured,
-                Some("interleaved-thinking-2025-05-14,context-1m-2025-08-07"),
-            ),
-            vec![
-                "context-1m-2025-08-07".to_string(),
-                "interleaved-thinking-2025-05-14".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn anthropic_stream_state_accumulates_text_thinking_and_tools() {
-        let mut state = AnthropicStreamState::default();
-        let events = [
-            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":3}}}),
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
-            json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-1","name":"read_file","input":{}}}),
-            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/main.rs\"}"}}),
-            json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
-            json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"hello"}}),
-            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
-            json!({"type":"message_stop"}),
-        ];
-
-        let mut reasoning_deltas = Vec::new();
-        let mut text = String::new();
-        for event in &events {
-            let (emitted, delta) = state
-                .handle_event(event, "item")
-                .expect("anthropic event parses");
-            text.push_str(&delta);
-            for emitted_event in emitted {
-                if let AgentEvent::ReasoningDelta { delta, .. } = emitted_event {
-                    reasoning_deltas.push(delta);
-                }
-            }
-        }
-
-        assert_eq!(text, "hello");
-        assert_eq!(reasoning_deltas, ["think"]);
-        assert_eq!(state.reasoning_content().as_deref(), Some("think"));
-        let wire = serde_json::from_str::<Value>(
-            state.reasoning_wire().as_deref().expect("reasoning wire"),
-        )
-        .expect("reasoning wire is valid JSON");
-        assert_eq!(
-            wire,
-            json!([{
-                "type": "thinking",
-                "thinking": "think",
-                "signature": "sig",
-            }])
-        );
-        let calls = state.tool_calls().expect("tool call is complete");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].call_id, "call-1");
-        assert_eq!(calls[0].arguments_json, r#"{"path":"src/main.rs"}"#);
-        let usage = state.provider_usage(100_000).expect("provider usage");
-        assert_eq!(usage.input_tokens, 10);
-        assert_eq!(usage.output_tokens, 4);
-        assert_eq!(usage.cached_tokens, 3);
-        state.validate_completion(false).expect("completion valid");
-    }
-
-    fn prepared_build_agent() -> Agent<OpenAIConfig> {
-        let client = Client::with_config(
-            OpenAIConfig::new()
-                .with_api_base("https://api.openai.com/v1")
-                .with_api_key("test"),
-        );
-        let mut agent = Agent::new(client, "group-16", 4, 4);
-        agent.prelude = vec![PromptMessage::system("GROUP-16 stable prelude")];
-        agent.set_model_catalog(HashMap::from([(
-            "group-16".into(),
-            crate::request_builder::ModelRequestMetadata {
-                context_window: Some(2_048),
-                effective_input_limit_tokens: Some(1_280),
-                max_output_tokens: Some(512),
-                supports_tools: true,
-                prompt_cache: crate::config::PromptCacheConfig {
-                    enabled: true,
-                    retention: Some(crate::config::PromptCacheRetention::InMemory),
-                    namespace: Some("group-16".into()),
-                },
-                ..Default::default()
-            },
-        )]));
-        agent
-            .replace_history(vec![
-                HistoryItem::user(format!("GROUP-16-DROPPED-SENTINEL {}", "old ".repeat(800))),
-                HistoryItem::assistant("GROUP-16 old response"),
-                HistoryItem::user("GROUP-16 volatile runtime material"),
-            ])
-            .expect("legal test history");
-        agent
-    }
-
-    #[test]
-    fn valid_top_level_response_metadata_extension_is_ignored() {
-        let event = json!({
-            "type": "response.metadata",
-            "response_id": "resp_123",
-            "sequence_number": 7,
-            "metadata": { "provider": "test" },
-        });
-
-        assert!(
-            project_response_stream_event(&event)
-                .expect("valid provider extension")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn malformed_top_level_response_metadata_extension_fails_closed() {
-        for event in [
-            json!({ "type": "response.metadata", "sequence_number": 7, "metadata": {} }),
-            json!({ "type": "response.metadata", "response_id": 7, "sequence_number": 7, "metadata": {} }),
-            json!({ "type": "response.metadata", "response_id": "resp_123", "sequence_number": 7.5, "metadata": {} }),
-            json!({ "type": "response.metadata", "response_id": "resp_123", "sequence_number": -1, "metadata": {} }),
-            json!({ "type": "response.metadata", "response_id": "resp_123", "sequence_number": 7, "metadata": [] }),
-        ] {
-            assert!(project_response_stream_event(&event).is_err(), "{event}");
-        }
-    }
-
-    #[test]
-    fn unknown_response_stream_event_remains_a_strict_error() {
-        let event = json!({ "type": "response.provider_extension", "value": true });
-        assert!(project_response_stream_event(&event).is_err());
-    }
-
-    #[test]
-    fn projection_removes_only_nested_reasoning_and_retains_nested_metadata() {
-        let event = json!({
-            "type": "response.created",
-            "response": {
-                "reasoning": { "opaque": true },
-                "metadata": { "request": "preserve" },
-            },
-        });
-
-        let projected = project_response_stream_event_value(&event)
-            .expect("nested projection")
-            .expect("normal event is not ignored");
-        assert!(projected["response"].get("reasoning").is_none());
-        assert_eq!(
-            projected["response"]["metadata"],
-            json!({ "request": "preserve" })
-        );
-    }
-
-    fn response_completed_event_with_usage(usage: Value) -> Value {
-        json!({
-            "type": "response.completed",
-            "response": { "usage": usage },
-        })
-    }
-
-    fn assert_completed_usage_deserializes(event: &Value) {
-        let response = json!({
-            "id": "resp_test",
-            "object": "response",
-            "created_at": 1,
-            "model": "test-model",
-            "output": [],
-            "status": "completed",
-            "usage": event["response"]["usage"],
-        });
-        let event = json!({
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": response,
-        });
-        assert!(
-            project_response_stream_event(&event).is_ok(),
-            "completed usage should deserialize: {event}"
-        );
-    }
-
-    #[test]
-    fn projection_adds_missing_output_token_details_to_completed_response() {
-        let event = response_completed_event_with_usage(json!({
-            "input_tokens": 5,
-            "input_tokens_details": { "cached_tokens": 2 },
-            "output_tokens": 3,
-            "total_tokens": 8,
-        }));
-
-        let projected = project_response_stream_event_value(&event)
-            .expect("completed projection")
-            .expect("completed event is not ignored");
-        let usage = &projected["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 5);
-        assert_eq!(usage["output_tokens"], 3);
-        assert_eq!(usage["total_tokens"], 8);
-        assert_eq!(
-            usage["output_tokens_details"],
-            json!({ "reasoning_tokens": 0 })
-        );
-        assert_completed_usage_deserializes(&projected);
-    }
-
-    #[test]
-    fn projection_adds_missing_input_token_details_to_completed_response() {
-        let event = response_completed_event_with_usage(json!({
-            "input_tokens": 5,
-            "output_tokens": 3,
-            "output_tokens_details": { "reasoning_tokens": 1 },
-            "total_tokens": 8,
-        }));
-
-        let projected = project_response_stream_event_value(&event)
-            .expect("completed projection")
-            .expect("completed event is not ignored");
-        let usage = &projected["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 5);
-        assert_eq!(usage["output_tokens"], 3);
-        assert_eq!(usage["total_tokens"], 8);
-        assert_eq!(usage["input_tokens_details"], json!({ "cached_tokens": 0 }));
-        assert_completed_usage_deserializes(&projected);
-    }
-
-    #[test]
-    fn projection_adds_both_missing_token_details_to_completed_response() {
-        let event = response_completed_event_with_usage(json!({
-            "input_tokens": 5,
-            "output_tokens": 3,
-            "total_tokens": 8,
-        }));
-
-        let projected = project_response_stream_event_value(&event)
-            .expect("completed projection")
-            .expect("completed event is not ignored");
-        let usage = &projected["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 5);
-        assert_eq!(usage["output_tokens"], 3);
-        assert_eq!(usage["total_tokens"], 8);
-        assert_eq!(usage["input_tokens_details"], json!({ "cached_tokens": 0 }));
-        assert_eq!(
-            usage["output_tokens_details"],
-            json!({ "reasoning_tokens": 0 })
-        );
-        assert_completed_usage_deserializes(&projected);
-    }
-
-    #[test]
-    fn projection_preserves_complete_response_usage() {
-        let event = response_completed_event_with_usage(json!({
-            "input_tokens": 5,
-            "input_tokens_details": { "cached_tokens": 2 },
-            "output_tokens": 3,
-            "output_tokens_details": { "reasoning_tokens": 1 },
-            "total_tokens": 8,
-        }));
-
-        let projected = project_response_stream_event_value(&event)
-            .expect("completed projection")
-            .expect("completed event is not ignored");
-        assert_eq!(projected, event);
-        assert_completed_usage_deserializes(&projected);
-    }
-
-    #[test]
-    fn projection_preserves_function_call_when_output_token_details_are_missing() {
-        let raw = json!({
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_test",
-                "object": "response",
-                "created_at": 1,
-                "model": "test-model",
-                "output": [{
-                    "type": "function_call",
-                    "id": "fc_test",
-                    "call_id": "call_test",
-                    "name": "test_function",
-                    "arguments": "{\"value\":1}",
-                    "status": "completed",
-                }],
-                "status": "completed",
-                "usage": {
-                    "input_tokens": 5,
-                    "input_tokens_details": { "cached_tokens": 0 },
-                    "output_tokens": 3,
-                    "total_tokens": 8,
-                },
-            },
-        });
-
-        let Some(ResponseStreamEvent::ResponseCompleted(event)) =
-            project_response_stream_event(&raw).expect("completed event should project")
-        else {
-            panic!("expected completed event")
-        };
-        let [async_openai::types::responses::OutputItem::FunctionCall(call)] =
-            event.response.output.as_slice()
-        else {
-            panic!("expected function call output")
-        };
-        assert_eq!(call.call_id, "call_test");
-        assert_eq!(call.name, "test_function");
-        assert_eq!(call.arguments, "{\"value\":1}");
-    }
-
-    fn response_output_item_added_function_call(item: Value) -> Value {
-        json!({
-            "type": "response.output_item.added",
-            "sequence_number": 1,
-            "output_index": 0,
-            "item": item,
-        })
-    }
-
-    #[test]
-    fn output_item_added_function_call_descriptor_deserializes_strictly() {
-        let complete = response_output_item_added_function_call(json!({
-            "type": "function_call",
-            "id": "fc_test",
-            "call_id": "call_test",
-            "name": "test_function",
-            "arguments": "{}",
-            "status": "in_progress",
-        }));
-        let Some(ResponseStreamEvent::ResponseOutputItemAdded(event)) =
-            project_response_stream_event(&complete)
-                .expect("complete descriptor should deserialize")
-        else {
-            panic!("expected output_item.added event")
-        };
-        let async_openai::types::responses::OutputItem::FunctionCall(call) = event.item else {
-            panic!("expected function_call output item")
-        };
-        assert_eq!(call.call_id, "call_test");
-        assert_eq!(call.name, "test_function");
-
-        for incomplete in ["call_id", "name"] {
-            let mut item = json!({
-                "type": "function_call",
-                "id": "fc_test",
-                "call_id": "call_test",
-                "name": "test_function",
-                "arguments": "{}",
-                "status": "in_progress",
-            });
-            item.as_object_mut()
-                .expect("function_call item is an object")
-                .remove(incomplete);
-            let event = response_output_item_added_function_call(item);
-            assert!(
-                project_response_stream_event(&event).is_err(),
-                "missing {incomplete} must fail strict deserialization"
-            );
-        }
-    }
-
-    struct Group16Tool;
-
-    #[async_trait::async_trait]
-    impl crate::tool::ToolHandler for Group16Tool {
-        fn name(&self) -> &'static str {
-            "group_16_tool"
-        }
-
-        fn description(&self) -> &'static str {
-            "Deterministic GROUP-16 tool"
-        }
-
-        fn parameters(&self) -> Value {
-            json!({"type": "object", "properties": {}})
-        }
-
-        async fn execute(&self, _args: Value) -> Result<Value> {
-            Ok(json!({"status": "complete"}))
-        }
-    }
-
-    fn prepared_group_16_agent() -> Agent<OpenAIConfig> {
-        let mut agent = prepared_build_agent();
-        agent.tools = crate::tool::ToolRegistry::new();
-        agent.register_tool(Group16Tool);
-        agent
-    }
 }

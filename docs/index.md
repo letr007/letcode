@@ -15,12 +15,16 @@ flowchart TD
     TUI["TUI"]
     CLI["Line CLI"]
     Request["Request Building"]
-    Provider["Model Provider"]
+    Runtime["ModelRuntime"]
+    Binding["ProtocolBinding"]
+    Transport["Transport"]
+    PromptPlan["PromptPlan"]
     Tools["Tools / MCP"]
     Subagents["Subagent Pool"]
 
     Main --> Config
     Config --> Agent
+    Config --> Runtime
     Config --> Skills
     Skills --> Agent
     Main --> Transcript
@@ -30,8 +34,12 @@ flowchart TD
     Session --> CLI
     Session --> Agent
     Agent --> Request
-    Request --> Provider
-    Provider --> Agent
+    Request --> PromptPlan
+    PromptPlan --> Runtime
+    Runtime --> Binding
+    Binding --> Transport
+    Transport --> Binding
+    Binding --> Agent
     Agent --> Tools
     Agent --> Subagents
     Tools --> Agent
@@ -43,13 +51,14 @@ flowchart TD
 
 1. 解析运行模式、版本、更新和配置检查命令；
 2. 加载 `letcode.toml` 和日志配置；
-3. 根据当前 Provider 和 Model 创建 Agent；
-4. 加载全局与工作区指令；
-5. 配置模型协议、上下文压缩、重试、权限和工具并发；
-6. 加载 Skill Registry 并注册 Skill 工具；
-7. 创建 Transcript，写入 Session 启动记录；
-8. 启动 Session Engine；
-9. 将 Session Engine 交给 TUI、交互式 CLI 或单次 CLI。
+3. 校验 provider/model 配置，创建不可变 `ProtocolRegistry`、`ResolvedRuntimeCatalog` 和当前 `ResolvedModelRoute`；
+4. 创建 Agent 并安装当前 resolved route；
+5. 加载全局与工作区指令；
+6. 配置上下文压缩、重试、权限和工具并发；
+7. 加载 Skill Registry 并注册 Skill 工具；
+8. 创建 Transcript，写入 Session 启动记录；
+9. 启动 Session Engine；
+10. 将 Session Engine 交给 TUI、交互式 CLI 或单次 CLI。
 
 ## 组件
 
@@ -59,11 +68,11 @@ Session Engine 的启动和通道、Session Command、Agent turn 执行、前端
 
 ### [Agent](components/agent.md)
 
-Agent 的运行状态、turn 循环、模型流处理、工具调用、自动继续、上下文压缩和完成过程。
+Agent 的运行状态、resolved route authority、统一 turn orchestration、工具调用、自动继续、上下文压缩和完成过程。
 
 ### [Request Building](components/request-building.md)
 
-模型请求的 Prompt 规划、历史预算、运行时投影、工具描述、Prompt Cache 和 Provider 协议序列化。
+模型请求的 Prompt 规划、历史预算、运行时投影和工具描述；Prompt Cache、wire 编码与增量解码由模型运行时的协议绑定负责。
 
 ### [Transcript](components/transcript.md)
 
@@ -86,7 +95,10 @@ sequenceDiagram
     participant Runner as AgentRunner
     participant Agent as Agent
     participant Request as Request Builder
-    participant Provider as Model Provider
+    participant Plan as PromptPlan
+    participant Runtime as ModelRuntime
+    participant Binding as ProtocolBinding
+    participant Transport as Transport
     participant Tool as Tool Runtime
     participant Transcript as Transcript
 
@@ -95,8 +107,13 @@ sequenceDiagram
     Runner->>Transcript: 写入用户消息
     Runner->>Agent: 启动 turn
     Agent->>Request: 构造模型请求
-    Request->>Provider: 发送协议请求
-    Provider-->>Agent: 文本、reasoning 或 tool call
+    Request->>Plan: 生成协议无关 PromptPlan
+    Agent->>Runtime: 提供 resolved route
+    Plan->>Runtime: 投影 ModelRequestInput
+    Runtime->>Binding: 准备协议请求
+    Binding->>Transport: 发送增量 HTTP 请求
+    Transport-->>Binding: 响应字节
+    Binding-->>Agent: 文本、reasoning 或 tool call
 
     opt 工具调用
         Agent->>Tool: 执行工具
@@ -118,7 +135,8 @@ sequenceDiagram
 | 配置 | `src/config.rs`、`src/config/` |
 | Session | `src/session/engine.rs`、`src/session/runner.rs` |
 | Agent | `src/agent.rs`、`src/agent/protocol_stream.rs` |
-| 模型请求 | `src/request_builder.rs`、`src/request_builder/provider_serialization.rs` |
+| 模型运行时 | `src/model_runtime/`（`ModelRuntime`、`ProtocolBinding`、`ResolvedProviderTransport` / `ProviderTransport`） |
+| 模型请求 | `src/request_builder.rs`、`src/request_builder/prompt_plan.rs` |
 | Transcript | `src/transcript.rs`、`src/transcript/recorder.rs` |
 | 工具 | `src/tool.rs`、`src/tool/registry.rs` |
 | 子代理 | `src/subagent.rs`、`src/subagent/pool.rs` |

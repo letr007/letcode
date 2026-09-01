@@ -345,16 +345,16 @@ impl LlmRequestTelemetry {
             prompt_composition: build.prompt_plan.composition(budget.estimated_tools_tokens),
             prompt_stable_prefix_hash: build.prompt_plan.stable_prefix_hash().map(str::to_owned),
             cache_first_volatile_index: plan.first_volatile_index,
-            cache_configured: cache.configured,
-            cache_hint_serialized: cache.hint_serialized,
-            cache_retention_sent: cache.retention_sent,
+            cache_configured: false,
+            cache_hint_serialized: false,
+            cache_retention_sent: None,
             cache_stable_prefix_segments: cache.stable_prefix_segments,
             cache_stable_prompt_tokens: cache.stable_prompt_tokens,
             cache_volatile_prompt_tokens: cache.volatile_prompt_tokens,
             cacheable_prefix_tokens: cache.cacheable_prefix_tokens,
             cache_stable_after_boundary_tokens: cache.stable_after_boundary_tokens,
-            local_prefix_fingerprint: cache.local_prefix_fingerprint,
-            routing_key: cache.routing_key,
+            local_prefix_fingerprint: None,
+            routing_key: None,
             tool_call_count_before,
             tool_definitions_count,
             adjacent_lcp_units: observation
@@ -468,16 +468,19 @@ impl LlmRequestErrorClass {
 impl CacheUsageReport {
     pub(crate) fn from_build(build: &crate::request_builder::BuildResult) -> Self {
         Self {
-            configured: build.cache.configured,
-            hint_serialized: build.cache.hint_serialized,
-            retention_sent: build.cache.retention_sent,
-            stable_prefix_segments: build.cache.local_prefix_segments,
+            configured: false,
+            hint_serialized: false,
+            retention_sent: None,
+            stable_prefix_segments: build
+                .prompt_plan
+                .stable_prefix_end
+                .map_or(0, |index| index + 1),
             stable_prompt_tokens: build.budget.plan_stable_prompt_tokens,
             volatile_prompt_tokens: build.budget.plan_volatile_prompt_tokens,
             cacheable_prefix_tokens: build.budget.plan_cacheable_prefix_tokens,
             stable_after_boundary_tokens: build.budget.plan_stable_after_boundary_tokens,
-            local_prefix_fingerprint: build.cache.local_prefix_fingerprint.clone(),
-            routing_key: build.cache.routing_key.clone(),
+            local_prefix_fingerprint: None,
+            routing_key: None,
             actual_cached_tokens: None,
         }
     }

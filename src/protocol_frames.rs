@@ -13,7 +13,6 @@ pub(crate) enum ProtocolFrameKind {
     User,
     InternalContinuation,
     Assistant,
-    AssistantToolCalls,
     Tool,
 }
 
@@ -36,17 +35,13 @@ pub enum ProtocolItem {
     InternalContinuation {
         text: String,
     },
-    AssistantText {
-        text: String,
-    },
-    AssistantToolCalls {
+    AssistantTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
-        /// Provider-native reasoning state needed for exact replay (e.g. signed
-        /// Anthropic thinking blocks), stored as JSON. Never rendered as ordinary text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_wire: Option<String>,
+        replay: Option<crate::model_runtime::OpaqueReplayState>,
         calls: Vec<ProtocolToolCall>,
     },
     ToolOutput {
@@ -77,7 +72,12 @@ impl ProtocolItem {
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self::AssistantText { text: text.into() }
+        Self::AssistantTurn {
+            text: Some(text.into()),
+            reasoning_content: None,
+            replay: None,
+            calls: Vec::new(),
+        }
     }
 }
 
@@ -115,14 +115,13 @@ impl ProtocolFrame {
     }
 
     pub(crate) fn kind(&self) -> ProtocolFrameKind {
-        match self.item {
+        match &self.item {
             ProtocolFrameItem::ContextSummary { .. } => ProtocolFrameKind::ContextSummary,
             ProtocolFrameItem::UserMessage { .. } => ProtocolFrameKind::User,
             ProtocolFrameItem::InternalContinuation { .. } => {
                 ProtocolFrameKind::InternalContinuation
             }
-            ProtocolFrameItem::AssistantText { .. } => ProtocolFrameKind::Assistant,
-            ProtocolFrameItem::AssistantToolCalls { .. } => ProtocolFrameKind::AssistantToolCalls,
+            ProtocolFrameItem::AssistantTurn { .. } => ProtocolFrameKind::Assistant,
             ProtocolFrameItem::ToolOutput { .. } => ProtocolFrameKind::Tool,
         }
     }
@@ -138,20 +137,20 @@ impl ProtocolFrame {
             ProtocolFrameItem::InternalContinuation { text } => {
                 format!("internal_continuation:{}:{}", self.history_index, text)
             }
-            ProtocolFrameItem::AssistantText { text } => {
-                format!("assistant:{}:{}", self.history_index, text)
-            }
-            ProtocolFrameItem::AssistantToolCalls {
+            ProtocolFrameItem::AssistantTurn {
                 text,
                 reasoning_content,
-                reasoning_wire,
+                replay,
                 calls,
             } => format!(
-                "assistant_tool_calls:{}:{}:{}:{}:{}",
+                "assistant_turn:{}:{}:{}:{}:{}",
                 self.history_index,
                 text.clone().unwrap_or_default(),
                 reasoning_content.clone().unwrap_or_default(),
-                reasoning_wire.clone().unwrap_or_default(),
+                replay
+                    .as_ref()
+                    .and_then(|state| serde_json::to_string(state).ok())
+                    .unwrap_or_default(),
                 calls
                     .iter()
                     .map(|call| format!("{}:{}:{}", call.call_id, call.name, call.arguments_json))
@@ -182,7 +181,6 @@ impl ProtocolFrame {
             ProtocolFrameKind::User => "user",
             ProtocolFrameKind::InternalContinuation => "internal_continuation",
             ProtocolFrameKind::Assistant => "assistant",
-            ProtocolFrameKind::AssistantToolCalls => "assistant_tool_calls",
             ProtocolFrameKind::Tool => "tool",
         }
     }
@@ -414,7 +412,7 @@ impl ProtocolAppendState {
         }
 
         match item {
-            ProtocolFrameItem::AssistantToolCalls { calls, .. } => {
+            ProtocolFrameItem::AssistantTurn { calls, .. } if !calls.is_empty() => {
                 ensure_unique_call_ids(history_index, calls)?;
             }
             ProtocolFrameItem::ToolOutput { call_id, .. } => {
@@ -438,7 +436,7 @@ impl ProtocolAppendState {
         }
 
         match item {
-            ProtocolFrameItem::AssistantToolCalls { calls, .. } => {
+            ProtocolFrameItem::AssistantTurn { calls, .. } if !calls.is_empty() => {
                 if let Some(group) = self.tail_open_group.take() {
                     self.historical_incomplete_groups.push(group);
                 }
@@ -629,7 +627,7 @@ pub(crate) fn analyze_history_items(
 
     for frame in &frames {
         match &frame.item {
-            ProtocolFrameItem::AssistantToolCalls { text: _, calls, .. } => {
+            ProtocolFrameItem::AssistantTurn { calls, .. } if !calls.is_empty() => {
                 if let Some(group) = pending_group.take() {
                     tool_call_groups.push(group.finish_incomplete());
                 }
@@ -817,14 +815,10 @@ impl ProtocolItem {
                 out.push(0x02);
                 field!(0x01, text);
             }
-            ProtocolItem::AssistantText { text } => {
-                out.push(0x03);
-                field!(0x01, text);
-            }
-            ProtocolItem::AssistantToolCalls {
+            ProtocolItem::AssistantTurn {
                 text,
                 reasoning_content,
-                reasoning_wire,
+                replay,
                 calls,
             } => {
                 out.push(0x04);
@@ -836,8 +830,15 @@ impl ProtocolItem {
                     Some(text) => field!(0x02, text),
                     None => out.push(0x00),
                 }
-                match reasoning_wire {
-                    Some(json) => field!(0x17, json),
+                match replay {
+                    Some(replay) => {
+                        field!(0x17, &replay.namespace);
+                        out.extend_from_slice(&replay.version.to_le_bytes());
+                        let producer = serde_json::to_string(&replay.producer).unwrap_or_default();
+                        field!(0x18, &producer);
+                        let payload = replay.payload.to_string();
+                        field!(0x19, &payload);
+                    }
                     None => out.push(0x00),
                 }
                 out.push(0x0f);
@@ -965,10 +966,10 @@ mod tests {
     fn canonical_boundary_predicate_rejects_splits_inside_tool_groups() {
         let history = vec![
             HistoryItem::user("request"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("call-1")],
             },
             HistoryItem::ToolOutput {
@@ -990,10 +991,10 @@ mod tests {
     fn compaction_boundary_keeps_a_complete_tool_call_batch_atomic() {
         let history = vec![
             HistoryItem::user("question"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("call-1"), tool_call("call-2")],
             },
             HistoryItem::ToolOutput {
@@ -1022,10 +1023,10 @@ mod tests {
         let cases = [
             vec![
                 HistoryItem::user("question"),
-                HistoryItem::AssistantToolCalls {
+                HistoryItem::AssistantTurn {
                     text: None,
                     reasoning_content: None,
-                    reasoning_wire: None,
+                    replay: None,
                     calls: vec![tool_call("case-1")],
                 },
                 HistoryItem::ToolOutput {
@@ -1036,10 +1037,10 @@ mod tests {
             ],
             vec![
                 HistoryItem::assistant("before"),
-                HistoryItem::AssistantToolCalls {
+                HistoryItem::AssistantTurn {
                     text: Some("tail".into()),
                     reasoning_content: Some("reasoning".into()),
-                    reasoning_wire: None,
+                    replay: None,
                     calls: vec![tool_call("case-2")],
                 },
                 HistoryItem::ToolOutput {
@@ -1077,10 +1078,13 @@ mod tests {
             history.push(HistoryItem::assistant(format!("answer-{index}")));
         }
         history.extend([
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: Some("working".into()),
                 reasoning_content: Some("reasoning".into()),
-                reasoning_wire: Some(r#"{"signature":"wire"}"#.into()),
+                replay:
+                    crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
+                        r#"{"signature":"wire"}"#,
+                    ),
                 calls: vec![tool_call("call-1"), tool_call("call-2")],
             },
             HistoryItem::ToolOutput {
@@ -1127,17 +1131,17 @@ mod tests {
     #[test]
     fn incremental_append_rejects_non_tail_incomplete_groups_and_accepts_matching_outputs() {
         let history = vec![
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("historical-call")],
             },
             HistoryItem::assistant("legacy continuation"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: Some("tail working".into()),
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("tail-call")],
             },
         ];
@@ -1236,10 +1240,10 @@ mod tests {
     fn analysis_marks_incomplete_group_as_protected() {
         let history = vec![
             HistoryItem::user("question"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: Some("working".into()),
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("call-1")],
             },
         ];
@@ -1259,10 +1263,10 @@ mod tests {
     fn validation_rejects_dangling_assistant_tool_calls() {
         let history = vec![
             HistoryItem::user("question"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("call-1")],
             },
         ];

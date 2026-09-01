@@ -129,10 +129,10 @@ mod tests {
             HistoryItem::user("old"),
             HistoryItem::assistant("old answer"),
             HistoryItem::user("current"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {
@@ -176,10 +176,10 @@ mod tests {
     fn plan_turn_cut_retires_completed_prefix_inside_long_current_turn() {
         let history = vec![
             HistoryItem::user("current"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {
@@ -215,10 +215,10 @@ mod tests {
     fn plan_turn_cut_stops_before_incomplete_tool_group() {
         let history = vec![
             HistoryItem::user("old"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("pending", "lookup")],
             },
             HistoryItem::assistant("recent tail"),
@@ -250,10 +250,10 @@ mod tests {
             HistoryItem::user("old-a"),
             HistoryItem::assistant("old-b"),
             HistoryItem::user("current"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {
@@ -274,10 +274,10 @@ mod tests {
     fn split_turn_compaction_retires_user_and_does_not_insert_continuation() {
         let history = vec![
             HistoryItem::user("current"),
-            HistoryItem::AssistantToolCalls {
+            HistoryItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![tool_call("c1", "fs__read")],
             },
             HistoryItem::ToolOutput {

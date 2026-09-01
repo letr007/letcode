@@ -6,8 +6,8 @@ use super::*;
 
 static NEXT_AGENT_EVIDENCE_ID: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn remember_tool_evidence<C: Config>(
-    agent: &mut Agent<C>,
+pub(super) fn remember_tool_evidence(
+    agent: &mut Agent,
     record: &ToolExecutionRecord,
 ) -> Result<EvidenceRecord> {
     let mut draft = EvidenceDraft::from_tool_execution_record(record);
@@ -21,7 +21,7 @@ pub(super) fn remember_tool_evidence<C: Config>(
     Ok(record)
 }
 
-pub(super) fn next_evidence_sequence<C: Config>(agent: &Agent<C>) -> u64 {
+pub(super) fn next_evidence_sequence(agent: &Agent) -> u64 {
     agent
         .runtime_snapshot
         .evidence

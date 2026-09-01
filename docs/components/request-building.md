@@ -1,171 +1,108 @@
 # 请求构建
 
-请求构建将单次模型调用的运行时状态转换为 provider request。`PromptPlanner` 完成运行时投影、历史与 evidence 选择和预算计算，生成 `PromptPlan`；随后对 plan 进行规范化、provider 序列化和缓存计算。
+请求构建负责把运行时上下文整理为 provider-neutral 的 prompt 计划和模型请求输入。它不承担 provider wire JSON 的序列化职责；协议格式化、请求体构造、请求检查和流解码由已解析路由上的 `ProtocolBinding` 负责。
 
-## 整体流程
+## 当前请求链路
 
 ```mermaid
-flowchart TD
-    A[RuntimeSnapshot 与模型元数据] --> B[Provider 可见的运行时投影]
-    H[Protocol frame 与 prelude] --> C[PromptPlanner]
-    B --> C
-    E[Evidence 记录] --> C
-    T[工具定义] --> C
-    C --> D[历史预算与证据选择]
-    D --> P[PromptPlan segment]
-    P --> N[规范化 kernel 与 volatile 区域]
-    N --> S[Provider 序列化]
-    N --> K[Prompt 缓存标识与报告]
-    S --> R[Responses、Anthropic 或 Chat Completions 请求]
+flowchart LR
+    A[RuntimeSnapshot + prelude + tools + model metadata]
+      --> B[PromptPlanner]
+    B --> C[PromptPlan]
+    C --> D[canonicalize_prompt_plan]
+    D --> E[model_request_from_prompt_plan]
+    E --> F[ModelRequestInput]
+    F --> G[ResolvedModelRoute.binding]
+    G --> H[ProtocolBinding]
+    H --> I[PreparedHttpRequest]
+    I --> J[transport send]
+    H --> K[PreparedRequestInspection]
+    K --> L[logical request observation]
+    L --> M[request telemetry / adjacent-request comparison]
 ```
 
-`build_request_with_policy`（`src/request_builder.rs:789-844`）创建 `PromptPlannerInput`，调用 `PromptPlanner::plan`，规范化返回的 plan，然后调用 `build_request_from_selected_prompt`。最后阶段校验 plan 使用的协议、刷新 plan 的 token 字段、序列化选定的协议，并生成缓存报告（`src/request_builder.rs:905-1045`）。
+`build_request_with_policy`（`src/request_builder.rs`）创建 `PromptPlannerInput`，调用 `PromptPlanner::plan`，对结果执行 canonicalization，再返回包含 `PromptPlan` 和 `BudgetReport` 的 `BuildResult`。随后正常 turn 的 `TurnDriver` 将 plan 投影为 `ModelRequestInput`，由当前 `ResolvedModelRoute` 的 binding 准备最终 HTTP 请求。
 
-## 运行时投影
+请求阶段的职责边界如下：
 
-`RuntimeSnapshot` 是面向 provider 的协议历史来源。`RuntimeSnapshot::active_protocol_frames` 选择包含 protocol item 的 active runtime frame，附加 runtime frame identity 和 provenance，并分配连续的 history index（`src/runtime_context.rs:538-557`）。
+- `request_builder`：运行时可见性投影、历史和 evidence 选择、预算、prompt segment 排序、稳定前缀元数据和逻辑观察所需的语义来源；
+- `model_runtime::projection`：把 `PromptPlan` 转换为 `ModelRequestInput`，保留 segment/message origin、工具定义、生成设置和 `CacheIntent`；
+- `ProtocolBinding`：按 route 的 protocol、profile、capability 和 protocol settings，将 `ModelRequestInput` 转换为 `PreparedHttpRequest`，并创建对应的 stream decoder；
+- `ModelRuntime`：发送 prepared request，消费 decoder 产生的 `ModelEvent`，处理响应终止状态、物理重试和 one-shot 执行；
+- Agent：把 binding-owned inspection 转换为不包含 prompt bytes 的逻辑 request observation，并记录 request telemetry。
 
-请求构建在 `src/request_builder/runtime_projection.rs:19-64` 中应用 provider 可见性边界：
+`PreparedHttpRequest` 包含 HTTP method、URL、协议 headers、body 和 prompt unit origins。`PreparedRequestInspection` 包含 request shape、prompt unit identity/semantic segment IDs 以及 binding 计算的 cache inspection。request builder 只消费 inspection 提供的语义单位，不解析 protocol body。
 
-- 只有 `FrameVisibility::Active` frame 可以进入 provider history；
-- `snapshot.compaction.compacted_frame_ids` 中的 frame 会被排除；
-- source span 与 `snapshot.compaction.retired_source_spans` 重叠的 frame 会被排除；
-- 剩余 protocol item 被转换为 `ProtocolFrame`，保留稳定的 runtime ID 和 provenance，并重新分配 history index。
+## 运行时可见性与 PromptPlan
 
-Request planner 仅从 runtime snapshot 中 provider-visible 的 protocol frame 获取 prompt material。ContextView 和 context tree 仍供 TUI 展示与工具寻址使用，但不会合成 prelude 或 history frame 注入 provider request。
+`RuntimeSnapshot` 是 provider-visible prompt material 的来源。`runtime_projection` 只选择 active、未被 compaction 排除且不与 retired source span 重叠的 runtime frame，并将其中的 protocol item 转换为 `ProtocolFrame`。ContextView 和 context tree 仍用于展示、导航和工具寻址；它们不会直接拼接成 provider request。
 
-protected boundary 根据 runtime frame ID 计算：`protected_start_index_for_snapshot` 查找第一个 ID 位于 `snapshot.compaction.protected_frame_ids` 中的 provider-visible frame；如果没有匹配项，边界就是 frame 列表末尾（`src/request_builder/runtime_projection.rs:37-49`）。
+`protected_start_index_for_snapshot` 依据 protected frame ID 在 provider-visible frame 中计算受保护边界。若没有匹配的 protected frame，边界位于 frame 列表末尾。
 
-## 提示计划
+`PromptPlan` 是 provider-neutral 的 prompt segment 列表。segment 记录 role、contributor、provenance、stability、retention、protection、token estimate、text 以及 typed content。typed content 覆盖普通文本、structured user content、assistant tool calls 和 tool output；它不是某个 provider 的 wire message。
 
-`PromptPlan` 是与 provider 无关的 prompt segment 规范列表。每个 `PromptSegment` 包含 role、contributor、provenance、stability、retention、protection flag、token estimate、text 和 typed content（`src/request_builder/prompt_plan.rs:35-166`）。plan 还记录 stable-prefix boundary 以及内部的 kernel/envelope boundary。
+`PromptPlannerInput` 包含 model metadata、model ID、prelude、runtime snapshot、工具定义、可选 frozen evidence 和 protected-context policy。planner 会：
 
-`PromptPlannerInput` 包含 protocol、model metadata、model ID、prelude、不可变的 runtime snapshot、工具定义、可选的 frozen evidence 和 protected-context policy（`src/request_builder/prompt_plan.rs:174-183`）。`build_request_with_frozen_and_policy` 在 `src/request_builder.rs:805-831` 中构造该输入。`PromptPlanner::plan` 从 snapshot 选择 provider 可见的 protocol frame，计算保护边界、历史预算和 evidence，然后构造内部的 `PromptPlanBuildInput`。后者包含已选择的 frame、segment order offset、protected suffix length、evidence message 和 selected evidence ID（`src/request_builder/prompt_plan.rs:311-323,636-646`）。
+1. 从 snapshot 取得 provider-visible protocol frames；
+2. 计算 protected boundary、历史保留范围和 evidence 预算；
+3. 保持完整的 tool-call/tool-output batch；
+4. 组装 required prelude、runtime material、protected suffix、evidence 和 typed history segments；
+5. 生成稳定的 contributor/segment identity 和 token report。
 
-`build_prompt_plan` 在规范化之前按以下顺序组装 segment（`src/request_builder/prompt_plan.rs:659-855`）：
+canonicalization 将 stable kernel、envelope、evidence、durable context、history 和 current-turn group 排成确定顺序，并重新计算 cache metadata。连续 stable segment 前缀是 cache-eligible prefix；`PromptPlan::stable_prefix_hash` 和 token report 只描述 plan 层面的稳定性。
 
-1. 按 role 和 origin 对 prelude message 分类，并作为 required segment 加入。
-2. 将 snapshot 中 active 的 prompt-payload contributor 作为 stable system/developer material 加入；如果 contributor 的 source frame ID 已由选定 frame 表示，则不重复加入。
-3. 根据 `protected_suffix_len` 计算 protected suffix；该 suffix 中的选定 frame 获得 `current_turn` protection。
-4. 如果存在 user frame，则将 evidence segment 插入最后一个 user frame 之前；否则追加到末尾。
-5. 将选定的 protocol frame 分类为 typed segment。Assistant tool-call 和 tool-output frame 会标记为 protocol boundary，并保留其 typed content。
-6. builder 根据 contributor metadata、provenance、order、source key、role、kind 和 text 生成确定性的 contributor ID 与 segment ID（`src/request_builder/prompt_plan.rs:988-1082`）。
+## 预算与历史保留
 
-仅处理 suffix 的路径 `build_prompt_plan_suffix` 不插入 runtime material，并保留调用方提供的 segment order offset（`src/request_builder/prompt_plan.rs:663-685`）。
+输入预算由 model metadata、output reserve、effective input limit 和工具定义计算。模型不支持 tools 时，工具 token 不计入预算。protected context 单独超出输入预算时直接返回错误，不静默丢弃受保护内容。
 
-### 规范化顺序与稳定性
+历史保留以 retention unit 为边界。assistant tool call 与对应 tool output 作为一个原子 batch；如果 protected boundary 落在 batch 内，会扩展到 batch 起点。evidence 使用独立预算，并将本次选择的 message 与 selected IDs 固定到当前逻辑 turn。
 
-`canonicalize_prompt_plan` 将构建出的 segment 分为 kernel、envelope、evidence、durable context、history 和 current-turn group（`src/request_builder/prompt_plan.rs:899-971`）。稳定的 system/developer/skill material 构成 kernel；prelude envelope material 和前置 evidence 紧随其后；durable context、history 和 current turn 位于 stable kernel 之后。Protocol tool-call 和 tool-output content 保持为 protocol content，不会仅根据 contributor kind 重新分类。
+`BuildResult.budget` 同时记录 planner 估算和 canonical plan token report，包括 total、stable、volatile、cacheable-prefix 以及 boundary 后的 stable tokens。最终请求 admission 使用这些字段判断 prompt 与 tools 是否超出选择的 input budget。
 
-第一个连续的 stable segment 区间是 cacheable prefix。第一个 volatile segment 之前的所有 segment 都标记为 cache-eligible。边界位置的 segment 获得 `StablePrefixEnd`；如果后面存在 segment，则下一个 segment 获得 `VolatileRegionStart` 和相同的 prefix hash（`src/request_builder/prompt_plan.rs:525-555`）。`cacheable_prefix_len` 表示该连续前缀（`src/request_builder/prompt_plan.rs:564-569`）。
+## ModelRequestInput 与 ProtocolBinding
 
-`token_report` 统计 total、stable、volatile 和 cacheable-prefix token，并报告位于 cacheable boundary 之后的 stable token（`src/request_builder/prompt_plan.rs:571-594`）。provider 序列化之前，`build_request_from_selected_prompt` 将这些值写入 `BudgetReport`（`src/request_builder.rs:908-924`）。
+`model_request_from_prompt_plan`（`src/model_runtime/projection.rs`）把 plan segment 映射为语义输入：
 
-## 历史预算
+- system/developer 文本进入 control segments；
+- user、assistant、tool 内容进入 typed `ModelMessage`；
+- assistant reasoning、tool calls 和 tool results 保留为 typed content；
+- `ToolSpec` 转换为 `ToolDefinition`；
+- model metadata 和 resolved route 生成 `GenerationSettings`；
+- plan 的 stable prefix 与模型的 prompt-cache 配置生成 `CacheIntent`。
 
-输入预算根据 model metadata 和 tool definition 计算。`context_window_tokens` 在模型 context window 为正数时使用该值，否则使用 8,192，最小值为 1,024。`output_reserve_tokens` 在配置的 output limit 为正数时使用该值，否则使用 1,024，最小值为 128（`src/request_builder.rs:121-138`）。
+`ModelRequestInput` 还保存 `segment_origins` 和 `message_origins`，使 protocol binding 能把最终请求单位关联回 prompt plan。binding 是 route-bound 的 immutable protocol implementation；它不保存某次请求的 semantic input，也不把 provider fields 暴露给 request builder。
 
-`effective_input_budget_tokens_for_tool_tokens` 计算：
+`ProtocolBinding` 提供：
 
-$$
-B_{input} = \max\left(1,\min(B_{context}-B_{output}-256,\ B_{effective\_limit})-B_{tools}\right)
-$$
+- `prepare_request(&ModelRequestInput) -> PreparedHttpRequest`；
+- `inspect_prepared_request(&PreparedHttpRequest, stable_request) -> PreparedRequestInspection`；
+- `new_decoder() -> ModelStreamDecoder`；
+- 基于 binding identity 的 replay compatibility 判断。
 
-只有 model metadata 提供 effective limit 时才应用该上限（`src/request_builder.rs:769-781`）。只有模型支持 tools 时才计入 tool token（`src/request_builder.rs:745-751`）。
+内置 binding 覆盖 Responses、Completions 和 Anthropic。每个 adapter 自己负责 protocol-specific request shape、headers、cache marker/key、reasoning 字段和终止/流事件解码；公共 runtime 只处理 provider-neutral contract。
 
-`history_budget::retain_history` 接收 prelude、protocol frame、protected boundary、protected token estimate、model、tools、evidence budget 和 required fallback token（`src/request_builder/history_budget.rs:54-63`），随后执行以下步骤：
+## Cache inspection 与 telemetry
 
-- 将 history 分为 older frame 和 protected suffix；
-- 预留 prelude、protected context、evidence 和 required fallback token；
-- 从最新的 retention unit 开始向更早内容遍历，直到加入下一个 unit 会超出预算；
-- 原样保留 protected suffix；
-- 报告保留和丢弃的 item 数量以及 estimated request token。
+cache metadata 在 `PromptPlan` 层描述 stable prefix，在 `ModelRequestInput.cache` 中表达为 `CacheIntent`，最终由 `ProtocolBinding` 决定如何落到 wire request。binding 的 `PreparedRequestCacheInspection` 报告是否发送 cache hint、retention、local prefix fingerprint 和 routing key。
 
-Retention unit 以原子方式保留 tool-call batch。`retention_units` 通过 protocol validation 将 assistant tool-call frame 与其全部 output 关联，因此完整 batch 要么整体保留，要么整体省略（`src/request_builder/history_budget.rs:142-164`）。如果 protected boundary 落在 tool-call group 内，`expand_protected_start_to_group` 会将边界扩展到该 group 起始处的 assistant call（`src/request_builder/history_budget.rs:166-187`）。
+正常 turn 在 prepared request 完成后调用 binding inspection。`observe_prepared_model_request` 根据 inspection 的 prompt units 和 plan segment IDs 生成 process-local `LogicalRequestObservation`：它包含 request-shape digest、semantic category、token estimate、byte count 和 digest，不携带 prompt bytes，也不会序列化到 transcript。
 
-Evidence 使用独立预算：context window 的 15%，范围限制为 512–3,000 token（`src/request_builder/history_budget.rs:209-214`）。`evidence_context_message` 根据 current query 对非 stale evidence 排序；除 diagnostic/validation record 外，它避免重复使用同一 source，并在达到 character budget 后停止（`src/evidence.rs:301-370`）。生成的 message 和 selected ID 会传入 prompt plan。
+Agent 将 observation 与 logical request ID、turn/iteration/attempt、model、protocol、工具数量和 budget 组合为 `LlmRequestTelemetry`。物理重试复用同一 logical request anchor；只有发生新的迭代、请求投影或 route 变化时才建立新的逻辑请求上下文。
 
-如果固定的 protected material 单独就超出 input budget，`ensure_protected_context_within_budget` 返回错误，不会静默丢弃 protected material（`src/request_builder/history_budget.rs:10-24`）。
+## One-shot 请求
 
-## Provider 序列化
+compaction 和其它窄用途 helper 使用 `build_oneshot_text_request` 构造只有受保护 user input 的最小 `PromptPlan`，关闭 reasoning、tools、parallel tool calls 和 Fast Mode。随后仍沿用同一条 `PromptPlan -> ModelRequestInput -> ProtocolBinding -> ModelRuntime` 链路。
 
-`ApiProtocol` 提供三种 request shape：`Responses`、`Completions` 和 `Anthropic`（`src/config.rs:14-31`）。request builder 在 canonical plan 完成后选择 request shape（`src/request_builder.rs:926-1025`）。`ProviderRequestStrategy` 另外区分普通 OpenAI-compatible 路径和 `DeepSeekV4` compatibility handling（`src/request_builder.rs:52-72`）。
-
-### Responses API 映射
-
-`build_responses_request` 通过 `prompt_segment_to_response_inputs` 转换每个 plan segment，将 system text 收集到顶层 `instructions`，将 developer text 转换为 developer input message，并加入 model output setting、reasoning、tools、parallel-tool-call support、streaming 和 cache field（`src/request_builder/provider_serialization.rs:36-95`）。
-
-| Prompt 内容 | Responses 表示 |
-| --- | --- |
-| System | `instructions`，不作为 `input` item 输出 |
-| Developer text | Developer input message |
-| User text/content | User input message，可包含 structured user content |
-| Assistant text | Assistant input message |
-| Assistant tool calls | `DeepSeekV4` 可选 reasoning item、可选 assistant text，以及 function-call item |
-| Tool output | Function-call output，可包含 text 或 text-plus-image content |
-
-该映射实现于 `src/request_builder/provider_serialization.rs:379-466`。当 cache configuration 和 stable prefix 都满足条件时，Responses request 使用 `prompt_cache_key` 和可选的 `prompt_cache_retention`（`src/request_builder/provider_serialization.rs:60-93`）。
-
-### Anthropic Messages 映射
-
-`build_anthropic_request` 将 system 和 developer text 收集到顶层 `system` array，并将其余 segment 输出为原生 Messages content（`src/request_builder/provider_serialization.rs:98-267`）。User content 转换为 user block；assistant tool call 转换为 assistant text/thinking/tool-use block；tool output 转换为 user `tool_result` block。如果条件允许，连续的 tool result 会合并到同一个 user message（`src/request_builder/provider_serialization.rs:116-215`）。
-
-Anthropic 专用配置在 message 构建后加入：
-
-- `apply_anthropic_thinking` 根据配置选择 disabled、adaptive 或 fixed-budget thinking（`src/request_builder/provider_serialization.rs:269-287`）；
-- 支持的 tool 使用 `name`、`description` 和 `input_schema`（`src/request_builder/provider_serialization.rs:227-240`）；
-- 启用 `cache_control` 时，ephemeral cache marker 会放置在最后一个 system block、最后一个 tool definition，以及与 stable-prefix boundary 对应的 message block 上（`src/request_builder/provider_serialization.rs:242-263`）。
-
-### Chat Completions 映射
-
-`build_completions_request` 将 plan segment 映射为 Chat Completions message，并序列化 tool、streaming usage、output limit、reasoning effort、verbosity 和 cache key（`src/request_builder/provider_serialization.rs:676-739`）。message 映射实现在 `src/request_builder/provider_serialization.rs:478-555`：
-
-- system 和 developer text 转换为 system/developer prelude message；
-- user text 和 structured user content 转换为 user message；
-- assistant tool call 转换为包含 function tool call 的 assistant message；
-- tool output 转换为带有 `tool_call_id` 的 tool message。
-
-Chat Completions 不支持 tool output 中的 image content，会返回错误并要求使用 Responses provider route（`src/request_builder/provider_serialization.rs:683-692`）。
-
-需要时，最终 request 会先转换为 JSON，再写入 compatibility field（`src/request_builder.rs:981-1023`）。`apply_chat_reasoning_content` 将 reasoning content 附加到 assistant tool-call message（`src/request_builder/provider_serialization.rs:584-600`）。`DeepSeekV4` 还会执行以下兼容处理：
-
-- 将 developer role 映射为 system role；
-- 将 `max_completion_tokens` 重命名为 `max_tokens`；
-- 移除不支持的 `verbosity`、`prompt_cache_key` 和 `service_tier` field；
-- 输出 DeepSeek `thinking` 和规范化的 reasoning setting；
-- 保留 assistant reasoning content（`src/request_builder/provider_serialization.rs:624-674`）。
-
-## 提示缓存
-
-提示缓存会在 canonicalization 之后、最终 request 构建期间计算。如果缓存被禁用，或 plan 没有 stable prefix，则不返回 cache key 和 retention（`src/request_builder/prompt_cache.rs:8-42`）。
-
-对于符合条件的 plan，routing key 根据以下内容构成的 canonical input 计算：
-
-- cache namespace；
-- shape version（`2`）；
-- protocol 和 model ID；
-- 模型支持 tools 时的 provider-serialized tool definition；
-- provider input shape，包括 parallel-tool-call behavior。
-
-Canonical input 使用与最终 request 相同的 provider conversion helper：Responses 使用 `instructions` 和 response input item；Anthropic 使用 role/text/content value；Completions 使用 Chat message（`src/request_builder/prompt_cache.rs:116-193`）。Routing key 的格式为 `lc-pc-v2-` 加 routing identity 的 SHA-256 digest 前 32 个字符（`src/request_builder/prompt_cache.rs:195-210`）。
-
-Local prefix fingerprint 包含 canonical serialized stable prefix，格式为 `ppf-v2-<sha256>`（`src/request_builder/prompt_cache.rs:67-90`）。它与 `PromptPlan::stable_prefix_hash` 不同：后者在 stable-prefix boundary 处对 plan 的 stable segment ID 和 text 进行 hash（`src/request_builder/prompt_plan.rs:537-551`）。
-
-面向 provider 的缓存行为按协议不同：
-
-- Responses 接收 `prompt_cache_key`，并在配置时接收 `prompt_cache_retention`；
-- Chat Completions 在普通 compatible request 中接收 `prompt_cache_key`；`DeepSeekV4` compatibility 会移除该 field，因为其 compatibility shape 不使用它（`src/request_builder/provider_serialization.rs:698-737`、`src/request_builder/provider_serialization.rs:639-650`）；
-- Anthropic 在原生 system、tools 和 message structure 中使用 `cache_control` marker，不使用 OpenAI cache-key field（`src/request_builder/provider_serialization.rs:242-263`）。
-
-最终的 `PromptCacheReport` 记录 cache 是否配置、是否序列化了 local stable prefix、prefix fingerprint、routing key 以及协议相关的 retention（`src/request_builder/prompt_cache.rs:45-92`）。
+`preflight_resolved_oneshot_text_request` 只做构建和 binding prepare 校验；`stream_resolved_oneshot_text_async` 由 `ModelRuntime::execute_text_oneshot` 执行，并要求 completed text terminal、无 tool calls。one-shot 使用调用方提供的 resolved route，并沿用该 route 的 binding、transport 和 decoder。
 
 ## 源码索引
 
-- `src/request_builder.rs:769-1045` — input budget、planner 调用、canonicalization、最终 request dispatch 以及 budget/cache report。
-- `src/request_builder/prompt_plan.rs:35-335, 525-1125` — planner input、历史和 evidence 选择、prompt-plan data model、segment 构建、canonical 顺序、stability 和 token report。
-- `src/request_builder/history_budget.rs:10-214` — protected-context 检查、history retention、atomic tool-call unit 和 evidence budget。
-- `src/request_builder/runtime_projection.rs:6-64` — provider-visible runtime projection 和 protected boundary。
-- `src/request_builder/provider_serialization.rs:48-739` — Responses、Anthropic 和 Chat Completions serialization。
-- `src/request_builder/prompt_cache.rs:8-225` — canonical cache input、routing identity、fingerprint 和 cache report。
-- `src/evidence.rs:301-370` — evidence selection 和 compact evidence message 构建。
-- `src/config.rs:14-31` — 支持的 API protocol。
+- `src/request_builder.rs` — planner 入口、预算、`BuildResult`、logical request observation。
+- `src/request_builder/prompt_plan.rs` — `PromptPlan`、segment、canonicalization、cache metadata 和 token report。
+- `src/request_builder/history_budget.rs` — protected context、history retention、tool-call batch 和 evidence budget。
+- `src/request_builder/runtime_projection.rs` — provider-visible runtime frame projection。
+- `src/model_runtime/projection.rs` — `PromptPlan` 到 `ModelRequestInput` 的投影。
+- `src/model_runtime/mod.rs` — `ProtocolAdapter`、`ProtocolBinding`、`ModelRequestInput`、`PreparedHttpRequest` 和 inspection types。
+- `src/model_runtime/adapters.rs` — 内置 protocol adapter、binding、wire preparation 和 decoder。
+- `src/model_runtime/runtime.rs` — `ModelRuntime`、physical retry、event accumulation 和 one-shot execution。
+- `src/agent/protocol_stream.rs` — normal turn 的 request preparation、inspection、telemetry 和 driver glue。

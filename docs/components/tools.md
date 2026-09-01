@@ -1,78 +1,68 @@
 # Tools
 
-Tools 将模型工具调用分派到本地 handler、子代理和 MCP 服务。每个 `ToolHandler` 提供名称、描述、参数 JSON Schema、strict 标志、权限类别、并发属性和异步执行入口。调用结果统一为 `ToolResult`，包含成功标志、工具名、可选数据、图片和错误信息。
+Tools 将模型工具调用分派到本地 handler、subagent pool 和 MCP 服务。每个 `ToolHandler` 提供名称、描述、参数 schema、strict 标志、权限类别、并发属性和异步执行入口；调用统一返回 `ToolResult`。
 
-## 注册、目录与契约
+## 工具目录
 
-内置工具包括：
+当前内置目录包括：
 
 - 基础与交互：`util__echo`、`question`；
-- 工作流与辅助：`workflow__todos`、`workflow__auto_continue`、`memory__recall`、`config__validate`；
-- 子代理：`agent__explore`、`agent__fixer`；
+- workflow 与辅助：`workflow__todos`、`workflow__auto_continue`、`memory__recall`、`config__validate`；
+- subagent experts：`agent__explore`、`agent__fixer`、`agent__oracle`、`agent__designer`、`agent__librarian`、`agent__general`；
+- subagent jobs：`agent__jobs`、`agent__status`、`agent__wait`、`agent__cancel`；
 - 文件与代码：`fs__list`、`fs__read`、`fs__write`、`fs__append`、`fs__mkdir`、`edit__apply_patch`、`code__ast_search`、`code__ast_replace_preview`；
 - 命令与仓库：`shell__exec`、`search__rg`、`git__status`、`git__diff`、`git__log`；
 - 网络：`web__fetch`。
 
-`ToolRegistry` 按名称保存 handler。`register` 注册 handler，`try_register` 还会拒绝受保护名称、重复名称和不满足并行 override 的 handler，`remove` 按名称移除工具。`context__checkpoint` 和 `context__return` 不能由动态工具注册。
+六个 expert delegation tool 的用途是：explorer 只读探索、fixer 限定范围修复、oracle 根因/风险判断、designer 设计梳理、librarian 资料和证据整理、general 只读通用辅助。reviewer 是独立的 permission review 专家，不是 delegation tool；job control tools 也不创建新的 expert。
 
-`spec()` 将 handler 的名称、描述、参数和 strict 标志转换为模型目录中的 `ToolSpec`。strict 工具在 debug 构建中检查 schema 的 `properties` 是否都列在 `required` 中；handler 仍执行运行时参数校验。工具目录按 scope 和可执行性筛选；调用时继续检查 scope 和权限。
+`ToolRegistry` 按名称注册 handler。`register`、`try_register` 和 `remove` 维护目录；受保护的 context checkpoint/return 名称不能由动态工具注册。`spec()` 将 handler 转换为模型可见 `ToolSpec`，scope、可执行性和当前 runtime 能力会进一步筛选目录。
 
-权限类别为 `Read`、`Preview`、`Write`、`Command` 和 `Unknown`。handler 可以显式覆盖类别；否则按工具名分类。并发属性为 `Parallel` 或 `Exclusive`，handler 默认是 exclusive，只有明确声明支持重叠调用时才是 parallel。registry 可以把工具收紧为 exclusive，但不能把未声明 parallel 的 handler 配置为 parallel。并发批处理和结果协调由 Agent 执行层处理，单次 registry 调用不会自动并行执行所有工具。
+## Scope、权限与并发
 
-工具 scope 包括 `FullAccess` 和 `ReadOnlyExplorer`。scope 同时影响目录生成和调用执行：调用时先检查 scope，再查找 handler；不允许的调用返回 scope 错误，未找到的 handler 返回 unknown 错误。
+scope 包括 `FullAccess` 和 `ReadOnlyExplorer`。scope 同时影响目录和执行：调用时先检查 scope，再查找 handler；未授权返回 scope error，未知名称返回 unknown error。
 
-## 调用与结果
+权限类别为 `Read`、`Preview`、`Write`、`Command` 和 `Unknown`。默认 handler 为 exclusive；只有显式声明支持重叠调用的 handler 才能成为 parallel。Agent 负责并行 batch 的 permission preflight、执行和结果 reconcile，registry 单次调用不会自动并行所有工具。
 
-模型调用进入 `execute_tool_call`。执行层解析工具别名并建立 trace span；JSON 参数无法解析时记录为 `Rejected` 并发送完成事件。有效参数依次经过可执行性、scope、执行 directive、写入目标预解析、外部 workspace 访问和权限决策，然后调用 registry 中的 handler。
+permission decision 综合工具、参数、permission class、execution directive、permission mode、外部 workspace access 和 internal-tool 标记，产生 Allow/Ask/Deny。`AllowAlways` 只有在 session grant 条件和 generation 仍有效时才写入 permission session。
 
-权限允许后，Agent 为 handler 创建 `ToolExecutionContext`，其中包含外部 workspace 授权、问题回调和预先绑定的写入或 patch 目标。registry 的 streaming 调用再次检查 scope，查找 handler，调用 `execute_streaming`，并将 handler 错误转换为 `ToolResult::err`。工具输出可通过 `Stdout` 和 `Stderr` 增量发送。
+subagent tools 额外受 normalized task、path scope、owned-path lock、expert policy、background capability 和 takeover route gate 约束。`agent__wait`、`agent__status`、`agent__jobs`、`agent__cancel` 只操作已存在的 Pool run，不会隐式创建 child。
 
-`ToolResult::ok` 返回 `ok: true` 和数据；handler 或 registry 错误返回 `ok: false` 与 `ToolError`。Agent 的执行记录区分 `Executed`、`Rejected` 和 `TimedOut`，并保留 invalid JSON、directive blocked、scope denied、delegation scope denied、permission policy denied 和 user denied 等拒绝原因。调用过程会发送 started、output delta、cancelled 和 finished 事件，并产生工具执行摘要。
+## 本地文件与 patch
 
-## 权限与工作区授权
+`fs__*` 处理 workspace 文件和目录，执行路径 canonicalization、大小/行数/图像限制和 scope checks。`fs__write`/`fs__append` 在执行前绑定 writable target；`edit__apply_patch` 预解析 patch targets。授权后，执行阶段重新检查路径、父目录和 file identity，目标变化则拒绝。
 
-`PermissionSessionState::approval_snapshot` 根据工具、参数、权限类别、执行 directive、权限 mode、外部 workspace 访问和内部工具标记计算 `Allow`、`Ask` 或 `Deny`。需要询问时，执行层通过 callback 或自动审查取得 `Deny`、`AllowOnce` 或 `AllowAlways`；只有在权限 mode 支持 session grant、资源存在且 permission generation 未变化时，`AllowAlways` 才会写入 grant。
+`code__ast_search` 和 `code__ast_replace_preview` 使用 AST-aware backend；preview 只返回 diff，不写文件，实际修改必须经过显式 patch 工具。`search__rg` 负责文本搜索。`config__validate` 只解析并校验指定 letcode 配置，不应用配置变更。
 
-`fs__write` 和 `fs__append` 会预先绑定可写目标，`edit__apply_patch` 会预先解析 patch 目标。授权后，执行阶段重新检查路径、父目录和文件身份；目标发生变化时拒绝继续。
+## Shell、timeout 与取消
 
-外部 workspace 路径会形成 `ExternalWorkspaceAccess`，在 default/auto 等 mode 下可能将原本允许的决定提升为 `Ask`。letcode 自身 fold artifact 目录的读取有单独的 trusted artifact 判断，仅适用于对应 artifact 路径。
+`shell__exec` 在 workspace root 启动进程，分别捕获 stdout/stderr，默认 timeout 为 300 秒，调用方可缩短但不能超过系统上限。超时会终止并等待子进程，结果标记失败并保留 timeout 信息；streaming path 同样清理子进程并收集剩余输出。
 
-## 超时、取消与进程清理
+普通工具按工具名使用 non-shell timeout。执行层通过 `tokio::select!` 处理 future、增量输出和 timeout；timeout 会发出 `ToolCallCancelled` 并返回超时结果。handler 没有统一 cancellation token，future 停止后的底层资源清理由具体 handler 决定。
 
-普通工具调用可按工具名应用 `non_shell_tool_timeout_secs`。执行层用 `tokio::select!` 同时处理工具结果、增量输出和 timeout；超时后发送 `ToolCallCancelled`，排空已产生的输出，返回超时错误，并将记录标为 `TimedOut`。`ToolHandler` 没有统一的 cancellation token；future 停止后的资源清理取决于具体 handler 和底层资源。
-
-`shell__exec` 默认超时为 300 秒，也可通过 `timeout_secs` 指定，但不能超过 `MAX_COMMAND_TIMEOUT_SECS`。命令在 workspace 根目录启动，stdout 和 stderr 分别捕获；超时会终止并等待子进程，结果包含 `command timed out after Ns`。streaming 路径实时发送 stdout/stderr，超时后终止子进程并收集剩余输出，结果中的 `success` 为 false。
-
-本地 MCP 会话为 JSON-RPC 写入、刷新和读取设置 server timeout；关闭时先关闭 stdin，等待进程退出，必要时优雅终止、强制终止或交给 reaper。远程 MCP 使用带 timeout 的 HTTP client，通过 HTTP/JSON 或 SSE 解析。远端服务已经开始的操作是否停止，不由客户端超时单方面保证。
-
-`workflow__auto_continue` 只校验 `enabled` 为 boolean 并返回参数；自动继续、显式中断、shutdown、permission 请求和 question 请求由上层流程处理。
-
-## 专用工具后端
-
-- `fs__*` 处理工作区文件和目录读写，并应用行数、字节数、图像大小和路径限制；
-- `search__rg` 处理文本搜索；
-- `git__status`、`git__diff` 和 `git__log` 在 workspace 根目录执行固定 git 子命令；
-- `edit__apply_patch` 处理精确文本替换，并在授权和 worker 阶段绑定 patch 目标；
-- `code__ast_search` 和 `code__ast_replace_preview` 使用 AST-aware 后端；preview 不写文件，实际写入通过显式 patch 工具完成；
-- `web__fetch` 接受公开 URL，设置请求和总超时，限制重定向、内容类型和响应大小；较大的响应会折叠为预览及本地 artifact；
-- `workflow__todos` 校验最多 100 项、字段长度、唯一 ID 和状态值；
-- `question` 通过 `ToolExecutionContext.question_handler` 连接交互运行时，没有交互 runtime 时返回错误；
-- `memory__recall` 调用 memory 域查询；`config__validate` 调用配置解析和校验实现，并声明为 read/parallel。
-
-`shell__exec` 的描述要求在专用工具适用时优先使用专用工具，并为循环、监听器和长任务设置退出或超时边界。
+`workflow__auto_continue` 只验证 enabled 参数；自动继续、显式 interrupt、shutdown、permission 和 question 的状态推进由 Agent/SessionEngine 处理。MCP client timeout 不保证远端 server 已经开始的操作被停止。
 
 ## MCP
 
-MCP server 配置包含 enabled 状态、`timeout_ms` 和 transport。发现阶段对启用 server 调用 `tools/list`：本地 transport 使用 stdio 子进程，remote transport 使用 HTTP；多个 server 的发现可并发执行，结果按配置顺序返回。禁用 server 不会被连接；单个 server 失败记录为 Offline，不影响其他 server 的发现结果。
+MCP discovery 对 enabled server 调用 `tools/list`：stdio server 使用子进程，remote server 使用 HTTP。多个 server 可并发 discovery，并按配置顺序汇总；单个 server offline 不阻塞其它 server。
 
-发现结果包含 MCP 工具名称、描述和 `inputSchema`。包装为 `McpTool` 时，工具名规范化为 `<server>__<tool>`，非 ASCII 字母、数字或下划线的字符压缩为下划线，空名称组件会被拒绝。描述带有 `[MCP <server>]` 前缀，缺失描述时生成默认描述。
+MCP tool 名称规范化为 `<server>__<tool>`，schema 作为 parameters，调用前建立/复用 transport session，发送 initialize、initialized notification 和 tools/call。MCP handler 在 letcode 中默认属于 Read/Exclusive，仍经过 Agent 的 scope、directive、permission、timeout、event 和 result 链路。
 
-`McpTool` 将发现到的 schema 作为 parameters，执行时按 transport 建立会话，发送 `initialize`、`notifications/initialized` 和 `tools/call`。本地调用通过 JSON-RPC stdio 与 MCP server 通信；远程调用通过 HTTP 请求并维护 MCP session header。
+## 事件与结果
 
-MCP handler 在 letcode 中的权限类别为 `Read`，并发属性为 `Exclusive`，strict 为 false。MCP server 实际执行的操作、鉴权要求和资源生命周期由 server 与 transport 决定。
+一次工具调用会产生 started、output delta、cancelled 和 finished 事件，并记录 `Executed`、`Rejected` 或 `TimedOut`。拒绝原因包括 invalid JSON、directive blocked、scope denied、delegation scope denied、permission policy denied 和 user denied。
 
-MCP 和本地工具共享 Agent 的目录、scope、directive、权限决策、审批、事件和结果记录链路。MCP 工具没有当前文件目标的 prepared resource，但仍会经过可执行性、scope、directive 和 permission decision 检查。
+`ToolResult::ok` 返回 `ok: true` 与可选 data；handler/registry failure 返回 `ok: false` 与 `ToolError`。工具 execution summary 会保留 tool identity、effects、status、拒绝原因和必要的 primary path/command，供 Agent、Session、Transcript、TUI 和 audit 使用。
 
-## 错误与事件
+subagent delegation 的前台结果带 `active: false`，后台启动结果带 `status: running`、`active: true` 和 `background: true`；jobs/status/wait/cancel 使用各自的 run/job data structures，不把 job 状态伪装成普通 tool output。
 
-调用失败通常表现为 `ToolResult { ok: false, error: ... }`；registry 将 handler 返回的错误转换为 recoverable tool error。Agent 的执行记录区分 `Executed`、`Rejected` 和 `TimedOut`，并保留拒绝原因。调用过程发送工具输出增量、取消和完成事件，供 Transcript、TUI 和 audit 使用。
+## 源码索引
+
+- `src/tool/registry.rs` — handler registration、scope、spec 和 streaming call。
+- `src/tool/delegation.rs` — expert delegation schema、normalization 和 path scope。
+- `src/tool/fs.rs`、`src/tool/apply_patch.rs` — filesystem/patch handlers。
+- `src/tool/command.rs` — shell execution、streaming、timeout 和 process cleanup。
+- `src/tool/workflow.rs`、`src/tool/memory.rs`、`src/tool/config_validate.rs` — workflow/auxiliary handlers。
+- `src/tool/code_analysis.rs`、`src/tool/search.rs` — AST/text analysis tools。
+- `src/tool/git.rs`、`src/tool/web_fetch.rs`、`src/tool/question.rs` — repository/network/interaction tools。
+- `src/subagent/pool.rs`、`src/session/subagent_delegate.rs` — expert jobs and control tool behavior。

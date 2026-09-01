@@ -367,7 +367,7 @@ fn normalize_incomplete_tool_call_groups(
     for (index, entry) in history.drain(..).enumerate() {
         if !incomplete_indexes.contains(&index) {
             normalized.push(entry);
-        } else if let HistoryItem::AssistantToolCalls {
+        } else if let HistoryItem::AssistantTurn {
             text: Some(text), ..
         } = entry.item
         {
@@ -403,19 +403,21 @@ fn normalize_incomplete_tool_call_groups(
 fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>, sequence: u64) {
     let Some(last_conversation_item) = history.iter().rfind(|item| {
         matches!(
-            item.item,
+            &item.item,
             HistoryItem::UserMessage { .. }
                 | HistoryItem::InternalContinuation { .. }
-                | HistoryItem::AssistantText { .. }
                 | HistoryItem::ContextSummary { .. }
-        )
+        ) || matches!(&item.item, HistoryItem::AssistantTurn { calls, .. } if calls.is_empty())
     }) else {
         return;
     };
 
     if matches!(
-        last_conversation_item.item,
+        &last_conversation_item.item,
         HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
+    ) || matches!(
+        &last_conversation_item.item,
+        HistoryItem::AssistantTurn { calls, .. } if !calls.is_empty()
     ) {
         history.push(HistoryProjectionEntry {
             item: HistoryItem::assistant(String::new()),
@@ -445,12 +447,13 @@ fn append_history_projection_entry_from_transcript_record(
         // Legacy transcripts have one start record per call. Consecutive starts
         // are one assistant response until a result is appended.
         if matches!(record.event, TranscriptEvent::ToolCallStarted { .. })
-            && let HistoryItem::AssistantToolCalls { calls, .. } = &item
+            && let HistoryItem::AssistantTurn { calls, .. } = &item
             && let Some(previous) = history.last_mut()
-            && let HistoryItem::AssistantToolCalls {
+            && let HistoryItem::AssistantTurn {
                 calls: previous_calls,
                 ..
             } = &mut previous.item
+            && !previous_calls.is_empty()
         {
             previous_calls.extend(calls.clone());
             previous
@@ -473,13 +476,12 @@ fn tool_call_is_declared_by_incomplete_group(
     history: &[HistoryProjectionEntry],
     call_id: &str,
 ) -> bool {
-    let Some(assistant_index) = history
-        .iter()
-        .rposition(|entry| matches!(entry.item, HistoryItem::AssistantToolCalls { .. }))
-    else {
+    let Some(assistant_index) = history.iter().rposition(
+        |entry| matches!(&entry.item, HistoryItem::AssistantTurn { calls, .. } if !calls.is_empty()),
+    ) else {
         return false;
     };
-    let HistoryItem::AssistantToolCalls { calls, .. } = &history[assistant_index].item else {
+    let HistoryItem::AssistantTurn { calls, .. } = &history[assistant_index].item else {
         return false;
     };
     if !calls.iter().any(|call| call.call_id == call_id) {
@@ -493,6 +495,7 @@ fn tool_call_is_declared_by_incomplete_group(
 fn source_spans_for_history_record(record: &TranscriptRecord) -> Vec<SourceSpan> {
     match &record.event {
         TranscriptEvent::UserMessage { .. }
+        | TranscriptEvent::AssistantTurn(_)
         | TranscriptEvent::AssistantMessage { .. }
         | TranscriptEvent::AssistantToolCallBatch { .. }
         | TranscriptEvent::InternalContinuation { .. }

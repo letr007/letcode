@@ -142,45 +142,79 @@ mode = "default" # solo 是 yolo 的兼容别名
 
 # 必需：至少配置一个 provider，且其中至少配置一个 model。
 [providers.openai]
-# 可选；也可使用 OPENAI_API_KEY 环境变量。
-api_key = "YOUR_API_KEY"
-# OpenAI provider 可省略，默认 https://api.openai.com/v1。
-base_url = "https://api.openai.com/v1"
-# OpenAI provider 可省略，默认 responses；其他 provider 必须配置。
-protocol = "responses" # responses | completions
-# 可选；省略时使用该 provider 下最先出现的 model。
+protocol = "responses" # responses | completions | anthropic
+flavor = "standard" # standard | deepseek
+# 当前必需；必须引用该 provider 下已配置的 model。
 default_model = "gpt-5.5"
+
+[providers.openai.auth]
+type = "bearer" # bearer | header | query | none
+credential_env = "OPENAI_API_KEY"
+# credential = "YOUR_API_KEY" # 适合直接配置凭据时使用
+
+[providers.openai.endpoints]
+base_url = "https://api.openai.com/v1"
+[providers.openai.endpoints.responses]
+path = "responses"
 
 # 必需：每个 provider 至少配置一个 model；model 内字段均可省略。
 [providers.openai.models."gpt-5.5"]
-display_name = "GPT-5.5"
-# protocol = "completions" # 可覆盖 provider 协议
+display = "GPT-5.5"
+# protocol = "completions" # 可覆盖 provider protocol
+# flavor = "standard" # 可覆盖 provider flavor；deepseek 表示显式选择 DeepSeek profile
 # context_window = 400000
 # effective_input_limit_tokens = 256000
-# max_output_tokens = 128000
-supports_tools = true # 默认 true
-parallel_tool_calls = true # 默认 true
-supports_reasoning = true # 默认 true
+
+# 能力标志省略时默认均为 false。
+[providers.openai.models."gpt-5.5".capabilities]
+tools = true
+parallel_tool_calls = true
+reasoning = true
+input_images = false
+tool_result_images = false
+prompt_cache = false
+priority_service = false
+[providers.openai.models."gpt-5.5".capabilities.generation]
+temperature = true
+top_p = true
+max_output_tokens = true
+reasoning = true
+reasoning_summary = true
+text_verbosity = true
+parallel_tool_calls = true
+
+[providers.openai.models."gpt-5.5".generation]
+temperature = 0.2
+top_p = 1.0
+max_output_tokens = 128000
 reasoning_effort = "medium"
 # 可选；限制可选推理等级及 TUI 循环顺序。
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto" # auto | concise | detailed
 text_verbosity = "medium" # low | medium | high
-# temperature = 0.2
-# top_p = 1.0
+parallel_tool_calls = true
 
-# 可选；模型级 prompt cache。
-# [providers.openai.models."gpt-5.5".prompt_cache]
-# enabled = true
-# retention = "in_memory" # in_memory | 24h
+[providers.openai.models."gpt-5.5".cache]
+enabled = false
+# retention = "in_memory" # in_memory | 24h；启用 cache 时设置
 # namespace = "openai"
+
+# 协议专属设置由选定的 protocol binding 按自身 schema 校验。
+# Anthropic 路由可配置，例如：
+# anthropic_thinking = { mode = "adaptive" }
+# anthropic_betas = ["context-1m-2025-08-07"]
+[providers.openai.models."gpt-5.5".protocol_settings]
 ```
 
-Provider API key 和 base URL 也可以来自按 provider 名称生成的环境变量，例如 `OPENAI_API_KEY` / `OPENAI_BASE_URL`；若 provider 名为 `compat`，对应为 `COMPAT_API_KEY` / `COMPAT_BASE_URL`。
+Provider 凭据可使用 `credential_env`，或使用按 provider 名称生成的默认环境变量，例如 `OPENAI_API_KEY`；endpoint URL 和协议专属路径配置在 `endpoints` 下。
 
 相对路径形式的 `sessions_dir` 和 `log_file` 会按配置文件所在目录解析。
 
 可选的 Langfuse/OpenTelemetry tracing 默认关闭。可用 `LETCODE_LANGFUSE_ENABLED=true`，并配置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 与可选的 `LANGFUSE_HOST`（或写在本地 `.env`）启用。缺少凭据时 tracing 保持关闭，不影响 Agent 运行。
+
+## 模型运行架构
+
+配置通过不可变的 `ProtocolRegistry` 和 `ResolvedRuntimeCatalog` 解析为 `ResolvedModelRoute`。每次请求都表示为与协议无关的 `PromptPlan`。绑定到路由的 `ProtocolBinding` 负责 wire 编码、缓存行为和增量响应解码，所有 binding 共享增量式 `reqwest` transport 与 `ModelRuntime`。
 
 ## 更新日志
 

@@ -1,15 +1,16 @@
 use anyhow::{Result, anyhow, bail};
-use async_openai::config::OpenAIConfig;
 use std::collections::HashMap;
 
 use crate::agent::{Agent, AgentFactory, AgentTemplate, PrimaryRouteFactory, SubagentChildFactory};
 use crate::config::{ModelRoute, ProviderConfig, RetryConfig};
+use crate::model_runtime::ResolvedRuntimeCatalog;
 
 #[derive(Clone)]
 pub struct ExpertRouteFactory {
     policies: HashMap<String, ExpertRoutePolicy>,
     providers: indexmap::IndexMap<String, ProviderConfig>,
     global_retry: RetryConfig,
+    runtime_catalog: Option<ResolvedRuntimeCatalog>,
 }
 
 #[derive(Clone)]
@@ -19,10 +20,15 @@ struct ExpertRoutePolicy {
 }
 
 impl ExpertRouteFactory {
-    fn prepare_route(
+    fn prepare_route(&self, route: ModelRoute) -> Result<crate::agent::PreparedPrimaryRoute> {
+        self.prepare_route_with_runtime_route(route, None)
+    }
+
+    fn prepare_route_with_runtime_route(
         &self,
         route: ModelRoute,
-    ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+        inherited_runtime_route: Option<std::sync::Arc<crate::model_runtime::ResolvedModelRoute>>,
+    ) -> Result<crate::agent::PreparedPrimaryRoute> {
         let provider = self.providers.get(&route.provider).ok_or_else(|| {
             anyhow!(
                 "child route provider '{}' is not configured",
@@ -36,8 +42,14 @@ impl ExpertRouteFactory {
                 route.model
             );
         }
-        Ok(crate::agent::PreparedPrimaryRoute::new(
-            route.clone().build_client(provider),
+        let runtime_route = inherited_runtime_route.or_else(|| {
+            self.runtime_catalog
+                .as_ref()
+                .and_then(|catalog| catalog.route(&route.provider, &route.model))
+                .cloned()
+                .map(std::sync::Arc::new)
+        });
+        let prepared = crate::agent::PreparedPrimaryRoute::new_with_runtime_route(
             route.clone(),
             provider.protocol,
             provider
@@ -54,7 +66,12 @@ impl ExpertRouteFactory {
                 .retry
                 .clone()
                 .unwrap_or_else(|| self.global_retry.clone()),
-        ))
+            runtime_route,
+        );
+        Ok(match self.runtime_catalog.clone() {
+            Some(catalog) => prepared.with_runtime_catalog(catalog),
+            None => prepared,
+        })
     }
 
     #[allow(dead_code)]
@@ -97,7 +114,13 @@ impl ExpertRouteFactory {
             policies: prepared,
             providers: providers.clone(),
             global_retry: global_retry.clone(),
+            runtime_catalog: None,
         })
+    }
+
+    pub fn with_runtime_catalog(mut self, runtime_catalog: ResolvedRuntimeCatalog) -> Self {
+        self.runtime_catalog = Some(runtime_catalog);
+        self
     }
 
     fn validate_configured_route(
@@ -123,19 +146,16 @@ impl ExpertRouteFactory {
     }
 }
 
-impl PrimaryRouteFactory<OpenAIConfig> for ExpertRouteFactory {
-    fn prepare_route(
-        &self,
-        route: ModelRoute,
-    ) -> Result<crate::agent::PreparedPrimaryRoute<OpenAIConfig>> {
+impl PrimaryRouteFactory for ExpertRouteFactory {
+    fn prepare_route(&self, route: ModelRoute) -> Result<crate::agent::PreparedPrimaryRoute> {
         self.prepare_route(route)
     }
 }
 
-impl SubagentChildFactory<OpenAIConfig> for ExpertRouteFactory {
+impl SubagentChildFactory for ExpertRouteFactory {
     fn resolve_route(
         &self,
-        parent: &Agent<OpenAIConfig>,
+        parent: &Agent,
         template: &AgentTemplate,
         requested_route: Option<&ModelRoute>,
         takeover: bool,
@@ -145,6 +165,9 @@ impl SubagentChildFactory<OpenAIConfig> for ExpertRouteFactory {
             .get(&template.name)
             .ok_or_else(|| anyhow!("no route policy configured for expert '{}'", template.name))?;
         if let Some(route) = requested_route {
+            if takeover && parent.prepare_primary_route(route.clone()).is_ok() {
+                return Ok(route.clone());
+            }
             let effective_default = policy
                 .default_route
                 .as_ref()
@@ -159,7 +182,7 @@ impl SubagentChildFactory<OpenAIConfig> for ExpertRouteFactory {
                     template.name
                 );
             }
-            self.prepare_route(route.clone())?;
+            parent.prepare_primary_route(route.clone())?;
             return Ok(route.clone());
         }
         if takeover {
@@ -179,12 +202,12 @@ impl SubagentChildFactory<OpenAIConfig> for ExpertRouteFactory {
 
     fn create_child(
         &self,
-        parent: &Agent<OpenAIConfig>,
+        parent: &Agent,
         template: &AgentTemplate,
         route: &ModelRoute,
         max_tool_calls_override: Option<usize>,
-    ) -> Result<Agent<OpenAIConfig>> {
-        let prepared = self.prepare_route(route.clone())?;
+    ) -> Result<Agent> {
+        let prepared = parent.prepare_primary_route(route.clone())?;
         Ok(
             AgentFactory::create_prepared_routed_child_with_max_tool_calls(
                 parent,

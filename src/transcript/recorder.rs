@@ -25,8 +25,8 @@ use crate::tool::ToolResult;
 use crate::user_content::UserMessageContent;
 
 use super::journal::{
-    FileJournalSink, JOURNAL_SCHEMA_VERSION, JOURNAL_TRANSACTION_COMMIT, JournalRecordV1,
-    JournalSink, JournalTransactionCommitV1, journal_payload_digest, journal_scope_for,
+    FileJournalSink, JOURNAL_SCHEMA_VERSION, JOURNAL_TRANSACTION_COMMIT, JournalRecordEnvelope,
+    JournalSink, JournalTransactionCommit, journal_payload_digest, journal_scope_for,
     serialize_journal_record,
 };
 
@@ -121,7 +121,8 @@ impl ActiveTurnTracker {
                 self.turn_id = None;
                 self.unfinished_tool_calls.clear();
             }
-            TranscriptEvent::AssistantToolCallBatch { calls, .. } => {
+            TranscriptEvent::AssistantTurn(TranscriptAssistantTurn { calls, .. })
+            | TranscriptEvent::AssistantToolCallBatch { calls, .. } => {
                 for call in calls {
                     if !self
                         .unfinished_tool_calls
@@ -204,11 +205,31 @@ impl TranscriptRecorder {
         Self::open_existing(base_dir, &session_id.into())
     }
 
+    pub(crate) fn open_after_partial_tail_repair(
+        base_dir: impl AsRef<Path>,
+        session_id: &str,
+    ) -> Result<Self> {
+        let base_dir = base_dir.as_ref();
+        fs::create_dir_all(base_dir)?;
+        let file_path = session_path(base_dir, session_id);
+        let content = fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
+        if !content.trim().is_empty() {
+            journal::ensure_resumable_content(&file_path, &content)?;
+        }
+        ensure!(
+            !journal::content_tail_is_uncommitted_transaction(&file_path, &content)?,
+            "transcript has an uncommitted transaction tail and cannot safely accept new records"
+        );
+        let records = journal::parse_records_content(&file_path, &content, false)?;
+        Self::open_existing_with_validated_records(base_dir, session_id, &records)
+    }
+
     pub fn open_existing(base_dir: impl AsRef<Path>, session_id: &str) -> Result<Self> {
         let base_dir = base_dir.as_ref();
         fs::create_dir_all(base_dir)?;
         let file_path = session_path(base_dir, session_id);
-        let (records, fingerprint) = read_records_with_fingerprint(&file_path)?;
+        let (records, fingerprint) = journal::read_resumable_records_with_fingerprint(&file_path)?;
         Self::open_existing_with_records_at_fingerprint(
             base_dir,
             session_id,
@@ -246,6 +267,7 @@ impl TranscriptRecorder {
         let file_path = session_path(base_dir, session_id);
         let content = fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
+        journal::ensure_resumable_content(&file_path, &content)?;
         ensure!(
             journal::transcript_file_fingerprint(&content) == *fingerprint,
             "transcript changed after records were loaded; retry resume"
@@ -265,6 +287,7 @@ impl TranscriptRecorder {
         content: &str,
     ) -> Result<Self> {
         let file_path = session_path(base_dir, session_id);
+        journal::ensure_resumable_content(&file_path, &content)?;
         ensure!(
             !content_tail_is_uncommitted_transaction(&file_path, content)?,
             "transcript has an uncommitted transaction tail and cannot safely accept new records"
@@ -867,9 +890,12 @@ impl TranscriptRecorder {
     }
 
     pub fn record_assistant_message(&mut self, content: impl Into<String>) -> Result<()> {
-        self.append(TranscriptEvent::AssistantMessage {
-            content: content.into(),
-        })
+        self.append(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+            text: Some(content.into()),
+            reasoning_content: None,
+            replay: None,
+            calls: Vec::new(),
+        }))
     }
 
     pub fn record_turn_started(&mut self, event: TurnStartedEvent) -> Result<()> {
@@ -1029,12 +1055,19 @@ impl TranscriptRecorder {
         reasoning_wire: Option<String>,
         calls: Vec<HistoryToolCall>,
     ) -> Result<()> {
-        self.append(TranscriptEvent::AssistantToolCallBatch {
+        let replay = reasoning_wire
+            .as_deref()
+            .map(|wire| {
+                crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(wire)
+                    .ok_or_else(|| anyhow!("invalid assistant replay state"))
+            })
+            .transpose()?;
+        self.append(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
             text,
             reasoning_content,
-            reasoning_wire,
+            replay,
             calls,
-        })
+        }))
     }
 
     pub fn record_tool_call_finished(
@@ -1366,6 +1399,7 @@ impl TranscriptRecorder {
             self.health == RecorderHealth::Healthy,
             "transcript recorder is poisoned after a previous I/O failure"
         );
+        let event = normalize_transcript_event_for_v2(event)?;
         let sequence = self
             .sequence
             .checked_add(1)
@@ -1378,7 +1412,7 @@ impl TranscriptRecorder {
             event,
         };
 
-        let envelope = JournalRecordV1 {
+        let envelope = JournalRecordEnvelope {
             schema_version: JOURNAL_SCHEMA_VERSION,
             event_id: format!("{}:{sequence}", self.session_id),
             scope: journal_scope_for(&record),
@@ -1467,6 +1501,7 @@ impl TranscriptRecorder {
         let mut payload = Vec::new();
         let mut index_records = Vec::with_capacity(count);
         for (index, (event, context_branch_id)) in events.iter().cloned().enumerate() {
+            let event = normalize_transcript_event_for_v2(event)?;
             let sequence = base_revision + u64::try_from(index).unwrap() + 1;
             let record = TranscriptRecord {
                 session_id: self.session_id.clone(),
@@ -1476,7 +1511,7 @@ impl TranscriptRecorder {
                 event,
             };
             index_records.push(record.clone());
-            let envelope = JournalRecordV1 {
+            let envelope = JournalRecordEnvelope {
                 schema_version: JOURNAL_SCHEMA_VERSION,
                 event_id: format!("{}:{sequence}", self.session_id),
                 scope: journal_scope_for(&record),
@@ -1490,7 +1525,7 @@ impl TranscriptRecorder {
             payload.extend(serialize_journal_record(&envelope)?);
             payload.push(b'\n');
         }
-        let commit = JournalTransactionCommitV1 {
+        let commit = JournalTransactionCommit {
             schema_version: JOURNAL_SCHEMA_VERSION,
             journal_entry: JOURNAL_TRANSACTION_COMMIT.into(),
             transaction_id,
@@ -1532,6 +1567,42 @@ impl TranscriptRecorder {
     }
 }
 
+fn normalize_transcript_event_for_v2(event: TranscriptEvent) -> Result<TranscriptEvent> {
+    match event {
+        TranscriptEvent::AssistantMessage { content } => {
+            Ok(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: Some(content),
+                reasoning_content: None,
+                replay: None,
+                calls: Vec::new(),
+            }))
+        }
+        TranscriptEvent::AssistantToolCallBatch {
+            text,
+            reasoning_content,
+            reasoning_wire,
+            calls,
+        } => {
+            let replay = reasoning_wire
+                .as_deref()
+                .map(|wire| {
+                    crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
+                        wire,
+                    )
+                    .ok_or_else(|| anyhow!("invalid assistant replay state"))
+                })
+                .transpose()?;
+            Ok(TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text,
+                reasoning_content,
+                replay,
+                calls,
+            }))
+        }
+        event => Ok(event),
+    }
+}
+
 pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
     matches!(
         event,
@@ -1553,6 +1624,7 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::FoldedOutputMetadata { .. }
             | TranscriptEvent::ContextExperimentReturned { .. }
             | TranscriptEvent::UserMessage { .. }
+            | TranscriptEvent::AssistantTurn(_)
             | TranscriptEvent::AssistantMessage { .. }
             | TranscriptEvent::ReasoningMessage { .. }
             | TranscriptEvent::AssistantToolCallBatch { .. }

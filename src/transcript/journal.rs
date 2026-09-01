@@ -7,7 +7,8 @@ use std::path::Path;
 
 use super::model::{TranscriptEvent, TranscriptFileFingerprint, TranscriptRecord};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,7 +18,7 @@ pub enum JournalScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalRecordV1 {
+pub struct JournalRecordEnvelope {
     pub(crate) schema_version: u32,
     pub(crate) event_id: String,
     pub(crate) scope: JournalScope,
@@ -34,7 +35,7 @@ pub struct JournalRecordV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalTransactionCommitV1 {
+pub struct JournalTransactionCommit {
     pub(crate) schema_version: u32,
     pub(crate) journal_entry: String,
     pub(crate) transaction_id: String,
@@ -72,7 +73,7 @@ impl JournalSink for FileJournalSink {
 /// Logical checkpoint payloads own their frozen `schema_version` field. Keep
 /// the existing journal field for every other event, but use a distinct outer
 /// name for this one flattened payload so JSON never contains duplicate keys.
-pub fn serialize_journal_record(envelope: &JournalRecordV1) -> Result<Vec<u8>> {
+pub fn serialize_journal_record(envelope: &JournalRecordEnvelope) -> Result<Vec<u8>> {
     if !matches!(envelope.record.event, TranscriptEvent::LogicalCheckpoint(_)) {
         return Ok(serde_json::to_vec(envelope)?);
     }
@@ -118,12 +119,29 @@ pub fn read_records(path: impl AsRef<Path>) -> Result<Vec<TranscriptRecord>> {
     read_records_inner(path, false)
 }
 
+#[cfg(test)]
 pub fn read_records_with_fingerprint(
     path: impl AsRef<Path>,
+) -> Result<(Vec<TranscriptRecord>, TranscriptFileFingerprint)> {
+    read_records_with_fingerprint_mode(path, false)
+}
+
+pub fn read_resumable_records_with_fingerprint(
+    path: impl AsRef<Path>,
+) -> Result<(Vec<TranscriptRecord>, TranscriptFileFingerprint)> {
+    read_records_with_fingerprint_mode(path, true)
+}
+
+fn read_records_with_fingerprint_mode(
+    path: impl AsRef<Path>,
+    require_current_schema: bool,
 ) -> Result<(Vec<TranscriptRecord>, TranscriptFileFingerprint)> {
     let path = path.as_ref();
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    if require_current_schema {
+        ensure_resumable_schema(path, &content)?;
+    }
     let records = parse_records_content(path, &content, false)?;
     Ok((records, transcript_file_fingerprint(&content)))
 }
@@ -143,10 +161,33 @@ pub fn read_records_allow_partial_tail(path: impl AsRef<Path>) -> Result<Vec<Tra
     read_records_inner(path, true)
 }
 
+pub fn ensure_resumable_content(path: &Path, content: &str) -> Result<()> {
+    ensure!(
+        content.ends_with('\n'),
+        "transcript {} is missing its append delimiter",
+        path.display()
+    );
+    ensure_resumable_schema(path, content)
+}
+
 pub(crate) fn repair_partial_tail(path: &Path) -> Result<()> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
-    if content.ends_with('\n') || parse_records_content(path, &content, false).is_ok() {
+    if content.ends_with('\n') || content.is_empty() {
+        return Ok(());
+    }
+    if parse_records_content(path, &content, false).is_ok() {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "failed to open transcript {} for tail repair",
+                    path.display()
+                )
+            })?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
         return Ok(());
     }
     let valid_len = content.rfind('\n').map_or(0, |index| index + 1);
@@ -197,7 +238,7 @@ pub fn parse_records_content(
 
         match parse_journal_line(line) {
             Ok(ParsedJournalLine::Record(entry)) => {
-                let transaction = transaction_fields(&entry.v1)?;
+                let transaction = transaction_fields(&entry.envelope)?;
                 match transaction {
                     Some((transaction_id, transaction_index, transaction_count)) => {
                         ensure!(
@@ -208,7 +249,7 @@ pub fn parse_records_content(
                             pending_transaction.get_or_insert_with(|| PendingTransaction {
                                 transaction_id: transaction_id.clone(),
                                 transaction_count,
-                                base_revision: entry.v1.as_ref().unwrap().base_revision,
+                                base_revision: entry.envelope.as_ref().unwrap().base_revision,
                                 payload: Vec::new(),
                                 entries: Vec::new(),
                             });
@@ -230,7 +271,7 @@ pub fn parse_records_content(
                         );
                         pending
                             .payload
-                            .extend(serialize_journal_record(entry.v1.as_ref().unwrap())?);
+                            .extend(serialize_journal_record(entry.envelope.as_ref().unwrap())?);
                         pending.payload.push(b'\n');
                         pending.entries.push(entry);
                     }
@@ -247,10 +288,15 @@ pub fn parse_records_content(
                 let pending = pending_transaction
                     .take()
                     .ok_or_else(|| anyhow!("transcript transaction commit has no records"))?;
+                ensure_supported_discovery_schema(commit.schema_version)?;
                 ensure!(
-                    commit.schema_version == JOURNAL_SCHEMA_VERSION,
-                    "unsupported transcript journal schema version {}",
-                    commit.schema_version
+                    pending
+                        .entries
+                        .iter()
+                        .all(|entry| entry.envelope.as_ref().is_some_and(|record| {
+                            record.schema_version == commit.schema_version
+                        })),
+                    "transcript transaction commit schema version does not match records"
                 );
                 ensure!(
                     commit.journal_entry == JOURNAL_TRANSACTION_COMMIT,
@@ -273,7 +319,7 @@ pub fn parse_records_content(
                 let last_payload_revision = pending
                     .entries
                     .last()
-                    .and_then(|entry| entry.v1.as_ref())
+                    .and_then(|entry| entry.envelope.as_ref())
                     .ok_or_else(|| anyhow!("transcript transaction commit has no payload records"))?
                     .resulting_revision;
                 ensure!(
@@ -357,7 +403,7 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                 path.display()
             )
         })? {
-            ParsedJournalLine::Record(entry) => match transaction_fields(&entry.v1)? {
+            ParsedJournalLine::Record(entry) => match transaction_fields(&entry.envelope)? {
                 Some((transaction_id, transaction_index, transaction_count)) => {
                     ensure!(
                         transaction_count > 0,
@@ -366,7 +412,7 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                     let pending = pending_transaction.get_or_insert_with(|| PendingTransaction {
                         transaction_id: transaction_id.clone(),
                         transaction_count,
-                        base_revision: entry.v1.as_ref().unwrap().base_revision,
+                        base_revision: entry.envelope.as_ref().unwrap().base_revision,
                         payload: Vec::new(),
                         entries: Vec::new(),
                     });
@@ -388,7 +434,7 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                     );
                     pending
                         .payload
-                        .extend(serialize_journal_record(entry.v1.as_ref().unwrap())?);
+                        .extend(serialize_journal_record(entry.envelope.as_ref().unwrap())?);
                     pending.payload.push(b'\n');
                     pending.entries.push(entry);
                 }
@@ -401,10 +447,15 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                 let pending = pending_transaction
                     .take()
                     .ok_or_else(|| anyhow!("transcript transaction commit has no records"))?;
+                ensure_supported_discovery_schema(commit.schema_version)?;
                 ensure!(
-                    commit.schema_version == JOURNAL_SCHEMA_VERSION,
-                    "unsupported transcript journal schema version {}",
-                    commit.schema_version
+                    pending
+                        .entries
+                        .iter()
+                        .all(|entry| entry.envelope.as_ref().is_some_and(|record| {
+                            record.schema_version == commit.schema_version
+                        })),
+                    "transcript transaction commit schema version does not match records"
                 );
                 ensure!(
                     commit.journal_entry == JOURNAL_TRANSACTION_COMMIT,
@@ -427,7 +478,7 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                 let last_payload_revision = pending
                     .entries
                     .last()
-                    .and_then(|entry| entry.v1.as_ref())
+                    .and_then(|entry| entry.envelope.as_ref())
                     .ok_or_else(|| anyhow!("transcript transaction commit has no payload records"))?
                     .resulting_revision;
                 ensure!(
@@ -456,7 +507,7 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
 #[derive(Debug)]
 pub(crate) struct JournalEntry {
     pub(crate) record: TranscriptRecord,
-    pub(crate) v1: Option<JournalRecordV1>,
+    pub(crate) envelope: Option<JournalRecordEnvelope>,
 }
 
 pub(crate) struct PendingTransaction {
@@ -469,7 +520,7 @@ pub(crate) struct PendingTransaction {
 
 pub enum ParsedJournalLine {
     Record(JournalEntry),
-    Commit(JournalTransactionCommitV1),
+    Commit(JournalTransactionCommit),
 }
 
 pub fn parse_journal_line(line: &str) -> Result<ParsedJournalLine> {
@@ -479,22 +530,75 @@ pub fn parse_journal_line(line: &str) -> Result<ParsedJournalLine> {
     if has_top_level_json_field(line, "journal_schema_version")
         || has_top_level_json_field(line, "schema_version")
     {
-        let v1 = parse_journal_v1(line)?;
-        ensure!(
-            v1.schema_version == JOURNAL_SCHEMA_VERSION,
-            "unsupported transcript journal schema version {}",
-            v1.schema_version
-        );
+        let envelope = parse_journal_envelope(line)?;
+        ensure_supported_discovery_schema(envelope.schema_version)?;
         Ok(ParsedJournalLine::Record(JournalEntry {
-            record: v1.record.clone(),
-            v1: Some(v1),
+            record: envelope.record.clone(),
+            envelope: Some(envelope),
         }))
     } else {
         Ok(ParsedJournalLine::Record(JournalEntry {
             record: serde_json::from_str(line)?,
-            v1: None,
+            envelope: None,
         }))
     }
+}
+
+fn ensure_supported_discovery_schema(schema_version: u32) -> Result<()> {
+    ensure!(
+        matches!(
+            schema_version,
+            LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        ),
+        "unsupported transcript journal schema version {schema_version}"
+    );
+    Ok(())
+}
+
+fn ensure_resumable_schema(path: &Path, content: &str) -> Result<()> {
+    let mut saw_record = false;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        saw_record = true;
+        let version = if has_top_level_json_field(line, "journal_entry") {
+            serde_json::from_str::<JournalTransactionCommit>(line)?.schema_version
+        } else if has_top_level_json_field(line, "journal_schema_version")
+            || has_top_level_json_field(line, "schema_version")
+        {
+            parse_journal_envelope(line)?.schema_version
+        } else {
+            0
+        };
+        ensure!(
+            version == JOURNAL_SCHEMA_VERSION,
+            "transcript {} uses schema version {}; resume requires schema version {}",
+            path.display(),
+            version,
+            JOURNAL_SCHEMA_VERSION
+        );
+        if !has_top_level_json_field(line, "journal_entry") {
+            let record = parse_journal_envelope(line)?.record;
+            ensure!(
+                !matches!(
+                    record.event,
+                    TranscriptEvent::AssistantMessage { .. }
+                        | TranscriptEvent::AssistantToolCallBatch { .. }
+                ),
+                "transcript {} contains legacy assistant payload in schema version {}",
+                path.display(),
+                JOURNAL_SCHEMA_VERSION
+            );
+        }
+    }
+    ensure!(
+        saw_record,
+        "transcript {} contains no journal records; resume requires schema version {}",
+        path.display(),
+        JOURNAL_SCHEMA_VERSION
+    );
+    Ok(())
 }
 
 fn has_top_level_json_field(line: &str, field: &str) -> bool {
@@ -538,7 +642,7 @@ fn has_top_level_json_field(line: &str, field: &str) -> bool {
     false
 }
 
-fn parse_journal_v1(line: &str) -> Result<JournalRecordV1> {
+fn parse_journal_envelope(line: &str) -> Result<JournalRecordEnvelope> {
     #[derive(Deserialize)]
     struct JournalMetadata {
         #[serde(rename = "journal_schema_version")]
@@ -590,9 +694,9 @@ fn parse_journal_v1(line: &str) -> Result<JournalRecordV1> {
     let record: TranscriptRecord = serde_json::from_str(line)?;
     ensure!(
         metadata.timestamp_ms == record.timestamp_ms,
-        "transcript v1 timestamp metadata is inconsistent"
+        "transcript journal timestamp metadata is inconsistent"
     );
-    Ok(JournalRecordV1 {
+    Ok(JournalRecordEnvelope {
         schema_version: metadata.schema_version,
         event_id: metadata.event_id,
         scope: metadata.scope,
@@ -605,12 +709,16 @@ fn parse_journal_v1(line: &str) -> Result<JournalRecordV1> {
     })
 }
 
-pub fn transaction_fields(v1: &Option<JournalRecordV1>) -> Result<Option<(String, usize, usize)>> {
-    let Some(v1) = v1 else { return Ok(None) };
+pub fn transaction_fields(
+    envelope: &Option<JournalRecordEnvelope>,
+) -> Result<Option<(String, usize, usize)>> {
+    let Some(envelope) = envelope else {
+        return Ok(None);
+    };
     match (
-        &v1.transaction_id,
-        v1.transaction_index,
-        v1.transaction_count,
+        &envelope.transaction_id,
+        envelope.transaction_index,
+        envelope.transaction_count,
     ) {
         (None, None, None) => Ok(None),
         (Some(id), Some(index), Some(count)) => Ok(Some((id.clone(), index, count))),
@@ -624,7 +732,7 @@ pub fn validate_journal_entries(entries: &[JournalEntry]) -> Result<()> {
     let mut session_id = None;
     let mut previous_sequence = None;
     let mut previous_revision = None;
-    let mut saw_v1 = false;
+    let mut saw_envelope = false;
     let mut event_ids = std::collections::BTreeSet::new();
 
     for entry in entries {
@@ -644,38 +752,42 @@ pub fn validate_journal_entries(entries: &[JournalEntry]) -> Result<()> {
         }
         previous_sequence = Some(entry.record.sequence);
 
-        match &entry.v1 {
-            Some(v1) => {
-                saw_v1 = true;
+        match &entry.envelope {
+            Some(envelope) => {
+                saw_envelope = true;
                 ensure!(
-                    v1.event_id == format!("{}:{}", entry.record.session_id, entry.record.sequence),
-                    "transcript v1 event_id does not match record identity"
+                    envelope.event_id
+                        == format!("{}:{}", entry.record.session_id, entry.record.sequence),
+                    "transcript journal event_id does not match record identity"
                 );
                 ensure!(
-                    event_ids.insert(v1.event_id.as_str()),
-                    "transcript v1 event_id must be unique"
+                    event_ids.insert(envelope.event_id.as_str()),
+                    "transcript journal event_id must be unique"
                 );
                 ensure!(
-                    v1.scope == journal_scope_for(&entry.record),
-                    "transcript v1 scope does not match context_branch_id"
+                    envelope.scope == journal_scope_for(&entry.record),
+                    "transcript journal scope does not match context_branch_id"
                 );
                 ensure!(
-                    v1.resulting_revision == v1.base_revision + 1,
-                    "transcript v1 revisions must be consecutive"
+                    envelope.resulting_revision == envelope.base_revision + 1,
+                    "transcript journal revisions must be consecutive"
                 );
                 ensure!(
-                    v1.resulting_revision == entry.record.sequence,
-                    "transcript v1 resulting_revision must equal sequence"
+                    envelope.resulting_revision == entry.record.sequence,
+                    "transcript journal resulting_revision must equal sequence"
                 );
                 let expected_base = previous_revision.unwrap_or(0);
                 ensure!(
-                    v1.base_revision == expected_base,
-                    "transcript v1 base_revision is not continuous"
+                    envelope.base_revision == expected_base,
+                    "transcript journal base_revision is not continuous"
                 );
-                previous_revision = Some(v1.resulting_revision);
+                previous_revision = Some(envelope.resulting_revision);
             }
             None => {
-                ensure!(!saw_v1, "legacy transcript record cannot follow v1 records");
+                ensure!(
+                    !saw_envelope,
+                    "legacy transcript record cannot follow journal envelopes"
+                );
                 previous_revision = Some(entry.record.sequence);
             }
         }

@@ -956,10 +956,10 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
             RuntimeFrameKind::ToolCall,
             FrameVisibility::Active,
             Some(SourceSpan::new(24, 24).expect("fixture span")),
-            ProtocolFrameItem::AssistantToolCalls {
+            ProtocolFrameItem::AssistantTurn {
                 text: None,
                 reasoning_content: None,
-                reasoning_wire: None,
+                replay: None,
                 calls: vec![HistoryToolCall {
                     call_id: "current-call".into(),
                     name: "shell__exec".into(),

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::config::Config;
 use futures_util::FutureExt;
 use serde_json::Value;
 use std::future::Future;
@@ -585,16 +584,16 @@ impl SubagentPool {
         ordinal
     }
 
-    pub async fn run_named_governed<C: Config + Clone + Send + Sync + 'static>(
+    pub async fn run_named_governed(
         &self,
-        parent: &Agent<C>,
+        parent: &Agent,
         agent_name: &str,
         invocation: SubagentInvocation,
         sessions_dir: impl AsRef<Path>,
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
+        event_sender: Option<SubagentEventSender>,
     ) -> Result<SubagentRunSummary> {
         self.complete_started_run(self.start_named_governed(
             parent,
@@ -609,17 +608,17 @@ impl SubagentPool {
         .await
     }
 
-    pub fn start_named_governed<C: Config + Clone + Send + Sync + 'static>(
+    pub fn start_named_governed(
         &self,
-        parent: &Agent<C>,
+        parent: &Agent,
         agent_name: &str,
         invocation: SubagentInvocation,
         sessions_dir: impl AsRef<Path>,
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
-    ) -> Result<StartedSubagentRun<C>> {
+        event_sender: Option<SubagentEventSender>,
+    ) -> Result<StartedSubagentRun> {
         let template = AgentTemplate::from_name(agent_name)
             .ok_or_else(|| anyhow!("unknown subagent template: {agent_name}"))?;
         let governance = SubagentRunGovernance::from_template_and_input(
@@ -661,9 +660,9 @@ impl SubagentPool {
         })
     }
 
-    pub async fn complete_started_run<C: Config + Clone + Send + Sync + 'static>(
+    pub async fn complete_started_run(
         &self,
-        started: StartedSubagentRun<C>,
+        started: StartedSubagentRun,
     ) -> Result<SubagentRunSummary> {
         complete_started_run(
             started.run,
@@ -687,18 +686,17 @@ impl SubagentPool {
     }
 
     #[cfg(test)]
-    pub(crate) async fn complete_started_run_with_executor<C, F>(
+    pub(crate) async fn complete_started_run_with_executor<F>(
         &self,
-        started: StartedSubagentRun<C>,
+        started: StartedSubagentRun,
         exec: F,
     ) -> Result<SubagentRunSummary>
     where
-        C: Config + Clone + Send + Sync + 'static,
         F: FnOnce(
-                Agent<C>,
+                Agent,
                 String,
                 Arc<Mutex<TranscriptRecorder>>,
-                Option<SubagentEventSender<C>>,
+                Option<SubagentEventSender>,
                 String,
                 String,
             ) -> BoxExecFuture
@@ -708,9 +706,9 @@ impl SubagentPool {
         complete_started_run(started.run, started.task, exec).await
     }
 
-    pub async fn run_with_executor<C, F>(
+    pub async fn run_with_executor<F>(
         &self,
-        parent: &Agent<C>,
+        parent: &Agent,
         template: AgentTemplate,
         task: String,
         governance: SubagentRunGovernance,
@@ -718,17 +716,16 @@ impl SubagentPool {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
+        event_sender: Option<SubagentEventSender>,
         takeover_child_session_id: Option<String>,
         exec: F,
     ) -> Result<SubagentRunSummary>
     where
-        C: Config + Clone + Send + Sync + 'static,
         F: FnOnce(
-                Agent<C>,
+                Agent,
                 String,
                 Arc<Mutex<TranscriptRecorder>>,
-                Option<SubagentEventSender<C>>,
+                Option<SubagentEventSender>,
                 String,
                 String,
             ) -> BoxExecFuture
@@ -750,9 +747,9 @@ impl SubagentPool {
         complete_started_run(running, task, exec).await
     }
 
-    fn start_run<C>(
+    fn start_run(
         &self,
-        parent: &Agent<C>,
+        parent: &Agent,
         template: AgentTemplate,
         task: String,
         governance: SubagentRunGovernance,
@@ -760,12 +757,9 @@ impl SubagentPool {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
+        event_sender: Option<SubagentEventSender>,
         takeover_child_session_id: Option<String>,
-    ) -> Result<StartedRun<C>>
-    where
-        C: Config + Clone + Send + Sync + 'static,
-    {
+    ) -> Result<StartedRun> {
         let scope = SubagentPathScope::from_input(&governance.input)?;
         let path_access = run_path_access(&template, &governance.input, scope.as_ref())?;
         let mut reservation =
@@ -786,13 +780,7 @@ impl SubagentPool {
             Self::child_sessions(&sessions_dir, &parent_records)
         };
 
-        let setup = (|| -> Result<(
-            String,
-            String,
-            u32,
-            Arc<Mutex<TranscriptRecorder>>,
-            Agent<C>,
-        )> {
+        let setup = (|| -> Result<(String, String, u32, Arc<Mutex<TranscriptRecorder>>, Agent)> {
             let run_id = reservation.run_id.clone();
             let child_dir = child_sessions_dir(&sessions_dir);
 
@@ -844,9 +832,7 @@ impl SubagentPool {
                         anyhow!("takeover failed: child `{target_id}` has no recorded model route")
                     })?;
                 let recorded_route = ModelRoute::parse(&recorded_route).with_context(|| {
-                    format!(
-                        "takeover failed: child `{target_id}` recorded an invalid model route"
-                    )
+                    format!("takeover failed: child `{target_id}` recorded an invalid model route")
                 })?;
                 let mut child_agent = AgentFactory::create_child_with_route_and_max_tool_calls(
                     parent,
@@ -867,8 +853,8 @@ impl SubagentPool {
                     &[],
                 )?;
                 child_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
-                let runtime_snapshot = child_agent
-                    .validate_runtime_snapshot_restore(snapshot.snapshot)?;
+                let runtime_snapshot =
+                    child_agent.validate_runtime_snapshot_restore(snapshot.snapshot)?;
 
                 child_recorder.record_subagent_lifecycle(
                     run_id.clone(),
@@ -975,7 +961,10 @@ impl SubagentPool {
                 .map(|recorder| recorder.path().to_path_buf())
                 && crate::transcript::repair_partial_tail(&parent_path).is_ok()
                 && let Some(parent_dir) = parent_path.parent()
-                && let Ok(mut recorder) = TranscriptRecorder::open(parent_dir, &parent_session_id)
+                && let Ok(mut recorder) = TranscriptRecorder::open_after_partial_tail_repair(
+                    parent_dir,
+                    &parent_session_id,
+                )
             {
                 let _ = recorder.record_subagent_started(
                     run_id.clone(),
@@ -1181,14 +1170,14 @@ impl StartingReservationForTest {
     }
 }
 
-pub struct StartedSubagentRun<C: Config> {
+pub struct StartedSubagentRun {
     run_id: String,
     receipt: ChildSessionSummary,
-    run: StartedRun<C>,
+    run: StartedRun,
     task: String,
 }
 
-impl<C: Config> StartedSubagentRun<C> {
+impl StartedSubagentRun {
     pub fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -1198,7 +1187,7 @@ impl<C: Config> StartedSubagentRun<C> {
     }
 }
 
-struct StartedRun<C: Config> {
+struct StartedRun {
     guard: ActiveRunGuard,
     path_access: RunPathAccess,
     run_id: String,
@@ -1209,24 +1198,23 @@ struct StartedRun<C: Config> {
     parent_session_id: String,
     parent_turn_id: String,
     parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-    event_sender: Option<SubagentEventSender<C>>,
+    event_sender: Option<SubagentEventSender>,
     child_transcript: Arc<Mutex<TranscriptRecorder>>,
-    child_agent: Agent<C>,
+    child_agent: Agent,
     cancel_rx: oneshot::Receiver<()>,
 }
 
-async fn complete_started_run<C, F>(
-    started: StartedRun<C>,
+async fn complete_started_run<F>(
+    started: StartedRun,
     task: String,
     exec: F,
 ) -> Result<SubagentRunSummary>
 where
-    C: Config + Clone + Send + Sync + 'static,
     F: FnOnce(
-            Agent<C>,
+            Agent,
             String,
             Arc<Mutex<TranscriptRecorder>>,
-            Option<SubagentEventSender<C>>,
+            Option<SubagentEventSender>,
             String,
             String,
         ) -> BoxExecFuture

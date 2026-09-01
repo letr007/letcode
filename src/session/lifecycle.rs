@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use async_openai::config::Config;
 
 use crate::agent::{Agent, PreparedPrimaryRoute};
 use crate::runtime_context::{RuntimeActiveContext, RuntimeSnapshot};
@@ -19,8 +18,7 @@ use crate::session::restore::project_runtime_restore_snapshot_with_children;
 use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
 use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptFileFingerprint, TranscriptRecord, TranscriptRecorder,
-    list_sessions, read_records, read_records_with_fingerprint, remove_empty_session_file,
-    resolve_session_id,
+    list_sessions, read_records, remove_empty_session_file, resolve_session_id,
 };
 
 /// Create a new on-disk session transcript and record the session-started event.
@@ -125,22 +123,22 @@ pub fn prepare_new_session_package(
 /// All fallible agent preparation completes before the recorder swap.
 /// All fallible validation required for a new-session switch, completed before
 /// the caller cancels the outgoing session's subagents.
-pub struct PreparedNewSessionInstall<C: Config> {
+pub struct PreparedNewSessionInstall {
     pub(crate) prepared: PreparedNewSession,
     prepared_scope: crate::session::context_scope::PreparedContextScope,
     runtime_snapshot: RuntimeSnapshot,
-    prepared_route: Option<PreparedPrimaryRoute<C>>,
+    prepared_route: Option<PreparedPrimaryRoute>,
     old_path: PathBuf,
     new_path: PathBuf,
 }
 
 /// Prepare a new-session install while retaining a route prepared for commit.
-pub(crate) fn prepare_new_session_install_with_route<C: Config>(
-    agent: &Agent<C>,
+pub(crate) fn prepare_new_session_install_with_route(
+    agent: &Agent,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedNewSession,
-    prepared_route: Option<PreparedPrimaryRoute<C>>,
-) -> Result<PreparedNewSessionInstall<C>> {
+    prepared_route: Option<PreparedPrimaryRoute>,
+) -> Result<PreparedNewSessionInstall> {
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     let runtime_snapshot =
         agent.validate_runtime_snapshot_restore(prepared.snapshot.snapshot.clone())?;
@@ -161,7 +159,7 @@ pub(crate) fn prepare_new_session_install_with_route<C: Config>(
     })
 }
 
-impl<C: Config> PreparedNewSessionInstall<C> {
+impl PreparedNewSessionInstall {
     pub(crate) fn session(&self) -> &PreparedNewSession {
         &self.prepared
     }
@@ -174,7 +172,7 @@ impl<C: Config> PreparedNewSessionInstall<C> {
     ///
     /// This contains no business-fallible operations. A poisoned lock or an
     /// invalid validated snapshot is an internal invariant violation.
-    pub(crate) fn commit(self, agent: &mut Agent<C>, live: &Arc<Mutex<TranscriptRecorder>>) {
+    pub(crate) fn commit(self, agent: &mut Agent, live: &Arc<Mutex<TranscriptRecorder>>) {
         let Self {
             prepared,
             prepared_scope,
@@ -259,7 +257,9 @@ pub(crate) fn load_session_records_with_fingerprint(
     sessions_dir: impl AsRef<Path>,
     session_id: &str,
 ) -> Result<(Vec<TranscriptRecord>, TranscriptFileFingerprint)> {
-    read_records_with_fingerprint(sessions_dir.as_ref().join(format!("{session_id}.jsonl")))
+    crate::transcript::read_resumable_records_with_fingerprint(
+        sessions_dir.as_ref().join(format!("{session_id}.jsonl")),
+    )
 }
 
 /// Open an existing session transcript for resume (append-safe open).

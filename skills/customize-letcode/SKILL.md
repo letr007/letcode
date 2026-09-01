@@ -104,10 +104,32 @@ url = "https://example.com/mcp"
 # oauth = false                   # true 会被拒绝（暂不支持 OAuth）
 
 [providers.openai]
-api_key = "YOUR_API_KEY"
+protocol = "responses" # responses | completions | anthropic
+flavor = "standard"    # standard | deepseek
+default_model = "gpt-5.5" # 当前必需，且必须引用已配置的 model
+
+[providers.openai.auth]
+type = "bearer" # bearer | header | query | none
+credential_env = "OPENAI_API_KEY"
+# credential = "YOUR_API_KEY" # 与 credential_env 二选一
+# header/query auth 还必须设置 name，例如 name = "x-api-key"
+
+[providers.openai.endpoints]
 base_url = "https://api.openai.com/v1"
-protocol = "responses" # responses | completions（provider 名不是 openai 时必填）
-default_model = "gpt-5.5"
+# 协议路径可省略，使用内置 adapter 默认值；也可显式覆盖：
+# [providers.openai.endpoints.responses]
+# path = "responses"
+# query = { api_version = "2026-01-01" }
+
+# 可选 provider transport/static request 设置：
+# [providers.openai.transport]
+# connect_timeout_secs = 10
+# no_proxy_loopback = true
+# [providers.openai.headers]
+# x-provider-version = "2026-01-01"
+# [providers.openai.query]
+# region = "global"
+
 # [providers.openai.retry]        # 可选：按 provider 独立覆盖任意 retry 字段
 # enabled = true
 # max_attempts = 10
@@ -115,42 +137,71 @@ default_model = "gpt-5.5"
 # exponential_backoff = false     # false 时每次固定等待 initial_delay_secs
 
 [providers.openai.models."gpt-5.5"]
-display_name = "GPT-5.5"          # 别名：name
-# protocol = "completions"        # 可选：覆盖 provider 的 protocol
+display = "GPT-5.5"
+# protocol = "completions"        # 可选：覆盖 provider protocol
+# flavor = "standard"             # 可选：覆盖 provider flavor
+# model_override = "wire-model-id"
 # context_window = 400000
 # effective_input_limit_tokens = 256000
-# max_output_tokens = 128000
-supports_tools = true             # 省略默认为 true
-parallel_tool_calls = true         # 省略默认为 true；设为 false 可关闭并行工具调用
-supports_reasoning = true         # 省略默认为 true
+
+# 所有 capability 省略时默认 false；只打开真实支持的能力。
+[providers.openai.models."gpt-5.5".capabilities]
+tools = true
+parallel_tool_calls = true
+reasoning = true
+input_images = false
+tool_result_images = false
+prompt_cache = true
+priority_service = false
+
+[providers.openai.models."gpt-5.5".capabilities.generation]
+temperature = true
+top_p = true
+max_output_tokens = true
+stop_sequences = false
+reasoning = true
+reasoning_summary = true
+text_verbosity = true
+parallel_tool_calls = true
+priority_service = false
+
+[providers.openai.models."gpt-5.5".generation]
+max_output_tokens = 128000
 reasoning_effort = "medium"       # none|minimal|low|medium|high|xhigh|max|自定义字符串
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto"        # auto|concise|detailed
 text_verbosity = "medium"         # low|medium|high
+parallel_tool_calls = true
 # temperature = 0.2
 # top_p = 1.0
-# anthropic_betas = ["context-1m-2025-08-07"] # 仅 Anthropic；发送为 anthropic-beta header
 
-# [providers.openai.models."gpt-5.5".prompt_cache]
-# enabled = true
-# retention = "in_memory"         # in_memory | 24h
-# namespace = "my-cache"
+[providers.openai.models."gpt-5.5".cache]
+enabled = true
+retention = "in_memory"           # in_memory | 24h；仅 responses 支持 retention
+namespace = "my-cache"
+
+# 协议专属设置由所选 binding 严格校验。Responses/Completions 当前留空；
+# Anthropic 可配置 anthropic_thinking 和 anthropic_betas。
+[providers.openai.models."gpt-5.5".protocol_settings]
+# anthropic_thinking = { mode = "adaptive" }
+# anthropic_betas = ["context-1m-2025-08-07"]
 ```
 
 形状说明：
 
 - 相对路径的 `sessions_dir` / `log_file` 相对**配置文件所在目录**解析。
-- Provider 环境变量覆盖 TOML：`<PROVIDER>_API_KEY`、`<PROVIDER>_BASE_URL`
-  （provider 名大写；非字母数字变 `_`）。例：`openai` →
-  `OPENAI_API_KEY` / `OPENAI_BASE_URL`。
-- TOML 里 `protocol` 用 kebab-case：`responses`、`completions`、`anthropic`。
-- `anthropic_betas` 是可选的模型级字符串数组，仅适用于 `protocol = "anthropic"`；值会按配置顺序合并为 `anthropic-beta` HTTP 请求头，不会写入 Messages JSON body，也不会根据模型名或 `context_window` 自动推断。
+- Provider 认证配置在 `[providers.<name>.auth]`。`credential_env` 可显式指定环境变量；未指定时默认读取按 provider 名生成的 `<PROVIDER>_API_KEY`，再回退到 `credential`。endpoint 不再通过 `<PROVIDER>_BASE_URL` 覆盖，必须配置在 `[providers.<name>.endpoints]`。
+- `type = "bearer"` 使用 `Authorization: Bearer ...`；`header` / `query` 必须配置合法的 `name`；`none` 不能携带 credential。
+- Provider 和 model 都可配置 `protocol` / `flavor`。`protocol` 支持 `responses`、`completions`、`anthropic`；`flavor = "deepseek"` 是显式 DeepSeek profile，不根据 provider/model 名猜测。
+- capability 与 generation capability 省略时均为 false。`.generation` 中出现某个参数时，必须先在 `.capabilities.generation` 打开对应能力；reasoning 参数还要求 `.capabilities.reasoning = true`。
+- `.cache.retention` 仅适用于 Responses，并要求 `enabled = true`；需要发送 provider-native prompt cache hint 时同时打开 `.capabilities.prompt_cache = true`。
+- `anthropic_betas` 和 `anthropic_thinking` 位于模型的 `.protocol_settings` table，仅适用于 `protocol = "anthropic"`。beta 会按配置顺序合并为 `anthropic-beta` header；thinking 支持 `disabled`、`adaptive`、`budget`，budget 模式至少 1024 token。
 - `[tools.parallelism]` 只能**收窄**已声明 `Parallel` 的工具（例如强制
   `exclusive`）。把 exclusive 工具提成 `parallel` 会被拒绝。
 - 本地 MCP 的 `command` 必须是字符串数组，不能是单个字符串。`type` 必填。
   remote 不能设 `command`/`environment`；local 不能设 `url`/`headers`/`oauth`。
 - 内置 expert agent 键固定为：`explorer`、`fixer`、`oracle`、`designer`、
-  `librarian`、`general`、`reviewer`。没有自由形式的 agent map。
+  `librarian`、`general`、`reviewer`。其中六个可委派 expert 是 explorer/fixer/oracle/designer/librarian/general，reviewer 仅用于权限自动审查；没有自由形式的 agent map。
 - `agents.<expert>.allowed_models` 仅接受 `provider/model`，用于 `agent__*`
   单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的
@@ -249,5 +300,5 @@ user = "#ff8800"
   `agent` map、`skills.urls`、`permission.bash` 模式映射这类形状会被拒绝。
 - 长说明放进 letcode skills 目录下的 skill 文件；`letcode.toml` 没有 skill
   正文字段。
-- 写完 `letcode.toml` 后跑 `config__validate`，修到 `valid` 为 true。仅 MCP /
+- 写完 `letcode.toml` 后跑与目标版本相同的 `config__validate`，修到 `valid` 为 true。若正在运行的是升级前旧进程，内置验证器仍可能按旧 schema 报错，此时应使用当前 working tree 的 `cargo run -- config validate <path>` 或升级后的二进制验证。仅 MCP /
   权限 / Fast Mode / max iteration·tool caps 需要重启。

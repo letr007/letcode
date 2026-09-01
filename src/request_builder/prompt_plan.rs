@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use crate::config::ApiProtocol;
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem, ProtocolTranscript};
 use crate::request_builder::{
     BudgetReport, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
@@ -141,7 +140,7 @@ pub(crate) enum PromptSegmentContent {
         text: Option<String>,
         reasoning_content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_wire: Option<String>,
+        replay: Option<crate::model_runtime::OpaqueReplayState>,
         calls: Vec<HistoryToolCall>,
     },
     ToolOutput {
@@ -154,7 +153,6 @@ pub(crate) enum PromptSegmentContent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptPlan {
-    pub protocol: ApiProtocol,
     pub model_id: String,
     pub contributors: Vec<PromptContributor>,
     pub segments: Vec<PromptSegment>,
@@ -172,7 +170,6 @@ pub(crate) struct PromptPlanner;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PromptPlannerInput<'a> {
-    pub protocol: ApiProtocol,
     pub model: ModelRequestMetadata,
     pub model_id: &'a str,
     pub prelude: &'a [PromptMessage],
@@ -301,7 +298,6 @@ impl PromptPlanner {
             Some(effective_protected_start_index),
         )?;
         let prompt_plan = build_prompt_plan(PromptPlanBuildInput {
-            protocol: input.protocol,
             model_id: input.model_id,
             prelude: &effective_prelude,
             snapshot: input.snapshot,
@@ -605,7 +601,6 @@ impl PromptPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PromptPlanBuildInput<'a> {
-    pub protocol: ApiProtocol,
     pub model_id: &'a str,
     pub prelude: &'a [PromptMessage],
     pub snapshot: &'a RuntimeSnapshot,
@@ -632,7 +627,6 @@ pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
 }
 
 pub(crate) fn build_prompt_plan_suffix(
-    protocol: ApiProtocol,
     model_id: &str,
     snapshot: &RuntimeSnapshot,
     selected_frames: &[ProtocolFrame],
@@ -640,7 +634,6 @@ pub(crate) fn build_prompt_plan_suffix(
 ) -> PromptPlan {
     let mut suffix = build_prompt_plan_with_runtime_material(
         PromptPlanBuildInput {
-            protocol,
             model_id,
             prelude: &[],
             snapshot,
@@ -660,8 +653,7 @@ fn build_prompt_plan_with_runtime_material(
     input: PromptPlanBuildInput<'_>,
     include_runtime_material: bool,
 ) -> PromptPlan {
-    let mut builder =
-        PromptPlanBuilder::new(input.protocol, input.model_id, input.segment_order_offset);
+    let mut builder = PromptPlanBuilder::new(input.model_id, input.segment_order_offset);
 
     for message in input.prelude {
         let classification = classify_prelude_message(message);
@@ -776,7 +768,7 @@ fn build_prompt_plan_with_runtime_material(
             classify_history_frame(frame, index >= current_turn_start, provenance.as_ref());
         if !matches!(
             frame.item,
-            ProtocolFrameItem::AssistantToolCalls { .. } | ProtocolFrameItem::ToolOutput { .. }
+            ProtocolFrameItem::AssistantTurn { .. } | ProtocolFrameItem::ToolOutput { .. }
         ) && let Some(contributor) = frame.runtime_frame_id.and_then(|id| {
             input
                 .snapshot
@@ -798,10 +790,9 @@ fn build_prompt_plan_with_runtime_material(
             protection: PromptSegmentProtection {
                 current_turn: index >= current_turn_start,
                 protocol_boundary: matches!(
-                    frame.item,
-                    ProtocolFrameItem::AssistantToolCalls { .. }
-                        | ProtocolFrameItem::ToolOutput { .. }
-                ),
+                    &frame.item,
+                    ProtocolFrameItem::AssistantTurn { calls, .. } if !calls.is_empty()
+                ) || matches!(frame.item, ProtocolFrameItem::ToolOutput { .. }),
                 retained: true,
             },
             provenance,
@@ -949,7 +940,6 @@ fn last_user_frame_index(frames: &[ProtocolFrame]) -> Option<usize> {
 }
 
 struct PromptPlanBuilder {
-    protocol: ApiProtocol,
     model_id: String,
     segment_order_offset: usize,
     contributors: Vec<PromptContributor>,
@@ -957,9 +947,8 @@ struct PromptPlanBuilder {
 }
 
 impl PromptPlanBuilder {
-    fn new(protocol: ApiProtocol, model_id: &str, segment_order_offset: usize) -> Self {
+    fn new(model_id: &str, segment_order_offset: usize) -> Self {
         Self {
-            protocol,
             model_id: model_id.to_string(),
             segment_order_offset,
             contributors: Vec::new(),
@@ -1084,7 +1073,6 @@ impl PromptPlanBuilder {
             segment.cache.cache_eligible = true;
         }
         PromptPlan {
-            protocol: self.protocol,
             model_id: self.model_id,
             contributors: self.contributors,
             segments: self.segments,
@@ -1221,15 +1209,14 @@ fn classify_history_frame(
             RuntimeSource::Transcript,
             PromptSegmentRetention::Retained,
         ),
-        ProtocolFrameItem::AssistantText { .. } => (
+        ProtocolFrameItem::AssistantTurn { calls, .. } => (
             PromptSegmentRole::Assistant,
             RuntimeSource::Transcript,
-            PromptSegmentRetention::Retained,
-        ),
-        ProtocolFrameItem::AssistantToolCalls { .. } => (
-            PromptSegmentRole::Assistant,
-            RuntimeSource::Transcript,
-            PromptSegmentRetention::Required,
+            if calls.is_empty() {
+                PromptSegmentRetention::Retained
+            } else {
+                PromptSegmentRetention::Required
+            },
         ),
         ProtocolFrameItem::ToolOutput { .. } => (
             PromptSegmentRole::Tool,
@@ -1364,17 +1351,27 @@ fn history_item_text(item: &HistoryItem) -> String {
         HistoryItem::ContextSummary { text } => render_context_summary(text),
         HistoryItem::UserMessage { content } => content.prompt_plan_text(),
         HistoryItem::InternalContinuation { text } => text.clone(),
-        HistoryItem::AssistantText { text } => text.clone(),
-        HistoryItem::AssistantToolCalls { text, calls, .. } => {
+        HistoryItem::AssistantTurn {
+            text,
+            reasoning_content,
+            calls,
+            ..
+        } => {
             let calls_text = calls
                 .iter()
                 .map(|call| format!("{} {} {}", call.call_id, call.name, call.arguments_json))
                 .collect::<Vec<_>>()
                 .join("\n");
-            match text {
-                Some(text) if !text.is_empty() => format!("{text}\n{calls_text}"),
-                _ => calls_text,
-            }
+            [
+                reasoning_content.as_deref(),
+                text.as_deref(),
+                (!calls_text.is_empty()).then_some(calls_text.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
         }
         HistoryItem::ToolOutput {
             call_id,
@@ -1442,22 +1439,27 @@ fn history_item_content(item: &HistoryItem) -> PromptSegmentContent {
         HistoryItem::ContextSummary { text } => PromptSegmentContent::Text {
             text: render_context_summary(text),
         },
-        HistoryItem::InternalContinuation { text } | HistoryItem::AssistantText { text } => {
+        HistoryItem::InternalContinuation { text } => {
             PromptSegmentContent::Text { text: text.clone() }
         }
         HistoryItem::UserMessage { content } => PromptSegmentContent::UserContent {
             content: content.clone(),
         },
-        HistoryItem::AssistantToolCalls {
+        HistoryItem::AssistantTurn {
             text,
             reasoning_content,
-            reasoning_wire,
+            replay,
             calls,
-        } => PromptSegmentContent::AssistantToolCalls {
-            text: text.clone(),
-            reasoning_content: reasoning_content.clone(),
-            reasoning_wire: reasoning_wire.clone(),
-            calls: calls.clone(),
+        } if !calls.is_empty() || reasoning_content.is_some() || replay.is_some() => {
+            PromptSegmentContent::AssistantToolCalls {
+                text: text.clone(),
+                reasoning_content: reasoning_content.clone(),
+                replay: replay.clone(),
+                calls: calls.clone(),
+            }
+        }
+        HistoryItem::AssistantTurn { text, .. } => PromptSegmentContent::Text {
+            text: text.clone().unwrap_or_default(),
         },
         HistoryItem::ToolOutput {
             call_id,
@@ -1506,7 +1508,6 @@ mod tests {
     #[test]
     fn prompt_plan_marks_stable_prefix_boundary() {
         let plan = build_prompt_plan(PromptPlanBuildInput {
-            protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             prelude: &[
                 PromptMessage::system("system"),
@@ -1538,9 +1539,35 @@ mod tests {
     }
 
     #[test]
+    fn assistant_turn_without_calls_keeps_reasoning_and_replay_in_prompt_content() {
+        let replay = crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
+            r#"[{"type":"thinking","signature":"signed"}]"#,
+        )
+        .expect("replay state");
+        let item = HistoryItem::AssistantTurn {
+            text: Some("answer".into()),
+            reasoning_content: Some("reasoning".into()),
+            replay: Some(replay),
+            calls: Vec::new(),
+        };
+
+        assert!(matches!(
+            history_item_content(&item),
+            PromptSegmentContent::AssistantToolCalls {
+                text: Some(text),
+                reasoning_content: Some(reasoning),
+                replay: Some(replay),
+                calls,
+            } if text == "answer"
+                && reasoning == "reasoning"
+                && replay.payload.to_string().contains("signed")
+                && calls.is_empty()
+        ));
+    }
+
+    #[test]
     fn prompt_composition_groups_request_material_by_context_category() {
         let plan = build_prompt_plan(PromptPlanBuildInput {
-            protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             prelude: &[
                 PromptMessage::system("system"),
@@ -1553,10 +1580,10 @@ mod tests {
             selected_frames: &history_items_to_frames(&[
                 HistoryItem::user("question"),
                 HistoryItem::assistant("answer"),
-                HistoryItem::AssistantToolCalls {
+                HistoryItem::AssistantTurn {
                     text: None,
                     reasoning_content: None,
-                    reasoning_wire: None,
+                    replay: None,
                     calls: vec![HistoryToolCall {
                         call_id: "call-1".into(),
                         name: "fs__read".into(),
@@ -1633,7 +1660,6 @@ mod tests {
         protected_suffix_len: usize,
     ) -> PromptPlan {
         build_prompt_plan(PromptPlanBuildInput {
-            protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             prelude,
             snapshot: &RuntimeSnapshot::new("test"),
