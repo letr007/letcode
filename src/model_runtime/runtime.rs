@@ -1,11 +1,16 @@
 use super::{
     ContentPart, FailureKind, FailurePhase, HttpMethod, ModelEvent, ModelFailure, ModelMessage,
     ModelRequestInput, PreparedHttpRequest, ResolvedModelRoute, RetryHint, RuntimeRetryConfig,
-    TerminalStatus,
+    TerminalStatus, TransportResponse,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
+use futures_util::Stream;
+use std::collections::{BTreeMap, HashMap};
+use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 512 * 1024;
@@ -24,6 +29,242 @@ pub trait ModelTransport: Send + Sync {
 
 #[derive(Clone, Default)]
 pub struct ResolvedProviderTransport;
+
+pub(crate) struct TurnLocalResponsesTransport {
+    session: Arc<tokio::sync::Mutex<Option<crate::model_runtime::websocket::TurnLocalWsSession>>>,
+    previous_response_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    force_full: Arc<tokio::sync::Mutex<bool>>,
+    next_prompt_unit_start: Arc<tokio::sync::Mutex<Option<usize>>>,
+    poisoned_response: Arc<AtomicBool>,
+}
+
+impl TurnLocalResponsesTransport {
+    pub(crate) fn new() -> Self {
+        Self {
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+            previous_response_id: Arc::new(tokio::sync::Mutex::new(None)),
+            force_full: Arc::new(tokio::sync::Mutex::new(false)),
+            next_prompt_unit_start: Arc::new(tokio::sync::Mutex::new(None)),
+            poisoned_response: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) async fn set_next_prompt_unit_start(&self, prompt_unit_start: usize) {
+        *self.next_prompt_unit_start.lock().await = Some(prompt_unit_start);
+    }
+
+    pub(crate) async fn reset_chain(&self) {
+        *self.previous_response_id.lock().await = None;
+        *self.next_prompt_unit_start.lock().await = None;
+        *self.force_full.lock().await = true;
+    }
+}
+
+#[async_trait]
+impl ModelTransport for TurnLocalResponsesTransport {
+    async fn send_prepared(
+        &self,
+        route: &ResolvedModelRoute,
+        request: PreparedHttpRequest,
+    ) -> Result<TransportResponse, ModelFailure> {
+        let previous_response_id = self.previous_response_id.lock().await.clone();
+        let force_full = *self.force_full.lock().await;
+        if self.poisoned_response.swap(false, Ordering::AcqRel) {
+            *self.session.lock().await = None;
+        }
+        let can_continue = !force_full && previous_response_id.is_some();
+        let incremental_prompt_unit_start = if can_continue {
+            *self.next_prompt_unit_start.lock().await
+        } else {
+            None
+        };
+        let mut session_guard = self.session.lock().await;
+        if session_guard.is_none() {
+            let builder = route.transport.request(
+                reqwest::Method::POST,
+                &request.url,
+                &route.provider,
+                &route.auth,
+                &route.headers,
+                &route.query,
+            )?;
+            let builder = request
+                .protocol_headers
+                .iter()
+                .filter(|(name, _)| {
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "accept" | "content-type"
+                    )
+                })
+                .fold(builder, |builder, (name, value)| {
+                    builder.header(name, value)
+                });
+            *session_guard = Some(
+                route
+                    .transport
+                    .open_websocket(&route.protocol_id, builder, &route.auth)
+                    .await?,
+            );
+        }
+        let Some(session) = session_guard.as_mut() else {
+            return Err(
+                ModelFailure::new(FailurePhase::Transport, FailureKind::Internal)
+                    .with_code("websocket_session_missing"),
+            );
+        };
+        let frame_previous_response_id = can_continue
+            .then_some(previous_response_id.as_deref())
+            .flatten();
+        let frame = route.binding.websocket_frame(
+            &request,
+            frame_previous_response_id,
+            incremental_prompt_unit_start,
+        )?;
+        if let Err(error) = session
+            .send_text(
+                frame,
+                &[route.auth.credential.as_deref().unwrap_or_default()],
+            )
+            .await
+        {
+            *session_guard = None;
+            return Err(error);
+        }
+        drop(session_guard);
+        let stream = websocket_response_stream(
+            self.session.clone(),
+            self.previous_response_id.clone(),
+            self.force_full.clone(),
+            self.next_prompt_unit_start.clone(),
+            self.poisoned_response.clone(),
+            route.auth.credential.clone().unwrap_or_default(),
+        );
+        Ok(TransportResponse::from_stream(200, BTreeMap::new(), stream))
+    }
+}
+
+struct WebsocketResponseStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Vec<u8>, ModelFailure>> + Send>>,
+    terminal: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl Stream for WebsocketResponseStream {
+    type Item = Result<Vec<u8>, ModelFailure>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for WebsocketResponseStream {
+    fn drop(&mut self) {
+        if !self.terminal.load(Ordering::Acquire) {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn websocket_response_stream(
+    session: Arc<tokio::sync::Mutex<Option<crate::model_runtime::websocket::TurnLocalWsSession>>>,
+    previous_response_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    force_full: Arc<tokio::sync::Mutex<bool>>,
+    next_prompt_unit_start: Arc<tokio::sync::Mutex<Option<usize>>>,
+    poisoned: Arc<AtomicBool>,
+    secret: String,
+) -> WebsocketResponseStream {
+    let terminal = Arc::new(AtomicBool::new(false));
+    let terminal_for_stream = terminal.clone();
+    let inner = futures_util::stream::unfold(
+        (session, previous_response_id, secret, false),
+        move |(session, previous_response_id, secret, ended)| {
+            let force_full = force_full.clone();
+            let next_prompt_unit_start = next_prompt_unit_start.clone();
+            let terminal_for_stream = terminal_for_stream.clone();
+            async move {
+                if ended {
+                    return None;
+                }
+                let mut guard = session.lock().await;
+                let socket = guard.as_mut()?;
+                let result = socket.next_text(&[secret.as_str()]).await;
+                drop(guard);
+                match result {
+                    Ok(Some(text)) => {
+                        let value = serde_json::from_slice::<serde_json::Value>(&text).ok();
+                        let event_type = value
+                            .as_ref()
+                            .and_then(|value| value.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let is_successful_terminal =
+                            matches!(event_type, "response.completed" | "response.incomplete");
+                        let terminal_response_id = is_successful_terminal
+                            .then(|| {
+                                value
+                                    .as_ref()
+                                    .and_then(|value| value.get("response"))
+                                    .and_then(|response| response.get("id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .flatten();
+                        if is_successful_terminal {
+                            *previous_response_id.lock().await = terminal_response_id.clone();
+                        }
+                        if event_type == "error" {
+                            let code = value
+                                .as_ref()
+                                .and_then(|value| value.get("error"))
+                                .and_then(|error| error.get("code"))
+                                .and_then(serde_json::Value::as_str)
+                                .or_else(|| {
+                                    value
+                                        .as_ref()
+                                        .and_then(|value| value.get("code"))
+                                        .and_then(serde_json::Value::as_str)
+                                });
+                            if code == Some("previous_response_not_found") {
+                                *previous_response_id.lock().await = None;
+                                *force_full.lock().await = true;
+                            }
+                        }
+                        if is_successful_terminal {
+                            *force_full.lock().await = terminal_response_id.is_none();
+                            *next_prompt_unit_start.lock().await = None;
+                        }
+                        let is_terminal = is_successful_terminal
+                            || matches!(event_type, "response.failed" | "error");
+                        if is_terminal {
+                            terminal_for_stream.store(true, Ordering::Release);
+                        }
+                        Some((
+                            Ok(text),
+                            (session, previous_response_id, secret, is_terminal),
+                        ))
+                    }
+                    Ok(None) => {
+                        *session.lock().await = None;
+                        None
+                    }
+                    Err(error) => {
+                        *session.lock().await = None;
+                        Some((Err(error), (session, previous_response_id, secret, true)))
+                    }
+                }
+            }
+        },
+    );
+    WebsocketResponseStream {
+        inner: Box::pin(inner),
+        terminal,
+        poisoned,
+    }
+}
 
 #[async_trait]
 impl ModelTransport for ResolvedProviderTransport {
@@ -152,6 +393,7 @@ pub struct ModelAttemptFailure {
 #[derive(Clone)]
 pub struct ModelRuntime {
     transport: Arc<dyn ModelTransport>,
+    responses_websocket: bool,
 }
 
 impl Default for ModelRuntime {
@@ -162,7 +404,17 @@ impl Default for ModelRuntime {
 
 impl ModelRuntime {
     pub fn new(transport: Arc<dyn ModelTransport>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            responses_websocket: false,
+        }
+    }
+
+    pub(crate) fn new_responses_websocket(transport: Arc<dyn ModelTransport>) -> Self {
+        Self {
+            transport,
+            responses_websocket: true,
+        }
     }
 
     pub async fn execute_text_oneshot<F, Fut>(
@@ -266,7 +518,11 @@ impl ModelRuntime {
                 partial: ModelAttemptSnapshot::default(),
             });
         }
-        let mut decoder = route.binding.new_decoder();
+        let mut decoder = if self.responses_websocket && route.protocol_id.as_str() == "responses" {
+            route.binding.new_websocket_decoder()
+        } else {
+            route.binding.new_decoder()
+        };
         let mut accumulator = AttemptAccumulator::default();
         while let Some(chunk) = response.next_chunk().await {
             let chunk = chunk.map_err(|failure| accumulator.failed(failure))?;
@@ -968,8 +1224,11 @@ impl Default for ModelAttemptSnapshot {
 mod tests {
     use super::*;
     use crate::model_runtime::{ProtocolRegistry, RuntimeConfig, TransportResponse};
+    use futures_util::{SinkExt, StreamExt};
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, accept_hdr_async, tungstenite::Message};
 
     #[derive(Default)]
     struct QueueTransport {
@@ -1042,6 +1301,319 @@ reasoning = true
                 .map(|chunk| chunk.as_ref().to_vec())
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn websocket_transport_replays_full_input_without_previous_id_after_not_found() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::http::Request<()>, response| {
+                    assert_eq!(request.headers()["x-turn-header"], "present");
+                    assert!(request.headers().get("content-type").is_none());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            for (round, expected_previous, expected_input_len) in [
+                (1, None, 2usize),
+                (2, Some("resp-1"), 1usize),
+                (3, None, 2usize),
+            ] {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected a text request frame");
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["type"], "response.create");
+                assert_eq!(value["instructions"], "system instructions");
+                assert_eq!(value["tools"][0]["name"], "lookup");
+                assert_eq!(value["input"].as_array().unwrap().len(), expected_input_len);
+                assert_eq!(
+                    value
+                        .get("previous_response_id")
+                        .and_then(serde_json::Value::as_str),
+                    expected_previous
+                );
+                let response = if round == 2 {
+                    r#"{"type":"error","code":"previous_response_not_found","message":"stale response"}"#
+                        .to_owned()
+                } else {
+                    format!(
+                        r#"{{"type":"response.completed","response":{{"id":"resp-{round}","status":"completed"}}}}"#
+                    )
+                };
+                socket.send(Message::Text(response.into())).await.unwrap();
+            }
+        });
+
+        let config = format!(
+            r#"active_provider = "vendor"
+[providers.vendor]
+protocol = "responses"
+default_model = "model"
+flavor = "standard"
+[providers.vendor.transport]
+websocket = true
+[providers.vendor.auth]
+type = "none"
+[providers.vendor.endpoints]
+base_url = "http://{address}"
+[providers.vendor.models.model]
+[providers.vendor.models.model.capabilities]
+reasoning = true
+tools = true
+"#
+        );
+        let route = RuntimeConfig::from_toml(&config)
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap()
+            .route("vendor", "model")
+            .unwrap()
+            .clone();
+        let mut input = ModelRequestInput::new(
+            "model",
+            vec![
+                ModelMessage::text(super::super::MessageRole::User, "assistant history"),
+                ModelMessage::text(super::super::MessageRole::User, "tool output"),
+            ],
+        );
+        input.segments = vec![super::super::ControlSegment::system("system instructions")];
+        input.segment_origins = vec!["system".into()];
+        input.message_origins = vec!["history".into(), "tool".into()];
+        input.tools = vec![super::super::ToolDefinition::new(
+            "lookup",
+            "look something up",
+            serde_json::json!({"type":"object"}),
+        )];
+        let mut request = route.binding.prepare_request(&input).unwrap();
+        request
+            .protocol_headers
+            .insert("x-turn-header".into(), "present".into());
+        let transport = TurnLocalResponsesTransport::new();
+        let first = transport
+            .send_prepared(&route, request.clone())
+            .await
+            .unwrap();
+        drain_response(first).await;
+        transport.set_next_prompt_unit_start(2).await;
+        let second = transport
+            .send_prepared(&route, request.clone())
+            .await
+            .unwrap();
+        drain_response(second).await;
+        let third = transport.send_prepared(&route, request).await.unwrap();
+        drain_response(third).await;
+        assert!(!*transport.force_full.lock().await);
+        assert_eq!(*transport.next_prompt_unit_start.lock().await, None);
+        server.await.unwrap();
+    }
+
+    async fn drain_response(mut response: TransportResponse) {
+        while let Some(chunk) = response.next_chunk().await {
+            chunk.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_missing_terminal_response_id_forces_full_next_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for (round, expected_previous, expected_input_len) in
+                [(1, None, 2usize), (2, None, 2usize)]
+            {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected a text request frame");
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["input"].as_array().unwrap().len(), expected_input_len);
+                assert_eq!(
+                    value
+                        .get("previous_response_id")
+                        .and_then(serde_json::Value::as_str),
+                    expected_previous
+                );
+                let response = if round == 1 {
+                    r#"{"type":"response.completed","response":{"status":"completed"}}"#.to_owned()
+                } else {
+                    r#"{"type":"response.completed","response":{"id":"resp-2","status":"completed"}}"#
+                        .to_owned()
+                };
+                socket.send(Message::Text(response.into())).await.unwrap();
+            }
+        });
+        let route = route_for_local_server(address);
+        let request = local_responses_request(&route);
+        let transport = TurnLocalResponsesTransport::new();
+        let first = transport
+            .send_prepared(&route, request.clone())
+            .await
+            .unwrap();
+        drain_response(first).await;
+        assert!(*transport.force_full.lock().await);
+        assert_eq!(*transport.previous_response_id.lock().await, None);
+        transport.set_next_prompt_unit_start(1).await;
+        let second = transport.send_prepared(&route, request).await.unwrap();
+        drain_response(second).await;
+        assert!(!*transport.force_full.lock().await);
+        assert_eq!(
+            transport.previous_response_id.lock().await.as_deref(),
+            Some("resp-2")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_incremental_boundary_survives_frame_failure_until_send_succeeds() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for (expected_input_len, expected_previous) in
+                [(2usize, None), (1usize, Some("resp-1"))]
+            {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected a text request frame");
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["input"].as_array().unwrap().len(), expected_input_len);
+                assert_eq!(
+                    value
+                        .get("previous_response_id")
+                        .and_then(serde_json::Value::as_str),
+                    expected_previous
+                );
+                socket
+                    .send(Message::Text(
+                        r#"{"type":"response.completed","response":{"id":"resp-1","status":"completed"}}"#.into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let route = route_for_local_server(address);
+        let request = local_responses_request(&route);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["input"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let transport = TurnLocalResponsesTransport::new();
+        let first = transport
+            .send_prepared(&route, request.clone())
+            .await
+            .unwrap();
+        drain_response(first).await;
+        transport.set_next_prompt_unit_start(99).await;
+        assert!(
+            transport
+                .send_prepared(&route, request.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(*transport.next_prompt_unit_start.lock().await, Some(99));
+        transport.set_next_prompt_unit_start(1).await;
+        let second = transport.send_prepared(&route, request).await.unwrap();
+        drain_response(second).await;
+        assert!(!*transport.force_full.lock().await);
+        assert_eq!(*transport.next_prompt_unit_start.lock().await, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_response_drop_poison_reconnects_before_next_send() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut first_socket = accept_async(stream).await.unwrap();
+            let Message::Text(_) = first_socket.next().await.unwrap().unwrap() else {
+                panic!("expected first request frame");
+            };
+            first_socket
+                .send(Message::Text(
+                    r#"{"type":"response.output_text.delta","delta":"partial"}"#.into(),
+                ))
+                .await
+                .unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut second_socket = accept_async(stream).await.unwrap();
+            let Message::Text(text) = second_socket.next().await.unwrap().unwrap() else {
+                panic!("expected reconnected request frame");
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["input"].as_array().unwrap().len(), 2);
+            assert!(value.get("previous_response_id").is_none());
+            second_socket
+                .send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp-2","status":"completed"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let route = route_for_local_server(address);
+        let request = local_responses_request(&route);
+        let transport = TurnLocalResponsesTransport::new();
+        let mut partial = transport
+            .send_prepared(&route, request.clone())
+            .await
+            .unwrap();
+        assert!(partial.next_chunk().await.unwrap().is_ok());
+        drop(partial);
+        let next = transport.send_prepared(&route, request).await.unwrap();
+        drain_response(next).await;
+        server.await.unwrap();
+    }
+
+    fn route_for_local_server(address: std::net::SocketAddr) -> ResolvedModelRoute {
+        let config = format!(
+            r#"active_provider = "vendor"
+[providers.vendor]
+protocol = "responses"
+default_model = "model"
+flavor = "standard"
+[providers.vendor.transport]
+websocket = true
+[providers.vendor.auth]
+type = "none"
+[providers.vendor.endpoints]
+base_url = "http://{address}"
+[providers.vendor.models.model]
+[providers.vendor.models.model.capabilities]
+reasoning = true
+"#
+        );
+        RuntimeConfig::from_toml(&config)
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap()
+            .route("vendor", "model")
+            .unwrap()
+            .clone()
+    }
+
+    fn local_responses_request(route: &ResolvedModelRoute) -> PreparedHttpRequest {
+        let mut input = ModelRequestInput::new(
+            "model",
+            vec![
+                ModelMessage::text(super::super::MessageRole::User, "first"),
+                ModelMessage::text(super::super::MessageRole::User, "second"),
+            ],
+        );
+        input.message_origins = vec!["first".into(), "second".into()];
+        route.binding.prepare_request(&input).unwrap()
     }
 
     #[tokio::test]

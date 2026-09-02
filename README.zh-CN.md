@@ -157,6 +157,11 @@ base_url = "https://api.openai.com/v1"
 [providers.openai.endpoints.responses]
 path = "responses"
 
+# 可选的 provider transport；WebSocket 仅用于 Responses 普通 Agent 回合。
+# [providers.openai.transport]
+# websocket = false # 默认：HTTP/SSE transport
+# websocket = true  # 显式启用 turn-local Responses WebSocket
+
 # 必需：每个 provider 至少配置一个 model；model 内字段均可省略。
 [providers.openai.models."gpt-5.5"]
 display = "GPT-5.5"
@@ -215,6 +220,8 @@ Provider 凭据可使用 `credential_env`，或使用按 provider 名称生成�
 ## 模型运行架构
 
 配置通过不可变的 `ProtocolRegistry` 和 `ResolvedRuntimeCatalog` 解析为 `ResolvedModelRoute`。每次请求都表示为与协议无关的 `PromptPlan`。绑定到路由的 `ProtocolBinding` 负责 wire 编码、缓存行为和增量响应解码，所有 binding 共享增量式 `reqwest` transport 与 `ModelRuntime`。
+
+Provider transport 可在 `[providers.<name>.transport]` 下设置 `websocket = true`。该设置只影响 Responses 路由的普通 Agent turn：每个 turn 建立一条本地连接并按顺序发送请求。默认 runtime 调用、标题、摘要、压缩和其他 one-shot 调用仍使用 HTTP/SSE。连接不会进入全局池，也不会跨 turn 复用；WebSocket 失败不会回退到 HTTP。只有在能够证明语义连续时才使用 `previous_response_id`，否则发送完整请求。
 
 ## 更新日志
 

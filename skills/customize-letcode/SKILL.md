@@ -125,6 +125,7 @@ base_url = "https://api.openai.com/v1"
 # [providers.openai.transport]
 # connect_timeout_secs = 10
 # no_proxy_loopback = true
+# websocket = false # Responses only; normal Agent turns use one turn-local WS session
 # [providers.openai.headers]
 # x-provider-version = "2026-01-01"
 # [providers.openai.query]

@@ -134,6 +134,14 @@ where
             .ok()
         })
     });
+    let ws_transport = (route.protocol_id.as_str() == "responses" && route.transport.websocket())
+        .then(|| {
+            std::sync::Arc::new(crate::model_runtime::runtime::TurnLocalResponsesTransport::new())
+        });
+    let runtime = ws_transport
+        .as_ref()
+        .map(|transport| ModelRuntime::new_responses_websocket(transport.clone()))
+        .unwrap_or_default();
     let mut driver = ResolvedTurnDriver {
         agent,
         route: route.clone(),
@@ -155,8 +163,10 @@ where
         current_attempt: 1,
         scheduled_retry: None,
         fake_decorator,
+        ws_transport,
+        ws_previous: None,
     };
-    TurnOrchestrator::new(ModelRuntime::default(), limits)
+    TurnOrchestrator::new(runtime, limits)
         .run(&route, &mut driver)
         .await
         .map_err(anyhow::Error::new)?;
@@ -172,6 +182,12 @@ struct PreparedResolvedIteration {
     epoch_preview: crate::agent::ActiveEpochPreview,
     telemetry: LlmRequestTelemetry,
     observation: crate::request_builder::LogicalRequestObservation,
+    inspection: Option<crate::model_runtime::PreparedRequestInspection>,
+}
+
+struct WsRequestSnapshot {
+    inspection: crate::model_runtime::PreparedRequestInspection,
+    assistant_frontier: u64,
 }
 
 struct ResolvedTurnDriver<'a, F, E, A> {
@@ -195,6 +211,9 @@ struct ResolvedTurnDriver<'a, F, E, A> {
     current_attempt: usize,
     scheduled_retry: Option<LlmRetryLifecycle>,
     fake_decorator: Option<crate::model_runtime::decorator::FakeRequestDecorator>,
+    ws_transport:
+        Option<std::sync::Arc<crate::model_runtime::runtime::TurnLocalResponsesTransport>>,
+    ws_previous: Option<WsRequestSnapshot>,
 }
 
 #[async_trait::async_trait]
@@ -259,6 +278,7 @@ where
                 },
                 units: Vec::new(),
             },
+            inspection: None,
         });
         Ok(input)
     }
@@ -314,6 +334,7 @@ where
                 &prepared.build.prompt_plan,
             )
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+            prepared.inspection = Some(inspection.clone());
             let adjacent = self
                 .agent
                 .preview_logical_observation(prepared.observation.clone());
@@ -346,6 +367,33 @@ where
             prepared.telemetry.first_breaker = adjacent.first_breaker;
             prepared.telemetry.cohort_comparable = adjacent.cohort_comparable;
             prepared.telemetry.cohort_changed = adjacent.cohort_changed;
+        }
+        if let Some(ws_transport) = &self.ws_transport {
+            let current_inspection = self
+                .prepared
+                .as_ref()
+                .and_then(|prepared| prepared.inspection.as_ref());
+            let current_plan = self
+                .prepared
+                .as_ref()
+                .map(|prepared| &prepared.build.prompt_plan);
+            let boundary = match (&self.ws_previous, current_inspection, current_plan) {
+                (Some(previous), Some(current_inspection), Some(current_plan)) => {
+                    websocket_incremental_prompt_unit_start(
+                        current_inspection,
+                        current_plan,
+                        previous,
+                    )
+                }
+                _ => None,
+            };
+            if let Some(prompt_unit_start) = boundary {
+                ws_transport
+                    .set_next_prompt_unit_start(prompt_unit_start)
+                    .await;
+            } else {
+                ws_transport.reset_chain().await;
+            }
         }
         Ok(request)
     }
@@ -433,6 +481,12 @@ where
         delay: std::time::Duration,
         failure: &ModelFailure,
     ) -> std::result::Result<(), ModelFailure> {
+        if failure.code.as_deref() == Some("previous_response_not_found")
+            && let Some(ws_transport) = &self.ws_transport
+        {
+            self.ws_previous = None;
+            ws_transport.reset_chain().await;
+        }
         let retry = LlmRetryLifecycle {
             attempt: next_attempt,
             max_attempts: self
@@ -585,6 +639,38 @@ where
                 calls: calls.clone(),
             })
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        if let Some(ws_transport) = &self.ws_transport {
+            let frontier = self
+                .agent
+                .active_protocol_frames()
+                .iter()
+                .rev()
+                .find_map(|frame| {
+                    matches!(
+                        frame.item,
+                        crate::protocol_frames::ProtocolFrameItem::AssistantTurn { .. }
+                    )
+                    .then(|| {
+                        frame
+                            .source_provenance
+                            .as_ref()
+                            .and_then(|provenance| provenance.source_span)
+                            .map(|span| span.end_sequence)
+                    })
+                    .flatten()
+                });
+            if let (Some(prepared), Some(frontier)) = (&self.prepared, frontier) {
+                if let Some(inspection) = &prepared.inspection {
+                    self.ws_previous = Some(WsRequestSnapshot {
+                        inspection: inspection.clone(),
+                        assistant_frontier: frontier,
+                    });
+                }
+            } else {
+                self.ws_previous = None;
+                ws_transport.reset_chain().await;
+            }
+        }
         if let Some(prepared) = &self.prepared {
             if let Some(usage) = self.usage {
                 let mut cache_report = CacheUsageReport::from_build(&prepared.build);
@@ -691,6 +777,10 @@ where
         partial: &ModelAttemptSnapshot,
         _failure: &ModelFailure,
     ) -> std::result::Result<(), ModelFailure> {
+        if let Some(ws_transport) = &self.ws_transport {
+            self.ws_previous = None;
+            ws_transport.reset_chain().await;
+        }
         let pending = partial
             .events
             .iter()
@@ -794,6 +884,320 @@ where
         _result: &ModelAttemptResult,
     ) -> std::result::Result<(), ModelFailure> {
         Ok(())
+    }
+}
+
+fn websocket_incremental_prompt_unit_start(
+    current_inspection: &crate::model_runtime::PreparedRequestInspection,
+    current_plan: &crate::request_builder::prompt_plan::PromptPlan,
+    previous: &WsRequestSnapshot,
+) -> Option<usize> {
+    let previous_len = previous.inspection.prompt_units.len();
+    if current_inspection.request_shape != previous.inspection.request_shape
+        || current_inspection.prompt_units.len() <= previous_len
+        || current_inspection.prompt_units[..previous_len] != previous.inspection.prompt_units[..]
+    {
+        return None;
+    }
+
+    let mut last_span_end = previous.assistant_frontier;
+    let mut first_new_index = None;
+    for (offset, unit) in current_inspection.prompt_units[previous_len..]
+        .iter()
+        .enumerate()
+    {
+        let segment_id = (unit.semantic_segment_ids.len() == 1)
+            .then(|| unit.semantic_segment_ids[0].as_str())?;
+        let segment = current_plan.segment(segment_id)?;
+        let span = segment.source.provenance.source_span?;
+        let is_assistant_output = matches!(
+            segment.role,
+            crate::request_builder::prompt_plan::PromptSegmentRole::Assistant
+        ) && matches!(
+            &segment.content,
+            crate::request_builder::prompt_plan::PromptSegmentContent::Text { .. }
+                | crate::request_builder::prompt_plan::PromptSegmentContent::AssistantToolCalls { .. }
+        );
+        let is_new_client_input = matches!(
+            &segment.content,
+            crate::request_builder::prompt_plan::PromptSegmentContent::ToolOutput { .. }
+        ) || (matches!(
+            &segment.content,
+            crate::request_builder::prompt_plan::PromptSegmentContent::Text { .. }
+        ) && segment.source.source_label.as_deref()
+            == Some("internal_continuation"));
+
+        if span.end_sequence <= previous.assistant_frontier {
+            if first_new_index.is_some() || !is_assistant_output {
+                return None;
+            }
+            continue;
+        }
+        if span.start_sequence <= previous.assistant_frontier
+            || span.start_sequence <= last_span_end
+            || !is_new_client_input
+        {
+            return None;
+        }
+        if first_new_index.is_none() {
+            first_new_index = Some(previous_len + offset);
+        }
+        last_span_end = span.end_sequence;
+    }
+    first_new_index
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod websocket_incremental_tests {
+    use super::*;
+    use crate::model_runtime::{PreparedPromptUnitInspection, PreparedRequestInspection};
+    use crate::request_builder::prompt_plan::{
+        PromptPlan, PromptSegment, PromptSegmentContent, PromptSegmentProtection,
+        PromptSegmentRetention, PromptSegmentRole, PromptSegmentSource, PromptSegmentStability,
+        PromptTokenEstimate,
+    };
+    use crate::runtime_context::{
+        PromptContributorKind, RuntimeFrameProvenance, RuntimeSource, SourceSpan,
+    };
+
+    fn inspection(units: Vec<(&str, &[&str])>) -> PreparedRequestInspection {
+        PreparedRequestInspection {
+            request_shape: vec![1],
+            prompt_units: units
+                .into_iter()
+                .map(|(kind, ids)| PreparedPromptUnitInspection {
+                    identity: serde_json::json!({"type": kind}).to_string().into_bytes(),
+                    semantic_segment_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+                })
+                .collect(),
+            cache: Default::default(),
+        }
+    }
+
+    fn segment(
+        id: &str,
+        role: PromptSegmentRole,
+        source_span: Option<SourceSpan>,
+        source_label: Option<&str>,
+        content: PromptSegmentContent,
+    ) -> PromptSegment {
+        PromptSegment {
+            id: id.into(),
+            order: 0,
+            role,
+            contributor_id: id.into(),
+            source: PromptSegmentSource {
+                order: 0,
+                contributor_kind: PromptContributorKind::CurrentTurn,
+                provenance: RuntimeFrameProvenance {
+                    source: RuntimeSource::Transcript,
+                    label: None,
+                    source_span,
+                    source_id: None,
+                },
+                source_key: None,
+                source_label: source_label.map(str::to_owned),
+            },
+            stability: PromptSegmentStability::Volatile,
+            retention: PromptSegmentRetention::Required,
+            protection: PromptSegmentProtection::default(),
+            cache: crate::request_builder::prompt_plan::PromptCacheMetadata {
+                cache_eligible: false,
+                boundary: None,
+                prefix_hash: None,
+            },
+            tokens: PromptTokenEstimate {
+                estimated_input_tokens: None,
+                budget_input_tokens: None,
+                actual_input_tokens: None,
+            },
+            text: id.into(),
+            content,
+        }
+    }
+
+    fn plan_with_assistant_and_tool(
+        assistant_span: Option<SourceSpan>,
+        tool_span: Option<SourceSpan>,
+    ) -> PromptPlan {
+        PromptPlan {
+            model_id: "test".into(),
+            contributors: Vec::new(),
+            segments: vec![
+                segment(
+                    "assistant",
+                    PromptSegmentRole::Assistant,
+                    assistant_span,
+                    None,
+                    PromptSegmentContent::AssistantToolCalls {
+                        text: Some("calling lookup".into()),
+                        reasoning_content: None,
+                        replay: None,
+                        calls: vec![crate::request_builder::HistoryToolCall {
+                            call_id: "call".into(),
+                            name: "lookup".into(),
+                            arguments_json: "{}".into(),
+                        }],
+                    },
+                ),
+                segment(
+                    "tool",
+                    PromptSegmentRole::Tool,
+                    tool_span,
+                    None,
+                    PromptSegmentContent::ToolOutput {
+                        call_id: "call".into(),
+                        output_json: "{}".into(),
+                        images: Vec::new(),
+                    },
+                ),
+            ],
+            stable_prefix_end: None,
+            kernel_end_exclusive: 0,
+            envelope_end_exclusive: 0,
+        }
+    }
+
+    fn previous_snapshot() -> WsRequestSnapshot {
+        WsRequestSnapshot {
+            inspection: inspection(vec![("instructions", &["system"]), ("message", &["user"])]),
+            assistant_frontier: 10,
+        }
+    }
+
+    #[test]
+    fn websocket_incremental_boundary_accepts_only_new_tool_output() {
+        let current = inspection(vec![
+            ("instructions", &["system"]),
+            ("message", &["user"]),
+            ("message", &["assistant"]),
+            ("message", &["tool"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &current,
+                &plan_with_assistant_and_tool(
+                    Some(SourceSpan::new(10, 10).unwrap()),
+                    Some(SourceSpan::new(11, 12).unwrap()),
+                ),
+                &previous_snapshot(),
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn websocket_incremental_boundary_skips_repeated_assistant_units() {
+        let current = inspection(vec![
+            ("instructions", &["system"]),
+            ("message", &["user"]),
+            ("message", &["assistant"]),
+            ("message", &["assistant"]),
+            ("message", &["tool"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &current,
+                &plan_with_assistant_and_tool(
+                    Some(SourceSpan::new(10, 10).unwrap()),
+                    Some(SourceSpan::new(11, 12).unwrap()),
+                ),
+                &previous_snapshot(),
+            ),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn websocket_incremental_boundary_resets_for_unsafe_prefix_or_missing_span() {
+        let unsafe_prefix = inspection(vec![
+            ("instructions", &["changed"]),
+            ("message", &["user"]),
+            ("message", &["assistant"]),
+            ("message", &["tool"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &unsafe_prefix,
+                &plan_with_assistant_and_tool(
+                    Some(SourceSpan::new(10, 10).unwrap()),
+                    Some(SourceSpan::new(11, 12).unwrap()),
+                ),
+                &previous_snapshot(),
+            ),
+            None
+        );
+
+        let current = inspection(vec![
+            ("instructions", &["system"]),
+            ("message", &["user"]),
+            ("message", &["assistant"]),
+            ("message", &["tool"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &current,
+                &plan_with_assistant_and_tool(Some(SourceSpan::new(10, 10).unwrap()), None,),
+                &previous_snapshot(),
+            ),
+            None
+        );
+
+        let crossing = inspection(vec![
+            ("instructions", &["system"]),
+            ("message", &["user"]),
+            ("message", &["assistant"]),
+            ("message", &["tool"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &crossing,
+                &plan_with_assistant_and_tool(
+                    Some(SourceSpan::new(10, 11).unwrap()),
+                    Some(SourceSpan::new(12, 13).unwrap()),
+                ),
+                &previous_snapshot(),
+            ),
+            None
+        );
+
+        let old_after_new = inspection(vec![
+            ("instructions", &["system"]),
+            ("message", &["user"]),
+            ("message", &["assistant"]),
+            ("message", &["tool"]),
+            ("message", &["assistant"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &old_after_new,
+                &plan_with_assistant_and_tool(
+                    Some(SourceSpan::new(10, 10).unwrap()),
+                    Some(SourceSpan::new(11, 12).unwrap()),
+                ),
+                &previous_snapshot(),
+            ),
+            None
+        );
+
+        let multi_origin = inspection(vec![
+            ("instructions", &["system"]),
+            ("message", &["user"]),
+            ("message", &["assistant", "other"]),
+            ("message", &["tool"]),
+        ]);
+        assert_eq!(
+            websocket_incremental_prompt_unit_start(
+                &multi_origin,
+                &plan_with_assistant_and_tool(
+                    Some(SourceSpan::new(10, 10).unwrap()),
+                    Some(SourceSpan::new(11, 12).unwrap()),
+                ),
+                &previous_snapshot(),
+            ),
+            None
+        );
     }
 }
 

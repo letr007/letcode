@@ -53,6 +53,7 @@ arboard = "3.4"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [target.'cfg(windows)'.dependencies]
 cap-fs-ext = "4.0"

@@ -157,6 +157,11 @@ base_url = "https://api.openai.com/v1"
 [providers.openai.endpoints.responses]
 path = "responses"
 
+# Optional provider transport; WebSocket is limited to Responses normal Agent turns.
+# [providers.openai.transport]
+# websocket = false # default: HTTP/SSE transport
+# websocket = true  # opt in to a turn-local Responses WebSocket
+
 # Required: each provider needs at least one model; every field inside the model is optional.
 [providers.openai.models."gpt-5.5"]
 display = "GPT-5.5"
@@ -215,6 +220,8 @@ Optional Langfuse/OpenTelemetry tracing is off by default. Enable it with `LETCO
 ## Model runtime architecture
 
 Configuration is resolved through an immutable `ProtocolRegistry` and `ResolvedRuntimeCatalog` into a `ResolvedModelRoute`. Each request is represented as a protocol-neutral `PromptPlan`. A route-bound `ProtocolBinding` owns wire encoding, cache behavior, and incremental response decoding, while all bindings share the incremental `reqwest` transport and `ModelRuntime`.
+
+Provider transport may set `websocket = true` under `[providers.<name>.transport]`. This affects only normal Agent turns on Responses routes: one turn-local WebSocket is opened and requests are sent sequentially. Default runtime calls, titles, summaries, compaction, and other one-shot calls remain HTTP/SSE. The session is not pooled or shared across turns; WebSocket failures do not fall back to HTTP. Safe Responses continuation may use `previous_response_id`; when continuity cannot be proven, the turn sends a complete request instead.
 
 ## Changelog
 

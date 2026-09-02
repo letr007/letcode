@@ -438,6 +438,7 @@ pub(crate) fn route_runtime_fingerprint_eq(
         && left_provider.query == right_provider.query
         && left_provider.connect_timeout_secs == right_provider.connect_timeout_secs
         && left_provider.no_proxy_loopback == right_provider.no_proxy_loopback
+        && left_provider.websocket == right_provider.websocket
         && left_provider.models.get(&route.model) == right_provider.models.get(&route.model)
 }
 
@@ -612,6 +613,40 @@ mod expert_route_switch_tests {
         ));
         assert!(!reload_has_runtime_delta(
             true, true, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn route_fingerprint_detects_websocket_transport_changes() {
+        let config = |websocket: bool| {
+            let websocket = if websocket {
+                "[providers.vendor.transport]\nwebsocket = true\n"
+            } else {
+                ""
+            };
+            crate::model_runtime::RuntimeConfig::from_toml(&format!(
+                r#"active_provider = "vendor"
+[providers.vendor]
+protocol = "responses"
+default_model = "model"
+[providers.vendor.auth]
+type = "none"
+[providers.vendor.endpoints]
+base_url = "https://example.invalid/v1"
+{websocket}[providers.vendor.models.model]
+"#
+            ))
+            .unwrap()
+            .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+            .unwrap()
+            .fingerprint()
+            .clone()
+        };
+        let route = ModelRoute::new("vendor", "model");
+        assert!(!route_runtime_fingerprint_eq(
+            &config(false),
+            &config(true),
+            &route
         ));
     }
 

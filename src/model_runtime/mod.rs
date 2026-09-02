@@ -11,6 +11,7 @@ pub(crate) mod adapters;
 pub(crate) mod decorator;
 pub(crate) mod projection;
 pub(crate) mod runtime;
+pub(crate) mod websocket;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -537,12 +538,26 @@ pub trait ProtocolBinding: Send + Sync {
         &self,
         input: &ModelRequestInput,
     ) -> Result<PreparedHttpRequest, ModelFailure>;
+    fn websocket_frame(
+        &self,
+        _request: &PreparedHttpRequest,
+        _previous_response_id: Option<&str>,
+        _incremental_prompt_unit_start: Option<usize>,
+    ) -> Result<Vec<u8>, ModelFailure> {
+        Err(
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_unsupported_protocol"),
+        )
+    }
     fn inspect_prepared_request(
         &self,
         request: &PreparedHttpRequest,
         stable_request: Option<&PreparedHttpRequest>,
     ) -> Result<PreparedRequestInspection, ModelFailure>;
     fn new_decoder(&self) -> Box<dyn ModelStreamDecoder>;
+    fn new_websocket_decoder(&self) -> Box<dyn ModelStreamDecoder> {
+        self.new_decoder()
+    }
 
     fn accepts_replay_state(&self, state: &OpaqueReplayState) -> bool {
         self.replay_scope()
@@ -840,6 +855,17 @@ impl TransportResponse {
     pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, ModelFailure>> {
         use futures_util::StreamExt;
         self.body.next().await
+    }
+
+    pub(crate) fn from_stream<S>(status: u16, headers: BTreeMap<String, String>, stream: S) -> Self
+    where
+        S: futures_util::Stream<Item = Result<Vec<u8>, ModelFailure>> + Send + 'static,
+    {
+        Self {
+            status,
+            headers,
+            body: Box::pin(stream),
+        }
     }
 
     #[cfg(test)]
@@ -1630,6 +1656,8 @@ pub struct RuntimeTransportConfig {
     pub connect_timeout_secs: u64,
     #[serde(default = "default_true")]
     pub no_proxy_loopback: bool,
+    #[serde(default)]
+    pub websocket: bool,
 }
 
 impl Default for RuntimeTransportConfig {
@@ -1637,6 +1665,7 @@ impl Default for RuntimeTransportConfig {
         Self {
             connect_timeout_secs: default_connect_timeout_secs(),
             no_proxy_loopback: true,
+            websocket: false,
         }
     }
 }
@@ -2583,6 +2612,7 @@ pub struct ProviderTransport {
     client: reqwest::Client,
     connect_timeout: Duration,
     no_proxy_loopback: bool,
+    websocket: bool,
 }
 
 impl ProviderTransport {
@@ -2623,11 +2653,64 @@ impl ProviderTransport {
             client,
             connect_timeout: Duration::from_secs(config.connect_timeout_secs),
             no_proxy_loopback: config.no_proxy_loopback,
+            websocket: config.websocket,
         })
     }
 
     pub fn client(&self) -> reqwest::Client {
         self.client.clone()
+    }
+
+    pub(crate) async fn open_websocket(
+        &self,
+        protocol: &ProtocolId,
+        request: reqwest::RequestBuilder,
+        auth: &RuntimeAuthConfig,
+    ) -> Result<websocket::TurnLocalWsSession, ModelFailure> {
+        if protocol.as_str() != "responses" {
+            return Err(
+                ModelFailure::new(FailurePhase::Transport, FailureKind::InvalidRequest)
+                    .with_code("websocket_unsupported_protocol"),
+            );
+        }
+        if !self.websocket {
+            return Err(
+                ModelFailure::new(FailurePhase::Transport, FailureKind::InvalidRequest)
+                    .with_code("websocket_disabled"),
+            );
+        }
+        let request = request.build().map_err(|error| {
+            ModelFailure::new(FailurePhase::Transport, FailureKind::InvalidRequest)
+                .with_code("request_build_failed")
+                .with_detail_redacted(
+                    error.to_string(),
+                    &[auth.credential.as_deref().unwrap_or_default()],
+                )
+        })?;
+        let mut owned_secrets = vec![auth.credential.clone().unwrap_or_default()];
+        owned_secrets.extend(
+            request
+                .url()
+                .query_pairs()
+                .map(|(_, value)| value.into_owned())
+                .filter(|value| !value.is_empty()),
+        );
+        owned_secrets.extend(
+            request
+                .headers()
+                .values()
+                .filter_map(|value| value.to_str().ok())
+                .filter(|value| value.len() > 1)
+                .map(str::to_owned),
+        );
+        let secrets = owned_secrets.iter().map(String::as_str).collect::<Vec<_>>();
+        websocket::TurnLocalWsSession::connect(
+            self.client.clone(),
+            request,
+            self.connect_timeout,
+            &secrets,
+        )
+        .await
     }
 
     pub async fn send(
@@ -2751,6 +2834,10 @@ impl ProviderTransport {
 
     pub fn no_proxy_loopback(&self) -> bool {
         self.no_proxy_loopback
+    }
+
+    pub fn websocket(&self) -> bool {
+        self.websocket
     }
 
     pub fn apply_request(
@@ -3117,6 +3204,7 @@ pub struct ProviderFingerprint {
     pub query: BTreeMap<String, String>,
     pub connect_timeout_secs: u64,
     pub no_proxy_loopback: bool,
+    pub websocket: bool,
     pub models: BTreeMap<String, ModelFingerprint>,
 }
 
@@ -3134,6 +3222,7 @@ impl fmt::Debug for ProviderFingerprint {
             .field("query", &"<hashed>")
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("no_proxy_loopback", &self.no_proxy_loopback)
+            .field("websocket", &self.websocket)
             .field("models", &self.models)
             .finish()
     }
@@ -3212,6 +3301,7 @@ impl RuntimeFingerprint {
                             query: provider.query.clone(),
                             connect_timeout_secs: provider.transport.connect_timeout.as_secs(),
                             no_proxy_loopback: provider.transport.no_proxy_loopback,
+                            websocket: provider.transport.websocket,
                             models: provider
                                 .models
                                 .iter()
@@ -3763,6 +3853,63 @@ base_url = "https://example.invalid/v1"
 {model_extra}
 "#
         )
+    }
+
+    #[test]
+    fn websocket_transport_defaults_off_and_is_resolved_into_fingerprint() {
+        let default =
+            RuntimeConfig::from_toml(&runtime_config("default-ws", "type = \"none\"", "", ""))
+                .unwrap()
+                .resolve(&ProtocolRegistry::builtins())
+                .unwrap();
+        assert!(
+            !default
+                .route("default-ws", "model")
+                .unwrap()
+                .transport
+                .websocket()
+        );
+        assert!(!default.fingerprint().providers["default-ws"].websocket);
+
+        let enabled = RuntimeConfig::from_toml(&runtime_config(
+            "enabled-ws",
+            "type = \"none\"",
+            "[providers.enabled-ws.transport]\nwebsocket = true",
+            "",
+        ))
+        .unwrap()
+        .resolve(&ProtocolRegistry::builtins())
+        .unwrap();
+        assert!(
+            enabled
+                .route("enabled-ws", "model")
+                .unwrap()
+                .transport
+                .websocket()
+        );
+        assert!(enabled.fingerprint().providers["enabled-ws"].websocket);
+        assert_ne!(default.fingerprint(), enabled.fingerprint());
+    }
+
+    #[test]
+    fn websocket_transport_allows_provider_mixed_protocols() {
+        let config = runtime_config(
+            "mixed-protocols",
+            "type = \"none\"",
+            "[providers.mixed-protocols.transport]\nwebsocket = true",
+            "protocol = \"completions\"",
+        );
+        let resolved = RuntimeConfig::from_toml(&config)
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap();
+        assert!(
+            resolved
+                .route("mixed-protocols", "model")
+                .unwrap()
+                .transport
+                .websocket()
+        );
     }
 
     #[test]

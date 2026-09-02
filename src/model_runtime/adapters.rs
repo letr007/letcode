@@ -2477,6 +2477,60 @@ impl ProtocolBinding for ResponsesBinding {
         })
     }
 
+    fn websocket_frame(
+        &self,
+        request: &PreparedHttpRequest,
+        previous_response_id: Option<&str>,
+        incremental_prompt_unit_start: Option<usize>,
+    ) -> Result<Vec<u8>, ModelFailure> {
+        let mut body: Value = serde_json::from_slice(&request.body).map_err(|error| {
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_frame_request")
+                .with_detail(error.to_string())
+        })?;
+        let fields = body.as_object_mut().ok_or_else(|| {
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_frame_shape")
+        })?;
+        if let Some(prompt_unit_start) = incremental_prompt_unit_start {
+            let instructions_present = fields
+                .get("instructions")
+                .is_some_and(|instructions| !instructions.is_null());
+            let input_start = prompt_unit_start
+                .checked_sub(usize::from(instructions_present))
+                .ok_or_else(|| {
+                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                        .with_code("websocket_frame_input_boundary")
+                })?;
+            let input = fields
+                .get_mut("input")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| {
+                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                        .with_code("websocket_frame_input")
+                })?;
+            if input_start > input.len() {
+                return Err(
+                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                        .with_code("websocket_frame_input_boundary"),
+                );
+            }
+            *input = input[input_start..].to_vec();
+        }
+        fields.insert("type".into(), Value::String("response.create".into()));
+        if let Some(previous_response_id) = previous_response_id {
+            fields.insert(
+                "previous_response_id".into(),
+                Value::String(previous_response_id.to_owned()),
+            );
+        }
+        serde_json::to_vec(&body).map_err(|error| {
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::Internal)
+                .with_code("websocket_frame_serialization")
+                .with_detail(error.to_string())
+        })
+    }
+
     fn inspect_prepared_request(
         &self,
         request: &PreparedHttpRequest,
@@ -2537,6 +2591,12 @@ impl ProtocolBinding for ResponsesBinding {
             self.profile,
             self.replay_scope(),
         ))
+    }
+
+    fn new_websocket_decoder(&self) -> Box<dyn ModelStreamDecoder> {
+        Box::new(ResponsesWebSocketDecoder {
+            inner: ResponsesDecoder::new(self.identity.clone(), self.profile, self.replay_scope()),
+        })
     }
 }
 
@@ -3290,11 +3350,11 @@ struct ResponsesStreamEvent {
     #[serde(default)]
     error: Option<ResponsesError>,
     #[serde(default)]
-    code: Option<String>,
+    code: Option<Value>,
     #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
+    message: Option<Value>,
+    #[serde(default, alias = "status_code")]
+    status: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -3380,10 +3440,14 @@ struct ResponsesTokenDetails {
 
 #[derive(Debug, Deserialize, Serialize, Default)]
 struct ResponsesError {
+    #[serde(default, alias = "status_code")]
+    status: Option<Value>,
+    #[serde(rename = "type", default)]
+    error_type: Option<Value>,
     #[serde(default)]
-    code: Option<String>,
+    code: Option<Value>,
     #[serde(default)]
-    message: Option<String>,
+    message: Option<Value>,
     #[serde(default)]
     param: Option<String>,
     #[serde(default)]
@@ -3673,17 +3737,28 @@ impl ResponsesDecoder {
                 if self.terminal {
                     return Err(decode_invalid("duplicate terminal event"));
                 }
-                let error = event.error.or_else(|| {
-                    if event.code.is_some() || event.message.is_some() || event.status.is_some() {
-                        Some(ResponsesError {
-                            code: event.code,
-                            message: event.message,
-                            ..ResponsesError::default()
-                        })
-                    } else {
-                        None
-                    }
-                });
+                let status = event.status.clone();
+                let error = event
+                    .error
+                    .map(|mut error| {
+                        if error.status.is_none() {
+                            error.status = status.clone();
+                        }
+                        error
+                    })
+                    .or_else(|| {
+                        if event.code.is_some() || event.message.is_some() || event.status.is_some()
+                        {
+                            Some(ResponsesError {
+                                status,
+                                code: event.code,
+                                message: event.message,
+                                ..ResponsesError::default()
+                            })
+                        } else {
+                            None
+                        }
+                    });
                 output.push(ModelEvent::Failure(error_failure(
                     FailurePhase::Decode,
                     error,
@@ -3877,6 +3952,40 @@ impl ResponsesDecoder {
     }
 }
 
+struct ResponsesWebSocketDecoder {
+    inner: ResponsesDecoder,
+}
+
+impl ModelStreamDecoder for ResponsesWebSocketDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ModelEvent>, ModelFailure> {
+        let event: ResponsesStreamEvent = serde_json::from_slice(chunk).map_err(|error| {
+            ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
+                .with_code("malformed_websocket_json")
+                .with_detail(error.to_string())
+        })?;
+        if event.event_type.is_empty() {
+            return Err(decode_invalid("websocket event type is required"));
+        }
+        let data = serde_json::to_string(&event).map_err(|error| {
+            ModelFailure::new(FailurePhase::Decode, FailureKind::Internal)
+                .with_code("websocket_event_serialization")
+                .with_detail(error.to_string())
+        })?;
+        let framed = format!("event: {}\ndata: {}\n\n", event.event_type, data);
+        self.inner.push(framed.as_bytes())
+    }
+
+    fn finish(&mut self) -> Result<Vec<ModelEvent>, ModelFailure> {
+        self.inner.finish().map_err(|failure| {
+            if failure.code.as_deref() == Some("missing_terminal_event") {
+                failure.with_code("websocket_closed_before_terminal")
+            } else {
+                failure
+            }
+        })
+    }
+}
+
 impl ModelStreamDecoder for ResponsesDecoder {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ModelEvent>, ModelFailure> {
         let events = self.framer.push(chunk).map_err(|error| {
@@ -3928,14 +4037,37 @@ fn response_failure(phase: FailurePhase, error: Option<ResponsesError>) -> Model
     error_failure(phase, error)
 }
 
+fn response_error_string(value: Option<Value>, fallback: &str) -> String {
+    match value {
+        Some(Value::String(value)) => value,
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(value) if !value.is_null() => value.to_string(),
+        _ => fallback.to_owned(),
+    }
+}
+
+fn response_error_status(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
 fn error_failure(phase: FailurePhase, error: Option<ResponsesError>) -> ModelFailure {
     let error = error.unwrap_or_default();
-    let code = error.code.unwrap_or_else(|| "provider_error".into());
+    let code = response_error_string(error.code.or(error.error_type), "provider_error");
     let normalized = code.to_ascii_lowercase();
-    let status = normalized
-        .strip_prefix("http_")
-        .and_then(|value| value.parse::<u16>().ok())
-        .or_else(|| normalized.parse::<u16>().ok());
+    let status = error
+        .status
+        .as_ref()
+        .and_then(response_error_status)
+        .or_else(|| {
+            normalized
+                .strip_prefix("http_")
+                .and_then(|value| value.parse::<u16>().ok())
+                .or_else(|| normalized.parse::<u16>().ok())
+        });
     let kind = if status == Some(429)
         || normalized.contains("rate_limit")
         || normalized.contains("too_many_requests")
@@ -3962,6 +4094,7 @@ fn error_failure(phase: FailurePhase, error: Option<ResponsesError>) -> ModelFai
             | "overloaded"
             | "bad_gateway"
             | "gateway_timeout"
+            | "previous_response_not_found"
     );
     let retry_hint = match kind {
         FailureKind::RateLimited | FailureKind::Timeout => RetryHint::Retryable,
@@ -3972,6 +4105,8 @@ fn error_failure(phase: FailurePhase, error: Option<ResponsesError>) -> ModelFai
     };
     let detail = error
         .message
+        .map(|value| response_error_string(Some(value), ""))
+        .filter(|value| !value.is_empty())
         .or(error.param)
         .or_else(|| error.detail.map(|value| value.to_string()))
         .unwrap_or_else(|| "provider reported a Responses error".into());
@@ -4084,6 +4219,167 @@ mod tests {
 
     fn sse(event: &str, data: &str) -> Vec<u8> {
         format!("event: {event}\ndata: {data}\n\n").into_bytes()
+    }
+
+    #[test]
+    fn responses_websocket_frame_uses_response_create_and_previous_response_id() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let input = ModelRequestInput::new("gpt-responses", Vec::new());
+        let request = binding.prepare_request(&input).unwrap();
+        let normal: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(normal.get("previous_response_id").is_none());
+        let first_frame: Value =
+            serde_json::from_slice(&binding.websocket_frame(&request, None, None).unwrap())
+                .unwrap();
+        assert_eq!(first_frame["type"], "response.create");
+        assert_eq!(first_frame["model"], "gpt-responses");
+        assert!(first_frame.get("previous_response_id").is_none());
+        let frame: Value = serde_json::from_slice(
+            &binding
+                .websocket_frame(&request, Some("resp-previous"), None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["type"], "response.create");
+        assert_eq!(frame["model"], "gpt-responses");
+        assert_eq!(frame["previous_response_id"], "resp-previous");
+        assert!(frame.get("stream_id").is_none());
+        assert!(frame.get("generate").is_none());
+    }
+
+    #[test]
+    fn responses_websocket_frame_crops_only_input_and_preserves_request_controls() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let mut input = ModelRequestInput::new(
+            "gpt-responses",
+            vec![
+                ModelMessage::text(MessageRole::User, "first"),
+                ModelMessage::text(MessageRole::User, "tool output"),
+            ],
+        );
+        input.segments = vec![super::super::ControlSegment::system("system instructions")];
+        input.segment_origins = vec!["system".into()];
+        input.message_origins = vec!["user-1".into(), "tool-1".into()];
+        input.tools = vec![super::super::ToolDefinition::new(
+            "lookup",
+            "look something up",
+            serde_json::json!({"type":"object"}),
+        )];
+        let request = binding.prepare_request(&input).unwrap();
+        let normal: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(normal.get("previous_response_id").is_none());
+        let frame: Value = serde_json::from_slice(
+            &binding
+                .websocket_frame(&request, Some("resp-1"), Some(2))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["type"], "response.create");
+        assert_eq!(frame["instructions"], "system instructions");
+        assert_eq!(frame["tools"][0]["name"], "lookup");
+        assert_eq!(frame["previous_response_id"], "resp-1");
+        assert_eq!(frame["input"].as_array().unwrap().len(), 1);
+        assert_eq!(frame["input"][0]["content"][0]["text"], "tool output");
+    }
+
+    #[test]
+    fn responses_websocket_frame_has_no_implicit_openai_beta_header() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let request = binding
+            .prepare_request(&ModelRequestInput::new("gpt-responses", Vec::new()))
+            .unwrap();
+        assert!(!request.protocol_headers.contains_key("openai-beta"));
+    }
+
+    #[test]
+    fn responses_websocket_json_frames_reuse_responses_event_state_machine() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let mut decoder = binding.new_websocket_decoder();
+        let delta = decoder
+            .push(br#"{"type":"response.output_text.delta","delta":"hello"}"#)
+            .unwrap();
+        assert_eq!(
+            delta,
+            vec![ModelEvent::TextDelta {
+                text: "hello".into()
+            }]
+        );
+        let terminal = decoder
+            .push(
+                br#"{"type":"response.completed","response":{"id":"resp-1","status":"completed"}}"#,
+            )
+            .unwrap();
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            ModelEvent::ResponseMetadata { response_id } if response_id == "resp-1"
+        )));
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            ModelEvent::Terminal {
+                status: TerminalStatus::Completed
+            }
+        )));
+        assert!(decoder.finish().is_ok());
+    }
+
+    #[test]
+    fn responses_websocket_error_envelope_accepts_numeric_status_and_retries_previous_response_not_found()
+     {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let mut decoder = binding.new_websocket_decoder();
+        let events = decoder
+            .push(
+                br#"{"type":"error","status":404,"error":{"code":"previous_response_not_found","message":"response was not found","param":"previous_response_id"}}"#,
+            )
+            .unwrap();
+        let ModelEvent::Failure(failure) = &events[0] else {
+            panic!("expected typed failure event");
+        };
+        assert_eq!(failure.status, Some(404));
+        assert_eq!(failure.code.as_deref(), Some("previous_response_not_found"));
+        assert_eq!(failure.retry_hint, RetryHint::Retryable);
+        assert!(failure.detail().contains("response was not found"));
+    }
+
+    #[test]
+    fn responses_websocket_error_envelope_accepts_status_code_and_error_type() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let mut decoder = binding.new_websocket_decoder();
+        let events = decoder
+            .push(
+                br#"{"type":"error","status_code":429,"error":{"type":"rate_limit_error","message":"try later"}}"#,
+            )
+            .unwrap();
+        let ModelEvent::Failure(failure) = &events[0] else {
+            panic!("expected typed failure event");
+        };
+        assert_eq!(failure.status, Some(429));
+        assert_eq!(failure.code.as_deref(), Some("rate_limit_error"));
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert_eq!(failure.retry_hint, RetryHint::Retryable);
+        assert!(failure.detail().contains("try later"));
+    }
+
+    #[test]
+    fn responses_websocket_close_before_terminal_is_typed() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let mut decoder = binding.new_websocket_decoder();
+        decoder
+            .push(br#"{"type":"response.output_text.delta","delta":"partial"}"#)
+            .unwrap();
+        let failure = decoder.finish().unwrap_err();
+        assert_eq!(failure.phase, FailurePhase::Finish);
+        assert_eq!(
+            failure.code.as_deref(),
+            Some("websocket_closed_before_terminal")
+        );
     }
 
     #[test]
