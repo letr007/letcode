@@ -8057,6 +8057,49 @@ fn unseen_child_terminal_then_first_view_loads_snapshot_history() {
 }
 
 #[test]
+fn unloaded_child_partial_timeline_is_replaced_by_complete_first_view_snapshot() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "background-child".into(),
+        agent_name: Some("fixer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("partial live history")),
+    });
+    let records = (1..=50)
+        .map(|sequence| TranscriptRecord {
+            session_id: "background-child".into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: format!("persisted child history {sequence}"),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "background-child".into(),
+        agent_name: "fixer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records,
+        runtime_context: event_context("background-child", 50),
+    });
+
+    assert_eq!(runtime.state().active_timeline().items().len(), 50);
+    assert!(matches!(
+        runtime.state().active_timeline().items().first(),
+        Some(TimelineItem::Assistant(message)) if message.text == "persisted child history 1"
+    ));
+    render_runtime_transcript(&mut runtime);
+    runtime.state_mut().scroll_transcript_up(usize::MAX);
+    render_runtime_transcript(&mut runtime);
+    assert_eq!(runtime.state().last_transcript_scroll_top, 0);
+}
+
+#[test]
 fn child_context_update_does_not_block_later_snapshot_growth() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {

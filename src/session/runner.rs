@@ -532,6 +532,18 @@ where {
                                         ),
                                     )?;
                                 }
+                                AgentEvent::LlmRetryScheduled(retry) => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::RetryScheduled(retry_lifecycle_event(retry)),
+                                    )?;
+                                }
+                                AgentEvent::LlmRetryStarted(retry) => {
+                                    send_optional_event(
+                                        &sender,
+                                        SessionTransportEvent::RetryStarted(retry_lifecycle_event(retry)),
+                                    )?;
+                                }
                                 AgentEvent::TurnContinuationBoundary => {
                                     tokio::task::yield_now().await;
                                 }

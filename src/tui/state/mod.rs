@@ -2428,7 +2428,7 @@ impl TuiState {
         if let Some(active) = self.child_timeline.as_mut()
             && active.session_id == child_session_id
         {
-            if active.snapshot_dirty {
+            if active.snapshot_loaded && active.snapshot_dirty {
                 active.context = context;
                 active.model = child_transcript_model(records);
             } else {
@@ -2458,7 +2458,7 @@ impl TuiState {
         self.child_session_summaries.remove(&child_session_id);
         let child_state = match self.child_timeline_cache.remove(&child_session_id) {
             Some(mut cached) => {
-                if cached.snapshot_dirty {
+                if cached.snapshot_loaded && cached.snapshot_dirty {
                     cached.context = context;
                     cached.model = child_transcript_model(records);
                 } else {
