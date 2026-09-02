@@ -95,7 +95,7 @@ request decorator（例如 fake client）只能修改已准备的 request metada
 
 成功时，driver 持久化 assistant turn，执行需要的工具或 continuation，发出 `TurnFinalized`，并由 `finish_current_turn` 清理 turn-local state。session runner 将 AgentEvent 转换为 transcript 和 session transport events。
 
-请求创建失败或无副作用的 stream failure 可以按 resolved route 的 retry config 重试。已经产生 text、reasoning 或 tool side effect 后的失败只能进入受控 recovery iteration，不能把部分响应伪装成完整成功。provider failed/error/incomplete、decoder validation failure、permission denial、tool reconcile failure 和 interrupt 都沿错误路径返回。
+请求创建失败或无副作用的 stream failure 可以按 resolved route 的 retry config 重试。已经产生 text、reasoning 或 tool side effect 后的失败只能进入受控 recovery iteration，不能把部分响应伪装成完整成功。非成功 HTTP 响应会在固定字节上限内读取 provider response body，保留 JSON、文本或 HTML 诊断并脱敏请求凭据，再随 session error 向用户展示；读取上限只约束无界响应，不按未知 schema 丢弃字段。provider failed/error/incomplete、decoder validation failure、permission denial、tool reconcile failure 和 interrupt 都沿错误路径返回。
 
 ## 源码索引
 

@@ -583,4 +583,9 @@ impl ErrorEvent {
             details: None,
         }
     }
+
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
 }

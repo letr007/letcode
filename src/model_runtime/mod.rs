@@ -23,7 +23,97 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-const MAX_DETAIL_BYTES: usize = 256;
+const MAX_DETAIL_CHARS: usize = 512 * 1024;
+const MAX_FAILURE_CODE_BYTES: usize = 256;
+const SENSITIVE_DETAIL_KEYS: &[&str] = &[
+    "proxy_authorization",
+    "authorization",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    "client_token",
+    "api_token",
+    "x_api_key",
+    "api_key",
+    "apikey",
+    "id_token",
+    "password",
+    "passwd",
+    "credentials",
+    "credential",
+    "secret",
+    "token",
+];
+const SENSITIVE_DETAIL_LABELS: &[&str] = &[
+    "proxy-authorization",
+    "proxy_authorization",
+    "proxy authorization",
+    "authorization",
+    "client-secret",
+    "client_secret",
+    "client secret",
+    "access-token",
+    "access_token",
+    "access token",
+    "refresh-token",
+    "refresh_token",
+    "refresh token",
+    "client-token",
+    "client_token",
+    "client token",
+    "api-token",
+    "api_token",
+    "api token",
+    "x-api-key",
+    "x_api_key",
+    "x api key",
+    "api-key",
+    "api_key",
+    "api key",
+    "apikey",
+    "id-token",
+    "id_token",
+    "id token",
+    "password",
+    "passwd",
+    "credentials",
+    "credential",
+    "secret",
+    "token",
+];
+const WHITESPACE_SEPARATED_DETAIL_LABELS: &[&str] = &[
+    "proxy-authorization",
+    "proxy_authorization",
+    "proxy authorization",
+    "authorization",
+    "client-secret",
+    "client_secret",
+    "client secret",
+    "access-token",
+    "access_token",
+    "access token",
+    "refresh-token",
+    "refresh_token",
+    "refresh token",
+    "client-token",
+    "client_token",
+    "client token",
+    "api-token",
+    "api_token",
+    "api token",
+    "x-api-key",
+    "x_api_key",
+    "x api key",
+    "api-key",
+    "api_key",
+    "api key",
+    "apikey",
+    "id-token",
+    "id_token",
+    "id token",
+    "password",
+    "passwd",
+];
 const MAX_IDENTIFIER_BYTES: usize = 128;
 
 /// A validated and extensible protocol identifier.
@@ -862,8 +952,8 @@ pub enum RetryHint {
     RetryAfterSeconds(u64),
 }
 
-/// Structured failure metadata. Detail is bounded/redacted and omitted from
-/// Display so routine error reporting does not expose response contents.
+/// Structured failure metadata. Detail is bounded and credential-redacted.
+/// Display remains concise; interactive callers can present `detail` separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFailure {
     pub phase: FailurePhase,
@@ -917,78 +1007,263 @@ impl ModelFailure {
 }
 
 fn redact_detail(detail: String, secrets: &[&str]) -> String {
-    let detail = secrets.iter().fold(detail, |value, secret| {
-        if secret.is_empty() {
-            value
-        } else {
-            vec![
-                (*secret).to_owned(),
-                percent_encode(secret, false, false),
-                percent_encode(secret, true, false),
-                percent_encode(secret, false, true),
-                percent_encode(secret, true, true),
-            ]
-            .into_iter()
-            .filter(|candidate| !candidate.is_empty())
-            .fold(value, |value, candidate| {
-                value.replace(candidate.as_str(), "[redacted]")
+    let (mut detail, structured_json) = redact_json_detail(detail);
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        let json_encoded = serde_json::to_string(secret)
+            .ok()
+            .and_then(|value| {
+                value
+                    .strip_prefix('"')?
+                    .strip_suffix('"')
+                    .map(str::to_owned)
             })
+            .unwrap_or_default();
+        for candidate in [
+            (*secret).to_owned(),
+            json_encoded,
+            percent_encode(secret, false, false),
+            percent_encode(secret, true, false),
+            percent_encode(secret, false, true),
+            percent_encode(secret, true, true),
+        ]
+        .into_iter()
+        .filter(|candidate| !candidate.is_empty())
+        {
+            detail = detail.replace(candidate.as_str(), "[redacted]");
         }
-    });
+    }
     let normalized = detail
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
         .chars()
         .map(|character| match character {
-            '\n' | '\r' | '\t' => ' ',
+            '\n' | '\t' => character,
             character if character.is_control() => '�',
             character => character,
         })
         .collect::<String>();
-    let mut redacted = String::new();
-    let mut mask_next = false;
-    for token in normalized.split_whitespace() {
-        if !redacted.is_empty() {
-            redacted.push(' ');
-        }
-        if mask_next {
-            redacted.push_str("[redacted]");
-            mask_next = false;
-            continue;
-        }
-        let lower = token.to_ascii_lowercase();
-        let key = [
-            "authorization",
-            "api-key",
-            "api_key",
-            "access-token",
-            "access_token",
-            "password",
-            "secret",
-            "token",
-        ]
-        .into_iter()
-        .find(|key| {
-            lower == *key
-                || lower.starts_with(&format!("{key}:"))
-                || lower.starts_with(&format!("{key}="))
-        });
-        if let Some(key) = key {
-            if lower == key {
-                redacted.push_str(token);
-                mask_next = true;
-            } else {
-                redacted.push_str(&token[..key.len()]);
-                redacted.push_str("[redacted]");
-                mask_next = true;
-            }
-        } else {
-            redacted.push_str(token);
-        }
+    let mut redacted = if structured_json {
+        normalized
+    } else {
+        redact_labeled_secrets(normalized)
     }
-    if redacted.chars().count() > MAX_DETAIL_BYTES {
-        redacted = redacted.chars().take(MAX_DETAIL_BYTES).collect();
-        redacted.push('…');
+    .trim()
+    .to_owned();
+    if redacted.chars().count() > MAX_DETAIL_CHARS {
+        redacted = redacted.chars().take(MAX_DETAIL_CHARS).collect();
+        redacted.push_str("\n[provider detail truncated]");
     }
     redacted
+}
+
+fn redact_json_detail(detail: String) -> (String, bool) {
+    let Ok(mut value) = serde_json::from_str::<Value>(&detail) else {
+        return (detail, false);
+    };
+    redact_json_value(&mut value);
+    (serde_json::to_string(&value).unwrap_or(detail), true)
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if is_sensitive_detail_key(key) {
+                    *value = Value::String("[redacted]".into());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(redact_json_value),
+        _ => {}
+    }
+}
+
+fn is_sensitive_detail_key(key: &str) -> bool {
+    let normalized = canonical_detail_name(key);
+    SENSITIVE_DETAIL_KEYS.contains(&normalized.as_str())
+}
+
+fn canonical_detail_name(value: &str) -> String {
+    let characters = value.trim().chars().collect::<Vec<_>>();
+    let mut normalized = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !normalized.is_empty() && !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index + 1);
+        let word_boundary = character.is_ascii_uppercase()
+            && !normalized.is_empty()
+            && !normalized.ends_with('_')
+            && (previous.is_some_and(|character| character.is_ascii_lowercase())
+                || previous.is_some_and(|character| character.is_ascii_uppercase())
+                    && next.is_some_and(|character| character.is_ascii_lowercase()));
+        if word_boundary {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+    }
+    normalized.trim_matches('_').to_owned()
+}
+
+fn redact_labeled_secrets(mut value: String) -> String {
+    let mut scan_from = 0;
+    while scan_from < value.len() {
+        let lower = value.to_ascii_lowercase();
+        let Some((_, value_start, whitespace_separated, authorization_label)) =
+            SENSITIVE_DETAIL_LABELS
+                .iter()
+                .filter_map(|key| {
+                    let mut search_from = scan_from;
+                    while let Some(relative) = lower[search_from..].find(key) {
+                        let start = search_from + relative;
+                        let before = lower[..start].chars().next_back();
+                        if before.is_some_and(|character| {
+                            character.is_ascii_alphanumeric() || character == '_'
+                        }) {
+                            search_from = start + key.len();
+                            continue;
+                        }
+                        let key_end = start + key.len();
+                        let mut cursor = key_end;
+                        while let Some(character) = lower[cursor..].chars().next() {
+                            if matches!(character, '"' | '\'') {
+                                cursor += character.len_utf8();
+                            } else {
+                                break;
+                            }
+                        }
+                        if lower[cursor..].starts_with(':') || lower[cursor..].starts_with('=') {
+                            let whitespace_separated =
+                                WHITESPACE_SEPARATED_DETAIL_LABELS.contains(key);
+                            let authorization_label = matches!(
+                                *key,
+                                "proxy-authorization"
+                                    | "proxy_authorization"
+                                    | "proxy authorization"
+                                    | "authorization"
+                            );
+                            return Some((
+                                start,
+                                cursor + 1,
+                                whitespace_separated,
+                                authorization_label,
+                            ));
+                        }
+                        if WHITESPACE_SEPARATED_DETAIL_LABELS.contains(key) {
+                            let mut value_start = key_end;
+                            while let Some(character) = lower[value_start..].chars().next() {
+                                if character.is_ascii_whitespace() {
+                                    value_start += character.len_utf8();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if value_start > key_end {
+                                let authorization_label = matches!(
+                                    *key,
+                                    "proxy-authorization"
+                                        | "proxy_authorization"
+                                        | "proxy authorization"
+                                        | "authorization"
+                                );
+                                return Some((start, value_start, true, authorization_label));
+                            }
+                        }
+                        search_from = key_end;
+                    }
+                    None
+                })
+                .min_by_key(|(start, _, _, _)| *start)
+        else {
+            break;
+        };
+
+        let mut value_start = value_start;
+        while let Some(character) = value[value_start..].chars().next() {
+            if character.is_ascii_whitespace() {
+                value_start += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let quote = value[value_start..]
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '"' | '\''));
+        if let Some(quote) = quote {
+            value_start += quote.len_utf8();
+        }
+        let value_end = if whitespace_separated && quote.is_none() {
+            whitespace_secret_end(&value, value_start, authorization_label)
+        } else {
+            value[value_start..]
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    let quoted_end = quote.is_some_and(|quote| character == quote);
+                    let unquoted_end = quote.is_none()
+                        && matches!(character, '\n' | ',' | ';' | '&' | '<' | '>' | '}' | ']');
+                    (quoted_end || unquoted_end).then_some(value_start + offset)
+                })
+                .unwrap_or(value.len())
+        };
+        value.replace_range(value_start..value_end, "[redacted]");
+        scan_from = value_start + "[redacted]".len();
+    }
+    value
+}
+
+fn whitespace_secret_end(value: &str, start: usize, authorization_label: bool) -> usize {
+    let line_end = value[start..]
+        .char_indices()
+        .find_map(|(offset, character)| (character == '\n').then_some(start + offset))
+        .unwrap_or(value.len());
+    if !authorization_label {
+        return value[start..line_end]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                character.is_ascii_whitespace().then_some(start + offset)
+            })
+            .unwrap_or(line_end);
+    }
+    let first_end = value[start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            (character.is_ascii_whitespace()
+                || matches!(character, ',' | ';' | '&' | '<' | '>' | '}' | ']'))
+            .then_some(start + offset)
+        })
+        .unwrap_or(value.len());
+    if !authorization_label
+        || !matches!(
+            value[start..first_end].to_ascii_lowercase().as_str(),
+            "bearer" | "basic" | "token" | "apikey" | "api-key"
+        )
+    {
+        return first_end;
+    }
+
+    let mut credential_start = first_end;
+    while let Some(character) = value[credential_start..].chars().next() {
+        if character.is_ascii_whitespace() {
+            credential_start += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    value[credential_start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            (character.is_ascii_whitespace()
+                || matches!(character, ',' | ';' | '&' | '<' | '>' | '}' | ']'))
+            .then_some(credential_start + offset)
+        })
+        .unwrap_or(value.len())
 }
 
 fn percent_encode(value: &str, form: bool, lowercase: bool) -> String {
@@ -1013,7 +1288,7 @@ fn percent_encode(value: &str, form: bool, lowercase: bool) -> String {
 fn redact_code(code: String) -> String {
     let code = code.trim();
     if !code.is_empty()
-        && code.len() <= MAX_DETAIL_BYTES
+        && code.len() <= MAX_FAILURE_CODE_BYTES
         && code.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
         })
@@ -3382,6 +3657,77 @@ flags = ["a", "b"]"#,
         assert!(!failure.detail().contains("bearer-secret"));
         assert!(!failure.to_string().contains("bearer-secret"));
         assert!(failure.to_string().contains("status 500"));
+    }
+
+    #[test]
+    fn model_failure_detail_preserves_unknown_provider_json_and_redacts_credentials() {
+        let failure = ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+            .with_detail_redacted(
+                r#"{"error":{"unfamiliar":{"explanation":"unsupported input","request_fragment":{"model":"demo","prompt":"keep this diagnostic"}}},"apiKey":"response-secret","nested":[{"accessToken":"echoed-token"}],"clientSecret":"client-secret","proxyAuthorization":"proxy-secret","credential":{"value":"nested-secret"}}"#,
+                &["response-secret", "echoed-token"],
+            );
+        assert!(failure.detail().contains("unsupported input"));
+        assert!(failure.detail().contains("keep this diagnostic"));
+        assert!(failure.detail().contains("\"unfamiliar\""));
+        assert!(failure.detail().contains("\"apiKey\":\"[redacted]\""));
+        assert!(failure.detail().contains("\"accessToken\":\"[redacted]\""));
+        assert!(failure.detail().contains("\"clientSecret\":\"[redacted]\""));
+        assert!(
+            failure
+                .detail()
+                .contains("\"proxyAuthorization\":\"[redacted]\"")
+        );
+        assert!(failure.detail().contains("\"credential\":\"[redacted]\""));
+        assert!(!failure.detail().contains("response-secret"));
+        assert!(!failure.detail().contains("echoed-token"));
+        assert!(!failure.detail().contains("client-secret"));
+        assert!(!failure.detail().contains("proxy-secret"));
+        assert!(!failure.detail().contains("nested-secret"));
+    }
+
+    #[test]
+    fn model_failure_detail_redacts_whitespace_credentials_without_hiding_diagnostics() {
+        let failure = ModelFailure::new(FailurePhase::Transport, FailureKind::Http).with_detail(
+            "Authorization: Bearer colon-secret colon request rejected\nAuthorization Bearer abc123 request rejected\napi-key: colon-key colon endpoint unavailable\napi key key-value endpoint unavailable\naccess token token-value scope denied\ntoken count 123\nsecret explanation remains useful",
+        );
+        assert!(!failure.detail().contains("colon-secret"));
+        assert!(!failure.detail().contains("abc123"));
+        assert!(!failure.detail().contains("colon-key"));
+        assert!(!failure.detail().contains("key-value"));
+        assert!(!failure.detail().contains("token-value"));
+        assert!(failure.detail().contains("colon request rejected"));
+        assert!(failure.detail().contains("request rejected"));
+        assert!(failure.detail().contains("colon endpoint unavailable"));
+        assert!(failure.detail().contains("endpoint unavailable"));
+        assert!(failure.detail().contains("scope denied"));
+        assert!(failure.detail().contains("token count 123"));
+        assert!(
+            failure
+                .detail()
+                .contains("secret explanation remains useful")
+        );
+    }
+
+    #[test]
+    fn model_failure_detail_preserves_large_provider_diagnostics() {
+        let diagnostic = "x".repeat(300 * 1024);
+        let failure = ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+            .with_detail(diagnostic.clone());
+        assert_eq!(failure.detail(), diagnostic);
+    }
+
+    #[test]
+    fn model_failure_detail_preserves_multiline_text_and_html() {
+        let failure = ModelFailure::new(FailurePhase::Transport, FailureKind::Http).with_detail(
+            "<html>\n<body>invalid field: input[2]</body>\n</html>\napi-key=provider-secret",
+        );
+        assert!(
+            failure
+                .detail()
+                .contains("<body>invalid field: input[2]</body>")
+        );
+        assert!(failure.detail().contains('\n'));
+        assert!(!failure.detail().contains("provider-secret"));
     }
 
     fn runtime_config(

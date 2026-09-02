@@ -557,9 +557,7 @@ where {
                 Ok(message)
             }
             Err(error) => {
-                self.emit(SessionTransportEvent::Error(ErrorEvent::new(format!(
-                    "{error:#}"
-                ))))?;
+                self.emit(SessionTransportEvent::Error(error_event(&error)))?;
                 self.emit(SessionTransportEvent::Done)?;
                 Err(error)
             }
@@ -1229,8 +1227,8 @@ where {
                 Ok(message)
             }
             Err(error) => {
-                let error_message = format!("{error:#}");
-                let event = ErrorEvent::new(error_message.clone());
+                let event = error_event(&error);
+                let error_message = recorded_error_message(&event);
                 if let Err(record_error) =
                     self.record(|recorder| recorder.record_error(error_message.clone()))
                 {
@@ -1314,8 +1312,7 @@ where {
     }
 
     fn finish_with_error(&self, error: anyhow::Error) -> Result<()> {
-        let event = ErrorEvent::new(format!("{error:#}"));
-        self.emit(SessionTransportEvent::Error(event))?;
+        self.emit(SessionTransportEvent::Error(error_event(&error)))?;
         self.emit(SessionTransportEvent::Done)?;
         Err(error)
     }
@@ -1348,6 +1345,27 @@ where {
         }
 
         Ok(Some((session_id, agent.session_title_agent())))
+    }
+}
+
+fn error_event(error: &anyhow::Error) -> ErrorEvent {
+    let event = ErrorEvent::new(format!("{error:#}"));
+    let Some(detail) = error
+        .downcast_ref::<crate::model_runtime::ModelFailure>()
+        .map(|failure| failure.detail())
+        .filter(|detail| !detail.is_empty())
+    else {
+        return event;
+    };
+    event.with_details(detail)
+}
+
+fn recorded_error_message(event: &ErrorEvent) -> String {
+    match event.details.as_deref() {
+        Some(details) if !details.is_empty() => {
+            format!("{}\n\nProvider response:\n{}", event.message, details)
+        }
+        _ => event.message.clone(),
     }
 }
 
@@ -1414,6 +1432,25 @@ mod tests {
     use crate::transcript::TranscriptRecorder;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn model_failure_detail_reaches_error_event_and_recorded_message() {
+        let error = anyhow::Error::new(
+            crate::model_runtime::ModelFailure::new(
+                crate::model_runtime::FailurePhase::Transport,
+                crate::model_runtime::FailureKind::Http,
+            )
+            .with_status(400)
+            .with_detail("provider says the request field is invalid"),
+        );
+        let event = error_event(&error);
+        assert!(event.message.contains("status 400"));
+        assert_eq!(
+            event.details.as_deref(),
+            Some("provider says the request field is invalid")
+        );
+        assert!(recorded_error_message(&event).contains("Provider response:"));
+    }
 
     #[test]
     fn summarize_search_uses_aggregate_and_marks_folded() {

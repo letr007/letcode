@@ -615,9 +615,15 @@ fn present_transport_event(
         }
         SessionTransportEvent::Error(err) => {
             marker.error = true;
-            *last_error = Some(err.message.clone());
+            let rendered = match err.details.as_deref() {
+                Some(details) if !details.is_empty() => {
+                    format!("{}\n\nProvider response:\n{}", err.message, details)
+                }
+                _ => err.message.clone(),
+            };
+            *last_error = Some(rendered.clone());
             if matches!(output_mode, OutputMode::Streaming) {
-                println!("{}", err.message);
+                println!("{rendered}");
             }
         }
         SessionTransportEvent::Done => {

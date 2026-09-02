@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 512 * 1024;
+
 /// Provider-neutral boundary used by the runtime. Production uses the resolved
 /// provider transport; tests can inject deterministic responses without a
 /// network server.
@@ -241,6 +243,8 @@ impl ModelRuntime {
         request: PreparedHttpRequest,
         observer: &mut dyn ModelEventObserver,
     ) -> Result<ModelAttemptResult, ModelAttemptFailure> {
+        let owned_secrets = route_error_secrets(route);
+        let secret_refs = owned_secrets.iter().map(String::as_str).collect::<Vec<_>>();
         let mut response =
             self.transport
                 .send_prepared(route, request)
@@ -250,8 +254,15 @@ impl ModelRuntime {
                     partial: ModelAttemptSnapshot::default(),
                 })?;
         if !(200..300).contains(&response.status) {
+            let status = response.status;
+            let retry_hint = response.retry_hint();
+            let detail = read_provider_error_detail(&mut response, &secret_refs).await;
+            let mut failure = http_status_failure(status, retry_hint);
+            if !detail.is_empty() {
+                failure = failure.with_detail_redacted(detail, &secret_refs);
+            }
             return Err(ModelAttemptFailure {
-                failure: http_status_failure(response.status, response.retry_hint()),
+                failure,
                 partial: ModelAttemptSnapshot::default(),
             });
         }
@@ -270,6 +281,65 @@ impl ModelRuntime {
         observe_events(observer, &mut accumulator, events).await?;
         accumulator.finish()
     }
+}
+
+async fn read_provider_error_detail(
+    response: &mut super::TransportResponse,
+    secrets: &[&str],
+) -> String {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    let mut read_error = None;
+    while let Some(chunk) = response.next_chunk().await {
+        match chunk {
+            Ok(chunk) => {
+                let remaining = MAX_PROVIDER_ERROR_BODY_BYTES.saturating_sub(body.len());
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Err(failure) => {
+                read_error = Some(failure);
+                break;
+            }
+        }
+    }
+
+    let mut detail = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        detail.push_str(&format!(
+            "\n[provider response body truncated after {MAX_PROVIDER_ERROR_BODY_BYTES} bytes]"
+        ));
+    }
+    if let Some(failure) = read_error {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str("[failed to finish reading provider response body: ");
+        detail.push_str(&failure.to_string());
+        if !failure.detail().is_empty() {
+            detail.push_str(": ");
+            detail.push_str(failure.detail());
+        }
+        detail.push(']');
+    }
+    ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+        .with_detail_redacted(detail, secrets)
+        .detail()
+        .to_owned()
+}
+
+fn route_error_secrets(route: &ResolvedModelRoute) -> Vec<String> {
+    route
+        .auth
+        .credential
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|credential| vec![credential.to_owned()])
+        .unwrap_or_default()
 }
 
 async fn observe_events(
@@ -975,7 +1045,7 @@ reasoning = true
     }
 
     #[tokio::test]
-    async fn non_success_status_is_classified_before_decoding() {
+    async fn non_success_status_preserves_provider_detail_before_decoding() {
         let route = route("responses");
         let transport = Arc::new(QueueTransport {
             responses: Mutex::new(VecDeque::from([Ok(TransportResponse::from_chunks(
@@ -992,7 +1062,28 @@ reasoning = true
         assert_eq!(error.failure.kind, FailureKind::RateLimited);
         assert_eq!(error.failure.status, Some(429));
         assert_eq!(error.failure.retry_hint, RetryHint::RetryAfterSeconds(7));
+        assert_eq!(error.failure.detail(), "not protocol data");
         assert!(!error.partial.side_effects.observable());
+    }
+
+    #[tokio::test]
+    async fn client_error_detail_is_preserved_without_becoming_retryable() {
+        let route = route("responses");
+        let transport = Arc::new(QueueTransport {
+            responses: Mutex::new(VecDeque::from([Ok(response(
+                400,
+                vec![br#"{"error":{"message":"input[3].role is invalid","unknown":{"expected":"user"}}}"#],
+            ))])),
+        });
+        let runtime = ModelRuntime::new(transport);
+        let error = runtime
+            .execute_attempt(&route, &ModelRequestInput::new("model", Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure.status, Some(400));
+        assert_eq!(error.failure.retry_hint, RetryHint::Never);
+        assert!(error.failure.detail().contains("input[3].role is invalid"));
+        assert!(error.failure.detail().contains("\"expected\":\"user\""));
     }
 
     #[tokio::test]

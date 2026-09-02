@@ -159,7 +159,7 @@ where
     TurnOrchestrator::new(ModelRuntime::default(), limits)
         .run(&route, &mut driver)
         .await
-        .map_err(|failure| anyhow!(failure.to_string()))?;
+        .map_err(anyhow::Error::new)?;
     Ok(if driver.final_text.is_empty() {
         "No response content".to_string()
     } else {
@@ -995,7 +995,7 @@ pub(super) fn preflight_resolved_oneshot_text_request(
     route
         .binding
         .prepare_request(&input)
-        .map_err(|failure| anyhow!(failure.to_string()))?;
+        .map_err(anyhow::Error::new)?;
     Ok(build)
 }
 
@@ -1030,7 +1030,7 @@ where
             }
         })
         .await
-        .map_err(|failure| anyhow!(failure.to_string()))
+        .map_err(anyhow::Error::new)
 }
 
 pub(super) async fn execute_resolved_text_oneshot(
