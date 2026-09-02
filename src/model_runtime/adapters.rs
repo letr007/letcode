@@ -2593,6 +2593,8 @@ enum ResponsesContentBlock {
     InputText { text: String },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -2938,7 +2940,10 @@ fn append_message(
     if !text.is_empty() || !images.is_empty() {
         let mut content = text
             .into_iter()
-            .map(|text| ResponsesContentBlock::InputText { text })
+            .map(|text| match message.role {
+                MessageRole::Assistant => ResponsesContentBlock::OutputText { text },
+                MessageRole::User | MessageRole::Tool => ResponsesContentBlock::InputText { text },
+            })
             .collect::<Vec<_>>();
         content.extend(
             images
@@ -4824,6 +4829,25 @@ anthropic_thinking = { mode = "adaptive" }"#,
         assert_eq!(body["prompt_cache_key"], "golden:standard:route:abc");
         assert_eq!(body["prompt_cache_retention"], "24h");
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_uses_role_appropriate_text_blocks() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let request = ModelRequestInput::new(
+            "gpt-responses",
+            vec![
+                ModelMessage::text(MessageRole::User, "question"),
+                ModelMessage::text(MessageRole::Assistant, "answer"),
+            ],
+        );
+
+        let body: Value =
+            serde_json::from_slice(&binding.prepare_request(&request).unwrap().body).unwrap();
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
     }
 
     #[test]
