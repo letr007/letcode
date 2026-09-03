@@ -647,6 +647,8 @@ struct AttemptAccumulator {
     order: Vec<AssistantPartKey>,
     text: String,
     reasoning: HashMap<String, (String, Option<super::OpaqueReplayState>)>,
+    reasoning_text_components: HashMap<String, String>,
+    reasoning_summary_components: BTreeMap<(String, u64), String>,
     tools: HashMap<String, PendingToolCall>,
     completed_tool_arguments: HashMap<String, serde_json::Value>,
     side_effects: AttemptSideEffects,
@@ -673,11 +675,35 @@ impl AttemptAccumulator {
             }
             ModelEvent::ReasoningDelta { item_id, text } => {
                 self.push_order(AssistantPartKey::Reasoning(item_id.clone()));
-                self.reasoning
+                self.reasoning_text_components
                     .entry(item_id.clone())
                     .or_default()
-                    .0
                     .push_str(text);
+                self.update_reasoning_content(item_id);
+                self.side_effects.reasoning = true;
+            }
+            ModelEvent::ReasoningSummaryDelta {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                self.push_order(AssistantPartKey::Reasoning(item_id.clone()));
+                self.reasoning_summary_components
+                    .entry((item_id.clone(), *summary_index))
+                    .or_default()
+                    .push_str(text);
+                self.update_reasoning_content(item_id);
+                self.side_effects.reasoning = true;
+            }
+            ModelEvent::ReasoningSummaryDone {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                self.push_order(AssistantPartKey::Reasoning(item_id.clone()));
+                self.reasoning_summary_components
+                    .insert((item_id.clone(), *summary_index), text.clone());
+                self.update_reasoning_content(item_id);
                 self.side_effects.reasoning = true;
             }
             ModelEvent::ReasoningDone {
@@ -738,6 +764,29 @@ impl AttemptAccumulator {
         }
         self.events.push(event);
         Ok(())
+    }
+
+    fn update_reasoning_content(&mut self, item_id: &str) {
+        let summary = self
+            .reasoning_summary_components
+            .iter()
+            .filter(|((component_item_id, _), _)| component_item_id == item_id)
+            .map(|(_, text)| text.as_str())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let reasoning_text = self
+            .reasoning_text_components
+            .get(item_id)
+            .map(String::as_str)
+            .filter(|text| !text.is_empty());
+        let text = match (summary.is_empty(), reasoning_text) {
+            (false, Some(reasoning_text)) => format!("{summary}\n\n{reasoning_text}"),
+            (false, None) => summary,
+            (true, Some(reasoning_text)) => reasoning_text.to_string(),
+            (true, None) => String::new(),
+        };
+        self.reasoning.entry(item_id.to_string()).or_default().0 = text;
     }
 
     fn push_order(&mut self, key: AssistantPartKey) {
@@ -1795,6 +1844,72 @@ reasoning = true
             [ContentPart::Reasoning { text, .. }, ContentPart::Text(value)]
                 if text == "plan" && value == "hello"
         ));
+    }
+
+    #[test]
+    fn accumulator_separates_reasoning_summary_parts() {
+        let mut accumulator = AttemptAccumulator::default();
+        for event in [
+            ModelEvent::ReasoningSummaryDelta {
+                item_id: "r1".into(),
+                summary_index: 0,
+                text: "first".into(),
+            },
+            ModelEvent::ReasoningSummaryDone {
+                item_id: "r1".into(),
+                summary_index: 0,
+                text: "first".into(),
+            },
+            ModelEvent::ReasoningSummaryDelta {
+                item_id: "r1".into(),
+                summary_index: 1,
+                text: "second".into(),
+            },
+        ] {
+            accumulator.consume_observed(event).unwrap();
+        }
+        assert!(matches!(
+            accumulator.snapshot().assistant.content.as_slice(),
+            [ContentPart::Reasoning { text, .. }] if text == "first\n\nsecond"
+        ));
+    }
+
+    #[test]
+    fn accumulator_preserves_mixed_reasoning_parts_before_done() {
+        for events in [
+            vec![
+                ModelEvent::ReasoningSummaryDelta {
+                    item_id: "r1".into(),
+                    summary_index: 0,
+                    text: "summary".into(),
+                },
+                ModelEvent::ReasoningDelta {
+                    item_id: "r1".into(),
+                    text: "raw reasoning".into(),
+                },
+            ],
+            vec![
+                ModelEvent::ReasoningDelta {
+                    item_id: "r1".into(),
+                    text: "raw reasoning".into(),
+                },
+                ModelEvent::ReasoningSummaryDelta {
+                    item_id: "r1".into(),
+                    summary_index: 0,
+                    text: "summary".into(),
+                },
+            ],
+        ] {
+            let mut accumulator = AttemptAccumulator::default();
+            for event in events {
+                accumulator.consume_observed(event).unwrap();
+            }
+            assert!(matches!(
+                accumulator.snapshot().assistant.content.as_slice(),
+                [ContentPart::Reasoning { text, .. }]
+                    if text == "summary\n\nraw reasoning"
+            ));
+        }
     }
 
     #[test]

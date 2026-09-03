@@ -6,10 +6,27 @@ use crate::model_runtime::runtime::{
 };
 use crate::model_runtime::{ModelEvent, ModelFailure, ModelMessage, ModelRequestInput};
 use crate::user_content::UserMessageContent;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
+
+fn reasoning_summary_presentation_id(item_id: &str, summary_index: u64) -> String {
+    format!("{item_id}:summary:{summary_index}")
+}
+
+fn reasoning_done_presentation_text<'a>(
+    item_id: &str,
+    canonical_text: &'a str,
+    summary_items: &BTreeSet<String>,
+    reasoning_text: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    if summary_items.contains(item_id) {
+        reasoning_text.get(item_id).map(String::as_str)
+    } else {
+        Some(canonical_text)
+    }
+}
 
 fn llm_request_telemetry(
     logical_request_id: &str,
@@ -162,6 +179,8 @@ where
         cache_details_present: false,
         current_attempt: 1,
         scheduled_retry: None,
+        reasoning_summary_items: BTreeSet::new(),
+        reasoning_text: BTreeMap::new(),
         fake_decorator,
         ws_transport,
         ws_previous: None,
@@ -210,6 +229,8 @@ struct ResolvedTurnDriver<'a, F, E, A> {
     cache_details_present: bool,
     current_attempt: usize,
     scheduled_retry: Option<LlmRetryLifecycle>,
+    reasoning_summary_items: BTreeSet<String>,
+    reasoning_text: BTreeMap<String, String>,
     fake_decorator: Option<crate::model_runtime::decorator::FakeRequestDecorator>,
     ws_transport:
         Option<std::sync::Arc<crate::model_runtime::runtime::TurnLocalResponsesTransport>>,
@@ -412,6 +433,8 @@ where
         self.cache_read_tokens = None;
         self.cache_write_tokens = None;
         self.cache_details_present = false;
+        self.reasoning_summary_items.clear();
+        self.reasoning_text.clear();
         let mut telemetry = prepared.telemetry.clone();
         telemetry.attempt = attempt;
         if attempt > 1 {
@@ -530,6 +553,10 @@ where
                 self.final_text.push_str(text);
             }
             ModelEvent::ReasoningDelta { item_id, text } => {
+                self.reasoning_text
+                    .entry(item_id.clone())
+                    .or_default()
+                    .push_str(text);
                 (self.on_event)(AgentEvent::ReasoningDelta {
                     item_id: item_id.clone(),
                     delta: text.clone(),
@@ -539,15 +566,52 @@ where
                     runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
                 })?;
             }
-            ModelEvent::ReasoningDone { item_id, text, .. } => {
+            ModelEvent::ReasoningSummaryDelta {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                self.reasoning_summary_items.insert(item_id.clone());
+                (self.on_event)(AgentEvent::ReasoningDelta {
+                    item_id: reasoning_summary_presentation_id(item_id, *summary_index),
+                    delta: text.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
+            }
+            ModelEvent::ReasoningSummaryDone {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                self.reasoning_summary_items.insert(item_id.clone());
                 (self.on_event)(AgentEvent::ReasoningDone {
-                    item_id: item_id.clone(),
+                    item_id: reasoning_summary_presentation_id(item_id, *summary_index),
                     text: text.clone(),
                 })
                 .await
                 .map_err(|error| {
                     runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
                 })?;
+            }
+            ModelEvent::ReasoningDone { item_id, text, .. } => {
+                if let Some(displayed_text) = reasoning_done_presentation_text(
+                    item_id,
+                    text,
+                    &self.reasoning_summary_items,
+                    &self.reasoning_text,
+                ) {
+                    (self.on_event)(AgentEvent::ReasoningDone {
+                        item_id: item_id.clone(),
+                        text: displayed_text.to_string(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                    })?;
+                }
             }
             ModelEvent::ToolStarted { id, name } => {
                 (self.on_event)(AgentEvent::ToolCallPending {
@@ -1281,6 +1345,44 @@ where
         on_event,
     )
     .await
+}
+
+#[cfg(test)]
+mod reasoning_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn summary_suppresses_only_the_duplicate_canonical_item() {
+        let summary_items = BTreeSet::from(["r1".to_string()]);
+        let reasoning_text = BTreeMap::from([("r1".to_string(), "raw reasoning".to_string())]);
+        assert_eq!(
+            reasoning_done_presentation_text(
+                "r1",
+                "summary\n\nraw reasoning",
+                &summary_items,
+                &reasoning_text,
+            ),
+            Some("raw reasoning")
+        );
+        assert_eq!(
+            reasoning_done_presentation_text(
+                "r2",
+                "summary only",
+                &BTreeSet::from(["r2".to_string()]),
+                &BTreeMap::new(),
+            ),
+            None
+        );
+        assert_eq!(
+            reasoning_done_presentation_text(
+                "r3",
+                "plain reasoning",
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+            ),
+            Some("plain reasoning")
+        );
+    }
 }
 
 #[cfg(test)]

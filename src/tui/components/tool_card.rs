@@ -243,19 +243,19 @@ pub fn render_tool_group_document(
         ToolExecutionStatus::Succeeded
     };
     let style = tool_trace_text_style(aggregate_status, theme);
-    let mut spans = vec![
+    let mut header_spans = vec![
         SemanticSpan::decoration("  ", theme.app_style()),
         SemanticSpan::decoration(
             format!("{glyph} "),
             tool_trace_arrow_style(aggregate_status, theme),
         ),
         SemanticSpan::decoration(
-            format!("{} · {}", translator.t("ui.tools"), stats.call_count),
+            format!("Tools · {}", stats.call_count),
             style.add_modifier(Modifier::BOLD),
         ),
     ];
     if stats.failed_count > 0 {
-        spans.push(SemanticSpan::decoration(
+        header_spans.push(SemanticSpan::decoration(
             format!(
                 " · {} {}",
                 stats.failed_count,
@@ -265,7 +265,7 @@ pub fn render_tool_group_document(
         ));
     }
     if stats.cancelled_count > 0 {
-        spans.push(SemanticSpan::decoration(
+        header_spans.push(SemanticSpan::decoration(
             format!(
                 " · {} {}",
                 stats.cancelled_count,
@@ -274,14 +274,17 @@ pub fn render_tool_group_document(
             style,
         ));
     }
-    spans.push(SemanticSpan::decoration(" · ", style));
-    spans.extend(tool_trace_segments(latest, style));
-    let mut line = SemanticLine {
-        spans,
+    document.push_semantic_line(SemanticLine {
+        spans: clip_semantic_spans(header_spans, width),
+        boundary: Break::HardBreak,
+    });
+
+    let mut trace_spans = vec![SemanticSpan::decoration("  ", theme.app_style())];
+    trace_spans.extend(tool_trace_segments(latest, style));
+    document.push_semantic_line(SemanticLine {
+        spans: clip_semantic_spans(trace_spans, width),
         boundary: Break::End,
-    };
-    line.spans = clip_semantic_spans(line.spans, width);
-    document.push_semantic_line(line);
+    });
     document.finish();
     debug_assert!(document.validate());
     document

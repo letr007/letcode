@@ -229,10 +229,6 @@ impl RetryNoticeState {
             .saturating_sub(now.saturating_duration_since(self.started_at).as_secs())
     }
 
-    pub fn toast_message(&self) -> String {
-        self.toast_message_at(std::time::Instant::now())
-    }
-
     fn toast_message_at(&self, now: std::time::Instant) -> String {
         format!(
             "Retrying in {}s · attempt {} of {}",

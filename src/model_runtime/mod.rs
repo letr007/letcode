@@ -912,6 +912,16 @@ pub enum ModelEvent {
         item_id: String,
         text: String,
     },
+    ReasoningSummaryDelta {
+        item_id: String,
+        summary_index: u64,
+        text: String,
+    },
+    ReasoningSummaryDone {
+        item_id: String,
+        summary_index: u64,
+        text: String,
+    },
     ReasoningDone {
         item_id: String,
         text: String,
@@ -3703,6 +3713,16 @@ flags = ["a", "b"]"#,
                 item_id: "r1".into(),
                 text: "think".into(),
             },
+            ModelEvent::ReasoningSummaryDelta {
+                item_id: "r1".into(),
+                summary_index: 0,
+                text: "summary".into(),
+            },
+            ModelEvent::ReasoningSummaryDone {
+                item_id: "r1".into(),
+                summary_index: 0,
+                text: "summary".into(),
+            },
             ModelEvent::ReasoningDone {
                 item_id: "r1".into(),
                 text: "thought".into(),
@@ -3741,7 +3761,7 @@ flags = ["a", "b"]"#,
                 FailureKind::MalformedResponse,
             )),
         ];
-        assert_eq!(events.len(), 10);
+        assert_eq!(events.len(), 12);
         let statuses = [
             TerminalStatus::Completed,
             TerminalStatus::ToolUse,

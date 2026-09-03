@@ -3373,6 +3373,8 @@ struct ResponsesStreamEvent {
     #[serde(default)]
     output_index: Option<u64>,
     #[serde(default)]
+    summary_index: Option<u64>,
+    #[serde(default)]
     item: Option<ResponsesStreamItem>,
     #[serde(default)]
     response: Option<ResponsesStreamResponse>,
@@ -3606,38 +3608,59 @@ impl ResponsesDecoder {
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let id = event.item_id.unwrap_or_else(|| "reasoning".into());
-                let component = if event.event_type.starts_with("response.reasoning_summary") {
-                    "summary"
-                } else {
-                    "text"
-                };
                 let text = event.delta.unwrap_or_default();
-                self.reasoning_components
-                    .entry((id.clone(), component.into()))
-                    .or_default()
-                    .push_str(&text);
-                self.reasoning
-                    .entry(id.clone())
-                    .or_default()
-                    .push_str(&text);
-                output.push(ModelEvent::ReasoningDelta { item_id: id, text });
+                if event.event_type.starts_with("response.reasoning_summary") {
+                    let summary_index = event.summary_index.unwrap_or(0);
+                    let component = format!("summary:{summary_index:020}");
+                    self.reasoning_components
+                        .entry((id.clone(), component))
+                        .or_default()
+                        .push_str(&text);
+                    self.reasoning
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(&text);
+                    output.push(ModelEvent::ReasoningSummaryDelta {
+                        item_id: id,
+                        summary_index,
+                        text,
+                    });
+                } else {
+                    self.reasoning_components
+                        .entry((id.clone(), "text".into()))
+                        .or_default()
+                        .push_str(&text);
+                    self.reasoning
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(&text);
+                    output.push(ModelEvent::ReasoningDelta { item_id: id, text });
+                }
             }
             "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
                 let id = event
                     .item_id
                     .ok_or_else(|| decode_invalid("reasoning item id is required"))?;
-                let component = if event.event_type.starts_with("response.reasoning_summary") {
-                    "summary"
-                } else {
-                    "text"
-                };
                 let value = event.text.or(event.delta).unwrap_or_default();
-                let key = (id.clone(), component.to_owned());
+                let summary_index = event.summary_index.unwrap_or(0);
+                let component = if event.event_type.starts_with("response.reasoning_summary") {
+                    format!("summary:{summary_index:020}")
+                } else {
+                    "text".into()
+                };
+                let key = (id.clone(), component);
                 if self.reasoning_component_done.contains(&key) {
                     return Ok(());
                 }
-                self.reasoning_components.insert(key.clone(), value);
+                self.reasoning_components.insert(key.clone(), value.clone());
                 self.reasoning_component_done.insert(key);
+                if event.event_type.starts_with("response.reasoning_summary") {
+                    output.push(ModelEvent::ReasoningSummaryDone {
+                        item_id: id,
+                        summary_index,
+                        text: value,
+                    });
+                }
             }
             "response.output_text.delta" => {
                 output.push(ModelEvent::TextDelta {
@@ -3822,16 +3845,18 @@ impl ResponsesDecoder {
                 .iter()
                 .chain(item.content.iter())
                 .filter_map(|block| block.text.as_deref())
+                .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
-                .join("")
+                .join("\n\n")
         });
         let component_text = self
             .reasoning_components
             .iter()
             .filter(|((item_id, _), _)| item_id == &id)
             .map(|(_, text)| text.as_str())
+            .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
-            .join("");
+            .join("\n\n");
         let text = authoritative_text
             .filter(|text| !text.is_empty())
             .or(delta.filter(|text| !text.is_empty()))
@@ -5309,15 +5334,23 @@ anthropic_thinking = { mode = "adaptive" }"#,
             ),
             sse(
                 "response.reasoning_summary_text.delta",
-                r#"{"type":"response.reasoning_summary_text.delta","item_id":"r1","delta":"think"}"#,
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"r1","summary_index":0,"delta":"think"}"#,
             ),
             sse(
                 "response.reasoning_summary_text.done",
-                r#"{"type":"response.reasoning_summary_text.done","item_id":"r1","text":"think"}"#,
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"r1","summary_index":0,"text":"think"}"#,
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"r1","summary_index":1,"delta":"plan"}"#,
+            ),
+            sse(
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"r1","summary_index":1,"text":"plan"}"#,
             ),
             sse(
                 "response.output_item.done",
-                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"r1","encrypted_content":"enc","summary":[],"content":[{"type":"reasoning_text","text":"think"}]}}"#,
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"r1","encrypted_content":"enc","summary":[{"type":"summary_text","text":"think"},{"type":"summary_text","text":"plan"}],"content":[]}}"#,
             ),
             sse(
                 "response.output_item.added",
@@ -5357,7 +5390,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
                 text,
                 replay: Some(replay),
             } if item_id == "r1"
-                && text == "think"
+                && text == "think\n\nplan"
                 && replay.payload["encrypted_content"] == "enc"
                 && replay.payload["summary"].as_array().is_some()
         )));
@@ -5367,6 +5400,21 @@ anthropic_thinking = { mode = "adaptive" }"#,
                 .filter(|event| matches!(event, ModelEvent::ReasoningDone { .. }))
                 .count(),
             1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ReasoningSummaryDelta {
+                item_id,
+                summary_index: 1,
+                text,
+            } if item_id == "r1" && text == "plan"
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ModelEvent::ReasoningSummaryDone { .. }))
+                .count(),
+            2
         );
         assert_eq!(
             events

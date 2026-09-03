@@ -12,6 +12,7 @@ use crate::agent::{
 use crate::agent::{ConversationMessage, ConversationRole};
 use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
+use unicode_segmentation::UnicodeSegmentation;
 
 use std::{
     collections::HashMap,
@@ -334,6 +335,8 @@ fn is_runtime_context_section(text: &str) -> bool {
         )
     )
 }
+
+pub(crate) const REASONING_TRANSITION_FRAME_MS: u64 = 20;
 
 fn reasoning_transition_source(text: &str) -> String {
     text.lines()
@@ -908,18 +911,24 @@ impl Timeline {
     }
 
     pub fn finish_reasoning_transitions(&mut self, now: std::time::Instant) {
-        const TRANSITION_DURATION: std::time::Duration = std::time::Duration::from_millis(198);
         let indices = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| match item {
-                TimelineItem::Reasoning(reasoning)
-                    if reasoning.transition_started_at.is_some_and(|started_at| {
-                        now.saturating_duration_since(started_at) >= TRANSITION_DURATION
-                    }) =>
-                {
-                    Some(index)
+                TimelineItem::Reasoning(reasoning) => {
+                    let started_at = reasoning.transition_started_at?;
+                    let previous = reasoning.transition_from.as_deref()?;
+                    let target = reasoning_transition_source(&reasoning.text);
+                    let frame_count = previous
+                        .graphemes(true)
+                        .count()
+                        .max(target.graphemes(true).count());
+                    let duration = std::time::Duration::from_millis(
+                        REASONING_TRANSITION_FRAME_MS
+                            .saturating_mul(u64::try_from(frame_count).unwrap_or(u64::MAX)),
+                    );
+                    (now.saturating_duration_since(started_at) >= duration).then_some(index)
                 }
                 _ => None,
             })
@@ -2146,13 +2155,13 @@ mod tests {
                     && reasoning.transition_started_at.is_none()
         ));
         timeline.begin_reasoning_transitions(start + std::time::Duration::from_millis(30));
-        timeline.finish_reasoning_transitions(start + std::time::Duration::from_millis(227));
+        timeline.finish_reasoning_transitions(start + std::time::Duration::from_millis(149));
         assert!(matches!(
             timeline.items().last(),
             Some(TimelineItem::Reasoning(reasoning))
                 if reasoning.transition_from.as_deref() == Some("First")
         ));
-        timeline.finish_reasoning_transitions(start + std::time::Duration::from_millis(228));
+        timeline.finish_reasoning_transitions(start + std::time::Duration::from_millis(150));
         assert!(matches!(
             timeline.items().last(),
             Some(TimelineItem::Reasoning(reasoning))

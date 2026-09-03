@@ -20,7 +20,7 @@
 ### Changed
 
 - Thoughts Level 1 将连续 thinking 的耗时累计到下一次 tool call 或 assistant 输出，并在最新标题替换时使用短暂的从左到右逐字过渡。
-- `/tool-output` 更名为 `/tools`（旧命令保留为隐藏兼容别名），提供 Level 1 单行累计工具调用数与 Level 2 逐项详细显示，并持久化用户选择。
+- `/tool-output` 更名为 `/tools`（旧命令保留为隐藏兼容别名），提供 Level 1 固定英文标题与最新调用分行展示、累计工具调用数，以及 Level 2 逐项详细显示，并持久化用户选择。
 - Provider 适配层重构为统一、类型化的 `ModelRuntime` 与 `ProtocolBinding`；Responses、Completions 和 Anthropic 的 wire request、缓存、流式解码、终止校验、重试及 one-shot 执行由各协议 adapter 与公共 runtime 协作处理。
 - 精简模型、主题、语言、侧栏等常规设置成功后的 TUI 状态提示，保留错误、排队和需要用户处理的状态。
 - Windows shell 命令优先使用 PowerShell 7（`pwsh.exe`），不可用时依次回退到 Windows PowerShell（`powershell.exe`）和 `cmd.exe`；选定结果在进程内缓存，缓存目标消失时重新探测。
@@ -32,6 +32,7 @@
 - 上下文压缩会按摘要请求的实际 token 预算选择可安全压缩的历史前缀，避免摘要请求超限或退休未进入摘要的历史。
 - Provider 请求失败时在 TUI、CLI 和 transcript 中保留经过凭据脱敏的响应详情，便于定位状态码之外的具体错误。
 - Responses 请求使用与消息角色匹配的文本块，并正确序列化纯文本与图片工具结果。
+- Responses reasoning summary 按 `summary_index` 分隔并逐项更新 Thoughts Level 1，避免多个阶段标题直接拼接。
 - Responses WebSocket 请求被关闭码 `1009` 拒绝时保留诊断信息，并在已启用重试时将当前回合后续尝试切换到 HTTP/SSE。
 - 主代理和子代理在模型重试等待期间持续显示实时倒计时，并在重试开始时立即清除通知。
 - 首次打开子代理视图时加载完整 snapshot history，不再被此前收到的局部实时事件覆盖。

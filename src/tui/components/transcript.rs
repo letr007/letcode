@@ -1174,9 +1174,6 @@ fn animated_compact_reasoning_title_at(
     width: usize,
     now: std::time::Instant,
 ) -> String {
-    const FRAME_MS: u128 = 33;
-    const REPLACEMENT_FRAMES: usize = 6;
-
     let target = tool_card::truncate_display_width(title, width);
     let (Some(previous), Some(started_at)) = (
         reasoning.transition_from.as_deref(),
@@ -1189,17 +1186,18 @@ fn animated_compact_reasoning_title_at(
         .unwrap_or_else(|| previous.to_string());
     let previous = tool_card::truncate_display_width(&previous, width);
     let elapsed_ms = now.saturating_duration_since(started_at).as_millis();
-    let frame = usize::try_from(elapsed_ms / FRAME_MS)
-        .unwrap_or(usize::MAX)
-        .min(REPLACEMENT_FRAMES);
-    if frame >= REPLACEMENT_FRAMES {
-        return target;
-    }
+    let frame = usize::try_from(
+        elapsed_ms / u128::from(crate::tui::timeline::REASONING_TRANSITION_FRAME_MS),
+    )
+    .unwrap_or(usize::MAX);
 
     let previous = previous.graphemes(true).collect::<Vec<_>>();
     let target = target.graphemes(true).collect::<Vec<_>>();
     let positions = previous.len().max(target.len());
-    let replaced = positions.saturating_mul(frame) / REPLACEMENT_FRAMES;
+    let replaced = frame.min(positions);
+    if replaced >= positions {
+        return target.concat();
+    }
     let mut rendered = String::new();
     for index in 0..positions {
         if index < replaced {
@@ -2913,43 +2911,53 @@ mod tests {
     }
 
     #[test]
-    fn compact_reasoning_title_replaces_from_left_to_right() {
+    fn compact_reasoning_title_replaces_one_grapheme_per_frame() {
         let start = std::time::Instant::now();
         let reasoning = ReasoningView {
             item_id: "reasoning-2".into(),
-            text: "New result".into(),
+            text: "新标题".into(),
             streaming: true,
             started_at: Some(start),
             duration_ms: None,
-            transition_from: Some("Old phase".into()),
+            transition_from: Some("旧文案".into()),
             transition_started_at: Some(start),
         };
 
         assert_eq!(
-            animated_compact_reasoning_title_at(&reasoning, "New result", 40, start),
-            "Old phase"
+            animated_compact_reasoning_title_at(&reasoning, "新标题", 40, start),
+            "旧文案"
         );
-        let middle = animated_compact_reasoning_title_at(
-            &reasoning,
-            "New result",
-            40,
-            start + std::time::Duration::from_millis(66),
-        );
-        assert!(middle.starts_with("New"), "{middle}");
-        assert_ne!(middle, "New result");
         assert_eq!(
             animated_compact_reasoning_title_at(
                 &reasoning,
-                "New result",
+                "新标题",
                 40,
-                start + std::time::Duration::from_millis(198),
+                start + std::time::Duration::from_millis(20),
             ),
-            "New result"
+            "新文案"
+        );
+        assert_eq!(
+            animated_compact_reasoning_title_at(
+                &reasoning,
+                "新标题",
+                40,
+                start + std::time::Duration::from_millis(40),
+            ),
+            "新标案"
+        );
+        assert_eq!(
+            animated_compact_reasoning_title_at(
+                &reasoning,
+                "新标题",
+                40,
+                start + std::time::Duration::from_millis(60),
+            ),
+            "新标题"
         );
     }
 
     #[test]
-    fn compact_tools_replace_contiguous_calls_with_one_counted_line() {
+    fn compact_tools_render_fixed_header_above_latest_call() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
         state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
@@ -2971,14 +2979,26 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        let tool_rows = compact
+        let header_index = compact
             .iter()
-            .filter(|line| line.contains("tools · 2"))
-            .collect::<Vec<_>>();
-        assert_eq!(tool_rows.len(), 1, "{compact:?}");
-        assert!(tool_rows[0].contains("1 failed"), "{compact:?}");
-        assert!(tool_rows[0].contains("second.rs"), "{compact:?}");
+            .position(|line| line.contains("Tools · 2"))
+            .expect("compact tools header");
+        assert!(compact[header_index].contains("1 failed"), "{compact:?}");
+        assert!(
+            compact
+                .get(header_index + 1)
+                .is_some_and(|line| line.contains("second.rs")),
+            "{compact:?}"
+        );
         assert!(!compact.iter().any(|line| line.contains("first.rs")));
+
+        state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+        let localized = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(localized.iter().any(|line| line.contains("Tools · 2")));
+        assert!(!localized.iter().any(|line| line.contains("工具 · 2")));
 
         state.set_tools_display(crate::command::ToolsDisplayMode::Detailed);
         let detailed = transcript_lines(&state, Theme::dark(), 80)
