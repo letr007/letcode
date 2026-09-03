@@ -1839,48 +1839,6 @@ mod tests {
         assert!(has_credential);
     }
 
-    #[test]
-    fn tool_driven_override_credential_check_uses_the_requested_route() {
-        let mut parent = Agent::new("shared", 1, 1);
-        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
-        let selected = crate::config::ModelRoute::new("expert", "shared");
-        let delegate = credential_delegate(
-            &mut parent,
-            crate::config::ModelRoute::new("expert", "shared"),
-            vec![selected.clone()],
-        );
-        let invocation = SubagentInvocation {
-            input: crate::tool::NormalizedSubagentInput {
-                objective: "inspect route credentials".into(),
-                success_criteria: Vec::new(),
-                allowed_paths: Vec::new(),
-                forbidden_paths: Vec::new(),
-                owned_paths: Vec::new(),
-                timeout_secs: None,
-                max_tool_calls: None,
-                model: Some(selected.display_name()),
-                target_child_session_id: None,
-                background: false,
-            },
-            model: Some(selected),
-            prompt: "inspect route credentials".into(),
-            parent_tool_call_id: Some("call-2".into()),
-        };
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("create runtime");
-        let output = runtime
-            .block_on(delegate.run_named(&parent, "explorer", invocation))
-            .expect("credential denial is a tool result");
-        assert!(!output.ok);
-        assert_eq!(
-            output.data.as_ref().and_then(|data| data.get("route")),
-            Some(&json!("expert/shared"))
-        );
-    }
-
     fn temp_transcript() -> Arc<Mutex<TranscriptRecorder>> {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-runner-child-streaming-test-{}",

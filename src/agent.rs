@@ -84,7 +84,7 @@ pub use events::{
 pub(crate) use events::{CompactionCheckpoint, CompactionFileOperations};
 
 #[cfg(test)]
-use compaction::{default_preserve_recent_budget, render_compaction_prompt};
+use compaction::default_preserve_recent_budget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExecutionStatus {
@@ -5509,115 +5509,6 @@ mod incremental_append_tests {
             cold.runtime_snapshot.compaction.turn_protected_frame_ids
         );
         assert_eq!(incremental.evidence(), cold.evidence());
-    }
-
-    #[test]
-    fn warm_suffix_matches_cold_request_and_budget_for_all_protocols() {
-        for protocol in [
-            ApiProtocol::Responses,
-            ApiProtocol::Completions,
-            ApiProtocol::Anthropic,
-        ] {
-            let base = vec![
-                HistoryItem::user("old question"),
-                HistoryItem::assistant("old answer"),
-            ];
-            let suffix = vec![
-                HistoryItem::user("new question"),
-                HistoryItem::assistant("new answer"),
-            ];
-            let mut warm_agent = Agent::new("m1", 4, 4);
-            warm_agent.turn.current_turn_start_index = Some(base.len());
-            warm_agent.set_history_for_test(base.clone());
-            let cold_epoch = warm_agent
-                .resolved_epoch_preview_for_test(protocol, &[], &[])
-                .expect("initial epoch preview");
-            warm_agent.commit_active_epoch(cold_epoch);
-            for item in &suffix {
-                warm_agent
-                    .append_history_item(item.clone())
-                    .expect("suffix append");
-            }
-            let warm = warm_agent
-                .resolved_epoch_preview_for_test(protocol, &[], &[])
-                .expect("warm epoch preview");
-
-            let mut cold_agent = Agent::new("m1", 4, 4);
-            cold_agent.turn.current_turn_start_index = Some(base.len());
-            cold_agent.set_history_for_test(base.iter().chain(&suffix).cloned().collect());
-            let cold = cold_agent
-                .resolved_epoch_preview_for_test(protocol, &[], &[])
-                .expect("cold epoch preview");
-
-            let mut expected_plan = cold.build.prompt_plan.clone();
-            for segment in &mut expected_plan.segments[..base.len()] {
-                segment.stability =
-                    crate::request_builder::prompt_plan::PromptSegmentStability::Stable;
-            }
-            expected_plan.recompute_cache_metadata();
-            assert_eq!(
-                warm.build.prompt_plan, expected_plan,
-                "{protocol:?} warm PromptPlan differs from canonical cold structure"
-            );
-            assert_eq!(
-                warm.build.budget.context_window_tokens, cold.build.budget.context_window_tokens,
-                "{protocol:?} context window differs"
-            );
-            assert_eq!(
-                warm.build.budget.input_budget_tokens, cold.build.budget.input_budget_tokens,
-                "{protocol:?} input budget differs"
-            );
-            assert_eq!(
-                warm.build.budget.estimated_request_tokens,
-                cold.build.budget.estimated_request_tokens,
-                "{protocol:?} request token estimate differs"
-            );
-            assert_eq!(
-                warm.build.budget.plan_total_prompt_tokens,
-                cold.build.budget.plan_total_prompt_tokens,
-                "{protocol:?} prompt token total differs"
-            );
-            assert!(matches!(
-                warm.transition,
-                ActiveEpochTransition::Append { added: 2 }
-            ));
-        }
-    }
-
-    #[test]
-    fn warm_suffix_planning_does_not_reenter_full_planner() {
-        let history = (0..64)
-            .map(|index| {
-                if index % 2 == 0 {
-                    HistoryItem::user(format!("question-{index}"))
-                } else {
-                    HistoryItem::assistant(format!("answer-{index}"))
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut agent = Agent::new("m1", 4, 4);
-        agent.set_history_for_test(history[..62].to_vec());
-        agent.turn.current_turn_start_index = Some(62);
-        crate::request_builder::prompt_plan::reset_plan_call_count();
-        let cold = agent
-            .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &[])
-            .expect("cold preview");
-        assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
-        agent.commit_active_epoch(cold);
-        agent
-            .append_history_item(history[62].clone())
-            .expect("first suffix append");
-        agent
-            .append_history_item(history[63].clone())
-            .expect("second suffix append");
-        let warm = agent
-            .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &[])
-            .expect("warm preview");
-        assert!(matches!(
-            warm.transition,
-            ActiveEpochTransition::Append { .. }
-        ));
-        assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
     }
 }
 

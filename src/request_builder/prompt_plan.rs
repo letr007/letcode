@@ -13,24 +13,6 @@ use crate::runtime_context::{
 use crate::user_content::{UserImageAttachment, UserMessageContent};
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use std::cell::Cell;
-
-#[cfg(test)]
-thread_local! {
-    static PLAN_CALL_COUNT: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_plan_call_count() {
-    PLAN_CALL_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn plan_call_count() -> usize {
-    PLAN_CALL_COUNT.with(Cell::get)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PromptSegmentRole {
@@ -189,8 +171,6 @@ pub(crate) struct PlannedPrompt {
 
 impl PromptPlanner {
     pub(crate) fn plan(input: PromptPlannerInput<'_>) -> anyhow::Result<PlannedPrompt> {
-        #[cfg(test)]
-        PLAN_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         input.snapshot.validate_references()?;
         let active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
         let active_protected_start_index =

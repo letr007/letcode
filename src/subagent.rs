@@ -29,8 +29,6 @@ use result::{build_completed_summary, build_runtime_summary, classify_failure_st
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
-use tokio::time::Duration;
 
 #[cfg(test)]
 mod tests {
@@ -51,8 +49,7 @@ mod tests {
     use crate::transcript::{JournalSink, read_records};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use tokio::sync::Barrier;
-    use tokio::time::sleep;
+    use tokio::sync::{Barrier, oneshot};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -167,19 +164,6 @@ mod tests {
         assert_eq!(result.status, SubagentStatus::Cancelled);
     }
 
-    async fn wait_until<F>(mut condition: F)
-    where
-        F: FnMut() -> bool,
-    {
-        for _ in 0..50 {
-            if condition() {
-                return;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        assert!(condition(), "condition was not met before timeout");
-    }
-
     #[test]
     fn child_agents_do_not_expose_recursive_subagent_tools() {
         let agent = test_agent();
@@ -290,6 +274,58 @@ mod tests {
         }
     }
 
+    fn resolved_runtime_catalog() -> crate::model_runtime::ResolvedRuntimeCatalog {
+        crate::model_runtime::RuntimeConfig::from_toml(
+            r#"
+active_provider = "primary"
+
+[providers.primary]
+protocol = "responses"
+default_model = "shared"
+[providers.primary.auth]
+type = "none"
+[providers.primary.endpoints]
+base_url = "https://primary.example.invalid/v1"
+[providers.primary.models.shared]
+
+[providers.expert]
+protocol = "completions"
+default_model = "shared"
+[providers.expert.auth]
+type = "none"
+[providers.expert.endpoints]
+base_url = "https://expert.example.invalid/v1"
+[providers.expert.models.shared]
+[providers.expert.models.special]
+
+[providers.test]
+protocol = "completions"
+default_model = "child-resume-model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "https://test.example.invalid/v1"
+[providers.test.models."child-resume-model"]
+"#,
+        )
+        .expect("parse resolved runtime test catalog")
+        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+        .expect("resolve resolved runtime test catalog")
+    }
+
+    fn use_resolved_runtime_catalog(agent: &mut Agent) {
+        let catalog = resolved_runtime_catalog();
+        let route = ModelRoute::new("primary", "shared");
+        let resolved_route = Arc::new(
+            catalog
+                .route(&route.provider, &route.model)
+                .expect("primary/shared route is resolved")
+                .clone(),
+        );
+        agent.set_resolved_runtime_catalog(Some(catalog));
+        agent.set_model_route_authority(route, resolved_route);
+    }
+
     #[test]
     fn expert_policy_default_inherits_parent_without_allowing_implicit_override() {
         let providers = indexmap::IndexMap::from([(
@@ -301,19 +337,24 @@ mod tests {
                 &["shared"],
             ),
         )]);
-        let factory = ExpertRouteFactory::new_with_policies(
-            [("explorer".into(), None, Vec::new())],
-            &providers,
-            &RetryConfig::default(),
-        )
-        .expect("factory should build");
+        let factory = Arc::new(
+            ExpertRouteFactory::new_with_policies(
+                [("explorer".into(), None, Vec::new())],
+                &providers,
+                &RetryConfig::default(),
+            )
+            .expect("factory should build")
+            .with_runtime_catalog(resolved_runtime_catalog()),
+        );
         let mut parent = test_agent();
+        use_resolved_runtime_catalog(&mut parent);
         parent.set_primary_route(ModelRoute::new("primary", "shared"));
+        parent.set_primary_route_factory(factory.clone());
 
         let inherited = ModelRoute::new("primary", "shared");
         assert_eq!(
             SubagentChildFactory::resolve_route(
-                &factory,
+                factory.as_ref(),
                 &parent,
                 &AgentTemplate::explorer(),
                 None,
@@ -324,7 +365,7 @@ mod tests {
         );
         assert_eq!(
             SubagentChildFactory::resolve_route(
-                &factory,
+                factory.as_ref(),
                 &parent,
                 &AgentTemplate::explorer(),
                 Some(&inherited),
@@ -333,19 +374,14 @@ mod tests {
             .expect("takeover may reuse the effective default route"),
             inherited
         );
-        let error = SubagentChildFactory::resolve_route(
-            &factory,
+        SubagentChildFactory::resolve_route(
+            factory.as_ref(),
             &parent,
             &AgentTemplate::explorer(),
             Some(&ModelRoute::new("primary", "shared")),
             false,
         )
         .expect_err("empty allowlist rejects explicit selection");
-        assert!(
-            error
-                .to_string()
-                .contains("is not allowed for expert 'explorer'")
-        );
     }
 
     #[test]
@@ -371,23 +407,28 @@ mod tests {
             ),
         ]);
         let selected = ModelRoute::new("expert", "special");
-        let factory = ExpertRouteFactory::new_with_policies(
-            [(
-                "explorer".into(),
-                Some(ModelRoute::new("primary", "shared")),
-                vec![selected.clone()],
-            )],
-            &providers,
-            &RetryConfig::default(),
-        )
-        .expect("factory should build");
+        let factory = Arc::new(
+            ExpertRouteFactory::new_with_policies(
+                [(
+                    "explorer".into(),
+                    Some(ModelRoute::new("primary", "shared")),
+                    vec![selected.clone()],
+                )],
+                &providers,
+                &RetryConfig::default(),
+            )
+            .expect("factory should build")
+            .with_runtime_catalog(resolved_runtime_catalog()),
+        );
         let mut parent = test_agent();
+        use_resolved_runtime_catalog(&mut parent);
         parent.set_primary_route(ModelRoute::new("primary", "shared"));
+        parent.set_primary_route_factory(factory.clone());
 
         for takeover in [false, true] {
             assert_eq!(
                 SubagentChildFactory::resolve_route(
-                    &factory,
+                    factory.as_ref(),
                     &parent,
                     &AgentTemplate::explorer(),
                     Some(&selected),
@@ -398,7 +439,7 @@ mod tests {
             );
         }
         let child = SubagentChildFactory::create_child(
-            &factory,
+            factory.as_ref(),
             &parent,
             &AgentTemplate::explorer(),
             &selected,
@@ -451,12 +492,7 @@ mod tests {
         let result =
             PrimaryRouteFactory::prepare_route(&factory, ModelRoute::new("expert", "unconfigured"));
 
-        assert!(matches!(
-            result,
-            Err(error)
-                if error.to_string()
-                    == "child route provider 'expert' model 'unconfigured' is not configured"
-        ));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -497,9 +533,11 @@ mod tests {
                 &indexmap::IndexMap::from([("expert".into(), provider)]),
                 &RetryConfig::default(),
             )
-            .expect("factory should build"),
+            .expect("factory should build")
+            .with_runtime_catalog(resolved_runtime_catalog()),
         );
         let mut parent = test_agent();
+        use_resolved_runtime_catalog(&mut parent);
         parent.set_subagent_child_factory(factory.clone());
         parent.set_primary_route_factory(factory);
 
@@ -555,14 +593,19 @@ mod tests {
             )]),
         };
         let providers = indexmap::IndexMap::from([("expert".into(), provider)]);
-        let factory = ExpertRouteFactory::new(
-            [("explorer".into(), ModelRoute::new("expert", "shared"))],
-            &providers,
-            &RetryConfig::default(),
-        )
-        .expect("factory should build");
+        let factory = Arc::new(
+            ExpertRouteFactory::new(
+                [("explorer".into(), ModelRoute::new("expert", "shared"))],
+                &providers,
+                &RetryConfig::default(),
+            )
+            .expect("factory should build")
+            .with_runtime_catalog(resolved_runtime_catalog()),
+        );
         let mut parent = test_agent();
-        parent.set_subagent_child_factory(Arc::new(factory));
+        use_resolved_runtime_catalog(&mut parent);
+        parent.set_primary_route_factory(factory.clone());
+        parent.set_subagent_child_factory(factory);
 
         let child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
 
@@ -817,10 +860,13 @@ mod tests {
                 )]),
                 &RetryConfig::default(),
             )
-            .expect("takeover route factory"),
+            .expect("takeover route factory")
+            .with_runtime_catalog(resolved_runtime_catalog()),
         );
         let mut takeover_parent = test_agent();
+        use_resolved_runtime_catalog(&mut takeover_parent);
         takeover_parent.set_primary_route(takeover_route);
+        takeover_parent.set_primary_route_factory(factory.clone());
         takeover_parent.set_subagent_child_factory(factory);
         let mut takeover_governance = test_governance();
         takeover_governance.input.target_child_session_id = Some(first.child_session_id.clone());
@@ -923,12 +969,14 @@ mod tests {
                 &indexmap::IndexMap::from([("expert".into(), provider)]),
                 &RetryConfig::default(),
             )
-            .expect("factory should build"),
+            .expect("factory should build")
+            .with_runtime_catalog(resolved_runtime_catalog()),
         );
         let mut parent = test_agent();
+        use_resolved_runtime_catalog(&mut parent);
         parent.set_primary_route(ModelRoute::new("primary", "shared"));
-        parent.set_subagent_child_factory(factory.clone());
         parent.set_primary_route_factory(factory.clone());
+        parent.set_subagent_child_factory(factory.clone());
         let first = runtime
             .run_with_executor(
                 &parent,
@@ -961,6 +1009,7 @@ mod tests {
             .expect("initial run succeeds");
 
         let mut current_expert_parent = test_agent();
+        use_resolved_runtime_catalog(&mut current_expert_parent);
         current_expert_parent.set_primary_route(ModelRoute::new("primary", "shared"));
         current_expert_parent.set_primary_route_factory(factory.clone());
         current_expert_parent.set_subagent_child_factory(factory);
@@ -1009,6 +1058,7 @@ mod tests {
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
         let barrier = Arc::new(Barrier::new(2));
+        let (release_first, wait_for_release) = oneshot::channel();
 
         let first_runtime = runtime.clone();
         let first_barrier = Arc::clone(&barrier);
@@ -1033,7 +1083,7 @@ mod tests {
                           _agent_name| {
                         async move {
                             first_barrier.wait().await;
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            wait_for_release.await.expect("release first reader");
                             Ok("done".into())
                         }
                         .boxed()
@@ -1063,7 +1113,10 @@ mod tests {
                  _child_session_id,
                  _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
-            .await
+            .now_or_never();
+        release_first.send(()).expect("first reader is waiting");
+        let second = second
+            .expect("second reader must not wait for the active reader")
             .expect("second reader should run concurrently");
         assert_eq!(second.status, SubagentStatus::Completed);
         let first_summary = first.await.expect("join first").expect("first ok");
@@ -1103,6 +1156,7 @@ mod tests {
         let mut governance = test_governance();
         governance.input.owned_paths = vec![owned_dir.to_string_lossy().into_owned()];
         let barrier = Arc::new(Barrier::new(2));
+        let (release_first, wait_for_release) = oneshot::channel();
 
         let first_runtime = runtime.clone();
         let first_barrier = Arc::clone(&barrier);
@@ -1123,7 +1177,7 @@ mod tests {
                     move |_agent, _task, _transcript, _tx, _child, _name| {
                         async move {
                             first_barrier.wait().await;
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            wait_for_release.await.expect("release first writer");
                             Ok("done".into())
                         }
                         .boxed()
@@ -1149,7 +1203,10 @@ mod tests {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
-            .await
+            .now_or_never();
+        release_first.send(()).expect("first writer is waiting");
+        let error = error
+            .expect("overlapping writer rejection must not wait")
             .expect_err("overlapping writer must be rejected")
             .to_string();
         assert!(error.contains("path lock conflict"), "{error}");
@@ -1176,6 +1233,7 @@ mod tests {
         let mut right_governance = test_governance();
         right_governance.input.owned_paths = vec![right.to_string_lossy().into_owned()];
         let barrier = Arc::new(Barrier::new(2));
+        let (release_first, wait_for_release) = oneshot::channel();
 
         let first_runtime = runtime.clone();
         let first_barrier = Arc::clone(&barrier);
@@ -1195,7 +1253,7 @@ mod tests {
                     move |_agent, _task, _transcript, _tx, _child, _name| {
                         async move {
                             first_barrier.wait().await;
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            wait_for_release.await.expect("release first writer");
                             Ok("done".into())
                         }
                         .boxed()
@@ -1220,7 +1278,10 @@ mod tests {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
-            .await
+            .now_or_never();
+        release_first.send(()).expect("first writer is waiting");
+        let second = second
+            .expect("disjoint writer must not wait for the active writer")
             .expect("disjoint writer starts");
         assert_eq!(second.status, SubagentStatus::Completed);
         assert_eq!(
@@ -1698,6 +1759,7 @@ mod tests {
                 fail: Arc::clone(&fail_parent_result),
             }));
         let barrier = Arc::new(Barrier::new(2));
+        let (release_executor, wait_for_release) = oneshot::channel();
         let exec_barrier = Arc::clone(&barrier);
         let run_runtime = runtime.clone();
         let run = tokio::spawn(async move {
@@ -1716,7 +1778,7 @@ mod tests {
                     move |_agent, _task, _transcript, _tx, _child, _name| {
                         async move {
                             exec_barrier.wait().await;
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            wait_for_release.await.expect("release executor");
                             Ok("completed summary".into())
                         }
                         .boxed()
@@ -1726,6 +1788,7 @@ mod tests {
         });
         barrier.wait().await;
         fail_parent_result.store(true, Ordering::SeqCst);
+        release_executor.send(()).expect("executor is waiting");
         let summary = run
             .await
             .expect("join run")

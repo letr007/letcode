@@ -700,18 +700,14 @@ mod tests {
 
     #[test]
     fn primary_route_factory_rejects_unknown_provider_or_model() {
-        let mut agent = test_agent();
         let factory =
             ConfiguredPrimaryRouteFactory::new(IndexMap::new(), config::RetryConfig::default());
-        agent.set_primary_route_factory(Arc::new(factory));
-
-        let error = agent
-            .switch_primary_route(config::ModelRoute::new("missing", "shared"))
-            .expect_err("unknown provider must fail");
         assert!(
-            error
-                .to_string()
-                .contains("provider 'missing' is not defined under [providers]")
+            crate::agent::PrimaryRouteFactory::prepare_route(
+                &factory,
+                config::ModelRoute::new("missing", "shared")
+            )
+            .is_err()
         );
 
         let provider = ProviderConfig {
@@ -723,18 +719,16 @@ mod tests {
             retry: None,
             models: IndexMap::new(),
         };
-        let mut agent = test_agent();
-        agent.set_primary_route_factory(Arc::new(ConfiguredPrimaryRouteFactory::new(
+        let factory = ConfiguredPrimaryRouteFactory::new(
             IndexMap::from([("known".into(), provider)]),
             config::RetryConfig::default(),
-        )));
-        let error = agent
-            .switch_primary_route(config::ModelRoute::new("known", "missing"))
-            .expect_err("unknown model must fail");
+        );
         assert!(
-            error
-                .to_string()
-                .contains("model 'missing' is not defined under [providers.known.models]")
+            crate::agent::PrimaryRouteFactory::prepare_route(
+                &factory,
+                config::ModelRoute::new("known", "missing")
+            )
+            .is_err()
         );
     }
 

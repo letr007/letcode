@@ -538,7 +538,10 @@ fn session_resumed_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     struct RecordingRouteFactory {
         accepted_routes: Vec<ModelRoute>,
@@ -551,11 +554,27 @@ mod tests {
                 anyhow::bail!("route is not configured: {}", route.display_name());
             }
             *self.applied_route.lock().expect("capture route") = Some(route.clone());
+            let model_id = route.model.clone();
             Ok(crate::agent::PreparedPrimaryRoute::new(
                 route,
                 crate::config::ApiProtocol::Responses,
                 std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
+                std::collections::HashMap::from([(
+                    model_id,
+                    crate::request_builder::ModelRequestMetadata {
+                        supports_tools: true,
+                        supports_reasoning: true,
+                        reasoning_effort: Some(
+                            crate::request_builder::ModelReasoningEffort::Medium,
+                        ),
+                        reasoning_efforts: vec![
+                            crate::request_builder::ModelReasoningEffort::Medium,
+                            crate::request_builder::ModelReasoningEffort::High,
+                        ],
+                        parallel_tool_calls: true,
+                        ..Default::default()
+                    },
+                )]),
                 crate::config::RetryConfig::default(),
             ))
         }
@@ -563,16 +582,67 @@ mod tests {
 
     fn temp_dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "letcode-session-restore-fast-mode-{}",
+            "letcode-session-restore-fast-mode-{}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time ok")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
         ))
     }
 
     fn test_agent() -> Agent {
         Agent::new("gpt-5.5", 1, 1)
+    }
+
+    fn routed_test_catalog() -> crate::model_runtime::ResolvedRuntimeCatalog {
+        crate::model_runtime::RuntimeConfig::from_toml(
+            r#"
+active_provider = "primary"
+
+[providers.primary]
+protocol = "responses"
+default_model = "shared"
+[providers.primary.auth]
+type = "none"
+[providers.primary.endpoints]
+base_url = "https://primary.example.invalid/v1"
+[providers.primary.models."gpt-5.5"]
+[providers.primary.models.shared]
+[providers.primary.models.shared.capabilities]
+tools = true
+parallel_tool_calls = true
+reasoning = true
+[providers.primary.models.shared.capabilities.generation]
+reasoning = true
+parallel_tool_calls = true
+[providers.primary.models.shared.generation]
+reasoning_effort = "medium"
+reasoning_efforts = ["medium", "high"]
+
+[providers.expert]
+protocol = "responses"
+default_model = "shared"
+[providers.expert.auth]
+type = "none"
+[providers.expert.endpoints]
+base_url = "https://expert.example.invalid/v1"
+[providers.expert.models.shared]
+[providers.expert.models.shared.capabilities]
+tools = true
+parallel_tool_calls = true
+reasoning = true
+[providers.expert.models.shared.capabilities.generation]
+reasoning = true
+parallel_tool_calls = true
+[providers.expert.models.shared.generation]
+reasoning_effort = "medium"
+reasoning_efforts = ["medium", "high"]
+"#,
+        )
+        .expect("parse routed test catalog")
+        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+        .expect("resolve routed test catalog")
     }
 
     struct SelectiveRouteFactory {
@@ -633,6 +703,7 @@ mod tests {
             .set_reasoning_effort(crate::request_builder::ModelReasoningEffort::High)
             .expect("set previous session effort for the resumed route");
         agent.set_primary_route(ModelRoute::new("primary", "shared"));
+        agent.set_resolved_runtime_catalog(Some(routed_test_catalog()));
         let applied_route = Arc::new(Mutex::new(None));
         agent.set_primary_route_factory(Arc::new(RecordingRouteFactory {
             accepted_routes: vec![ModelRoute::new("expert", "shared")],
@@ -659,11 +730,64 @@ mod tests {
         );
         assert_eq!(
             agent.reasoning_effort(),
-            None,
-            "resuming a different session must not retain the previous session effort"
+            Some(crate::request_builder::ModelReasoningEffort::Medium),
+            "resuming a different session must use the restored route default instead of the previous session effort"
         );
         assert!(!fast_mode_auto_disabled);
         assert_eq!(token_usage.output_tokens, 0);
+    }
+
+    fn assert_invalid_routed_resume_is_atomic(recorded_model: &str) {
+        let sessions_dir = temp_dir();
+        let mut target =
+            TranscriptRecorder::create(&sessions_dir).expect("create target transcript");
+        target
+            .record_session_started("primary/shared")
+            .expect("record target session start");
+        target
+            .record_model_changed("primary/shared", recorded_model)
+            .expect("record invalid target route");
+        let target_session_id = target.session_id().to_string();
+        drop(target);
+
+        let mut agent = test_agent();
+        agent.set_model("shared");
+        let current_route = ModelRoute::new("primary", "shared");
+        agent.set_primary_route(current_route.clone());
+        agent.set_resolved_runtime_catalog(Some(routed_test_catalog()));
+        agent.set_primary_route_factory(Arc::new(SelectiveRouteFactory {
+            accepted_routes: vec![current_route.clone()],
+            attempted_routes: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let live = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&sessions_dir).expect("create live transcript"),
+        ));
+        let live_session_id = live
+            .lock()
+            .expect("live transcript")
+            .session_id()
+            .to_string();
+        let prepared =
+            prepare_resume_package(&sessions_dir, target_session_id).expect("prepare resume");
+
+        install_prepared_routed_resume_for_agent(&mut agent, &live, prepared)
+            .expect_err("invalid routed resume must fail before commit");
+        assert_eq!(agent.primary_route(), Some(&current_route));
+        assert_eq!(agent.model(), "shared");
+        assert_eq!(
+            live.lock().expect("live transcript").session_id(),
+            live_session_id
+        );
+    }
+
+    #[test]
+    fn routed_resume_fails_before_mutation_when_provider_route_is_invalid() {
+        assert_invalid_routed_resume_is_atomic("missing/shared");
+    }
+
+    #[test]
+    fn routed_resume_fails_before_mutation_when_model_is_missing() {
+        assert_invalid_routed_resume_is_atomic("primary/missing");
     }
 
     #[test]
@@ -937,6 +1061,7 @@ protocol = "responses"
 
         let mut agent = test_agent();
         agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
+        agent.set_resolved_runtime_catalog(Some(routed_test_catalog()));
         agent.set_primary_route_factory(Arc::new(SelectiveRouteFactory {
             accepted_routes: vec![ModelRoute::new("primary", "shared")],
             attempted_routes: Arc::new(Mutex::new(Vec::new())),

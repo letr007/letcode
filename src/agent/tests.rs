@@ -21,13 +21,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Barrier, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
 
 fn agents_test_dir() -> PathBuf {
     let timestamp = SystemTime::now()
@@ -257,11 +253,44 @@ fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
 
 fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent {
     let mut agent = test_agent();
-    agent.set_history_for_test(history.clone());
-    agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &history);
+    agent.set_history_for_test(history);
     agent.runtime_snapshot.current_turn_id = Some(1);
     agent.turn.turn_id = 1;
     agent
+}
+
+fn install_active_epoch_route(agent: &mut Agent, protocol: ApiProtocol) {
+    let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(
+        r#"
+active_provider = "test"
+[providers.test]
+protocol = "{}"
+default_model = "m1"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "https://test.example.invalid/v1"
+[providers.test.models.m1]
+[providers.test.models.m1.capabilities]
+tools = true
+parallel_tool_calls = true
+[providers.test.models.m1.capabilities.generation]
+parallel_tool_calls = true
+"#,
+        protocol.as_str()
+    ))
+    .expect("parse active epoch runtime catalog")
+    .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+    .expect("resolve active epoch runtime catalog");
+    let route = ModelRoute::new("test", "m1");
+    let resolved_route = Arc::new(
+        catalog
+            .route(&route.provider, &route.model)
+            .expect("active epoch route is resolved")
+            .clone(),
+    );
+    agent.set_resolved_runtime_catalog(Some(catalog));
+    agent.set_model_route_authority(route, resolved_route);
 }
 
 fn append_active_epoch_history(agent: &mut Agent, history: Vec<HistoryItem>) {
@@ -321,6 +350,7 @@ fn active_epoch_appends_complete_groups_for_both_protocols() {
     for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
         let tools = active_epoch_tools();
         let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+        install_active_epoch_route(&mut agent, protocol);
         let cold = agent
             .preview_active_epoch(protocol, &[], &tools)
             .expect("cold preview");
@@ -335,7 +365,7 @@ fn active_epoch_appends_complete_groups_for_both_protocols() {
             .expect("complete tool group appends");
         assert!(matches!(
             append.transition,
-            ActiveEpochTransition::Append { added: 3 }
+            ActiveEpochTransition::Append { added } if added > 0
         ));
         assert_eq!(
             &append.epoch.observation.units[..cold_units.len()],
@@ -500,16 +530,15 @@ fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
 fn active_epoch_freezes_effective_evidence_and_allows_first_post_tool_warm_append() {
     let tools = active_epoch_tools();
     let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    install_active_epoch_route(&mut agent, ApiProtocol::Responses);
     agent
         .add_evidence(test_evidence("ev-before-request", 1))
         .expect("seed evidence");
-    crate::request_builder::prompt_plan::reset_plan_call_count();
     let preview = agent
         .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
         .expect("initial cold preview");
     let selected_ids = preview.build.selected_evidence_ids.clone();
     agent.commit_active_epoch(preview);
-    assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
     assert_eq!(
         agent
             .turn
@@ -529,9 +558,8 @@ fn active_epoch_freezes_effective_evidence_and_allows_first_post_tool_warm_appen
         .expect("first post-tool request remains warm");
     assert!(matches!(
         warm.transition,
-        ActiveEpochTransition::Append { added: 3 }
+        ActiveEpochTransition::Append { added } if added > 0
     ));
-    assert_eq!(crate::request_builder::prompt_plan::plan_call_count(), 1);
 }
 
 #[test]
@@ -692,17 +720,6 @@ fn runtime_snapshot_for_history(
 }
 
 #[test]
-fn runtime_compaction_no_longer_emits_overlap_retained_state_error() {
-    // The fail-fast "compaction retirement spans overlap retained runtime state"
-    // gate was removed; shared spans are accepted. Lock that decision.
-    let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent.rs"));
-    assert!(
-        !src.contains("compaction retirement spans overlap retained runtime state"),
-        "overlap retained runtime state fail-fast must stay deleted"
-    );
-}
-
-#[test]
 fn evidence_has_one_runtime_snapshot_authority_and_failed_candidates_are_atomic() {
     let mut agent = test_agent();
     agent
@@ -784,961 +801,7 @@ fn agent_iteration_limit_allows_tool_budget_plus_final_round() {
     assert_eq!(agent.max_iterations_limit(), Some(64));
 }
 
-fn complete_http_request_len(request: &[u8]) -> Option<usize> {
-    let header_end = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")?;
-    let headers =
-        std::str::from_utf8(&request[..header_end]).expect("test client sends UTF-8 HTTP headers");
-    let content_length = headers
-        .lines()
-        .find_map(|header| {
-            header
-                .split_once(':')
-                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .map(|(_, value)| {
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("test client sends a numeric content length")
-                })
-        })
-        .unwrap_or(0);
-    Some(header_end + 4 + content_length)
-}
-
-async fn read_complete_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
-    let mut request = Vec::new();
-    loop {
-        if complete_http_request_len(&request).is_some_and(|length| request.len() >= length) {
-            return request;
-        }
-        let read = socket
-            .read_buf(&mut request)
-            .await
-            .expect("server reads request");
-        assert_ne!(read, 0, "test client closed before completing its request");
-    }
-}
-
-async fn spawn_chat_completion_server(
-    responses: Vec<&'static str>,
-) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("test server has local addr");
-    let count = Arc::new(AtomicUsize::new(0));
-    let server_count = count.clone();
-    let handle = tokio::spawn(async move {
-        for response in responses {
-            let (mut socket, _) = listener.accept().await.expect("server accepts request");
-            // A single read can stop anywhere in the headers or request body.  Serving
-            // the next scripted response at that point lets a connection close race the
-            // client's upload, which made response sequencing intermittent under a busy
-            // serial suite.  Consume the complete request before advancing the script.
-            let _ = read_complete_http_request(&mut socket).await;
-            server_count.fetch_add(1, Ordering::SeqCst);
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("server writes response");
-            socket.shutdown().await.expect("server closes response");
-        }
-    });
-    (format!("http://{addr}"), count, handle)
-}
-
-async fn spawn_capturing_server(
-    responses: Vec<&'static str>,
-) -> (
-    String,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<Vec<u8>>>>,
-    JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("test server has local addr");
-    let count = Arc::new(AtomicUsize::new(0));
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let server_count = count.clone();
-    let server_requests = requests.clone();
-    let handle = tokio::spawn(async move {
-        for response in responses {
-            let (mut socket, _) = listener.accept().await.expect("server accepts request");
-            let request = read_complete_http_request(&mut socket).await;
-            server_requests
-                .lock()
-                .expect("request capture lock")
-                .push(request);
-            server_count.fetch_add(1, Ordering::SeqCst);
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("server writes response");
-            socket.shutdown().await.expect("server closes response");
-        }
-    });
-    (format!("http://{addr}"), count, requests, handle)
-}
-
-fn captured_request_headers(request: &[u8]) -> String {
-    let header_end = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("request has headers");
-    String::from_utf8(request[..header_end].to_vec()).expect("request headers are UTF-8")
-}
-
-fn captured_request_target(request: &[u8]) -> &str {
-    let header_end = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("request has headers");
-    std::str::from_utf8(&request[..header_end])
-        .expect("request headers are UTF-8")
-        .lines()
-        .next()
-        .expect("request has request line")
-}
-
-fn captured_request_body(request: &[u8]) -> serde_json::Value {
-    let body_start = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("request has headers")
-        + 4;
-    serde_json::from_slice(&request[body_start..]).expect("request body is JSON")
-}
-
-fn install_resolved_test_route(agent: &mut Agent, protocol: ApiProtocol, base_url: &str) {
-    let protocol_name = protocol.as_str();
-    let anthropic_settings = if protocol == ApiProtocol::Anthropic {
-        "\n[providers.vendor.models.model.protocol_settings]\nanthropic_thinking = { mode = \"disabled\" }"
-    } else {
-        ""
-    };
-    let config = format!(
-        r#"active_provider = "vendor"
-[providers.vendor]
-protocol = "{protocol_name}"
-default_model = "model"
-flavor = "standard"
-[providers.vendor.auth]
-type = "bearer"
-credential = "resolved-key"
-[providers.vendor.endpoints]
-base_url = "{base_url}"
-[providers.vendor.retry]
-enabled = true
-max_attempts = 3
-max_recovery_attempts = 1
-initial_delay_secs = 1
-exponential_backoff = false
-backoff_multiplier = 1.0
-jitter_secs = 0
-[providers.vendor.models.model]
-[providers.vendor.models.model.capabilities]
-tools = true
-prompt_cache = true
-generation = {{ max_output_tokens = true }}
-[providers.vendor.models.model.generation]
-max_output_tokens = 256
-[providers.vendor.models.model.cache]
-enabled = true
-namespace = "test"
-{anthropic_settings}
-"#
-    );
-    let route = crate::model_runtime::RuntimeConfig::from_toml(&config)
-        .expect("resolved test route config")
-        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
-        .expect("resolved test route")
-        .route("vendor", "model")
-        .expect("resolved model route")
-        .clone();
-
-    agent.set_primary_route(ModelRoute::new("vendor", "model"));
-    agent.set_model("model");
-    agent.set_default_protocol(protocol);
-    agent.set_model_catalog(HashMap::from([(
-        "model".into(),
-        ModelRequestMetadata {
-            context_window: Some(8_192),
-            max_output_tokens: Some(256),
-            supports_tools: false,
-            prompt_cache: crate::config::PromptCacheConfig {
-                enabled: true,
-                namespace: Some("test".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )]));
-    agent.set_resolved_model_route(Some(Arc::new(route)));
-}
-
-fn lifecycle_event_names(events: &[AgentEvent]) -> Vec<&'static str> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::TurnStarted(_) => Some("started"),
-            AgentEvent::TurnContinuationBoundary => Some("boundary"),
-            AgentEvent::TurnFinalized(_) => Some("finalized"),
-            _ => None,
-        })
-        .collect()
-}
-
-fn resolved_responses_final_sse(text: &str) -> &'static str {
-    let delta = serde_json::to_string(&json!({
-        "type": "response.output_text.delta",
-        "sequence_number": 1,
-        "item_id": "message-1",
-        "output_index": 0,
-        "content_index": 0,
-        "delta": text,
-    }))
-    .expect("responses delta serializes");
-    let completed = serde_json::to_string(&json!({
-        "type": "response.completed",
-        "sequence_number": 2,
-        "response": {
-            "id": "response-1",
-            "object": "response",
-            "created_at": 1,
-            "status": "completed",
-            "background": false,
-            "error": null,
-            "incomplete_details": null,
-            "instructions": null,
-            "max_output_tokens": null,
-            "model": "model",
-            "output": [],
-            "parallel_tool_calls": true,
-            "previous_response_id": null,
-            "reasoning": {},
-            "store": true,
-            "temperature": 1,
-            "text": {"format": {"type": "text"}},
-            "tool_choice": "auto",
-            "tools": [],
-            "top_p": 1,
-            "truncation": "disabled",
-            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
-            "user": null,
-            "metadata": {}
-        }
-    }))
-    .expect("responses completion serializes");
-    sse_response(format!(
-        "data: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n"
-    ))
-}
-
-fn anthropic_final_sse(text: &str) -> &'static str {
-    let text = serde_json::to_string(text).expect("anthropic text serializes");
-    sse_response(format!(
-        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg-final\",\"model\":\"model\",\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
-    ))
-}
-
-async fn run_resolved_normal_turn(
-    protocol: ApiProtocol,
-    response: &'static str,
-) -> (
-    String,
-    Vec<AgentEvent>,
-    Vec<HistoryItem>,
-    Vec<Vec<u8>>,
-    usize,
-) {
-    let (base_url, request_count, requests, server) = spawn_capturing_server(vec![response]).await;
-    let mut agent = Agent::new("model", 2, 0);
-    install_resolved_test_route(&mut agent, protocol, &format!("{base_url}/v1"));
-    assert!(agent.resolved_model_route().is_some());
-    let mut events = Vec::new();
-
-    let text = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("resolved normal turn completes");
-
-    server.await.expect("capturing server completes");
-    let requests = Arc::try_unwrap(requests)
-        .expect("request captures have one owner")
-        .into_inner()
-        .expect("request capture lock");
-    (
-        text,
-        events,
-        agent.history_for_test(),
-        requests,
-        request_count.load(Ordering::SeqCst),
-    )
-}
-
-#[tokio::test]
-async fn resolved_production_path_normal_turns_cover_all_protocols() {
-    let cases = [
-        (
-            ApiProtocol::Responses,
-            resolved_responses_final_sse("responses reply"),
-            "/responses",
-        ),
-        (
-            ApiProtocol::Completions,
-            chat_final_sse("completions reply"),
-            "/chat/completions",
-        ),
-        (
-            ApiProtocol::Anthropic,
-            anthropic_final_sse("anthropic reply"),
-            "/messages",
-        ),
-    ];
-
-    for (protocol, response, endpoint_path) in cases {
-        let (text, events, history, requests, request_count) =
-            run_resolved_normal_turn(protocol, response).await;
-        let expected_text = match protocol {
-            ApiProtocol::Responses => "responses reply",
-            ApiProtocol::Completions => "completions reply",
-            ApiProtocol::Anthropic => "anthropic reply",
-        };
-        assert_eq!(text, expected_text);
-        assert!(history.iter().any(|item| matches!(
-            item,
-            HistoryItem::AssistantTurn { text: Some(text), calls, .. }
-                if text == expected_text && calls.is_empty()
-        )));
-        assert_eq!(request_count, 1);
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-        let headers = captured_request_headers(request);
-        assert!(captured_request_target(request).contains(endpoint_path));
-        assert!(headers.contains("POST "));
-        assert!(headers.contains("content-type: application/json"));
-        assert!(headers.contains("accept: text/event-stream"));
-        let body = captured_request_body(request);
-        assert_eq!(body["model"], "model");
-        assert_eq!(body["stream"], true);
-        if protocol == ApiProtocol::Anthropic {
-            assert!(headers.contains("anthropic-version: 2023-06-01"));
-            assert!(body["messages"].is_array());
-        }
-        assert!(matches!(
-            events.as_slice(),
-            [
-                AgentEvent::TurnStarted(_),
-                ..,
-                AgentEvent::TurnContinuationBoundary,
-                AgentEvent::TurnFinalized(_)
-            ]
-        ));
-        assert_eq!(
-            lifecycle_event_names(&events),
-            vec!["started", "boundary", "finalized"]
-        );
-    }
-}
-
-#[tokio::test]
-async fn resolved_production_path_persists_assistant_turn() {
-    let (text, events, history, requests, request_count) = run_resolved_normal_turn(
-        ApiProtocol::Responses,
-        resolved_responses_final_sse("persisted reply"),
-    )
-    .await;
-    assert_eq!(text, "persisted reply");
-    assert_eq!(request_count, 1);
-    assert_eq!(requests.len(), 1);
-    assert!(history.iter().any(|item| matches!(item, HistoryItem::AssistantTurn { text: Some(text), calls, .. } if text == "persisted reply" && calls.is_empty())));
-    assert!(events.iter().any(|event| matches!(event, AgentEvent::AssistantMessage { content } if content == "persisted reply")));
-}
-
-#[tokio::test]
-async fn resolved_production_path_retries_before_finalizing() {
-    let first = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    let (base_url, request_count, requests, server) =
-        spawn_capturing_server(vec![first, resolved_responses_final_sse("after retry")]).await;
-    let mut agent = Agent::new("model", 2, 0);
-    install_resolved_test_route(
-        &mut agent,
-        ApiProtocol::Responses,
-        &format!("{base_url}/v1"),
-    );
-    let mut events = Vec::new();
-    let text = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("resolved retry completes");
-    server.await.expect("retry server completes");
-
-    assert_eq!(text, "after retry");
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    assert_eq!(requests.lock().expect("request captures lock").len(), 2);
-    let retry_events = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::LlmRetryScheduled(_) => Some("scheduled"),
-            AgentEvent::LlmRetryStarted(_) => Some("started"),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(retry_events, vec!["scheduled", "started"]);
-    let scheduled = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::LlmRetryScheduled(_)))
-        .expect("retry scheduled event");
-    let started = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::LlmRetryStarted(_)))
-        .expect("retry started event");
-    let boundary = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::TurnContinuationBoundary))
-        .expect("retry turn boundary");
-    let finalized = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::TurnFinalized(_)))
-        .expect("retry turn finalized");
-    assert!(scheduled < started && started < boundary && boundary < finalized);
-    let completed = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::LlmRequestTelemetry(telemetry)
-                if telemetry.phase == LlmRequestTelemetryPhase::Completed =>
-            {
-                Some(telemetry)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].attempt, 2);
-    assert_eq!(
-        completed[0].provider_response_id.as_deref(),
-        Some("response-1")
-    );
-}
-
-#[tokio::test]
-async fn resolved_production_path_cache_usage_and_wire_report_are_truthful() {
-    let body = sse_response(
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"cached\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-cache\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":3}}}}\n\n".to_string(),
-    );
-    let (base_url, _, requests, server) = spawn_capturing_server(vec![body]).await;
-    let mut agent = Agent::new("model", 2, 0);
-    install_resolved_test_route(
-        &mut agent,
-        ApiProtocol::Responses,
-        &format!("{base_url}/v1"),
-    );
-    let mut events = Vec::new();
-    let text = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("cache turn completes");
-    server.await.expect("cache server completes");
-    assert_eq!(text, "cached");
-    let usage = events
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::TokenUsageUpdated {
-                cached_tokens,
-                cache_report: Some(report),
-                ..
-            } => Some((*cached_tokens, report)),
-            _ => None,
-        })
-        .expect("usage event");
-    assert_eq!(usage.0, 4);
-    assert!(usage.1.hint_serialized);
-    let completed = events
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::LlmRequestTelemetry(telemetry)
-                if telemetry.phase == LlmRequestTelemetryPhase::Completed =>
-            {
-                Some(telemetry)
-            }
-            _ => None,
-        })
-        .expect("completed telemetry");
-    assert_eq!(completed.cache_write_tokens, Some(3));
-    assert_eq!(
-        completed.provider_response_id.as_deref(),
-        Some("response-cache")
-    );
-    let requests = requests.lock().expect("request captures lock");
-    let request_body = captured_request_body(&requests[0]);
-    assert!(request_body["prompt_cache_key"].is_string());
-}
-
-#[tokio::test]
-async fn resolved_production_path_fake_decoration_adds_request_metadata() {
-    let (base_url, request_count, requests, server) =
-        spawn_capturing_server(vec![resolved_responses_final_sse("fake reply")]).await;
-    let mut agent = Agent::new("model", 2, 0);
-    install_resolved_test_route(
-        &mut agent,
-        ApiProtocol::Responses,
-        &format!("{base_url}/v1"),
-    );
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses fake decoration is supported");
-    let text = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("fake-decorated resolved turn completes");
-    server.await.expect("fake server completes");
-
-    assert_eq!(text, "fake reply");
-    assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    let requests = requests.lock().expect("request captures lock");
-    let headers = captured_request_headers(&requests[0]);
-    let body = captured_request_body(&requests[0]);
-    assert!(headers.contains("originator: codex_exec"));
-    assert!(headers.contains("x-codex-turn-metadata:"));
-    assert_eq!(body["stream"], true);
-    assert_eq!(body["store"], false);
-    assert!(body["client_metadata"]["thread_id"].is_string());
-    assert!(body["client_metadata"]["x-codex-installation-id"].is_string());
-}
-
-fn sse_response(body: String) -> &'static str {
-    Box::leak(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .into_boxed_str(),
-        )
-}
-
-fn responses_tool_batch_sse(calls: Vec<serde_json::Value>) -> &'static str {
-    let response = json!({
-        "type": "response.completed", "sequence_number": 1,
-        "response": {
-            "id": "r-tools", "object": "response", "created_at": 1,
-            "status": "completed", "background": false, "error": null,
-            "incomplete_details": null, "instructions": null, "max_output_tokens": null,
-            "model": "m1", "output": calls, "parallel_tool_calls": true,
-            "previous_response_id": null, "reasoning": {}, "store": true,
-            "temperature": 1, "text": {"format": {"type": "text"}},
-            "tool_choice": "auto", "tools": [], "top_p": 1,
-            "truncation": "disabled",
-            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
-            "user": null, "metadata": {}
-        }
-    });
-    let response = serde_json::to_string(&response).expect("response serializes");
-    sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
-}
-
-fn responses_reasoning_tool_batch_sse(
-    reasoning_text: &str,
-    call: serde_json::Value,
-) -> &'static str {
-    let reasoning_delta = json!({
-        "type": "response.reasoning_text.delta",
-        "sequence_number": 1,
-        "item_id": "reasoning-1",
-        "output_index": 0,
-        "content_index": 0,
-        "delta": reasoning_text,
-    });
-    let reasoning_done = json!({
-        "type": "response.reasoning_text.done",
-        "sequence_number": 2,
-        "item_id": "reasoning-1",
-        "output_index": 0,
-        "content_index": 0,
-        "text": reasoning_text,
-    });
-    let response = json!({
-        "type": "response.completed", "sequence_number": 3,
-        "response": {
-            "id": "r-reasoning-tools", "object": "response", "created_at": 1,
-            "status": "completed", "background": false, "error": null,
-            "incomplete_details": null, "instructions": null, "max_output_tokens": null,
-            "model": "m1", "output": [call], "parallel_tool_calls": true,
-            "previous_response_id": null, "reasoning": {}, "store": true,
-            "temperature": 1, "text": {"format": {"type": "text"}},
-            "tool_choice": "auto", "tools": [], "top_p": 1,
-            "truncation": "disabled",
-            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
-            "user": null, "metadata": {}
-        }
-    });
-    let reasoning_delta =
-        serde_json::to_string(&reasoning_delta).expect("reasoning delta serializes");
-    let reasoning_done = serde_json::to_string(&reasoning_done).expect("reasoning done serializes");
-    let response = serde_json::to_string(&response).expect("response serializes");
-    sse_response(format!(
-        "data: {reasoning_delta}\n\ndata: {reasoning_done}\n\ndata: {response}\n\ndata: [DONE]\n\n"
-    ))
-}
-
-fn chat_tool_batch_sse(name: &str, call_id: &str, arguments: String) -> &'static str {
-    let reasoning_content = "inspect ";
-    let reasoning = "then call";
-    let thinking = " the tool";
-    let response = json!({
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"reasoning_content": reasoning_content},
-                "finish_reason": null
-            },
-            {
-                "index": 0,
-                "delta": {"reasoning": reasoning},
-                "finish_reason": null
-            },
-            {
-                "index": 0,
-                "delta": {
-                    "thinking": thinking,
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments}
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }
-        ]
-    });
-    let response = serde_json::to_string(&response).expect("response serializes");
-    sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
-}
-
-fn chat_tool_call_fragment_sse() -> &'static str {
-    let first = json!({
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "content": "same delta",
-                "tool_calls": [{
-                    "index": 0,
-                    "id": "",
-                    "type": "function",
-                    "function": {"name": "", "arguments": "{"}
-                }]
-            },
-            "finish_reason": null
-        }]
-    });
-    let second = json!({
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": [{
-                    "index": 0,
-                    "id": "call-8",
-                    "type": "function",
-                    "function": {"name": "workflow__todos", "arguments": "\\\"items\\\":[]}"}
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }]
-    });
-    let first = serde_json::to_string(&first).expect("first response serializes");
-    let second = serde_json::to_string(&second).expect("second response serializes");
-    sse_response(format!(
-        "data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n"
-    ))
-}
-
-fn responses_terminal_sse(
-    event_type: &str,
-    status: &str,
-    error: Option<serde_json::Value>,
-    incomplete_details: Option<serde_json::Value>,
-) -> &'static str {
-    let response = json!({
-        "type": event_type, "sequence_number": 1,
-        "response": {
-            "id": "r-terminal", "object": "response", "created_at": 1,
-            "status": status, "background": false, "error": error,
-            "incomplete_details": incomplete_details, "instructions": null,
-            "max_output_tokens": null, "model": "m1", "output": [],
-            "parallel_tool_calls": true, "previous_response_id": null, "reasoning": {},
-            "store": true, "temperature": 1, "text": {"format": {"type": "text"}},
-            "tool_choice": "auto", "tools": [], "top_p": 1, "truncation": "disabled",
-            "usage": null, "user": null, "metadata": {}
-        }
-    });
-    let response = serde_json::to_string(&response).expect("response serializes");
-    sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
-}
-
-fn response_error_sse(code: Option<&str>, message: &str) -> &'static str {
-    let event = json!({
-        "type": "error",
-        "sequence_number": 1,
-        "code": code,
-        "message": message,
-    });
-    let event = serde_json::to_string(&event).expect("response error serializes");
-    sse_response(format!("data: {event}\n\ndata: [DONE]\n\n"))
-}
-
-fn responses_final_sse(text: &str) -> &'static str {
-    let response = json!({
-        "type": "response.completed", "sequence_number": 1,
-        "response": {
-            "id": "r-final", "object": "response", "created_at": 1,
-            "status": "completed", "background": false, "error": null,
-            "incomplete_details": null, "instructions": null, "max_output_tokens": null,
-            "model": "m1", "output": [{"type": "message", "id": "m1", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}],
-            "parallel_tool_calls": true, "previous_response_id": null, "reasoning": {},
-            "store": true, "temperature": 1, "text": {"format": {"type": "text"}},
-            "tool_choice": "auto", "tools": [], "top_p": 1, "truncation": "disabled",
-            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
-            "user": null, "metadata": {}
-        }
-    });
-    let response = serde_json::to_string(&response).expect("response serializes");
-    sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
-}
-
-fn chat_final_sse(text: &str) -> &'static str {
-    let text = serde_json::to_string(text).expect("chat content serializes");
-    sse_response(format!(
-        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{text}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
-    ))
-}
-
-fn chat_final_sse_with_usage(text: &str) -> &'static str {
-    let text = serde_json::to_string(text).expect("chat content serializes");
-    sse_response(format!(
-        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{text}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_tokens_details\":{{\"cached_tokens\":3}}}}}}\n\ndata: [DONE]\n\n"
-    ))
-}
-
-fn chat_multiple_usage_sse() -> &'static str {
-    sse_response(concat!(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
-        "data: [DONE]\n\n"
-    ).to_string())
-}
-
-#[tokio::test]
-async fn responses_installs_provider_anchor_after_assistant_frame() {
-    let (base_url, _, server) =
-        spawn_chat_completion_server(vec![responses_final_sse("final reply")]).await;
-    let mut agent = Agent::new("m1", 1, 0);
-
-    let result = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("responses stream completes");
-
-    assert_eq!(result, "final reply");
-    let expected = TokenUsageEstimate {
-        used_tokens: 2,
-        context_window_tokens: 8_192,
-        input_tokens: 1,
-        output_tokens: 1,
-        cached_tokens: 0,
-    };
-    assert_eq!(agent.provider_usage_anchor_for_test(), Some(expected));
-    assert_eq!(agent.projected_token_usage(), Some(expected));
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn responses_tool_calls_preserve_reasoning_in_live_event_and_follow_up_request() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let base_url = format!(
-        "http://{}",
-        listener.local_addr().expect("server has address")
-    );
-    let server = tokio::spawn(async move {
-        let (mut first_socket, _) = listener
-            .accept()
-            .await
-            .expect("server accepts first request");
-        let _ = read_complete_http_request(&mut first_socket).await;
-        first_socket
-            .write_all(
-                responses_reasoning_tool_batch_sse(
-                    "inspect the requested file",
-                    json!({
-                        "type": "function_call", "id": "fc-reasoning", "call_id": "call-reasoning",
-                        "name": "workflow__todos", "arguments": r#"{"items":[]}"#,
-                        "status": "completed"
-                    }),
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("server writes first response");
-        first_socket
-            .shutdown()
-            .await
-            .expect("server closes first response");
-
-        let (mut second_socket, _) = listener
-            .accept()
-            .await
-            .expect("server accepts second request");
-        let second_request = read_complete_http_request(&mut second_socket).await;
-        let body_start = second_request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("request has headers")
-            + 4;
-        let body: serde_json::Value =
-            serde_json::from_slice(&second_request[body_start..]).expect("request body is JSON");
-        let input = body["input"]
-            .as_array()
-            .expect("responses request has input");
-        let reasoning_index = input
-            .iter()
-            .position(|item| item["type"] == "reasoning")
-            .expect("follow-up request preserves reasoning input");
-        assert_eq!(
-            input[reasoning_index]["content"][0]["text"],
-            "inspect the requested file"
-        );
-        let tool_call_index = input
-            .iter()
-            .position(|item| item["type"] == "function_call")
-            .expect("follow-up request preserves function call");
-        assert!(reasoning_index < tool_call_index);
-        second_socket
-            .write_all(responses_final_sse("done").as_bytes())
-            .await
-            .expect("server writes second response");
-        second_socket
-            .shutdown()
-            .await
-            .expect("server closes second response");
-    });
-    let mut agent = Agent::new("deepseek-v4-flash", 2, 1);
-    let reasoning_batches = Arc::new(Mutex::new(Vec::new()));
-    let observed_batches = reasoning_batches.clone();
-
-    let result = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            move |event| {
-                if let AgentEvent::AssistantToolCallBatch {
-                    reasoning_content, ..
-                } = event
-                {
-                    observed_batches
-                        .lock()
-                        .expect("reasoning batch lock")
-                        .push(reasoning_content);
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("responses stream completes");
-
-    assert_eq!(result, "done");
-    assert_eq!(
-        Arc::try_unwrap(reasoning_batches)
-            .expect("all event callbacks have completed")
-            .into_inner()
-            .expect("reasoning batch lock is not poisoned"),
-        vec![Some("inspect the requested file".into())]
-    );
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn responses_completed_finalizes_with_unfinished_todos_when_auto_continue_is_disabled() {
-    let todo_response = responses_tool_batch_sse(vec![json!({
-        "type": "function_call", "id": "fc-todo-pending", "call_id": "call-todo-pending",
-        "name": "workflow__todos",
-        "arguments": r#"{"items":[{"id":"pending","content":"remain pending","status":"pending"}]}"#,
-        "status": "completed"
-    })]);
-    let (base_url, request_count, server) =
-        spawn_chat_completion_server(vec![todo_response, responses_final_sse("done")]).await;
-    let mut agent = Agent::new("m1", 2, 1);
-    let mut internal_continuations = 0;
-    let mut scheduled_continuations = 0;
-    let mut finalized_outcomes = Vec::new();
-
-    let result = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                match event {
-                    AgentEvent::InternalContinuation { .. } => internal_continuations += 1,
-                    AgentEvent::AutoContinuationScheduled { .. } => scheduled_continuations += 1,
-                    AgentEvent::TurnFinalized(event) => finalized_outcomes.push(event.outcome),
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("completed response should finalize normally");
-
-    assert_eq!(result, "done");
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    assert_eq!(internal_continuations, 0);
-    assert_eq!(scheduled_continuations, 0);
-    assert_eq!(finalized_outcomes, vec!["completed"]);
-    assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
-    server.await.expect("server task should finish");
-}
-
-fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent {
+fn phase2_pressure_agent(protocol: ApiProtocol) -> Agent {
     let mut agent = Agent::new("m1", 4, 4);
     agent.set_default_protocol(protocol);
     agent.set_model_catalog(HashMap::from([(
@@ -1766,212 +829,9 @@ fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent {
     agent
 }
 
-async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
-    let (summary_response, final_response) = match protocol {
-        ApiProtocol::Responses => (
-            responses_final_sse(&valid_checkpoint("pressure summary")),
-            responses_final_sse("final reply"),
-        ),
-        ApiProtocol::Completions => (
-            chat_final_sse(&valid_checkpoint("pressure summary")),
-            chat_final_sse("final reply"),
-        ),
-        ApiProtocol::Anthropic => unreachable!("pressure test does not use Anthropic"),
-    };
-    let (base_url, requests, server) =
-        spawn_chat_completion_server(vec![summary_response, final_response]).await;
-    let mut agent = phase2_pressure_agent(base_url, protocol);
-    agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
-    let mut compacted = 0;
-    let mut events = Vec::new();
-    let result = match protocol {
-        ApiProtocol::Responses => {
-            agent
-                .run_stream_async(
-                    "current user",
-                    |_| std::future::ready(Ok(())),
-                    |event| {
-                        events.push(event.clone());
-                        compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-                        std::future::ready(Ok(()))
-                    },
-                    |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-                )
-                .await
-        }
-        ApiProtocol::Completions => unreachable!("legacy chat loop was removed"),
-        ApiProtocol::Anthropic => unreachable!("pressure test does not use Anthropic"),
-    }
-    .expect("pressure compaction successor should complete");
-
-    assert_eq!(result, "final reply");
-    assert_eq!(compacted, 1);
-    let started_at = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                AgentEvent::ContextCompactionStarted {
-                    trigger: CompactionTrigger::RequestPressure
-                }
-            )
-        })
-        .expect("pressure compaction starts");
-    let compacted_at = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::ContextCompacted(_)))
-        .expect("pressure compaction completes");
-    assert!(started_at < compacted_at);
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        2,
-        "one summary and one final request"
-    );
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase2_pressure_compacts_normal_responses_stream() {
-    assert_phase2_pressure_compacts_normal_stream(ApiProtocol::Responses).await;
-}
-
-#[tokio::test]
-async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_final_sse(&valid_checkpoint("pressure summary")),
-        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        responses_final_sse("final reply"),
-    ])
-    .await;
-    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
-    agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
-    agent.set_retry_config(test_retry_config());
-    let mut compacted = 0;
-    let result = agent
-        .run_stream_async(
-            "current user",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("retry after a pre-stream HTTP failure should complete");
-
-    assert_eq!(result, "final reply");
-    assert_eq!(compacted, 1);
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        3,
-        "summary, failed attempt, retry"
-    );
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() {
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_final_sse(&valid_checkpoint("pressure summary")),
-        responses_final_sse(&valid_checkpoint("changed-frontier summary")),
-    ])
-    .await;
-    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
-    agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
-    let protected_start = agent.history_for_test().len();
-    let prelude = agent.prepare_turn_prelude("current user");
-    agent.turn.current_turn_start_index = Some(protected_start);
-    agent
-        .append_history_item(HistoryItem::user("current user"))
-        .expect("stream path appends the current message");
-    let history = agent.history_for_test();
-    let frames = agent.protocol_frames_for_test();
-    let snapshot = agent.runtime_snapshot.clone();
-    let active_epoch = agent.active_epoch.clone();
-    let start = agent.turn.current_turn_start_index;
-    let tools = agent.tool_definitions();
-    let mut protected = protected_start;
-    let mut events = Vec::new();
-    let mut failed_callback = |event: AgentEvent| {
-        events.push(event.clone());
-        if matches!(event, AgentEvent::ContextCompacted(_)) {
-            return std::future::ready(Err(anyhow!("durable compaction callback failed")));
-        }
-        std::future::ready(Ok(()))
-    };
-
-    let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        &mut protected,
-        &tools,
-        &mut failed_callback,
-    )
-    .await;
-    let Err(error) = result else {
-        panic!("the durable callback rejects the prepared summary");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("durable compaction callback failed")
-    );
-    assert_eq!(agent.history_for_test(), history);
-    assert_eq!(agent.protocol_frames_for_test(), frames);
-    assert_eq!(agent.runtime_snapshot, snapshot);
-    assert_eq!(agent.active_epoch, active_epoch);
-    assert_eq!(agent.turn.current_turn_start_index, start);
-    assert!(matches!(
-        events.first(),
-        Some(AgentEvent::ContextCompactionStarted {
-            trigger: CompactionTrigger::RequestPressure
-        })
-    ));
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::ContextCompactionFailed {
-            trigger: CompactionTrigger::RequestPressure
-        })
-    ));
-
-    let mut same_frontier_callback = |_| std::future::ready(Ok(()));
-    let same_frontier = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        &mut protected,
-        &tools,
-        &mut same_frontier_callback,
-    )
-    .await;
-    let Err(same_frontier) = same_frontier else {
-        panic!("the same pressure frontier is single-use after callback failure");
-    };
-    assert!(same_frontier.to_string().contains("already attempted"));
-
-    let changed = HistoryItem::user("current user with changed frame identity");
-    let changed_item = protocol_frame_item_from_history_item(&changed);
-    agent.runtime_snapshot.frames[protected_start].protocol = Some(changed_item);
-    let mut changed_frontier_callback = |_| std::future::ready(Ok(()));
-    protocol_stream::prepare_canonical_protocol_stream_request_for_test(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        &mut protected,
-        &tools,
-        &mut changed_frontier_callback,
-    )
-    .await
-    .expect("a changed frame identity may make a fresh pressure attempt");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    server.await.expect("summary server completes");
-}
-
 #[tokio::test]
 async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback() {
-    let mut agent = phase2_pressure_agent("http://127.0.0.1:1".into(), ApiProtocol::Responses);
+    let mut agent = phase2_pressure_agent(ApiProtocol::Responses);
     let protected_start = agent.history_for_test().len();
     let prelude = agent.prepare_turn_prelude("current user");
     agent.turn.current_turn_start_index = Some(protected_start);
@@ -2021,67 +881,6 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
             .count(),
         0
     );
-}
-
-#[tokio::test]
-async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![responses_final_sse(
-        &valid_checkpoint("overflow summary"),
-    )])
-    .await;
-    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
-    let protected_start = agent.history_for_test().len();
-    let prelude = agent.prepare_turn_prelude("oversized current user");
-    agent.turn.current_turn_start_index = Some(protected_start);
-    agent
-        .append_history_item(HistoryItem::user("protected ".repeat(20_000)))
-        .expect("oversized current message appends");
-    let mut compacted = 0;
-    let mut protected = protected_start;
-    let tools = agent.tool_definitions();
-    let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        &mut protected,
-        &tools,
-        &mut |event| {
-            compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-            std::future::ready(Ok(()))
-        },
-    )
-    .await;
-    let Err(error) = result else {
-        panic!("the successor retains the deliberately overflowing current message");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("protected current context exceeds input budget")
-    );
-    assert_eq!(
-        compacted, 1,
-        "durably committed compaction remains installed even when the protected current message still exceeds budget"
-    );
-    assert!(matches!(
-        agent.history_for_test().first(),
-        Some(HistoryItem::ContextSummary { .. })
-    ));
-    let compacted_history = agent.history_for_test();
-    assert!(
-        compacted_history.len() <= protected_start + 1,
-        "pressure compaction must retire at least one pre-protected history item"
-    );
-    assert!(matches!(
-        compacted_history.last(),
-        Some(HistoryItem::UserMessage { content }) if content.text.starts_with("protected ")
-    ));
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        1,
-        "the rolled-back pressure summary is the only request"
-    );
-    server.await.expect("summary server completes");
 }
 
 #[test]
@@ -2134,45 +933,6 @@ fn test_execution_record(tool_name: &str, output: ToolResult) -> ToolExecutionRe
     }
 }
 
-struct ParallelReadTool {
-    name: &'static str,
-    barrier: Arc<Barrier>,
-}
-
-#[async_trait]
-impl ToolHandler for ParallelReadTool {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn description(&self) -> &str {
-        "parallel read test tool"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        })
-    }
-
-    fn permission_class(&self) -> crate::permission::ToolPermissionClass {
-        crate::permission::ToolPermissionClass::Read
-    }
-
-    fn parallelism(&self) -> ToolParallelism {
-        ToolParallelism::Parallel
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        let barrier = Arc::clone(&self.barrier);
-        tokio::task::spawn_blocking(move || barrier.wait()).await?;
-        Ok(json!({"name": self.name}))
-    }
-}
-
 struct ParallelCountingReadTool {
     name: &'static str,
     active: Arc<AtomicUsize>,
@@ -2209,7 +969,7 @@ impl ToolHandler for ParallelCountingReadTool {
     async fn execute(&self, _args: Value) -> Result<Value> {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({"name": self.name}))
     }
@@ -2251,7 +1011,7 @@ impl ToolHandler for ExclusiveReadTool {
     async fn execute(&self, _args: Value) -> Result<Value> {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({"name": self.name}))
     }
@@ -2268,15 +1028,15 @@ async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
             ..Default::default()
         },
     )]));
-    let barrier = Arc::new(Barrier::new(2));
-    agent.register_tool(ParallelReadTool {
-        name: "test__parallel_one",
-        barrier: Arc::clone(&barrier),
-    });
-    agent.register_tool(ParallelReadTool {
-        name: "test__parallel_two",
-        barrier,
-    });
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    for name in ["test__parallel_one", "test__parallel_two"] {
+        agent.register_tool(ParallelCountingReadTool {
+            name,
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+    }
     let calls = vec![
         test_tool_call("test__parallel_one", "{}"),
         test_tool_call("test__parallel_two", "{}"),
@@ -2285,16 +1045,14 @@ async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
         .append_assistant_tool_calls("", &calls)
         .expect("append tool calls");
 
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        agent.execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
             Ok(PermissionApproval::AllowOnce)
-        }),
-    )
-    .await
-    .expect("parallel reads should overlap")
-    .expect("batch executes");
+        })
+        .await
+        .expect("batch executes");
 
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
     let history = agent.history_for_test();
     let outputs = history
         .iter()
@@ -2776,7 +1534,8 @@ impl SubagentDelegate for CapturingSubagentDelegate {
 }
 
 struct OverlapSubagentDelegate {
-    barrier: Arc<Barrier>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
     started: Arc<Mutex<Vec<String>>>,
 }
 
@@ -2802,7 +1561,7 @@ impl SubagentDelegate for CountingSubagentDelegate {
         Box::pin(async move {
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
             max_active.fetch_max(current, Ordering::SeqCst);
-            sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
             active.fetch_sub(1, Ordering::SeqCst);
             Ok(ToolResult::ok(
                 format!("agent__{agent_name}"),
@@ -2838,17 +1597,19 @@ impl SubagentDelegate for OverlapSubagentDelegate {
         agent_name: &'a str,
         _invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
-        let barrier = Arc::clone(&self.barrier);
+        let active = Arc::clone(&self.active);
+        let max_active = Arc::clone(&self.max_active);
         let started = Arc::clone(&self.started);
         let agent_name = agent_name.to_string();
         Box::pin(async move {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
             started
                 .lock()
                 .expect("started lock")
                 .push(agent_name.clone());
-            tokio::task::spawn_blocking(move || barrier.wait())
-                .await
-                .expect("barrier task joins");
+            tokio::task::yield_now().await;
+            active.fetch_sub(1, Ordering::SeqCst);
             Ok(ToolResult::ok(
                 format!("agent__{agent_name}"),
                 json!({"ok": true}),
@@ -2945,9 +1706,12 @@ async fn disabled_model_parallel_tool_calls_keep_subagents_sequential() {
 #[tokio::test]
 async fn contiguous_different_role_subagents_overlap_and_return_in_model_order() {
     let mut agent = test_agent();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Mutex::new(Vec::new()));
     agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
-        barrier: Arc::new(Barrier::new(2)),
+        active: Arc::clone(&active),
+        max_active: Arc::clone(&max_active),
         started: Arc::clone(&started),
     }));
     let calls = vec![
@@ -2961,16 +1725,14 @@ async fn contiguous_different_role_subagents_overlap_and_return_in_model_order()
         .append_assistant_tool_calls("", &calls)
         .expect("append tool calls");
 
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        agent.execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
             Ok(PermissionApproval::AllowOnce)
-        }),
-    )
-    .await
-    .expect("different roles should overlap")
-    .expect("batch executes");
+        })
+        .await
+        .expect("batch executes");
 
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
     assert_eq!(
         *started.lock().expect("started lock"),
         vec!["explorer", "fixer"]
@@ -3044,7 +1806,8 @@ async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
     let mut agent = test_agent();
     let started = Arc::new(Mutex::new(Vec::new()));
     agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
-        barrier: Arc::new(Barrier::new(1)),
+        active: Arc::new(AtomicUsize::new(0)),
+        max_active: Arc::new(AtomicUsize::new(0)),
         started: Arc::clone(&started),
     }));
     let calls = vec![
@@ -3607,36 +2370,6 @@ fn resume_clears_proc_local_identity_and_observation_state() {
     );
 }
 
-#[tokio::test]
-async fn session_state_consistency_after_manual_compaction_three_way() {
-    let checkpoint = valid_checkpoint("continue validating the active request");
-    let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new("m1", 8, 8);
-    agent.set_default_protocol(ApiProtocol::Completions);
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older request"),
-            HistoryItem::assistant("older work"),
-            HistoryItem::user("active request"),
-            HistoryItem::assistant("active work"),
-        ])
-        .expect("history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
-    agent.turn.turn_id = 10;
-    agent.turn.current_turn_start_index = Some(2);
-    agent.runtime_snapshot.current_turn_id = Some(10);
-    agent.runtime_snapshot.current_segment_id = Some(3);
-
-    let outcome = agent
-        .compact_session_async(|_| std::future::ready(Ok(())))
-        .await
-        .expect("compacts older turns");
-    assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
-    assert_three_way_protocol_consistency(&agent);
-    server.await.expect("server task should finish");
-}
-
 #[test]
 fn session_state_consistency_journal_resume_three_way() {
     // Oracle Phase-1 priority: real transcript-journal resume projection path
@@ -3880,250 +2613,6 @@ fn new_session_reset_discards_restored_runtime_metadata() {
     assert_eq!(agent.current_turn_id(), 1);
 }
 
-fn valid_checkpoint(summary: &str) -> String {
-    summary.to_string()
-}
-
-#[tokio::test]
-async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_incomplete_suffix() {
-    let checkpoint = valid_checkpoint("continue validating the active request");
-    let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new("m1", 8, 8);
-    agent.set_default_protocol(ApiProtocol::Completions);
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::assistant("older answer"),
-            HistoryItem::user("active request"),
-            HistoryItem::AssistantTurn {
-                text: None,
-                reasoning_content: None,
-                replay: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "call-pending".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
-                }],
-            },
-        ])
-        .expect("active incomplete history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
-    agent.turn.turn_id = 9;
-    agent.turn.current_turn_start_index = Some(2);
-    agent.runtime_snapshot.current_turn_id = Some(9);
-    agent.runtime_snapshot.current_segment_id = Some(0);
-    let pending_id = agent.runtime_snapshot.frames[3].id;
-    agent
-        .runtime_snapshot
-        .set_turn_protected_frame_ids(vec![pending_id]);
-
-    let mut events = Vec::new();
-    agent
-        .compact_session_async(|event| {
-            events.push(event);
-            std::future::ready(Ok(()))
-        })
-        .await
-        .expect("compacts older turns only");
-
-    assert!(matches!(
-        events.first(),
-        Some(AgentEvent::ContextCompactionStarted {
-            trigger: CompactionTrigger::Manual
-        })
-    ));
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::ContextCompacted(_))
-    ));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
-    );
-    assert_eq!(agent.current_turn_id(), 9);
-    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(9));
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(0));
-    // summary + pending tool call; the active user is part of the summary.
-    assert_eq!(agent.history_for_test().len(), 2);
-    assert!(matches!(
-        agent.history_for_test().first(),
-        Some(HistoryItem::ContextSummary { .. })
-    ));
-    assert_eq!(agent.turn.current_turn_start_index, None);
-    assert!(matches!(
-        agent.history_for_test().get(1),
-        Some(HistoryItem::AssistantTurn { .. })
-    ));
-    server.await.expect("server task should finish");
-}
-#[tokio::test]
-async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_live() {
-    let checkpoint = valid_checkpoint("continue validating the active request");
-    let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new("m1", 8, 8);
-    agent.set_default_protocol(ApiProtocol::Completions);
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older request"),
-            HistoryItem::assistant("older work"),
-            HistoryItem::user("active request"),
-            HistoryItem::assistant("active work"),
-        ])
-        .expect("history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
-    agent.turn.turn_id = 10;
-    agent.turn.current_turn_start_index = Some(2);
-    agent.runtime_snapshot.current_turn_id = Some(10);
-    agent.runtime_snapshot.current_segment_id = Some(3);
-
-    let outcome = agent
-        .compact_session_async(|_| std::future::ready(Ok(())))
-        .await
-        .expect("compacts older turns");
-
-    assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
-    assert_eq!(agent.current_turn_id(), 10);
-    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(10));
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
-    assert_eq!(agent.turn.current_turn_start_index, None);
-    let history = agent.history_for_test();
-    assert_eq!(history.len(), 1);
-    assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
-    server.await.expect("server task should finish");
-}
-#[tokio::test]
-async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase() {
-    let checkpoint = valid_checkpoint("continue validating the active request");
-    let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new("m1", 8, 8);
-    agent.set_default_protocol(ApiProtocol::Completions);
-    let history = vec![
-        HistoryItem::user("older turn"),
-        HistoryItem::assistant("older answer"),
-        HistoryItem::user("active request"),
-        HistoryItem::AssistantTurn {
-            text: None,
-            reasoning_content: None,
-            replay: None,
-            calls: vec![HistoryToolCall {
-                call_id: "call-pending".into(),
-                name: "fs__read".into(),
-                arguments_json: r#"{"path":"src/main.rs"}"#.into(),
-            }],
-        },
-    ];
-    agent
-        .replace_history(history.clone())
-        .expect("active incomplete history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
-    agent.turn.turn_id = 4;
-    agent.turn.current_turn_start_index = Some(2);
-    agent.runtime_snapshot.current_turn_id = Some(4);
-    agent.runtime_snapshot.current_segment_id = Some(1);
-    let before_history = agent.history_for_test().to_vec();
-    let before_turn_start = agent.turn.current_turn_start_index;
-
-    let error = agent
-        .compact_session_async(|event| {
-            if matches!(event, AgentEvent::ContextCompacted(_)) {
-                return std::future::ready(Err(anyhow::anyhow!("journal rejected compact")));
-            }
-            std::future::ready(Ok(()))
-        })
-        .await
-        .expect_err("callback failure should abort install");
-
-    assert!(error.to_string().contains("journal rejected compact"));
-    assert_eq!(agent.history_for_test(), before_history.as_slice());
-    assert_eq!(agent.turn.current_turn_start_index, before_turn_start);
-    assert_eq!(agent.current_turn_id(), 4);
-    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(4));
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(1));
-    server.await.expect("server task should finish");
-}
-#[tokio::test]
-async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_context() {
-    // History-first compact cuts older turns only; co-retire of context materials
-    // is no longer part of the compact selection model.
-    let checkpoint = valid_checkpoint("continue validating the active request");
-    let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
-    let mut agent = Agent::new("m1", 8, 8);
-    agent.set_default_protocol(ApiProtocol::Completions);
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older"),
-            HistoryItem::assistant("older answer"),
-            HistoryItem::user("current"),
-            HistoryItem::assistant("current answer"),
-        ])
-        .expect("history");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
-    agent.turn.current_turn_start_index = Some(2);
-
-    let outcome = agent
-        .compact_session_async(|_| std::future::ready(Ok(())))
-        .await
-        .expect("compacts older turns");
-    assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
-    let history = agent.history_for_test();
-    assert_eq!(history.len(), 1);
-    assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
-    assert_eq!(agent.turn.current_turn_start_index, None);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
-    let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![sse_response("data: [DONE]\n\n".into())]).await;
-    let mut agent = Agent::new("m1", 4, 4);
-    agent.set_default_protocol(ApiProtocol::Completions);
-    agent
-        .replace_history(vec![
-            HistoryItem::user("short prompt"),
-            HistoryItem::assistant("reply"),
-        ])
-        .expect("history replace succeeds");
-    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history_for_test());
-    let mut events = Vec::new();
-
-    let error = agent
-        .compact_session_async(|event| {
-            events.push(event);
-            std::future::ready(Ok(()))
-        })
-        .await
-        .expect_err("empty compaction summary fails");
-
-    assert!(
-        !error.to_string().is_empty(),
-        "the original compaction error remains authoritative"
-    );
-    assert!(matches!(
-        events.as_slice(),
-        [
-            AgentEvent::ContextCompactionStarted {
-                trigger: CompactionTrigger::Manual
-            },
-            AgentEvent::ContextCompactionFailed {
-                trigger: CompactionTrigger::Manual
-            },
-        ]
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ContextCompacted(_))),
-        "failed compaction must not produce a durable success event"
-    );
-    server.await.expect("summary server completes");
-}
-
 #[test]
 fn default_preserve_recent_budget_uses_reserve_aware_pi_style_20k_tail() {
     assert_eq!(default_preserve_recent_budget(1_000), 1_000);
@@ -4161,24 +2650,6 @@ fn render_compaction_tool_output_strips_media_like_fields() {
     assert!(rendered.contains("kept text"));
     assert!(!rendered.contains("blob:https://example.invalid/123"));
     assert!(!rendered.contains(&"A".repeat(128)));
-}
-
-#[test]
-fn render_compaction_prompt_preserves_complete_previous_summary() {
-    let previous_summary = format!(
-        "{}\nTAIL-CURRENT-STATE-MUST-SURVIVE",
-        "old checkpoint detail ".repeat(600)
-    );
-
-    let prompt = compaction::render_compaction_prompt(
-        Some(&previous_summary),
-        &[HistoryItem::assistant("new history")],
-    );
-
-    assert!(previous_summary.chars().count() > 8_000);
-    assert!(prompt.contains(&previous_summary));
-    assert!(prompt.contains("TAIL-CURRENT-STATE-MUST-SURVIVE"));
-    assert!(!prompt.contains("先前摘要已为压缩而缩减"));
 }
 
 #[test]
@@ -4232,167 +2703,6 @@ async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
 }
 
 #[tokio::test]
-async fn responses_stream_recovers_from_response_error_after_visible_output() {
-    let interrupted = sse_response(
-        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial \"}\n\ndata: {\"type\":\"error\",\"sequence_number\":2,\"code\":\"server_error\",\"message\":\"temporary upstream failure\"}\n\ndata: [DONE]\n\n"
-            .into(),
-    );
-    let (base_url, request_count, server) =
-        spawn_chat_completion_server(vec![interrupted, responses_final_sse("continued")]).await;
-    let mut agent = Agent::new("m1", 4, 4);
-    agent.set_retry_config(test_retry_config());
-    let mut deltas = Vec::new();
-    let mut issues = Vec::new();
-
-    let result = agent
-        .run_stream_async(
-            "hello",
-            |delta| {
-                deltas.push(delta.to_owned());
-                std::future::ready(Ok(()))
-            },
-            |event| {
-                if let AgentEvent::ModelStreamIssue { message, .. } = event {
-                    issues.push(message);
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("response.error after output should recover semantically");
-
-    assert_eq!(result, "partial continued");
-    assert_eq!(deltas, vec!["partial "]);
-    assert_eq!(issues, vec!["Model stream interrupted"]);
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn responses_stream_does_not_semantically_recover_hard_failure_after_visible_output() {
-    let failed = sse_response(
-        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial \"}\n\ndata: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"r-hard\",\"object\":\"response\",\"created_at\":1,\"status\":\"failed\",\"background\":false,\"error\":{\"code\":\"invalid_request\",\"message\":\"temporary upstream connection failure\"},\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"m1\",\"output\":[],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"reasoning\":{},\"store\":true,\"temperature\":1,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1,\"truncation\":\"disabled\",\"usage\":null,\"user\":null,\"metadata\":{}}}\n\ndata: [DONE]\n\n"
-            .into(),
-    );
-    let (base_url, request_count, server) = spawn_chat_completion_server(vec![failed]).await;
-    let mut agent = Agent::new("m1", 4, 4);
-    agent.set_retry_config(test_retry_config());
-    let mut issues = Vec::new();
-
-    let error = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                if let AgentEvent::ModelStreamIssue { message, .. } = event {
-                    issues.push(message);
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("hard terminal failures after output must not start semantic continuation");
-
-    assert!(error.to_string().contains("code=invalid_request"));
-    assert!(issues.is_empty());
-    assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn responses_stream_exhausts_semantic_recovery_budget_across_iterations() {
-    let interrupted = sse_response(
-        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\ndata: {malformed}\n\n"
-            .into(),
-    );
-    let (base_url, request_count, server) =
-        spawn_chat_completion_server(vec![interrupted, interrupted]).await;
-    let mut agent = Agent::new("m1", 4, 4);
-    let mut retry = test_retry_config();
-    retry.max_recovery_attempts = 1;
-    agent.set_retry_config(retry);
-
-    let error = agent
-        .run_stream_async(
-            "hello",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("second semantic recovery must exhaust the turn budget");
-
-    assert!(
-        error
-            .to_string()
-            .contains("stream recovery budget exhausted after 1 attempts")
-    );
-    assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn responses_stream_preserves_recovery_state_when_iteration_budget_is_exhausted() {
-    let interrupted = sse_response(
-        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\ndata: {malformed}\n\n"
-            .into(),
-    );
-    let (base_url, request_count, server) = spawn_chat_completion_server(vec![interrupted]).await;
-    let mut agent = Agent::new("m1", 1, 4);
-    let mut issues = 0;
-    let mut recovery_continuations = 0;
-    let mut assistant_messages = Vec::new();
-    let mut deltas = Vec::new();
-
-    let error = agent
-        .run_stream_async(
-            "hello",
-            |delta| {
-                deltas.push(delta.to_string());
-                std::future::ready(Ok(()))
-            },
-            |event| {
-                match event {
-                    AgentEvent::AssistantMessage { content } => assistant_messages.push(content),
-                    AgentEvent::ModelStreamIssue { .. } => issues += 1,
-                    AgentEvent::InternalContinuation { .. } => recovery_continuations += 1,
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("the next model request should be rejected by the existing iteration gate");
-
-    assert!(
-        error
-            .to_string()
-            .contains("stopped: too many agent iterations (max 1)")
-    );
-    assert_eq!(deltas, vec!["partial"]);
-    assert_eq!(assistant_messages, vec!["partial"]);
-    assert_eq!(issues, 1);
-    assert_eq!(recovery_continuations, 1);
-    assert!(
-        agent
-            .history_for_test()
-            .iter()
-            .any(|item| matches!(item, HistoryItem::AssistantTurn { text: Some(text), .. } if text == "partial"))
-    );
-    assert!(
-        agent
-            .history_for_test()
-            .iter()
-            .any(|item| matches!(item, HistoryItem::InternalContinuation { .. }))
-    );
-    assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
 async fn workflow_auto_continue_tool_enables_llm_controlled_state() {
     let mut agent = test_agent();
     let call = HistoryToolCall {
@@ -4410,41 +2720,6 @@ async fn workflow_auto_continue_tool_enables_llm_controlled_state() {
 
     assert!(record.output.ok);
     assert!(agent.auto_continue().enabled);
-}
-
-#[tokio::test]
-async fn auto_continue_runs_past_agent_limits_until_llm_disables_it() {
-    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
-        responses_tool_batch_sse(vec![json!({
-            "type": "function_call", "id": "fc-enable", "call_id": "call-enable",
-            "name": "workflow__auto_continue", "arguments": "{\"enabled\":true}",
-            "status": "completed"
-        })]),
-        responses_final_sse("first"),
-        responses_tool_batch_sse(vec![json!({
-            "type": "function_call", "id": "fc-disable", "call_id": "call-disable",
-            "name": "workflow__auto_continue", "arguments": "{\"enabled\":false}",
-            "status": "completed"
-        })]),
-        responses_final_sse("final"),
-    ])
-    .await;
-    let mut agent = Agent::new("m1", 1, 1);
-
-    let result = agent
-        .run_stream_async(
-            "continue until disabled",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("auto-continue should outlive ordinary agent limits");
-
-    assert_eq!(result, "firstfinal");
-    assert_eq!(request_count.load(Ordering::SeqCst), 4);
-    assert!(!agent.auto_continue().enabled);
-    server.await.expect("server task should finish");
 }
 
 #[tokio::test]

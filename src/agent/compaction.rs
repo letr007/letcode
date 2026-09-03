@@ -646,13 +646,6 @@ fn render_protected_workflow_facts(agent: &Agent) -> String {
     facts.join("\n\n")
 }
 
-pub(super) fn render_compaction_prompt(
-    previous_summary: Option<&str>,
-    head_for_summary: &[HistoryItem],
-) -> String {
-    render_compaction_prompt_with_workflow_facts(previous_summary, head_for_summary, false, "无")
-}
-
 fn render_compaction_prompt_with_workflow_facts(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],

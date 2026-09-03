@@ -427,17 +427,6 @@ pub enum LlmRequestTelemetryPhase {
     Interrupted,
 }
 
-impl LlmRequestTelemetryPhase {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepared => "prepared",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmRetryLifecycle {
     pub attempt: usize,

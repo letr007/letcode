@@ -64,6 +64,7 @@ pub fn apply_permission_mode(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn apply_model_route_with(
     agent: &mut Agent,
     transcript: &Arc<Mutex<TranscriptRecorder>>,

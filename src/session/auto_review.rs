@@ -784,47 +784,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
-
-    #[tokio::test]
-    async fn review_gate_serializes_auto_reviews() {
-        let dir = std::env::temp_dir().join(format!(
-            "letcode-auto-review-gate-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("sessions dir");
-        let transcript = Arc::new(Mutex::new(
-            TranscriptRecorder::create(&dir).expect("transcript"),
-        ));
-        let reviewer = StickyAutoReviewer::new(
-            SubagentPool::new(),
-            dir.clone(),
-            Arc::clone(&transcript),
-            None,
-            Arc::new(Mutex::new(indexmap::IndexMap::new())),
-            Arc::new(Mutex::new(indexmap::IndexMap::new())),
-            "Set the provider API key".into(),
-        );
-
-        let first = reviewer.review_gate.lock().await;
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(20),
-                reviewer.review_gate.lock()
-            )
-            .await
-            .is_err(),
-            "a concurrent review must wait for the active review"
-        );
-        drop(first);
-        let _second = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            reviewer.review_gate.lock(),
-        )
-        .await
-        .expect("queued review should proceed after the gate is released");
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }

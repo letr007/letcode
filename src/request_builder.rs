@@ -242,6 +242,7 @@ fn default_prompt_message_origin() -> PromptMessageOrigin {
 }
 
 impl PromptMessage {
+    #[cfg(test)]
     pub fn developer(text: impl Into<String>) -> Self {
         Self {
             role: PromptRole::Developer,
