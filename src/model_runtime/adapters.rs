@@ -2671,7 +2671,14 @@ struct ResponsesFunctionCallOutput {
     #[serde(rename = "type")]
     item_type: &'static str,
     call_id: String,
-    output: Vec<ResponsesContentBlock>,
+    output: ResponsesFunctionCallOutputContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ResponsesFunctionCallOutputContent {
+    Text(String),
+    Blocks(Vec<ResponsesContentBlock>),
 }
 
 #[derive(Debug, Serialize)]
@@ -3038,19 +3045,45 @@ fn append_message(
         }));
     }
     for (id, content) in tool_outputs {
-        let output = content
-            .into_iter()
-            .map(|part| match part {
-                ContentPart::Text(text) => Ok(ResponsesContentBlock::InputText { text }),
-                ContentPart::Image { media_type, data } => Ok(ResponsesContentBlock::InputImage {
-                    image_url: format!("data:{media_type};base64,{}", base64_encode(&data)),
-                }),
-                _ => Err(unsupported(
-                    "tool_output",
-                    "unsupported nested tool output block",
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let has_images = content
+            .iter()
+            .any(|part| matches!(part, ContentPart::Image { .. }));
+        let output = if has_images {
+            ResponsesFunctionCallOutputContent::Blocks(
+                content
+                    .into_iter()
+                    .map(|part| match part {
+                        ContentPart::Text(text) => Ok(ResponsesContentBlock::InputText { text }),
+                        ContentPart::Image { media_type, data } => {
+                            Ok(ResponsesContentBlock::InputImage {
+                                image_url: format!(
+                                    "data:{media_type};base64,{}",
+                                    base64_encode(&data)
+                                ),
+                            })
+                        }
+                        _ => Err(unsupported(
+                            "tool_output",
+                            "unsupported nested tool output block",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            let mut text = String::new();
+            for part in content {
+                match part {
+                    ContentPart::Text(value) => text.push_str(&value),
+                    _ => {
+                        return Err(unsupported(
+                            "tool_output",
+                            "unsupported nested tool output block",
+                        ));
+                    }
+                }
+            }
+            ResponsesFunctionCallOutputContent::Text(text)
+        };
         items.push(ResponsesInputItem::FunctionCallOutput(
             ResponsesFunctionCallOutput {
                 item_type: "function_call_output",
@@ -4367,6 +4400,29 @@ mod tests {
     }
 
     #[test]
+    fn responses_websocket_error_envelope_without_status_preserves_provider_detail() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let mut decoder = binding.new_websocket_decoder();
+        let events = decoder
+            .push(
+                br#"{"type":"error","error":{"code":"request_too_large","message":"serialized request exceeded upstream limit"}}"#,
+            )
+            .unwrap();
+        let ModelEvent::Failure(failure) = &events[0] else {
+            panic!("expected typed failure event");
+        };
+        assert_eq!(failure.status, None);
+        assert_eq!(failure.code.as_deref(), Some("request_too_large"));
+        assert_eq!(failure.retry_hint, RetryHint::Never);
+        assert!(
+            failure
+                .detail()
+                .contains("serialized request exceeded upstream limit")
+        );
+    }
+
+    #[test]
     fn responses_websocket_close_before_terminal_is_typed() {
         let (capabilities, generation) = all_support();
         let binding = binding("standard", capabilities, generation);
@@ -5144,6 +5200,52 @@ anthropic_thinking = { mode = "adaptive" }"#,
 
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+    }
+
+    #[test]
+    fn responses_tool_outputs_use_string_for_text_and_blocks_for_images() {
+        let (capabilities, generation) = all_support();
+        let binding = binding("standard", capabilities, generation);
+        let request = ModelRequestInput {
+            control: super::super::RequestControl::new("model"),
+            segments: vec![],
+            segment_origins: vec![],
+            messages: vec![
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        id: "call-text".into(),
+                        content: vec![ContentPart::Text(r#"{"ok":true}"#.into())],
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        id: "call-image".into(),
+                        content: vec![
+                            ContentPart::Text(r#"{"ok":true}"#.into()),
+                            ContentPart::Image {
+                                media_type: "image/png".into(),
+                                data: vec![1, 2, 3],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            message_origins: vec!["text-output".into(), "image-output".into()],
+            tools: vec![],
+            generation: GenerationSettings::default(),
+            cache: CacheIntent::default(),
+        };
+
+        let body: Value =
+            serde_json::from_slice(&binding.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(body["input"][0]["output"], r#"{"ok":true}"#);
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert!(body["input"][1]["output"].is_array());
+        assert_eq!(body["input"][1]["output"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["output"][1]["type"], "input_image");
     }
 
     #[test]

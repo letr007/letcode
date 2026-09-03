@@ -825,6 +825,7 @@ pub enum HttpMethod {
 pub struct TransportResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
+    responses_websocket_events: bool,
     body: Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, ModelFailure>> + Send>>,
 }
 
@@ -834,6 +835,10 @@ impl fmt::Debug for TransportResponse {
             .debug_struct("TransportResponse")
             .field("status", &self.status)
             .field("headers", &self.headers)
+            .field(
+                "responses_websocket_events",
+                &self.responses_websocket_events,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -857,13 +862,22 @@ impl TransportResponse {
         self.body.next().await
     }
 
-    pub(crate) fn from_stream<S>(status: u16, headers: BTreeMap<String, String>, stream: S) -> Self
+    pub(crate) fn uses_responses_websocket_events(&self) -> bool {
+        self.responses_websocket_events
+    }
+
+    pub(crate) fn from_responses_websocket_stream<S>(
+        status: u16,
+        headers: BTreeMap<String, String>,
+        stream: S,
+    ) -> Self
     where
         S: futures_util::Stream<Item = Result<Vec<u8>, ModelFailure>> + Send + 'static,
     {
         Self {
             status,
             headers,
+            responses_websocket_events: true,
             body: Box::pin(stream),
         }
     }
@@ -883,6 +897,7 @@ impl TransportResponse {
         Self {
             status,
             headers,
+            responses_websocket_events: false,
             body: Box::pin(body),
         }
     }
@@ -2811,6 +2826,7 @@ impl ProviderTransport {
         Ok(TransportResponse {
             status,
             headers,
+            responses_websocket_events: false,
             body: Box::pin(body),
         })
     }

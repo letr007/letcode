@@ -11,6 +11,7 @@ type Socket = WebSocketStream<reqwest::Upgraded>;
 /// must await each send before reading or sending the next frame.
 pub(crate) struct TurnLocalWsSession {
     socket: Socket,
+    last_sent_text_bytes: Option<usize>,
 }
 
 impl TurnLocalWsSession {
@@ -83,7 +84,10 @@ impl TurnLocalWsSession {
         let socket =
             WebSocketStream::from_raw_socket(upgraded, tungstenite::protocol::Role::Client, None)
                 .await;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            last_sent_text_bytes: None,
+        })
     }
 
     pub(crate) async fn send_text(
@@ -95,6 +99,7 @@ impl TurnLocalWsSession {
             ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
                 .with_code("websocket_frame_utf8")
         })?;
+        let text_bytes = text.len();
         self.socket
             .send(Message::Text(text.into()))
             .await
@@ -102,17 +107,16 @@ impl TurnLocalWsSession {
                 ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
                     .with_code("websocket_send_failed")
                     .with_retry_hint(RetryHint::Retryable)
-                    .with_detail_redacted(error.to_string(), secrets)
-            })
+                    .with_detail_redacted(format!("{error}; request_bytes={text_bytes}"), secrets)
+            })?;
+        self.last_sent_text_bytes = Some(text_bytes);
+        Ok(())
     }
 
-    pub(crate) async fn next_text(
-        &mut self,
-        secrets: &[&str],
-    ) -> Result<Option<Vec<u8>>, ModelFailure> {
+    pub(crate) async fn next_text(&mut self, secrets: &[&str]) -> Result<Vec<u8>, ModelFailure> {
         loop {
             match self.socket.next().await {
-                Some(Ok(Message::Text(text))) => return Ok(Some(text.as_bytes().to_vec())),
+                Some(Ok(Message::Text(text))) => return Ok(text.as_bytes().to_vec()),
                 Some(Ok(Message::Ping(payload))) => {
                     self.socket
                         .send(Message::Pong(payload))
@@ -125,7 +129,20 @@ impl TurnLocalWsSession {
                         })?;
                 }
                 Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | None => return Ok(None),
+                Some(Ok(Message::Close(frame))) => {
+                    return Err(websocket_close_failure(
+                        frame,
+                        self.last_sent_text_bytes,
+                        secrets,
+                    ));
+                }
+                None => {
+                    return Err(websocket_close_failure(
+                        None,
+                        self.last_sent_text_bytes,
+                        secrets,
+                    ));
+                }
                 Some(Ok(Message::Binary(_))) => {
                     return Err(ModelFailure::new(
                         FailurePhase::Decode,
@@ -134,7 +151,13 @@ impl TurnLocalWsSession {
                     .with_code("websocket_binary_frame"));
                 }
                 Some(Ok(Message::Frame(_))) => {}
-                Some(Err(error)) => return Err(websocket_io_failure(error, secrets)),
+                Some(Err(error)) => {
+                    return Err(websocket_io_failure(
+                        error,
+                        self.last_sent_text_bytes,
+                        secrets,
+                    ));
+                }
             }
         }
     }
@@ -160,8 +183,46 @@ fn handshake_failure(error: reqwest::Error, secrets: &[&str]) -> ModelFailure {
     failure
 }
 
+fn websocket_close_failure(
+    frame: Option<tungstenite::protocol::CloseFrame>,
+    request_bytes: Option<usize>,
+    secrets: &[&str],
+) -> ModelFailure {
+    let message_too_big = frame
+        .as_ref()
+        .is_some_and(|frame| frame.code == tungstenite::protocol::frame::coding::CloseCode::Size);
+    let mut detail = match frame {
+        Some(frame) => format!(
+            "peer closed WebSocket before terminal response: code={} reason={}",
+            frame.code, frame.reason
+        ),
+        None => "WebSocket ended before terminal response without a close frame".to_owned(),
+    };
+    if let Some(request_bytes) = request_bytes {
+        detail.push_str(&format!("; request_bytes={request_bytes}"));
+    }
+    let (phase, kind) = if message_too_big {
+        (FailurePhase::Transport, FailureKind::Http)
+    } else {
+        (FailurePhase::Finish, FailureKind::MalformedResponse)
+    };
+    ModelFailure::new(phase, kind)
+        .with_code(if message_too_big {
+            "websocket_message_too_big"
+        } else {
+            "websocket_closed_before_terminal"
+        })
+        .with_retry_hint(if message_too_big {
+            RetryHint::RetryAfterSeconds(0)
+        } else {
+            RetryHint::Retryable
+        })
+        .with_detail_redacted(detail, secrets)
+}
+
 fn websocket_io_failure(
     error: tokio_tungstenite::tungstenite::Error,
+    request_bytes: Option<usize>,
     secrets: &[&str],
 ) -> ModelFailure {
     let kind = match &error {
@@ -170,22 +231,28 @@ fn websocket_io_failure(
         }
         _ => FailureKind::Http,
     };
+    let detail = match request_bytes {
+        Some(request_bytes) => format!("{error}; request_bytes={request_bytes}"),
+        None => error.to_string(),
+    };
     ModelFailure::new(FailurePhase::Transport, kind)
         .with_code("websocket_receive_failed")
         .with_retry_hint(RetryHint::Retryable)
-        .with_detail_redacted(error.to_string(), secrets)
+        .with_detail_redacted(detail, secrets)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::model_runtime::{
-        AuthScheme, ProviderTransport, RuntimeAuthConfig, RuntimeTransportConfig,
+        AuthScheme, ProviderTransport, RetryHint, RuntimeAuthConfig, RuntimeTransportConfig,
     };
     use futures_util::{SinkExt, StreamExt};
     use std::collections::BTreeMap;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
@@ -252,6 +319,13 @@ mod tests {
                     .await
                     .unwrap();
             }
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Size,
+                    reason: "Message Too Big".into(),
+                })))
+                .await
+                .unwrap();
         });
 
         let transport = ProviderTransport::new_for_endpoint(
@@ -294,27 +368,25 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let first = session
-                .next_text(&["bearer-secret"])
-                .await
-                .unwrap()
-                .unwrap();
+            let first = session.next_text(&["bearer-secret"]).await.unwrap();
             assert!(
                 std::str::from_utf8(&first)
                     .unwrap()
                     .contains(&format!("hello-{round}"))
             );
-            let second = session
-                .next_text(&["bearer-secret"])
-                .await
-                .unwrap()
-                .unwrap();
+            let second = session.next_text(&["bearer-secret"]).await.unwrap();
             assert!(
                 std::str::from_utf8(&second)
                     .unwrap()
                     .contains(&format!("resp-{round}"))
             );
         }
+        let failure = session.next_text(&["bearer-secret"]).await.unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("websocket_message_too_big"));
+        assert_eq!(failure.retry_hint, RetryHint::RetryAfterSeconds(0));
+        assert!(failure.detail().contains("code=1009"));
+        assert!(failure.detail().contains("reason=Message Too Big"));
+        assert!(failure.detail().contains("request_bytes=36"));
         server.await.unwrap();
     }
 }

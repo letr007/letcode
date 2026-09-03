@@ -36,6 +36,7 @@ pub(crate) struct TurnLocalResponsesTransport {
     force_full: Arc<tokio::sync::Mutex<bool>>,
     next_prompt_unit_start: Arc<tokio::sync::Mutex<Option<usize>>>,
     poisoned_response: Arc<AtomicBool>,
+    force_http: Arc<AtomicBool>,
 }
 
 impl TurnLocalResponsesTransport {
@@ -46,6 +47,7 @@ impl TurnLocalResponsesTransport {
             force_full: Arc::new(tokio::sync::Mutex::new(false)),
             next_prompt_unit_start: Arc::new(tokio::sync::Mutex::new(None)),
             poisoned_response: Arc::new(AtomicBool::new(false)),
+            force_http: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -67,6 +69,11 @@ impl ModelTransport for TurnLocalResponsesTransport {
         route: &ResolvedModelRoute,
         request: PreparedHttpRequest,
     ) -> Result<TransportResponse, ModelFailure> {
+        if self.force_http.load(Ordering::Acquire) {
+            return ResolvedProviderTransport
+                .send_prepared(route, request)
+                .await;
+        }
         let previous_response_id = self.previous_response_id.lock().await.clone();
         let force_full = *self.force_full.lock().await;
         if self.poisoned_response.swap(false, Ordering::AcqRel) {
@@ -138,9 +145,14 @@ impl ModelTransport for TurnLocalResponsesTransport {
             self.force_full.clone(),
             self.next_prompt_unit_start.clone(),
             self.poisoned_response.clone(),
+            self.force_http.clone(),
             route.auth.credential.clone().unwrap_or_default(),
         );
-        Ok(TransportResponse::from_stream(200, BTreeMap::new(), stream))
+        Ok(TransportResponse::from_responses_websocket_stream(
+            200,
+            BTreeMap::new(),
+            stream,
+        ))
     }
 }
 
@@ -175,6 +187,7 @@ fn websocket_response_stream(
     force_full: Arc<tokio::sync::Mutex<bool>>,
     next_prompt_unit_start: Arc<tokio::sync::Mutex<Option<usize>>>,
     poisoned: Arc<AtomicBool>,
+    force_http: Arc<AtomicBool>,
     secret: String,
 ) -> WebsocketResponseStream {
     let terminal = Arc::new(AtomicBool::new(false));
@@ -185,6 +198,7 @@ fn websocket_response_stream(
             let force_full = force_full.clone();
             let next_prompt_unit_start = next_prompt_unit_start.clone();
             let terminal_for_stream = terminal_for_stream.clone();
+            let force_http = force_http.clone();
             async move {
                 if ended {
                     return None;
@@ -194,7 +208,7 @@ fn websocket_response_stream(
                 let result = socket.next_text(&[secret.as_str()]).await;
                 drop(guard);
                 match result {
-                    Ok(Some(text)) => {
+                    Ok(text) => {
                         let value = serde_json::from_slice::<serde_json::Value>(&text).ok();
                         let event_type = value
                             .as_ref()
@@ -247,12 +261,11 @@ fn websocket_response_stream(
                             (session, previous_response_id, secret, is_terminal),
                         ))
                     }
-                    Ok(None) => {
-                        *session.lock().await = None;
-                        None
-                    }
                     Err(error) => {
                         *session.lock().await = None;
+                        if error.code.as_deref() == Some("websocket_message_too_big") {
+                            force_http.store(true, Ordering::Release);
+                        }
                         Some((Err(error), (session, previous_response_id, secret, true)))
                     }
                 }
@@ -518,7 +531,10 @@ impl ModelRuntime {
                 partial: ModelAttemptSnapshot::default(),
             });
         }
-        let mut decoder = if self.responses_websocket && route.protocol_id.as_str() == "responses" {
+        let mut decoder = if self.responses_websocket
+            && response.uses_responses_websocket_events()
+            && route.protocol_id.as_str() == "responses"
+        {
             route.binding.new_websocket_decoder()
         } else {
             route.binding.new_decoder()
@@ -1227,6 +1243,7 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, accept_hdr_async, tungstenite::Message};
 
@@ -1418,6 +1435,96 @@ tools = true
         while let Some(chunk) = response.next_chunk().await {
             chunk.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_message_too_big_uses_http_on_next_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let Message::Text(_) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected websocket request frame");
+            };
+            socket
+                .send(Message::Close(Some(
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Size,
+                        reason: "message too big".into(),
+                    },
+                )))
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "HTTP request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (header_end, content_length);
+            };
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "HTTP request closed before body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request_line = std::str::from_utf8(&request)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap();
+            assert!(matches!(
+                request_line,
+                "POST /responses HTTP/1.1" | "POST /responses? HTTP/1.1"
+            ));
+            let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"status\":\"completed\"}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut route = route_for_local_server(address);
+        route.retry = Some(RuntimeRetryConfig {
+            enabled: true,
+            max_attempts: 2,
+            max_recovery_attempts: 0,
+            initial_delay_secs: 0,
+            exponential_backoff: false,
+            backoff_multiplier: 1.0,
+            jitter_secs: 0,
+        });
+        let input = ModelRequestInput::new(
+            "model",
+            vec![ModelMessage::text(super::super::MessageRole::User, "hello")],
+        );
+        let transport = Arc::new(TurnLocalResponsesTransport::new());
+        let runtime = ModelRuntime::new_responses_websocket(transport.clone());
+        let output = runtime
+            .execute_text_oneshot(&route, &input, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+        assert!(transport.force_http.load(Ordering::Acquire));
+        server.await.unwrap();
     }
 
     #[tokio::test]
