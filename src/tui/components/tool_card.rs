@@ -185,8 +185,108 @@ pub(crate) fn render_tool_card_lines_with_frame(
     ))
 }
 
-/// Renderer-neutral tool document. The existing card layout remains visual-only;
-/// its semantic text is registered as leaves before the Ratatui bridge consumes it.
+pub(crate) fn tool_is_active(tool: &ToolView) -> bool {
+    match tool.status {
+        ToolExecutionStatus::Pending | ToolExecutionStatus::Running => true,
+        ToolExecutionStatus::Failed | ToolExecutionStatus::Cancelled => false,
+        ToolExecutionStatus::Succeeded => {
+            crate::agent::is_subagent_tool_name(&tool.name)
+                && tool
+                    .output
+                    .as_deref()
+                    .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+                    .and_then(|value| {
+                        value
+                            .get("data")
+                            .unwrap_or(&value)
+                            .get("active")
+                            .and_then(serde_json::Value::as_bool)
+                    })
+                    == Some(true)
+        }
+    }
+}
+
+/// Renderer-neutral compact summary for a contiguous tool group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolGroupStats {
+    pub call_count: usize,
+    pub failed_count: usize,
+    pub cancelled_count: usize,
+    pub active: bool,
+}
+
+pub fn render_tool_group_document(
+    latest: &ToolView,
+    stats: ToolGroupStats,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+    translator: &crate::tui::i18n::Translator,
+) -> Document<Style> {
+    let mut document = Document::default();
+    if width == 0 || stats.call_count == 0 {
+        return document;
+    }
+    let glyph = if stats.active {
+        PROCESS_FRAMES[frame % PROCESS_FRAMES.len()]
+    } else {
+        "→"
+    };
+    let aggregate_status = if stats.active {
+        ToolExecutionStatus::Running
+    } else if stats.failed_count > 0 {
+        ToolExecutionStatus::Failed
+    } else if stats.cancelled_count > 0 {
+        ToolExecutionStatus::Cancelled
+    } else {
+        ToolExecutionStatus::Succeeded
+    };
+    let style = tool_trace_text_style(aggregate_status, theme);
+    let mut spans = vec![
+        SemanticSpan::decoration("  ", theme.app_style()),
+        SemanticSpan::decoration(
+            format!("{glyph} "),
+            tool_trace_arrow_style(aggregate_status, theme),
+        ),
+        SemanticSpan::decoration(
+            format!("{} · {}", translator.t("ui.tools"), stats.call_count),
+            style.add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if stats.failed_count > 0 {
+        spans.push(SemanticSpan::decoration(
+            format!(
+                " · {} {}",
+                stats.failed_count,
+                translator.t("status.failed")
+            ),
+            style,
+        ));
+    }
+    if stats.cancelled_count > 0 {
+        spans.push(SemanticSpan::decoration(
+            format!(
+                " · {} {}",
+                stats.cancelled_count,
+                translator.t("status.cancelled")
+            ),
+            style,
+        ));
+    }
+    spans.push(SemanticSpan::decoration(" · ", style));
+    spans.extend(tool_trace_segments(latest, style));
+    let mut line = SemanticLine {
+        spans,
+        boundary: Break::End,
+    };
+    line.spans = clip_semantic_spans(line.spans, width);
+    document.push_semantic_line(line);
+    document.finish();
+    debug_assert!(document.validate());
+    document
+}
+
 pub fn render_tool_card_document(
     tool: &ToolView,
     theme: Theme,

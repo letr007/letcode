@@ -322,6 +322,14 @@ fn render_picker_body(
                         selected,
                         item.id == state.thoughts_display.as_str(),
                     ),
+                    DialogKind::ToolsPicker => render_reasoning_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        item.id == state.tools_display.as_str(),
+                    ),
                     DialogKind::ContextDetail => {
                         render_session_row(frame, row, theme, item, selected, None)
                     }
@@ -348,6 +356,7 @@ fn render_picker_body(
             DialogKind::FakePicker => state.t("dialog.no_fake_clients"),
             DialogKind::ReasoningPicker => state.t("dialog.no_reasoning"),
             DialogKind::ThoughtsPicker => state.t("dialog.no_thoughts"),
+            DialogKind::ToolsPicker => state.t("dialog.no_items"),
             DialogKind::AgentPicker => state.t("dialog.no_experts"),
             DialogKind::ExpertModelPicker(_) | DialogKind::ModelPicker => {
                 state.t("dialog.no_models")

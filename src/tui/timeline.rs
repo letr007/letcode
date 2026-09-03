@@ -258,6 +258,8 @@ pub struct ReasoningView {
     pub streaming: bool,
     pub started_at: Option<std::time::Instant>,
     pub duration_ms: Option<u64>,
+    pub transition_from: Option<String>,
+    pub transition_started_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +333,13 @@ fn is_runtime_context_section(text: &str) -> bool {
                 | "[Context: Open Detail]"
         )
     )
+}
+
+fn reasoning_transition_source(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take(512).collect())
+        .unwrap_or_default()
 }
 
 fn append_streaming_tool_output(
@@ -543,17 +552,26 @@ impl Timeline {
 
     fn push_item(&mut self, item: TimelineItem) {
         let revision = self.next_item_revision();
+        let inserted_tool = matches!(&item, TimelineItem::Tool(_));
         self.mark_mutated();
 
-        if is_queued_user_item(&item) {
+        let index = if is_queued_user_item(&item) {
+            let index = self.items.len();
             self.items.push(item);
             self.revisions.push(revision);
+            index
         } else if let Some(index) = self.items.iter().position(is_queued_user_item) {
             self.items.insert(index, item);
             self.revisions.insert(index, revision);
+            index
         } else {
+            let index = self.items.len();
             self.items.push(item);
             self.revisions.push(revision);
+            index
+        };
+        if inserted_tool && index > 0 && matches!(self.items[index - 1], TimelineItem::Tool(_)) {
+            self.bump_revision(index - 1);
         }
         self.rebuild_lookup_indices();
     }
@@ -657,6 +675,8 @@ impl Timeline {
             streaming: false,
             started_at: None,
             duration_ms,
+            transition_from: None,
+            transition_started_at: None,
         }));
     }
 
@@ -800,12 +820,21 @@ impl Timeline {
             .unwrap_or(self.items.len())
             .checked_sub(1)
             .filter(|index| matches!(self.items[*index], TimelineItem::Reasoning(_)));
+        let transition_from = previous_reasoning_index.and_then(|index| match &self.items[index] {
+            TimelineItem::Reasoning(reasoning) => {
+                let title = reasoning_transition_source(&reasoning.text);
+                (!title.is_empty()).then_some(title)
+            }
+            _ => None,
+        });
         self.push_item(TimelineItem::Reasoning(ReasoningView {
             item_id: event.item_id,
             text: event.delta,
             streaming: true,
             started_at: Some(event.observed_at),
             duration_ms: None,
+            transition_started_at: None,
+            transition_from,
         }));
         if let Some(index) = previous_reasoning_index {
             self.bump_revision(index);
@@ -855,6 +884,55 @@ impl Timeline {
         }
     }
 
+    pub fn begin_reasoning_transitions(&mut self, now: std::time::Instant) {
+        let indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                TimelineItem::Reasoning(reasoning)
+                    if reasoning.transition_from.is_some()
+                        && reasoning.transition_started_at.is_none() =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for index in indices {
+            if let TimelineItem::Reasoning(reasoning) = &mut self.items[index] {
+                reasoning.transition_started_at = Some(now);
+            }
+            self.bump_revision(index);
+        }
+    }
+
+    pub fn finish_reasoning_transitions(&mut self, now: std::time::Instant) {
+        const TRANSITION_DURATION: std::time::Duration = std::time::Duration::from_millis(198);
+        let indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                TimelineItem::Reasoning(reasoning)
+                    if reasoning.transition_started_at.is_some_and(|started_at| {
+                        now.saturating_duration_since(started_at) >= TRANSITION_DURATION
+                    }) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for index in indices {
+            if let TimelineItem::Reasoning(reasoning) = &mut self.items[index] {
+                reasoning.transition_from = None;
+                reasoning.transition_started_at = None;
+            }
+            self.bump_revision(index);
+        }
+    }
+
     pub fn push_delegation(&mut self, agent_name: impl Into<String>, task: impl Into<String>) {
         self.push_item(TimelineItem::Delegation(DelegationView {
             agent_name: agent_name.into(),
@@ -898,6 +976,8 @@ impl Timeline {
             streaming: false,
             started_at: None,
             duration_ms: None,
+            transition_from: None,
+            transition_started_at: None,
         }));
         if let Some(index) = previous_reasoning_index {
             self.bump_revision(index);
@@ -2036,6 +2116,49 @@ mod tests {
 
         timeline.tick_reasoning_elapsed(start + std::time::Duration::from_millis(2_000));
         assert_ne!(timeline.item_revisions()[0], first_second_revision);
+    }
+
+    #[test]
+    fn quick_reasoning_completion_keeps_title_transition_until_animation_finishes() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new();
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at("reasoning-1", "First", start));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reasoning-1",
+            "First",
+            start + std::time::Duration::from_millis(20),
+        ));
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::at(
+            "reasoning-2",
+            "Second",
+            start + std::time::Duration::from_millis(30),
+        ));
+        timeline.finalize_reasoning(crate::tui::events::ReasoningDoneEvent::at(
+            "reasoning-2",
+            "Second",
+            start + std::time::Duration::from_millis(50),
+        ));
+
+        assert!(matches!(
+            timeline.items().last(),
+            Some(TimelineItem::Reasoning(reasoning))
+                if reasoning.transition_from.as_deref() == Some("First")
+                    && reasoning.transition_started_at.is_none()
+        ));
+        timeline.begin_reasoning_transitions(start + std::time::Duration::from_millis(30));
+        timeline.finish_reasoning_transitions(start + std::time::Duration::from_millis(227));
+        assert!(matches!(
+            timeline.items().last(),
+            Some(TimelineItem::Reasoning(reasoning))
+                if reasoning.transition_from.as_deref() == Some("First")
+        ));
+        timeline.finish_reasoning_transitions(start + std::time::Duration::from_millis(228));
+        assert!(matches!(
+            timeline.items().last(),
+            Some(TimelineItem::Reasoning(reasoning))
+                if reasoning.transition_from.is_none()
+                    && reasoning.transition_started_at.is_none()
+        ));
     }
 
     #[test]

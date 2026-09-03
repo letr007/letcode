@@ -4,7 +4,7 @@
 //! [`SessionEngineIngress`], present [`SessionTransportEvent`] on stdout, and
 //! answer permission/question handles. No direct agent/runner ownership.
 
-use crate::command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
+use crate::command::{CommandIntent, command_metadata, parse_command};
 use crate::config::AppConfig;
 use crate::permission::{PermissionApproval, PermissionMode};
 use crate::request_builder::{ModelReasoningEffort, ModelRequestMetadata};
@@ -869,10 +869,8 @@ fn parse_repl_command(input: &str) -> ReplCommand {
             "CLI does not support /thoughts; use the TUI to switch thinking display.".into(),
         ),
         CommandIntent::ResumeShow => ReplCommand::ResumeShow,
-        CommandIntent::ToolOutputSet(ToolOutputMode::Toggle)
-        | CommandIntent::ToolOutputSet(ToolOutputMode::Expanded)
-        | CommandIntent::ToolOutputSet(ToolOutputMode::Truncated) => ReplCommand::Unsupported(
-            "CLI does not support /tool-output yet; parity is pending.".into(),
+        CommandIntent::ToolsShow | CommandIntent::ToolsSet(_) => ReplCommand::Unsupported(
+            "CLI does not support /tools; use the TUI to switch tool display.".into(),
         ),
         CommandIntent::TranscriptScrollbarSet(_) => ReplCommand::Unsupported(
             "CLI does not support /scrollbar; use the TUI to toggle the transcript scrollbar."

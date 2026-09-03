@@ -21,11 +21,29 @@ pub enum ChildNavigation {
     Prev,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolOutputMode {
-    Toggle,
-    Expanded,
-    Truncated,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolsDisplayMode {
+    Compact,
+    #[default]
+    Detailed,
+}
+
+impl ToolsDisplayMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Detailed => "detailed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "compact" | "collapsed" | "off" | "truncated" => Some(Self::Compact),
+            "2" | "detailed" | "full" | "expanded" | "on" => Some(Self::Detailed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +144,8 @@ pub enum CommandIntent {
     ReasoningSet(ModelReasoningEffort),
     ThoughtsShow,
     ThoughtsSet(ThoughtsDisplayMode),
-    ToolOutputSet(ToolOutputMode),
+    ToolsShow,
+    ToolsSet(ToolsDisplayMode),
     TranscriptScrollbarSet(TranscriptScrollbarMode),
     PanelSet(PanelMode),
     Theme(ThemeCommand),
@@ -341,13 +360,22 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
-        name: "/tool-output",
-        insert_text: "/tool-output ",
-        description_key: "command.tool_output",
-        usage: "/tool-output <on|off|expanded|truncated|full|compact>",
+        name: "/tools",
+        insert_text: "/tools",
+        description_key: "command.tools",
+        usage: "/tools <compact|detailed>",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/tool-output",
+        insert_text: "/tool-output",
+        description_key: "command.tools",
+        usage: "/tool-output <compact|detailed>",
+        visible_in_slash: false,
+        visible_in_help: false,
+        visible_in_summary: false,
     },
     CommandMetadata {
         name: "/scrollbar",
@@ -511,7 +539,7 @@ pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
         "/reasoning",
         "/thoughts",
         "/permission",
-        "/tool-output",
+        "/tools",
         "/scrollbar",
         "/panel",
         "/theme",
@@ -582,7 +610,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/fast" => expect_no_extra_args(&parts, "/fast", CommandIntent::FastToggle),
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/thoughts" => parse_thoughts(&parts),
-        "/tool-output" => parse_tool_output(&parts),
+        "/tools" | "/tool-output" => parse_tools(&parts),
         "/scrollbar" => parse_transcript_scrollbar(&parts),
         "/panel" => parse_panel(&parts),
         "/theme" => parse_theme(&parts),
@@ -688,18 +716,16 @@ fn parse_thoughts(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     }
 }
 
-fn parse_tool_output(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+fn parse_tools(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     match parts {
-        ["/tool-output"] => Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle)),
-        ["/tool-output", value] => match parse_tool_output_mode(value) {
-            Some(mode) => Ok(CommandIntent::ToolOutputSet(mode)),
-            None => Err(CommandParseError::with_args(
-                "parse.unknown_tool_output",
-                [],
-            )),
+        ["/tools" | "/tool-output"] => Ok(CommandIntent::ToolsShow),
+        ["/tools" | "/tool-output", value] => match ToolsDisplayMode::parse(value) {
+            Some(mode) => Ok(CommandIntent::ToolsSet(mode)),
+            None => Err(CommandParseError::with_args("parse.unknown_tools", [])),
         },
+        ["/tools", ..] => Err(CommandParseError::new("Usage: /tools <compact|detailed>")),
         ["/tool-output", ..] => Err(CommandParseError::new(
-            "Usage: /tool-output <on|off|expanded|truncated|full|compact>",
+            "Usage: /tool-output <compact|detailed>",
         )),
         _ => unreachable!(),
     }
@@ -863,22 +889,6 @@ pub fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
         "xhigh" | "x-high" | "extra-high" => Some(ModelReasoningEffort::Xhigh),
         "max" => Some(ModelReasoningEffort::Max),
         _ => None,
-    }
-}
-
-fn parse_tool_output_mode(value: &str) -> Option<ToolOutputMode> {
-    if value.eq_ignore_ascii_case("on")
-        || value.eq_ignore_ascii_case("expanded")
-        || value.eq_ignore_ascii_case("full")
-    {
-        Some(ToolOutputMode::Expanded)
-    } else if value.eq_ignore_ascii_case("off")
-        || value.eq_ignore_ascii_case("truncated")
-        || value.eq_ignore_ascii_case("compact")
-    {
-        Some(ToolOutputMode::Truncated)
-    } else {
-        None
     }
 }
 
@@ -1090,6 +1100,23 @@ mod tests {
         assert_eq!(
             parse_command("/thoughts verbose"),
             Err(CommandParseError::with_args("parse.unknown_thoughts", []))
+        );
+        assert_eq!(parse_command("/tools"), Ok(CommandIntent::ToolsShow));
+        assert_eq!(
+            parse_command("/tools 1"),
+            Ok(CommandIntent::ToolsSet(ToolsDisplayMode::Compact))
+        );
+        assert_eq!(
+            parse_command("/tools detailed"),
+            Ok(CommandIntent::ToolsSet(ToolsDisplayMode::Detailed))
+        );
+        assert_eq!(
+            parse_command("/tool-output off"),
+            Ok(CommandIntent::ToolsSet(ToolsDisplayMode::Compact))
+        );
+        assert_eq!(
+            parse_command("/tools verbose"),
+            Err(CommandParseError::with_args("parse.unknown_tools", []))
         );
     }
 }

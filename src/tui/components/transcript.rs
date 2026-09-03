@@ -6,6 +6,8 @@
 //! `transcript_ratatui` bridge; the model itself comes from
 //! `transcript_read_model`.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -25,7 +27,7 @@ use crate::tui::{
     theme::Theme,
     timeline::{
         DelegationView, ErrorView, MessageView, PermissionPromptStatus, PermissionView,
-        ReasoningView, TimelineItem, ToolView,
+        ReasoningView, TimelineItem, ToolExecutionStatus, ToolView,
     },
     transcript_ratatui,
     transcript_render::{
@@ -243,7 +245,12 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
     }
 
     for (index, item) in items.iter().enumerate() {
-        if timeline_item_needs_separator_before(index, items, state.thoughts_display) {
+        if timeline_item_needs_separator_before(
+            index,
+            items,
+            state.thoughts_display,
+            state.tools_display,
+        ) {
             lines.push(Line::from(""));
         }
 
@@ -257,6 +264,10 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 is_reviewer_child_view(state),
                 state.thoughts_display,
                 index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_)),
+                state.tools_display,
+                index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Tool(_)),
+                compact_tool_group_stats(items, index),
+                compact_reasoning_group_elapsed_ms(items, index),
                 &state.translator(),
             ),
         ));
@@ -325,6 +336,7 @@ fn cached_transcript_row_count_with_reflow(
             index,
             state.active_timeline().items(),
             state.thoughts_display,
+            state.tools_display,
         ) {
             1
         } else {
@@ -404,6 +416,7 @@ fn transcript_viewport_ranges(
             index,
             items,
             state.thoughts_display,
+            state.tools_display,
         ));
         let separator_start = item_start.saturating_sub(separator_rows);
         let item_end = item_start.saturating_add(item_count);
@@ -519,9 +532,29 @@ fn timeline_item_needs_separator_before(
     index: usize,
     items: &[TimelineItem],
     thoughts_display: crate::command::ThoughtsDisplayMode,
+    tools_display: crate::command::ToolsDisplayMode,
 ) -> bool {
     if index == 0 {
         return false;
+    }
+    if tools_display == crate::command::ToolsDisplayMode::Compact
+        && matches!(items[index], TimelineItem::Tool(_))
+    {
+        if index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Tool(_)) {
+            return false;
+        }
+        let group_start = (0..index)
+            .rev()
+            .take_while(|previous| matches!(items[*previous], TimelineItem::Tool(_)))
+            .last()
+            .unwrap_or(index);
+        if group_start == 0 {
+            return false;
+        }
+        return !matches!(
+            (&items[group_start - 1], &items[index]),
+            (TimelineItem::Todo(_), TimelineItem::Todo(_))
+        );
     }
     match (&items[index - 1], &items[index]) {
         (TimelineItem::Todo(_), TimelineItem::Todo(_)) => false,
@@ -530,6 +563,89 @@ fn timeline_item_needs_separator_before(
         }
         _ => true,
     }
+}
+
+fn compact_tool_group_stats(items: &[TimelineItem], index: usize) -> tool_card::ToolGroupStats {
+    if !matches!(items.get(index), Some(TimelineItem::Tool(_))) {
+        return tool_card::ToolGroupStats::default();
+    }
+    let start = (0..index)
+        .rev()
+        .take_while(|previous| matches!(items[*previous], TimelineItem::Tool(_)))
+        .last()
+        .unwrap_or(index);
+    let mut stats = tool_card::ToolGroupStats::default();
+    for tool in items[start..=index].iter().filter_map(|item| match item {
+        TimelineItem::Tool(tool) => Some(tool),
+        _ => None,
+    }) {
+        stats.call_count = stats.call_count.saturating_add(1);
+        stats.failed_count = stats
+            .failed_count
+            .saturating_add(usize::from(tool.status == ToolExecutionStatus::Failed));
+        stats.cancelled_count = stats
+            .cancelled_count
+            .saturating_add(usize::from(tool.status == ToolExecutionStatus::Cancelled));
+        stats.active |= tool_card::tool_is_active(tool);
+    }
+    stats
+}
+
+fn compact_reasoning_group_elapsed_ms(items: &[TimelineItem], index: usize) -> Option<u64> {
+    if !matches!(items.get(index), Some(TimelineItem::Reasoning(_))) {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let mut total = 0u64;
+    let mut found = false;
+    for item in items[..=index].iter().rev() {
+        let TimelineItem::Reasoning(reasoning) = item else {
+            break;
+        };
+        let elapsed = reasoning.duration_ms.or_else(|| {
+            reasoning.started_at.map(|started_at| {
+                u64::try_from(now.saturating_duration_since(started_at).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+        });
+        if let Some(elapsed) = elapsed {
+            total = total.saturating_add(elapsed);
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+fn compact_tool_group_revision(
+    items: &[TimelineItem],
+    revisions: &[u64],
+    index: usize,
+) -> Option<u64> {
+    if !matches!(items.get(index), Some(TimelineItem::Tool(_))) {
+        return revisions.get(index).copied();
+    }
+    let start = (0..index)
+        .rev()
+        .take_while(|previous| matches!(items[*previous], TimelineItem::Tool(_)))
+        .last()
+        .unwrap_or(index);
+    revisions.get(start..=index)?.iter().copied().max()
+}
+
+fn compact_reasoning_group_revision(
+    items: &[TimelineItem],
+    revisions: &[u64],
+    index: usize,
+) -> Option<u64> {
+    if !matches!(items.get(index), Some(TimelineItem::Reasoning(_))) {
+        return revisions.get(index).copied();
+    }
+    let start = (0..index)
+        .rev()
+        .take_while(|previous| matches!(items[*previous], TimelineItem::Reasoning(_)))
+        .last()
+        .unwrap_or(index);
+    revisions.get(start..=index)?.iter().copied().max()
 }
 
 fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool {
@@ -578,30 +694,74 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
             });
     }
 
-    let revision = state.active_timeline().item_revisions().get(index).copied();
-    let live = matches!(
-        &state.active_timeline().items()[index],
-        TimelineItem::Tool(tool)
-            if matches!(
-                tool.status,
-                crate::tui::timeline::ToolExecutionStatus::Pending
-                    | crate::tui::timeline::ToolExecutionStatus::Running
+    let (
+        revision,
+        live,
+        item,
+        next_reasoning,
+        next_tool,
+        tool_group_stats,
+        compact_reasoning_elapsed_ms,
+    ) = {
+        let timeline = state.active_timeline();
+        let items = timeline.items();
+        let revisions = timeline.item_revisions();
+        let item = items[index].clone();
+        let next_reasoning =
+            index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_));
+        let next_tool =
+            index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Tool(_));
+        let tool_group_stats = compact_tool_group_stats(items, index);
+        let compact_reasoning_elapsed_ms = compact_reasoning_group_elapsed_ms(items, index);
+        let revision = if state.tools_display == crate::command::ToolsDisplayMode::Compact
+            && matches!(item, TimelineItem::Tool(_))
+            && !next_tool
+        {
+            compact_tool_group_revision(items, revisions, index)
+        } else if state.thoughts_display == crate::command::ThoughtsDisplayMode::Compact
+            && matches!(item, TimelineItem::Reasoning(_))
+            && !next_reasoning
+        {
+            compact_reasoning_group_revision(items, revisions, index)
+        } else {
+            revisions.get(index).copied()
+        };
+        let live = if state.tools_display == crate::command::ToolsDisplayMode::Compact
+            && matches!(item, TimelineItem::Tool(_))
+            && !next_tool
+        {
+            tool_group_stats.active
+        } else {
+            matches!(
+                &item,
+                TimelineItem::Tool(tool)
+                    if matches!(
+                        tool.status,
+                        crate::tui::timeline::ToolExecutionStatus::Pending
+                            | crate::tui::timeline::ToolExecutionStatus::Running
+                    )
+            ) || matches!(
+                &item,
+                TimelineItem::Reasoning(reasoning)
+                    if reasoning.streaming || reasoning.transition_started_at.is_some()
             )
-    ) || matches!(
-        &state.active_timeline().items()[index],
-        TimelineItem::Reasoning(reasoning) if reasoning.streaming
-    );
+        };
+        (
+            revision,
+            live,
+            item,
+            next_reasoning,
+            next_tool,
+            tool_group_stats,
+            compact_reasoning_elapsed_ms,
+        )
+    };
     let frame = state.status_spinner_frame;
     if state.transcript_render_cache.entries[index].revision == revision
         && (!live || state.transcript_render_cache.live_render_frames[index] == Some(frame))
     {
         return;
     }
-
-    let item = state.active_timeline().items()[index].clone();
-    let items = state.active_timeline().items();
-    let next_reasoning =
-        index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_));
     let document = render_timeline_item_document(
         &item,
         theme,
@@ -611,6 +771,10 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         is_reviewer_child_view(state),
         state.thoughts_display,
         next_reasoning,
+        state.tools_display,
+        next_tool,
+        tool_group_stats,
+        compact_reasoning_elapsed_ms,
         &state.translator(),
     );
     let entry = &mut state.transcript_render_cache.entries[index];
@@ -685,6 +849,10 @@ struct TimelineItemComponent<'a> {
     reviewer_view: bool,
     thoughts_display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
+    tools_display: crate::command::ToolsDisplayMode,
+    next_tool: bool,
+    tool_group_stats: tool_card::ToolGroupStats,
+    compact_reasoning_elapsed_ms: Option<u64>,
     translator: &'a Translator,
 }
 
@@ -712,6 +880,7 @@ impl Component<Style> for TimelineItemComponent<'_> {
                 self.width,
                 self.thoughts_display,
                 self.next_reasoning,
+                self.compact_reasoning_elapsed_ms,
             ),
             TimelineItem::Delegation(delegation) => {
                 build_delegation_lines(&mut out, delegation, self.theme, self.width)
@@ -723,15 +892,30 @@ impl Component<Style> for TimelineItemComponent<'_> {
                 self.theme,
                 self.width,
             ),
-            TimelineItem::Tool(tool) => build_tool_lines(
-                &mut out,
-                tool,
-                self.theme,
-                self.width,
-                self.frame,
-                self.expanded_output,
-                self.translator,
-            ),
+            TimelineItem::Tool(tool) => {
+                if self.tools_display == crate::command::ToolsDisplayMode::Compact {
+                    if !self.next_tool {
+                        out.document = tool_card::render_tool_group_document(
+                            tool,
+                            self.tool_group_stats,
+                            self.theme,
+                            self.width,
+                            self.frame,
+                            self.translator,
+                        );
+                    }
+                } else {
+                    build_tool_lines(
+                        &mut out,
+                        tool,
+                        self.theme,
+                        self.width,
+                        self.frame,
+                        self.expanded_output,
+                        self.translator,
+                    );
+                }
+            }
             TimelineItem::Todo(todo) => build_todo_card(&mut out, todo, self.theme, self.width),
             TimelineItem::Permission(permission) => {
                 build_permission_lines(&mut out, permission, self.theme, self.width)
@@ -800,6 +984,10 @@ fn render_timeline_item_document(
     reviewer_view: bool,
     thoughts_display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
+    tools_display: crate::command::ToolsDisplayMode,
+    next_tool: bool,
+    tool_group_stats: tool_card::ToolGroupStats,
+    compact_reasoning_elapsed_ms: Option<u64>,
     translator: &Translator,
 ) -> Document<Style> {
     let mut document = Document::default();
@@ -812,6 +1000,10 @@ fn render_timeline_item_document(
         reviewer_view,
         thoughts_display,
         next_reasoning,
+        tools_display,
+        next_tool,
+        tool_group_stats,
+        compact_reasoning_elapsed_ms,
         translator,
     }
     .render(&mut document);
@@ -887,6 +1079,7 @@ fn build_reasoning_lines(
     width: usize,
     display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
+    compact_group_elapsed_ms: Option<u64>,
 ) {
     let content_width = width.saturating_sub(2).max(1);
     let (title, body) = reasoning_title_and_body(&reasoning.text);
@@ -897,7 +1090,14 @@ fn build_reasoning_lines(
             "Thought".to_string()
         }
     });
-    let elapsed = format_reasoning_elapsed(reasoning);
+    let elapsed = compact_group_elapsed_ms
+        .map(format_elapsed_duration)
+        .unwrap_or_else(|| format_reasoning_elapsed(reasoning));
+    let title = if display == crate::command::ThoughtsDisplayMode::Compact {
+        animated_compact_reasoning_title(reasoning, &title, content_width)
+    } else {
+        title
+    };
 
     if display == crate::command::ThoughtsDisplayMode::Compact {
         if next_reasoning {
@@ -958,6 +1158,59 @@ fn build_reasoning_lines(
             Break::End,
         );
     }
+}
+
+fn animated_compact_reasoning_title(
+    reasoning: &ReasoningView,
+    title: &str,
+    width: usize,
+) -> String {
+    animated_compact_reasoning_title_at(reasoning, title, width, std::time::Instant::now())
+}
+
+fn animated_compact_reasoning_title_at(
+    reasoning: &ReasoningView,
+    title: &str,
+    width: usize,
+    now: std::time::Instant,
+) -> String {
+    const FRAME_MS: u128 = 33;
+    const REPLACEMENT_FRAMES: usize = 6;
+
+    let target = tool_card::truncate_display_width(title, width);
+    let (Some(previous), Some(started_at)) = (
+        reasoning.transition_from.as_deref(),
+        reasoning.transition_started_at,
+    ) else {
+        return target;
+    };
+    let previous = reasoning_title_and_body(previous)
+        .0
+        .unwrap_or_else(|| previous.to_string());
+    let previous = tool_card::truncate_display_width(&previous, width);
+    let elapsed_ms = now.saturating_duration_since(started_at).as_millis();
+    let frame = usize::try_from(elapsed_ms / FRAME_MS)
+        .unwrap_or(usize::MAX)
+        .min(REPLACEMENT_FRAMES);
+    if frame >= REPLACEMENT_FRAMES {
+        return target;
+    }
+
+    let previous = previous.graphemes(true).collect::<Vec<_>>();
+    let target = target.graphemes(true).collect::<Vec<_>>();
+    let positions = previous.len().max(target.len());
+    let replaced = positions.saturating_mul(frame) / REPLACEMENT_FRAMES;
+    let mut rendered = String::new();
+    for index in 0..positions {
+        if index < replaced {
+            if let Some(grapheme) = target.get(index) {
+                rendered.push_str(grapheme);
+            }
+        } else if let Some(grapheme) = previous.get(index) {
+            rendered.push_str(grapheme);
+        }
+    }
+    tool_card::truncate_display_width(&rendered, width)
 }
 
 fn push_reasoning_status_line(
@@ -2011,11 +2264,13 @@ fn split_grapheme_span(text: &str, start: usize, end: usize) -> (String, String,
 
 #[cfg(test)]
 mod tests {
+    use crate::tui::components::tool_card;
+
     use super::{
-        cached_transcript_row_count, cached_transcript_row_count_with_reflow,
-        render_timeline_item_document, render_transcript, transcript_lines, transcript_row_count,
-        try_render_reviewer_view_item, visible_cached_transcript_lines, visible_document_lines,
-        visible_transcript_lines,
+        animated_compact_reasoning_title_at, cached_item_lines, cached_transcript_row_count,
+        cached_transcript_row_count_with_reflow, render_timeline_item_document, render_transcript,
+        transcript_lines, transcript_row_count, try_render_reviewer_view_item,
+        visible_cached_transcript_lines, visible_document_lines, visible_transcript_lines,
     };
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
@@ -2025,14 +2280,15 @@ mod tests {
             AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent,
             ReasoningDoneEvent, SessionEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
             UserMessageEvent,
-            events::{AutoContinueChangedEvent, TodoSnapshotEvent},
+            events::{AutoContinueChangedEvent, TodoSnapshotEvent, ToolCancelledEvent},
             measure::display_width,
             state::{ContextDetailTarget, TuiState},
             surface,
             theme::{Theme, ThemeName},
             timeline::{
                 CompactionView, ErrorView, MessageRole, MessageView, PermissionPromptStatus,
-                PermissionView, Timeline, TimelineItem, TodoView, ToolExecutionStatus, ToolView,
+                PermissionView, ReasoningView, Timeline, TimelineItem, TodoView,
+                ToolExecutionStatus, ToolView,
             },
         },
         user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission},
@@ -2221,6 +2477,10 @@ mod tests {
             false,
             crate::command::ThoughtsDisplayMode::Full,
             false,
+            crate::command::ToolsDisplayMode::Detailed,
+            false,
+            tool_card::ToolGroupStats::default(),
+            None,
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
         );
         let expanded = render_timeline_item_document(
@@ -2232,6 +2492,10 @@ mod tests {
             false,
             crate::command::ThoughtsDisplayMode::Full,
             false,
+            crate::command::ToolsDisplayMode::Detailed,
+            false,
+            tool_card::ToolGroupStats::default(),
+            None,
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
         );
         let collapsed_text = collapsed
@@ -2272,6 +2536,10 @@ mod tests {
             false,
             crate::command::ThoughtsDisplayMode::Full,
             false,
+            crate::command::ToolsDisplayMode::Detailed,
+            false,
+            tool_card::ToolGroupStats::default(),
+            None,
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
         );
         assert!(narrow.validate());
@@ -2360,6 +2628,10 @@ mod tests {
                         false,
                         crate::command::ThoughtsDisplayMode::Full,
                         false,
+                        crate::command::ToolsDisplayMode::Detailed,
+                        false,
+                        tool_card::ToolGroupStats::default(),
+                        None,
                         &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
                     ),
                 ));
@@ -2392,6 +2664,10 @@ mod tests {
                 false,
                 crate::command::ThoughtsDisplayMode::Full,
                 false,
+                crate::command::ToolsDisplayMode::Detailed,
+                false,
+                tool_card::ToolGroupStats::default(),
+                None,
                 &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
             ));
         assert!(
@@ -2560,7 +2836,7 @@ mod tests {
 
     #[test]
     fn compact_reasoning_cache_refreshes_when_adjacent_item_is_added() {
-        let start = std::time::Instant::now();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(2);
         let mut state = TuiState::default();
         state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Compact);
         state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
@@ -2598,6 +2874,263 @@ mod tests {
 
         assert!(!after.contains("First title"), "{after}");
         assert!(after.contains("Second title"), "{after}");
+    }
+
+    #[test]
+    fn compact_reasoning_accumulates_adjacent_thinking_durations() {
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        let mut state = TuiState::default();
+        state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Compact);
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-1",
+            "First title",
+            start,
+        )));
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-1",
+            "First title",
+            start + std::time::Duration::from_millis(600),
+        )));
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-2",
+            "Second title",
+            start + std::time::Duration::from_millis(700),
+        )));
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-2",
+            "Second title",
+            start + std::time::Duration::from_millis(1_300),
+        )));
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Thought · 1s"), "{rendered}");
+        assert!(!rendered.contains("First title"), "{rendered}");
+        assert!(rendered.contains("Second title"), "{rendered}");
+    }
+
+    #[test]
+    fn compact_reasoning_title_replaces_from_left_to_right() {
+        let start = std::time::Instant::now();
+        let reasoning = ReasoningView {
+            item_id: "reasoning-2".into(),
+            text: "New result".into(),
+            streaming: true,
+            started_at: Some(start),
+            duration_ms: None,
+            transition_from: Some("Old phase".into()),
+            transition_started_at: Some(start),
+        };
+
+        assert_eq!(
+            animated_compact_reasoning_title_at(&reasoning, "New result", 40, start),
+            "Old phase"
+        );
+        let middle = animated_compact_reasoning_title_at(
+            &reasoning,
+            "New result",
+            40,
+            start + std::time::Duration::from_millis(66),
+        );
+        assert!(middle.starts_with("New"), "{middle}");
+        assert_ne!(middle, "New result");
+        assert_eq!(
+            animated_compact_reasoning_title_at(
+                &reasoning,
+                "New result",
+                40,
+                start + std::time::Duration::from_millis(198),
+            ),
+            "New result"
+        );
+    }
+
+    #[test]
+    fn compact_tools_replace_contiguous_calls_with_one_counted_line() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
+        let mut first = ToolStartedEvent::new("call-1", "fs__read", "read first");
+        first.arguments = Some(json!({"path": "first.rs"}).to_string());
+        state.apply_event(SessionEvent::ToolStarted(first));
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-1".into(),
+            name: "fs__read".into(),
+            summary: "read first".into(),
+            outcome: ToolOutcome::Failure,
+            output: None,
+        }));
+        let mut second = ToolStartedEvent::new("call-2", "fs__read", "read second");
+        second.arguments = Some(json!({"path": "second.rs"}).to_string());
+        state.apply_event(SessionEvent::ToolStarted(second));
+
+        let compact = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let tool_rows = compact
+            .iter()
+            .filter(|line| line.contains("tools · 2"))
+            .collect::<Vec<_>>();
+        assert_eq!(tool_rows.len(), 1, "{compact:?}");
+        assert!(tool_rows[0].contains("1 failed"), "{compact:?}");
+        assert!(tool_rows[0].contains("second.rs"), "{compact:?}");
+        assert!(!compact.iter().any(|line| line.contains("first.rs")));
+
+        state.set_tools_display(crate::command::ToolsDisplayMode::Detailed);
+        let detailed = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detailed.contains("first.rs"), "{detailed}");
+        assert!(detailed.contains("second.rs"), "{detailed}");
+    }
+
+    #[test]
+    fn compact_tool_cache_refreshes_when_an_earlier_call_finishes() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent::new(
+            "call-1",
+            "fs__read",
+            "read first",
+        )));
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent::new(
+            "call-2",
+            "fs__read",
+            "read second",
+        )));
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-2".into(),
+            name: "fs__read".into(),
+            summary: "read second".into(),
+            outcome: ToolOutcome::Success,
+            output: None,
+        }));
+
+        cached_transcript_row_count_with_reflow(&mut state, Theme::dark(), 80);
+        let before = cached_item_lines(&mut state, 1, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!before.contains("failed"), "{before}");
+
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-1".into(),
+            name: "fs__read".into(),
+            summary: "read first".into(),
+            outcome: ToolOutcome::Failure,
+            output: None,
+        }));
+        cached_transcript_row_count_with_reflow(&mut state, Theme::dark(), 80);
+        let after = cached_item_lines(&mut state, 1, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(after.contains("1 failed"), "{after}");
+    }
+
+    #[test]
+    fn compact_tools_keep_background_subagents_active_until_completion() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent::new(
+            "call-1",
+            "agent__explore",
+            "inspect repository",
+        )));
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-1".into(),
+            name: "agent__explore".into(),
+            summary: "background run started".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "data": {
+                        "run_id": "run-1",
+                        "child_session_id": "child-1",
+                        "agent_name": "explorer",
+                        "background": true,
+                        "active": true
+                    }
+                })
+                .to_string(),
+            ),
+        }));
+
+        cached_transcript_row_count_with_reflow(&mut state, Theme::dark(), 80);
+        let active = cached_item_lines(&mut state, 0, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(active.contains('⠋'), "{active}");
+
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-1".into(),
+            name: "agent__explore".into(),
+            summary: "background run completed".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "data": {
+                        "run_id": "run-1",
+                        "child_session_id": "child-1",
+                        "agent_name": "explorer",
+                        "background": true,
+                        "active": false
+                    }
+                })
+                .to_string(),
+            ),
+        }));
+        cached_transcript_row_count_with_reflow(&mut state, Theme::dark(), 80);
+        let completed = cached_item_lines(&mut state, 0, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(completed.contains('→'), "{completed}");
+    }
+
+    #[test]
+    fn compact_tools_treat_cancelled_subagent_as_terminal_despite_stale_active_output() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent::new(
+            "call-1",
+            "agent__explore",
+            "inspect repository",
+        )));
+        assert!(state.timeline.update_active_subagent_tool_live_summary(
+            "child-1",
+            Some("explorer"),
+            Some("call-1"),
+            "running",
+            "background run started",
+        ));
+        state.apply_event(SessionEvent::ToolCancelled(ToolCancelledEvent::new(
+            "call-1",
+            "agent__explore",
+        )));
+
+        cached_transcript_row_count_with_reflow(&mut state, Theme::dark(), 80);
+        let cancelled = cached_item_lines(&mut state, 0, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cancelled.contains('→'), "{cancelled}");
+        assert!(cancelled.contains("1 cancelled"), "{cancelled}");
     }
 
     #[test]
@@ -2663,7 +3196,7 @@ mod tests {
 
     #[test]
     fn consecutive_reasoning_titles_are_separated_outside_compact_mode() {
-        let start = std::time::Instant::now();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let mut state = TuiState::default();
         for (index, title) in ["First thought", "Second thought", "Third thought"]
             .into_iter()

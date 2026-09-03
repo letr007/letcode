@@ -1645,11 +1645,11 @@ mod tests {
             1,
             1,
         );
-        state.set_input("/tool-output".to_string());
+        state.set_input("/tools".to_string());
 
         let rendered = draw_to_string(&mut state, 100, 8);
 
-        assert!(rendered.contains("/tool-output"), "{rendered}");
+        assert!(rendered.contains("/tools"), "{rendered}");
         assert!(!rendered.contains("Read-only child view"), "{rendered}");
     }
 

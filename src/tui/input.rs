@@ -875,6 +875,7 @@ mod tests {
             (DialogKind::PermissionPicker, false),
             (DialogKind::ReasoningPicker, false),
             (DialogKind::ThoughtsPicker, false),
+            (DialogKind::ToolsPicker, false),
             (DialogKind::ThemePicker, false),
             (DialogKind::FakePicker, false),
             (DialogKind::LanguagePicker, false),

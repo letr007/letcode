@@ -11,7 +11,7 @@ use super::transcript_render::Interaction;
 #[cfg(test)]
 use crate::agent::ConversationMessage;
 use crate::agent::{AutoContinueState, CacheUsageReport};
-use crate::command::ThoughtsDisplayMode;
+use crate::command::{ThoughtsDisplayMode, ToolsDisplayMode};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
     ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
@@ -194,45 +194,61 @@ pub struct RetryNoticeState {
     pub max_attempts: usize,
     pub delay_secs: u64,
     pub error: String,
-    pub secs_remaining: u64,
-    ticks_in_current_second: u8,
+    started_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryToastScope {
+    Parent,
+    Child {
+        session_id: String,
+        agent_name: Option<String>,
+    },
 }
 
 impl RetryNoticeState {
-    /// Matches `TUI_FRAME_POLL_INTERVAL` (~33ms): about one displayed second.
-    pub const TICKS_PER_SECOND: u8 = 30;
-
     pub fn from_lifecycle(event: crate::session::RetryLifecycleEvent) -> Self {
+        Self::from_lifecycle_at(event, std::time::Instant::now())
+    }
+
+    fn from_lifecycle_at(
+        event: crate::session::RetryLifecycleEvent,
+        started_at: std::time::Instant,
+    ) -> Self {
         Self {
             attempt: event.attempt,
             max_attempts: event.max_attempts,
             delay_secs: event.delay_secs,
             error: event.error,
-            secs_remaining: event.delay_secs,
-            ticks_in_current_second: 0,
+            started_at,
         }
+    }
+
+    fn secs_remaining_at(&self, now: std::time::Instant) -> u64 {
+        self.delay_secs
+            .saturating_sub(now.saturating_duration_since(self.started_at).as_secs())
     }
 
     pub fn toast_message(&self) -> String {
+        self.toast_message_at(std::time::Instant::now())
+    }
+
+    fn toast_message_at(&self, now: std::time::Instant) -> String {
         format!(
             "Retrying in {}s · attempt {} of {}",
-            self.secs_remaining, self.attempt, self.max_attempts
+            self.secs_remaining_at(now),
+            self.attempt,
+            self.max_attempts
         )
     }
 
-    fn tick_frame(&mut self) {
-        self.ticks_in_current_second = self.ticks_in_current_second.saturating_add(1);
-        if self.ticks_in_current_second < Self::TICKS_PER_SECOND {
-            return;
-        }
-        self.ticks_in_current_second = 0;
-        self.secs_remaining = self.secs_remaining.saturating_sub(1);
+    fn sticky_toast(&self) -> ToastState {
+        self.sticky_toast_at(std::time::Instant::now())
     }
 
-    fn sticky_toast(&self) -> ToastState {
-        // ticks are ignored while retry is active; Tick refreshes this toast.
+    fn sticky_toast_at(&self, now: std::time::Instant) -> ToastState {
         ToastState::new(
-            self.toast_message(),
+            self.toast_message_at(now),
             ToastKind::Error,
             ToastState::DEFAULT_TICKS,
         )
@@ -296,6 +312,7 @@ pub enum DialogKind {
     PermissionPicker,
     ReasoningPicker,
     ThoughtsPicker,
+    ToolsPicker,
     ThemePicker,
     FakePicker,
     LanguagePicker,
@@ -1163,6 +1180,7 @@ pub struct TuiState {
     pub compaction_animation_start_frame: usize,
     pub reasoning_effort_label: Option<String>,
     pub thoughts_display: ThoughtsDisplayMode,
+    pub tools_display: ToolsDisplayMode,
     pub permission_mode_label: String,
     pub pending_composer_settings: PendingComposerSettings,
     pub session_id: Option<String>,
@@ -1172,6 +1190,7 @@ pub struct TuiState {
     pub latest_auto_continue: AutoContinueState,
     pub latest_todo: Option<TodoView>,
     pub retry: Option<RetryNoticeState>,
+    retry_toast_scope: Option<RetryToastScope>,
     pub transcript_view: TranscriptViewState,
     pub transcript_scroll: usize,
     pub auto_scroll: bool,
@@ -1258,6 +1277,7 @@ impl Default for TuiState {
             compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
             thoughts_display: ThoughtsDisplayMode::default(),
+            tools_display: ToolsDisplayMode::default(),
             permission_mode_label: "default".into(),
             pending_composer_settings: PendingComposerSettings::default(),
             session_id: None,
@@ -1267,6 +1287,7 @@ impl Default for TuiState {
             latest_auto_continue: AutoContinueState::default(),
             latest_todo: None,
             retry: None,
+            retry_toast_scope: None,
             transcript_view: TranscriptViewState::Parent,
             transcript_scroll: 0,
             auto_scroll: true,
@@ -1390,6 +1411,14 @@ impl TuiState {
     pub fn set_thoughts_display(&mut self, mode: ThoughtsDisplayMode) {
         if self.thoughts_display != mode {
             self.thoughts_display = mode;
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+        }
+    }
+
+    pub fn set_tools_display(&mut self, mode: ToolsDisplayMode) {
+        if self.tools_display != mode {
+            self.tools_display = mode;
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }
@@ -2388,7 +2417,6 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.child_timeline = Some(child_state);
-        self.retry = None;
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
             child_session_id,
@@ -2397,6 +2425,7 @@ impl TuiState {
             total,
             pool_ordinal,
         };
+        self.refresh_retry_toast();
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
@@ -2438,7 +2467,6 @@ impl TuiState {
             self.clear_input();
             self.close_dialog();
             self.reset_slash_panel();
-            self.retry = None;
             self.transcript_view = TranscriptViewState::Child {
                 parent_session_id,
                 child_session_id,
@@ -2447,6 +2475,7 @@ impl TuiState {
                 total,
                 pool_ordinal,
             };
+            self.refresh_retry_toast();
             self.scroll_transcript_to_bottom();
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
@@ -2477,7 +2506,6 @@ impl TuiState {
         self.clear_input();
         self.close_dialog();
         self.reset_slash_panel();
-        self.retry = None;
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id,
             child_session_id,
@@ -2486,6 +2514,7 @@ impl TuiState {
             total,
             pool_ordinal,
         };
+        self.refresh_retry_toast();
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
@@ -2682,6 +2711,9 @@ impl TuiState {
         self.child_timeline_cache.clear();
         self.child_timeline_cache_order.clear();
         self.child_session_summaries.clear();
+        if matches!(self.retry_toast_scope, Some(RetryToastScope::Child { .. })) {
+            self.retry_toast_scope = None;
+        }
     }
 
     pub fn try_restore_parent_timeline_view_with_runtime_context(
@@ -2701,8 +2733,8 @@ impl TuiState {
 
     pub fn restore_parent_timeline_view(&mut self) {
         self.cache_active_child_timeline();
-        self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
+        self.refresh_retry_toast();
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
@@ -2713,6 +2745,7 @@ impl TuiState {
 
     fn reset_after_session_timeline_replace(&mut self) {
         self.retry = None;
+        self.retry_toast_scope = None;
         self.pending_permission = None;
         self.pending_question = None;
         self.active_tool_call_id = None;
@@ -2764,6 +2797,19 @@ impl TuiState {
                 ..
             } if active_child_session_id == child_session_id
         );
+        let retry_scheduled = matches!(&event, SessionEvent::RetryScheduled(_));
+        let retry_started = matches!(&event, SessionEvent::RetryStarted(_));
+        let retry_finished = retry_started
+            || matches!(
+                &event,
+                SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
+            );
+        if retry_scheduled {
+            self.retry_toast_scope = Some(RetryToastScope::Child {
+                session_id: child_session_id.to_string(),
+                agent_name: agent_name.map(str::to_string),
+            });
+        }
 
         match event {
             SessionEvent::Notice(notice) => {
@@ -2785,16 +2831,7 @@ impl TuiState {
                 }
                 return;
             }
-            SessionEvent::RetryScheduled(ref retry) => {
-                let message = format!(
-                    "{} · Retrying in {}s · attempt {} of {}",
-                    retry.error, retry.delay_secs, retry.attempt, retry.max_attempts
-                );
-                self.show_toast(
-                    child_feedback_message(agent_name, child_session_id, &message),
-                    ToastKind::Error,
-                );
-            }
+            SessionEvent::RetryScheduled(_) => {}
             SessionEvent::ProcessIssue(issue) => {
                 self.show_toast(
                     child_feedback_message(agent_name, child_session_id, &issue.message),
@@ -2819,6 +2856,16 @@ impl TuiState {
         if !self.child_event_targets_loaded_child(child_session_id) {
             if let Some(summary) = self.child_session_summaries.get_mut(child_session_id) {
                 update_child_session_summary(summary, &event);
+                if retry_finished
+                    && matches!(
+                        &self.retry_toast_scope,
+                        Some(RetryToastScope::Child { session_id, .. })
+                            if session_id == child_session_id
+                    )
+                {
+                    self.retry_toast_scope = None;
+                    self.toast = None;
+                }
                 return;
             }
             if matches!(
@@ -2831,6 +2878,16 @@ impl TuiState {
                         phase: child_phase_for_event(&event),
                     },
                 );
+                if retry_finished
+                    && matches!(
+                        &self.retry_toast_scope,
+                        Some(RetryToastScope::Child { session_id, .. })
+                            if session_id == child_session_id
+                    )
+                {
+                    self.retry_toast_scope = None;
+                    self.toast = None;
+                }
                 return;
             }
             self.cache_child_timeline(ChildTranscriptState::empty(child_session_id));
@@ -2840,6 +2897,16 @@ impl TuiState {
         if !self.child_event_targets_loaded_child(child_session_id) {
             if let Some(summary) = self.child_session_summaries.get_mut(child_session_id) {
                 update_child_session_summary(summary, &event);
+            }
+            if retry_finished
+                && matches!(
+                    &self.retry_toast_scope,
+                    Some(RetryToastScope::Child { session_id, .. })
+                        if session_id == child_session_id
+                )
+            {
+                self.retry_toast_scope = None;
+                self.toast = None;
             }
             return;
         }
@@ -2872,8 +2939,11 @@ impl TuiState {
             child_toast
         };
 
+        if retry_scheduled || retry_finished {
+            self.refresh_retry_toast();
+        }
         if viewing_child {
-            if child_toast.is_some() {
+            if !retry_scheduled && !retry_started && child_toast.is_some() {
                 self.toast = child_toast;
             }
             self.invalidate_transcript_cache();
@@ -2891,6 +2961,11 @@ impl TuiState {
     }
 
     pub fn apply_event(&mut self, event: SessionEvent) {
+        if matches!(&event, SessionEvent::Tick) {
+            self.tick_frame();
+            return;
+        }
+
         if self.apply_context_event(&event) {
             return;
         }
@@ -2905,6 +2980,13 @@ impl TuiState {
         }
 
         let accepts_tool_events = self.accepts_tool_events();
+        let retry_scheduled = matches!(&event, SessionEvent::RetryScheduled(_));
+        let retry_started = matches!(&event, SessionEvent::RetryStarted(_));
+        let retry_finished = retry_started
+            || matches!(
+                &event,
+                SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
+            );
         apply_projected_session_event(
             EventProjection {
                 active_session: &mut self.active_session,
@@ -2927,6 +3009,149 @@ impl TuiState {
             .with_tool_event_acceptance(accepts_tool_events),
             event,
         );
+        if retry_scheduled {
+            self.retry_toast_scope = Some(RetryToastScope::Parent);
+            self.refresh_retry_toast();
+        } else if retry_finished && matches!(self.retry_toast_scope, Some(RetryToastScope::Parent))
+        {
+            self.retry_toast_scope = None;
+            self.toast = None;
+        }
+    }
+
+    fn tick_frame(&mut self) {
+        self.status_spinner_frame = self.status_spinner_frame.wrapping_add(1);
+        let retry_visible = self.refresh_live_presentations(std::time::Instant::now());
+        if !retry_visible && self.toast.as_mut().is_some_and(ToastState::tick) {
+            self.toast = None;
+        }
+    }
+
+    pub(crate) fn begin_live_presentations(&mut self, now: std::time::Instant) {
+        if self.is_read_only_child_view() {
+            if let Some(child) = self.child_timeline.as_mut() {
+                child.timeline.begin_reasoning_transitions(now);
+            }
+        } else {
+            self.timeline.begin_reasoning_transitions(now);
+        }
+    }
+
+    pub(crate) fn refresh_live_presentations(&mut self, now: std::time::Instant) -> bool {
+        self.timeline.tick_reasoning_elapsed(now);
+        self.timeline.finish_reasoning_transitions(now);
+        if let Some(child) = self.child_timeline.as_mut() {
+            child.timeline.tick_reasoning_elapsed(now);
+            child.timeline.finish_reasoning_transitions(now);
+        }
+        for child in self.child_timeline_cache.values_mut() {
+            child.timeline.tick_reasoning_elapsed(now);
+            child.timeline.finish_reasoning_transitions(now);
+        }
+        self.refresh_retry_toast_at(now)
+    }
+
+    fn refresh_retry_toast(&mut self) -> bool {
+        self.refresh_retry_toast_at(std::time::Instant::now())
+    }
+
+    fn refresh_retry_toast_at(&mut self, now: std::time::Instant) -> bool {
+        let previous_scope = self.retry_toast_scope.clone();
+        let preferred_scope = self.preferred_retry_toast_scope();
+        let Some(scope) = preferred_scope else {
+            if previous_scope.is_some() {
+                self.retry_toast_scope = None;
+                self.toast = None;
+            }
+            return false;
+        };
+        let Some(retry) = self.retry_notice_for_scope(&scope).cloned() else {
+            self.retry_toast_scope = None;
+            if previous_scope.is_some() {
+                self.toast = None;
+            }
+            return false;
+        };
+        self.toast = Some(match &scope {
+            RetryToastScope::Parent => retry.sticky_toast_at(now),
+            RetryToastScope::Child {
+                session_id,
+                agent_name,
+            } => {
+                let message = format!("{} · {}", retry.error, retry.toast_message_at(now));
+                ToastState::new(
+                    child_feedback_message(agent_name.as_deref(), session_id, &message),
+                    ToastKind::Error,
+                    ToastState::DEFAULT_TICKS,
+                )
+            }
+        });
+        self.retry_toast_scope = Some(scope);
+        true
+    }
+
+    fn preferred_retry_toast_scope(&self) -> Option<RetryToastScope> {
+        match &self.transcript_view {
+            TranscriptViewState::Parent if self.retry.is_some() => {
+                return Some(RetryToastScope::Parent);
+            }
+            TranscriptViewState::Child {
+                child_session_id,
+                agent_name,
+                ..
+            } if self.child_retry_notice(child_session_id).is_some() => {
+                return Some(RetryToastScope::Child {
+                    session_id: child_session_id.clone(),
+                    agent_name: Some(agent_name.clone()),
+                });
+            }
+            _ => {}
+        }
+        if let Some(scope) = self.retry_toast_scope.as_ref()
+            && self.retry_notice_for_scope(scope).is_some()
+        {
+            return Some(scope.clone());
+        }
+        if self.retry.is_some() {
+            return Some(RetryToastScope::Parent);
+        }
+        if let Some(child) = self
+            .child_timeline
+            .as_ref()
+            .filter(|child| child.retry.is_some())
+        {
+            return Some(RetryToastScope::Child {
+                session_id: child.session_id.clone(),
+                agent_name: None,
+            });
+        }
+        self.child_timeline_cache
+            .iter()
+            .find(|(_, child)| child.retry.is_some())
+            .map(|(session_id, _)| RetryToastScope::Child {
+                session_id: session_id.clone(),
+                agent_name: None,
+            })
+    }
+
+    fn retry_notice_for_scope(&self, scope: &RetryToastScope) -> Option<&RetryNoticeState> {
+        match scope {
+            RetryToastScope::Parent => self.retry.as_ref(),
+            RetryToastScope::Child { session_id, .. } => self.child_retry_notice(session_id),
+        }
+    }
+
+    fn child_retry_notice(&self, child_session_id: &str) -> Option<&RetryNoticeState> {
+        if let Some(child) = self
+            .child_timeline
+            .as_ref()
+            .filter(|child| child.session_id == child_session_id)
+        {
+            return child.retry.as_ref();
+        }
+        self.child_timeline_cache
+            .get(child_session_id)
+            .and_then(|child| child.retry.as_ref())
     }
 
     fn on_permission_requested(&mut self, request: PermissionRequestEvent) {
@@ -4497,6 +4722,32 @@ mod tests {
                 .map(|retry| (retry.attempt, retry.max_attempts, retry.delay_secs)),
             Some((2, 3, 4))
         );
+        let now = std::time::Instant::now();
+        state
+            .child_timeline_cache
+            .get_mut("background-child")
+            .and_then(|child| child.retry.as_mut())
+            .expect("child retry")
+            .started_at = now - std::time::Duration::from_secs(1);
+        state.refresh_live_presentations(now);
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some(
+                "explorer · background-child: network request failed · Retrying in 3s · attempt 2 of 3"
+            )
+        );
+        state.apply_child_session_event_with_agent(
+            "background-child",
+            Some("explorer"),
+            None,
+            SessionEvent::RetryStarted(RetryLifecycleEvent {
+                attempt: 2,
+                max_attempts: 3,
+                delay_secs: 4,
+                error: "network request failed".into(),
+            }),
+        );
+        assert!(state.toast().is_none());
 
         state.apply_child_session_event_with_agent(
             "background-child-session-with-long-id",
@@ -4517,6 +4768,92 @@ mod tests {
             toast.message
         );
         assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
+    }
+
+    #[test]
+    fn parent_retry_countdown_stays_live_until_retry_starts() {
+        let mut state = TuiState::default();
+        let retry = RetryLifecycleEvent {
+            attempt: 2,
+            max_attempts: 4,
+            delay_secs: 2,
+            error: "provider unavailable".into(),
+        };
+        let now = std::time::Instant::now();
+        state.retry = Some(RetryNoticeState::from_lifecycle_at(retry.clone(), now));
+        state.retry_toast_scope = Some(RetryToastScope::Parent);
+        state.refresh_live_presentations(now);
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Retrying in 2s · attempt 2 of 4")
+        );
+        state.refresh_live_presentations(now + std::time::Duration::from_secs(1));
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Retrying in 1s · attempt 2 of 4")
+        );
+        state.apply_event(SessionEvent::RetryStarted(retry.clone()));
+        assert!(state.toast().is_none());
+
+        state.retry = Some(RetryNoticeState::from_lifecycle_at(retry.clone(), now));
+        state.retry_toast_scope = Some(RetryToastScope::Parent);
+        state.refresh_live_presentations(now);
+        state.apply_event(SessionEvent::Interrupted);
+        assert!(state.toast().is_none());
+
+        state.retry = Some(RetryNoticeState::from_lifecycle_at(retry.clone(), now));
+        state.retry_toast_scope = Some(RetryToastScope::Parent);
+        state.refresh_live_presentations(now);
+        state.apply_event(SessionEvent::Done);
+        assert!(state.toast().is_none());
+
+        state.retry = Some(RetryNoticeState::from_lifecycle_at(retry, now));
+        state.retry_toast_scope = Some(RetryToastScope::Parent);
+        state.refresh_live_presentations(now);
+        state.apply_event(SessionEvent::Error(crate::tui::events::ErrorEvent::new(
+            "failed",
+        )));
+        assert!(state.toast().is_none());
+    }
+
+    #[test]
+    fn child_retry_toast_clears_on_terminal_event() {
+        let mut state = TuiState::default();
+        let retry = RetryLifecycleEvent {
+            attempt: 2,
+            max_attempts: 4,
+            delay_secs: 2,
+            error: "provider unavailable".into(),
+        };
+        state.apply_child_session_event_with_agent(
+            "child-1",
+            Some("explorer"),
+            None,
+            SessionEvent::RetryScheduled(retry.clone()),
+        );
+        assert!(state.toast().is_some());
+        state.apply_child_session_event_with_agent(
+            "child-1",
+            Some("explorer"),
+            None,
+            SessionEvent::Done,
+        );
+        assert!(state.toast().is_none());
+
+        state.apply_child_session_event_with_agent(
+            "child-2",
+            Some("explorer"),
+            None,
+            SessionEvent::RetryScheduled(retry),
+        );
+        assert!(state.toast().is_some());
+        state.apply_child_session_event_with_agent(
+            "child-2",
+            Some("explorer"),
+            None,
+            SessionEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
+        );
+        assert!(state.toast().is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, FakeCommand, PanelMode, ThemeCommand,
-    ThoughtsDisplayMode, ToolOutputMode, TranscriptScrollbarMode, help_summary, parse_command,
+    ThoughtsDisplayMode, ToolsDisplayMode, TranscriptScrollbarMode, help_summary, parse_command,
 };
 use crate::mcp;
 use crate::permission::PermissionMode;
@@ -2212,6 +2212,9 @@ impl TuiRuntime {
     }
 
     pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
+        let now = std::time::Instant::now();
+        self.state.begin_live_presentations(now);
+        self.state.refresh_live_presentations(now);
         drawer.draw(&mut self.state)
     }
 
@@ -2374,10 +2377,11 @@ impl TuiRuntime {
                 | CommandIntent::ReasoningShow
                 | CommandIntent::ThoughtsShow
                 | CommandIntent::ThoughtsSet(_)
+                | CommandIntent::ToolsShow
+                | CommandIntent::ToolsSet(_)
                 | CommandIntent::ContextBrowse
                 | CommandIntent::McpBrowse
                 | CommandIntent::SkillBrowse
-                | CommandIntent::ToolOutputSet(_)
                 | CommandIntent::TranscriptScrollbarSet(_)
                 | CommandIntent::PanelSet(_)
                 | CommandIntent::Theme(_)
@@ -2596,8 +2600,9 @@ impl TuiRuntime {
             CommandIntent::ReasoningShow => self.show_reasoning_dialog(),
             CommandIntent::ThoughtsShow => self.show_thoughts_dialog(),
             CommandIntent::ThoughtsSet(mode) => self.handle_thoughts_command(mode),
+            CommandIntent::ToolsShow => self.show_tools_dialog(),
+            CommandIntent::ToolsSet(mode) => self.handle_tools_command(mode),
             CommandIntent::PermissionShow => self.show_permission_dialog(),
-            CommandIntent::ToolOutputSet(mode) => self.handle_tool_output_command(mode),
             CommandIntent::Theme(command) => Ok(Some(self.handle_theme_command(command))),
             CommandIntent::Fake(command) => Ok(Some(self.handle_fake_command(command))),
             CommandIntent::TranscriptScrollbarSet(mode) => {
@@ -2765,32 +2770,21 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn handle_tool_output_command(
-        &mut self,
-        mode: ToolOutputMode,
-    ) -> Result<Option<SubmittedCommand>> {
-        let mode = match mode {
-            ToolOutputMode::Toggle => {
-                if self.state.tool_output_expanded {
-                    LocalToolOutputMode::Truncated
-                } else {
-                    LocalToolOutputMode::Expanded
-                }
-            }
-            ToolOutputMode::Expanded => LocalToolOutputMode::Expanded,
-            ToolOutputMode::Truncated => LocalToolOutputMode::Truncated,
-        };
+    fn handle_tools_command(&mut self, mode: ToolsDisplayMode) -> Result<Option<SubmittedCommand>> {
+        self.apply_tools_display(mode);
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
 
-        self.state.set_tool_output_expanded(mode.expanded());
+    fn apply_tools_display(&mut self, mode: ToolsDisplayMode) {
+        self.state.set_tools_display(mode);
         let prefs = self.tui_preferences();
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
-            tracing::warn!(%error, "failed to save tool output preference");
+            tracing::warn!(%error, "failed to save tools display preference");
             self.state.show_toast(
                 self.state.t("runtime.preference_not_saved"),
                 ToastKind::Info,
             );
         }
-        Ok(Some(SubmittedCommand::LocalOnly))
     }
 
     fn handle_panel_command(&mut self, mode: PanelMode) -> SubmittedCommand {
@@ -2842,6 +2836,7 @@ impl TuiRuntime {
             sidebar_forced_open: self.state.sidebar_forced_open,
             theme: self.state.theme_id.clone(),
             thoughts_display: self.state.thoughts_display,
+            tools_display: self.state.tools_display,
             language: self
                 .state
                 .language
@@ -3366,6 +3361,32 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn show_tools_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let mut dialog = DialogState::new(
+            DialogKind::ToolsPicker,
+            self.state.t("runtime.tools_display_title"),
+            Some(self.state.t("runtime.tools_display_description")),
+            vec![
+                DialogItem::new(
+                    ToolsDisplayMode::Compact.as_str(),
+                    "Level 1 · Compact",
+                    Some("One updating line with the total tool-call count".into()),
+                ),
+                DialogItem::new(
+                    ToolsDisplayMode::Detailed.as_str(),
+                    "Level 2 · Detailed",
+                    Some("Show each tool call and its details".into()),
+                ),
+            ],
+        );
+        dialog.selected = match self.state.tools_display {
+            ToolsDisplayMode::Compact => 0,
+            ToolsDisplayMode::Detailed => 1,
+        };
+        self.state.open_dialog(dialog);
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
     fn show_reasoning_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let efforts = self.active_reasoning_efforts();
         if efforts.is_empty() {
@@ -3639,6 +3660,13 @@ impl TuiRuntime {
                 let mode = ThoughtsDisplayMode::parse(&selected.id)
                     .expect("thinking display picker items should use valid ids");
                 self.apply_thoughts_display(mode);
+                Ok(None)
+            }
+            DialogKind::ToolsPicker => {
+                self.state.close_dialog();
+                let mode = ToolsDisplayMode::parse(&selected.id)
+                    .expect("tools display picker items should use valid ids");
+                self.apply_tools_display(mode);
                 Ok(None)
             }
             DialogKind::ThemePicker => {
@@ -4193,23 +4221,12 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/children"
             | "/parent"
             | "/thoughts"
+            | "/tools"
             | "/tool-output"
             | "/scrollbar"
             | "/theme"
             | "/context"
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalToolOutputMode {
-    Expanded,
-    Truncated,
-}
-
-impl LocalToolOutputMode {
-    fn expanded(self) -> bool {
-        matches!(self, Self::Expanded)
-    }
 }
 
 #[cfg(test)]
@@ -4549,6 +4566,7 @@ pub async fn run_tui(
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
     state.set_sidebar_preference(preferences.sidebar_hidden, preferences.sidebar_forced_open);
     state.set_thoughts_display(preferences.thoughts_display);
+    state.set_tools_display(preferences.tools_display);
     apply_preferences_theme(&mut state, &preferences_dir, &preferences.theme);
     state.set_fake_client(preferences.fake_client);
     state.fake_installation_id = preferences.fake_installation_id;

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::command::{ThemeName, ThoughtsDisplayMode};
+use crate::command::{ThemeName, ThoughtsDisplayMode, ToolsDisplayMode};
 use crate::tui::i18n::Language;
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
@@ -27,6 +27,8 @@ pub struct TuiPreferences {
     #[serde(default)]
     pub thoughts_display: ThoughtsDisplayMode,
     #[serde(default)]
+    pub tools_display: ToolsDisplayMode,
+    #[serde(default)]
     pub language: Option<String>,
     #[serde(default)]
     pub fake_client: Option<crate::fake::FakeClient>,
@@ -43,6 +45,7 @@ impl Default for TuiPreferences {
             sidebar_forced_open: false,
             theme: default_theme_id(),
             thoughts_display: ThoughtsDisplayMode::default(),
+            tools_display: ToolsDisplayMode::default(),
             language: None,
             fake_client: None,
             fake_installation_id: None,
@@ -136,6 +139,7 @@ mod tests {
             sidebar_forced_open: false,
             theme: "forest".into(),
             thoughts_display: ThoughtsDisplayMode::Titles,
+            tools_display: ToolsDisplayMode::Compact,
             language: Some("zh-CN".into()),
             fake_client: Some(crate::fake::FakeClient::Codex),
             fake_installation_id: Some("fake-installation".into()),
@@ -180,6 +184,7 @@ mod tests {
         )
         .expect("legacy preferences deserialize");
         assert_eq!(loaded.thoughts_display, ThoughtsDisplayMode::Full);
+        assert_eq!(loaded.tools_display, ToolsDisplayMode::Detailed);
     }
 
     #[test]
@@ -202,6 +207,7 @@ mod tests {
             sidebar_forced_open: true,
             theme: "sunset".into(),
             thoughts_display: ThoughtsDisplayMode::Compact,
+            tools_display: ToolsDisplayMode::Detailed,
             language: None,
             fake_client: None,
             fake_installation_id: None,

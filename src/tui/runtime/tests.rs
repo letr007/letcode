@@ -33,8 +33,8 @@ use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_em
 use crate::tui::state::MAX_CACHED_CHILD_TIMELINES;
 use crate::tui::{
     AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, SessionEvent, TimelineItem, ToolFinishedEvent, ToolOutcome,
-    ToolStartedEvent, UserMessageEvent,
+    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, SessionEvent, TimelineItem,
+    ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
@@ -200,12 +200,81 @@ fn runtime() -> TuiRuntime {
     runtime_with_experts(Vec::new())
 }
 
+struct ReasoningTransitionProbe {
+    started_at: Option<std::time::Instant>,
+}
+
+impl RuntimeDrawer for ReasoningTransitionProbe {
+    fn draw(&mut self, state: &mut TuiState) -> std::io::Result<()> {
+        self.started_at = state.active_timeline().items().last().and_then(|item| {
+            let TimelineItem::Reasoning(reasoning) = item else {
+                return None;
+            };
+            reasoning.transition_started_at
+        });
+        Ok(())
+    }
+}
+
 fn render_runtime_transcript(runtime: &mut TuiRuntime) {
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).expect("create test terminal");
     terminal
         .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
         .expect("render transcript");
+}
+
+#[test]
+fn draw_starts_reasoning_transition_at_first_presentation() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_thoughts_display(ThoughtsDisplayMode::Compact);
+    let observed_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    runtime
+        .state_mut()
+        .apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-1",
+            "First",
+            observed_at,
+        )));
+    runtime
+        .state_mut()
+        .apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-1",
+            "First",
+            observed_at + std::time::Duration::from_millis(10),
+        )));
+    runtime
+        .state_mut()
+        .apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-2",
+            "Second",
+            observed_at + std::time::Duration::from_millis(20),
+        )));
+    runtime
+        .state_mut()
+        .apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-2",
+            "Second",
+            observed_at + std::time::Duration::from_millis(30),
+        )));
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Reasoning(reasoning))
+            if reasoning.transition_from.as_deref() == Some("First")
+                && reasoning.transition_started_at.is_none()
+    ));
+
+    let before_draw = std::time::Instant::now();
+    let mut drawer = ReasoningTransitionProbe { started_at: None };
+    runtime.draw(&mut drawer).expect("draw runtime");
+    let after_draw = std::time::Instant::now();
+    assert!(
+        drawer
+            .started_at
+            .is_some_and(|started_at| started_at >= before_draw && started_at <= after_draw)
+    );
 }
 
 #[test]
@@ -1200,6 +1269,39 @@ fn thoughts_command_opens_picker_and_persists_selected_mode() {
     assert_eq!(
         TuiPreferences::load_from_dir(&runtime.preferences_dir).thoughts_display,
         ThoughtsDisplayMode::Titles
+    );
+}
+
+#[test]
+fn tools_command_opens_picker_and_persists_selected_mode() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("/tools");
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("tools picker opens"),
+        None
+    );
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if dialog.kind == DialogKind::ToolsPicker
+                && dialog.selected_item().map(|item| item.id.as_str()) == Some("detailed")
+    ));
+
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("select compact");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("accept tools display");
+
+    assert_eq!(runtime.state().tools_display, ToolsDisplayMode::Compact);
+    assert!(!runtime.state().dialog_is_open());
+    assert_eq!(
+        TuiPreferences::load_from_dir(&runtime.preferences_dir).tools_display,
+        ToolsDisplayMode::Compact
     );
 }
 
