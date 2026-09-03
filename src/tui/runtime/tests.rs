@@ -7735,6 +7735,157 @@ fn assistant_typewriter_tracks_delta_arrival_rate() {
 }
 
 #[test]
+fn child_view_navigation_preserves_complete_structured_result() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    let result = serde_json::json!({
+        "status": "completed",
+        "summary": "Structured result survives parent and child view navigation",
+        "findings": [
+            "The already streamed result remains visible",
+            "Later delta content is appended to the same result"
+        ],
+        "files_read": ["src/tui/runtime.rs"],
+        "files_changed": [],
+        "commands_run": [],
+        "validation": ["view navigation completed immediately"],
+        "blockers": [],
+        "next_steps": []
+    })
+    .to_string();
+    let split_at = result.find("\"validation\"").expect("validation field");
+    let (initial, later) = result.split_at(split_at);
+
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: Some("parent-tool".into()),
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(initial)),
+    });
+    runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
+    runtime
+        .handle_input_action(InputAction::ChildParent)
+        .expect("parent navigation is accepted")
+        .expect("parent navigation command");
+    assert!(!runtime.state().transcript_view.is_child());
+
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: Some("parent-tool".into()),
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(later)),
+    });
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    assert!(runtime.state().transcript_view.is_child());
+    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.deferred_session_events.is_empty());
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message))
+            if message.text == result
+                && crate::subagent::try_parse_structured_subagent_result(&message.text).is_some()
+    ));
+    let rendered =
+        crate::tui::components::transcript::transcript_lines(runtime.state(), Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+    assert!(
+        rendered.contains("Structured result survives parent and child view navigation"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains('…'), "{rendered}");
+}
+
+#[test]
+fn deferred_child_view_navigation_completes_with_ordered_structured_result() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime
+        .handle_input_action(InputAction::ChildParent)
+        .expect("parent navigation is accepted")
+        .expect("parent navigation command");
+
+    let result = serde_json::json!({
+        "status": "completed",
+        "summary": "Deferred view projection keeps the complete result",
+        "findings": ["AssistantDone remains ordered before the child snapshot"],
+        "files_read": [],
+        "files_changed": [],
+        "commands_run": [],
+        "validation": [],
+        "blockers": [],
+        "next_steps": []
+    })
+    .to_string();
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: Some("parent-tool".into()),
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(result.clone())),
+    });
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: Some("parent-tool".into()),
+        event: SessionEvent::AssistantDone { message_id: None },
+    });
+    runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    assert!(!runtime.state().transcript_view.is_child());
+    assert_eq!(runtime.deferred_session_events.len(), 2);
+    runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
+
+    assert!(runtime.state().transcript_view.is_child());
+    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.deferred_session_events.is_empty());
+    assert!(matches!(
+        runtime.state().active_timeline().items().last(),
+        Some(TimelineItem::Assistant(message))
+            if message.text == result && !message.streaming
+    ));
+}
+
+#[test]
 fn child_delta_flush_before_parent_view_preserves_child_projection() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut runtime = TuiRuntime::new(
@@ -7776,7 +7927,7 @@ fn child_delta_flush_before_parent_view_preserves_child_projection() {
     })
     .expect("queue parent view");
     runtime.try_drain_session_events();
-    runtime.flush_assistant_typewriter();
+    assert!(!runtime.state().transcript_view.is_child());
 
     tx.send(SessionTransportEvent::ChildSessionViewed {
         parent_session_id: "parent-session".into(),

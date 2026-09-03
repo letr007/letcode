@@ -519,6 +519,14 @@ fn enqueue_merged_event(queue: &mut VecDeque<SessionTransportEvent>, event: Sess
     queue.push_back(event);
 }
 
+fn is_transcript_view_projection(event: &SessionTransportEvent) -> bool {
+    matches!(
+        event,
+        SessionTransportEvent::ChildSessionViewed { .. }
+            | SessionTransportEvent::ParentSessionViewed { .. }
+    )
+}
+
 fn try_merge_adjacent_transport_events(
     previous: &mut SessionTransportEvent,
     next: &SessionTransportEvent,
@@ -762,6 +770,18 @@ impl TuiRuntime {
     }
 
     fn consume_observed_session_transport_event(&mut self, event: SessionTransportEvent) {
+        // View projections change which timeline owns subsequent paint work, so
+        // commit any paced text before applying the navigation snapshot.
+        if is_transcript_view_projection(&event) {
+            if self.deferred_session_events.is_empty() {
+                self.flush_assistant_typewriter();
+                self.apply_session_transport_event(event);
+            } else {
+                self.enqueue_deferred_session_event(event);
+            }
+            return;
+        }
+
         if !self.deferred_session_events.is_empty() {
             self.enqueue_deferred_session_event(event);
             return;
@@ -815,9 +835,17 @@ impl TuiRuntime {
         budget: &mut SessionEventBudget,
     ) {
         let catch_up = !self.deferred_session_events.is_empty();
+        let view_projection_pending = self
+            .deferred_session_events
+            .iter()
+            .any(is_transcript_view_projection);
         if self.assistant_typewriter.is_some() && budget.can_process() {
             let event = self.assistant_typewriter.as_mut().and_then(|typewriter| {
-                let delta = typewriter.take_frame(now, catch_up);
+                let delta = if view_projection_pending {
+                    std::mem::take(&mut typewriter.pending)
+                } else {
+                    typewriter.take_frame(now, catch_up)
+                };
                 (!delta.is_empty()).then(|| {
                     assistant_delta_event(&typewriter.stream, &typewriter.agent_name, delta)
                 })
