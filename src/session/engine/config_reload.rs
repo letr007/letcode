@@ -190,6 +190,7 @@ pub(crate) fn apply_config_reload(
                 .insert(previous_active_route.model.clone(), model);
         }
     }
+    let primary_session_providers = session_providers.clone();
     for route in expert_model_routes.values() {
         if config.resolve_route(route).is_ok() {
             continue;
@@ -222,7 +223,7 @@ pub(crate) fn apply_config_reload(
         }
     }
     let primary_factory = ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
-        session_providers.clone(),
+        primary_session_providers,
         config.global.retry.clone(),
         config.runtime_catalog.clone(),
     );
