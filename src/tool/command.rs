@@ -2,7 +2,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::io::Write;
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -38,7 +40,7 @@ impl ToolHandler for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a shell command in the current workspace when specialized tools are not a better fit (prefer fs__/search__/git__/edit tools for file and repo work). Commands run with cmd.exe on Windows and /bin/sh elsewhere. Avoid high-impact irreversible commands without clear scope; keep compound commands from chaining steps that need separate confirmation; ensure loops/listeners have exit/timeout limits. Authorization is handled by the tool-level permission policy."
+        "Run a shell command in the current workspace when specialized tools are not a better fit (prefer fs__/search__/git__/edit tools for file and repo work). On Windows, commands prefer PowerShell 7 (pwsh.exe), then Windows PowerShell (powershell.exe), and fall back to cmd.exe; other platforms use /bin/sh. Avoid high-impact irreversible commands without clear scope; keep compound commands from chaining steps that need separate confirmation; ensure loops/listeners have exit/timeout limits. Authorization is handled by the tool-level permission policy."
     }
 
     fn parameters(&self) -> Value {
@@ -47,7 +49,7 @@ impl ToolHandler for RunCommandTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Shell command to run. Uses cmd.exe on Windows and /bin/sh elsewhere, e.g. cargo check"
+                    "description": "Shell command to run. On Windows prefers pwsh.exe, then powershell.exe, then cmd.exe; uses /bin/sh elsewhere, e.g. cargo check"
                 },
                 "timeout_secs": {
                     "type": ["integer", "null"],
@@ -177,17 +179,8 @@ pub(super) async fn run_workspace_command(
 
 async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result<Value> {
     let root = workspace_root()?;
-    let (shell, shell_flag) = shell_invocation();
+    let (shell, mut child) = spawn_workspace_shell(command, &root)?;
     debug!(command = %command, shell = %shell, "running workspace shell command");
-
-    let mut shell_command = Command::new(shell);
-    configure_shell_command(&mut shell_command, shell_flag, command);
-    shell_command
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(shell_command)?;
     let stdout = child
         .take_stdout()
         .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
@@ -239,18 +232,9 @@ async fn run_workspace_shell_command_streaming(
     emit: ToolOutputEmitter<'_>,
 ) -> Result<Value> {
     let root = workspace_root()?;
-    let (shell, shell_flag) = shell_invocation();
-    debug!(command = %command, shell = %shell, "running streaming workspace shell command");
-
-    let mut shell_command = Command::new(shell);
-    configure_shell_command(&mut shell_command, shell_flag, command);
-    shell_command
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(shell_command)
+    let (shell, mut child) = spawn_workspace_shell(command, &root)
         .with_context(|| format!("failed to spawn shell command: {command}"))?;
+    debug!(command = %command, shell = %shell, "running streaming workspace shell command");
     let stdout = child
         .take_stdout()
         .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
@@ -497,15 +481,137 @@ fn open_stream_artifact(ext: &str) -> Result<(std::fs::File, String)> {
     Ok((file, path.to_string_lossy().to_string()))
 }
 
-fn configure_shell_command(command: &mut Command, shell_flag: &str, script: &str) {
+#[derive(Debug, Clone, Copy)]
+struct ShellInvocation {
+    executable: &'static str,
+    args: &'static [&'static str],
+}
+
+#[cfg(windows)]
+const SHELL_INVOCATIONS: &[ShellInvocation] = &[
+    ShellInvocation {
+        executable: "pwsh.exe",
+        args: &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+    },
+    ShellInvocation {
+        executable: "powershell.exe",
+        args: &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+    },
+    ShellInvocation {
+        executable: "cmd.exe",
+        args: &["/D", "/S", "/C"],
+    },
+];
+
+#[cfg(not(windows))]
+const SHELL_INVOCATIONS: &[ShellInvocation] = &[ShellInvocation {
+    executable: "/bin/sh",
+    args: &["-c"],
+}];
+
+const UNCACHED_SHELL_INDEX: usize = usize::MAX;
+static CACHED_SHELL_INDEX: AtomicUsize = AtomicUsize::new(UNCACHED_SHELL_INDEX);
+
+fn spawn_workspace_shell(script: &str, root: &Path) -> Result<(&'static str, ManagedChild)> {
+    let mut missing = Vec::new();
+    let cached_index = cached_shell_index();
+
+    if let Some(index) = cached_index {
+        let invocation = &SHELL_INVOCATIONS[index];
+        match spawn_shell_candidate(invocation, script, root) {
+            Ok(child) => return Ok((invocation.executable, child)),
+            Err(error) if executable_not_found(&error) => {
+                invalidate_cached_shell(index);
+                debug!(
+                    shell = invocation.executable,
+                    %error,
+                    "cached shell executable unavailable; probing fallbacks"
+                );
+                missing.push(invocation.executable);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to spawn shell '{}'", invocation.executable));
+            }
+        }
+    }
+
+    for (index, invocation) in SHELL_INVOCATIONS.iter().enumerate() {
+        if cached_index == Some(index) {
+            continue;
+        }
+        match spawn_shell_candidate(invocation, script, root) {
+            Ok(child) => {
+                CACHED_SHELL_INDEX.store(index, Ordering::Release);
+                return Ok((invocation.executable, child));
+            }
+            Err(error) if executable_not_found(&error) => {
+                debug!(
+                    shell = invocation.executable,
+                    %error,
+                    "shell executable unavailable; trying fallback"
+                );
+                missing.push(invocation.executable);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to spawn shell '{}'", invocation.executable));
+            }
+        }
+    }
+    Err(anyhow!(
+        "no supported shell executable found (tried: {})",
+        missing.join(", ")
+    ))
+}
+
+fn cached_shell_index() -> Option<usize> {
+    let index = CACHED_SHELL_INDEX.load(Ordering::Acquire);
+    (index < SHELL_INVOCATIONS.len()).then_some(index)
+}
+
+fn invalidate_cached_shell(index: usize) {
+    let _ = CACHED_SHELL_INDEX.compare_exchange(
+        index,
+        UNCACHED_SHELL_INDEX,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+fn spawn_shell_candidate(
+    invocation: &ShellInvocation,
+    script: &str,
+    root: &Path,
+) -> Result<ManagedChild> {
+    let mut command = Command::new(invocation.executable);
+    configure_shell_command(&mut command, invocation, script);
+    command
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    ManagedChild::spawn(command)
+}
+
+fn executable_not_found(error: &anyhow::Error) -> bool {
+    let cause: &(dyn std::error::Error + Send + Sync + 'static) = error.as_ref();
+    cause
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn configure_shell_command(command: &mut Command, invocation: &ShellInvocation, script: &str) {
     #[cfg(windows)]
     {
-        let raw = format!("{shell_flag} {}", quote_windows_arg(script));
+        let mut raw = invocation.args.join(" ");
+        raw.push(' ');
+        raw.push_str(&quote_windows_arg(script));
         command.raw_arg(raw);
     }
     #[cfg(not(windows))]
     {
-        command.arg(shell_flag).arg(script);
+        command.args(invocation.args.iter().copied()).arg(script);
     }
 }
 
@@ -533,14 +639,6 @@ fn quote_windows_arg(value: &str) -> String {
     quoted
 }
 
-fn shell_invocation() -> (&'static str, &'static str) {
-    if cfg!(windows) {
-        ("cmd.exe", "/D /S /C")
-    } else {
-        ("/bin/sh", "-c")
-    }
-}
-
 struct TruncatedText {
     text: String,
     truncated: bool,
@@ -564,6 +662,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -619,6 +718,35 @@ mod tests {
             marker.display()
         )
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_shells_prefer_powershell_7_then_fall_back() {
+        let shells = super::SHELL_INVOCATIONS
+            .iter()
+            .map(|invocation| invocation.executable)
+            .collect::<Vec<_>>();
+        assert_eq!(shells, ["pwsh.exe", "powershell.exe", "cmd.exe"]);
+    }
+
+    #[test]
+    fn executable_not_found_only_accepts_direct_spawn_error() {
+        let missing = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing executable",
+        ));
+        assert!(super::executable_not_found(&missing));
+
+        let contextual = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "other missing resource",
+        ))
+        .context("shell setup failed");
+        assert!(!super::executable_not_found(&contextual));
+        assert!(!super::executable_not_found(&anyhow::anyhow!(
+            "other error"
+        )));
+    }
+
     #[test]
     fn command_timeout_uses_default_and_accepts_explicit_value() {
         assert_eq!(super::command_timeout_secs(&json!({})).unwrap(), 300);
