@@ -959,7 +959,6 @@ impl SubagentPool {
                 .as_ref()
                 .and_then(|recorder| recorder.lock().ok())
                 .map(|recorder| recorder.path().to_path_buf())
-                && crate::transcript::repair_partial_tail(&parent_path).is_ok()
                 && let Some(parent_dir) = parent_path.parent()
                 && let Ok(mut recorder) = TranscriptRecorder::open_after_partial_tail_repair(
                     parent_dir,

@@ -51,20 +51,7 @@ impl JournalSink for FailingSink {
 }
 
 fn recorder_with_sink(sink: impl JournalSink + 'static) -> TranscriptRecorder {
-    TranscriptRecorder {
-        session_id: "test-session".into(),
-        path: PathBuf::from("unused.jsonl"),
-        sink: Box::new(sink),
-        sequence: 0,
-        health: RecorderHealth::Healthy,
-        current_context_branch_id: None,
-        context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
-        reasoning_started_at: std::collections::HashMap::new(),
-        active_turn_trackers: std::collections::HashMap::from([(
-            ROOT_CONTEXT_BRANCH_ID.to_string(),
-            super::recorder::ActiveTurnTracker::default(),
-        )]),
-    }
+    TranscriptRecorder::with_sink_for_test(Box::new(sink))
 }
 
 fn journal_test_dir(name: &str) -> PathBuf {
@@ -235,9 +222,12 @@ fn partial_tail_repair_open_allows_only_the_empty_recovery_frontier() {
     assert_eq!(read_records(&complete_path).unwrap().len(), 2);
 
     let v1_path = base_dir.join("legacy.jsonl");
+    let mut legacy = v1_record(1);
+    legacy.record.session_id = "legacy".into();
+    legacy.event_id = "legacy:1".into();
     fs::write(
         &v1_path,
-        format!("{}\n", serde_json::to_string(&v1_record(1)).unwrap()),
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
     )
     .unwrap();
     let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "legacy")
@@ -300,6 +290,7 @@ fn v1_transcript_is_discoverable_resumable_and_appends_v2() {
     assert!(lines[1].contains("\"schema_version\":2"));
     assert!(lines[1].contains("\"kind\":\"assistant_turn\""));
 
+    drop(recorder);
     let prepared = crate::session::prepare_resume_package(&base_dir, "legacy-session")
         .expect("mixed v1/v2 transcript should prepare resume");
     assert_eq!(prepared.records.len(), 2);
@@ -1028,6 +1019,69 @@ fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancell
 }
 
 #[test]
+fn active_writer_blocks_resume_until_the_recorder_is_dropped() {
+    let base_dir = journal_test_dir("exclusive-writer-lock");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_session_started("model")
+        .expect("record session start");
+    let session_id = recorder.session_id().to_string();
+    let path = recorder.path().to_path_buf();
+    let (records, fingerprint) =
+        read_records_with_fingerprint(&path).expect("read active transcript");
+
+    let error = match TranscriptRecorder::open_existing_with_records_at_fingerprint(
+        &base_dir,
+        &session_id,
+        &records,
+        &fingerprint,
+    ) {
+        Ok(_) => panic!("a second writer must not open an active transcript"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("session transcript is already open for writing")
+    );
+
+    drop(recorder);
+    let mut reopened =
+        TranscriptRecorder::open_existing(&base_dir, &session_id).expect("lock releases on drop");
+    reopened
+        .record_session_title("continued")
+        .expect("append after exclusive owner exits");
+    assert_eq!(
+        read_records(path)
+            .expect("read reopened transcript")
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn poisoned_recorder_releases_writer_lock_for_recovery() {
+    let base_dir = journal_test_dir("poison-releases-writer-lock");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_session_started("model")
+        .expect("record session start");
+    let session_id = recorder.session_id().to_string();
+    recorder.replace_sink_for_test(Box::new(FailingSink {
+        fail: FailPoint::Write,
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+
+    assert!(recorder.record_session_title("fails").is_err());
+    assert_eq!(recorder.health, RecorderHealth::Poisoned);
+    let reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+        .expect("poisoned recorder must release its writer lock");
+    assert_eq!(reopened.sequence, 1);
+}
+
+#[test]
 fn open_existing_with_records_preserves_sequence_and_context_scope() {
     let base_dir = journal_test_dir("open-with-records");
     let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
@@ -1287,6 +1341,7 @@ fn legacy_linear_branch_adoption_scopes_future_records_without_topology_mutation
         .expect("adopt matching branch");
     assert_eq!(reopened.current_context_branch_id(), Some("legacy-child"));
     assert!(reopened.active_context_experiment().is_none());
+    drop(reopened);
     let reconstructed = TranscriptRecorder::open_existing(&base_dir, &session_id)
         .expect("reconstruct legacy state");
     assert_eq!(reconstructed.current_context_branch_id(), None);
@@ -1299,6 +1354,12 @@ fn legacy_linear_branch_adoption_scopes_future_records_without_topology_mutation
             writes_observed: false,
         })
     );
+    drop(reconstructed);
+    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+        .expect("reopen before adopting branch for append");
+    reopened
+        .adopt_legacy_linear_branch("legacy-child")
+        .expect("adopt matching branch for append");
     reopened
         .record_user_message("continued")
         .expect("user append");
@@ -1332,6 +1393,7 @@ fn legacy_linear_branch_adoption_scopes_future_records_without_topology_mutation
             | TranscriptEvent::ContextExperimentReturned { .. }
     )));
 
+    drop(reopened);
     let reopened_again =
         TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen again");
     assert_eq!(
@@ -1670,7 +1732,8 @@ fn context_view_remove_is_append_only_metadata_not_raw_purge() {
         )
         .expect("record remove-from-view metadata");
 
-    let transcript_path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+    let session_id = recorder.session_id().to_string();
+    let transcript_path = base_dir.join(format!("{session_id}.jsonl"));
     let records = read_records(&transcript_path).expect("read records");
 
     assert_eq!(records.len(), 2);
@@ -1698,8 +1761,9 @@ fn context_view_remove_is_append_only_metadata_not_raw_purge() {
         vec![1, 2]
     );
 
-    let mut reopened = TranscriptRecorder::open_existing(&base_dir, recorder.session_id())
-        .expect("reopen recorder");
+    drop(recorder);
+    let mut reopened =
+        TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen recorder");
     reopened
         .record_user_message("new message after reopen")
         .expect("append after reopen");

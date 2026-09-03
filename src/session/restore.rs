@@ -667,6 +667,44 @@ mod tests {
     }
 
     #[test]
+    fn prepare_resume_rejects_a_session_with_an_active_writer() {
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("gpt-5.5")
+            .expect("record session start");
+        recorder
+            .record_user_message("still running")
+            .expect("record active user message");
+        recorder
+            .record_turn_started(crate::agent::TurnStartedEvent {
+                turn_id: 1,
+                intent: "active".into(),
+                directive: "do not interrupt from another writer".into(),
+                validation_reminder: String::new(),
+            })
+            .expect("record active turn");
+        let session_id = recorder.session_id().to_string();
+        let path = recorder.path().to_path_buf();
+        let before = std::fs::read(&path).expect("read active transcript before resume attempt");
+
+        let error = match prepare_resume_package(&sessions_dir, session_id) {
+            Ok(_) => panic!("an active session must not accept a second writer"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("session transcript is already open for writing")
+        );
+        assert_eq!(
+            std::fs::read(path).expect("read active transcript after resume attempt"),
+            before,
+            "a rejected concurrent resume must not append an interruption"
+        );
+    }
+
+    #[test]
     fn prepare_resume_interrupts_orphaned_active_turn() {
         let sessions_dir = temp_dir();
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");

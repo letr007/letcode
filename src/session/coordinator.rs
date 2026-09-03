@@ -1143,6 +1143,7 @@ protocol = "responses"
                 recorder.session_id().to_string(),
             )
         };
+        drop(transcript);
         let reopened = Arc::new(Mutex::new(
             TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("reopen"),
         ));

@@ -107,7 +107,7 @@ pub struct TranscriptAssistantTurn {
 
 读取器只释放通过 commit 校验的 transaction。完整但未 commit 的 transaction tail 对 projection 不可见，也不能作为 append-safe resume 的已确认 frontier。
 
-单条写入执行 `write_all` 和 `flush`；影响恢复语义的事件还会执行 `sync_data`。transaction 一次写入全部 payload 和 commit 后执行 `flush`、`sync_data`。任一 I/O 失败都会将 recorder 标记为 poisoned，且不会推进 sequence 或 active-turn state。
+单条写入执行 `write_all` 和 `flush`；影响恢复语义的事件还会执行 `sync_data`。transaction 一次写入全部 payload 和 commit 后执行 `flush`、`sync_data`。每个 `TranscriptRecorder` 在整个写入生命周期内持有 `<session_id>.jsonl.lock` 的非阻塞跨进程独占锁；同一主会话或子会话不能同时打开第二个 writer，只读 projection 不受影响。任一 I/O 失败都会将 recorder 标记为 poisoned、释放 writer lock，且不会推进 sequence 或 active-turn state，允许受控恢复路径修复尾部后重新取得写入所有权。
 
 `logical_checkpoint` payload 自带独立的 `schema_version`。为避免扁平 JSON 出现重复 key，该事件的 journal envelope 使用 `journal_schema_version = 2`；payload 的 `schema_version` 当前为 `1`。
 
@@ -135,7 +135,8 @@ pub struct TranscriptAssistantTurn {
 2. 校验 sequence/revision、transaction 和文件 fingerprint；
 3. 将 schema 1 的 `assistant_message` / `assistant_tool_call_batch` 在内存中规范化为 `AssistantTurn`；无效的 legacy replay state 直接报错；
 4. 投影选定 branch 的 runtime snapshot，并验证 restored route 和 context scope；
-5. 打开 append-safe recorder，并在提交点替换 live session。
+5. 非阻塞取得 session writer lock，在锁内重新校验 fingerprint 和 transaction frontier；活动 session 已持锁时明确拒绝第二个 resume；
+6. 打开 append-safe recorder，并在提交点替换 live session。
 
 兼容过程不改写既有 JSONL。resume 后的新记录使用 schema 2，因此文件可以包含合法的 v1 前缀和 v2 后缀；下次 resume 会重复相同的内存规范化。无 envelope 的更早 legacy transcript 仍可用于发现、列表、摘要和只读审计，但不能普通 resume 或 append。
 

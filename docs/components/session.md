@@ -65,7 +65,7 @@ assistant delta、reasoning、tool lifecycle、usage/prepared usage、compaction
 
 1. 使用 resumable transcript reader 读取当前 JSONL 和 fingerprint；
 2. 按 default cursor 解析 branch、leaf 和 runtime restore projection，并发现 child sessions；
-3. 在 fingerprint 仍匹配、事务完整且 schema 可恢复时打开 append-safe `TranscriptRecorder`；
+3. 非阻塞取得目标 session 的跨进程 writer lock，并在锁内确认 fingerprint 仍匹配、事务完整且 schema 可恢复；活动 session 已被另一个 writer 持有时拒绝 resume；
 4. 将 recorder 采用到选定 branch，并准备 restored context scope；
 5. 如果 snapshot 有 active turn，取消未完成 tool/subagent，记录 `TurnInterrupted`，重新读取并投影；
 6. 返回包含 session ID、records、runtime snapshot 和 recorder 的 `PreparedResume`。

@@ -52,13 +52,13 @@ tempfile = "3"
 arboard = "3.4"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
+fs4 = "0.13"
 libc = "0.2"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [target.'cfg(windows)'.dependencies]
 cap-fs-ext = "4.0"
 cap-std = "4.0"
-fs4 = "0.13"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

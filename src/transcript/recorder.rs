@@ -161,11 +161,55 @@ impl ActiveTurnTracker {
     }
 }
 
+struct TranscriptWriterLock {
+    _file: fs::File,
+}
+
+impl TranscriptWriterLock {
+    fn try_acquire(transcript_path: &Path) -> Result<Option<Self>> {
+        use fs4::fs_std::FileExt as _;
+
+        let mut lock_path = transcript_path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open transcript writer lock {}",
+                    lock_path.display()
+                )
+            })?;
+        if !file.try_lock_exclusive().with_context(|| {
+            format!(
+                "failed to acquire transcript writer lock {}",
+                lock_path.display()
+            )
+        })? {
+            return Ok(None);
+        }
+        Ok(Some(Self { _file: file }))
+    }
+
+    fn acquire(transcript_path: &Path) -> Result<Self> {
+        Self::try_acquire(transcript_path)?.ok_or_else(|| {
+            anyhow!(
+                "session transcript is already open for writing: {}",
+                transcript_path.display()
+            )
+        })
+    }
+}
+
 pub struct TranscriptRecorder {
     pub(crate) session_id: String,
     #[allow(dead_code)]
     pub(crate) path: PathBuf,
     pub(crate) sink: Box<dyn JournalSink>,
+    writer_lock: Option<TranscriptWriterLock>,
     pub(crate) sequence: u64,
     pub(crate) health: RecorderHealth,
     pub(crate) current_context_branch_id: Option<String>,
@@ -178,17 +222,28 @@ impl TranscriptRecorder {
     pub fn create(base_dir: impl AsRef<Path>) -> Result<Self> {
         fs::create_dir_all(base_dir.as_ref())?;
 
-        let session_id = generate_session_id();
-        let file_path = session_path(base_dir.as_ref(), &session_id);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
+        let (session_id, file_path, file, writer_lock) = loop {
+            let session_id = generate_session_id();
+            let file_path = session_path(base_dir.as_ref(), &session_id);
+            let Some(writer_lock) = TranscriptWriterLock::try_acquire(&file_path)? else {
+                continue;
+            };
+            match OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&file_path)
+            {
+                Ok(file) => break (session_id, file_path, file, writer_lock),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
 
         Ok(Self {
             session_id,
             path: file_path,
             sink: Box::new(FileJournalSink(file)),
+            writer_lock: Some(writer_lock),
             sequence: 0,
             health: RecorderHealth::Healthy,
             current_context_branch_id: None,
@@ -213,6 +268,8 @@ impl TranscriptRecorder {
         let base_dir = base_dir.as_ref();
         fs::create_dir_all(base_dir)?;
         let file_path = session_path(base_dir, session_id);
+        let writer_lock = TranscriptWriterLock::acquire(&file_path)?;
+        journal::repair_partial_tail(&file_path)?;
         let content = fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
         if !content.trim().is_empty() {
@@ -226,19 +283,21 @@ impl TranscriptRecorder {
         for record in &mut records {
             record.event = normalize_transcript_event_for_v2(record.event.clone())?;
         }
-        Self::open_existing_with_validated_records(base_dir, session_id, &records)
+        Self::open_existing_with_validated_records(base_dir, session_id, &records, writer_lock)
     }
 
     pub fn open_existing(base_dir: impl AsRef<Path>, session_id: &str) -> Result<Self> {
         let base_dir = base_dir.as_ref();
         fs::create_dir_all(base_dir)?;
         let file_path = session_path(base_dir, session_id);
+        let writer_lock = TranscriptWriterLock::acquire(&file_path)?;
         let (records, fingerprint) = journal::read_resumable_records_with_fingerprint(&file_path)?;
-        Self::open_existing_with_records_at_fingerprint(
+        Self::open_existing_with_records_at_fingerprint_locked(
             base_dir,
             session_id,
             &records,
             &fingerprint,
+            writer_lock,
         )
     }
 
@@ -255,9 +314,16 @@ impl TranscriptRecorder {
         let base_dir = base_dir.as_ref();
         fs::create_dir_all(base_dir)?;
         let file_path = session_path(base_dir, session_id);
+        let writer_lock = TranscriptWriterLock::acquire(&file_path)?;
         let content = fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
-        Self::open_existing_with_records_and_content(base_dir, session_id, records, &content)
+        Self::open_existing_with_records_and_content(
+            base_dir,
+            session_id,
+            records,
+            &content,
+            writer_lock,
+        )
     }
 
     pub(crate) fn open_existing_with_records_at_fingerprint(
@@ -268,6 +334,24 @@ impl TranscriptRecorder {
     ) -> Result<Self> {
         let base_dir = base_dir.as_ref();
         fs::create_dir_all(base_dir)?;
+        let file_path = session_path(base_dir, session_id);
+        let writer_lock = TranscriptWriterLock::acquire(&file_path)?;
+        Self::open_existing_with_records_at_fingerprint_locked(
+            base_dir,
+            session_id,
+            records,
+            fingerprint,
+            writer_lock,
+        )
+    }
+
+    fn open_existing_with_records_at_fingerprint_locked(
+        base_dir: &Path,
+        session_id: &str,
+        records: &[TranscriptRecord],
+        fingerprint: &TranscriptFileFingerprint,
+        writer_lock: TranscriptWriterLock,
+    ) -> Result<Self> {
         let file_path = session_path(base_dir, session_id);
         let content = fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read transcript {}", file_path.display()))?;
@@ -280,7 +364,7 @@ impl TranscriptRecorder {
             !journal::content_tail_is_uncommitted_transaction(&file_path, &content)?,
             "transcript has an uncommitted transaction tail and cannot safely accept new records"
         );
-        Self::open_existing_with_validated_records(base_dir, session_id, records)
+        Self::open_existing_with_validated_records(base_dir, session_id, records, writer_lock)
     }
 
     #[cfg(test)]
@@ -289,6 +373,7 @@ impl TranscriptRecorder {
         session_id: &str,
         records: &[TranscriptRecord],
         content: &str,
+        writer_lock: TranscriptWriterLock,
     ) -> Result<Self> {
         let file_path = session_path(base_dir, session_id);
         journal::ensure_resumable_content(&file_path, &content)?;
@@ -305,13 +390,14 @@ impl TranscriptRecorder {
             transcript_records_match(&current_records, records)?,
             "transcript changed after records were loaded; retry resume"
         );
-        Self::open_existing_with_validated_records(base_dir, session_id, records)
+        Self::open_existing_with_validated_records(base_dir, session_id, records, writer_lock)
     }
 
     fn open_existing_with_validated_records(
         base_dir: &Path,
         session_id: &str,
         records: &[TranscriptRecord],
+        writer_lock: TranscriptWriterLock,
     ) -> Result<Self> {
         ensure!(
             records.iter().all(|record| record.session_id == session_id),
@@ -333,6 +419,7 @@ impl TranscriptRecorder {
             session_id: session_id.to_string(),
             path: file_path,
             sink: Box::new(FileJournalSink(file)),
+            writer_lock: Some(writer_lock),
             sequence,
             health: RecorderHealth::Healthy,
             current_context_branch_id,
@@ -342,9 +429,33 @@ impl TranscriptRecorder {
         })
     }
 
+    fn poison_after_io_failure(&mut self) {
+        self.health = RecorderHealth::Poisoned;
+        self.writer_lock.take();
+    }
+
     #[allow(dead_code)]
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_sink_for_test(sink: Box<dyn JournalSink>) -> Self {
+        Self {
+            session_id: "test-session".into(),
+            path: PathBuf::from("unused.jsonl"),
+            sink,
+            writer_lock: None,
+            sequence: 0,
+            health: RecorderHealth::Healthy,
+            current_context_branch_id: None,
+            context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
+            reasoning_started_at: HashMap::new(),
+            active_turn_trackers: HashMap::from([(
+                ROOT_CONTEXT_BRANCH_ID.to_string(),
+                ActiveTurnTracker::default(),
+            )]),
+        }
     }
 
     #[cfg(test)]
@@ -1431,15 +1542,15 @@ impl TranscriptRecorder {
         line.push(b'\n');
         let durable = durable || requires_durable_commit(&envelope.record.event);
         if let Err(error) = self.sink.write_all(&line) {
-            self.health = RecorderHealth::Poisoned;
+            self.poison_after_io_failure();
             return Err(error.into());
         }
         if let Err(error) = self.sink.flush() {
-            self.health = RecorderHealth::Poisoned;
+            self.poison_after_io_failure();
             return Err(error.into());
         }
         if durable && let Err(error) = self.sink.sync_data() {
-            self.health = RecorderHealth::Poisoned;
+            self.poison_after_io_failure();
             return Err(error.into());
         }
         self.sequence = sequence;
@@ -1552,15 +1663,15 @@ impl TranscriptRecorder {
         let (buffer, index_records, resulting_revision) =
             self.prepare_transaction_buffer(&events)?;
         if let Err(error) = self.sink.write_all(&buffer) {
-            self.health = RecorderHealth::Poisoned;
+            self.poison_after_io_failure();
             return Err(error.into());
         }
         if let Err(error) = self.sink.flush() {
-            self.health = RecorderHealth::Poisoned;
+            self.poison_after_io_failure();
             return Err(error.into());
         }
         if let Err(error) = self.sink.sync_data() {
-            self.health = RecorderHealth::Poisoned;
+            self.poison_after_io_failure();
             return Err(error.into());
         }
         self.sequence = resulting_revision;
