@@ -7,6 +7,35 @@
 
 ## [Unreleased]
 
+### Added
+
+- Responses 路由支持通过 `[providers.<name>.transport]` 启用普通 Agent 回合的 WebSocket transport；标题、摘要、上下文压缩等 one-shot 调用仍使用 HTTP/SSE。
+- 会话恢复支持 transcript schema v1，并从 journal 记录重建当前会话状态。
+- 新增 Agent、请求构建、会话、子代理、工具和 transcript 等核心组件的技术文档。
+
+### Breaking
+
+- Provider 与 model 配置改用结构化的 `auth`、`endpoints`、`transport`、`capabilities`、`generation`、`cache` 和 `protocol_settings`；`default_model` 必须显式引用已配置模型，省略的能力标志默认关闭，旧版 `api_key`、`base_url`、`supports_*` 等扁平字段不再接受。
+
+### Changed
+
+- Provider 适配层重构为统一、类型化的 `ModelRuntime` 与 `ProtocolBinding`；Responses、Completions 和 Anthropic 的 wire request、缓存、流式解码、终止校验、重试及 one-shot 执行由各协议 adapter 与公共 runtime 协作处理。
+- 精简模型、主题、语言、侧栏等常规设置成功后的 TUI 状态提示，保留错误、排队和需要用户处理的状态。
+- Windows shell 命令优先使用 PowerShell 7（`pwsh.exe`），不可用时依次回退到 Windows PowerShell（`powershell.exe`）和 `cmd.exe`；选定结果在进程内缓存，缓存目标消失时重新探测。
+
+### Fixed
+
+- TODO 在会话后续回合、回合中断和错误后保持可见，仅重置对应的自动续跑状态。
+- 新建或恢复其他会话前会取消并等待当前子代理结束，避免旧会话结果进入新会话；仍在运行的当前会话不会被重复恢复。
+- 上下文压缩会按摘要请求的实际 token 预算选择可安全压缩的历史前缀，避免摘要请求超限或退休未进入摘要的历史。
+- Provider 请求失败时在 TUI、CLI 和 transcript 中保留经过凭据脱敏的响应详情，便于定位状态码之外的具体错误。
+- Responses 请求使用与消息角色匹配的文本块，并正确序列化纯文本与图片工具结果。
+- Responses WebSocket 请求被关闭码 `1009` 拒绝时保留诊断信息，并在已启用重试时将当前回合后续尝试切换到 HTTP/SSE。
+- 后台 continuation 的模型重试重新显示倒计时通知，首次打开子代理历史时不再丢失已有结果。
+- 父会话与子代理视图切换时先提交待渲染输出，避免导航过程中遗漏子代理结果。
+- Transcript writer 持有跨进程排他锁并在锁内重新校验序列，避免并发恢复或子会话修复造成重复写入和序号冲突。
+- 配置热重载保持主会话 route catalog 与专家路由扩展隔离，避免专家模型影响当前主模型的解析。
+
 ## [0.9.0] - 2026-08-28
 
 ### Added

@@ -217,12 +217,6 @@ Relative `sessions_dir` and `log_file` paths are resolved relative to the config
 
 Optional Langfuse/OpenTelemetry tracing is off by default. Enable it with `LETCODE_LANGFUSE_ENABLED=true`, and set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optional `LANGFUSE_HOST` (or the same variables in a local `.env`). Missing credentials leave tracing disabled without stopping the agent.
 
-## Model runtime architecture
-
-Configuration is resolved through an immutable `ProtocolRegistry` and `ResolvedRuntimeCatalog` into a `ResolvedModelRoute`. Each request is represented as a protocol-neutral `PromptPlan`. A route-bound `ProtocolBinding` owns wire encoding, cache behavior, and incremental response decoding, while all bindings share the incremental `reqwest` transport and `ModelRuntime`.
-
-Provider transport may set `websocket = true` under `[providers.<name>.transport]`. This affects only normal Agent turns on Responses routes: one turn-local WebSocket is opened and requests are sent sequentially. Default runtime calls, titles, summaries, compaction, and other one-shot calls remain HTTP/SSE. The session is not pooled or shared across turns. If the peer rejects a request with WebSocket close code `1009` (`message too big`), an enabled physical retry uses HTTP/SSE for the rest of that turn; other WebSocket failures remain on the configured transport. Safe Responses continuation may use `previous_response_id`; when continuity cannot be proven, the turn sends a complete request instead.
-
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.

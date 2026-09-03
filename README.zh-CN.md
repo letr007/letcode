@@ -217,12 +217,6 @@ Provider 凭据可使用 `credential_env`，或使用按 provider 名称生成�
 
 可选的 Langfuse/OpenTelemetry tracing 默认关闭。可用 `LETCODE_LANGFUSE_ENABLED=true`，并配置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 与可选的 `LANGFUSE_HOST`（或写在本地 `.env`）启用。缺少凭据时 tracing 保持关闭，不影响 Agent 运行。
 
-## 模型运行架构
-
-配置通过不可变的 `ProtocolRegistry` 和 `ResolvedRuntimeCatalog` 解析为 `ResolvedModelRoute`。每次请求都表示为与协议无关的 `PromptPlan`。绑定到路由的 `ProtocolBinding` 负责 wire 编码、缓存行为和增量响应解码，所有 binding 共享增量式 `reqwest` transport 与 `ModelRuntime`。
-
-Provider transport 可在 `[providers.<name>.transport]` 下设置 `websocket = true`。该设置只影响 Responses 路由的普通 Agent turn：每个 turn 建立一条本地连接并按顺序发送请求。默认 runtime 调用、标题、摘要、压缩和其他 one-shot 调用仍使用 HTTP/SSE。连接不会进入全局池，也不会跨 turn 复用。当对端用 WebSocket 关闭码 `1009`（`message too big`）拒绝请求时，若已启用物理重试，当前 turn 的后续尝试会改用 HTTP/SSE；其他 WebSocket 失败仍保持配置的 transport。只有在能够证明语义连续时才使用 `previous_response_id`，否则发送完整请求。
-
 ## 更新日志
 
 发布说明见 [CHANGELOG.md](CHANGELOG.md)。
