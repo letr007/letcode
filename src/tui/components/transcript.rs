@@ -265,7 +265,7 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 state.thoughts_display,
                 index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_)),
                 state.tools_display,
-                index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Tool(_)),
+                index + 1 < items.len() && is_compact_tool_group_item(&items[index + 1]),
                 compact_tool_group_stats(items, index),
                 compact_reasoning_group_elapsed_ms(items, index),
                 &state.translator(),
@@ -528,6 +528,15 @@ fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
         && state.transcript_render_cache.total_rows.is_some()
 }
 
+fn tool_keeps_card_in_compact_mode(tool: &ToolView) -> bool {
+    crate::agent::is_subagent_tool_name(&tool.name)
+        || crate::agent::is_subagent_control_tool_name(&tool.name)
+}
+
+fn is_compact_tool_group_item(item: &TimelineItem) -> bool {
+    matches!(item, TimelineItem::Tool(tool) if !tool_keeps_card_in_compact_mode(tool))
+}
+
 fn timeline_item_needs_separator_before(
     index: usize,
     items: &[TimelineItem],
@@ -538,23 +547,20 @@ fn timeline_item_needs_separator_before(
         return false;
     }
     if tools_display == crate::command::ToolsDisplayMode::Compact
-        && matches!(items[index], TimelineItem::Tool(_))
+        && let TimelineItem::Tool(tool) = &items[index]
     {
-        if index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Tool(_)) {
+        if tool_keeps_card_in_compact_mode(tool) {
+            return true;
+        }
+        if index + 1 < items.len() && is_compact_tool_group_item(&items[index + 1]) {
             return false;
         }
         let group_start = (0..index)
             .rev()
-            .take_while(|previous| matches!(items[*previous], TimelineItem::Tool(_)))
+            .take_while(|previous| is_compact_tool_group_item(&items[*previous]))
             .last()
             .unwrap_or(index);
-        if group_start == 0 {
-            return false;
-        }
-        return !matches!(
-            (&items[group_start - 1], &items[index]),
-            (TimelineItem::Todo(_), TimelineItem::Todo(_))
-        );
+        return group_start > 0;
     }
     match (&items[index - 1], &items[index]) {
         (TimelineItem::Todo(_), TimelineItem::Todo(_)) => false,
@@ -566,12 +572,12 @@ fn timeline_item_needs_separator_before(
 }
 
 fn compact_tool_group_stats(items: &[TimelineItem], index: usize) -> tool_card::ToolGroupStats {
-    if !matches!(items.get(index), Some(TimelineItem::Tool(_))) {
+    if !items.get(index).is_some_and(is_compact_tool_group_item) {
         return tool_card::ToolGroupStats::default();
     }
     let start = (0..index)
         .rev()
-        .take_while(|previous| matches!(items[*previous], TimelineItem::Tool(_)))
+        .take_while(|previous| is_compact_tool_group_item(&items[*previous]))
         .last()
         .unwrap_or(index);
     let mut stats = tool_card::ToolGroupStats::default();
@@ -621,12 +627,12 @@ fn compact_tool_group_revision(
     revisions: &[u64],
     index: usize,
 ) -> Option<u64> {
-    if !matches!(items.get(index), Some(TimelineItem::Tool(_))) {
+    if !items.get(index).is_some_and(is_compact_tool_group_item) {
         return revisions.get(index).copied();
     }
     let start = (0..index)
         .rev()
-        .take_while(|previous| matches!(items[*previous], TimelineItem::Tool(_)))
+        .take_while(|previous| is_compact_tool_group_item(&items[*previous]))
         .last()
         .unwrap_or(index);
     revisions.get(start..=index)?.iter().copied().max()
@@ -709,12 +715,11 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         let item = items[index].clone();
         let next_reasoning =
             index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_));
-        let next_tool =
-            index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Tool(_));
+        let next_tool = index + 1 < items.len() && is_compact_tool_group_item(&items[index + 1]);
         let tool_group_stats = compact_tool_group_stats(items, index);
         let compact_reasoning_elapsed_ms = compact_reasoning_group_elapsed_ms(items, index);
         let revision = if state.tools_display == crate::command::ToolsDisplayMode::Compact
-            && matches!(item, TimelineItem::Tool(_))
+            && is_compact_tool_group_item(&item)
             && !next_tool
         {
             compact_tool_group_revision(items, revisions, index)
@@ -727,7 +732,7 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
             revisions.get(index).copied()
         };
         let live = if state.tools_display == crate::command::ToolsDisplayMode::Compact
-            && matches!(item, TimelineItem::Tool(_))
+            && is_compact_tool_group_item(&item)
             && !next_tool
         {
             tool_group_stats.active
@@ -894,7 +899,17 @@ impl Component<Style> for TimelineItemComponent<'_> {
             ),
             TimelineItem::Tool(tool) => {
                 if self.tools_display == crate::command::ToolsDisplayMode::Compact {
-                    if !self.next_tool {
+                    if tool_keeps_card_in_compact_mode(tool) {
+                        build_tool_lines(
+                            &mut out,
+                            tool,
+                            self.theme,
+                            self.width,
+                            self.frame,
+                            self.expanded_output,
+                            self.translator,
+                        );
+                    } else if !self.next_tool {
                         out.document = tool_card::render_tool_group_document(
                             tool,
                             self.tool_group_stats,
@@ -3058,7 +3073,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_tools_keep_background_subagents_active_until_completion() {
+    fn compact_tools_render_background_subagents_as_detailed_cards() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
         state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
@@ -3078,6 +3093,7 @@ mod tests {
                         "run_id": "run-1",
                         "child_session_id": "child-1",
                         "agent_name": "explorer",
+                        "status": "running",
                         "background": true,
                         "active": true
                     }
@@ -3092,7 +3108,26 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(active.contains('⠋'), "{active}");
+        assert!(
+            active.contains("running [background/active] explorer"),
+            "{active}"
+        );
+        assert!(active.contains("/child child-1"), "{active}");
+        assert!(!active.contains("Tools ·"), "{active}");
+
+        let compact_active = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.set_tools_display(crate::command::ToolsDisplayMode::Detailed);
+        let detailed_active = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(compact_active, detailed_active);
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
 
         state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
             call_id: "call-1".into(),
@@ -3105,6 +3140,7 @@ mod tests {
                         "run_id": "run-1",
                         "child_session_id": "child-1",
                         "agent_name": "explorer",
+                        "status": "completed",
                         "background": true,
                         "active": false
                     }
@@ -3118,11 +3154,109 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(completed.contains('→'), "{completed}");
+        assert!(
+            completed.contains("completed [background] explorer"),
+            "{completed}"
+        );
+        assert!(!completed.contains("Tools ·"), "{completed}");
     }
 
     #[test]
-    fn compact_tools_treat_cancelled_subagent_as_terminal_despite_stale_active_output() {
+    fn compact_tools_keep_subagent_cards_between_ordinary_tool_groups() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
+
+        for (call_id, path) in [("call-1", "first.rs"), ("call-3", "second.rs")] {
+            let mut started = ToolStartedEvent::new(call_id, "fs__read", "read file");
+            started.arguments = Some(json!({"path": path}).to_string());
+            state.apply_event(SessionEvent::ToolStarted(started));
+            state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+                call_id: call_id.into(),
+                name: "fs__read".into(),
+                summary: "read file".into(),
+                outcome: ToolOutcome::Success,
+                output: None,
+            }));
+            if call_id == "call-1" {
+                let mut subagent =
+                    ToolStartedEvent::new("call-2", "agent__explore", "inspect repository");
+                subagent.arguments = Some(json!({"task": "inspect repository"}).to_string());
+                state.apply_event(SessionEvent::ToolStarted(subagent));
+                state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+                    call_id: "call-2".into(),
+                    name: "agent__explore".into(),
+                    summary: "inspection completed".into(),
+                    outcome: ToolOutcome::Success,
+                    output: Some(
+                        json!({
+                            "data": {
+                                "run_id": "run-1",
+                                "child_session_id": "child-1",
+                                "agent_name": "explorer",
+                                "status": "completed",
+                                "summary": "inspection completed",
+                                "active": false
+                            }
+                        })
+                        .to_string(),
+                    ),
+                }));
+            }
+        }
+
+        let compact = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(compact.matches("Tools · 1").count(), 2, "{compact}");
+        assert!(!compact.contains("Tools · 3"), "{compact}");
+        assert!(compact.contains("first.rs"), "{compact}");
+        assert!(
+            compact.contains("completed explorer inspection completed"),
+            "{compact}"
+        );
+        assert!(compact.contains("/child child-1"), "{compact}");
+        assert!(compact.contains("second.rs"), "{compact}");
+    }
+
+    #[test]
+    fn compact_tools_render_subagent_control_calls_like_detailed_mode() {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        let mut started =
+            ToolStartedEvent::new("call-status", "agent__status", "inspect subagent status");
+        started.arguments = Some(json!({"run_id": "run-1"}).to_string());
+        state.apply_event(SessionEvent::ToolStarted(started));
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-status".into(),
+            name: "agent__status".into(),
+            summary: "subagent completed".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(json!({"data": {"run_id": "run-1", "active": false}}).to_string()),
+        }));
+
+        state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
+        let compact = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.set_tools_display(crate::command::ToolsDisplayMode::Detailed);
+        let detailed = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(compact, detailed);
+        assert!(compact.contains("status completed"), "{compact}");
+        assert!(!compact.contains("Tools ·"), "{compact}");
+    }
+
+    #[test]
+    fn compact_tools_render_cancelled_subagent_card_despite_stale_active_output() {
         let mut state = TuiState::default();
         state.set_language(Some(crate::tui::i18n::Language::En));
         state.set_tools_display(crate::command::ToolsDisplayMode::Compact);
@@ -3149,8 +3283,21 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(cancelled.contains('→'), "{cancelled}");
-        assert!(cancelled.contains("1 cancelled"), "{cancelled}");
+        assert!(cancelled.contains("explorer"), "{cancelled}");
+        assert!(!cancelled.contains("Tools ·"), "{cancelled}");
+
+        let compact = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.set_tools_display(crate::command::ToolsDisplayMode::Detailed);
+        let detailed = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(compact, detailed);
     }
 
     #[test]

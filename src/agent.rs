@@ -4360,7 +4360,7 @@ fn is_read_only_subagent_tool_name(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_subagent_control_tool_name(name: &str) -> bool {
+pub(crate) fn is_subagent_control_tool_name(name: &str) -> bool {
     matches!(
         name,
         tool_names::TOOL_AGENT_JOBS
