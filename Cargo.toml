@@ -67,3 +67,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[profile.dev]
+debug = 0
+
+[profile.local]
+inherits = "release"
+incremental = true
+codegen-units = 16

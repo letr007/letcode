@@ -1,0 +1,2 @@
+[alias]
+install-local = "install --path . --force --locked --profile local --target-dir target"
