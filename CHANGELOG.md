@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-04
+
 ### Added
 
 - Responses 路由支持通过 `[providers.<name>.transport]` 启用普通 Agent 回合的 WebSocket transport；标题、摘要、上下文压缩等 one-shot 调用仍使用 HTTP/SSE。
@@ -270,7 +272,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/letr007/letcode/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/letr007/letcode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/letr007/letcode/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/letr007/letcode/compare/v0.6.1...v0.7.0
