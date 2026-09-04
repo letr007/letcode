@@ -1847,6 +1847,10 @@ mod tests {
     fn common_mermaid_families_render_and_fallback_cleanly() {
         let cases = [
             (
+                "```mermaid\nflowchart LR\nA[letcode<br>binary] --> B[composition root]\n```",
+                "binary",
+            ),
+            (
                 "```mermaid\nclassDiagram\nclass User {\n  +name String\n}\nclass Service\nUser --> Service : calls\n```",
                 "calls",
             ),
@@ -1870,6 +1874,22 @@ mod tests {
                 "```mermaid\ntimeline\n    title Release plan\n    section Client\n    2026 : Implement renderer : Ship\n```",
                 "Ship",
             ),
+            (
+                "```mermaid\nsequenceDiagram\nparticipant 用户\nparticipant 前端\n用户->>前端: 点击登录\n前端-->>用户: 登录成功\n```",
+                "登录成功",
+            ),
+            (
+                "```mermaid\npie title Language share\n\"TypeScript\" : 45\n\"Rust\" : 30\n\"Python\" : 15\n\"Other\" : 10\n```",
+                "█ TypeScript  45%",
+            ),
+            (
+                "```mermaid\njourney\ntitle Delivery\nsection Build\nImplement renderer: 5: Agent\nVerify output: 4: User\n```",
+                "●●●●○",
+            ),
+            (
+                "```mermaid\ngitGraph\ncommit id: start\nbranch feature\ncommit id: implement\ncheckout main\nmerge feature\n```",
+                "merge feature",
+            ),
         ];
         for (markdown, expected) in cases {
             let document =
@@ -1891,6 +1911,8 @@ mod tests {
             "```mermaid\nstateDiagram\ndirection LR\nA --> B\n```",
             "```mermaid\nmindmap\nroot\n  child:::class\n```",
             "```mermaid\ntimeline\n    2026 : event :\n```",
+            "```mermaid\njourney\nsection Build\nInvalid score: 8: Agent\n```",
+            "```mermaid\ngitGraph\ncheckout missing\ncommit\n```",
         ] {
             let text = rendered(markdown, 80)
                 .iter()

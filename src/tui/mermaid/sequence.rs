@@ -564,32 +564,47 @@ fn parse_participant(
     participants: &mut HashMap<String, ir::MermaidNode>,
     keyword: &str,
 ) -> Option<()> {
-    let rest = line.text.strip_prefix(keyword)?.strip_prefix(' ')?;
-    let (id, label) = rest.split_once(" as ")?;
-    let id = id.trim();
-    let label = label.trim();
+    let after_keyword = line.text.strip_prefix(keyword)?;
+    if !after_keyword.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let declaration_start = line.base
+        + keyword.chars().count()
+        + after_keyword
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+    let rest = after_keyword.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let (id, label, label_start) = if let Some(separator) = rest.find(" as ") {
+        let id = rest[..separator].trim();
+        let label_segment = &rest[separator + " as ".len()..];
+        let label = label_segment.trim();
+        let label_leading = label_segment
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+        let label_start =
+            declaration_start + rest[..separator + " as ".len()].chars().count() + label_leading;
+        (id, label, label_start)
+    } else {
+        (rest, rest, declaration_start)
+    };
+
     if !valid_id(id) || label.is_empty() || participants.contains_key(id) {
         return None;
     }
-    let separator = rest.find(" as ")?;
-    let label_segment = &rest[separator + " as ".len()..];
-    let label_leading = label_segment
-        .chars()
-        .take_while(|ch| ch.is_whitespace())
-        .count();
-    let start = line.base
-        + keyword.chars().count()
-        + 1
-        + rest[..separator + " as ".len()].chars().count()
-        + label_leading;
     let raw_label_len = label.chars().count();
     let (label, atomic) = parse_label(label)?;
     participants.insert(
         id.to_string(),
         ir::MermaidNode {
             label,
-            start,
-            end: start + raw_label_len,
+            start: label_start,
+            end: label_start + raw_label_len,
             atomic,
         },
     );
@@ -610,7 +625,7 @@ fn parse_message(
     let from = route[..arrow_at].trim();
     let raw_to = route[arrow_at + arrow.len()..].trim();
     let to = match raw_to.as_bytes().first() {
-        Some(b'+' | b'-') => &raw_to[1..],
+        Some(b'+' | b'-') if !participants.contains_key(raw_to) => &raw_to[1..],
         _ => raw_to,
     };
     if matches!(to.as_bytes().first(), Some(b'+' | b'-'))
@@ -670,7 +685,7 @@ fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
 }
 
 fn parse_label(label: &str) -> Option<(String, bool)> {

@@ -63,6 +63,10 @@ struct LayerRows {
 }
 
 fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
+    layout_layered(diagram, width).or_else(|| layout_relaxed(diagram, width))
+}
+
+fn layout_layered(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
     if diagram.entities.len() > 24 || diagram.relations.len() > 48 {
         return None;
     }
@@ -202,6 +206,176 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         },
     )?;
     Some(canvas)
+}
+
+fn layout_relaxed(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
+    if diagram.entities.is_empty() || diagram.entities.len() > 24 || diagram.relations.len() > 48 {
+        return None;
+    }
+
+    let sizes = diagram
+        .entities
+        .iter()
+        .map(|entity| {
+            let inner = std::iter::once(display_width(&entity.name.text))
+                .chain(
+                    entity
+                        .attributes
+                        .iter()
+                        .map(|attribute| display_width(&attribute.text)),
+                )
+                .max()
+                .unwrap_or(1)
+                .max(1)
+                + 2;
+            (inner + 2, entity.attributes.len() + 4)
+        })
+        .collect::<Vec<_>>();
+    let max_entity_width = sizes.iter().map(|(width, _)| *width).max().unwrap_or(0);
+    let label_width = diagram
+        .relations
+        .iter()
+        .map(|relation| display_width(&relation.label.text))
+        .max()
+        .unwrap_or(0);
+    let side_tracks = diagram.relations.len().div_ceil(2).checked_mul(2)?;
+    let side_margin = label_width.checked_add(side_tracks)?.checked_add(3)?;
+    let graph_width = max_entity_width.checked_add(side_margin.checked_mul(2)?)?;
+    if max_entity_width == 0 || graph_width > width {
+        return None;
+    }
+
+    let gap = 3;
+    let mut canvas = canvas::MermaidCanvas {
+        rows: Vec::new(),
+        labels: Vec::new(),
+    };
+    let mut placements = HashMap::new();
+    let mut row = 0;
+    for (index, entity) in diagram.entities.iter().enumerate() {
+        let (entity_width, entity_height) = sizes[index];
+        let placed = PlacedEntity {
+            row,
+            col: side_margin + (max_entity_width - entity_width) / 2,
+            width: entity_width,
+            height: entity_height,
+        };
+        draw_entity(&mut canvas, entity, placed);
+        placements.insert(index, placed);
+        row = row.checked_add(entity_height)?.checked_add(gap)?;
+    }
+
+    route_relaxed_relations(&mut canvas, diagram, graph_width, side_margin, &placements)?;
+    Some(canvas)
+}
+
+fn route_relaxed_relations(
+    canvas: &mut canvas::MermaidCanvas,
+    diagram: &ir::Diagram,
+    graph_width: usize,
+    side_margin: usize,
+    placements: &HashMap<usize, PlacedEntity>,
+) -> Option<()> {
+    let index = diagram
+        .entities
+        .iter()
+        .enumerate()
+        .map(|(index, entity)| (entity.name.text.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut incidents = HashMap::<usize, Vec<usize>>::new();
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        let from = index[relation.from.text.as_str()];
+        let to = index[relation.to.text.as_str()];
+        incidents.entry(from).or_default().push(relation_index);
+        if to != from {
+            incidents.entry(to).or_default().push(relation_index);
+        }
+    }
+    let mut routes = routing::RouteGrid::new();
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        let from = placements[&index[relation.from.text.as_str()]];
+        let to = placements[&index[relation.to.text.as_str()]];
+        let left = relation_index.is_multiple_of(2);
+        let track = relation_index / 2;
+        let route_col = if left {
+            side_margin.checked_sub(2 + track * 2)?
+        } else {
+            graph_width
+                .checked_sub(side_margin)?
+                .checked_add(1 + track * 2)?
+        };
+        let from_ordinal = incidents[&index[relation.from.text.as_str()]]
+            .iter()
+            .position(|candidate| *candidate == relation_index)?;
+        let to_ordinal = incidents[&index[relation.to.text.as_str()]]
+            .iter()
+            .position(|candidate| *candidate == relation_index)?;
+        let from_row = relaxed_port_row(from, from_ordinal)?;
+        let to_row = relaxed_port_row(to, to_ordinal + usize::from(from.row == to.row))?;
+        let from_port = if left {
+            (from.col.checked_sub(1)?, from_row)
+        } else {
+            (from.col + from.width, from_row)
+        };
+        let to_port = if left {
+            (to.col.checked_sub(1)?, to_row)
+        } else {
+            (to.col + to.width, to_row)
+        };
+        if from_port == to_port {
+            return None;
+        }
+        routes.connect(from_port, (route_col, from_row));
+        routes.connect((route_col, from_row), (route_col, to_row));
+        routes.connect((route_col, to_row), to_port);
+        canvas.put(
+            from_port.0,
+            from_port.1,
+            cardinality_icon(&relation.from_cardinality.text),
+        );
+        canvas.put(
+            to_port.0,
+            to_port.1,
+            cardinality_icon(&relation.to_cardinality.text),
+        );
+
+        let label_width = display_width(&relation.label.text).max(1);
+        let label_col = if left {
+            route_col.checked_sub(label_width + 2)?
+        } else {
+            route_col + 2
+        };
+        let label_row = from_row.min(to_row) + from_row.abs_diff(to_row) / 2;
+        canvas.blit(label_row, label_col, &relation.label.text);
+        canvas.labels.push(canvas::MermaidCanvasLabel {
+            row: label_row,
+            col: label_col,
+            text: relation.label.text.clone(),
+            source: relation.label.span,
+        });
+    }
+
+    let mut cells = routes.iter().collect::<Vec<_>>();
+    cells.sort_by_key(|((col, row), _)| (*row, *col));
+    for (&(col, row), &mask) in cells {
+        if !matches!(
+            canvas.rows.get(row).and_then(|line| line.get(col)),
+            Some(canvas::MermaidCell::Char('1' | '○' | '┤' | '◇' | '•'))
+        ) {
+            canvas.put(col, row, routing::route_glyph(mask));
+        }
+    }
+    Some(())
+}
+
+fn relaxed_port_row(placed: PlacedEntity, ordinal: usize) -> Option<usize> {
+    let slots = placed.height.checked_sub(3)?;
+    let slot = ordinal % slots;
+    Some(if slot == 0 {
+        placed.row + 1
+    } else {
+        placed.row + 2 + slot
+    })
 }
 
 fn draw_entity(canvas: &mut canvas::MermaidCanvas, entity: &ir::Entity, placed: PlacedEntity) {
@@ -442,7 +616,9 @@ fn parse_relation(line: &str, base: usize) -> Option<ir::Relation> {
     let from_at = find_char(line, from)?;
     let token_byte = line.find(token)?;
     let token_at = char_index(line, token_byte);
-    let to_at = find_char(line, to)?;
+    let after_token = token_byte + token.len();
+    let to_byte = after_token + line[after_token..].find(to)?;
+    let to_at = char_index(line, to_byte);
     let label_byte = colon_byte + 1 + line[colon_byte + 1..].find(label)?;
     let label_at = char_index(line, label_byte);
     Some(ir::Relation {

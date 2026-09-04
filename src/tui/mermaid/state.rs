@@ -4,7 +4,7 @@ use super::{
     source_within_limits,
 };
 use crate::tui::measure::display_width;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_DEPTH: usize = 4;
 const START_STATE: &str = "\0start";
@@ -26,6 +26,36 @@ fn is_end_state(id: &str) -> bool {
     id == END_STATE || id.starts_with(&format!("{END_STATE}:"))
 }
 
+fn collect_feedback_edges(outgoing: &[Vec<(usize, usize)>]) -> HashSet<usize> {
+    fn visit(
+        node: usize,
+        outgoing: &[Vec<(usize, usize)>],
+        colors: &mut [u8],
+        feedback: &mut HashSet<usize>,
+    ) {
+        colors[node] = 1;
+        for &(to, transition_index) in &outgoing[node] {
+            match colors[to] {
+                0 => visit(to, outgoing, colors, feedback),
+                1 => {
+                    feedback.insert(transition_index);
+                }
+                _ => {}
+            }
+        }
+        colors[node] = 2;
+    }
+
+    let mut colors = vec![0; outgoing.len()];
+    let mut feedback = HashSet::new();
+    for node in 0..outgoing.len() {
+        if colors[node] == 0 {
+            visit(node, outgoing, &mut colors, &mut feedback);
+        }
+    }
+    feedback
+}
+
 pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
     let diagram = parse(source)?;
     let composite = diagram.items.iter().any(|item| {
@@ -39,7 +69,7 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
                 return Some(lines);
             }
         }
-    } else if let Some(canvas) = layout(&diagram, width) {
+    } else if let Some(canvas) = layout(&diagram, width, true) {
         let lines = canvas.render();
         if render_line_count_within_limits(lines.len()) {
             return Some(lines);
@@ -118,7 +148,7 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
         {
             return None;
         }
-        let canvas = layout(&ir::Diagram { items }, width.saturating_sub(6))?;
+        let canvas = layout(&ir::Diagram { items }, width.saturating_sub(6), false)?;
         inner.insert(composite.id.clone(), canvas);
     }
 
@@ -399,6 +429,7 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
                 to_col,
                 graph_width,
             )?;
+            canvas.blit(label_row, label_col, &label.text);
             canvas.labels.push(canvas::MermaidCanvasLabel {
                 row: label_row,
                 col: label_col,
@@ -418,7 +449,11 @@ fn layout_composite(diagram: &ir::Diagram, width: usize) -> Option<canvas::Merma
     Some(canvas)
 }
 
-fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> {
+fn layout(
+    diagram: &ir::Diagram,
+    width: usize,
+    allow_cycles: bool,
+) -> Option<canvas::MermaidCanvas> {
     let declared = diagram
         .items
         .iter()
@@ -460,12 +495,26 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         .collect::<HashMap<_, _>>();
     let mut indegree = vec![0usize; ids.len()];
     let mut outgoing = vec![Vec::new(); ids.len()];
+    let mut cycle_outgoing = vec![Vec::new(); ids.len()];
     for (transition_index, transition) in transitions.iter().enumerate() {
         let from = index[&endpoint_key(&transition.from.text, true, transition_index)];
         let to = index[&endpoint_key(&transition.to.text, false, transition_index)];
         if from == to {
             return None;
         }
+        cycle_outgoing[from].push((to, transition_index));
+    }
+    let feedback_edges = if allow_cycles {
+        collect_feedback_edges(&cycle_outgoing)
+    } else {
+        HashSet::new()
+    };
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        if feedback_edges.contains(&transition_index) {
+            continue;
+        }
+        let from = index[&endpoint_key(&transition.from.text, true, transition_index)];
+        let to = index[&endpoint_key(&transition.to.text, false, transition_index)];
         outgoing[from].push(to);
         indegree[to] += 1;
     }
@@ -490,6 +539,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         || transitions
             .iter()
             .enumerate()
+            .filter(|(transition_index, _)| !feedback_edges.contains(transition_index))
             .any(|(transition_index, transition)| {
                 depths[index[&endpoint_key(&transition.to.text, false, transition_index)]]
                     != depths[index[&endpoint_key(&transition.from.text, true, transition_index)]]
@@ -534,12 +584,25 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
         .map_or(0, |label_width| {
             label_width.saturating_mul(2).saturating_add(4)
         });
+    let feedback_label_clearance = feedback_edges
+        .iter()
+        .filter_map(|index| transitions[*index].label.as_ref())
+        .map(|label| display_width(&label.text).max(1))
+        .max()
+        .unwrap_or(0);
     let graph_width = layer_widths
         .iter()
         .copied()
         .max()
         .unwrap_or(0)
-        .max(label_clearance);
+        .max(label_clearance)
+        .saturating_add(
+            feedback_edges
+                .len()
+                .saturating_mul(4)
+                .saturating_add(feedback_label_clearance)
+                .saturating_add(2),
+        );
     if graph_width == 0 || graph_width > width {
         return None;
     }
@@ -570,8 +633,9 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
             .iter()
             .enumerate()
             .filter(|(transition_index, transition)| {
-                depths[index[&endpoint_key(&transition.from.text, true, *transition_index)]]
-                    == layer - 1
+                !feedback_edges.contains(transition_index)
+                    && depths[index[&endpoint_key(&transition.from.text, true, *transition_index)]]
+                        == layer - 1
             })
             .count();
         let corridor_height = edges.saturating_mul(2).saturating_add(1);
@@ -646,6 +710,9 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     let mut routes = routing::RouteGrid::new();
     let mut layer_offsets = HashMap::<usize, usize>::new();
     for (transition_index, transition) in transitions.iter().enumerate() {
+        if feedback_edges.contains(&transition_index) {
+            continue;
+        }
         let from_index = index[&endpoint_key(&transition.from.text, true, transition_index)];
         let to_index = index[&endpoint_key(&transition.to.text, false, transition_index)];
         let from = placements[&from_index];
@@ -671,6 +738,108 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
                 to_col,
                 graph_width,
             )?;
+            canvas.blit(label_row, label_col, &label.text);
+            canvas.labels.push(canvas::MermaidCanvasLabel {
+                row: label_row,
+                col: label_col,
+                text: label.text.clone(),
+                source: label.span,
+            });
+        }
+    }
+    let mut left_feedback = 0usize;
+    let mut right_feedback = 0usize;
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        if !feedback_edges.contains(&transition_index) {
+            continue;
+        }
+        let from_index = index[&endpoint_key(&transition.from.text, true, transition_index)];
+        let to_index = index[&endpoint_key(&transition.to.text, false, transition_index)];
+        let from = placements[&from_index];
+        let to = placements[&to_index];
+        let from_row = from.row + from.height / 2;
+        let to_row = to.row + to.height / 2;
+        let label_width = transition
+            .label
+            .as_ref()
+            .map_or(0, |label| display_width(&label.text));
+        let horizontal_clear = |row: usize, first: usize, last: usize| {
+            let lo = first.min(last);
+            let hi = first.max(last);
+            placements.values().all(|placed| {
+                row < placed.row
+                    || row >= placed.row + placed.height
+                    || hi < placed.col
+                    || lo >= placed.col + placed.width
+            }) && (lo..=hi).all(|col| !routes.contains_key(&(col, row)))
+        };
+        let vertical_clear = |col: usize| {
+            let lo = from_row.min(to_row);
+            let hi = from_row.max(to_row);
+            placements.values().all(|placed| {
+                col < placed.col
+                    || col >= placed.col + placed.width
+                    || hi < placed.row
+                    || lo >= placed.row + placed.height
+            }) && (lo..=hi).all(|row| !routes.contains_key(&(col, row)))
+        };
+        let left =
+            from.col
+                .checked_sub(1)
+                .zip(to.col.checked_sub(1))
+                .and_then(|(from_col, to_col)| {
+                    let outer_col = left_feedback.checked_mul(4)?;
+                    (horizontal_clear(from_row, outer_col, from_col)
+                        && horizontal_clear(to_row, outer_col, to_col)
+                        && vertical_clear(outer_col))
+                    .then_some((
+                        outer_col,
+                        (from_col, from_row),
+                        (to_col, to_row),
+                        '▶',
+                        outer_col + 1,
+                    ))
+                });
+        let right_outer = graph_width.checked_sub(1 + right_feedback * 4)?;
+        let right_from = from.col + from.width;
+        let right_to = to.col + to.width;
+        let right = (horizontal_clear(from_row, right_from, right_outer)
+            && horizontal_clear(to_row, right_to, right_outer)
+            && vertical_clear(right_outer))
+        .then_some((
+            right_outer,
+            (right_from, from_row),
+            (right_to, to_row),
+            '◀',
+            right_outer.saturating_sub(label_width + 1),
+        ));
+        let prefer_left = from.col <= graph_width.saturating_sub(from.col + from.width);
+        let (outer_col, from_exit, to_entry, arrow, label_col) = if prefer_left {
+            left.or(right)?
+        } else {
+            right.or(left)?
+        };
+        if outer_col == right_outer {
+            right_feedback += 1;
+        } else {
+            left_feedback += 1;
+        }
+        routes.connect(from_exit, (outer_col, from_row));
+        routes.connect((outer_col, from_row), (outer_col, to_row));
+        routes.connect((outer_col, to_row), to_entry);
+        canvas.put(to_entry.0, to_entry.1, arrow);
+        if let Some(label) = &transition.label {
+            let upper_bottom = if from.row < to.row {
+                from.row + from.height
+            } else {
+                to.row + to.height
+            };
+            let lower_top = from.row.max(to.row);
+            let middle = upper_bottom + lower_top.saturating_sub(upper_bottom) / 2;
+            let label_row = (upper_bottom..lower_top)
+                .filter(|row| canvas.labels.iter().all(|placed| placed.row != *row))
+                .min_by_key(|row| row.abs_diff(middle))
+                .unwrap_or(middle);
             canvas.labels.push(canvas::MermaidCanvasLabel {
                 row: label_row,
                 col: label_col,
@@ -682,7 +851,7 @@ fn layout(diagram: &ir::Diagram, width: usize) -> Option<canvas::MermaidCanvas> 
     for (&(col, row), &mask) in &*routes {
         if !matches!(
             canvas.rows.get(row).and_then(|line| line.get(col)),
-            Some(canvas::MermaidCell::Char('▼'))
+            Some(canvas::MermaidCell::Char(ch)) if matches!(ch, '▼' | '◀' | '▶')
         ) {
             canvas.put(col, row, routing::route_glyph(mask));
         }
@@ -734,12 +903,15 @@ fn state_transition_label_col(
     };
     let horizontal_start = from_col.min(to_col);
     let horizontal_end = from_col.max(to_col);
-    let preferred = [
-        horizontal_start.checked_sub(label_width + 1),
-        horizontal_end
-            .checked_add(2)
-            .filter(|col| col + label_width <= graph_width),
-    ];
+    let left = horizontal_start.checked_sub(label_width + 1);
+    let right = horizontal_end
+        .checked_add(2)
+        .filter(|col| col + label_width <= graph_width);
+    let preferred = if from_col >= to_col {
+        [right, left]
+    } else {
+        [left, right]
+    };
     for col in preferred.into_iter().flatten() {
         if span_is_free(col) {
             return Some(col);
@@ -923,7 +1095,7 @@ fn parse(source: &str) -> Option<ir::Diagram> {
             if stack.len() >= MAX_DEPTH || !declared.insert(declaration.id.to_string()) {
                 return None;
             }
-            let label_at = base + find_char(trimmed, declaration.label)?;
+            let label_at = base + state_declaration_label_offset(trimmed)?;
             let scope = stack.last().cloned();
             if states
                 .get(declaration.id)
@@ -980,6 +1152,13 @@ struct StateDeclaration<'a> {
     id: &'a str,
     label: &'a str,
     composite: bool,
+}
+
+fn state_declaration_label_offset(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("state ")?;
+    let leading = rest.chars().take_while(|ch| ch.is_whitespace()).count();
+    let rest = rest.trim_start();
+    Some("state ".chars().count() + leading + usize::from(rest.starts_with('"')))
 }
 
 fn parse_state_declaration(rest: &str) -> Option<StateDeclaration<'_>> {

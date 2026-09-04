@@ -22,6 +22,19 @@ mod tests {
         }
     }
 
+    fn assert_spans_valid(source: &str, rendered: &MermaidRender) {
+        for line in &rendered.lines {
+            for span in line {
+                if let Some(MermaidSourceSpan { start, end }) = span.source {
+                    let original = source_slice(source, start, end);
+                    assert!(!original.is_empty());
+                    assert!(span.atomic || original == span.text, "{span:?}");
+                    assert!(!span.text.contains(['\n', '\r']), "{span:?}");
+                }
+            }
+        }
+    }
+
     fn rendered_text(source: &str, width: usize) -> String {
         flowchart::render(source, width)
             .unwrap()
@@ -161,6 +174,60 @@ mod tests {
     }
 
     #[test]
+    fn flowchart_br_labels_render_as_dynamic_multiline_nodes() {
+        for separator in ["<br>", "<br/>", "<br />"] {
+            let source = format!(
+                "flowchart LR\nA[letcode{separator}binary] -->|build{separator}ready| B[composition{separator}root]\n"
+            );
+            let rendered = super::super::render(&source, 80).expect("multiline flowchart");
+            assert_spans_valid(&source, &rendered);
+            let rows = rendered
+                .lines
+                .iter()
+                .map(|line| {
+                    line.iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let text = rows.join("\n");
+            assert!(!text.contains("<br"), "{text}");
+            assert!(
+                text.contains("build / ready"),
+                "edge label did not retain both lines:\n{text}"
+            );
+            let letcode_row = rows.iter().position(|row| row.contains("letcode")).unwrap();
+            let binary_row = rows.iter().position(|row| row.contains("binary")).unwrap();
+            let composition_row = rows
+                .iter()
+                .position(|row| row.contains("composition"))
+                .unwrap();
+            let root_row = rows.iter().position(|row| row.contains("root")).unwrap();
+            assert_eq!(
+                binary_row,
+                letcode_row + 1,
+                "first label was not split into adjacent rows:\n{text}"
+            );
+            assert_eq!(
+                root_row,
+                composition_row + 1,
+                "second label was not split into adjacent rows:\n{text}"
+            );
+            for row in [
+                &rows[letcode_row],
+                &rows[binary_row],
+                &rows[composition_row],
+                &rows[root_row],
+            ] {
+                assert!(
+                    row.contains('│'),
+                    "multiline label escaped its node box: {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn flowchart_math_labels_transform_atomically_and_preserve_wrapper_spans() {
         let source = concat!(
             "flowchart TD\n",
@@ -285,7 +352,7 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
-    fn multi_layer_crossing_threshold_preserves_linear_fallback() {
+    fn multi_layer_crossings_fall_back_when_routes_cannot_be_drawn_unambiguously() {
         let source = concat!(
             "graph TD\n",
             "A --> J\n",
@@ -917,6 +984,11 @@ A[$$\not_a_supported_command$$] --> B[Done]
                 "    2004 : 开始🚀 : 完成\n",
                 "         : 验收\n",
             ),
+            concat!(
+                "pie showData title 语言占比🙂\n",
+                "\"Rust🚀\" : 60\n",
+                "\"其他✅\" : 40\n",
+            ),
         ];
         for source in cases {
             let rendered = super::super::render(source, 120).unwrap_or_else(|| panic!("{source}"));
@@ -938,7 +1010,12 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "stateDiagram\nstate A {\nA --> B\n",
             "mindmap\nroot\n  child:::class\n",
             "timeline\n    section Phase A : Event\n    2004 : event\n",
+            "journey\nsection Experience\nTask: 0: User\n",
+            "gitGraph\nmerge missing\ncommit\n",
             "pie\ntitle unsupported\n",
+            "pie\nTypeScript : 45\n",
+            "pie\n\"TypeScript\" : 0\n",
+            "pie\n\"TypeScript\" : 45\n\"TypeScript\" : 30\n",
         ];
         for source in malformed {
             assert!(
@@ -954,6 +1031,9 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "stateDiagram\nVeryLongStateName --> OtherState\n",
             "mindmap\nVeryLongRoot\n",
             "timeline\n    2004 : This event is too wide\n",
+            "journey\nsection Experience\nA very long journey task: 5: User\n",
+            "gitGraph\ncommit id: a-very-long-commit-label\n",
+            "pie title This title is too long\n\"A\" : 1\n",
         ];
         for source in narrow {
             assert!(super::super::render(source, 4).is_none(), "fit {source:?}");
@@ -969,6 +1049,10 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "stateDiagram-v2  \nA --> B\n",
             " mindmap\nroot\n",
             "timeline \n2004 : event\n",
+            " journey\nsection Experience\nTask: 5: User\n",
+            "gitGraph \ncommit\n",
+            " pie\n\"A\" : 1\n",
+            "pieChart\n\"A\" : 1\n",
         ] {
             assert!(
                 super::super::render(source, 120).is_none(),
@@ -1059,6 +1143,50 @@ A[$$\not_a_supported_command$$] --> B[Done]
                 .any(|line| line.contains("response") && line.contains('◀')),
             "{text}"
         );
+    }
+
+    #[test]
+    fn sequence_accepts_bare_unicode_participants_and_renders_login_flow() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "participant 用户\n",
+            "participant 前端\n",
+            "participant 服务器\n",
+            "participant 数据库\n",
+            "用户->>前端: 点击登录\n",
+            "前端->>服务器: 发送登录请求\n",
+            "服务器->>数据库: 校验账号密码\n",
+            "数据库-->>服务器: 返回结果\n",
+            "服务器-->>前端: 返回 token\n",
+            "前端-->>用户: 登录成功\n",
+        );
+        let rendered = super::super::render(source, 100).expect("unicode sequence diagram");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 100);
+        let rows = text.lines().collect::<Vec<_>>();
+        let header = rows.first().unwrap();
+        let participant_positions = ["用户", "前端", "服务器", "数据库"]
+            .map(|participant| header.find(participant).unwrap());
+        assert!(
+            participant_positions
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "participant order changed:\n{text}"
+        );
+        for (message, arrow) in [
+            ("点击登录", '▶'),
+            ("发送登录请求", '▶'),
+            ("校验账号密码", '▶'),
+            ("返回结果", '◀'),
+            ("返回 token", '◀'),
+            ("登录成功", '◀'),
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains(message) && row.contains(arrow)),
+                "message {message:?} lost its direction:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -1234,7 +1362,8 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "sequenceDiagram\nautonumber\nautonumber\nparticipant A as A\nparticipant B as B\nA->>B: x\n",
             "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: x\nautonumber\n",
             "sequenceDiagram\nparticipant A as A\nparticipant B as B\nalt branch\nautonumber\nA->>B: x\nend\n",
-            "sequenceDiagram\nactor A\nparticipant B as B\nA->>B: x\n",
+            "sequenceDiagram\nparticipant用户\nparticipant B\n用户->>B: x\n",
+            "sequenceDiagram\nparticipant A/B\nparticipant B\nA/B->>B: x\n",
             "sequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>++B: x\n",
         ] {
             assert!(super::super::render(source, 80).is_none(), "{source}");
@@ -1286,6 +1415,103 @@ A[$$\not_a_supported_command$$] --> B[Done]
         );
         assert!(
             !text.lines().any(|line| line.starts_with("USER||")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn er_cycles_keep_entity_tables_and_relationship_routes() {
+        let source = concat!(
+            "erDiagram\n",
+            "USER {\n  int id PK\n}\n",
+            "TEAM {\n  int id PK\n}\n",
+            "USER ||--o{ TEAM : joins\n",
+            "TEAM ||--o{ USER : includes\n",
+        );
+        let rendered = super::super::render(source, 80).expect("cyclic ER diagram");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        let user_row = text
+            .lines()
+            .position(|line| line.contains("USER") && line.contains('│'))
+            .unwrap();
+        let team_row = text
+            .lines()
+            .position(|line| line.contains("TEAM") && line.contains('│'))
+            .unwrap();
+        let joins_row = text
+            .lines()
+            .position(|line| line.contains("joins"))
+            .unwrap();
+        let includes_row = text
+            .lines()
+            .position(|line| line.contains("includes"))
+            .unwrap();
+        assert!(
+            user_row < team_row,
+            "entities lost their stable vertical layout:\n{text}"
+        );
+        assert!(
+            joins_row > user_row && joins_row < team_row,
+            "joins relation is not routed between its entities:\n{text}"
+        );
+        assert!(
+            includes_row > user_row && includes_row < team_row,
+            "includes relation is not routed between its entities:\n{text}"
+        );
+        assert!(
+            text.lines().any(|line| line.contains("│ int id PK │")),
+            "entity attributes are no longer table rows:\n{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("USER||")),
+            "cycle fell back to linear Mermaid source:\n{text}"
+        );
+    }
+
+    #[test]
+    fn er_empty_entity_self_relation_uses_readable_linear_fallback() {
+        let source = concat!("erDiagram\n", "NODE {\n}\n", "NODE ||--o{ NODE : parent\n",);
+        let text = facade_text(source, 40);
+        let relation = text.lines().find(|row| row.contains("parent")).unwrap();
+        assert!(
+            relation.contains("NODE||--o{NODE : parent"),
+            "self relation disappeared when both graphical ports collapsed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn er_relaxed_routes_go_around_intermediate_entity_tables() {
+        let source = concat!(
+            "erDiagram\n",
+            "A {\n  int id PK\n}\n",
+            "B {\n  int id PK\n}\n",
+            "C {\n  int id PK\n}\n",
+            "A ||--o{ C : forward\n",
+            "C ||--o{ A : return\n",
+        );
+        let text = facade_text(source, 100);
+        let rows = text.lines().collect::<Vec<_>>();
+        let b_header = rows
+            .iter()
+            .position(|row| row.contains('B') && row.contains('│'))
+            .unwrap();
+        for expected in [
+            "┌───────────┐",
+            "│     B     │",
+            "├───────────┤",
+            "│ int id PK │",
+            "└───────────┘",
+        ] {
+            assert!(
+                rows[b_header - 1..=b_header + 3]
+                    .iter()
+                    .any(|row| row.contains(expected)),
+                "intermediate B table was crossed or damaged at {expected:?}:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("forward") && text.contains("return"),
             "{text}"
         );
     }
@@ -1449,6 +1675,72 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
+    fn state_cycles_route_back_to_the_existing_boxed_state() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "state \"等待输入\" as Idle\n",
+            "state \"模型推理\" as Thinking\n",
+            "state \"执行工具\" as Tool\n",
+            "state \"输出回复\" as Reply\n",
+            "[*] --> Idle\n",
+            "Idle --> Thinking : 提交任务\n",
+            "Thinking --> Tool : 请求调用工具\n",
+            "Tool --> Thinking : 返回工具结果\n",
+            "Thinking --> Reply : 最终答案\n",
+            "Reply --> [*] : 输出完成\n",
+        );
+        let rendered = super::super::render(source, 80).expect("cyclic state diagram");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        let rows = text.lines().collect::<Vec<_>>();
+        let thinking_row = rows
+            .iter()
+            .position(|row| row.contains("模型推理") && row.contains('│'))
+            .unwrap();
+        let tool_row = rows
+            .iter()
+            .position(|row| row.contains("执行工具") && row.contains('│'))
+            .unwrap();
+        let feedback_label_row = rows
+            .iter()
+            .position(|row| row.contains("返回工具结果"))
+            .unwrap();
+        for transition in [
+            "提交任务",
+            "请求调用工具",
+            "返回工具结果",
+            "最终答案",
+            "输出完成",
+        ] {
+            assert!(
+                text.contains(transition),
+                "missing transition {transition}:\n{text}"
+            );
+        }
+        assert!(
+            thinking_row < tool_row,
+            "main state chain is not laid out top to bottom:\n{text}"
+        );
+        assert!(
+            feedback_label_row > thinking_row && feedback_label_row < tool_row,
+            "feedback label is detached from the loop corridor:\n{text}"
+        );
+        assert_eq!(
+            text.matches("模型推理").count(),
+            1,
+            "target state was repeated as an ordinary hint:\n{text}"
+        );
+        assert!(
+            rows[thinking_row].contains('◀') || rows[thinking_row].contains('▶'),
+            "feedback edge does not enter the existing Thinking box:\n{text}"
+        );
+        assert!(
+            !text.contains("[ 模型推理 ]"),
+            "cycle fell back to boxed transition text:\n{text}"
+        );
+    }
+
+    #[test]
     fn state_accepts_chinese_composites_declared_after_transitions() {
         let source = concat!(
             "stateDiagram-v2\n",
@@ -1520,13 +1812,37 @@ A[$$\not_a_supported_command$$] --> B[Done]
         let rendered = super::super::render(source, 120).unwrap();
         assert_spans_exact(source, &rendered);
         let text = facade_text(source, 120);
-        for marker in ['=', '#', '!', '-'] {
-            assert!(text.contains(marker), "missing {marker}:\n{text}");
-        }
+        let rows = text.lines().collect::<Vec<_>>();
+        let requirement = rows.iter().find(|row| row.starts_with("需求分析")).unwrap();
+        let prototype = rows.iter().find(|row| row.starts_with("原型设计")).unwrap();
+        let development = rows.iter().find(|row| row.starts_with("功能开发")).unwrap();
+        let acceptance = rows.iter().find(|row| row.starts_with("测试验收")).unwrap();
+        assert!(
+            requirement.find('━').unwrap() < prototype.find('▶').unwrap()
+                && prototype.find('▶').unwrap() < development.find('!').unwrap()
+                && development.find('!').unwrap() < acceptance.find('━').unwrap(),
+            "dependent task bars are not ordered on the timeline:\n{text}"
+        );
+        assert!(
+            requirement.contains('✓'),
+            "done task lost its completion marker:\n{text}"
+        );
+        assert!(
+            [requirement, prototype, development, acceptance]
+                .iter()
+                .all(|row| row.matches('┊').count() <= 6),
+            "timeline reference lines are dense again:\n{text}"
+        );
         assert!(text.contains("08-01") && text.contains("08-18"), "{text}");
         assert!(
-            text.contains("section 设计") && text.contains("section 开发"),
-            "{text}"
+            rows.iter().any(|row| row.trim_end() == "── 设计")
+                && rows.iter().any(|row| row.trim_end() == "── 开发"),
+            "sections are not concise group labels:\n{text}"
+        );
+        assert!(
+            rows.first()
+                .is_some_and(|row| row.trim_end() == "╭─ 项目排期 ─╮"),
+            "title still expands into a full-width rule:\n{text}"
         );
         assert!(
             !text.contains("after req") && !text.contains("after ui"),
@@ -1558,7 +1874,8 @@ A[$$\not_a_supported_command$$] --> B[Done]
             .lines()
             .find(|line| line.starts_with("基础设施"))
             .unwrap();
-        assert!(first_task.matches('=').count() >= 20, "{text}");
+        assert!(first_task.matches('━').count() >= 20, "{text}");
+        assert!(first_task.contains('✓'), "{text}");
     }
 
     #[test]
@@ -1612,20 +1929,181 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
-    fn gantt_axis_format_uses_linear_fallback_with_exact_spans() {
-        let source = concat!(
+    fn gantt_axis_format_keeps_the_graphical_timeline() {
+        for (axis_format, start, end) in [
+            ("%m-%d", "08-01", "08-03"),
+            ("%Y-%m-%d", "2026-08-01", "2026-08-03"),
+        ] {
+            let source = format!(
+                "gantt\ndateFormat YYYY-MM-DD\naxisFormat {axis_format}\nsection 计划\n交付 : task, 2026-08-01, 2d\n"
+            );
+            let rendered = super::super::render(&source, 120).unwrap();
+            assert_spans_exact(&source, &rendered);
+            let text = facade_text(&source, 120);
+            let rows = text.lines().collect::<Vec<_>>();
+            assert!(
+                rows.first().is_some_and(|row| row.trim_end() == "── 计划"),
+                "section is not a concise group label:\n{text}"
+            );
+            let task_row = rows.iter().position(|row| row.starts_with("交付")).unwrap();
+            let axis_row = rows
+                .iter()
+                .position(|row| row.contains(start) && row.contains(end))
+                .unwrap();
+            assert!(
+                task_row < axis_row,
+                "task bar must appear above the date axis:\n{text}"
+            );
+            assert!(
+                rows[task_row].contains("━━━"),
+                "delivery task lost its scheduled bar:\n{text}"
+            );
+            assert!(
+                !text.contains("axisFormat") && !text.contains("2026-08-01, 2d"),
+                "graphical rendering fell back to Mermaid source:\n{text}"
+            );
+        }
+
+        let narrow = concat!(
             "gantt\n",
             "dateFormat YYYY-MM-DD\n",
             "axisFormat %Y-%m-%d\n",
             "section 计划\n",
             "交付 : task, 2026-08-01, 2d\n",
         );
-        let rendered = super::super::render(source, 120).unwrap();
+        let narrow_text = facade_text(narrow, 27);
+        assert!(
+            narrow_text.contains("axisFormat %Y-%m-%d") && narrow_text.contains("2026-08-01, 2d"),
+            "long-date axis silently dropped an endpoint instead of using the exact fallback:\n{narrow_text}"
+        );
+    }
+
+    #[test]
+    fn gantt_milestone_uses_a_single_distinct_event_marker() {
+        let source = concat!(
+            "gantt\n",
+            "dateFormat YYYY-MM-DD\n",
+            "section 发布\n",
+            "正式发布 : milestone, release, 2026-09-28, 0d\n",
+        );
+        let text = facade_text(source, 60);
+        let release = text
+            .lines()
+            .find(|row| row.starts_with("正式发布"))
+            .unwrap();
+        assert_eq!(release.matches('◆').count(), 1, "{text}");
+        assert!(
+            !release.contains('━'),
+            "milestone was rendered as a duration bar:\n{text}"
+        );
+        assert!(
+            text.lines().any(|row| row.trim_end() == "── 发布"),
+            "{text}"
+        );
+
+        let dependency_source = concat!(
+            "gantt\n",
+            "dateFormat YYYY-MM-DD\n",
+            "section 发布\n",
+            "正式发布 : milestone, release, 2026-09-28, 0d\n",
+            "发布观察 : observe, after release, 2d\n",
+        );
+        let dependency_text = facade_text(dependency_source, 60);
+        let release_row = dependency_text
+            .lines()
+            .find(|row| row.starts_with("正式发布"))
+            .unwrap();
+        let observation_row = dependency_text
+            .lines()
+            .find(|row| row.starts_with("发布观察"))
+            .unwrap();
+        assert_eq!(
+            release_row.find('◆'),
+            observation_row.find('━'),
+            "a task after a zero-day milestone started one day late:\n{dependency_text}"
+        );
+
+        let terminal_source = concat!(
+            "gantt\n",
+            "dateFormat YYYY-MM-DD\n",
+            "section 发布\n",
+            "准备发布 : prep, 2026-09-27, 1d\n",
+            "正式发布 : milestone, release, 2026-09-28, 0d\n",
+        );
+        let terminal_text = facade_text(terminal_source, 60);
+        let terminal_release = terminal_text
+            .lines()
+            .find(|row| row.starts_with("正式发布"))
+            .unwrap();
+        assert_eq!(
+            terminal_release.matches('◆').count(),
+            1,
+            "milestone at the timeline's right boundary disappeared:\n{terminal_text}"
+        );
+    }
+
+    #[test]
+    fn pie_renders_a_segmented_proportion_bar_and_readable_legend() {
+        let source = concat!(
+            "pie showData title 语言使用占比\n",
+            "\"TypeScript\" : 45\n",
+            "\"Rust\" : 30\n",
+            "\"Python\" : 15\n",
+            "\"其他\" : 10\n",
+        );
+        let rendered = super::super::render(source, 64).expect("pie proportion bar");
         assert_spans_exact(source, &rendered);
-        let text = facade_text(source, 120);
-        assert!(text.contains("axisFormat %Y-%m-%d"), "{text}");
-        assert_eq!(text.lines().count(), 4, "expected linear fallback:\n{text}");
-        assert!(!text.contains("08-03"), "expected linear fallback:\n{text}");
+        let text = facade_text(source, 64);
+        let rows = text.lines().collect::<Vec<_>>();
+        assert_eq!(rows.first().copied(), Some("语言使用占比"), "{text}");
+        let bar = rows[2];
+        let segment_counts = ['█', '▓', '▒', '░'].map(|glyph| bar.matches(glyph).count());
+        assert_eq!(segment_counts.iter().sum::<usize>(), 64, "{text}");
+        assert!(
+            segment_counts.windows(2).all(|pair| pair[0] > pair[1]),
+            "segment lengths do not reflect descending values:\n{text}"
+        );
+        for legend in [
+            "█ TypeScript  45% · 45",
+            "▓ Rust        30% · 30",
+            "▒ Python      15% · 15",
+            "░ 其他        10% · 10",
+        ] {
+            assert!(
+                rows.iter().any(|row| row == &legend),
+                "missing legend {legend:?}:\n{text}"
+            );
+        }
+
+        let without_data = concat!(
+            "pie title 语言使用占比\n",
+            "\"TypeScript\" : 45\n",
+            "\"Rust\" : 30\n",
+            "\"Python\" : 15\n",
+            "\"其他\" : 10\n",
+        );
+        let text = facade_text(without_data, 40);
+        assert!(text.contains("█ TypeScript  45%"), "{text}");
+        assert!(
+            !text.contains("· 45"),
+            "showData=false leaked raw values:\n{text}"
+        );
+
+        let decimals = concat!(
+            "pie title Decimal values\n",
+            "\"Ready\" : 12.5\n",
+            "\"Remaining\" : 87.5\n",
+        );
+        let decimal_text = facade_text(decimals, 40);
+        assert!(decimal_text.contains("Ready      12.5%"), "{decimal_text}");
+        assert!(decimal_text.contains("Remaining  87.5%"), "{decimal_text}");
+        for invalid in ["1e3", "+1", ".5", "5."] {
+            let source = format!("pie\n\"A\" : {invalid}\n\"B\" : 1\n");
+            assert!(
+                super::super::render(&source, 40).is_none(),
+                "accepted non-decimal pie value {invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -1650,6 +2128,302 @@ A[$$\not_a_supported_command$$] --> B[Done]
         }
         assert!(text.contains('┌') && text.contains('└'), "{text}");
         assert!(text.contains('▼'), "{text}");
+    }
+
+    #[test]
+    fn journey_renders_section_lanes_connected_tasks_and_score_marks() {
+        let source = concat!(
+            "journey\n",
+            "title 完成编程任务\n",
+            "section 发起任务\n",
+            "打开项目: 5: 用户\n",
+            "描述需求: 4: 用户\n",
+            "section Agent 执行\n",
+            "分析代码: 4: Agent\n",
+            "运行验证: 5: Agent\n",
+        );
+        let rendered = super::super::render(source, 120).expect("journey diagram");
+        assert_spans_valid(source, &rendered);
+        let text = facade_text(source, 120);
+        let rows = text.lines().collect::<Vec<_>>();
+        assert!(
+            rows.first().is_some_and(|row| row.contains("完成编程任务")),
+            "journey title is missing:\n{text}"
+        );
+        let first_section = rows
+            .iter()
+            .position(|row| row.starts_with("╭─ 发起任务"))
+            .unwrap();
+        let first_tasks = rows
+            .iter()
+            .position(|row| {
+                row.contains("打开项目") && row.contains("─▶─") && row.contains("描述需求")
+            })
+            .unwrap();
+        let second_section = rows
+            .iter()
+            .position(|row| row.starts_with("╭─ Agent 执行"))
+            .unwrap();
+        let second_tasks = rows
+            .iter()
+            .position(|row| {
+                row.contains("分析代码") && row.contains("─▶─") && row.contains("运行验证")
+            })
+            .unwrap();
+        assert!(
+            first_section < first_tasks
+                && first_tasks < second_section
+                && second_section < second_tasks,
+            "journey stages or task order are incorrect:\n{text}"
+        );
+        assert!(
+            rows[first_tasks].contains("打开项目 ●●●●● 用户"),
+            "first task lost score or actor context:\n{text}"
+        );
+        assert!(
+            rows[first_tasks].contains("描述需求 ●●●●○ 用户"),
+            "second task lost score or actor context:\n{text}"
+        );
+        assert!(
+            !text.contains("score=") && !text.contains("participants="),
+            "debug-style field names leaked into the chart:\n{text}"
+        );
+
+        let compact = super::super::render(source, 32).expect("compact journey diagram");
+        assert_spans_valid(source, &compact);
+        let compact_text = compact
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact_rows = compact_text.lines().collect::<Vec<_>>();
+        let open_project = compact_rows
+            .iter()
+            .position(|row| row.contains("打开项目"))
+            .unwrap();
+        let describe_task = compact_rows
+            .iter()
+            .position(|row| row.contains("描述需求"))
+            .unwrap();
+        assert!(
+            open_project < describe_task,
+            "compact journey did not preserve task order:\n{compact_text}"
+        );
+        assert!(
+            compact_rows[open_project + 2].contains('▼'),
+            "compact journey did not connect vertically stacked tasks:\n{compact_text}"
+        );
+
+        let long_section = "journey\nsection A deliberately long delivery phase\nShip: 5: Agent\n";
+        let long_rendered = super::super::render(long_section, 60).expect("long journey section");
+        let long_rows = long_rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let widths = long_rows
+            .iter()
+            .map(|row| crate::tui::measure::display_width(row))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            widths.len(),
+            1,
+            "section border and task rows have different widths: {long_rows:?}"
+        );
+
+        let stacked_source = "journey\nsection X\nT: 5: A\nU: 4: B\n";
+        let stacked = super::super::render(stacked_source, 16).expect("stacked journey");
+        let stacked_rows = stacked
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stacked_rows
+                .iter()
+                .all(|row| crate::tui::measure::display_width(row) == 16),
+            "stacked journey rows do not share the section width: {stacked_rows:?}"
+        );
+        for task in ["T", "U"] {
+            let row = stacked_rows.iter().find(|row| row.contains(task)).unwrap();
+            assert!(
+                row.ends_with("││"),
+                "stacked task {task} lost its inner or outer right border: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gitgraph_renders_left_side_tracks_and_right_side_event_labels() {
+        let source = concat!(
+            "gitGraph\n",
+            "commit id: \"初始化项目\"\n",
+            "commit id: \"实现核心功能\"\n",
+            "branch   feature\n",
+            "checkout   feature\n",
+            "commit id: \"开发新功能\"\n",
+            "commit id: \"补充测试\"\n",
+            "checkout  main\n",
+            "commit id: \"修复线上问题\"\n",
+            "merge   feature\n",
+            "commit id: \"发布版本\"\n",
+        );
+        let rendered = super::super::render(source, 100).expect("gitGraph diagram");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 100);
+        let rows = text.lines().collect::<Vec<_>>();
+        let header = rows.first().unwrap();
+        let main_header = header.find("main").unwrap();
+        let feature_header = header.find("feature").unwrap();
+        assert!(
+            main_header < feature_header,
+            "branch headers are not aligned with their left-side lanes:\n{text}"
+        );
+        let initial = rows
+            .iter()
+            .position(|row| row.contains("commit 初始化项目"))
+            .unwrap();
+        let feature_lane = feature_header + "feature".len() / 2;
+        assert_eq!(
+            rows[initial].chars().nth(feature_lane),
+            Some(' '),
+            "feature lane is visible before the branch is created:\n{text}"
+        );
+        let feature_commit = rows
+            .iter()
+            .position(|row| row.contains("commit 开发新功能"))
+            .unwrap();
+        let main_checkout = rows
+            .iter()
+            .position(|row| row.contains("checkout main"))
+            .unwrap();
+        let hotfix = rows
+            .iter()
+            .position(|row| row.contains("commit 修复线上问题"))
+            .unwrap();
+        let merge = rows
+            .iter()
+            .position(|row| row.contains("merge feature"))
+            .unwrap();
+        let release = rows
+            .iter()
+            .position(|row| row.contains("commit 发布版本"))
+            .unwrap();
+        assert!(
+            initial < feature_commit
+                && feature_commit < main_checkout
+                && main_checkout < hotfix
+                && hotfix < merge
+                && merge < release,
+            "git event order changed:\n{text}"
+        );
+        assert!(
+            rows[feature_commit].find('●').unwrap() > rows[initial].find('●').unwrap(),
+            "feature commit was not placed on its branch lane:\n{text}"
+        );
+        assert!(
+            rows[merge].contains("●◀") || rows[merge].contains("▶●"),
+            "merge row does not point from the branch back to main:\n{text}"
+        );
+    }
+
+    #[test]
+    fn transformed_labels_keep_their_syntactic_source_occurrence() {
+        let state_source = concat!("stateDiagram-v2\n", "state \"state\" as S\n", "[*] --> S\n",);
+        let state = super::super::render(state_source, 40).unwrap();
+        let state_label = state
+            .lines
+            .iter()
+            .flatten()
+            .find(|span| span.text == "state")
+            .unwrap();
+        let quoted_state_byte = state_source.find("\"state\"").unwrap() + 1;
+        assert_eq!(
+            state_label.source.unwrap().start,
+            state_source[..quoted_state_byte].chars().count()
+        );
+
+        let er_source = concat!(
+            "erDiagram\n",
+            "ITEM {\n  int id PK\n}\n",
+            "ITEM ||--o{ ITEM : x\n",
+        );
+        let er = super::super::render(er_source, 18).unwrap();
+        let mut item_starts = er
+            .lines
+            .iter()
+            .flatten()
+            .filter(|span| span.text == "ITEM")
+            .map(|span| span.source.unwrap().start)
+            .collect::<Vec<_>>();
+        item_starts.sort_unstable();
+        item_starts.dedup();
+        let expected_item_starts = er_source
+            .match_indices("ITEM")
+            .map(|(byte, _)| er_source[..byte].chars().count())
+            .collect::<Vec<_>>();
+        assert_eq!(item_starts, expected_item_starts);
+
+        let git_source = concat!(
+            "gitGraph\n",
+            "commit id: commit\n",
+            "branch   branch\n",
+            "commit id: work\n",
+        );
+        let git = super::super::render(git_source, 60).unwrap();
+        let commit_id = git
+            .lines
+            .iter()
+            .flatten()
+            .find(|span| span.text == "commit")
+            .unwrap();
+        let expected_commit = git_source
+            .match_indices("commit")
+            .nth(1)
+            .map(|(byte, _)| git_source[..byte].chars().count())
+            .unwrap();
+        assert_eq!(commit_id.source.unwrap().start, expected_commit);
+        let branch_name = git
+            .lines
+            .iter()
+            .flatten()
+            .find(|span| span.text == "branch")
+            .unwrap();
+        let expected_branch = git_source
+            .match_indices("branch")
+            .nth(1)
+            .map(|(byte, _)| git_source[..byte].chars().count())
+            .unwrap();
+        assert_eq!(branch_name.source.unwrap().start, expected_branch);
+    }
+
+    #[test]
+    fn journey_and_gitgraph_reject_invalid_semantics() {
+        for source in [
+            "journey\nsection 体验\n任务: 6: 用户\n",
+            "journey\n任务: 5: 用户\n",
+            "gitGraph\ncheckout missing\ncommit\n",
+            "gitGraph\nbranch feature\nbranch feature\ncommit\n",
+            "gitGraph\ncommit id: same\ncommit id: same\n",
+        ] {
+            assert!(
+                super::super::render(source, 100).is_none(),
+                "accepted {source:?}"
+            );
+        }
     }
 
     #[test]

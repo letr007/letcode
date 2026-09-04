@@ -228,7 +228,7 @@ fn parse_endpoint_prefix(
                 + opener.chars().count()
                 + label_leading
                 + usize::from(label_seg.trim_start().starts_with('"'));
-            let (label, atomic) = parse_label(raw)?;
+            let (label, atomic) = parse_label(raw, true)?;
             let node = MermaidNode {
                 label,
                 start,
@@ -320,7 +320,7 @@ fn parse_connector(
                     style,
                     *carrow,
                     Some({
-                        let (text, atomic) = parse_label(raw)?;
+                        let (text, atomic) = parse_label(raw, false)?;
                         MermaidLabel {
                             text,
                             start,
@@ -351,7 +351,7 @@ fn parse_pipe_label(segment: &str, base: usize) -> Option<(Option<MermaidLabel>,
         return None;
     }
     let start = tbase + 1 + raw.chars().count() - raw.trim_start().chars().count();
-    let (text, atomic) = parse_label(lt)?;
+    let (text, atomic) = parse_label(lt, false)?;
     Some((
         Some(MermaidLabel {
             text,
@@ -364,8 +364,19 @@ fn parse_pipe_label(segment: &str, base: usize) -> Option<(Option<MermaidLabel>,
     ))
 }
 
-fn parse_label(raw: &str) -> Option<(String, bool)> {
-    super::render_math_label(raw)
+fn parse_label(raw: &str, multiline: bool) -> Option<(String, bool)> {
+    let (text, atomic) = super::render_math_label(raw)?;
+    let text = text
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n");
+    let transformed = text.contains('\n');
+    let text = if multiline {
+        text
+    } else {
+        text.split('\n').collect::<Vec<_>>().join(" / ")
+    };
+    Some((text, atomic || transformed))
 }
 
 fn insert_node(

@@ -15,7 +15,13 @@ mod flowchart_ir;
 mod flowchart_parser;
 mod gantt;
 mod gantt_ir;
+mod gitgraph;
+mod gitgraph_ir;
+mod journey;
+mod journey_ir;
 mod mindmap;
+mod pie;
+mod pie_ir;
 mod routing;
 mod sequence;
 mod sequence_ir;
@@ -131,7 +137,10 @@ fn render_uncached(source: &str, width: usize) -> Option<MermaidRender> {
         "classDiagram" => class::render(source, width)?,
         "erDiagram" => er::render(source, width)?,
         "gantt" => gantt::render(source, width)?,
+        "gitGraph" => gitgraph::render(source, width)?,
+        "journey" => journey::render(source, width)?,
         "mindmap" => mindmap::render(source, width)?,
+        header if header == "pie" || header.starts_with("pie ") => pie::render(source, width)?,
         "timeline" | "timeline LR" => timeline::render(source, width)?,
         "stateDiagram" | "stateDiagram-v2" => state::render(source, width)?,
         header

@@ -142,11 +142,23 @@ fn layout(
     positioned: &[PositionedTask],
 ) -> Option<canvas::MermaidCanvas> {
     if diagram.items.iter().any(|item| {
-        matches!(item, ir::Item::Config(config) if config.key == "axisFormat")
-            || matches!(item, ir::Item::Config(config) if config.key == "dateFormat" && config.value.text != "YYYY-MM-DD")
+        matches!(item, ir::Item::Config(config) if config.key == "dateFormat" && config.value.text != "YYYY-MM-DD")
     }) {
         return None;
     }
+    let axis_format = diagram
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ir::Item::Config(config) if config.key == "axisFormat" => {
+                Some(parse_axis_format(&config.value.text))
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .next()
+        .unwrap_or(AxisFormat::MonthDay);
 
     if tasks.is_empty() || tasks.len() != positioned.len() {
         return None;
@@ -154,19 +166,16 @@ fn layout(
 
     let min_day = positioned.iter().map(|task| task.start).min()?;
     let max_day = positioned.iter().map(|task| task.end).max()?;
-    let timeline_days = usize::try_from(max_day.checked_sub(min_day)?).ok()?;
-    if timeline_days == 0 {
-        return None;
-    }
+    let timeline_days = usize::try_from(max_day.checked_sub(min_day)?).ok()?.max(1);
 
     let header_width = diagram
         .items
         .iter()
         .filter_map(|item| match item {
             ir::Item::Config(config) if config.key == "title" => {
-                Some(6 + display_width(&config.value.text))
+                Some(7 + display_width(&config.value.text))
             }
-            ir::Item::Section(label) => Some(8 + display_width(&label.text)),
+            ir::Item::Section(label) => Some(3 + display_width(&label.text)),
             _ => None,
         })
         .max()
@@ -180,7 +189,11 @@ fn layout(
         .max()
         .unwrap_or(0);
     let timeline_start = left_width.checked_add(3)?;
-    if timeline_start.checked_add(MIN_TIMELINE_WIDTH)? > width {
+    let axis_width = display_width(&axis_date(min_day, axis_format))
+        .checked_add(display_width(&axis_date(max_day, axis_format)))?
+        .checked_add(1)?;
+    let minimum_timeline_width = MIN_TIMELINE_WIDTH.max(axis_width);
+    if timeline_start.checked_add(minimum_timeline_width)? > width {
         return None;
     }
     let timeline_width = width.checked_sub(timeline_start)?;
@@ -195,24 +208,19 @@ fn layout(
         match item {
             ir::Item::Config(config) if config.key == "title" => {
                 result.ensure_row(row, total_width);
-                result.blit(row, 0, "title ");
+                result.blit(row, 0, "╭─ ");
                 result.labels.push(canvas::MermaidCanvasLabel {
                     row,
-                    col: 6,
+                    col: 3,
                     text: config.value.text.clone(),
                     source: config.value.span,
                 });
+                result.blit(row, 3 + display_width(&config.value.text), " ─╮");
                 row += 1;
             }
             ir::Item::Section(label) => {
                 result.ensure_row(row, total_width);
-                result.blit(row, 0, "section ");
-                result.labels.push(canvas::MermaidCanvasLabel {
-                    row,
-                    col: 8,
-                    text: label.text.clone(),
-                    source: label.span,
-                });
+                draw_section_header(&mut result, row, label);
                 row += 1;
             }
             ir::Item::Task(task) => {
@@ -222,6 +230,12 @@ fn layout(
                 let task_position = &positioned[index];
                 result.ensure_row(row, total_width);
                 draw_task_text(&mut result, row, task);
+                for tick in timeline_ticks(timeline_days, timeline_width) {
+                    let col = timeline_start + tick;
+                    if col < total_width {
+                        result.put(col, row, '┊');
+                    }
+                }
                 let start = timeline_start
                     + timeline_boundary_col(
                         task_position.start,
@@ -236,10 +250,14 @@ fn layout(
                         timeline_days,
                         timeline_width,
                     )?;
-                let marker = status_marker(task.status.as_ref().map(|status| status.text.as_str()));
-                for col in start..end.max(start + 1).min(total_width) {
-                    result.put(col, row, marker);
-                }
+                draw_task_bar(
+                    &mut result,
+                    row,
+                    start,
+                    end,
+                    total_width,
+                    task.status.as_ref().map(|status| status.text.as_str()),
+                );
                 row += 1;
             }
             _ => {}
@@ -247,9 +265,47 @@ fn layout(
     }
 
     result.ensure_row(row, total_width);
-    let axis = format_axis(min_day, max_day, timeline_width);
+    let axis = format_axis(min_day, max_day, timeline_width, axis_format);
     result.blit(row, timeline_start, &axis);
     Some(result)
+}
+
+#[derive(Clone, Copy)]
+enum AxisFormat {
+    MonthDay,
+    YearMonthDay,
+}
+
+fn parse_axis_format(value: &str) -> Option<AxisFormat> {
+    match value {
+        "%m-%d" => Some(AxisFormat::MonthDay),
+        "%Y-%m-%d" => Some(AxisFormat::YearMonthDay),
+        _ => None,
+    }
+}
+
+fn draw_section_header(canvas: &mut canvas::MermaidCanvas, row: usize, label: &ir::Label) {
+    canvas.blit(row, 0, "── ");
+    canvas.labels.push(canvas::MermaidCanvasLabel {
+        row,
+        col: 3,
+        text: label.text.clone(),
+        source: label.span,
+    });
+}
+
+fn timeline_ticks(_days: usize, width: usize) -> Vec<usize> {
+    const REFERENCE_LINES: usize = 6;
+    if width == 0 {
+        return Vec::new();
+    }
+    let lines = REFERENCE_LINES.min(width);
+    if lines == 1 {
+        return vec![0];
+    }
+    (0..lines)
+        .map(|index| index * (width - 1) / (lines - 1))
+        .collect()
 }
 
 fn resolve_task(
@@ -290,7 +346,12 @@ fn resolve_task(
     if end < start {
         return None;
     }
-    if end == start {
+    if end == start
+        && tasks[index]
+            .status
+            .as_ref()
+            .is_none_or(|status| status.text != "milestone")
+    {
         end = start + 1;
     }
     resolved[index] = Some((start, end));
@@ -322,19 +383,49 @@ fn draw_task_text(canvas: &mut canvas::MermaidCanvas, row: usize, task: &ir::Tas
     });
 }
 
-fn status_marker(status: Option<&str>) -> char {
+fn draw_task_bar(
+    canvas: &mut canvas::MermaidCanvas,
+    row: usize,
+    start: usize,
+    end: usize,
+    total_width: usize,
+    status: Option<&str>,
+) {
+    if status == Some("milestone") {
+        if total_width > 0 {
+            canvas.put(start.min(total_width - 1), row, status_marker(status));
+        }
+        return;
+    }
+
+    let end = end.max(start.saturating_add(1)).min(total_width);
+    if start >= end {
+        return;
+    }
+
+    for col in start..end {
+        canvas.put(col, row, '━');
+    }
     match status {
-        Some("done") => '=',
-        Some("active") => '#',
-        Some("crit") => '!',
-        Some("milestone") => 'M',
-        _ => '-',
+        Some("done") => canvas.put(end - 1, row, status_marker(status)),
+        Some("active") | Some("crit") => canvas.put(start, row, status_marker(status)),
+        _ => {}
     }
 }
 
-fn format_axis(start: i64, end: i64, width: usize) -> String {
-    let start_text = short_date(start);
-    let end_text = short_date(end);
+fn status_marker(status: Option<&str>) -> char {
+    match status {
+        Some("done") => '✓',
+        Some("active") => '▶',
+        Some("crit") => '!',
+        Some("milestone") => '◆',
+        _ => '━',
+    }
+}
+
+fn format_axis(start: i64, end: i64, width: usize, format: AxisFormat) -> String {
+    let start_text = axis_date(start, format);
+    let end_text = axis_date(end, format);
     let mut axis = vec![' '; width];
     for (index, ch) in start_text.chars().enumerate().take(width) {
         axis[index] = ch;
@@ -350,9 +441,12 @@ fn format_axis(start: i64, end: i64, width: usize) -> String {
     axis.into_iter().collect()
 }
 
-fn short_date(days: i64) -> String {
-    let (_, month, day) = civil_from_days(days);
-    format!("{month:02}-{day:02}")
+fn axis_date(days: i64, format: AxisFormat) -> String {
+    let (year, month, day) = civil_from_days(days);
+    match format {
+        AxisFormat::MonthDay => format!("{month:02}-{day:02}"),
+        AxisFormat::YearMonthDay => format!("{year:04}-{month:02}-{day:02}"),
+    }
 }
 
 fn parse_date(value: &str) -> Option<i64> {
