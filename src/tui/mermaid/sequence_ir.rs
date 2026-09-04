@@ -23,6 +23,8 @@ pub(crate) enum MermaidBlockKind {
     Loop,
     Alt,
     Opt,
+    Rect,
+    Par,
 }
 
 impl MermaidBlockKind {
@@ -31,6 +33,15 @@ impl MermaidBlockKind {
             Self::Loop => "loop",
             Self::Alt => "alt",
             Self::Opt => "opt",
+            Self::Rect => "rect",
+            Self::Par => "par",
+        }
+    }
+
+    pub(crate) const fn branch_keyword(self) -> &'static str {
+        match self {
+            Self::Par => "and",
+            _ => "else",
         }
     }
 }
@@ -46,6 +57,8 @@ pub(crate) struct MermaidSequence {
 pub(crate) enum MermaidSequenceItem {
     Message(MermaidMessage),
     Block(MermaidBlock),
+    Activation(MermaidActivation),
+    Note(MermaidNote),
 }
 
 #[derive(Debug)]
@@ -67,4 +80,27 @@ pub(crate) struct MermaidMessage {
     pub(crate) to: String,
     pub(crate) label: MermaidLabel,
     pub(crate) dashed: bool,
+    pub(crate) activate: bool,
+    pub(crate) deactivate: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct MermaidActivation {
+    pub(crate) participant: String,
+    pub(crate) label: MermaidLabel,
+    pub(crate) active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MermaidNotePosition {
+    Right,
+    Left,
+    Over,
+}
+
+#[derive(Debug)]
+pub(crate) struct MermaidNote {
+    pub(crate) position: MermaidNotePosition,
+    pub(crate) participants: Vec<String>,
+    pub(crate) label: MermaidLabel,
 }

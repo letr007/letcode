@@ -1,6 +1,6 @@
 //! Flowchart-specific layout, routing, and rendering.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::tui::measure::display_width;
 
@@ -78,8 +78,12 @@ fn render_linear(graph: &ir::MermaidGraph, width: usize) -> Option<Vec<Vec<Merma
             from.end,
             from.atomic,
         ));
+        let reverse = if edge.reverse_arrow { '◀' } else { ' ' };
+        let forward = if edge.arrow { '▶' } else { ' ' };
         if let Some(label) = &edge.label {
-            spans.push(MermaidRenderSpan::decoration(format!(" {line}{line}")));
+            spans.push(MermaidRenderSpan::decoration(format!(
+                " {reverse}{line}{line}"
+            )));
             spans.push(source_span(
                 &linear_label(&label.text),
                 label.start,
@@ -87,13 +91,11 @@ fn render_linear(graph: &ir::MermaidGraph, width: usize) -> Option<Vec<Vec<Merma
                 label.atomic,
             ));
             spans.push(MermaidRenderSpan::decoration(format!(
-                " {line}{line}{} ",
-                if edge.arrow { '▶' } else { ' ' }
+                " {line}{line}{forward} "
             )));
         } else {
             spans.push(MermaidRenderSpan::decoration(format!(
-                " {line}{line}{} ",
-                if edge.arrow { '▶' } else { ' ' }
+                " {reverse}{line}{line}{forward} "
             )));
         }
         spans.push(source_span(
@@ -141,25 +143,26 @@ fn fits(lines: &[Vec<MermaidRenderSpan>], width: usize) -> bool {
 }
 
 fn layout(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::MermaidCanvas> {
-    let layers = mermaid_layers(graph)?;
+    let (layers, feedback) = mermaid_topology(graph)?;
     if layers.len() > 24 || graph.nodes.len() > 48 {
         return None;
     }
+    let node_gap = mermaid_node_gap(graph);
     for layer in &layers {
         let required = layer
             .iter()
             .map(|id| mermaid_node_width(&graph.nodes[id]))
             .sum::<usize>()
-            + MERMAID_NODE_GAP * layer.len().saturating_sub(1);
+            + node_gap * layer.len().saturating_sub(1);
         if required > width {
             return None;
         }
     }
-    render_mermaid_canvas(graph, &layers)
+    render_mermaid_canvas(graph, &layers, &feedback)
 }
 
 fn layout_horizontal(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::MermaidCanvas> {
-    let layers = mermaid_layers(graph)?;
+    let (layers, feedback) = mermaid_topology(graph)?;
     if layers.len() > 16 || graph.nodes.len() > 32 {
         return None;
     }
@@ -243,7 +246,7 @@ fn layout_horizontal(graph: &ir::MermaidGraph, width: usize) -> Option<canvas::M
             row += node_height + 2;
         }
     }
-    route_horizontal_edges(&mut canvas, graph, &placements, &layer_of)?;
+    route_horizontal_edges(&mut canvas, graph, &placements, &layer_of, &feedback)?;
     Some(canvas)
 }
 
@@ -320,6 +323,24 @@ fn horizontal_target_entry(
     }
 }
 
+fn horizontal_layer_bounds(
+    id: &str,
+    layer_of: &HashMap<&str, usize>,
+    placements: &PlacementMap<'_>,
+) -> Option<(usize, usize)> {
+    let layer = *layer_of.get(id)?;
+    placements
+        .iter()
+        .filter(|(node_id, _)| layer_of.get(**node_id).copied() == Some(layer))
+        .map(|(_, placement)| (placement.col, placement.col + placement.width))
+        .fold(None, |bounds, (left, right)| {
+            Some(match bounds {
+                Some((min_left, max_right)) => (min_left.min(left), max_right.max(right)),
+                None => (left, right),
+            })
+        })
+}
+
 fn horizontal_channel_bounds(a: usize, b: usize) -> Option<(usize, usize)> {
     let lo = a.min(b).checked_add(1)?;
     let hi = a.max(b).checked_sub(1)?;
@@ -348,7 +369,11 @@ fn push_horizontal_segment<'a>(
     }
 }
 
-fn horizontal_routes_do_not_conflict(segments: &[HorizontalRouteSegment<'_>]) -> bool {
+fn horizontal_routes_do_not_conflict(
+    segments: &[HorizontalRouteSegment<'_>],
+    shared_node_ports: &HashSet<(usize, usize)>,
+    graph: Option<&ir::MermaidGraph>,
+) -> bool {
     let mut vertices = HashMap::new();
     let mut units = HashMap::new();
     for segment in segments {
@@ -359,6 +384,8 @@ fn horizontal_routes_do_not_conflict(segments: &[HorizontalRouteSegment<'_>]) ->
             for point in [from, to] {
                 if let Some(owner) = vertices.get(&point)
                     && *owner != segment.owner
+                    && !shared_node_ports.contains(&point)
+                    && !vertical_trunks_may_share(*owner, segment.owner, graph)
                 {
                     return false;
                 }
@@ -367,6 +394,7 @@ fn horizontal_routes_do_not_conflict(segments: &[HorizontalRouteSegment<'_>]) ->
             let unit = if from <= to { (from, to) } else { (to, from) };
             if let Some(owner) = units.get(&unit)
                 && *owner != segment.owner
+                && !vertical_trunks_may_share(*owner, segment.owner, graph)
             {
                 return false;
             }
@@ -428,11 +456,15 @@ fn route_horizontal_edges(
     graph: &ir::MermaidGraph,
     placements: &PlacementMap<'_>,
     layer_of: &HashMap<&str, usize>,
+    feedback: &HashSet<usize>,
 ) -> Option<()> {
     let left_to_right = matches!(graph.direction, ir::MermaidDirection::Lr);
     let mut outgoing: HashMap<&str, Vec<&ir::MermaidEdge>> = HashMap::new();
     let mut incoming: HashMap<&str, Vec<&ir::MermaidEdge>> = HashMap::new();
-    for edge in &graph.edges {
+    for (index, edge) in graph.edges.iter().enumerate() {
+        if feedback.contains(&index) {
+            continue;
+        }
         outgoing.entry(edge.from.as_str()).or_default().push(edge);
         incoming.entry(edge.to.as_str()).or_default().push(edge);
     }
@@ -587,6 +619,9 @@ fn route_horizontal_edges(
     let mut arrows = Vec::new();
     let mut label_routes = Vec::new();
     for (edge_index, edge) in graph.edges.iter().enumerate() {
+        if feedback.contains(&edge_index) {
+            continue;
+        }
         let from = placements.get(edge.from.as_str())?;
         let to = placements.get(edge.to.as_str())?;
         let from_row = from.row + from.height / 2;
@@ -653,6 +688,9 @@ fn route_horizontal_edges(
         if edge.arrow {
             arrows.push((target_entry, if left_to_right { '▶' } else { '◀' }));
         }
+        if edge.reverse_arrow {
+            arrows.push((source_exit, if left_to_right { '◀' } else { '▶' }));
+        }
         if edge.label.is_some() {
             label_routes.push(HorizontalLabelRoute {
                 edge,
@@ -665,8 +703,103 @@ fn route_horizontal_edges(
         }
     }
     segments.extend(beam_segments);
-    if !horizontal_routes_do_not_conflict(&segments)
-        || !horizontal_routes_avoid_nodes(&segments, placements)
+    let mut feedback_labels = Vec::new();
+    let mut feedback_indices = feedback.iter().copied().collect::<Vec<_>>();
+    feedback_indices.sort_unstable();
+    let feedback_base_row = placements
+        .values()
+        .map(|placed| placed.row + placed.height)
+        .max()?;
+    for (feedback_offset, edge_index) in feedback_indices.into_iter().enumerate() {
+        let edge = &graph.edges[edge_index];
+        if edge.from == edge.to {
+            return None;
+        }
+        let from = placements.get(edge.from.as_str())?;
+        let to = placements.get(edge.to.as_str())?;
+        let source_feedback_count = feedback
+            .iter()
+            .filter(|index| graph.edges[**index].from == edge.from)
+            .count();
+        let target_feedback_count = feedback
+            .iter()
+            .filter(|index| graph.edges[**index].to == edge.to)
+            .count();
+        let owner = if target_feedback_count > 1 {
+            HorizontalRouteOwner::Target(edge.to.as_str())
+        } else if source_feedback_count > 1 {
+            HorizontalRouteOwner::Source(edge.from.as_str())
+        } else {
+            HorizontalRouteOwner::Edge(edge_index)
+        };
+        let bottom_row = feedback_base_row + 2 + feedback_offset * 2;
+        let source_row = from.row + from.height / 2;
+        let target_row = to.row + to.height / 2;
+        let source_port = (from.col + from.width, source_row);
+        let target_port = (to.col + to.width, target_row);
+        let source_layer_right = horizontal_layer_bounds(&edge.from, layer_of, placements)?.1;
+        let target_layer_right = horizontal_layer_bounds(&edge.to, layer_of, placements)?.1;
+        let channel_offset = 1 + feedback_offset * 2;
+        let source_channel = source_layer_right.checked_add(channel_offset)?;
+        let target_channel = target_layer_right.checked_add(channel_offset)?;
+        let path = [
+            (source_port, (source_channel, source_row)),
+            ((source_channel, source_row), (source_channel, bottom_row)),
+            ((source_channel, bottom_row), (target_channel, bottom_row)),
+            ((target_channel, bottom_row), (target_channel, target_row)),
+            ((target_channel, target_row), target_port),
+        ];
+        let path_segments = path
+            .iter()
+            .map(|(from, to)| HorizontalRouteSegment {
+                from: *from,
+                to: *to,
+                owner,
+            })
+            .collect::<Vec<_>>();
+        let mut combined = segments.clone();
+        combined.extend(path_segments.iter().copied());
+        if !horizontal_routes_avoid_nodes(&combined, placements) {
+            return None;
+        }
+        for (from, to) in path {
+            push_horizontal_segment(&mut segments, from, to, owner);
+        }
+        if edge.arrow {
+            arrows.push((target_port, '◀'));
+        }
+        if edge.reverse_arrow {
+            arrows.push((source_port, '◀'));
+        }
+        let label_row = bottom_row;
+        let label_start = source_channel;
+        let label_end = target_channel;
+        if let Some(label) = &edge.label {
+            let label_width = mermaid_label_width(&label.text);
+            if let Some(col) = centered_mermaid_label_col(label_start, label_end, label_width) {
+                feedback_labels.push((
+                    label_row,
+                    col,
+                    label.text.as_str(),
+                    MermaidSourceSpan::new(label.start, label.end),
+                ));
+            } else {
+                return None;
+            }
+        }
+    }
+    let shared_node_ports = placements
+        .values()
+        .flat_map(|placed| {
+            let row = placed.row + placed.height / 2;
+            [
+                (placed.col.saturating_sub(1), row),
+                (placed.col + placed.width, row),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    if !horizontal_routes_avoid_nodes(&segments, placements)
+        || !horizontal_routes_do_not_conflict(&segments, &shared_node_ports, Some(graph))
     {
         return None;
     }
@@ -711,13 +844,18 @@ fn route_horizontal_edges(
     for (row, col, text, source) in edge_labels {
         place_multiline_label(canvas, row, col, text, source);
     }
+    for (row, col, text, source) in feedback_labels {
+        place_multiline_label(canvas, row, col, text, source);
+    }
     Some(())
 }
 
 fn render_mermaid_canvas(
     graph: &ir::MermaidGraph,
     layers: &[Vec<String>],
+    feedback: &HashSet<usize>,
 ) -> Option<canvas::MermaidCanvas> {
+    let node_gap = mermaid_node_gap(graph);
     let layer_widths = layers
         .iter()
         .map(|layer| {
@@ -725,7 +863,7 @@ fn render_mermaid_canvas(
                 .iter()
                 .map(|id| mermaid_node_width(&graph.nodes[id]))
                 .sum::<usize>()
-                + MERMAID_NODE_GAP * layer.len().saturating_sub(1)
+                + node_gap * layer.len().saturating_sub(1)
         })
         .collect::<Vec<_>>();
     let layer_heights = layers
@@ -756,11 +894,11 @@ fn render_mermaid_canvas(
                     height,
                 },
             );
-            col += width + MERMAID_NODE_GAP;
+            col += width + node_gap;
         }
         row += layer_height + MERMAID_EDGE_HEIGHT;
     }
-    route_mermaid_edges(&mut canvas, graph, &placements)?;
+    route_mermaid_edges(&mut canvas, graph, &placements, feedback)?;
     Some(canvas)
 }
 
@@ -800,6 +938,17 @@ fn render_mermaid_node_shape(node: &ir::MermaidNode) -> Vec<String> {
     shape.push(format!("╰{}╯", "─".repeat(inner_width)));
     let _ = node.shape;
     shape
+}
+
+fn mermaid_node_gap(graph: &ir::MermaidGraph) -> usize {
+    graph
+        .edges
+        .iter()
+        .filter_map(|edge| edge.label.as_ref())
+        .map(|label| mermaid_label_width(&label.text).saturating_add(2))
+        .max()
+        .unwrap_or(MERMAID_NODE_GAP)
+        .clamp(MERMAID_NODE_GAP, 16)
 }
 
 fn mermaid_label_width(label: &str) -> usize {
@@ -847,10 +996,14 @@ fn route_mermaid_edges(
     canvas: &mut canvas::MermaidCanvas,
     graph: &ir::MermaidGraph,
     placements: &PlacementMap<'_>,
+    feedback: &HashSet<usize>,
 ) -> Option<()> {
     let mut outgoing: HashMap<&str, Vec<&ir::MermaidEdge>> = HashMap::new();
     let mut incoming: HashMap<&str, Vec<&ir::MermaidEdge>> = HashMap::new();
-    for edge in &graph.edges {
+    for (index, edge) in graph.edges.iter().enumerate() {
+        if feedback.contains(&index) {
+            continue;
+        }
         outgoing.entry(edge.from.as_str()).or_default().push(edge);
         incoming.entry(edge.to.as_str()).or_default().push(edge);
     }
@@ -902,6 +1055,9 @@ fn route_mermaid_edges(
     let mut arrows = Vec::new();
     let mut labels = Vec::new();
     for (edge_index, edge) in graph.edges.iter().enumerate() {
+        if feedback.contains(&edge_index) {
+            continue;
+        }
         let Some(from) = placements.get(edge.from.as_str()) else {
             continue;
         };
@@ -966,11 +1122,74 @@ fn route_mermaid_edges(
             push_horizontal_segment(&mut route_segments, from, to, owner);
         }
         if edge.arrow {
-            arrows.push(target_entry);
+            arrows.push((target_entry, '▼'));
+        }
+        if edge.reverse_arrow {
+            arrows.push((source_exit, '▲'));
         }
         labels.push((edge, departure, arrival, from_col, channel, to_col, forked));
     }
-    if !vertical_routes_do_not_cross(&route_segments) {
+
+    let outer_col_base = placements
+        .values()
+        .map(|placed| placed.col + placed.width)
+        .max()?
+        .checked_add(8)?;
+    let mut feedback_indices = feedback.iter().copied().collect::<Vec<_>>();
+    feedback_indices.sort_unstable();
+    for (feedback_offset, edge_index) in feedback_indices.into_iter().enumerate() {
+        let outer_col = outer_col_base.checked_add(feedback_offset * 4)?;
+        let edge = &graph.edges[edge_index];
+        if edge.from == edge.to {
+            return None;
+        }
+        let from = placements.get(edge.from.as_str())?;
+        let to = placements.get(edge.to.as_str())?;
+        let source = (from.col + from.width, from.row + from.height / 2);
+        let target = (to.col + to.width, to.row + to.height / 2);
+        let owner = HorizontalRouteOwner::Edge(edge_index);
+        let path = [
+            (source, (outer_col, source.1)),
+            ((outer_col, source.1), (outer_col, target.1)),
+            ((outer_col, target.1), target),
+        ];
+        let feedback_segments = path
+            .iter()
+            .map(|(from, to)| HorizontalRouteSegment {
+                from: *from,
+                to: *to,
+                owner,
+            })
+            .collect::<Vec<_>>();
+        if !horizontal_routes_avoid_nodes(&feedback_segments, placements)
+            || !vertical_routes_do_not_cross(&feedback_segments, Some(graph))
+        {
+            return None;
+        }
+        for (from, to) in path {
+            connect_mermaid_route(&mut routes, from, to);
+            push_horizontal_segment(&mut route_segments, from, to, owner);
+        }
+        if edge.arrow {
+            arrows.push((target, '◀'));
+        }
+        if edge.reverse_arrow {
+            arrows.push((source, '◀'));
+        }
+        if let Some(label) = &edge.label {
+            let col = outer_col + 1;
+            place_multiline_label(
+                canvas,
+                (source.1 + target.1) / 2,
+                col,
+                &label.text,
+                MermaidSourceSpan::new(label.start, label.end),
+            );
+        }
+    }
+    if !horizontal_routes_avoid_nodes(&route_segments, placements)
+        || !vertical_routes_do_not_cross(&route_segments, Some(graph))
+    {
         return None;
     }
     let mut route_cells = routes.iter().collect::<Vec<_>>();
@@ -978,8 +1197,8 @@ fn route_mermaid_edges(
     for (&(col, row), &mask) in route_cells {
         canvas.put(col, row, mermaid_route_glyph(mask));
     }
-    for (col, row) in arrows {
-        canvas.put(col, row, '▼');
+    for ((col, row), arrow) in arrows {
+        canvas.put(col, row, arrow);
     }
     for (edge, departure, arrival, from_col, channel, to_col, forked) in labels {
         place_edge_label(
@@ -989,7 +1208,10 @@ fn route_mermaid_edges(
     Some(())
 }
 
-fn vertical_routes_do_not_cross(segments: &[HorizontalRouteSegment<'_>]) -> bool {
+fn vertical_routes_do_not_cross(
+    segments: &[HorizontalRouteSegment<'_>],
+    graph: Option<&ir::MermaidGraph>,
+) -> bool {
     for (index, first) in segments.iter().enumerate() {
         for second in &segments[index + 1..] {
             if first.owner == second.owner {
@@ -1020,7 +1242,7 @@ fn vertical_routes_do_not_cross(segments: &[HorizontalRouteSegment<'_>]) -> bool
                 };
                 if same_axis
                     && first_min.max(second_min) < first_max.min(second_max)
-                    && !vertical_trunks_may_share(first.owner, second.owner)
+                    && !vertical_trunks_may_share(first.owner, second.owner, graph)
                 {
                     return false;
                 }
@@ -1052,17 +1274,22 @@ fn vertical_routes_do_not_cross(segments: &[HorizontalRouteSegment<'_>]) -> bool
 fn vertical_trunks_may_share(
     first: HorizontalRouteOwner<'_>,
     second: HorizontalRouteOwner<'_>,
+    graph: Option<&ir::MermaidGraph>,
 ) -> bool {
-    matches!(
-        (first, second),
-        (
-            HorizontalRouteOwner::Source(_),
-            HorizontalRouteOwner::Target(_)
-        ) | (
-            HorizontalRouteOwner::Target(_),
-            HorizontalRouteOwner::Source(_)
-        )
-    )
+    let (source, target) = match (first, second) {
+        (HorizontalRouteOwner::Source(source), HorizontalRouteOwner::Target(target))
+        | (HorizontalRouteOwner::Target(target), HorizontalRouteOwner::Source(source)) => {
+            (source, target)
+        }
+        _ => return false,
+    };
+    source == target
+        || graph.is_some_and(|graph| {
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == source && edge.to == target)
+        })
 }
 
 fn mermaid_row_in_box(row: usize, placements: &PlacementMap<'_>) -> bool {
@@ -1204,10 +1431,45 @@ fn place_multiline_label(
     }
 }
 
-pub(super) fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>>> {
+fn topology_reachable(
+    start: &str,
+    goal: &str,
+    selected: &[usize],
+    graph: &ir::MermaidGraph,
+) -> bool {
+    let mut stack = vec![start];
+    let mut visited = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == goal {
+            return true;
+        }
+        if !visited.insert(id) {
+            continue;
+        }
+        for &edge_index in selected {
+            let edge = &graph.edges[edge_index];
+            if edge.from == id {
+                stack.push(edge.to.as_str());
+            }
+        }
+    }
+    false
+}
+
+fn mermaid_topology(graph: &ir::MermaidGraph) -> Option<(Vec<Vec<String>>, HashSet<usize>)> {
+    let mut selected = Vec::new();
+    let mut feedback = HashSet::new();
+    for (index, edge) in graph.edges.iter().enumerate() {
+        if edge.from == edge.to || topology_reachable(&edge.to, &edge.from, &selected, graph) {
+            feedback.insert(index);
+        } else {
+            selected.push(index);
+        }
+    }
+
     let mut indeg: HashMap<String, usize> = graph.nodes.keys().map(|id| (id.clone(), 0)).collect();
-    for edge in &graph.edges {
-        *indeg.get_mut(&edge.to)? += 1;
+    for &edge_index in &selected {
+        *indeg.get_mut(&graph.edges[edge_index].to)? += 1;
     }
     let mut layers = Vec::new();
     let mut remaining = graph.nodes.len();
@@ -1222,7 +1484,11 @@ pub(super) fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>
             return None;
         }
         for id in &layer {
-            for edge in graph.edges.iter().filter(|edge| &edge.from == id) {
+            for &edge_index in selected
+                .iter()
+                .filter(|index| graph.edges[**index].from == *id)
+            {
+                let edge = &graph.edges[edge_index];
                 if let Some(degree) = indeg.get_mut(&edge.to) {
                     *degree = degree.saturating_sub(1);
                 }
@@ -1232,7 +1498,12 @@ pub(super) fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>
         remaining -= layer.len();
         layers.push(layer);
     }
-    Some(layers)
+    Some((layers, feedback))
+}
+
+#[cfg(test)]
+pub(super) fn mermaid_layers(graph: &ir::MermaidGraph) -> Option<Vec<Vec<String>>> {
+    mermaid_topology(graph).map(|(layers, _)| layers)
 }
 #[cfg(test)]
 pub(super) fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]) -> usize {
@@ -1270,7 +1541,12 @@ pub(super) fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]
 
 #[cfg(test)]
 mod tests {
-    use super::{HorizontalRouteOwner, HorizontalRouteSegment, horizontal_routes_do_not_conflict};
+    use std::collections::HashSet;
+
+    use super::{
+        HorizontalRouteOwner, HorizontalRouteSegment, horizontal_routes_do_not_conflict,
+        vertical_trunks_may_share,
+    };
 
     #[test]
     fn horizontal_route_ownership_allows_same_net_junctions_and_rejects_foreign_contacts() {
@@ -1287,13 +1563,35 @@ mod tests {
                 owner,
             },
         ];
-        assert!(horizontal_routes_do_not_conflict(&segments));
+        assert!(horizontal_routes_do_not_conflict(
+            &segments,
+            &HashSet::new(),
+            None,
+        ));
 
         segments.push(HorizontalRouteSegment {
             from: (2, 1),
             to: (4, 1),
             owner: HorizontalRouteOwner::Edge(0),
         });
-        assert!(!horizontal_routes_do_not_conflict(&segments));
+        assert!(!horizontal_routes_do_not_conflict(
+            &segments,
+            &HashSet::new(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn independent_fanout_and_fanin_do_not_share_a_trunk() {
+        assert!(!vertical_trunks_may_share(
+            HorizontalRouteOwner::Source("fanout"),
+            HorizontalRouteOwner::Target("fanin"),
+            None,
+        ));
+        assert!(vertical_trunks_may_share(
+            HorizontalRouteOwner::Source("same"),
+            HorizontalRouteOwner::Target("same"),
+            None,
+        ));
     }
 }

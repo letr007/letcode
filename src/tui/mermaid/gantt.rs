@@ -20,7 +20,14 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
         })
         .collect::<Vec<_>>();
     validate_task_dependencies(&tasks)?;
-    if let Some(positioned) = position_tasks(&tasks)
+    let excludes_weekends = diagram.items.iter().any(|item| {
+        matches!(
+            item,
+            ir::Item::Config(config)
+                if config.key == "excludes" && config.value.text == "weekends"
+        )
+    });
+    if let Some(positioned) = position_tasks(&tasks, excludes_weekends)
         && let Some(canvas) = layout(&diagram, width, &tasks, &positioned)
     {
         let lines = canvas.render();
@@ -112,7 +119,7 @@ fn validate_task_dependencies(tasks: &[&ir::Task]) -> Option<()> {
     Some(())
 }
 
-fn position_tasks(tasks: &[&ir::Task]) -> Option<Vec<PositionedTask>> {
+fn position_tasks(tasks: &[&ir::Task], excludes_weekends: bool) -> Option<Vec<PositionedTask>> {
     let mut ids = HashMap::new();
     for (index, task) in tasks.iter().enumerate() {
         if let Some(id) = &task.id
@@ -123,7 +130,14 @@ fn position_tasks(tasks: &[&ir::Task]) -> Option<Vec<PositionedTask>> {
     }
     let mut resolved = vec![None; tasks.len()];
     for index in 0..tasks.len() {
-        resolve_task(index, tasks, &ids, &mut resolved, &mut HashSet::new())?;
+        resolve_task(
+            index,
+            tasks,
+            &ids,
+            &mut resolved,
+            &mut HashSet::new(),
+            excludes_weekends,
+        )?;
     }
     tasks
         .iter()
@@ -314,6 +328,7 @@ fn resolve_task(
     ids: &HashMap<&str, usize>,
     resolved: &mut [Option<(i64, i64)>],
     visiting: &mut HashSet<usize>,
+    excludes_weekends: bool,
 ) -> Option<(i64, i64)> {
     if let Some(value) = resolved[index] {
         return Some(value);
@@ -328,7 +343,15 @@ fn resolve_task(
         date
     } else if let Some(id) = start_token.strip_prefix("after ") {
         let predecessor = *ids.get(id.trim())?;
-        resolve_task(predecessor, tasks, ids, resolved, visiting)?.1
+        resolve_task(
+            predecessor,
+            tasks,
+            ids,
+            resolved,
+            visiting,
+            excludes_weekends,
+        )?
+        .1
     } else {
         return None;
     };
@@ -336,9 +359,17 @@ fn resolve_task(
         date
     } else if let Some(id) = end_token.strip_prefix("until ") {
         let predecessor = *ids.get(id.trim())?;
-        resolve_task(predecessor, tasks, ids, resolved, visiting)?.1
+        resolve_task(
+            predecessor,
+            tasks,
+            ids,
+            resolved,
+            visiting,
+            excludes_weekends,
+        )?
+        .0
     } else if let Some(days) = duration_days(end_token) {
-        start.checked_add(days)?
+        advance_duration(start, days, excludes_weekends)?
     } else {
         return None;
     };
@@ -356,6 +387,44 @@ fn resolve_task(
     }
     resolved[index] = Some((start, end));
     Some((start, end))
+}
+
+fn advance_duration(start: i64, days: i64, excludes_weekends: bool) -> Option<i64> {
+    if !excludes_weekends {
+        return start.checked_add(days);
+    }
+    if days == 0 {
+        return Some(start);
+    }
+
+    let mut end = start;
+    let mut remaining = days;
+    if is_weekend(end) {
+        end = next_weekday(end)?;
+        remaining -= 1;
+        if remaining == 0 {
+            return Some(end);
+        }
+    }
+
+    let full_weeks = remaining / 5;
+    end = end.checked_add(full_weeks.checked_mul(7)?)?;
+    for _ in 0..(remaining % 5) {
+        end = next_weekday(end)?;
+    }
+    Some(end)
+}
+
+fn next_weekday(day: i64) -> Option<i64> {
+    let mut next = day.checked_add(1)?;
+    while is_weekend(next) {
+        next = next.checked_add(1)?;
+    }
+    Some(next)
+}
+
+fn is_weekend(day: i64) -> bool {
+    matches!(day.rem_euclid(7), 2 | 3)
 }
 
 fn task_text_width(task: &ir::Task) -> usize {
@@ -548,12 +617,28 @@ fn parse(source: &str) -> Option<ir::Diagram> {
                     span: MermaidSourceSpan::new(base + at, base + at + value.chars().count()),
                 }));
             }
-            "excludes" | "todayMarker" | "weekday" => return None,
+            "excludes" => {
+                if value != "weekends" {
+                    return None;
+                }
+                let at = find_char(trimmed, value)?;
+                items.push(ir::Item::Config(ir::Config {
+                    key: "excludes",
+                    value: ir::Label {
+                        text: value.to_string(),
+                        span: MermaidSourceSpan::new(base + at, base + at + value.chars().count()),
+                    },
+                }));
+            }
+            "todayMarker" | "weekday" => return None,
             _ => items.push(ir::Item::Task(parse_task(trimmed, base)?)),
         }
         offset += raw.chars().count() + 1;
     }
-    (!items.is_empty()).then_some(ir::Diagram { items })
+    items
+        .iter()
+        .any(|item| matches!(item, ir::Item::Task(_)))
+        .then_some(ir::Diagram { items })
 }
 
 fn parse_task(line: &str, base: usize) -> Option<ir::Task> {

@@ -22,6 +22,8 @@ mod journey_ir;
 mod mindmap;
 mod pie;
 mod pie_ir;
+mod quadrant;
+mod quadrant_ir;
 mod routing;
 mod sequence;
 mod sequence_ir;
@@ -141,6 +143,7 @@ fn render_uncached(source: &str, width: usize) -> Option<MermaidRender> {
         "journey" => journey::render(source, width)?,
         "mindmap" => mindmap::render(source, width)?,
         header if header == "pie" || header.starts_with("pie ") => pie::render(source, width)?,
+        "quadrantChart" => quadrant::render(source, width)?,
         "timeline" | "timeline LR" => timeline::render(source, width)?,
         "stateDiagram" | "stateDiagram-v2" => state::render(source, width)?,
         header

@@ -61,4 +61,5 @@ pub(crate) struct MermaidEdge {
     pub(crate) label: Option<MermaidLabel>,
     pub(crate) style: MermaidEdgeStyle,
     pub(crate) arrow: bool,
+    pub(crate) reverse_arrow: bool,
 }

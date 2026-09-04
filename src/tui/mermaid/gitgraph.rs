@@ -90,15 +90,20 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
         match item {
             ir::Item::Commit(commit) => {
                 let index = *branch_index.get(current.as_str())?;
-                canvas.put(centers[index], row, '●');
+                canvas.put(centers[index], row, commit_glyph(commit.commit_type));
                 draw_command_prefix(&mut canvas, row, label_start, "commit");
+                let mut col = label_start + display_width("commit ");
                 if let Some(id) = &commit.id {
-                    canvas.labels.push(canvas::MermaidCanvasLabel {
-                        row,
-                        col: label_start + display_width("commit "),
-                        text: id.text.clone(),
-                        source: id.span,
-                    });
+                    draw_source_label(&mut canvas, row, col, id);
+                    col += display_width(&id.text);
+                }
+                if let Some(tag) = &commit.tag {
+                    let prefix = if commit.id.is_some() {
+                        " tag: "
+                    } else {
+                        "tag: "
+                    };
+                    draw_metadata_label(&mut canvas, row, col, prefix, tag);
                 }
             }
             ir::Item::Branch(branch) => {
@@ -115,11 +120,25 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
                 draw_command_label(&mut canvas, row, label_start, "checkout ", branch);
                 current = branch.text.clone();
             }
-            ir::Item::Merge(branch) => {
-                let from = *branch_index.get(branch.text.as_str())?;
+            ir::Item::Merge(merge) => {
+                let from = *branch_index.get(merge.branch.text.as_str())?;
                 let to = *branch_index.get(current.as_str())?;
-                connect_merge(&mut canvas, row, centers[from], centers[to]);
-                draw_command_label(&mut canvas, row, label_start, "merge ", branch);
+                connect_merge(
+                    &mut canvas,
+                    row,
+                    centers[from],
+                    centers[to],
+                    commit_glyph(merge.commit_type),
+                );
+                draw_command_label(&mut canvas, row, label_start, "merge ", &merge.branch);
+                let mut col =
+                    label_start + display_width("merge ") + display_width(&merge.branch.text);
+                if let Some(id) = &merge.id {
+                    col += draw_metadata_label(&mut canvas, row, col, " id: ", id);
+                }
+                if let Some(tag) = &merge.tag {
+                    draw_metadata_label(&mut canvas, row, col, " tag: ", tag);
+                }
             }
         }
     }
@@ -164,13 +183,19 @@ fn connect_branch(canvas: &mut canvas::MermaidCanvas, row: usize, from: usize, t
     }
 }
 
-fn connect_merge(canvas: &mut canvas::MermaidCanvas, row: usize, from: usize, to: usize) {
+fn connect_merge(
+    canvas: &mut canvas::MermaidCanvas,
+    row: usize,
+    from: usize,
+    to: usize,
+    target_glyph: char,
+) {
     let (left, right) = (from.min(to), from.max(to));
     for col in left..=right {
         let glyph = if col == from {
             '○'
         } else if col == to {
-            '●'
+            target_glyph
         } else if from < to && col + 1 == to {
             '▶'
         } else if from > to && col == to + 1 {
@@ -182,8 +207,43 @@ fn connect_merge(canvas: &mut canvas::MermaidCanvas, row: usize, from: usize, to
     }
 }
 
+fn commit_glyph(commit_type: ir::CommitType) -> char {
+    match commit_type {
+        ir::CommitType::Normal => '●',
+        ir::CommitType::Reverse => '⊗',
+        ir::CommitType::Highlight => '■',
+    }
+}
+
 fn draw_command_prefix(canvas: &mut canvas::MermaidCanvas, row: usize, col: usize, command: &str) {
     canvas.blit(row, col, &format!("{command} "));
+}
+
+fn draw_source_label(
+    canvas: &mut canvas::MermaidCanvas,
+    row: usize,
+    col: usize,
+    label: &ir::Label,
+) {
+    canvas.labels.push(canvas::MermaidCanvasLabel {
+        row,
+        col,
+        text: label.text.clone(),
+        source: label.span,
+    });
+}
+
+fn draw_metadata_label(
+    canvas: &mut canvas::MermaidCanvas,
+    row: usize,
+    col: usize,
+    prefix: &str,
+    label: &ir::Label,
+) -> usize {
+    canvas.blit(row, col, prefix);
+    let value_col = col + display_width(prefix);
+    draw_source_label(canvas, row, value_col, label);
+    display_width(prefix) + display_width(&label.text)
 }
 
 fn draw_command_label(
@@ -204,12 +264,39 @@ fn draw_command_label(
 
 fn item_label_width(item: &ir::Item) -> usize {
     match item {
-        ir::Item::Commit(commit) => commit.id.as_ref().map_or(display_width("commit"), |id| {
-            display_width("commit ") + display_width(&id.text)
-        }),
+        ir::Item::Commit(commit) => {
+            display_width("commit")
+                + commit
+                    .id
+                    .as_ref()
+                    .map_or(0, |id| display_width(" ") + display_width(&id.text))
+                + if commit.id.is_none() && commit.tag.is_some() {
+                    1
+                } else {
+                    0
+                }
+                + commit.tag.as_ref().map_or(0, |tag| {
+                    display_width(if commit.id.is_some() {
+                        " tag: "
+                    } else {
+                        "tag: "
+                    }) + display_width(&tag.text)
+                })
+        }
         ir::Item::Branch(label) => display_width("branch ") + display_width(&label.text),
         ir::Item::Checkout(label) => display_width("checkout ") + display_width(&label.text),
-        ir::Item::Merge(label) => display_width("merge ") + display_width(&label.text),
+        ir::Item::Merge(merge) => {
+            display_width("merge ")
+                + display_width(&merge.branch.text)
+                + merge
+                    .id
+                    .as_ref()
+                    .map_or(0, |id| display_width(" id: ") + display_width(&id.text))
+                + merge
+                    .tag
+                    .as_ref()
+                    .map_or(0, |tag| display_width(" tag: ") + display_width(&tag.text))
+        }
     }
 }
 
@@ -257,22 +344,34 @@ fn parse(source: &str) -> Option<ir::Diagram> {
             offset += line_len + 1;
             continue;
         }
+        let command_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let whitespace = &trimmed[command_end..];
+        let rest_base = base
+            + trimmed[..command_end].chars().count()
+            + whitespace
+                .chars()
+                .count()
+                .saturating_sub(whitespace.trim_start().chars().count());
         let (command, rest) = trimmed
             .split_once(char::is_whitespace)
             .map_or((trimmed, ""), |(command, rest)| (command, rest.trim()));
         match command {
             "commit" => {
-                let id = parse_commit_id(rest, trimmed, base)?;
-                if let Some(id) = &id {
+                let metadata = parse_metadata(rest, rest_base)?;
+                if let Some(id) = &metadata.id {
                     if !commit_ids.insert(id.text.clone()) {
                         return None;
                     }
                 }
-                items.push(ir::Item::Commit(ir::Commit { id }));
+                items.push(ir::Item::Commit(ir::Commit {
+                    id: metadata.id,
+                    tag: metadata.tag,
+                    commit_type: metadata.commit_type.unwrap_or(ir::CommitType::Normal),
+                }));
                 commits += 1;
             }
             "branch" => {
-                let label = parse_name(rest, trimmed, base)?;
+                let label = parse_name(rest, rest_base)?;
                 if !known.insert(label.text.clone()) {
                     return None;
                 }
@@ -284,7 +383,7 @@ fn parse(source: &str) -> Option<ir::Diagram> {
                 items.push(ir::Item::Branch(label));
             }
             "checkout" => {
-                let label = parse_name(rest, trimmed, base)?;
+                let label = parse_name(rest, rest_base)?;
                 if !known.contains(&label.text) {
                     return None;
                 }
@@ -292,11 +391,11 @@ fn parse(source: &str) -> Option<ir::Diagram> {
                 items.push(ir::Item::Checkout(label));
             }
             "merge" => {
-                let label = parse_name(rest, trimmed, base)?;
-                if !known.contains(&label.text) || label.text == current {
+                let merge = parse_merge(rest, rest_base)?;
+                if !known.contains(&merge.branch.text) || merge.branch.text == current {
                     return None;
                 }
-                items.push(ir::Item::Merge(label));
+                items.push(ir::Item::Merge(merge));
             }
             _ => return None,
         }
@@ -308,45 +407,133 @@ fn parse(source: &str) -> Option<ir::Diagram> {
     Some(ir::Diagram { branches, items })
 }
 
-fn parse_commit_id(rest: &str, line: &str, base: usize) -> Option<Option<ir::Label>> {
-    if rest.is_empty() {
-        return Some(None);
-    }
-    let value = rest.strip_prefix("id:")?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let (text, quote_offset) = if let Some(quoted) = value.strip_prefix('"') {
-        let end = quoted.strip_suffix('"')?;
-        if end.is_empty() || end.contains('"') {
-            return None;
-        }
-        (end, 1)
-    } else {
-        if !valid_name(value) {
-            return None;
-        }
-        (value, 0)
-    };
-    let id_byte = line.find("id:")?;
-    let value_byte = id_byte + 3 + line[id_byte + 3..].find(value)?;
-    let start = base + line[..value_byte].chars().count() + quote_offset;
-    Some(Some(ir::Label {
-        text: text.to_string(),
-        span: MermaidSourceSpan::new(start, start + text.chars().count()),
-    }))
+fn parse_merge(rest: &str, base: usize) -> Option<ir::Merge> {
+    let (branch_name, metadata) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(branch, metadata)| (branch, metadata.trim()));
+    let branch = parse_name(branch_name, base)?;
+    let metadata_base = base + branch_name.chars().count();
+    let metadata_base = metadata_base
+        + rest[branch_name.len()..]
+            .chars()
+            .count()
+            .saturating_sub(rest[branch_name.len()..].trim_start().chars().count());
+    let metadata = parse_metadata(metadata, metadata_base)?;
+    Some(ir::Merge {
+        branch,
+        id: metadata.id,
+        tag: metadata.tag,
+        commit_type: metadata.commit_type.unwrap_or(ir::CommitType::Normal),
+    })
 }
 
-fn parse_name(rest: &str, line: &str, base: usize) -> Option<ir::Label> {
+fn parse_metadata(rest: &str, base: usize) -> Option<CommitMetadata> {
+    let mut metadata = CommitMetadata::default();
+    let mut cursor = 0usize;
+    while cursor < rest.len() {
+        while rest[cursor..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            cursor += rest[cursor..].chars().next()?.len_utf8();
+        }
+        if cursor == rest.len() {
+            break;
+        }
+        let key_start = cursor;
+        while cursor < rest.len()
+            && !rest[cursor..].chars().next()?.is_whitespace()
+            && rest.as_bytes()[cursor] != b':'
+        {
+            cursor += rest[cursor..].chars().next()?.len_utf8();
+        }
+        let key = &rest[key_start..cursor];
+        while cursor < rest.len() && rest[cursor..].chars().next()?.is_whitespace() {
+            cursor += rest[cursor..].chars().next()?.len_utf8();
+        }
+        if key.is_empty() || rest.as_bytes().get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor += 1;
+        while cursor < rest.len() && rest[cursor..].chars().next()?.is_whitespace() {
+            cursor += rest[cursor..].chars().next()?.len_utf8();
+        }
+        let value_start = cursor;
+        let (value, value_span_start, quoted) = if rest.as_bytes().get(cursor) == Some(&b'"') {
+            cursor += 1;
+            let content_start = cursor;
+            let end = content_start + rest[content_start..].find('"')?;
+            let value = &rest[content_start..end];
+            if value.is_empty() {
+                return None;
+            }
+            cursor = end + 1;
+            (value, content_start, true)
+        } else {
+            while cursor < rest.len() && !rest[cursor..].chars().next()?.is_whitespace() {
+                cursor += rest[cursor..].chars().next()?.len_utf8();
+            }
+            let value = &rest[value_start..cursor];
+            if value.is_empty() {
+                return None;
+            }
+            (value, value_start, false)
+        };
+        if cursor < rest.len() && !rest[cursor..].chars().next()?.is_whitespace() {
+            return None;
+        }
+        let label = || ir::Label {
+            text: value.to_string(),
+            span: MermaidSourceSpan::new(
+                base + rest[..value_span_start].chars().count(),
+                base + rest[..value_span_start].chars().count() + value.chars().count(),
+            ),
+        };
+        match key {
+            "id" => {
+                if metadata.id.is_some() || (!quoted && !valid_name(value)) {
+                    return None;
+                }
+                metadata.id = Some(label());
+            }
+            "tag" => {
+                if metadata.tag.is_some() || (!quoted && !valid_name(value)) {
+                    return None;
+                }
+                metadata.tag = Some(label());
+            }
+            "type" => {
+                if quoted || metadata.commit_type.is_some() {
+                    return None;
+                }
+                metadata.commit_type = Some(match value {
+                    "NORMAL" => ir::CommitType::Normal,
+                    "REVERSE" => ir::CommitType::Reverse,
+                    "HIGHLIGHT" => ir::CommitType::Highlight,
+                    _ => return None,
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(metadata)
+}
+
+#[derive(Default)]
+struct CommitMetadata {
+    id: Option<ir::Label>,
+    tag: Option<ir::Label>,
+    commit_type: Option<ir::CommitType>,
+}
+
+fn parse_name(rest: &str, base: usize) -> Option<ir::Label> {
     if rest.is_empty() || rest.split_whitespace().count() != 1 || !valid_name(rest) {
         return None;
     }
-    let argument_byte = line.find(char::is_whitespace)?;
-    let value_byte = argument_byte + line[argument_byte..].find(rest)?;
-    let start = base + line[..value_byte].chars().count();
     Some(ir::Label {
         text: rest.to_string(),
-        span: MermaidSourceSpan::new(start, start + rest.chars().count()),
+        span: MermaidSourceSpan::new(base, base + rest.chars().count()),
     })
 }
 

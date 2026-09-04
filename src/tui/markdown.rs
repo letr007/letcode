@@ -1890,6 +1890,10 @@ mod tests {
                 "```mermaid\ngitGraph\ncommit id: start\nbranch feature\ncommit id: implement\ncheckout main\nmerge feature\n```",
                 "merge feature",
             ),
+            (
+                "```mermaid\nquadrantChart\ntitle Technology choice\nx-axis Low cost --> High cost\ny-axis Low return --> High return\nquadrant-1 Invest\nquadrant-2 Evaluate\nquadrant-3 Avoid\nquadrant-4 Trial\nPostgreSQL: [0.4, 0.85]\n```",
+                "PostgreSQL",
+            ),
         ];
         for (markdown, expected) in cases {
             let document =
@@ -1913,6 +1917,7 @@ mod tests {
             "```mermaid\ntimeline\n    2026 : event :\n```",
             "```mermaid\njourney\nsection Build\nInvalid score: 8: Agent\n```",
             "```mermaid\ngitGraph\ncheckout missing\ncommit\n```",
+            "```mermaid\nquadrantChart\nx-axis low --> high\ny-axis low --> high\nquadrant-1 one\nA: [0.5, 0.5]\n```",
         ] {
             let text = rendered(markdown, 80)
                 .iter()

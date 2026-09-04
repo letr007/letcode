@@ -53,7 +53,7 @@ pub(crate) fn parse(source: &str) -> Option<MermaidGraph> {
                 for (idx, byte) in trimmed.bytes().enumerate() {
                     if byte == b';' {
                         let segment = &trimmed[segment_start..idx];
-                        if !segment.trim().is_empty() {
+                        if !segment.trim().is_empty() && !is_structural_statement(segment) {
                             parse_statement(
                                 segment,
                                 base_line + trimmed[..segment_start].chars().count(),
@@ -66,7 +66,7 @@ pub(crate) fn parse(source: &str) -> Option<MermaidGraph> {
                     }
                 }
                 let segment = &trimmed[segment_start..];
-                if !segment.trim().is_empty() {
+                if !segment.trim().is_empty() && !is_structural_statement(segment) {
                     parse_statement(
                         segment,
                         base_line + trimmed[..segment_start].chars().count(),
@@ -127,7 +127,7 @@ fn parse_statement(
 
     let mut pending_nodes = from_group;
     let mut pending_edges = Vec::new();
-    let (mut style, mut arrow, mut label, mut rest, mut rest_base) =
+    let (mut style, mut arrow, mut reverse_arrow, mut label, mut rest, mut rest_base) =
         parse_connector(rest, rest_base)?;
     let mut left_group = pending_nodes.clone();
 
@@ -146,6 +146,7 @@ fn parse_statement(
                     label: label.clone(),
                     style,
                     arrow,
+                    reverse_arrow,
                 });
             }
         }
@@ -155,7 +156,7 @@ fn parse_statement(
         if rest.trim().is_empty() {
             break;
         }
-        (style, arrow, label, rest, rest_base) = parse_connector(rest, rest_base)?;
+        (style, arrow, reverse_arrow, label, rest, rest_base) = parse_connector(rest, rest_base)?;
         left_group = right_group;
     }
 
@@ -264,23 +265,31 @@ fn parse_endpoint_prefix(
 fn parse_connector(
     segment: &str,
     base: usize,
-) -> Option<(MermaidEdgeStyle, bool, Option<MermaidLabel>, &str, usize)> {
+) -> Option<(
+    MermaidEdgeStyle,
+    bool,
+    bool,
+    Option<MermaidLabel>,
+    &str,
+    usize,
+)> {
     let leading = segment.chars().take_while(|ch| ch.is_whitespace()).count();
     let segment = segment.trim_start();
     let base = base + leading;
-    const TOKENS: &[(&str, MermaidEdgeStyle, bool)] = &[
-        ("-.->", MermaidEdgeStyle::Dashed, true),
-        ("--->", MermaidEdgeStyle::Solid, true),
-        ("-->", MermaidEdgeStyle::Solid, true),
-        ("==>", MermaidEdgeStyle::Thick, true),
-        ("-.-", MermaidEdgeStyle::Dashed, false),
-        ("---", MermaidEdgeStyle::Solid, false),
-        ("===", MermaidEdgeStyle::Thick, false),
+    const TOKENS: &[(&str, MermaidEdgeStyle, bool, bool)] = &[
+        ("<-->", MermaidEdgeStyle::Solid, true, true),
+        ("-.->", MermaidEdgeStyle::Dashed, true, false),
+        ("--->", MermaidEdgeStyle::Solid, true, false),
+        ("-->", MermaidEdgeStyle::Solid, true, false),
+        ("==>", MermaidEdgeStyle::Thick, true, false),
+        ("-.-", MermaidEdgeStyle::Dashed, false, false),
+        ("---", MermaidEdgeStyle::Solid, false, false),
+        ("===", MermaidEdgeStyle::Thick, false, false),
     ];
-    for (token, style, arrow) in TOKENS {
+    for (token, style, arrow, reverse_arrow) in TOKENS {
         if let Some(rest) = segment.strip_prefix(token) {
             let (label, rest, rest_base) = parse_pipe_label(rest, base + token.chars().count())?;
-            return Some((*style, *arrow, label, rest, rest_base));
+            return Some((*style, *arrow, *reverse_arrow, label, rest, rest_base));
         }
     }
     let (style, extension) = if segment.starts_with("--") {
@@ -297,16 +306,16 @@ fn parse_connector(
     }
     let rest = segment[2..].trim_start();
     let rest_base = base + 2 + segment[2..].chars().count() - rest.chars().count();
-    const CLOSERS: &[(&str, MermaidEdgeStyle, bool)] = &[
-        ("--->", MermaidEdgeStyle::Solid, true),
-        ("-->", MermaidEdgeStyle::Solid, true),
-        (".->", MermaidEdgeStyle::Dashed, true),
-        ("==>", MermaidEdgeStyle::Thick, true),
-        ("---", MermaidEdgeStyle::Solid, false),
-        ("-.-", MermaidEdgeStyle::Dashed, false),
-        ("===", MermaidEdgeStyle::Thick, false),
+    const CLOSERS: &[(&str, MermaidEdgeStyle, bool, bool)] = &[
+        ("--->", MermaidEdgeStyle::Solid, true, false),
+        ("-->", MermaidEdgeStyle::Solid, true, false),
+        (".->", MermaidEdgeStyle::Dashed, true, false),
+        ("==>", MermaidEdgeStyle::Thick, true, false),
+        ("---", MermaidEdgeStyle::Solid, false, false),
+        ("-.-", MermaidEdgeStyle::Dashed, false, false),
+        ("===", MermaidEdgeStyle::Thick, false, false),
     ];
-    for (closer, cstyle, carrow) in CLOSERS {
+    for (closer, cstyle, carrow, creverse_arrow) in CLOSERS {
         if let Some(pos) = rest.find(closer) {
             if rest[..pos].ends_with(extension) {
                 return None;
@@ -319,6 +328,7 @@ fn parse_connector(
                 return Some((
                     style,
                     *carrow,
+                    *creverse_arrow,
                     Some({
                         let (text, atomic) = parse_label(raw, false)?;
                         MermaidLabel {
@@ -362,6 +372,16 @@ fn parse_pipe_label(segment: &str, base: usize) -> Option<(Option<MermaidLabel>,
         &trimmed[close + 1..],
         tbase + trimmed[..close + 1].chars().count(),
     ))
+}
+
+// Terminal rendering preserves the topology while intentionally ignoring CSS styling.
+fn is_structural_statement(segment: &str) -> bool {
+    let trimmed = segment.trim_start();
+    ["classDef", "class", "style"].iter().any(|keyword| {
+        trimmed
+            .strip_prefix(keyword)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
 }
 
 fn parse_label(raw: &str, multiline: bool) -> Option<(String, bool)> {

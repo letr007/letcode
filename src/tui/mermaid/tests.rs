@@ -352,7 +352,7 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
-    fn multi_layer_crossings_fall_back_when_routes_cannot_be_drawn_unambiguously() {
+    fn multi_layer_crossings_use_unambiguous_linear_fallback() {
         let source = concat!(
             "graph TD\n",
             "A --> J\n",
@@ -989,6 +989,17 @@ A[$$\not_a_supported_command$$] --> B[Done]
                 "\"Rust🚀\" : 60\n",
                 "\"其他✅\" : 40\n",
             ),
+            concat!(
+                "quadrantChart\n",
+                "title 技术选型🙂\n",
+                "x-axis 低成本 --> 高成本\n",
+                "y-axis 低收益 --> 高收益\n",
+                "quadrant-1 重点投入\n",
+                "quadrant-2 谨慎评估\n",
+                "quadrant-3 暂不采用\n",
+                "quadrant-4 快速试点\n",
+                "PostgreSQL✅: [0.4, 0.85]\n",
+            ),
         ];
         for source in cases {
             let rendered = super::super::render(source, 120).unwrap_or_else(|| panic!("{source}"));
@@ -1016,6 +1027,8 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "pie\nTypeScript : 45\n",
             "pie\n\"TypeScript\" : 0\n",
             "pie\n\"TypeScript\" : 45\n\"TypeScript\" : 30\n",
+            "quadrantChart\nx-axis low --> high\ny-axis low --> high\nquadrant-1 one\n",
+            "quadrantChart\nx-axis low --> high\ny-axis low --> high\nquadrant-1 one\nquadrant-1 duplicate\nquadrant-2 two\nquadrant-3 three\nquadrant-4 four\nA: [0.5, 0.5]\n",
         ];
         for source in malformed {
             assert!(
@@ -1034,6 +1047,7 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "journey\nsection Experience\nA very long journey task: 5: User\n",
             "gitGraph\ncommit id: a-very-long-commit-label\n",
             "pie title This title is too long\n\"A\" : 1\n",
+            "quadrantChart\nx-axis low --> high\ny-axis low --> high\nquadrant-1 one\nquadrant-2 two\nquadrant-3 three\nquadrant-4 four\nA very long label: [0.5, 0.5]\n",
         ];
         for source in narrow {
             assert!(super::super::render(source, 4).is_none(), "fit {source:?}");
@@ -1053,6 +1067,7 @@ A[$$\not_a_supported_command$$] --> B[Done]
             "gitGraph \ncommit\n",
             " pie\n\"A\" : 1\n",
             "pieChart\n\"A\" : 1\n",
+            "quadrantChart \nx-axis low --> high\ny-axis low --> high\nquadrant-1 one\nquadrant-2 two\nquadrant-3 three\nquadrant-4 four\nA: [0.5, 0.5]\n",
         ] {
             assert!(
                 super::super::render(source, 120).is_none(),
@@ -2424,6 +2439,439 @@ A[$$\not_a_supported_command$$] --> B[Done]
                 "accepted {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn complex_flowcharts_render_bidirectional_edges_styles_and_feedback_cycles() {
+        let service_flow = concat!(
+            "flowchart TD\n",
+            "Start([用户请求到达]) --> LB[负载均衡器]\n",
+            "LB --> GW{网关鉴权}\n",
+            "GW -->|Token 有效| Route{路由判断}\n",
+            "GW -->|Token 无效| Auth[返回 401]\n",
+            "GW -->|限流触发| RL[返回 429 Too Many Requests]\n",
+            "subgraph 服务层\n",
+            "Route -->|/api/user| UserSvc[用户服务]\n",
+            "Route -->|/api/order| OrderSvc[订单服务]\n",
+            "Route -->|/api/pay| PaySvc[支付服务]\n",
+            "end\n",
+            "subgraph 数据层\n",
+            "DB[(PostgreSQL)]\n",
+            "Cache[(Redis 缓存)]\n",
+            "MQ[[消息队列]]\n",
+            "end\n",
+            "UserSvc <--> DB\n",
+            "OrderSvc <--> DB\n",
+            "PaySvc <--> DB\n",
+            "UserSvc & OrderSvc & PaySvc -.读取.-> Cache\n",
+            "PaySvc --发布事件--> MQ\n",
+            "MQ -.异步通知.-> Notify[通知服务]\n",
+            "Auth --> End1([流程结束])\n",
+            "RL --> End1\n",
+            "Notify --> End2([通知送达])\n",
+            "classDef gateway fill:#e1f5fe,stroke:#0288d1,stroke-width:2px\n",
+            "classDef service fill:#f3e5f5,stroke:#7b1fa2\n",
+            "classDef data fill:#fff3e0,stroke:#ef6c00\n",
+            "classDef error fill:#ffebee,stroke:#c62828,stroke-dasharray: 5 5\n",
+            "class GW,LB gateway\n",
+            "class UserSvc,OrderSvc,PaySvc,Notify service\n",
+            "class DB,Cache,MQ data\n",
+            "class Auth,RL error\n",
+        );
+        let rendered = super::super::render(service_flow, 180).expect("complex service flow");
+        assert_spans_exact(service_flow, &rendered);
+        let text = facade_text(service_flow, 180);
+        for label in [
+            "用户请求到达",
+            "网关鉴权",
+            "PostgreSQL",
+            "Redis 缓存",
+            "异步通知",
+        ] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        assert!(
+            (text.contains('▲') && text.contains('▼'))
+                || (text.contains('◀') && text.contains('▶')),
+            "{text}"
+        );
+        assert!(
+            !text.contains("classDef") && !text.contains("stroke:"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("/api/order/api/pay") && !text.contains("Token 无效Token"),
+            "edge labels overlap:\n{text}"
+        );
+
+        let architecture = concat!(
+            "flowchart LR\n",
+            "subgraph Client[客户端层]\n",
+            "Web[Web 端]\n",
+            "MP[小程序]\n",
+            "APP[移动 App]\n",
+            "end\n",
+            "subgraph Core[核心服务]\n",
+            "direction TB\n",
+            "BFF[BFF 聚合层]\n",
+            "Auth[认证中心]\n",
+            "Biz[业务集群]\n",
+            "end\n",
+            "subgraph Infra[基础设施]\n",
+            "direction LR\n",
+            "PG[(PostgreSQL)]\n",
+            "RD[(Redis)]\n",
+            "COS[对象存储]\n",
+            "CDN[CDN]\n",
+            "end\n",
+            "Web & MP & APP --> BFF\n",
+            "BFF --> Auth\n",
+            "Auth -.JWT 校验.-> BFF\n",
+            "BFF --> Biz\n",
+            "Biz --> PG\n",
+            "Biz --> RD\n",
+            "Biz --> COS\n",
+            "COS --> CDN\n",
+            "CDN -.静态资源.-> Web & MP & APP\n",
+            "style BFF fill:#bbdefb\n",
+            "style PG fill:#ffe0b2\n",
+            "style RD fill:#ffe0b2\n",
+        );
+        let rendered = super::super::render(architecture, 120).expect("cyclic architecture");
+        assert_spans_exact(architecture, &rendered);
+        let text = facade_text(architecture, 120);
+        assert!(text.contains("JWT 校验"), "{text}");
+        assert!(
+            text.contains("静态资源") && text.contains("移动 App"),
+            "{text}"
+        );
+        assert!(!text.contains("style BFF"), "{text}");
+    }
+
+    #[test]
+    fn flowchart_feedback_bidirectional_arrows_point_into_both_nodes() {
+        let source = concat!("flowchart TD\n", "A[上游] --> B[下游]\n", "B <--> A\n",);
+        let text = facade_text(source, 80);
+        assert!(text.contains('╭') && text.contains('▼'), "{text}");
+        assert_eq!(
+            text.matches('◀').count(),
+            2,
+            "feedback arrows do not point into both endpoint nodes:\n{text}"
+        );
+        assert!(
+            !text.contains('▶'),
+            "feedback target arrow points outward:\n{text}"
+        );
+    }
+
+    #[test]
+    fn complex_sequence_renders_parallel_notes_rectangles_and_activation() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "autonumber\n",
+            "actor U as 用户\n",
+            "participant FE as 前端应用\n",
+            "participant API as API 网关\n",
+            "participant OS as 订单服务\n",
+            "participant PS as 支付服务\n",
+            "participant INV as 库存服务\n",
+            "participant DB as 数据库\n",
+            "U->>FE: 提交订单\n",
+            "activate FE\n",
+            "FE->>API: POST /api/orders\n",
+            "activate API\n",
+            "API->>OS: createOrder(payload)\n",
+            "rect rgb(240, 248, 255)\n",
+            "note right of OS: 事务性下单流程\n",
+            "activate OS\n",
+            "par 并行锁定资源\n",
+            "OS->>INV: lockStock(items)\n",
+            "INV-->>OS: 锁定成功\n",
+            "and\n",
+            "OS->>DB: INSERT order (PENDING)\n",
+            "DB-->>OS: orderId\n",
+            "end\n",
+            "OS->>PS: createPayment(orderId, amount)\n",
+            "activate PS\n",
+            "alt 支付成功\n",
+            "PS-->>OS: paymentSuccess(txnId)\n",
+            "OS->>DB: UPDATE order SET status='PAID'\n",
+            "OS->>INV: confirmStock(items)\n",
+            "else 支付超时\n",
+            "PS-->>OS: paymentTimeout\n",
+            "OS->>DB: UPDATE order SET status='CANCELLED'\n",
+            "OS->>INV: releaseStock(items)\n",
+            "end\n",
+            "deactivate PS\n",
+            "deactivate OS\n",
+            "end\n",
+            "OS-->>API: OrderResult\n",
+            "deactivate API\n",
+            "API-->>FE: 200 OK { orderId, status }\n",
+            "deactivate FE\n",
+            "FE-->>U: 显示下单结果\n",
+            "loop 每 30 秒\n",
+            "FE->>API: GET /api/orders/{id}/status\n",
+            "API-->>FE: 最新状态\n",
+            "end\n",
+        );
+        let rendered = super::super::render(source, 320).expect("complex sequence");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 320);
+        for semantic in [
+            "rect rgb(240, 248, 255)",
+            "事务性下单流程",
+            "par 并行锁定资源",
+            "and",
+            "alt 支付成功",
+            "else 支付超时",
+            "loop 每 30 秒",
+        ] {
+            assert!(text.contains(semantic), "missing {semantic:?}:\n{text}");
+        }
+        assert!(text.contains('█'), "activation bars are missing:\n{text}");
+
+        let compact = super::super::render(source, 100).expect("compact sequence fallback");
+        let compact_text = compact
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(compact_text.contains("note right of OS"), "{compact_text}");
+        assert!(compact_text.contains("par 并行锁定资源"), "{compact_text}");
+    }
+
+    #[test]
+    fn sequence_shorthand_deactivates_the_sender_and_preserves_nested_counts() {
+        let source = concat!(
+            "sequenceDiagram\n",
+            "participant A\n",
+            "participant B\n",
+            "A->>+B: enter one\n",
+            "A->>+B: enter two\n",
+            "B-->>-A: leave one\n",
+            "B-->>A: still active\n",
+            "B-->>-A: leave two\n",
+            "B-->>A: inactive\n",
+        );
+        let rendered = super::super::render(source, 80).expect("nested activation sequence");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        let rows = text.lines().collect::<Vec<_>>();
+        let participant_b = rows[0].find('B').unwrap();
+        let leave_one = rows
+            .iter()
+            .position(|row| row.contains("leave one"))
+            .unwrap();
+        let leave_two = rows
+            .iter()
+            .position(|row| row.contains("leave two"))
+            .unwrap();
+        assert_eq!(
+            rows[leave_one + 1].chars().nth(participant_b),
+            Some('█'),
+            "{text}"
+        );
+        assert_eq!(
+            rows[leave_two + 1].chars().nth(participant_b),
+            Some('│'),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn complex_state_machine_preserves_nested_states_and_cycles() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "[*] --> 已连接\n",
+            "state 已连接 {\n",
+            "[*] --> 空闲\n",
+            "空闲 --> 传输中 : 数据发出\n",
+            "state 传输中 {\n",
+            "[*] --> 分片\n",
+            "分片 --> 发送中 : 分片发送\n",
+            "发送中 --> [*] : 全部发出\n",
+            "}\n",
+            "传输中 --> 等待确认 : 数据发出\n",
+            "等待确认 --> 空闲 : 收到 ACK\n",
+            "}\n",
+            "已连接 --> 断开中 : 收到 CLOSE\n",
+            "断开中 --> 已断开 : 四次挥手完成\n",
+            "已连接 --> 异常 : 心跳丢失\n",
+            "异常 --> 已连接 : 自动重连成功\n",
+            "异常 --> 已断开 : 重连 3 次失败\n",
+            "已断开 --> [*]\n",
+        );
+        let rendered = super::super::render(source, 160).expect("nested cyclic state machine");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 160);
+        for label in [
+            "已连接",
+            "空闲",
+            "传输中",
+            "分片",
+            "发送中",
+            "等待确认",
+            "断开中",
+            "异常",
+            "重连 3 次失败",
+        ] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn complex_gitgraph_supports_tags_and_commit_types() {
+        let source = concat!(
+            "gitGraph\n",
+            "commit id: \"init\"\n",
+            "commit id: \"feat: base\"\n",
+            "branch develop\n",
+            "checkout develop\n",
+            "commit id: \"feat: api\"\n",
+            "branch feature/payment\n",
+            "checkout feature/payment\n",
+            "commit id: \"feat: pay core\"\n",
+            "commit id: \"fix: refund bug\"\n",
+            "checkout develop\n",
+            "merge feature/payment tag: \"v0.2.0\"\n",
+            "checkout main\n",
+            "merge develop tag: \"v1.0.0\"\n",
+            "branch hotfix/memory-leak\n",
+            "commit id: \"fix: leak\" type: REVERSE\n",
+            "checkout main\n",
+            "merge hotfix/memory-leak tag: \"v1.0.1\"\n",
+        );
+        let rendered = super::super::render(source, 160).expect("complex gitGraph");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 160);
+        for value in ["v0.2.0", "v1.0.0", "v1.0.1", "fix: leak"] {
+            assert!(text.contains(value), "missing {value}:\n{text}");
+        }
+        assert!(
+            text.contains('⊗'),
+            "REVERSE commit glyph is missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn gantt_weekend_start_and_until_use_mermaid_boundaries() {
+        let weekend = concat!(
+            "gantt\n",
+            "dateFormat YYYY-MM-DD\n",
+            "excludes weekends\n",
+            "Weekend : w, 2026-09-12, 1d\n",
+        );
+        let weekend_text = facade_text(weekend, 80);
+        assert!(
+            weekend_text.contains("09-12") && weekend_text.contains("09-14"),
+            "{weekend_text}"
+        );
+
+        let until = concat!(
+            "gantt\n",
+            "dateFormat YYYY-MM-DD\n",
+            "Before : before, 2026-09-10, until target\n",
+            "Target : target, 2026-09-14, 2d\n",
+        );
+        let until_text = facade_text(until, 80);
+        let before = until_text
+            .lines()
+            .find(|row| row.starts_with("Before"))
+            .unwrap();
+        let target = until_text
+            .lines()
+            .find(|row| row.starts_with("Target"))
+            .unwrap();
+        let before_end = before
+            .chars()
+            .enumerate()
+            .filter_map(|(index, ch)| (ch == '━').then_some(index))
+            .last()
+            .unwrap()
+            + 1;
+        assert_eq!(
+            before_end,
+            target.chars().position(|ch| ch == '━').unwrap(),
+            "until must stop at the target task start:\n{until_text}"
+        );
+    }
+
+    #[test]
+    fn gantt_excludes_weekends_and_quadrant_chart_render_semantically() {
+        let gantt = concat!(
+            "gantt\n",
+            "title 系统 2.0 升级计划\n",
+            "dateFormat YYYY-MM-DD\n",
+            "excludes weekends\n",
+            "section 准备\n",
+            "方案评审 :milestone, m1, 2026-09-07, 0d\n",
+            "技术调研 :a1, 2026-09-08, 5d\n",
+            "section 开发\n",
+            "核心模块 :crit, b1, after a1, 14d\n",
+            "接口适配 :b2, after a1, 10d\n",
+            "联调 :b3, after b1, 5d\n",
+            "section 发布\n",
+            "灰度 10% :c1, after b3, 3d\n",
+            "灰度 50% :c2, after c1, 3d\n",
+            "全量上线 :crit, c3, after c2, 2d\n",
+            "上线完成 :milestone, m2, after c3, 0d\n",
+        );
+        let rendered = super::super::render(gantt, 160).expect("working-day gantt");
+        assert_spans_exact(gantt, &rendered);
+        let gantt_text = facade_text(gantt, 160);
+        assert!(
+            gantt_text.contains("09-07") && gantt_text.contains("10-22"),
+            "{gantt_text}"
+        );
+        assert!(
+            gantt_text.contains('◆') && gantt_text.contains('!'),
+            "{gantt_text}"
+        );
+        assert!(!gantt_text.contains("excludes weekends"), "{gantt_text}");
+
+        let quadrant = concat!(
+            "quadrantChart\n",
+            "title 技术选型评估\n",
+            "x-axis 低成本 --> 高成本\n",
+            "y-axis 低收益 --> 高收益\n",
+            "quadrant-1 重点投入\n",
+            "quadrant-2 谨慎评估\n",
+            "quadrant-3 暂不采用\n",
+            "quadrant-4 快速试点\n",
+            "PostgreSQL: [0.4, 0.85]\n",
+            "Redis: [0.3, 0.7]\n",
+            "自建 K8s: [0.85, 0.4]\n",
+            "Serverless: [0.5, 0.6]\n",
+            "区块链存储: [0.9, 0.15]\n",
+        );
+        let rendered = super::super::render(quadrant, 100).expect("quadrant chart");
+        assert_spans_exact(quadrant, &rendered);
+        let quadrant_text = facade_text(quadrant, 100);
+        let rows = quadrant_text.lines().collect::<Vec<_>>();
+        let top = rows
+            .iter()
+            .find(|row| row.contains("谨慎评估") && row.contains("重点投入"))
+            .unwrap();
+        assert!(
+            top.find("谨慎评估").unwrap() < top.find("重点投入").unwrap(),
+            "{quadrant_text}"
+        );
+        let middle = rows.iter().position(|row| row.contains('┼')).unwrap();
+        let postgres = rows
+            .iter()
+            .position(|row| row.contains("PostgreSQL"))
+            .unwrap();
+        let blockchain = rows
+            .iter()
+            .position(|row| row.contains("区块链存储"))
+            .unwrap();
+        assert!(postgres < middle && blockchain > middle, "{quadrant_text}");
     }
 
     #[test]
