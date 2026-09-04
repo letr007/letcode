@@ -194,7 +194,7 @@ pub fn apply_codex_response_shape(request: &mut Value, context: &CodexRequestCon
         .filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "model" | "instructions" | "input" | "tools" | "max_output_tokens"
+                "model" | "instructions" | "input" | "tools" | "max_output_tokens" | "reasoning"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -319,6 +319,7 @@ mod tests {
             "instructions": "core and workspace instructions",
             "input": [{"type": "message"}],
             "tools": [{"name": "fs__read"}],
+            "reasoning": {"effort": "minimal", "summary": "concise"},
             "temperature": 0.2,
             "service_tier": "priority"
         });
@@ -331,6 +332,9 @@ mod tests {
         assert_eq!(request["parallel_tool_calls"], false);
         assert_eq!(request["tool_choice"], "auto");
         assert_eq!(request["store"], false);
+        assert_eq!(request["reasoning"]["effort"], "minimal");
+        assert_eq!(request["reasoning"]["summary"], "concise");
+        assert_eq!(request["reasoning"]["context"], "all_turns");
         assert_eq!(request["prompt_cache_key"], context.session_id);
         assert!(request.get("temperature").is_none());
         assert!(request.get("service_tier").is_none());
