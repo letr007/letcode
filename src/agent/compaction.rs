@@ -152,6 +152,7 @@ where
     let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
         &generate_context_summary(
             agent,
+            trigger,
             cut.previous_summary.as_deref(),
             &cut.prefix,
             cut.split_active_turn,
@@ -549,6 +550,7 @@ fn fit_compaction_cut_to_summary_budget(
 
 async fn generate_context_summary(
     agent: &Agent,
+    trigger: CompactionTrigger,
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
     split_active_turn: bool,
@@ -563,10 +565,16 @@ where
         &render_protected_workflow_facts(agent),
     );
     // Narrow oneshot stream: no nested Agent turn, no tools, reasoning forced off.
-    // Preview deltas ride the event channel only (session maps to CompactionPreviewDelta).
-    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
-    let emit_tx = delta_tx.clone();
-    drop(delta_tx);
+    // Preview deltas and retry resets share one queue so a retry reset is
+    // observed after the failed attempt's deltas and before the next attempt.
+    // Retry waits for the reset callback to succeed before sending another request.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        AgentEvent,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    )>();
+    let delta_tx = event_tx.clone();
+    let retry_tx = event_tx.clone();
+    drop(event_tx);
     let prelude = [PromptMessage::system(CONTEXT_COMPACTION_PRELUDE)];
     let route = agent.resolved_model_route().ok_or_else(|| {
         anyhow::anyhow!("context compaction requires an installed resolved model route")
@@ -578,10 +586,30 @@ where
         &prompt,
         move |delta| {
             std::future::ready(
-                emit_tx
-                    .send(delta.to_string())
-                    .map_err(|_| anyhow::anyhow!("context compaction delta receiver closed")),
+                delta_tx
+                    .send((
+                        AgentEvent::ContextCompactionDelta {
+                            delta: delta.to_string(),
+                        },
+                        None,
+                    ))
+                    .map_err(|_| anyhow::anyhow!("context compaction event receiver closed")),
             )
+        },
+        move || {
+            let retry_tx = retry_tx.clone();
+            async move {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                retry_tx
+                    .send((
+                        AgentEvent::ContextCompactionStarted { trigger },
+                        Some(ack_tx),
+                    ))
+                    .map_err(|_| anyhow::anyhow!("context compaction event receiver closed"))?;
+                ack_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("context compaction retry acknowledgement closed"))
+            }
         },
     )
     .boxed();
@@ -589,13 +617,19 @@ where
     let summary = loop {
         tokio::select! {
             result = &mut summary => break result?,
-            Some(delta) = delta_rx.recv() => {
-                on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
+            Some((event, ack)) = event_rx.recv() => {
+                on_event(event).await?;
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
             }
         }
     };
-    while let Ok(delta) = delta_rx.try_recv() {
-        on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
+    while let Ok((event, ack)) = event_rx.try_recv() {
+        on_event(event).await?;
+        if let Some(ack) = ack {
+            let _ = ack.send(());
+        }
     }
     let trimmed = summary.trim();
     if trimmed.is_empty() {
@@ -909,6 +943,9 @@ mod transaction_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn test_agent() -> Agent {
         let mut agent = Agent::new("test-model", 1, 1);
@@ -985,6 +1022,170 @@ max_output_tokens = 128
                 current_turn_start_index: None,
                 runtime_snapshot,
             }),
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_retry_commits_only_successful_output_and_preserves_history_on_failure() {
+        for (final_failure, reject_reset) in [(false, false), (true, false), (false, true)] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for attempt in 0..if reject_reset { 1 } else { 2 } {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (header_end, content_length) = loop {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "request closed before headers");
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(header_end) =
+                            request.windows(4).position(|part| part == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let header_end = header_end + 4;
+                        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .expect("responses request has content length");
+                        break (header_end, content_length);
+                    };
+                    while request.len() < header_end + content_length {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "request closed before body");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+
+                    let body = if attempt == 0 || final_failure {
+                        concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"failed attempt\"}\n\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}}\n\n"
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"successful summary\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                if reject_reset {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                            .await
+                            .is_err(),
+                        "rejected preview reset must not issue another request"
+                    );
+                }
+            });
+
+            let config = crate::model_runtime::RuntimeConfig::from_toml(&format!(
+                r#"active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "test-model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.retry]
+enabled = true
+max_attempts = 2
+max_recovery_attempts = 1
+initial_delay_secs = 1
+exponential_backoff = false
+backoff_multiplier = 1.0
+jitter_secs = 0
+[providers.test.models."test-model"]
+[providers.test.models."test-model".capabilities]
+generation = {{ max_output_tokens = true }}
+[providers.test.models."test-model".generation]
+max_output_tokens = 128
+"#
+            ))
+            .unwrap()
+            .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+            .unwrap();
+            let mut route = config.route("test", "test-model").unwrap().clone();
+            route.retry.as_mut().unwrap().initial_delay_secs = 0;
+            let mut agent = test_agent();
+            agent.set_resolved_model_route(Some(Arc::new(route)));
+            let original = vec![
+                HistoryItem::user("history"),
+                HistoryItem::assistant("reply"),
+            ];
+            agent.replace_history(original.clone()).unwrap();
+
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = events.clone();
+            let mut starts = 0;
+            let mut on_event = move |event| {
+                if matches!(event, AgentEvent::ContextCompactionStarted { .. }) {
+                    starts += 1;
+                    if reject_reset && starts == 2 {
+                        return Box::pin(std::future::ready(Err(anyhow!("preview reset failed"))))
+                            as BoxFuture<'_, Result<()>>;
+                    }
+                }
+                observed.lock().unwrap().push(event);
+                Box::pin(std::future::ready(Ok(()))) as BoxFuture<'_, Result<()>>
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                compact_session_stream_async(&mut agent, &mut on_event, || Ok(())),
+            )
+            .await
+            .expect("local Responses retry test timed out");
+
+            let events = events.lock().unwrap();
+            if final_failure || reject_reset {
+                assert!(result.is_err());
+                assert_eq!(agent.history_for_test(), original);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, AgentEvent::ContextCompacted(_)))
+                );
+                assert!(matches!(
+                    events.last(),
+                    Some(AgentEvent::ContextCompactionFailed { .. })
+                ));
+            } else {
+                result.expect("summary succeeds after retry");
+                assert_eq!(
+                    agent.history_for_test(),
+                    vec![HistoryItem::context_summary("successful summary")]
+                );
+                assert!(matches!(
+                    events.as_slice(),
+                    [
+                        AgentEvent::ContextCompactionStarted { trigger: CompactionTrigger::Manual },
+                        AgentEvent::ContextCompactionDelta { delta },
+                        AgentEvent::ContextCompactionStarted { trigger: CompactionTrigger::Manual },
+                        AgentEvent::ContextCompactionDelta { delta: second },
+                        AgentEvent::ContextCompacted(committed),
+                    ] if delta == "failed attempt" && second == "successful summary" && committed.summary == "successful summary"
+                ));
+            }
+            drop(events);
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("local Responses server timed out")
+                .unwrap();
         }
     }
 

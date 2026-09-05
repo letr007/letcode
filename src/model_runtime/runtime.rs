@@ -326,6 +326,7 @@ pub trait ModelEventObserver: Send {
 struct TextOneshotObserver<'a, F> {
     text: String,
     on_delta: &'a mut F,
+    rejected_event: bool,
 }
 
 #[async_trait]
@@ -337,12 +338,16 @@ where
     async fn observe(&mut self, event: &ModelEvent) -> Result<(), ModelFailure> {
         match event {
             ModelEvent::TextDelta { text } => {
-                (self.on_delta)(text).await?;
+                if let Err(error) = (self.on_delta)(text).await {
+                    self.rejected_event = true;
+                    return Err(error);
+                }
                 self.text.push_str(text);
             }
             ModelEvent::ToolStarted { .. }
             | ModelEvent::ToolArgumentsDelta { .. }
             | ModelEvent::ToolDone { .. } => {
+                self.rejected_event = true;
                 return Err(runtime_invalid("oneshot emitted a tool call"));
             }
             _ => {}
@@ -437,15 +442,20 @@ impl ModelRuntime {
         }
     }
 
-    pub async fn execute_text_oneshot<F, Fut>(
+    /// Text deltas are provisional until completion. Before retrying, `on_retry`
+    /// must discard any preview from the failed attempt.
+    pub async fn execute_text_oneshot<F, Fut, R, Rfut>(
         &self,
         route: &ResolvedModelRoute,
         input: &ModelRequestInput,
         mut on_delta: F,
+        mut on_retry: R,
     ) -> Result<String, ModelFailure>
     where
         F: FnMut(&str) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+        R: FnMut() -> Rfut + Send,
+        Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
     {
         let retry = route.retry.clone().unwrap_or_else(default_retry_config);
         let request = route.binding.prepare_request(input)?;
@@ -454,6 +464,7 @@ impl ModelRuntime {
             let mut observer = TextOneshotObserver {
                 text: String::new(),
                 on_delta: &mut on_delta,
+                rejected_event: false,
             };
             match self
                 .execute_prepared_attempt(route, request.clone(), &mut observer)
@@ -468,13 +479,24 @@ impl ModelRuntime {
                     return Ok(observer.text);
                 }
                 Err(error)
-                    if !error.partial.side_effects.observable()
+                    if !observer.rejected_event
                         && retryable_failure(&error.failure)
                         && retry.enabled
                         && attempt < retry.max_attempts =>
                 {
-                    tokio::time::sleep(retry_delay(&retry, attempt, error.failure.retry_hint))
-                        .await;
+                    let delay = retry_delay(&retry, attempt, error.failure.retry_hint);
+                    tracing::warn!(
+                        provider = %route.provider,
+                        model = %route.model,
+                        next_attempt = attempt + 1,
+                        max_attempts = retry.max_attempts,
+                        delay_secs = delay.as_secs(),
+                        error = %error.failure,
+                        detail = %error.failure.detail(),
+                        "retrying text oneshot request"
+                    );
+                    on_retry().await?;
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(error) => return Err(error.failure),
@@ -1376,6 +1398,178 @@ reasoning = true
         )
     }
 
+    fn oneshot_response(text: &str, failure: Option<ModelFailure>) -> TransportResponse {
+        let delta = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"response.output_text.delta", "delta":text})
+        );
+        let end = match failure {
+            Some(failure) => Err(failure),
+            None => Ok(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n".to_vec()),
+        };
+        TransportResponse::from_results(200, BTreeMap::new(), vec![Ok(delta.into_bytes()), end])
+    }
+
+    fn oneshot_stream_failure() -> ModelFailure {
+        ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+            .with_status(200)
+            .with_code("response_chunk_failed")
+            .with_retry_hint(RetryHint::RetryAfterSeconds(0))
+            .with_detail("stream interrupted")
+    }
+
+    #[tokio::test]
+    async fn text_oneshot_resets_partial_preview_before_retry() {
+        let route = route("responses");
+        let transport = Arc::new(QueueTransport {
+            responses: Mutex::new(VecDeque::from([
+                Ok(oneshot_response(
+                    "discarded",
+                    Some(oneshot_stream_failure()),
+                )),
+                Ok(oneshot_response("summary", None)),
+            ])),
+        });
+        let runtime = ModelRuntime::new(transport.clone());
+        let events = Mutex::new(Vec::new());
+        let output = runtime
+            .execute_text_oneshot(
+                &route,
+                &ModelRequestInput::new("model", Vec::new()),
+                |delta| {
+                    events.lock().unwrap().push(delta.to_owned());
+                    std::future::ready(Ok(()))
+                },
+                || {
+                    events.lock().unwrap().push("reset".into());
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, "summary");
+        assert_eq!(*events.lock().unwrap(), ["discarded", "reset", "summary"]);
+        assert!(transport.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_oneshot_respects_retry_limits_and_preserves_provider_failure() {
+        for (enabled, max_attempts, hint, expected_attempts) in [
+            (true, 2, RetryHint::RetryAfterSeconds(0), 2),
+            (false, 3, RetryHint::RetryAfterSeconds(0), 1),
+            (true, 1, RetryHint::RetryAfterSeconds(0), 1),
+            (true, 3, RetryHint::Never, 1),
+        ] {
+            let mut route = route("responses");
+            let retry = route.retry.as_mut().unwrap();
+            retry.enabled = enabled;
+            retry.max_attempts = max_attempts;
+            let failure = oneshot_stream_failure().with_retry_hint(hint);
+            let transport = Arc::new(QueueTransport {
+                responses: Mutex::new(
+                    (0..3)
+                        .map(|_| Ok(oneshot_response("partial", Some(failure.clone()))))
+                        .collect(),
+                ),
+            });
+            let runtime = ModelRuntime::new(transport.clone());
+            let mut resets = 0;
+            let error = runtime
+                .execute_text_oneshot(
+                    &route,
+                    &ModelRequestInput::new("model", Vec::new()),
+                    |_| std::future::ready(Ok(())),
+                    || {
+                        resets += 1;
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, failure);
+            assert_eq!(resets, expected_attempts - 1);
+            assert_eq!(
+                transport.responses.lock().unwrap().len(),
+                3 - expected_attempts
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn text_oneshot_retries_before_output_but_rejects_tools() {
+        for emits_tool in [false, true] {
+            let route = route("responses");
+            let first = if emits_tool {
+                response(200, vec![b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"search\"}}\n\n".as_slice()])
+            } else {
+                TransportResponse::from_results(
+                    200,
+                    BTreeMap::new(),
+                    vec![Err(oneshot_stream_failure())],
+                )
+            };
+            let transport = Arc::new(QueueTransport {
+                responses: Mutex::new(VecDeque::from([
+                    Ok(first),
+                    Ok(oneshot_response("summary", None)),
+                ])),
+            });
+            let runtime = ModelRuntime::new(transport.clone());
+            let mut resets = 0;
+            let output = runtime
+                .execute_text_oneshot(
+                    &route,
+                    &ModelRequestInput::new("model", Vec::new()),
+                    |_| std::future::ready(Ok(())),
+                    || {
+                        resets += 1;
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await;
+            if emits_tool {
+                assert_eq!(output.unwrap_err().retry_hint, RetryHint::Never);
+                assert_eq!(resets, 0);
+                assert_eq!(transport.responses.lock().unwrap().len(), 1);
+            } else {
+                assert_eq!(output.unwrap(), "summary");
+                assert_eq!(resets, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_oneshot_does_not_retry_callback_failures() {
+        for fail_on_reset in [false, true] {
+            let route = route("responses");
+            let callback_error = oneshot_stream_failure().with_code("callback_failed");
+            let transport = Arc::new(QueueTransport {
+                responses: Mutex::new(VecDeque::from([
+                    Ok(oneshot_response("partial", Some(oneshot_stream_failure()))),
+                    Ok(oneshot_response("unused", None)),
+                ])),
+            });
+            let runtime = ModelRuntime::new(transport.clone());
+            let error = runtime
+                .execute_text_oneshot(
+                    &route,
+                    &ModelRequestInput::new("model", Vec::new()),
+                    |_| {
+                        std::future::ready(if fail_on_reset {
+                            Ok(())
+                        } else {
+                            Err(callback_error.clone())
+                        })
+                    },
+                    || std::future::ready(Err(callback_error.clone())),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, callback_error);
+            assert_eq!(transport.responses.lock().unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::result_large_err)]
     async fn websocket_transport_replays_full_input_without_previous_id_after_not_found() {
@@ -1575,7 +1769,7 @@ tools = true
         let transport = Arc::new(TurnLocalResponsesTransport::new());
         let runtime = ModelRuntime::new_responses_websocket(transport.clone());
         let output = runtime
-            .execute_text_oneshot(&route, &input, |_| async { Ok(()) })
+            .execute_text_oneshot(&route, &input, |_| async { Ok(()) }, || async { Ok(()) })
             .await
             .unwrap();
         assert!(output.is_empty());

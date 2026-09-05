@@ -75,6 +75,13 @@ fn runtime_failure(
         .with_detail(error.to_string())
 }
 
+fn preparation_failure(error: anyhow::Error) -> ModelFailure {
+    error
+        .downcast_ref::<ModelFailure>()
+        .cloned()
+        .unwrap_or_else(|| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))
+}
+
 fn failure_error_class(failure: &ModelFailure) -> LlmRequestErrorClass {
     match failure.phase {
         crate::model_runtime::FailurePhase::Prepare | crate::model_runtime::FailurePhase::Bind => {
@@ -264,7 +271,7 @@ where
             self.on_event,
         )
         .await
-        .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+        .map_err(preparation_failure)?;
         self.protected_start_index = prepared.protected_start_index;
         let input = model_request_from_prompt_plan(
             &self.route,
@@ -1016,6 +1023,30 @@ fn websocket_incremental_prompt_unit_start(
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
+mod preparation_failure_tests {
+    use super::*;
+
+    #[test]
+    fn preparation_preserves_typed_model_failure_through_context() {
+        let failure = ModelFailure::new(
+            crate::model_runtime::FailurePhase::Transport,
+            crate::model_runtime::FailureKind::Http,
+        )
+        .with_status(200)
+        .with_code("response_chunk_failed")
+        .with_retry_hint(crate::model_runtime::RetryHint::Retryable)
+        .with_detail("summary stream interrupted");
+        let error = anyhow::Error::new(failure.clone()).context("summary request");
+        assert_eq!(preparation_failure(error), failure);
+        let local = preparation_failure(anyhow!("invalid local history"));
+        assert_eq!(local.phase, crate::model_runtime::FailurePhase::Prepare);
+        assert_eq!(local.kind, crate::model_runtime::FailureKind::Internal);
+        assert_eq!(local.retry_hint, crate::model_runtime::RetryHint::Never);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod websocket_transport_tests {
     use super::should_use_responses_websocket;
     use crate::model_runtime::{ProtocolRegistry, RuntimeConfig};
@@ -1560,16 +1591,19 @@ pub(super) fn preflight_resolved_oneshot_text_request(
     Ok(build)
 }
 
-pub(super) async fn stream_resolved_oneshot_text_async<F, Fut>(
+pub(super) async fn stream_resolved_oneshot_text_async<F, Fut, R, Rfut>(
     route: &crate::model_runtime::ResolvedModelRoute,
     mut model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
     mut on_delta: F,
+    mut on_retry: R,
 ) -> Result<String>
 where
     F: FnMut(&str) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
+    R: FnMut() -> Rfut + Send,
+    Rfut: Future<Output = Result<()>> + Send,
 {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
@@ -1582,14 +1616,26 @@ where
     let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
     ModelRuntime::default()
-        .execute_text_oneshot(route, &input, move |delta| {
-            let future = on_delta(delta);
-            async move {
-                future.await.map_err(|error| {
-                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
-                })
-            }
-        })
+        .execute_text_oneshot(
+            route,
+            &input,
+            move |delta| {
+                let future = on_delta(delta);
+                async move {
+                    future.await.map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                    })
+                }
+            },
+            move || {
+                let future = on_retry();
+                async move {
+                    future.await.map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                    })
+                }
+            },
+        )
         .await
         .map_err(anyhow::Error::new)
 }
@@ -1600,9 +1646,14 @@ pub(super) async fn execute_resolved_text_oneshot(
     prelude: &[PromptMessage],
     user_text: &str,
 ) -> Result<String> {
-    stream_resolved_oneshot_text_async(route, model, prelude, user_text, |_| {
-        std::future::ready(Ok(()))
-    })
+    stream_resolved_oneshot_text_async(
+        route,
+        model,
+        prelude,
+        user_text,
+        |_| std::future::ready(Ok(())),
+        || std::future::ready(Ok(())),
+    )
     .await
 }
 
