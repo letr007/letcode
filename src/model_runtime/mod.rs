@@ -1681,8 +1681,6 @@ pub struct RuntimeTransportConfig {
     pub connect_timeout_secs: u64,
     #[serde(default = "default_true")]
     pub no_proxy_loopback: bool,
-    #[serde(default)]
-    pub websocket: bool,
 }
 
 impl Default for RuntimeTransportConfig {
@@ -1690,7 +1688,6 @@ impl Default for RuntimeTransportConfig {
         Self {
             connect_timeout_secs: default_connect_timeout_secs(),
             no_proxy_loopback: true,
-            websocket: false,
         }
     }
 }
@@ -1825,6 +1822,13 @@ impl From<RuntimeGenerationConfig> for GenerationSupport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeModelTransportConfig {
+    #[serde(default)]
+    pub websocket: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeModelConfig {
@@ -1840,6 +1844,8 @@ pub struct RuntimeModelConfig {
     pub model_override: Option<String>,
     #[serde(default)]
     pub flavor: Option<ProviderFlavor>,
+    #[serde(default)]
+    pub transport: RuntimeModelTransportConfig,
     #[serde(default)]
     pub capabilities: RuntimeCapabilities,
     #[serde(default)]
@@ -2637,7 +2643,6 @@ pub struct ProviderTransport {
     client: reqwest::Client,
     connect_timeout: Duration,
     no_proxy_loopback: bool,
-    websocket: bool,
 }
 
 impl ProviderTransport {
@@ -2678,7 +2683,6 @@ impl ProviderTransport {
             client,
             connect_timeout: Duration::from_secs(config.connect_timeout_secs),
             no_proxy_loopback: config.no_proxy_loopback,
-            websocket: config.websocket,
         })
     }
 
@@ -2696,12 +2700,6 @@ impl ProviderTransport {
             return Err(
                 ModelFailure::new(FailurePhase::Transport, FailureKind::InvalidRequest)
                     .with_code("websocket_unsupported_protocol"),
-            );
-        }
-        if !self.websocket {
-            return Err(
-                ModelFailure::new(FailurePhase::Transport, FailureKind::InvalidRequest)
-                    .with_code("websocket_disabled"),
             );
         }
         let request = request.build().map_err(|error| {
@@ -2860,10 +2858,6 @@ impl ProviderTransport {
 
     pub fn no_proxy_loopback(&self) -> bool {
         self.no_proxy_loopback
-    }
-
-    pub fn websocket(&self) -> bool {
-        self.websocket
     }
 
     pub fn apply_request(
@@ -3036,6 +3030,7 @@ impl ResolvedProvider {
                     cache: model.cache.clone(),
                     protocol_settings: model.protocol_settings.clone(),
                     retry: config.retry.clone(),
+                    websocket: model.transport.websocket,
                     transport: transport.clone(),
                     binding: registry
                         .lookup(&protocol)
@@ -3115,6 +3110,7 @@ pub struct ResolvedModelRoute {
     pub cache: RuntimeCacheConfig,
     pub protocol_settings: ProtocolSettings,
     pub retry: Option<RuntimeRetryConfig>,
+    pub websocket: bool,
     pub transport: Arc<ProviderTransport>,
     pub binding: Arc<dyn ProtocolBinding>,
 }
@@ -3230,7 +3226,6 @@ pub struct ProviderFingerprint {
     pub query: BTreeMap<String, String>,
     pub connect_timeout_secs: u64,
     pub no_proxy_loopback: bool,
-    pub websocket: bool,
     pub models: BTreeMap<String, ModelFingerprint>,
 }
 
@@ -3248,7 +3243,6 @@ impl fmt::Debug for ProviderFingerprint {
             .field("query", &"<hashed>")
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("no_proxy_loopback", &self.no_proxy_loopback)
-            .field("websocket", &self.websocket)
             .field("models", &self.models)
             .finish()
     }
@@ -3270,6 +3264,7 @@ pub struct ModelFingerprint {
     pub generation_defaults: RuntimeGenerationDefaults,
     pub cache: RuntimeCacheConfig,
     pub protocol_settings: ProtocolSettings,
+    pub websocket: bool,
 }
 
 impl fmt::Debug for ModelFingerprint {
@@ -3292,6 +3287,7 @@ impl fmt::Debug for ModelFingerprint {
             .field("generation_defaults", &self.generation_defaults)
             .field("cache", &self.cache)
             .field("protocol_settings", &"<redacted>")
+            .field("websocket", &self.websocket)
             .finish()
     }
 }
@@ -3327,7 +3323,6 @@ impl RuntimeFingerprint {
                             query: provider.query.clone(),
                             connect_timeout_secs: provider.transport.connect_timeout.as_secs(),
                             no_proxy_loopback: provider.transport.no_proxy_loopback,
-                            websocket: provider.transport.websocket,
                             models: provider
                                 .models
                                 .iter()
@@ -3350,6 +3345,7 @@ impl RuntimeFingerprint {
                                             generation_defaults: route.generation_defaults.clone(),
                                             cache: route.cache.clone(),
                                             protocol_settings: route.protocol_settings.clone(),
+                                            websocket: route.websocket,
                                         },
                                     )
                                 })
@@ -3892,60 +3888,52 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn websocket_transport_defaults_off_and_is_resolved_into_fingerprint() {
-        let default =
-            RuntimeConfig::from_toml(&runtime_config("default-ws", "type = \"none\"", "", ""))
+    fn websocket_transport_defaults_off_and_is_resolved_into_model_fingerprint() {
+        let resolve = |setting: &str| {
+            RuntimeConfig::from_toml(&runtime_config("vendor", "type = \"none\"", "", setting))
                 .unwrap()
                 .resolve(&ProtocolRegistry::builtins())
-                .unwrap();
-        assert!(
-            !default
-                .route("default-ws", "model")
                 .unwrap()
-                .transport
-                .websocket()
-        );
-        assert!(!default.fingerprint().providers["default-ws"].websocket);
-
-        let enabled = RuntimeConfig::from_toml(&runtime_config(
-            "enabled-ws",
-            "type = \"none\"",
-            "[providers.enabled-ws.transport]\nwebsocket = true",
-            "",
-        ))
-        .unwrap()
-        .resolve(&ProtocolRegistry::builtins())
-        .unwrap();
-        assert!(
-            enabled
-                .route("enabled-ws", "model")
-                .unwrap()
-                .transport
-                .websocket()
-        );
-        assert!(enabled.fingerprint().providers["enabled-ws"].websocket);
+        };
+        let default = resolve("");
+        let disabled = resolve("[providers.vendor.models.model.transport]\nwebsocket = false");
+        let enabled = resolve("[providers.vendor.models.model.transport]\nwebsocket = true");
+        assert!(!default.route("vendor", "model").unwrap().websocket);
+        assert!(!default.fingerprint().providers["vendor"].models["model"].websocket);
+        assert!(enabled.route("vendor", "model").unwrap().websocket);
+        assert!(enabled.fingerprint().providers["vendor"].models["model"].websocket);
+        assert_eq!(default.fingerprint(), disabled.fingerprint());
         assert_ne!(default.fingerprint(), enabled.fingerprint());
     }
 
     #[test]
-    fn websocket_transport_allows_provider_mixed_protocols() {
+    fn websocket_transport_is_model_scoped_with_a_shared_provider_client() {
         let config = runtime_config(
-            "mixed-protocols",
+            "aggregator",
             "type = \"none\"",
-            "[providers.mixed-protocols.transport]\nwebsocket = true",
-            "protocol = \"completions\"",
+            "[providers.aggregator.transport]\nconnect_timeout_secs = 17\nno_proxy_loopback = false",
+            r#"[providers.aggregator.models.model.transport]
+websocket = true
+[providers.aggregator.models.other]
+[providers.aggregator.models.disabled.transport]
+websocket = false
+[providers.aggregator.models.chat]
+protocol = "completions"
+"#,
         );
         let resolved = RuntimeConfig::from_toml(&config)
             .unwrap()
             .resolve(&ProtocolRegistry::builtins())
             .unwrap();
-        assert!(
-            resolved
-                .route("mixed-protocols", "model")
-                .unwrap()
-                .transport
-                .websocket()
-        );
+        let enabled = resolved.route("aggregator", "model").unwrap();
+        assert!(enabled.websocket);
+        for model in ["other", "disabled", "chat"] {
+            let route = resolved.route("aggregator", model).unwrap();
+            assert!(!route.websocket, "{model}");
+            assert!(Arc::ptr_eq(&enabled.transport, &route.transport));
+            assert_eq!(route.transport.connect_timeout().as_secs(), 17);
+            assert!(!route.transport.no_proxy_loopback());
+        }
     }
 
     #[test]

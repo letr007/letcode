@@ -69,24 +69,24 @@ impl ModelTransport for TurnLocalResponsesTransport {
         route: &ResolvedModelRoute,
         request: PreparedHttpRequest,
     ) -> Result<TransportResponse, ModelFailure> {
+        if !route.websocket {
+            return Err(
+                ModelFailure::new(FailurePhase::Transport, FailureKind::InvalidRequest)
+                    .with_code("websocket_disabled"),
+            );
+        }
         if self.force_http.load(Ordering::Acquire) {
             return ResolvedProviderTransport
                 .send_prepared(route, request)
                 .await;
         }
-        let previous_response_id = self.previous_response_id.lock().await.clone();
-        let force_full = *self.force_full.lock().await;
         if self.poisoned_response.swap(false, Ordering::AcqRel) {
             *self.session.lock().await = None;
         }
-        let can_continue = !force_full && previous_response_id.is_some();
-        let incremental_prompt_unit_start = if can_continue {
-            *self.next_prompt_unit_start.lock().await
-        } else {
-            None
-        };
         let mut session_guard = self.session.lock().await;
         if session_guard.is_none() {
+            // Incremental continuation relies on state cached by this connection.
+            self.reset_chain().await;
             let builder = route.transport.request(
                 reqwest::Method::POST,
                 &request.url,
@@ -119,6 +119,13 @@ impl ModelTransport for TurnLocalResponsesTransport {
                 ModelFailure::new(FailurePhase::Transport, FailureKind::Internal)
                     .with_code("websocket_session_missing"),
             );
+        };
+        let previous_response_id = self.previous_response_id.lock().await.clone();
+        let can_continue = !*self.force_full.lock().await && previous_response_id.is_some();
+        let incremental_prompt_unit_start = if can_continue {
+            *self.next_prompt_unit_start.lock().await
+        } else {
+            None
         };
         let frame_previous_response_id = can_continue
             .then_some(previous_response_id.as_deref())
@@ -1423,13 +1430,13 @@ reasoning = true
 protocol = "responses"
 default_model = "model"
 flavor = "standard"
-[providers.vendor.transport]
-websocket = true
 [providers.vendor.auth]
 type = "none"
 [providers.vendor.endpoints]
 base_url = "http://{address}"
 [providers.vendor.models.model]
+[providers.vendor.models.model.transport]
+websocket = true
 [providers.vendor.models.model.capabilities]
 reasoning = true
 tools = true
@@ -1733,6 +1740,81 @@ tools = true
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn websocket_reconnect_starts_full_context_then_resumes_incremental_input() {
+        for drop_partial in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let route = route_for_local_server(listener.local_addr().unwrap());
+                let server = async {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = accept_async(stream).await.unwrap();
+                    assert!(matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+                    socket
+                        .send(Message::Text(
+                            r#"{"type":"response.completed","response":{"id":"resp-old","status":"completed"}}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                        panic!("expected incremental request");
+                    };
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(value["previous_response_id"], "resp-old");
+                    assert_eq!(value["input"].as_array().unwrap().len(), 1);
+                    if drop_partial {
+                        socket
+                            .send(Message::Text(
+                                r#"{"type":"response.output_text.delta","delta":"partial"}"#.into(),
+                            ))
+                            .await
+                            .unwrap();
+                    } else {
+                        socket.send(Message::Close(None)).await.unwrap();
+                    }
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut reconnected = accept_async(stream).await.unwrap();
+                    for (previous, input_len) in [(None, 2), (Some("resp-new"), 1)] {
+                        let Message::Text(text) = reconnected.next().await.unwrap().unwrap() else {
+                            panic!("expected request on new connection");
+                        };
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(value.get("previous_response_id").and_then(|v| v.as_str()), previous);
+                        assert_eq!(value["input"].as_array().unwrap().len(), input_len);
+                        reconnected
+                            .send(Message::Text(
+                                r#"{"type":"response.completed","response":{"id":"resp-new","status":"completed"}}"#.into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                };
+                let client = async {
+                    let request = local_responses_request(&route);
+                    let transport = TurnLocalResponsesTransport::new();
+                    drain_response(transport.send_prepared(&route, request.clone()).await.unwrap()).await;
+                    transport.set_next_prompt_unit_start(1).await;
+                    let mut interrupted = transport.send_prepared(&route, request.clone()).await.unwrap();
+                    let chunk = interrupted.next_chunk().await.unwrap();
+                    if drop_partial {
+                        assert!(chunk.is_ok());
+                    } else {
+                        let error = chunk.unwrap_err();
+                        assert_eq!(error.code.as_deref(), Some("websocket_closed_before_terminal"));
+                        assert_eq!(error.retry_hint, RetryHint::Retryable);
+                    }
+                    drop(interrupted);
+                    drain_response(transport.send_prepared(&route, request.clone()).await.unwrap()).await;
+                    transport.set_next_prompt_unit_start(1).await;
+                    drain_response(transport.send_prepared(&route, request).await.unwrap()).await;
+                };
+                tokio::join!(server, client);
+            })
+            .await
+            .expect("WebSocket reconnect test timed out");
+        }
+    }
+
     fn route_for_local_server(address: std::net::SocketAddr) -> ResolvedModelRoute {
         let config = format!(
             r#"active_provider = "vendor"
@@ -1740,13 +1822,13 @@ tools = true
 protocol = "responses"
 default_model = "model"
 flavor = "standard"
-[providers.vendor.transport]
-websocket = true
 [providers.vendor.auth]
 type = "none"
 [providers.vendor.endpoints]
 base_url = "http://{address}"
 [providers.vendor.models.model]
+[providers.vendor.models.model.transport]
+websocket = true
 [providers.vendor.models.model.capabilities]
 reasoning = true
 "#

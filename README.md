@@ -157,10 +157,10 @@ base_url = "https://api.openai.com/v1"
 [providers.openai.endpoints.responses]
 path = "responses"
 
-# Optional provider transport; WebSocket is limited to Responses normal Agent turns.
+# Optional provider connection settings.
 # [providers.openai.transport]
-# websocket = false # default: HTTP/SSE transport
-# websocket = true  # opt in to a turn-local Responses WebSocket
+# connect_timeout_secs = 10
+# no_proxy_loopback = true
 
 # Required: each provider needs at least one model; every field inside the model is optional.
 [providers.openai.models."gpt-5.5"]
@@ -169,6 +169,12 @@ display = "GPT-5.5"
 # flavor = "standard" # overrides the provider flavor; deepseek selects the explicit DeepSeek profile
 # context_window = 400000
 # effective_input_limit_tokens = 256000
+
+# Optional model transport; defaults to HTTP/SSE. Set websocket = true for normal Agent
+# turns using Responses on a WebSocket-capable endpoint. Title generation and compaction
+# one-shot requests remain on HTTP/SSE.
+[providers.openai.models."gpt-5.5".transport]
+websocket = false
 
 # Capability flags default to false when omitted.
 [providers.openai.models."gpt-5.5".capabilities]

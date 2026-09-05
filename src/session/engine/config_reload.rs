@@ -439,7 +439,6 @@ pub(crate) fn route_runtime_fingerprint_eq(
         && left_provider.query == right_provider.query
         && left_provider.connect_timeout_secs == right_provider.connect_timeout_secs
         && left_provider.no_proxy_loopback == right_provider.no_proxy_loopback
-        && left_provider.websocket == right_provider.websocket
         && left_provider.models.get(&route.model) == right_provider.models.get(&route.model)
 }
 
@@ -621,7 +620,7 @@ mod expert_route_switch_tests {
     fn route_fingerprint_detects_websocket_transport_changes() {
         let config = |websocket: bool| {
             let websocket = if websocket {
-                "[providers.vendor.transport]\nwebsocket = true\n"
+                "[providers.vendor.models.model.transport]\nwebsocket = true\n"
             } else {
                 ""
             };
@@ -634,7 +633,8 @@ default_model = "model"
 type = "none"
 [providers.vendor.endpoints]
 base_url = "https://example.invalid/v1"
-{websocket}[providers.vendor.models.model]
+[providers.vendor.models.model]
+{websocket}[providers.vendor.models.other]
 "#
             ))
             .unwrap()
@@ -643,11 +643,17 @@ base_url = "https://example.invalid/v1"
             .fingerprint()
             .clone()
         };
-        let route = ModelRoute::new("vendor", "model");
+        let disabled = config(false);
+        let enabled = config(true);
         assert!(!route_runtime_fingerprint_eq(
-            &config(false),
-            &config(true),
-            &route
+            &disabled,
+            &enabled,
+            &ModelRoute::new("vendor", "model"),
+        ));
+        assert!(route_runtime_fingerprint_eq(
+            &disabled,
+            &enabled,
+            &ModelRoute::new("vendor", "other"),
         ));
     }
 

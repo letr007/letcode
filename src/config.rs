@@ -1509,6 +1509,31 @@ namespace = "standard-cache"
     }
 
     #[test]
+    fn model_websocket_settings_are_loaded_into_runtime_routes() {
+        let text = config(
+            "aggregator",
+            "enabled",
+            r#"[providers.aggregator.models.enabled.transport]
+websocket = true
+[providers.aggregator.models.other]
+[providers.aggregator.models.disabled.transport]
+websocket = false
+"#,
+        );
+        let loaded = AppConfig::load_from_path(&write_temp_config(text)).unwrap();
+        for (model, expected) in [("enabled", true), ("other", false), ("disabled", false)] {
+            assert_eq!(
+                loaded
+                    .runtime_catalog
+                    .route("aggregator", model)
+                    .unwrap()
+                    .websocket,
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn provider_and_model_flavor_protocol_and_endpoint_overrides_are_deterministic() {
         let path = write_temp_config(
             r#"active_provider = "deepseek"

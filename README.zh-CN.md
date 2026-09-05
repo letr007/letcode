@@ -157,10 +157,10 @@ base_url = "https://api.openai.com/v1"
 [providers.openai.endpoints.responses]
 path = "responses"
 
-# 可选的 provider transport；WebSocket 仅用于 Responses 普通 Agent 回合。
+# 可选的 provider 连接设置。
 # [providers.openai.transport]
-# websocket = false # 默认：HTTP/SSE transport
-# websocket = true  # 显式启用 turn-local Responses WebSocket
+# connect_timeout_secs = 10
+# no_proxy_loopback = true
 
 # 必需：每个 provider 至少配置一个 model；model 内字段均可省略。
 [providers.openai.models."gpt-5.5"]
@@ -169,6 +169,11 @@ display = "GPT-5.5"
 # flavor = "standard" # 可覆盖 provider flavor；deepseek 表示显式选择 DeepSeek profile
 # context_window = 400000
 # effective_input_limit_tokens = 256000
+
+# 可选的模型传输设置，默认 HTTP/SSE。端点支持 WebSocket 时，可显式设置 websocket = true，
+# 为该模型的 Responses 普通 Agent 回合启用 WS；标题生成和压缩等 one-shot 请求仍使用 HTTP/SSE。
+[providers.openai.models."gpt-5.5".transport]
+websocket = false
 
 # 能力标志省略时默认均为 false。
 [providers.openai.models."gpt-5.5".capabilities]

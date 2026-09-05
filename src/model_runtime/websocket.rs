@@ -1,5 +1,7 @@
 use super::{FailureKind, FailurePhase, ModelFailure, RetryHint};
 use futures_util::{SinkExt, StreamExt};
+use std::error::Error as StdError;
+use std::io::ErrorKind;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::{self, Message};
@@ -163,24 +165,71 @@ impl TurnLocalWsSession {
     }
 }
 
+const MAX_HANDSHAKE_ERROR_SOURCES: usize = 8;
+
 fn handshake_failure(error: reqwest::Error, secrets: &[&str]) -> ModelFailure {
-    let kind = if error.is_timeout() {
+    let timed_out = error.is_timeout();
+    let status = error.status();
+    let retryable = status.is_none() && (timed_out || error_chain_has_retryable_io(&error));
+    let kind = if timed_out {
         FailureKind::Timeout
     } else {
         FailureKind::Http
     };
     let mut failure = ModelFailure::new(FailurePhase::Transport, kind)
         .with_code("websocket_handshake_failed")
-        .with_retry_hint(if error.is_timeout() {
+        .with_retry_hint(if retryable {
             RetryHint::Retryable
         } else {
             RetryHint::Never
         })
-        .with_detail_redacted(error.to_string(), secrets);
-    if let Some(status) = error.status() {
+        .with_detail_redacted(format_error_chain(&error), secrets);
+    if let Some(status) = status {
         failure = failure.with_status(status.as_u16());
     }
     failure
+}
+
+fn error_chain_has_retryable_io(error: &(dyn StdError + 'static)) -> bool {
+    let mut source = Some(error);
+    for _ in 0..=MAX_HANDSHAKE_ERROR_SOURCES {
+        let Some(error) = source else {
+            break;
+        };
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| is_retryable_io_kind(error.kind()))
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn is_retryable_io_kind(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::TimedOut
+    )
+}
+
+fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    for depth in 1..=MAX_HANDSHAKE_ERROR_SOURCES {
+        let Some(error) = source else {
+            break;
+        };
+        detail.push_str(&format!("; source[{depth}]={error}"));
+        source = error.source();
+    }
+    detail
 }
 
 fn websocket_close_failure(
@@ -243,16 +292,159 @@ fn websocket_io_failure(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        Duration, TurnLocalWsSession, format_error_chain, handshake_failure, is_retryable_io_kind,
+    };
     use crate::model_runtime::{
         AuthScheme, ProviderTransport, RetryHint, RuntimeAuthConfig, RuntimeTransportConfig,
     };
     use futures_util::{SinkExt, StreamExt};
     use std::collections::BTreeMap;
+    use std::error::Error as StdError;
+    use std::io::ErrorKind;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    #[test]
+    fn retryable_io_classification_is_narrow_and_typed() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(is_retryable_io_kind(kind));
+        }
+        assert!(!is_retryable_io_kind(ErrorKind::InvalidInput));
+        assert!(!is_retryable_io_kind(ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn source_chain_format_is_depth_bounded() {
+        #[derive(Debug)]
+        struct ChainedError {
+            message: String,
+            source: Option<Box<Self>>,
+        }
+
+        impl std::fmt::Display for ChainedError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.message)
+            }
+        }
+
+        impl StdError for ChainedError {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                self.source
+                    .as_deref()
+                    .map(|error| error as &(dyn StdError + 'static))
+            }
+        }
+
+        let mut error = ChainedError {
+            message: "source-9".to_owned(),
+            source: None,
+        };
+        for index in (0..9).rev() {
+            error = ChainedError {
+                message: format!("source-{index}"),
+                source: Some(Box::new(error)),
+            };
+        }
+        let detail = format_error_chain(&error as &(dyn StdError + 'static));
+        assert!(detail.contains("source[8]=source-8"));
+        assert!(!detail.contains("source[9]="));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn closed_handshake_preserves_redacted_source_diagnostic_and_is_retryable() {
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            let result = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(result, 0);
+            drop(stream);
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!("http://{address}/?token=top-secret"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_err();
+        let failure = handshake_failure(response, &["top-secret"]);
+        assert_eq!(failure.retry_hint, RetryHint::Retryable);
+        assert!(failure.detail().contains("source["));
+        assert!(failure.detail().contains("connection"));
+        assert!(!failure.detail().contains("top-secret"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn reqwest_builder_error_is_not_retryable() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = client.get("http://[invalid").build().unwrap_err();
+        let failure = handshake_failure(error, &[]);
+        assert_eq!(failure.retry_hint, RetryHint::Never);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn client_error_status_is_not_retryable() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = client.get(format!("http://{address}/")).build().unwrap();
+        let failure =
+            match TurnLocalWsSession::connect(client, request, Duration::from_secs(1), &[]).await {
+                Ok(_) => panic!("a 403 handshake must fail"),
+                Err(failure) => failure,
+            };
+        assert_eq!(failure.status, Some(403));
+        assert_eq!(failure.retry_hint, RetryHint::Never);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
@@ -329,10 +521,7 @@ mod tests {
         });
 
         let transport = ProviderTransport::new_for_endpoint(
-            &RuntimeTransportConfig {
-                websocket: true,
-                ..RuntimeTransportConfig::default()
-            },
+            &RuntimeTransportConfig::default(),
             Some(&format!("http://{address}/responses")),
         )
         .unwrap();

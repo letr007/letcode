@@ -121,11 +121,10 @@ base_url = "https://api.openai.com/v1"
 # path = "responses"
 # query = { api_version = "2026-01-01" }
 
-# 可选 provider transport/static request 设置：
+# 可选 provider 连接设置：
 # [providers.openai.transport]
 # connect_timeout_secs = 10
 # no_proxy_loopback = true
-# websocket = false # Responses only; normal Agent turns use one turn-local WS session
 # [providers.openai.headers]
 # x-provider-version = "2026-01-01"
 # [providers.openai.query]
@@ -144,6 +143,11 @@ display = "GPT-5.5"
 # model_override = "wire-model-id"
 # context_window = 400000
 # effective_input_limit_tokens = 256000
+
+# 可选的模型传输设置，默认 HTTP/SSE。端点支持 WebSocket 时，可显式设置 websocket = true，
+# 为该模型的 Responses 普通 Agent 回合启用 WS；标题生成和压缩等 one-shot 请求仍使用 HTTP/SSE。
+[providers.openai.models."gpt-5.5".transport]
+websocket = false
 
 # 所有 capability 省略时默认 false；只打开真实支持的能力。
 [providers.openai.models."gpt-5.5".capabilities]
