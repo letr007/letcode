@@ -80,12 +80,12 @@ pub(crate) fn model_request_from_prompt_plan(
                 },
             ) => {
                 let mut parts = Vec::new();
-                if let Some(reasoning) = reasoning_content
-                    && (!reasoning.is_empty() || replay.is_some())
+                if reasoning_content.as_ref().is_some_and(|text| !text.is_empty())
+                    || replay.is_some()
                 {
                     parts.push(ContentPart::Reasoning {
                         item_id: format!("reasoning:{}", segment.id),
-                        text: reasoning.clone(),
+                        text: reasoning_content.clone().unwrap_or_default(),
                         replay: replay.clone(),
                     });
                 }
@@ -241,6 +241,191 @@ mod tests {
     use crate::request_builder::prompt_plan::{PromptPlanBuildInput, build_prompt_plan};
     use crate::request_builder::{HistoryItem, PromptMessage};
     use crate::runtime_context::RuntimeSnapshot;
+
+    fn replay_test_route(protocol: &str) -> super::super::ResolvedModelRoute {
+        crate::model_runtime::RuntimeConfig::from_toml(&format!(
+            r#"active_provider = "vendor"
+[providers.vendor]
+protocol = "{protocol}"
+default_model = "model"
+[providers.vendor.auth]
+type = "none"
+[providers.vendor.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.vendor.models.model.capabilities]
+tools = true
+parallel_tool_calls = true
+reasoning = true
+input_images = true
+prompt_cache = true
+[providers.vendor.models.model.capabilities.generation]
+max_output_tokens = true
+parallel_tool_calls = true
+"#
+        ))
+        .unwrap()
+        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+        .unwrap()
+        .route("vendor", "model")
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn history_replay_preserves_native_state_and_converts_foreign_messages() {
+        use crate::model_runtime::{OpaqueReplayState, ReplayProducer};
+        use serde_json::{Value, json};
+
+        for source in ["responses", "anthropic"] {
+            let source_route = replay_test_route(source);
+            let replay = if source == "anthropic" {
+                OpaqueReplayState::from_anthropic_thinking_blocks_json(
+                    r#"[{"type":"redacted_thinking","data":"native-opaque"}]"#,
+                )
+                .unwrap()
+            } else {
+                OpaqueReplayState::new(
+                    "responses.reasoning",
+                    1,
+                    ReplayProducer::new(
+                        source_route.binding.replay_scope(),
+                        source_route.binding.binding_identity(),
+                    ),
+                    json!({"type":"reasoning", "id":"rs_1", "encrypted_content":"native-opaque", "summary":[]}),
+                )
+            };
+            let history = vec![
+                HistoryItem::UserMessage {
+                    content: crate::user_content::UserMessageContent::new(
+                        "question",
+                        vec![crate::user_content::UserImageAttachment::from_bytes(
+                            "image",
+                            "image/png",
+                            b"png",
+                        )],
+                    ),
+                },
+                HistoryItem::AssistantTurn {
+                    text: None,
+                    reasoning_content: None,
+                    replay: Some(replay),
+                    calls: vec![],
+                },
+                HistoryItem::AssistantTurn {
+                    text: None,
+                    reasoning_content: Some("private reasoning".into()),
+                    replay: None,
+                    calls: vec![],
+                },
+                HistoryItem::AssistantTurn {
+                    text: Some("checking".into()),
+                    reasoning_content: None,
+                    replay: None,
+                    calls: ["call_a", "call_b"]
+                        .into_iter()
+                        .map(|id| ProtocolToolCall {
+                            call_id: id.into(),
+                            name: "search".into(),
+                            arguments_json: "{}".into(),
+                        })
+                        .collect(),
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "call_a".into(),
+                    output_json: "result a".into(),
+                    images: vec![],
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "call_b".into(),
+                    output_json: "result b".into(),
+                    images: vec![],
+                },
+                HistoryItem::assistant("answer"),
+                HistoryItem::user("continue"),
+            ];
+            let saved = serde_json::to_vec(&history).unwrap();
+            let restored: Vec<HistoryItem> = serde_json::from_slice(&saved).unwrap();
+            let frames = restored
+                .iter()
+                .enumerate()
+                .map(|(index, item)| ProtocolFrame::from_history_item(index, item))
+                .collect::<Vec<_>>();
+            let plan = build_prompt_plan(PromptPlanBuildInput {
+                model_id: "model",
+                prelude: &[
+                    PromptMessage::system("system rules"),
+                    PromptMessage::developer("dynamic context"),
+                ],
+                snapshot: &RuntimeSnapshot::new("test"),
+                selected_frames: &frames,
+                segment_order_offset: 0,
+                protected_suffix_len: 1,
+                evidence_message: None,
+                selected_evidence_ids: &[],
+            });
+            for target in ["responses", "anthropic", "completions"] {
+                let route = replay_test_route(target);
+                let request = model_request_from_prompt_plan(
+                    &route,
+                    &ModelRequestMetadata {
+                        supports_tools: true,
+                        ..Default::default()
+                    },
+                    &plan,
+                    &[],
+                )
+                .unwrap();
+                let prepared = route.binding.prepare_request(&request).unwrap();
+                let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+                let wire = body.to_string();
+                assert_eq!(
+                    wire.contains("native-opaque"),
+                    source == target,
+                    "{source} -> {target}: {body}"
+                );
+                assert!(!wire.contains("private reasoning"));
+                for text in [
+                    "question", "checking", "result a", "result b", "answer", "continue", "call_a",
+                    "call_b",
+                ] {
+                    assert!(wire.contains(text), "{source} -> {target}: missing {text}");
+                }
+                if target == "anthropic" {
+                    assert!(
+                        body["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|message| { !message["content"].as_array().unwrap().is_empty() })
+                    );
+                    assert_eq!(body["system"][0]["text"], "system rules");
+                } else if target == "completions" {
+                    assert!(body["messages"].as_array().unwrap().iter().all(|message| {
+                        !message["content"].is_null() || message["tool_calls"].is_array()
+                    }));
+                    assert_eq!(body["messages"][0]["role"], "system");
+                } else {
+                    assert_eq!(body["instructions"], "system rules");
+                }
+                let inspection = route
+                    .binding
+                    .inspect_prepared_request(&prepared, None)
+                    .unwrap();
+                assert_eq!(
+                    inspection.prompt_units.len(),
+                    prepared.prompt_unit_origins.len()
+                );
+                assert!(inspection.prompt_units.iter().all(|unit| {
+                    !unit.semantic_segment_ids.is_empty()
+                        && unit
+                            .semantic_segment_ids
+                            .iter()
+                            .all(|id| plan.segments.iter().any(|segment| &segment.id == id))
+                }));
+            }
+            assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
+        }
+    }
 
     #[test]
     fn projection_preserves_replay_tools_images_and_cache_boundary() {

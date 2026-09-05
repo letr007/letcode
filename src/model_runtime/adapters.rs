@@ -425,7 +425,8 @@ impl ProtocolBinding for AnthropicBinding {
             })
             .collect::<Vec<_>>();
         let mut messages = Vec::new();
-        for message in &input.messages {
+        let mut message_indices = Vec::new();
+        for (index, message) in input.messages.iter().enumerate() {
             let role = match message.role {
                 MessageRole::User => "user",
                 MessageRole::Assistant => "assistant",
@@ -513,6 +514,12 @@ impl ProtocolBinding for AnthropicBinding {
                 }
             }
             content.extend(tool_calls);
+            // Foreign reasoning has no Anthropic wire representation. Keep the
+            // canonical history intact, but do not emit an empty assistant turn.
+            if message.role == MessageRole::Assistant && content.is_empty() {
+                continue;
+            }
+            message_indices.push(index);
             messages.push(AnthropicMessage { role, content });
         }
         if input.cache.enabled && self.capabilities.prompt_cache {
@@ -528,7 +535,10 @@ impl ProtocolBinding for AnthropicBinding {
             }
             if prefix_count > system.len() {
                 let message_index = prefix_count - system.len() - 1;
-                if let Some(message) = messages.get_mut(message_index)
+                if let Some(retained_index) = message_indices
+                    .iter()
+                    .rposition(|index| *index <= message_index)
+                    && let Some(message) = messages.get_mut(retained_index)
                     && let Some(last) = message.content.last_mut()
                     && !last.set_cache()
                 {
@@ -624,7 +634,11 @@ impl ProtocolBinding for AnthropicBinding {
             prompt_unit_origins: input
                 .segment_origins
                 .iter()
-                .chain(input.message_origins.iter())
+                .chain(
+                    message_indices
+                        .iter()
+                        .filter_map(|index| input.message_origins.get(*index)),
+                )
                 .map(|origin| vec![origin.clone()])
                 .collect(),
         })
@@ -1918,7 +1932,7 @@ impl ProtocolBinding for CompletionsBinding {
         &self,
         input: &ModelRequestInput,
     ) -> Result<PreparedHttpRequest, ModelFailure> {
-        let mut request = CompletionsRequest::from_input(self, input)?;
+        let (mut request, message_indices) = CompletionsRequest::from_input(self, input)?;
         if self.flavor == CompletionsFlavor::Standard && input.cache.enabled {
             request.prompt_cache_key = Some(cache_key_for_completions(self, input, &request)?);
         }
@@ -1938,7 +1952,11 @@ impl ProtocolBinding for CompletionsBinding {
             prompt_unit_origins: input
                 .segment_origins
                 .iter()
-                .chain(input.message_origins.iter())
+                .chain(
+                    message_indices
+                        .iter()
+                        .filter_map(|index| input.message_origins.get(*index)),
+                )
                 .map(|origin| vec![origin.clone()])
                 .collect(),
         })
@@ -2094,8 +2112,9 @@ impl CompletionsRequest {
     fn from_input(
         binding: &CompletionsBinding,
         input: &ModelRequestInput,
-    ) -> Result<Self, ModelFailure> {
+    ) -> Result<(Self, Vec<usize>), ModelFailure> {
         let mut messages = Vec::new();
+        let mut message_indices = Vec::new();
         for segment in &input.segments {
             let role = if binding.flavor == CompletionsFlavor::DeepSeek {
                 "system"
@@ -2113,7 +2132,7 @@ impl CompletionsRequest {
                 reasoning_content: None,
             });
         }
-        for message in &input.messages {
+        for (index, message) in input.messages.iter().enumerate() {
             let role = match message.role {
                 MessageRole::User => "user",
                 MessageRole::Assistant => "assistant",
@@ -2183,6 +2202,14 @@ impl CompletionsRequest {
                     _ => {}
                 }
             }
+            if message.role == MessageRole::Assistant
+                && content.is_empty()
+                && calls.is_empty()
+                && (binding.flavor != CompletionsFlavor::DeepSeek || reasoning.is_empty())
+            {
+                continue;
+            }
+            message_indices.push(index);
             if binding.flavor == CompletionsFlavor::DeepSeek
                 && message.role == MessageRole::Assistant
                 && (reasoning.is_empty() == false || !calls.is_empty())
@@ -2336,7 +2363,7 @@ impl CompletionsRequest {
                 "priority service capability is disabled",
             ));
         }
-        Ok(Self {
+        let request = Self {
             model: input.control.model.clone(),
             messages,
             n: 1,
@@ -2382,7 +2409,8 @@ impl CompletionsRequest {
                 }),
             prompt_cache_key: None,
             tools,
-        })
+        };
+        Ok((request, message_indices))
     }
 }
 
@@ -4544,6 +4572,126 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code.as_deref(), Some("unsupported_responses_flavor"));
+    }
+
+    #[test]
+    fn anthropic_replay_filter_preserves_cache_boundary_and_origins() {
+        let binding = anthropic_binding("").unwrap();
+        let reasoning = ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::Reasoning {
+                item_id: "rs_foreign".into(),
+                text: "foreign reasoning".into(),
+                replay: Some(OpaqueReplayState::new(
+                    "responses.reasoning",
+                    1,
+                    ReplayProducer::new(ReplayScope::Profile, &identity("standard")),
+                    serde_json::json!({"type":"reasoning", "id":"rs_foreign", "encrypted_content":"opaque"}),
+                )),
+            }],
+        };
+        let mut input = ModelRequestInput::new(
+            "claude",
+            vec![
+                ModelMessage::text(MessageRole::User, "question"),
+                reasoning.clone(),
+                ModelMessage::text(MessageRole::Assistant, "answer"),
+                reasoning,
+                ModelMessage::text(MessageRole::User, "current"),
+            ],
+        );
+        input.segments = vec![ControlSegment::system("rules")];
+        input.segment_origins = vec!["system".into()];
+        input.message_origins = [
+            "question",
+            "reasoning-1",
+            "answer",
+            "reasoning-2",
+            "current",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        input.cache.enabled = true;
+        for (segment_count, cached_message) in [
+            (1, None),
+            (2, Some(0)),
+            (3, Some(0)),
+            (4, Some(1)),
+            (5, Some(1)),
+        ] {
+            input.cache.stable_prefix = Some(StablePrefixMetadata {
+                segment_count,
+                fingerprint: None,
+            });
+            let prepared = binding.prepare_request(&input).unwrap();
+            let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+            for (index, message) in body["messages"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(
+                    message["content"][0].get("cache_control").is_some(),
+                    cached_message == Some(index)
+                );
+            }
+            assert_eq!(
+                prepared.prompt_unit_origins,
+                vec![
+                    vec!["system".to_string()],
+                    vec!["question".to_string()],
+                    vec!["answer".to_string()],
+                    vec!["current".to_string()],
+                ]
+            );
+            let inspection = binding.inspect_prepared_request(&prepared, None).unwrap();
+            assert_eq!(inspection.prompt_units.len(), 4);
+            assert_eq!(
+                inspection.prompt_units[3].semantic_segment_ids,
+                vec!["current"]
+            );
+            assert!(inspection.cache.hint_serialized);
+        }
+    }
+
+    #[test]
+    fn deepseek_completions_preserves_text_reasoning_and_omits_opaque_only_turns() {
+        let binding = completions_binding("deepseek");
+        let mut input = ModelRequestInput::new(
+            "deepseek",
+            vec![
+                ModelMessage::text(MessageRole::User, "question"),
+                ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentPart::Reasoning {
+                        item_id: "reasoning".into(),
+                        text: "plain reasoning".into(),
+                        replay: None,
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentPart::Reasoning {
+                        item_id: "opaque".into(),
+                        text: String::new(),
+                        replay: OpaqueReplayState::from_anthropic_thinking_blocks_json(
+                            r#"[{"type":"redacted_thinking","data":"opaque"}]"#,
+                        ),
+                    }],
+                },
+                ModelMessage::text(MessageRole::User, "continue"),
+            ],
+        );
+        input.message_origins = ["question", "reasoning", "opaque", "continue"]
+            .map(str::to_owned)
+            .to_vec();
+        let prepared = binding.prepare_request(&input).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][1]["reasoning_content"], "plain reasoning");
+        assert!(!body.to_string().contains("opaque"));
+        let inspection = binding.inspect_prepared_request(&prepared, None).unwrap();
+        assert_eq!(
+            inspection.prompt_units[2].semantic_segment_ids,
+            vec!["continue"]
+        );
     }
 
     #[test]

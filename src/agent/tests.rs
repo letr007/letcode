@@ -346,6 +346,52 @@ fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
 }
 
 #[test]
+fn protocol_switch_rebuilds_request_observation_without_rewriting_history() {
+    use crate::model_runtime::{OpaqueReplayState, ProfileIdentity, ReplayProducer, ReplayScope};
+
+    let mut history = active_epoch_history_with_complete_tool_group();
+    history.insert(1, HistoryItem::AssistantTurn {
+        text: None,
+        reasoning_content: None,
+        replay: Some(OpaqueReplayState::new(
+            "responses.reasoning", 1,
+            ReplayProducer {
+                scope: ReplayScope::Profile,
+                protocol_id: crate::model_runtime::ProtocolId::new("responses").unwrap(),
+                profile_identity: Some(ProfileIdentity::new("test").unwrap()),
+                route_identity: None,
+            },
+            json!({"type":"reasoning", "id":"rs_history", "encrypted_content":"opaque", "summary":[]}),
+        )),
+        calls: vec![],
+    });
+    let mut agent = active_epoch_agent(history.clone());
+    let tools = active_epoch_tools();
+    for protocol in [
+        ApiProtocol::Responses,
+        ApiProtocol::Anthropic,
+        ApiProtocol::Completions,
+        ApiProtocol::Responses,
+    ] {
+        install_active_epoch_route(&mut agent, protocol);
+        let preview = agent
+            .resolved_epoch_preview_for_test(protocol, &[], &tools)
+            .expect("history serializes and origin attribution matches on the target protocol");
+        assert!(matches!(preview.transition, ActiveEpochTransition::Cold));
+        assert!(!preview.epoch.observation.units.is_empty());
+        agent.commit_active_epoch(preview);
+        assert_eq!(agent.history_for_test(), history);
+        assert!(
+            agent
+                .session_token_usage()
+                .expect("target request budget")
+                .input_tokens
+                > 0
+        );
+    }
+}
+
+#[test]
 fn active_epoch_appends_complete_groups_for_both_protocols() {
     for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
         let tools = active_epoch_tools();
