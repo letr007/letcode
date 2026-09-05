@@ -302,7 +302,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as StdError;
     use std::io::ErrorKind;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
@@ -426,6 +426,20 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            // Consume the handshake before closing; unread request bytes can
+            // cause a TCP reset that hides the HTTP response on Windows.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(
+                        request.len() < 16_384,
+                        "handshake headers exceed test limit"
+                    );
+                    request.push(stream.read_u8().await.unwrap());
+                }
+            })
+            .await
+            .expect("handshake request timed out");
             stream
                 .write_all(
                     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
