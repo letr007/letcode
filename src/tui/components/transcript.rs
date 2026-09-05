@@ -300,7 +300,7 @@ fn cached_transcript_row_count_with_reflow(
         state.on_timeline_changed();
     }
 
-    if state.transcript_render_cache.row_metadata_revision == Some(mutation_revision) {
+    if transcript_row_metadata_is_current(state) {
         return (
             state
                 .transcript_render_cache
@@ -480,7 +480,10 @@ fn visible_cached_transcript_lines(
                 line_start,
                 line_end,
             } => {
-                let lines = cached_item_lines(state, index, theme, width);
+                // Slice the same document used to calculate the viewport geometry.
+                let lines = transcript_ratatui::document_to_ratatui(
+                    &state.transcript_render_cache.entries[index].document,
+                );
                 visible.extend(lines[line_start..line_end].iter().cloned());
             }
         }
@@ -526,6 +529,12 @@ fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
     let timeline = state.active_timeline();
     state.transcript_render_cache.row_metadata_revision == Some(timeline.mutation_revision())
         && state.transcript_render_cache.total_rows.is_some()
+        && state
+            .transcript_render_cache
+            .live_render_frames
+            .iter()
+            .flatten()
+            .all(|frame| *frame == state.status_spinner_frame)
 }
 
 fn tool_keeps_card_in_compact_mode(tool: &ToolView) -> bool {
@@ -669,16 +678,14 @@ fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool 
 }
 
 fn cached_item_line_count(state: &mut TuiState, index: usize, theme: Theme, width: usize) -> usize {
-    let revision = state.active_timeline().item_revisions().get(index).copied();
-    if state.transcript_render_cache.entries[index].revision != revision {
-        refresh_cached_item_document(state, index, theme, width);
-    }
+    refresh_cached_item_document(state, index, theme, width);
     state.transcript_render_cache.entries[index]
         .document
         .lines
         .len()
 }
 
+#[cfg(test)]
 fn cached_item_lines(
     state: &mut TuiState,
     index: usize,
@@ -700,26 +707,23 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
             });
     }
 
-    let (
-        revision,
-        live,
-        item,
-        next_reasoning,
-        next_tool,
-        tool_group_stats,
-        compact_reasoning_elapsed_ms,
-    ) = {
+    let (revision, live, item, next_reasoning, next_tool, tool_group_stats) = {
         let timeline = state.active_timeline();
         let items = timeline.items();
         let revisions = timeline.item_revisions();
-        let item = items[index].clone();
+        let item = &items[index];
         let next_reasoning =
             index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_));
         let next_tool = index + 1 < items.len() && is_compact_tool_group_item(&items[index + 1]);
-        let tool_group_stats = compact_tool_group_stats(items, index);
-        let compact_reasoning_elapsed_ms = compact_reasoning_group_elapsed_ms(items, index);
+        let tool_group_stats = if state.tools_display == crate::command::ToolsDisplayMode::Compact
+            && !next_tool
+        {
+            compact_tool_group_stats(items, index)
+        } else {
+            tool_card::ToolGroupStats::default()
+        };
         let revision = if state.tools_display == crate::command::ToolsDisplayMode::Compact
-            && is_compact_tool_group_item(&item)
+            && is_compact_tool_group_item(item)
             && !next_tool
         {
             compact_tool_group_revision(items, revisions, index)
@@ -732,13 +736,13 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
             revisions.get(index).copied()
         };
         let live = if state.tools_display == crate::command::ToolsDisplayMode::Compact
-            && is_compact_tool_group_item(&item)
+            && is_compact_tool_group_item(item)
             && !next_tool
         {
             tool_group_stats.active
         } else {
             matches!(
-                &item,
+                item,
                 TimelineItem::Tool(tool)
                     if matches!(
                         tool.status,
@@ -746,20 +750,12 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
                             | crate::tui::timeline::ToolExecutionStatus::Running
                     )
             ) || matches!(
-                &item,
+                item,
                 TimelineItem::Reasoning(reasoning)
                     if reasoning.streaming || reasoning.transition_started_at.is_some()
             )
         };
-        (
-            revision,
-            live,
-            item,
-            next_reasoning,
-            next_tool,
-            tool_group_stats,
-            compact_reasoning_elapsed_ms,
-        )
+        (revision, live, item, next_reasoning, next_tool, tool_group_stats)
     };
     let frame = state.status_spinner_frame;
     if state.transcript_render_cache.entries[index].revision == revision
@@ -768,18 +764,22 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         return;
     }
     let document = render_timeline_item_document(
-        &item,
+        item,
         theme,
         width,
         state.status_spinner_frame,
-        tool_output_expanded_for_item(state, &item),
+        tool_output_expanded_for_item(state, item),
         is_reviewer_child_view(state),
         state.thoughts_display,
         next_reasoning,
         state.tools_display,
         next_tool,
         tool_group_stats,
-        compact_reasoning_elapsed_ms,
+        if state.thoughts_display == crate::command::ThoughtsDisplayMode::Compact && next_reasoning {
+            None
+        } else {
+            compact_reasoning_group_elapsed_ms(state.active_timeline().items(), index)
+        },
         &state.translator(),
     );
     let entry = &mut state.transcript_render_cache.entries[index];
@@ -2308,6 +2308,84 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use serde_json::json;
+
+    #[test]
+    fn live_reasoning_visible_window_tracks_elapsed_layout() {
+        use crate::command::ThoughtsDisplayMode::{Compact, Full, Titles};
+
+        for (display, width) in [(Titles, 80), (Full, 80), (Compact, 18)] {
+            for child_view in [false, true] {
+                let mut state = TuiState::default();
+                let theme = Theme::dark();
+                state.set_thoughts_display(display);
+                state
+                    .timeline
+                    .push_restored_message(MessageRole::Assistant, "parent".into());
+                cached_transcript_row_count(&mut state, theme, width);
+                let event = SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+                    "reasoning",
+                    "B".repeat(64),
+                    std::time::Instant::now() - std::time::Duration::from_secs(2),
+                ));
+                if child_view {
+                    state.replace_child_timeline_from_records(
+                        &[], "parent", "child", "explorer", 0, 1, 1,
+                    );
+                    state.apply_child_session_event("child", event);
+                } else {
+                    state.apply_event(event);
+                }
+                cached_transcript_row_count(&mut state, theme, width);
+                let index = state.active_timeline().items().len() - 1;
+
+                // Seed a prior frame's millisecond layout using an explicit elapsed
+                // sample, without a timing-sensitive sleep around the seconds boundary.
+                let previous = render_timeline_item_document(
+                    &state.active_timeline().items()[index],
+                    theme,
+                    width,
+                    state.status_spinner_frame,
+                    false,
+                    false,
+                    display,
+                    false,
+                    state.tools_display,
+                    false,
+                    tool_card::ToolGroupStats::default(),
+                    Some(960),
+                    &state.translator(),
+                );
+                let previous_rows = previous.lines.len();
+                state.transcript_render_cache.entries[index].document = previous;
+                state.transcript_render_cache.invalidate_row_metadata();
+                cached_transcript_row_count(&mut state, theme, width);
+                assert_eq!(
+                    state.transcript_render_cache.row_counts[index],
+                    previous_rows
+                );
+                let revision = state.active_timeline().mutation_revision();
+
+                // A presentation frame can change without a timeline mutation.
+                state.status_spinner_frame += 1;
+                let visible = visible_cached_transcript_lines(&mut state, theme, width, 20, 0);
+                assert_eq!(state.active_timeline().mutation_revision(), revision);
+                assert_eq!(
+                    state.transcript_render_cache.row_counts[index],
+                    previous_rows - 1
+                );
+                assert_eq!(
+                    state.transcript_render_cache.row_counts[index],
+                    state.transcript_render_cache.entries[index].document.lines.len(),
+                );
+                assert_eq!(visible, transcript_lines(&state, theme, width));
+                assert_eq!(visible_document_lines(&state, 20, 0).len(), visible.len());
+                assert_eq!(
+                    cached_transcript_row_count(&mut state, theme, width),
+                    visible.len()
+                );
+            }
+        }
+    }
 
     fn test_attachment(id: &str, label: &str) -> UserImageAttachment {
         UserImageAttachment {
