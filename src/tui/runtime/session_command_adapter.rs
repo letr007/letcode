@@ -10,7 +10,7 @@ use crate::session::{
     ActiveTurnCommandDisposition, SessionCommand, SessionCommandHandler, SessionEngineIngress,
 };
 
-use crate::tui::state::ToastKind;
+use crate::tui::state::{AppPhase, ToastKind};
 
 use super::{TuiRuntime, child_navigation_anchor};
 
@@ -65,6 +65,26 @@ impl<'a> TuiSessionCommandAdapter<'a> {
         }
         if deferred {
             self.runtime.project_deferred_setting(&command);
+        }
+        match command {
+            SessionCommand::Compact => {
+                self.runtime.state.mark_session_active();
+                self.runtime.state.phase = AppPhase::Running;
+                self.runtime.session_turn_active = true;
+                let message = self.runtime.state.t("runtime.compacting_context");
+                self.runtime.show_toast(message, ToastKind::Info);
+            }
+            SessionCommand::DelegateSubagent { agent_name, task } => {
+                self.runtime.state.mark_session_active();
+                self.runtime.state.phase = AppPhase::Running;
+                self.runtime.session_turn_active = true;
+                self.runtime
+                    .state
+                    .timeline
+                    .push_delegation(agent_name, task);
+                self.runtime.state.toast = None;
+            }
+            _ => {}
         }
         Ok(())
     }

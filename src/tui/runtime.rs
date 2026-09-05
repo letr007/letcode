@@ -2671,14 +2671,7 @@ impl TuiRuntime {
             SessionCommand::SetFakeClient(client) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::SetFakeClient(client),
             ))),
-            SessionCommand::Compact => {
-                self.state.mark_session_active();
-                self.state.phase = super::state::AppPhase::Running;
-                self.session_turn_active = true;
-                self.state
-                    .show_toast(self.state.t("runtime.compacting_context"), ToastKind::Info);
-                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
-            }
+            SessionCommand::Compact => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact))),
             SessionCommand::ShowHistoryTree => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ShowHistoryTree,
             ))),
@@ -2711,18 +2704,9 @@ impl TuiRuntime {
                 }
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
             }
-            SessionCommand::DelegateSubagent { agent_name, task } => {
-                self.state.mark_session_active();
-                self.state.phase = super::state::AppPhase::Running;
-                self.session_turn_active = true;
-                self.state
-                    .timeline
-                    .push_delegation(agent_name.clone(), task.clone());
-                self.state.toast = None;
-                Ok(Some(SubmittedCommand::Runtime(
-                    RuntimeCommand::DelegateSubagent { agent_name, task },
-                )))
-            }
+            SessionCommand::DelegateSubagent { agent_name, task } => Ok(Some(
+                SubmittedCommand::Runtime(RuntimeCommand::DelegateSubagent { agent_name, task }),
+            )),
             SessionCommand::ToggleMcpServer(server_name) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleMcpServer(server_name),
             ))),
