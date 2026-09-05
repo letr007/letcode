@@ -80,7 +80,9 @@ pub(crate) fn model_request_from_prompt_plan(
                 },
             ) => {
                 let mut parts = Vec::new();
-                if reasoning_content.as_ref().is_some_and(|text| !text.is_empty())
+                if reasoning_content
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty())
                     || replay.is_some()
                 {
                     parts.push(ContentPart::Reasoning {

@@ -30,6 +30,7 @@ pub mod slash;
 pub mod state;
 pub mod surface;
 pub mod terminal;
+mod terminal_input;
 pub mod theme;
 pub mod theme_file;
 pub mod timeline;

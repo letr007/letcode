@@ -7,6 +7,33 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-05
+
+### Added
+
+- TUI 的 Mermaid 渲染新增饼图、Git 图、用户旅程图和象限图。
+
+### Breaking
+
+- WebSocket 开关从 `[providers.<name>.transport]` 移至 `[providers.<name>.models.<model>.transport]`，可按模型独立启用；旧位置的 `websocket` 字段不再接受，已配置的用户需迁移。默认仍为 HTTP/SSE，WebSocket 仅用于 Responses 普通 Agent 回合。
+
+### Changed
+
+- 增强 Mermaid 复杂图表展示，支持流程图双向边与回环、时序图并行块与激活标记，并改进嵌套状态图、ER 图和甘特图的布局。
+- `/tools` 紧凑模式保留子代理委派及控制操作的独立卡片，不再将它们合并进普通工具调用组。
+
+### Fixed
+
+- 修复父会话与子代理视图中思考状态换行变化时，行数缓存与实际内容不一致导致的程序异常退出。
+- 修复 Responses、Anthropic 与 Chat Completions 之间切换时，历史 reasoning 转换后留下空 assistant 消息的问题；保留无明文的原生 replay 数据，并同步维护请求来源映射和缓存断点，不改写原始历史。
+- 修复 Responses WebSocket 重连后的上下文续接，并让可重试的握手连接错误遵循已配置的重试策略，保留脱敏后的底层错误详情。
+- 上下文压缩的摘要流失败后可按重试配置重新生成；重试前清除上次预览，避免混入失败尝试的内容，最终失败时保留原历史。
+- Codex 请求兼容模式保留已配置的 reasoning effort 与 summary，避免思考摘要设置丢失。
+- 手动压缩和专家委派在成功派发后正确显示运行状态，派发失败时不会残留忙碌状态。
+- Windows TUI 解析终端发送的 bracketed-paste 边界，将大段文本作为一次粘贴处理，保留中文、emoji 和空行；CRLF／CR 统一为 LF，避免粘贴中的换行触发发送。
+- 补齐应用收到的 Ctrl-Shift-V 和 Shift-Insert 剪贴板快捷键，支持在主输入框读取文字与图片；图片转换失败时保留草稿并显示错误，不再退出 TUI。
+- Transcript 写锁在释放时显式解锁，避免 Unix 子进程继承的文件描述符导致会话关闭后短暂无法重新打开。
+
 ## [0.10.0] - 2026-09-04
 
 ### Added
@@ -272,7 +299,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/letr007/letcode/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/letr007/letcode/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/letr007/letcode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/letr007/letcode/compare/v0.7.0...v0.8.0

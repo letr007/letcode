@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use tokio::sync::mpsc;
 
 use crate::command::{
@@ -4021,70 +4021,103 @@ impl TuiRuntime {
         Ok(())
     }
 
-    fn handle_paste_from_clipboard(&mut self) -> Result<()> {
-        use arboard::Clipboard;
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
+    fn clipboard_paste_context(&self) -> ClipboardPasteContext {
+        if self.state.dialog_is_open() {
+            ClipboardPasteContext::Dialog
+        } else if self.state.pending_question.is_some() {
+            ClipboardPasteContext::Question
+        } else if self.state.pending_permission.is_some() {
+            ClipboardPasteContext::Permission
+        } else {
+            ClipboardPasteContext::Composer
+        }
+    }
 
-        match Clipboard::new() {
+    fn handle_paste_from_clipboard(&mut self) -> Result<()> {
+        match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
                 let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
-                let context = if self.state.dialog_is_open() {
-                    ClipboardPasteContext::Dialog
-                } else if self.state.pending_question.is_some() {
-                    ClipboardPasteContext::Question
-                } else if self.state.pending_permission.is_some() {
-                    ClipboardPasteContext::Permission
-                } else {
+                let image = if matches!(
+                    self.clipboard_paste_context(),
                     ClipboardPasteContext::Composer
-                };
-                let image = if matches!(context, ClipboardPasteContext::Composer) {
+                ) {
                     clipboard.get_image().ok()
                 } else {
                     None
                 };
-
-                match choose_clipboard_paste(context, text.is_some(), image.is_some()) {
-                    ClipboardPasteChoice::Image => {
-                        let image = image.expect("clipboard image choice requires an image");
-                        let mut png_bytes = Vec::new();
-                        PngEncoder::new(&mut png_bytes).write_image(
-                            image.bytes.as_ref(),
-                            image.width as u32,
-                            image.height as u32,
-                            ColorType::Rgba8.into(),
-                        )?;
-
-                        let data_url =
-                            format!("data:image/png;base64,{}", STANDARD.encode(png_bytes));
-                        self.state.add_composer_attachment(UserImageAttachment {
-                            id: next_attachment_id(),
-                            label: "clipboard".into(),
-                            mime: "image/png".into(),
-                            data_url,
-                        });
-                        self.reset_history_navigation();
-                    }
-                    ClipboardPasteChoice::Text => {
-                        let action = map_paste_event(
-                            &self.state,
-                            text.expect("clipboard text choice requires text"),
-                        );
-                        let _ = self.handle_input_action(action)?;
-                    }
-                    ClipboardPasteChoice::None => {
-                        self.show_toast(self.state.t("runtime.paste_failed"), ToastKind::Error);
-                    }
+                if let Err(error) = self.apply_clipboard_content(text, image) {
+                    tracing::warn!(%error, "failed to paste clipboard content");
+                    self.show_toast(self.state.t("runtime.paste_failed"), ToastKind::Error);
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(%error, "failed to open clipboard");
                 self.show_toast(
                     self.state.t("runtime.clipboard_unavailable"),
                     ToastKind::Error,
                 );
             }
         }
+        Ok(())
+    }
 
+    fn apply_clipboard_content(
+        &mut self,
+        text: Option<String>,
+        image: Option<arboard::ImageData<'_>>,
+    ) -> Result<()> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
+
+        match choose_clipboard_paste(
+            self.clipboard_paste_context(),
+            text.is_some(),
+            image.is_some(),
+        ) {
+            ClipboardPasteChoice::Image => {
+                if self.state.is_read_only_child_view() {
+                    return Ok(());
+                }
+                let image = image.expect("clipboard image choice requires an image");
+                let width = u32::try_from(image.width)?;
+                let height = u32::try_from(image.height)?;
+                anyhow::ensure!(
+                    width > 0
+                        && height > 0
+                        && image
+                            .width
+                            .checked_mul(image.height)
+                            .and_then(|pixels| pixels.checked_mul(4))
+                            == Some(image.bytes.len()),
+                    "invalid clipboard RGBA image dimensions"
+                );
+                let mut png_bytes = Vec::new();
+                PngEncoder::new(&mut png_bytes).write_image(
+                    image.bytes.as_ref(),
+                    width,
+                    height,
+                    ColorType::Rgba8.into(),
+                )?;
+                let data_url = format!("data:image/png;base64,{}", STANDARD.encode(png_bytes));
+                self.state.add_composer_attachment(UserImageAttachment {
+                    id: next_attachment_id(),
+                    label: "clipboard".into(),
+                    mime: "image/png".into(),
+                    data_url,
+                });
+                self.reset_history_navigation();
+            }
+            ClipboardPasteChoice::Text => {
+                let action = map_paste_event(
+                    &self.state,
+                    text.expect("clipboard text choice requires text"),
+                );
+                let _ = self.handle_input_action(action)?;
+            }
+            ClipboardPasteChoice::None => {
+                self.show_toast(self.state.t("runtime.paste_failed"), ToastKind::Error);
+            }
+        }
         Ok(())
     }
 }
@@ -4590,6 +4623,8 @@ pub async fn run_tui(
         runtime.start_update_check();
         runtime.session_title = projection.session_title;
         let mut terminal = OwnedTerminal::new()?;
+        // Restore platform input modes before OwnedTerminal restores raw mode.
+        let mut input = super::terminal_input::TerminalInput::new()?;
         runtime.update_terminal_title(&mut terminal)?;
         let mut drawer = TerminalDrawer::new(&mut terminal);
 
@@ -4607,10 +4642,10 @@ pub async fn run_tui(
 
         loop {
             for _ in 0..MAX_INPUT_EVENTS_PER_FRAME {
-                if !event::poll(Duration::ZERO)? {
+                let Some(event) = input.read(Duration::ZERO)? else {
                     break;
-                }
-                process_terminal_event(&mut runtime, event::read()?, &ingress)?;
+                };
+                process_terminal_event(&mut runtime, event, &ingress)?;
             }
             runtime.try_drain_session_events();
             if let Some(command) = runtime.take_next_queued_prompt_command() {
@@ -4628,8 +4663,8 @@ pub async fn run_tui(
                 }
                 break;
             }
-            if event::poll(TUI_FRAME_POLL_INTERVAL)? {
-                process_terminal_event(&mut runtime, event::read()?, &ingress)?;
+            if let Some(event) = input.read(TUI_FRAME_POLL_INTERVAL)? {
+                process_terminal_event(&mut runtime, event, &ingress)?;
             } else {
                 let _ = runtime.handle_input_action(InputAction::Tick)?;
             }

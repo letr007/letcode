@@ -758,6 +758,72 @@ fn expert_allowlist_event_syncs_the_open_picker() {
 }
 
 #[test]
+fn clipboard_image_becomes_a_png_attachment_without_inserting_text() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("describe ");
+    let pixels = vec![255, 0, 0, 255, 0, 255, 0, 255];
+    runtime
+        .apply_clipboard_content(
+            Some("image description".into()),
+            Some(arboard::ImageData {
+                width: 2,
+                height: 1,
+                bytes: pixels.clone().into(),
+            }),
+        )
+        .unwrap();
+    let content = runtime.state().composer_content();
+    assert_eq!(content.text, "describe [Image 1]");
+    assert_eq!(content.attachments.len(), 1);
+    let png = STANDARD
+        .decode(
+            content.attachments[0]
+                .data_url
+                .strip_prefix("data:image/png;base64,")
+                .unwrap(),
+        )
+        .unwrap();
+    let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+    assert_eq!(decoded.dimensions(), (2, 1));
+    assert_eq!(decoded.as_raw(), &pixels);
+    assert!(!runtime.state().quit_requested);
+}
+
+#[test]
+fn clipboard_large_text_is_one_token_and_never_submits_commands() {
+    let mut runtime = runtime();
+    let paste = "中文😀\r\n/quit\r\n\r\n".repeat(20_000);
+    let expected = paste.replace("\r\n", "\n");
+    runtime.apply_clipboard_content(Some(paste), None).unwrap();
+    assert_eq!(runtime.state().composer_tokens.len(), 1);
+    assert_eq!(runtime.state().input_buffer.chars().count(), 1);
+    assert_eq!(runtime.state().composer_content().text, expected);
+    assert!(!runtime.state().quit_requested);
+}
+
+#[test]
+fn invalid_clipboard_image_does_not_change_the_composer() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("keep draft");
+    assert!(
+        runtime
+            .apply_clipboard_content(
+                None,
+                Some(arboard::ImageData {
+                    width: 2,
+                    height: 2,
+                    bytes: vec![0; 3].into(),
+                })
+            )
+            .is_err()
+    );
+    assert_eq!(runtime.state().input_buffer, "keep draft");
+    assert!(runtime.state().composer_content().attachments.is_empty());
+}
+
+#[test]
 fn clipboard_paste_prefers_image_only_in_composer_context() {
     assert_eq!(
         choose_clipboard_paste(ClipboardPasteContext::Composer, true, true),

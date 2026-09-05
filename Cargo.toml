@@ -1,6 +1,6 @@
 [package]
 name = "letcode"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "A terminal coding agent with a Ratatui TUI and REPL CLI"
 license = "MIT OR Apache-2.0"
@@ -63,10 +63,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
+termwiz = { version = "0.23.3", default-features = false }
+
+[dev-dependencies]
+termwiz = { version = "0.23.3", default-features = false }
 
 [profile.dev]
 debug = 0

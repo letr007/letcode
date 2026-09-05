@@ -102,12 +102,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     if let Some(question) = state.pending_question.as_ref() {
         if question.editing_custom {
             return match key.code {
-                KeyCode::Char('v')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        || key.modifiers.contains(KeyModifiers::SUPER) =>
-                {
-                    InputAction::PasteFromClipboard
-                }
+                _ if is_clipboard_paste_key(key) => InputAction::PasteFromClipboard,
                 KeyCode::Backspace => InputAction::QuestionBackspace,
                 KeyCode::Delete => InputAction::QuestionDelete,
                 KeyCode::Left => InputAction::QuestionMoveCursorLeft,
@@ -157,10 +152,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     // Ctrl+V / Cmd+V: 主动从系统剪贴板读取并插入，避免依赖终端把内容逐字符“灌进来”。
-    if (key.modifiers.contains(KeyModifiers::CONTROL)
-        || key.modifiers.contains(KeyModifiers::SUPER))
-        && matches!(key.code, KeyCode::Char('v'))
-    {
+    if is_clipboard_paste_key(key) {
         return InputAction::PasteFromClipboard;
     }
 
@@ -347,6 +339,12 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 }
 
+fn is_clipboard_paste_key(key: KeyEvent) -> bool {
+    ((key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER))
+        && matches!(key.code, KeyCode::Char('v' | 'V')))
+        || (key.code == KeyCode::Insert && key.modifiers == KeyModifiers::SHIFT)
+}
+
 pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
     if state.is_read_only_child_view()
         && state.input_buffer.is_empty()
@@ -379,6 +377,9 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
 }
 
 pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
+    // Terminal paste commonly uses CR, while the system clipboard uses CRLF.
+    // Normalize once per paste; embedded newlines never become Submit actions.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if state
         .pending_question
         .as_ref()
@@ -631,6 +632,41 @@ mod tests {
         ));
         assert_eq!(state.input_buffer, "hell\nworldlo");
         assert_eq!(state.input_cursor, 2 + "ll\nworld".len());
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings_without_losing_blank_lines() {
+        let state = TuiState::default();
+        assert_eq!(
+            map_paste_event(&state, "first\r\n\r\nsecond\rthird\n".into()),
+            InputAction::PasteLongText("first\n\nsecond\nthird\n".into()),
+        );
+        assert_eq!(
+            map_paste_event(&state, "a\rb".into()),
+            InputAction::Paste("a\nb".into())
+        );
+    }
+
+    #[test]
+    fn clipboard_shortcuts_accept_shift_insert_and_uppercase_v() {
+        let state = TuiState::default();
+        for key in [
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+            KeyEvent::new(
+                KeyCode::Char('V'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert_eq!(map_key_event(&state, key), InputAction::PasteFromClipboard);
+        }
+        assert_ne!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE)),
+            InputAction::PasteFromClipboard
+        );
     }
 
     #[test]

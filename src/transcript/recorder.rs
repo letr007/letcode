@@ -204,6 +204,37 @@ impl TranscriptWriterLock {
     }
 }
 
+impl Drop for TranscriptWriterLock {
+    fn drop(&mut self) {
+        // Closing this descriptor alone does not release flock while a spawned
+        // process still holds a fork-inherited copy before exec.
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self._file) {
+            tracing::warn!(%error, "failed to release transcript writer lock");
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod writer_lock_tests {
+    use super::*;
+
+    #[test]
+    fn writer_lock_releases_while_a_duplicate_descriptor_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let lock = TranscriptWriterLock::acquire(&path).unwrap();
+        // A forked child shares this file description until exec closes it.
+        let duplicate = lock._file.try_clone().unwrap();
+        assert!(TranscriptWriterLock::try_acquire(&path).unwrap().is_none());
+        drop(lock);
+        let next = TranscriptWriterLock::acquire(&path).unwrap();
+        drop(duplicate);
+        assert!(TranscriptWriterLock::try_acquire(&path).unwrap().is_none());
+        drop(next);
+        assert!(TranscriptWriterLock::try_acquire(&path).unwrap().is_some());
+    }
+}
+
 pub struct TranscriptRecorder {
     pub(crate) session_id: String,
     #[allow(dead_code)]

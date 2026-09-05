@@ -715,13 +715,12 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         let next_reasoning =
             index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_));
         let next_tool = index + 1 < items.len() && is_compact_tool_group_item(&items[index + 1]);
-        let tool_group_stats = if state.tools_display == crate::command::ToolsDisplayMode::Compact
-            && !next_tool
-        {
-            compact_tool_group_stats(items, index)
-        } else {
-            tool_card::ToolGroupStats::default()
-        };
+        let tool_group_stats =
+            if state.tools_display == crate::command::ToolsDisplayMode::Compact && !next_tool {
+                compact_tool_group_stats(items, index)
+            } else {
+                tool_card::ToolGroupStats::default()
+            };
         let revision = if state.tools_display == crate::command::ToolsDisplayMode::Compact
             && is_compact_tool_group_item(item)
             && !next_tool
@@ -755,7 +754,14 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
                     if reasoning.streaming || reasoning.transition_started_at.is_some()
             )
         };
-        (revision, live, item, next_reasoning, next_tool, tool_group_stats)
+        (
+            revision,
+            live,
+            item,
+            next_reasoning,
+            next_tool,
+            tool_group_stats,
+        )
     };
     let frame = state.status_spinner_frame;
     if state.transcript_render_cache.entries[index].revision == revision
@@ -775,7 +781,8 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         state.tools_display,
         next_tool,
         tool_group_stats,
-        if state.thoughts_display == crate::command::ThoughtsDisplayMode::Compact && next_reasoning {
+        if state.thoughts_display == crate::command::ThoughtsDisplayMode::Compact && next_reasoning
+        {
             None
         } else {
             compact_reasoning_group_elapsed_ms(state.active_timeline().items(), index)
@@ -2329,7 +2336,13 @@ mod tests {
                 ));
                 if child_view {
                     state.replace_child_timeline_from_records(
-                        &[], "parent", "child", "explorer", 0, 1, 1,
+                        &[],
+                        "parent",
+                        "child",
+                        "explorer",
+                        0,
+                        1,
+                        1,
                     );
                     state.apply_child_session_event("child", event);
                 } else {
@@ -2375,7 +2388,10 @@ mod tests {
                 );
                 assert_eq!(
                     state.transcript_render_cache.row_counts[index],
-                    state.transcript_render_cache.entries[index].document.lines.len(),
+                    state.transcript_render_cache.entries[index]
+                        .document
+                        .lines
+                        .len(),
                 );
                 assert_eq!(visible, transcript_lines(&state, theme, width));
                 assert_eq!(visible_document_lines(&state, 20, 0).len(), visible.len());
