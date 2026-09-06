@@ -5,13 +5,32 @@ use crate::context_history::{
 };
 use crate::session::historian::HistoryWork;
 
+// Live appends retain process-local frame identities for request replay, but
+// their provisional spans are not journal coordinates. History work and retained
+// boundaries must come from the recorder's selected projection, without replacing
+// the live request state merely to prepare a background task.
+fn persisted_history_snapshot(agent: &Agent) -> Result<RuntimeSnapshot> {
+    let provider = agent
+        .runtime_snapshot_provider
+        .as_ref()
+        .ok_or_else(|| anyhow!("history requires a persisted runtime snapshot provider"))?;
+    let snapshot = provider()?;
+    anyhow::ensure!(
+        snapshot.session_id == agent.runtime_snapshot.session_id
+            && snapshot.active_context.branch_id == agent.runtime_snapshot.active_context.branch_id
+            && snapshot.context_scope_revision == agent.runtime_snapshot.context_scope_revision,
+        "history source scope changed before preparation"
+    );
+    Ok(snapshot)
+}
+
 pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
-    let history = agent.active_history_items();
-    let frames = agent.active_protocol_frames();
-    let analysis = crate::protocol_frames::analyze_history_items(
-        &history,
-        agent.turn.current_turn_start_index,
-    )?;
+    let snapshot = persisted_history_snapshot(agent)?;
+    let frames = snapshot.active_protocol_frames();
+    let history = crate::protocol_frames::history_items_from_frames(&frames);
+    let current_turn_start_index = Agent::current_turn_start_index_for_snapshot(&snapshot);
+    let analysis =
+        crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
     let budget =
         effective_input_budget_tokens(agent.active_model_metadata(), &agent.tool_definitions());
     let preserve = if manual {
@@ -24,7 +43,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
     };
     let Some(cut) = history_compact::plan_turn_cut_with_transcript(
         &history,
-        agent.turn.current_turn_start_index,
+        current_turn_start_index,
         preserve,
         &analysis,
     )?
@@ -42,12 +61,11 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
     let route = helper
         .resolved_model_route()
         .ok_or_else(|| anyhow!("historian requires a resolved route"))?;
-    let session_id = agent
-        .runtime_snapshot
+    let session_id = snapshot
         .session_id
         .clone()
         .ok_or_else(|| anyhow!("historian requires a persisted session"))?;
-    let archive = &agent.runtime_snapshot.history_archive;
+    let archive = &snapshot.history_archive;
     let references: Vec<_> = archive
         .publication_order
         .iter()
@@ -60,8 +78,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
     let mut facts = Vec::new();
     let mut fact_tokens = 0;
     let mut external_fact_ids = Vec::new();
-    for evidence in agent
-        .runtime_snapshot
+    for evidence in snapshot
         .evidence
         .iter()
         .rev()
@@ -107,8 +124,8 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
                 let identity = format!(
                     "{}:{}:{}:{}",
                     session_id,
-                    agent.runtime_snapshot.active_context.branch_id,
-                    agent.runtime_snapshot.context_scope_revision,
+                    snapshot.active_context.branch_id,
+                    snapshot.context_scope_revision,
                     source_ids.join("|")
                 );
                 let id = format!(
@@ -118,8 +135,8 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
                 return Ok(Some(HistoryWork {
                     id,
                     session_id,
-                    branch_id: agent.runtime_snapshot.active_context.branch_id.clone(),
-                    revision: agent.runtime_snapshot.context_scope_revision,
+                    branch_id: snapshot.active_context.branch_id.clone(),
+                    revision: snapshot.context_scope_revision,
                     source_ids,
                     prompt,
                     project_path: crate::tool::workspace_root_for_subagent_lock()?
@@ -144,8 +161,9 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
 }
 
 fn pending_application(agent: &Agent, hard: bool) -> Result<Option<HistoryApplication>> {
-    let archive = &agent.runtime_snapshot.history_archive;
-    let frames = agent.active_protocol_frames();
+    let snapshot = persisted_history_snapshot(agent)?;
+    let archive = &snapshot.history_archive;
+    let frames = snapshot.active_protocol_frames();
     let raw: Vec<_> = frames
         .iter()
         .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
@@ -292,9 +310,11 @@ fn pending_application(agent: &Agent, hard: bool) -> Result<Option<HistoryApplic
     }))
 }
 
-fn external_retraction_application(agent: &Agent) -> Option<HistoryApplication> {
+fn external_retraction_application(agent: &Agent) -> Result<Option<HistoryApplication>> {
     let archive = &agent.runtime_snapshot.history_archive;
-    let previous = archive.application.as_ref()?;
+    let Some(previous) = archive.application.as_ref() else {
+        return Ok(None);
+    };
     let known: std::collections::BTreeSet<_> = archive
         .applied_ids
         .iter()
@@ -311,7 +331,7 @@ fn external_retraction_application(agent: &Agent) -> Option<HistoryApplication> 
         .map(str::to_string)
         .collect();
     if revoked.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut application = previous.clone();
     application.publication_ids.clear();
@@ -324,13 +344,13 @@ fn external_retraction_application(agent: &Agent) -> Option<HistoryApplication> 
     application.withdrawn_fact_ids.extend(revoked);
     application.withdrawn_fact_ids.sort();
     application.withdrawn_fact_ids.dedup();
-    application.first_kept_entry_id = agent
+    application.first_kept_entry_id = persisted_history_snapshot(agent)?
         .active_protocol_frames()
         .iter()
         .find(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
         .and_then(|f| f.source_provenance.as_ref())
         .and_then(|p| p.source_id.clone());
-    Some(application)
+    Ok(Some(application))
 }
 
 fn reconcile_recalled_facts(agent: &mut Agent) {
@@ -368,7 +388,7 @@ where
     if agent.runtime_snapshot_provider.is_none() {
         return Ok(false);
     }
-    if let Some(application) = external_retraction_application(agent) {
+    if let Some(application) = external_retraction_application(agent)? {
         on_event(AgentEvent::HistoryApplied {
             application,
             revision: agent.runtime_snapshot.context_scope_revision,
@@ -796,9 +816,6 @@ mod retraction_tests {
         agent.runtime_snapshot = snapshot;
         agent.turn.recalled_project_facts =
             crate::memory::recall_project_facts(root.path(), "project", "a").unwrap();
-        let application = external_retraction_application(&agent).unwrap();
-        assert!(!application.baseline_fact_ids.contains(&"a-f".to_string()));
-        assert!(application.withdrawn_fact_ids.contains(&"a-f".to_string()));
         let mut recorder =
             crate::transcript::TranscriptRecorder::open_existing(root.path(), "a").unwrap();
         let path = recorder.path().to_path_buf();
@@ -816,6 +833,9 @@ mod retraction_tests {
                 .snapshot,
             )
         }));
+        let application = external_retraction_application(&agent).unwrap().unwrap();
+        assert!(!application.baseline_fact_ids.contains(&"a-f".to_string()));
+        assert!(application.withdrawn_fact_ids.contains(&"a-f".to_string()));
         let mut events = |event| {
             std::future::ready(
                 crate::agent_event_journal::persist_agent_event(&mut recorder, &event).map(|_| ()),
@@ -828,7 +848,7 @@ mod retraction_tests {
             "reconcile even below the background threshold"
         );
         assert!(
-            external_retraction_application(&agent).is_none(),
+            external_retraction_application(&agent).unwrap().is_none(),
             "the same retraction is not applied twice"
         );
         let hard = pending_application(&agent, true).unwrap().unwrap();
@@ -853,5 +873,296 @@ mod retraction_tests {
             matches!(&records[1].event,crate::transcript::TranscriptEvent::HistoryPublished(p) if p.facts[0].text=="a design")
         );
         assert!(crate::transcript::restore_session_history(&records).unwrap().iter().all(|item|!matches!(item,HistoryItem::ContextSummary {text} if text.contains("a design"))));
+    }
+}
+
+#[cfg(test)]
+mod live_source_tests {
+    use super::*;
+    use crate::transcript::{TranscriptEvent, TranscriptRecorder};
+    use std::sync::{Arc, Mutex};
+
+    fn agent_with_recorder(root: &std::path::Path) -> (Agent, Arc<Mutex<TranscriptRecorder>>) {
+        let config = crate::model_runtime::RuntimeConfig::from_toml(
+            r#"
+active_provider="test"
+[providers.test]
+protocol="responses"
+default_model="m"
+[providers.test.auth]
+type="none"
+[providers.test.endpoints]
+base_url="http://127.0.0.1:1"
+[providers.test.models.m]
+[providers.test.models.m.capabilities]
+generation={max_output_tokens=true}
+[providers.test.models.m.generation]
+max_output_tokens=128
+"#,
+        )
+        .unwrap()
+        .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+        .unwrap();
+        let mut agent = Agent::new("m", 5, 0);
+        agent.set_primary_route(crate::config::ModelRoute::new("test", "m"));
+        agent.set_resolved_model_route(Some(Arc::new(config.route("test", "m").unwrap().clone())));
+        let mut recorder = TranscriptRecorder::create(root).unwrap();
+        recorder.record_session_started("test/m").unwrap();
+        let recorder = Arc::new(Mutex::new(recorder));
+        let projected = recorder.clone();
+        agent.set_runtime_snapshot_provider(Arc::new(move || {
+            let recorder = projected.lock().unwrap();
+            Ok(
+                crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                    recorder.session_id().into(),
+                    crate::transcript::read_records(recorder.path())?,
+                    crate::transcript::transcript_projection::SessionContextCursor {
+                        branch_id: None,
+                        leaf_sequence: None,
+                    },
+                    &[],
+                )?
+                .snapshot,
+            )
+        }));
+        agent.reload_runtime_snapshot_from_provider().unwrap();
+        (agent, recorder)
+    }
+
+    // Mirrors the live append/persist order, including non-protocol journal rows
+    // between results. A synthetic live span must never become a raw journal ID.
+    fn append_live_group(
+        agent: &mut Agent,
+        recorder: &Arc<Mutex<TranscriptRecorder>>,
+        prefix: &str,
+        count: usize,
+    ) {
+        let calls: Vec<_> = (0..count)
+            .map(|i| HistoryToolCall {
+                call_id: format!("{prefix}-{i}"),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"source.rs"}"#.into(),
+            })
+            .collect();
+        agent
+            .append_history_item(HistoryItem::AssistantTurn {
+                text: None,
+                reasoning_content: None,
+                replay: None,
+                calls: calls.clone(),
+            })
+            .unwrap();
+        recorder
+            .lock()
+            .unwrap()
+            .record_assistant_tool_call_batch(None, None, None, calls.clone())
+            .unwrap();
+        for call in &calls {
+            recorder
+                .lock()
+                .unwrap()
+                .record_tool_call_started(
+                    &call.call_id,
+                    &call.name,
+                    serde_json::json!({"path":"source.rs"}),
+                )
+                .unwrap();
+        }
+        for call in &calls {
+            let output = crate::tool::ToolResult::ok(
+                "fs__read",
+                serde_json::json!({"content":format!("unique body {}",call.call_id)}),
+            );
+            recorder
+                .lock()
+                .unwrap()
+                .record_tool_call_finished(&call.call_id, &call.name, true, output.clone())
+                .unwrap();
+            agent
+                .append_history_item(HistoryItem::ToolOutput {
+                    call_id: call.call_id.clone(),
+                    output_json: serde_json::to_string(&output).unwrap(),
+                    images: vec![],
+                })
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_sources_prepare_and_apply_while_live_appends_keep_request_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut agent, recorder) = agent_with_recorder(root.path());
+        recorder
+            .lock()
+            .unwrap()
+            .record_user_message("Inspect source")
+            .unwrap();
+        recorder
+            .lock()
+            .unwrap()
+            .record_turn_started(TurnStartedEvent {
+                turn_id: 1,
+                intent: "inspect".into(),
+                directive: String::new(),
+                validation_reminder: String::new(),
+            })
+            .unwrap();
+        agent.turn.current_turn_start_index = Some(0);
+        agent
+            .append_history_item(HistoryItem::user("Inspect source"))
+            .unwrap();
+        append_live_group(&mut agent, &recorder, "first", 8);
+        assert!(
+            agent.active_protocol_frames().iter().all(|f| f
+                .source_provenance
+                .as_ref()
+                .unwrap()
+                .source_id
+                .is_none())
+        );
+        let before = agent.runtime_snapshot.clone();
+        let frontier = agent.protocol_append_state.frontier_token();
+        let generation = agent.protocol_append_state.generation();
+        let prepared = work(&agent, true).unwrap().unwrap();
+        assert_eq!(
+            agent.runtime_snapshot, before,
+            "background preparation must not install a different runtime"
+        );
+        assert_eq!(agent.protocol_append_state.frontier_token(), frontier);
+        assert_eq!(agent.protocol_append_state.generation(), generation);
+        let canonical = persisted_history_snapshot(&agent).unwrap();
+        let expected: Vec<_> = canonical
+            .active_protocol_frames()
+            .iter()
+            .map(|f| {
+                f.source_provenance
+                    .as_ref()
+                    .unwrap()
+                    .source_id
+                    .clone()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(prepared.source_ids, expected);
+        assert_eq!(prepared.source_ids.len(), 10);
+        assert!(prepared.prompt.contains("unique body first-7"));
+        let mut publication = crate::historian::parse_publication(&prepared.id,&prepared.source_ids,&serde_json::json!({
+            "compartments":[{"start":0,"end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"}],
+            "facts":[{"start":0,"end":10,"category":"architecture","text":"Source fact","supersedes":[]}],"unprocessed_from":null
+        }).to_string()).unwrap();
+        publication.project_path = Some(prepared.project_path);
+        let fact_id = publication.facts[0].id.clone();
+        recorder
+            .lock()
+            .unwrap()
+            .record_history_event(
+                TranscriptEvent::HistoryPublished(publication),
+                prepared.revision,
+            )
+            .unwrap();
+        append_live_group(&mut agent, &recorder, "second", 2);
+        let canonical = persisted_history_snapshot(&agent).unwrap();
+        let tail = canonical.active_protocol_frames()[10..].to_vec();
+        let application = pending_application(&agent, true).unwrap().unwrap();
+        assert_eq!(
+            application.first_kept_entry_id,
+            tail[0].source_provenance.as_ref().unwrap().source_id
+        );
+        recorder
+            .lock()
+            .unwrap()
+            .record_history_event(
+                TranscriptEvent::HistoryApplied(application),
+                prepared.revision,
+            )
+            .unwrap();
+        agent.reload_runtime_snapshot_from_provider().unwrap();
+        assert_eq!(
+            agent.active_history_items().last(),
+            Some(&tail.last().unwrap().item)
+        );
+        let second = work(&agent, true).unwrap().unwrap();
+        let publication = crate::historian::parse_publication(&second.id, &second.source_ids,
+            &serde_json::json!({"compartments":[{"start":0,"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}],"facts":[],"unprocessed_from":null}).to_string()).unwrap();
+        recorder
+            .lock()
+            .unwrap()
+            .record_history_event(
+                TranscriptEvent::HistoryPublished(publication),
+                second.revision,
+            )
+            .unwrap();
+        let second_application = pending_application(&agent, true).unwrap().unwrap();
+        assert!(second_application.first_kept_entry_id.is_none());
+        recorder
+            .lock()
+            .unwrap()
+            .record_history_event(
+                TranscriptEvent::HistoryApplied(second_application),
+                second.revision,
+            )
+            .unwrap();
+        agent.reload_runtime_snapshot_from_provider().unwrap();
+        append_live_group(&mut agent, &recorder, "third", 1);
+        assert!(
+            agent
+                .active_protocol_frames()
+                .iter()
+                .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
+                .all(|f| f.source_provenance.as_ref().unwrap().source_id.is_none())
+        );
+        let expected_tail: Vec<_> = persisted_history_snapshot(&agent)
+            .unwrap()
+            .active_protocol_frames()
+            .into_iter()
+            .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
+            .map(|f| f.item)
+            .collect();
+        // External fact retraction is another application with no retired raw
+        // prefix. Its retained boundary must also use persisted identity.
+        let mut fact = agent
+            .runtime_snapshot
+            .evidence
+            .iter()
+            .find(|e| e.id == format!("fact:{fact_id}"))
+            .unwrap()
+            .clone();
+        fact.tags = vec![format!("withdraw_local_fact:{fact_id}")];
+        agent.turn.recalled_project_facts = vec![fact];
+        let observed = recorder.clone();
+        let mut events = move |event| {
+            std::future::ready(
+                crate::agent_event_journal::persist_agent_event(
+                    &mut observed.lock().unwrap(),
+                    &event,
+                )
+                .map(|_| ()),
+            )
+        };
+        assert!(
+            advance(&mut agent, false, false, &mut events)
+                .await
+                .unwrap()
+        );
+        let actual_tail: Vec<_> = agent
+            .active_history_items()
+            .into_iter()
+            .filter(|item| !matches!(item, HistoryItem::ContextSummary { .. }))
+            .collect();
+        assert_eq!(actual_tail, expected_tail);
+    }
+
+    #[test]
+    fn historian_sources_reject_a_different_persisted_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut agent, _recorder) = agent_with_recorder(root.path());
+        agent.runtime_snapshot.context_scope_revision += 1;
+        assert!(
+            work(&agent, true)
+                .err()
+                .expect("scope mismatch")
+                .to_string()
+                .contains("scope changed")
+        );
     }
 }
