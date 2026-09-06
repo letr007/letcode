@@ -50,6 +50,48 @@ fn metadata_record_at(sequence: u64, event: TranscriptEvent) -> TranscriptRecord
     }
 }
 
+#[test]
+fn history_validation_cache_reuses_only_an_extended_prefix() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("hello"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AssistantMessage {
+                content: "world".into(),
+            },
+        ),
+        record_at(3, TranscriptEvent::SessionTitle { title: "u".into() }),
+    ];
+    let mut cache = HistoryProjectionValidationCache::default();
+
+    cache.snapshot(&records[..1]);
+    assert_eq!(cache.total_applied_records, 1);
+    let (_, incremental_history) = cache.snapshot(&records[..2]);
+    assert_eq!(cache.total_applied_records, 2);
+    assert_eq!(
+        incremental_history
+            .iter()
+            .map(|entry| &entry.item)
+            .collect::<Vec<_>>(),
+        restore_history_projection(&records[..2])
+            .iter()
+            .map(|entry| &entry.item)
+            .collect::<Vec<_>>(),
+        "incremental projection must match complete restoration"
+    );
+
+    cache.snapshot(&[records[0].clone(), records[2].clone()]);
+    assert_eq!(
+        cache.total_applied_records, 2,
+        "a changed scope must rebuild only the new scope"
+    );
+}
+
 fn mixed_context_view(compacted: &[&str]) -> ContextViewProjection {
     let mut projection = ContextViewProjection::default();
     for sequence in 1..=3 {

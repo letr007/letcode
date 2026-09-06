@@ -62,14 +62,24 @@ pub(crate) fn restore_session_history_projection(records: &[TranscriptRecord]) -
         .collect()
 }
 
-pub(super) fn restore_history_projection(
-    records: &[TranscriptRecord],
-) -> Vec<HistoryProjectionEntry> {
-    let mut history: Vec<HistoryProjectionEntry> = Vec::new();
-    let mut active_turn_id = None;
-    let mut active_segment_id = None;
-    let mut archive = crate::context_history::HistoryArchive::default();
-    for record in records.iter() {
+#[derive(Debug, Clone, Default)]
+pub(super) struct HistoryProjectionState {
+    history: Vec<HistoryProjectionEntry>,
+    active_turn_id: Option<u64>,
+    active_segment_id: Option<u64>,
+    archive: crate::context_history::HistoryArchive,
+    cancelled_call_ids: BTreeSet<String>,
+}
+
+impl HistoryProjectionState {
+    pub(super) fn apply_record(&mut self, record: &TranscriptRecord) {
+        if let TranscriptEvent::ToolCallCancelled { call_id, .. } = &record.event {
+            self.cancelled_call_ids.insert(call_id.clone());
+        }
+        let mut history = std::mem::take(&mut self.history);
+        let mut active_turn_id = self.active_turn_id;
+        let mut active_segment_id = self.active_segment_id;
+        let archive = &mut self.archive;
         match &record.event {
             TranscriptEvent::TurnStarted(event) => {
                 // Recorders historically append the user frame before the start
@@ -298,16 +308,55 @@ pub(super) fn restore_history_projection(
                 active_segment_id,
             ),
         }
+        self.history = history;
+        self.active_turn_id = active_turn_id;
+        self.active_segment_id = active_segment_id;
     }
-    let cancelled_call_ids = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            TranscriptEvent::ToolCallCancelled { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    normalize_incomplete_tool_call_groups(&mut history, active_turn_id, &cancelled_call_ids);
-    history
+
+    pub(super) fn snapshot(
+        &self,
+    ) -> (
+        crate::context_history::HistoryArchive,
+        Vec<HistoryProjectionEntry>,
+    ) {
+        let mut history = self.history.clone();
+        let cancelled_call_ids = self
+            .cancelled_call_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        normalize_incomplete_tool_call_groups(
+            &mut history,
+            self.active_turn_id,
+            &cancelled_call_ids,
+        );
+        (self.archive.clone(), history)
+    }
+
+    fn finish(self) -> Vec<HistoryProjectionEntry> {
+        let mut history = self.history;
+        let cancelled_call_ids = self
+            .cancelled_call_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        normalize_incomplete_tool_call_groups(
+            &mut history,
+            self.active_turn_id,
+            &cancelled_call_ids,
+        );
+        history
+    }
+}
+
+pub(super) fn restore_history_projection(
+    records: &[TranscriptRecord],
+) -> Vec<HistoryProjectionEntry> {
+    let mut state = HistoryProjectionState::default();
+    for record in records {
+        state.apply_record(record);
+    }
+    state.finish()
 }
 
 pub(super) fn active_turn_segment_from_lifecycle_records(

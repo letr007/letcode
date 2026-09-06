@@ -67,8 +67,8 @@ pub(crate) use history::{
 };
 
 use history::{
-    active_turn_segment_from_lifecycle_records, checkpoint_spans_from_history,
-    restore_history_projection,
+    HistoryProjectionEntry, HistoryProjectionState, active_turn_segment_from_lifecycle_records,
+    checkpoint_spans_from_history, restore_history_projection,
 };
 
 #[path = "transcript_projection/checkpoint.rs"]
@@ -405,7 +405,51 @@ pub(crate) fn validate_context_projection_events(
     validate_projection_events("", records, records)
 }
 
-/// Validate replacement events in transcript order.  A later replacement may
+/// Projection state reused only while the selected source prefix extends within
+/// one validation call. A different branch path rebuilds from its own sources.
+#[derive(Default)]
+struct HistoryProjectionValidationCache {
+    processed_sequences: Vec<u64>,
+    state: HistoryProjectionState,
+    #[cfg(test)]
+    total_applied_records: usize,
+}
+
+impl HistoryProjectionValidationCache {
+    fn snapshot(
+        &mut self,
+        records: &[TranscriptRecord],
+    ) -> (
+        crate::context_history::HistoryArchive,
+        Vec<HistoryProjectionEntry>,
+    ) {
+        let is_extension = self.processed_sequences.len() <= records.len()
+            && self
+                .processed_sequences
+                .iter()
+                .zip(records)
+                .all(|(sequence, current)| *sequence == current.sequence);
+        if !is_extension {
+            self.processed_sequences.clear();
+            self.state = HistoryProjectionState::default();
+            #[cfg(test)]
+            {
+                self.total_applied_records = 0;
+            }
+        }
+        for record in &records[self.processed_sequences.len()..] {
+            self.state.apply_record(record);
+            #[cfg(test)]
+            {
+                self.total_applied_records += 1;
+            }
+            self.processed_sequences.push(record.sequence);
+        }
+        self.state.snapshot()
+    }
+}
+
+/// Validate replacement events in transcript order. A later replacement may
 /// depend on an earlier one, but must never make an earlier malformed event
 /// appear valid.
 fn validate_projection_events(
@@ -413,6 +457,7 @@ fn validate_projection_events(
     all_records: &[TranscriptRecord],
     visible: &[TranscriptRecord],
 ) -> anyhow::Result<()> {
+    let mut history_cache = HistoryProjectionValidationCache::default();
     for record in visible {
         match &record.event {
             TranscriptEvent::ContextCompaction(event) => {
@@ -447,7 +492,9 @@ fn validate_projection_events(
                         leaf_sequence: None,
                     },
                 )?;
-                validate_history_event_in_scope(&scope, &record.event)?;
+                let (mut archive, history) =
+                    history_cache.snapshot(scope.selected_history_records());
+                validate_history_event_projection(&mut archive, &history, &record.event)?;
             }
             TranscriptEvent::LogicalCheckpoint(event) => {
                 validate_logical_checkpoint_record(session_id, all_records, record, event)?;
@@ -496,6 +543,14 @@ pub(crate) fn validate_history_event_in_scope(
     let records = scope.selected_history_records();
     let mut archive = crate::context_history::HistoryArchive::from_records(records)?;
     let history = restore_history_projection(records);
+    validate_history_event_projection(&mut archive, &history, event)
+}
+
+fn validate_history_event_projection(
+    archive: &mut crate::context_history::HistoryArchive,
+    history: &[HistoryProjectionEntry],
+    event: &TranscriptEvent,
+) -> anyhow::Result<()> {
     match event {
         TranscriptEvent::HistoryPublished(publication) => {
             let published: std::collections::BTreeSet<_> = archive
@@ -626,3 +681,7 @@ pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> anyhow::Result<
 #[cfg(test)]
 #[path = "transcript_projection/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transcript_projection/history_validation_tests.rs"]
+mod history_validation_tests;
