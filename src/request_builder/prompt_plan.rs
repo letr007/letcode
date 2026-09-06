@@ -1174,6 +1174,11 @@ fn classify_history_frame(
     provenance: Option<&RuntimeFrameProvenance>,
 ) -> HistoryClassification {
     let (role, default_source, retention) = match &frame.item {
+        ProtocolFrameItem::ContextSummary { text } if text.starts_with("[Session history]\n") => (
+            PromptSegmentRole::User,
+            RuntimeSource::SummaryArtifact,
+            PromptSegmentRetention::Retained,
+        ),
         ProtocolFrameItem::ContextSummary { .. } => (
             PromptSegmentRole::Developer,
             RuntimeSource::SummaryArtifact,
@@ -1392,7 +1397,11 @@ fn evidence_message_segment(input: &PromptPlanBuildInput<'_>) -> Option<NewPromp
     Some(NewPromptSegment {
         contributor_kind: PromptContributorKind::Evidence,
         contributor_label: Some("selected_evidence".to_string()),
-        role: PromptSegmentRole::Developer,
+        role: if evidence_message.starts_with("[Session memory]\n") {
+            PromptSegmentRole::User
+        } else {
+            PromptSegmentRole::Developer
+        },
         stability: PromptSegmentStability::Volatile,
         retention: PromptSegmentRetention::Droppable,
         protection: PromptSegmentProtection {

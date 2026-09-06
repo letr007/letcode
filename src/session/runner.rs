@@ -1051,6 +1051,13 @@ where {
                                     )?;
                                 }
                                 AgentEvent::ToolExecutionSummary(_) => {}
+                                AgentEvent::HistoryPublished { .. } => {}
+                                AgentEvent::HistoryApplied { blocking, .. } => {
+                                    let _ = emit_context_projection_updates(&sender, &transcript, child_session_id.as_deref(), agent_name.as_deref(), parent_tool_call_id.as_deref());
+                                    if blocking {
+                                        let _ = send_scoped_event(&sender, child_session_id.as_deref(), agent_name.as_deref(), parent_tool_call_id.as_deref(), SessionTransportEvent::CompactionCommitted { summary: None });
+                                    }
+                                }
                                 AgentEvent::ContextCompacted(event) => {
                                     // Recorder success is the compaction acknowledgement;
                                     // presentation delivery cannot roll it back.

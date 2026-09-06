@@ -39,6 +39,7 @@ mod config_validate;
 mod delegation;
 mod fold_artifact;
 pub(crate) use fold_artifact::is_trusted_artifact_path;
+mod context_history;
 mod fs;
 mod git;
 mod memory;
@@ -333,6 +334,7 @@ pub type QuestionCallback = Arc<dyn Fn(QuestionRequest) -> QuestionCallbackFutur
 
 #[derive(Clone, Default)]
 pub struct ToolExecutionContext {
+    pub(crate) history_cursor: Option<crate::context_history::HistoryCursor>,
     pub allow_outside_workspace: bool,
     pub question_handler: Option<QuestionCallback>,
     prepared_writable_leaf: Option<PreparedWritableLeaf>,
@@ -369,6 +371,7 @@ impl ToolExecutionContext {
     pub fn outside_workspace_granted() -> Self {
         Self {
             allow_outside_workspace: true,
+            history_cursor: None,
             question_handler: None,
             prepared_writable_leaf: None,
             prepared_apply_patch: None,
@@ -501,6 +504,7 @@ impl ToolRegistry {
         question::register(&mut registry);
         workflow::register(&mut registry);
         memory::register(&mut registry);
+        context_history::register(&mut registry);
         config_validate::register(&mut registry);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);

@@ -53,7 +53,7 @@ pub const DELEGATION_EXPERTS: &[DelegationMetadata] = &[
 ];
 
 /// System experts are configurable via `[agents.<name>]` but not user-delegable via `@`.
-pub const SYSTEM_EXPERTS: &[&str] = &["reviewer"];
+pub const SYSTEM_EXPERTS: &[&str] = &["reviewer", "historian"];
 
 pub fn supported_agent_names() -> impl Iterator<Item = &'static str> {
     DELEGATION_EXPERTS
@@ -123,6 +123,7 @@ mod tests {
                 "librarian",
                 "general",
                 "reviewer",
+                "historian",
             ]
         );
         assert!(is_system_expert("reviewer"));

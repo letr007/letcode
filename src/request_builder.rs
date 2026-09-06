@@ -844,7 +844,7 @@ fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> 
     history_budget::current_user_query(history, protected_start_index)
 }
 
-fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
+pub(crate) fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
     history_budget::evidence_budget_tokens(context_window_tokens)
 }
 

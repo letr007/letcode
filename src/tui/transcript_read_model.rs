@@ -227,6 +227,8 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::ContextNodeCreated { .. }
             | TranscriptEvent::ContextNodeLifecycle { .. }
             | TranscriptEvent::ContextViewOperationMetadata { .. }
+            | TranscriptEvent::HistoryPublished(_)
+            | TranscriptEvent::HistoryApplied(_)
             | TranscriptEvent::ContextSummaryArtifactMetadata { .. }
             | TranscriptEvent::FoldedOutputMetadata { .. }
             | TranscriptEvent::TurnStarted(_)

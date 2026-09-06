@@ -1595,15 +1595,12 @@ impl Timeline {
         })
     }
 
-    /// Begin a durable streaming compaction block in the transcript.
+    /// Reset unfinished summary text. Only an actual preview creates a block;
+    /// history organization without summary output uses the footer status.
     pub fn start_compaction(&mut self) {
         if let Some(index) = self.streaming_compaction_index() {
             self.remove_item(index);
         }
-        self.push_item(TimelineItem::Compaction(CompactionView {
-            summary: String::new(),
-            streaming: true,
-        }));
     }
 
     pub fn append_compaction_preview(&mut self, delta: &str) {
@@ -1649,8 +1646,6 @@ impl Timeline {
                 }
                 return;
             }
-            // Committed with no in-flight block: leave a durable empty block.
-            self.push_restored_compaction(String::new());
             return;
         }
         if let Some(index) = self.streaming_compaction_index() {
@@ -2275,6 +2270,19 @@ mod tests {
             timeline.items(),
             [TimelineItem::Compaction(view)] if !view.streaming && view.summary == "first second"
         ));
+    }
+
+    #[test]
+    fn compaction_without_summary_keeps_existing_transcript_unchanged() {
+        let mut timeline = Timeline::new();
+        timeline.push_restored_compaction("An existing summary");
+        for _ in 0..2 {
+            timeline.start_compaction();
+            assert_eq!(timeline.items().len(), 1);
+            timeline.finish_compaction(true);
+            assert!(matches!(timeline.items(), [TimelineItem::Compaction(view)]
+                if !view.streaming && view.summary == "An existing summary"));
+        }
     }
 
     #[test]

@@ -6184,3 +6184,172 @@ fn bounded_session_transport_event_drain_keeps_double_escape_cancel_dispatch_fai
         "interrupt dispatch makes progress after flood"
     );
 }
+
+#[test]
+fn compaction_without_summary_uses_status_and_preserves_notices() {
+    let mut runtime = runtime_with_experts(Vec::new());
+    runtime
+        .state
+        .timeline
+        .push_restored_compaction("Existing summary");
+    runtime.apply_session_transport_event(SessionTransportEvent::CompactionStarted);
+    assert!(
+        runtime
+            .state
+            .active_compaction_animation_start_frame()
+            .is_some()
+    );
+    assert_eq!(runtime.state.timeline.items().len(), 1);
+    runtime.apply_session_transport_event(SessionTransportEvent::CompactionCommitted {
+        summary: None,
+    });
+    assert!(
+        runtime
+            .state
+            .active_compaction_animation_start_frame()
+            .is_none()
+    );
+    assert_eq!(runtime.state.timeline.items().len(), 1);
+    assert_eq!(
+        runtime.state.toast().unwrap().message,
+        runtime.state.t("runtime.context_organized")
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::CompactionStarted);
+    assert!(runtime.state.toast().is_none());
+    runtime.show_toast("Unrelated notice", ToastKind::Info);
+    runtime.apply_session_transport_event(SessionTransportEvent::CompactionCommitted {
+        summary: None,
+    });
+    assert_eq!(runtime.state.toast().unwrap().message, "Unrelated notice");
+    assert!(
+        matches!(runtime.state.timeline.items(), [TimelineItem::Compaction(view)]
+        if !view.streaming && view.summary == "Existing summary")
+    );
+}
+
+#[test]
+fn historian_child_report_keys_refresh_layout_without_changing_history() {
+    use crate::tui::components::historian_report::{ReportView, tests::sample_report};
+    let report = sample_report();
+    let content = serde_json::to_string(&report).unwrap();
+    let records = vec![TranscriptRecord {
+        session_id: "historian-child".into(),
+        sequence: 1,
+        timestamp_ms: 1,
+        context_branch_id: None,
+        event: TranscriptEvent::AssistantMessage {
+            content: content.clone(),
+        },
+    }];
+    let mut runtime = runtime_with_experts(Vec::new());
+    runtime
+        .state
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state.replace_child_timeline_from_records(
+        &records,
+        "parent",
+        "historian-child",
+        "historian",
+        1,
+        1,
+        1,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, &mut runtime.state))
+        .unwrap();
+    assert!(!runtime.state.transcript_render_cache.is_empty());
+    let compact_rows = crate::tui::components::transcript::transcript_row_count(
+        &runtime.state,
+        runtime.state.theme(),
+        100,
+    );
+    for (key, view) in [
+        ('1', ReportView::Compact),
+        ('2', ReportView::Detailed),
+        ('3', ReportView::Anchor),
+        ('0', ReportView::Raw),
+    ] {
+        let action = crate::tui::input::map_key_event(
+            &runtime.state,
+            KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+        );
+        assert_eq!(action, InputAction::HistorianView(view));
+        runtime.handle_input_action(action).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render::render(frame, &mut runtime.state))
+            .unwrap();
+        let lines = crate::tui::components::transcript::transcript_lines(
+            &runtime.state,
+            runtime.state.theme(),
+            100,
+        );
+        let output = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = match view {
+            ReportView::Compact => "Compact-only",
+            ReportView::Detailed => "Detailed-only",
+            ReportView::Anchor => "Anchor-only",
+            ReportView::Raw => "historian_report_v1",
+        };
+        assert!(output.contains(expected), "{output}");
+        assert!(
+            runtime
+                .state
+                .transcript_render_cache
+                .entries()
+                .iter()
+                .all(|entry| entry.document.validate())
+        );
+    }
+    assert!(
+        crate::tui::components::transcript::transcript_row_count(
+            &runtime.state,
+            runtime.state.theme(),
+            100
+        ) > compact_rows
+    );
+    runtime
+        .handle_input_action(InputAction::HistorianView(ReportView::Compact))
+        .unwrap();
+    runtime
+        .handle_input_action(InputAction::HistorianSources)
+        .unwrap();
+    assert!(runtime.state.transcript_render_cache.is_empty());
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, &mut runtime.state))
+        .unwrap();
+    assert!(
+        matches!(runtime.state.active_timeline().items(),[TimelineItem::Assistant(message)] if message.text==content)
+    );
+    runtime.state.set_input("/model ");
+    assert_eq!(
+        crate::tui::input::map_key_event(
+            &runtime.state,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
+        ),
+        InputAction::Insert('2')
+    );
+    runtime.state.clear_input();
+    runtime.state.child_navigation_prefix = true;
+    assert_eq!(
+        crate::tui::input::map_key_event(
+            &runtime.state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+        ),
+        InputAction::ShowSkills
+    );
+    runtime.state.child_navigation_prefix = false;
+    runtime.state.restore_parent_timeline_view();
+    assert_eq!(
+        crate::tui::input::map_key_event(
+            &runtime.state,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
+        ),
+        InputAction::Insert('2')
+    );
+}

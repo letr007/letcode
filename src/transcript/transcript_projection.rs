@@ -203,6 +203,10 @@ impl ContextCompactionValidationScope {
     }
 
     /// Root content retains the journal's canonical global (`None`) scope.
+    pub(crate) fn checkout_revision(&self) -> u64 {
+        self.resolved.scope_checkout_sequence.unwrap_or(0)
+    }
+
     pub(crate) fn actual_append_branch_id(&self) -> &Option<String> {
         &self.actual_append_branch_id
     }
@@ -429,6 +433,22 @@ fn validate_projection_events(
                 )?;
                 validate_context_compaction_event_in_scope(&scope, event)?;
             }
+            TranscriptEvent::HistoryPublished(_) | TranscriptEvent::HistoryApplied(_) => {
+                let scope = context_compaction_validation_scope(
+                    all_records,
+                    record.sequence.saturating_sub(1),
+                    SessionContextCursor {
+                        branch_id: Some(
+                            record
+                                .context_branch_id
+                                .clone()
+                                .unwrap_or_else(|| ROOT_CONTEXT_BRANCH_ID.into()),
+                        ),
+                        leaf_sequence: None,
+                    },
+                )?;
+                validate_history_event_in_scope(&scope, &record.event)?;
+            }
             TranscriptEvent::LogicalCheckpoint(event) => {
                 validate_logical_checkpoint_record(session_id, all_records, record, event)?;
             }
@@ -468,6 +488,132 @@ pub(crate) fn validate_context_compaction_event_in_scope(
     Ok(())
 }
 
+/// Validate source coverage against the selected branch BEFORE appending the event.
+pub(crate) fn validate_history_event_in_scope(
+    scope: &ContextCompactionValidationScope,
+    event: &TranscriptEvent,
+) -> anyhow::Result<()> {
+    let records = scope.selected_history_records();
+    let mut archive = crate::context_history::HistoryArchive::from_records(records)?;
+    let history = restore_history_projection(records);
+    match event {
+        TranscriptEvent::HistoryPublished(publication) => {
+            let published: std::collections::BTreeSet<_> = archive
+                .publications
+                .values()
+                .flat_map(|p| p.source_ids.iter())
+                .collect();
+            let candidates: Vec<_> = history
+                .iter()
+                .filter(|e| {
+                    !matches!(e.item, HistoryItem::ContextSummary { .. })
+                        && !published.contains(&e.stable_key)
+                })
+                .collect();
+            ensure!(
+                publication.source_ids.len() <= candidates.len(),
+                "history publication exceeds source frontier"
+            );
+            let head = &candidates[..publication.source_ids.len()];
+            ensure!(
+                head.iter()
+                    .map(|e| &e.stable_key)
+                    .eq(publication.source_ids.iter()),
+                "history publication does not cover the next visible raw prefix"
+            );
+            crate::protocol_frames::validate_history_items_complete(
+                &head.iter().map(|e| e.item.clone()).collect::<Vec<_>>(),
+                None,
+            )?;
+            archive.publish(publication.clone())?;
+        }
+        TranscriptEvent::HistoryApplied(application) => {
+            let expected_legacy = match &archive.application {
+                Some(previous) => previous.legacy_summary.clone(),
+                None => {
+                    let text = history
+                        .iter()
+                        .filter_map(|e| match &e.item {
+                            HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    (!text.is_empty()).then_some(text)
+                }
+            };
+            ensure!(
+                application.legacy_summary == expected_legacy,
+                "history application must preserve its legacy baseline"
+            );
+            let end = match &application.first_kept_entry_id {
+                Some(id) => history
+                    .iter()
+                    .position(|e| &e.stable_key == id)
+                    .ok_or_else(|| anyhow::anyhow!("history retained boundary is absent"))?,
+                None => history.len(),
+            };
+            let retired: Vec<_> = history[..end]
+                .iter()
+                .filter(|e| !matches!(e.item, HistoryItem::ContextSummary { .. }))
+                .map(|e| &e.stable_key)
+                .collect();
+            let mut covered = Vec::new();
+            for id in &application.publication_ids {
+                let p = archive
+                    .publications
+                    .get(id)
+                    .ok_or_else(|| anyhow::anyhow!("unpublished history application"))?;
+                covered.extend(p.source_ids.iter());
+            }
+            ensure!(
+                retired == covered,
+                "history application retires raw sources not covered by its publications"
+            );
+            let tail: Vec<_> = history[end..].iter().map(|e| e.item.clone()).collect();
+            crate::protocol_frames::validate_history_items_complete(&tail, None)?;
+            archive.apply(application.clone())?;
+        }
+        _ => anyhow::bail!("not a history publication or application"),
+    }
+    Ok(())
+}
+
+pub(crate) fn raw_protocol_source_entries(
+    records: &[TranscriptRecord],
+) -> Vec<(String, HistoryItem)> {
+    let raw: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            !matches!(
+                r.event,
+                TranscriptEvent::ContextCompaction(_)
+                    | TranscriptEvent::HistoryApplied(_)
+                    | TranscriptEvent::LogicalCheckpoint(_)
+            )
+        })
+        .cloned()
+        .collect();
+    let mut entries = restore_history_projection(&raw);
+    entries.extend(restore_history_projection(records));
+    let mut seen = std::collections::BTreeSet::new();
+    entries
+        .into_iter()
+        .filter(|e| seen.insert(e.stable_key.clone()))
+        .map(|e| (e.stable_key, e.item))
+        .collect()
+}
+
+pub(crate) fn selected_source_records(
+    records: &[TranscriptRecord],
+    cursor: SessionContextCursor,
+) -> anyhow::Result<Vec<TranscriptRecord>> {
+    let resolved = resolve_branch_context(records.to_vec(), cursor)?;
+    validate_projection_events("", records, &resolved.records)?;
+    Ok(resolved.records)
+}
+
+#[cfg(test)]
 pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> anyhow::Result<String> {
     let trimmed = summary.trim();
     ensure!(

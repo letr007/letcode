@@ -66,6 +66,11 @@ pub enum EvidenceSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_session_id: Option<String>,
     },
+    Session {
+        session_id: String,
+        branch_id: String,
+        entry_id: String,
+    },
     Transcript {
         sequence: u64,
     },
@@ -192,6 +197,57 @@ pub fn restore_evidence_records(records: &[TranscriptRecord]) -> Result<Vec<Evid
     let mut seen = HashSet::new();
 
     for record in records {
+        if let TranscriptEvent::HistoryApplied(application) = &record.event {
+            evidence.retain(|old: &EvidenceRecord| {
+                !application
+                    .withdrawn_fact_ids
+                    .iter()
+                    .any(|id| old.id == format!("fact:{id}"))
+            });
+            for publication_id in &application.publication_ids {
+                let publication = records
+                    .iter()
+                    .take_while(|r| r.sequence < record.sequence)
+                    .find_map(|r| match &r.event {
+                        TranscriptEvent::HistoryPublished(p) if &p.id == publication_id => Some(p),
+                        _ => None,
+                    })
+                    .ok_or_else(|| anyhow!("facts reference unpublished history"))?;
+                evidence.retain(|old: &EvidenceRecord| {
+                    !publication
+                        .withdrawn_fact_ids
+                        .iter()
+                        .any(|id| old.id == format!("fact:{id}"))
+                });
+                for fact in &publication.facts {
+                    let id = format!("fact:{}", fact.id);
+                    ensure_unique_restored_id(&mut seen, &id, id.clone())?;
+                    evidence.retain(|old: &EvidenceRecord| {
+                        !fact
+                            .supersedes
+                            .iter()
+                            .any(|id| old.id == format!("fact:{id}"))
+                    });
+                    evidence.push(EvidenceRecord {
+                        id,
+                        sequence: record.sequence,
+                        timestamp_ms: record.timestamp_ms,
+                        evidence_kind: EvidenceKind::Decision,
+                        title: format!("{:?}", fact.category),
+                        summary: fact.text.clone(),
+                        detail: None,
+                        source: EvidenceSource::Transcript {
+                            sequence: record.sequence,
+                        },
+                        tags: vec![
+                            "historian_fact".into(),
+                            format!("publication:{}", publication.id),
+                        ],
+                    });
+                }
+            }
+            continue;
+        }
         let TranscriptEvent::Evidence {
             id,
             evidence_kind,
@@ -269,6 +325,12 @@ pub fn evidence_context_message(
         text.push_str(&item.compact_line());
         text.push('\n');
     }
+    if selected
+        .iter()
+        .any(|record| record.tags.iter().any(|tag| tag == "recalled_project_fact"))
+    {
+        text.insert_str(0, "[Session memory]\n");
+    }
     let dropped = evidence.len().saturating_sub(selected.len());
     (Some(text), ids, dropped)
 }
@@ -283,6 +345,7 @@ fn select_relevant_evidence(
     let latest_change_paths = latest_change_paths(evidence);
     let mut scored = evidence
         .iter()
+        .filter(|record| !record.tags.iter().any(|tag| tag == "historian_fact"))
         .filter(|record| !is_stale_file_evidence(record, &latest_change_paths))
         .map(|record| (evidence_score(record, &query_tokens), record))
         .filter(|(score, _)| *score > 0)
@@ -291,6 +354,7 @@ fn select_relevant_evidence(
     scored.sort_by(|(left_score, left), (right_score, right)| {
         right_score
             .cmp(left_score)
+            .then_with(|| right.timestamp_ms.cmp(&left.timestamp_ms))
             .then_with(|| right.sequence.cmp(&left.sequence))
     });
 
@@ -319,6 +383,11 @@ fn select_relevant_evidence(
 }
 
 fn evidence_score(record: &EvidenceRecord, query_tokens: &HashSet<String>) -> i32 {
+    // Recalled project facts are standing memory, not incidental query hits.
+    // They share the existing bounded evidence surface and are frozen per turn.
+    if record.tags.iter().any(|tag| tag == "recalled_project_fact") {
+        return i32::MAX;
+    }
     let mut score = 0;
     if query_tokens.is_empty() {
         if matches!(
@@ -604,6 +673,18 @@ fn validate_source(source: &EvidenceSource) -> Result<()> {
         EvidenceSource::Transcript { sequence } if *sequence == 0 => {
             bail!("transcript evidence source requires positive sequence");
         }
+        EvidenceSource::Session {
+            session_id,
+            branch_id,
+            entry_id,
+        } => {
+            if session_id.trim().is_empty()
+                || branch_id.trim().is_empty()
+                || entry_id.trim().is_empty()
+            {
+                bail!("session evidence requires a source identity");
+            }
+        }
         EvidenceSource::Transcript { .. } => {}
     }
     Ok(())
@@ -643,6 +724,11 @@ fn source_label(source: &EvidenceSource) -> String {
                 truncate_chars(child_session_id, 16)
             ),
         },
+        EvidenceSource::Session {
+            session_id,
+            branch_id,
+            entry_id,
+        } => format!("session:{session_id}/{branch_id}/{entry_id}"),
         EvidenceSource::Transcript { sequence } => format!("transcript:{sequence}"),
     }
 }

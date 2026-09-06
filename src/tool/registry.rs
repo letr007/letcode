@@ -173,8 +173,31 @@ impl ToolRegistry {
             return ToolResult::err(name, format!("unknown tool: {name}"));
         };
 
+        let history_cursor = context.history_cursor.clone();
         match tool.execute_streaming(args, context, emit).await {
-            Ok(output) => output,
+            Ok(mut output) => {
+                if let Some(cursor) = history_cursor {
+                    if let Err(error) = super::fold_artifact::retain_session_outputs(
+                        name,
+                        &mut output,
+                        &cursor.session_id,
+                    )
+                    .await
+                    {
+                        // Preserve the operation's observed result; report that its
+                        // original output could not be retained instead of claiming success.
+                        if let Some(data) = output.data.as_mut().and_then(Value::as_object_mut) {
+                            data.insert("operation_ok".into(), Value::Bool(output.ok));
+                        }
+                        output.ok = false;
+                        output.error = Some(super::ToolError {
+                            message: format!("output retention failed: {error}"),
+                            recoverable: true,
+                        });
+                    }
+                }
+                output
+            }
             Err(err) => {
                 warn!(tool_name = %name, error = %err, "tool execution failed");
                 ToolResult::err(name, err.to_string())

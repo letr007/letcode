@@ -33,6 +33,7 @@ pub mod context_scope;
 pub mod coordinator;
 pub mod engine;
 pub mod event;
+pub(crate) mod historian;
 pub mod interrupt;
 pub mod lifecycle;
 pub mod ports;

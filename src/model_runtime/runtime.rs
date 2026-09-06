@@ -448,8 +448,8 @@ impl ModelRuntime {
         &self,
         route: &ResolvedModelRoute,
         input: &ModelRequestInput,
-        mut on_delta: F,
-        mut on_retry: R,
+        on_delta: F,
+        on_retry: R,
     ) -> Result<String, ModelFailure>
     where
         F: FnMut(&str) -> Fut + Send,
@@ -457,6 +457,27 @@ impl ModelRuntime {
         R: FnMut() -> Rfut + Send,
         Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
     {
+        self.execute_text_oneshot_with_usage(route, input, on_delta, on_retry)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    /// Retain provider-reported accounting from each attempt, including retries.
+    /// Only usage/cache events are returned, never hidden reasoning or prompt text.
+    pub async fn execute_text_oneshot_with_usage<F, Fut, R, Rfut>(
+        &self,
+        route: &ResolvedModelRoute,
+        input: &ModelRequestInput,
+        mut on_delta: F,
+        mut on_retry: R,
+    ) -> Result<(String, Vec<ModelEvent>), ModelFailure>
+    where
+        F: FnMut(&str) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+        R: FnMut() -> Rfut + Send,
+        Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+    {
+        let mut usage_events = Vec::new();
         let retry = route.retry.clone().unwrap_or_else(default_retry_config);
         let request = route.binding.prepare_request(input)?;
         let mut attempt = 1;
@@ -476,7 +497,10 @@ impl ModelRuntime {
                     {
                         return Err(runtime_invalid("oneshot requires text completion"));
                     }
-                    return Ok(observer.text);
+                    usage_events.extend(result.snapshot.events.into_iter().filter(|event| {
+                        matches!(event, ModelEvent::Usage { .. } | ModelEvent::Cache { .. })
+                    }));
+                    return Ok((observer.text, usage_events));
                 }
                 Err(error)
                     if !observer.rejected_event
@@ -484,6 +508,16 @@ impl ModelRuntime {
                         && retry.enabled
                         && attempt < retry.max_attempts =>
                 {
+                    usage_events.extend(
+                        error
+                            .partial
+                            .events
+                            .iter()
+                            .filter(|event| {
+                                matches!(event, ModelEvent::Usage { .. } | ModelEvent::Cache { .. })
+                            })
+                            .cloned(),
+                    );
                     let delay = retry_delay(&retry, attempt, error.failure.retry_hint);
                     tracing::warn!(
                         provider = %route.provider,

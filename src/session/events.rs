@@ -229,6 +229,11 @@ pub(crate) enum SessionTransportEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    HistorianStatus {
+        session_id: String,
+        running: bool,
+        failed: bool,
+    },
     CompactionStarted,
     CompactionPreviewDelta {
         delta: String,
@@ -343,7 +348,8 @@ impl SessionTransportEvent {
             Self::ToolBatchFinished => Some(SessionEvent::ToolBatchFinished),
             Self::RetryScheduled(event) => Some(SessionEvent::RetryScheduled(event.clone())),
             Self::RetryStarted(event) => Some(SessionEvent::RetryStarted(event.clone())),
-            Self::FastModeChanged { .. }
+            Self::HistorianStatus { .. }
+            | Self::FastModeChanged { .. }
             | Self::AnchoredChanged { .. }
             | Self::ModelChanged { .. }
             | Self::ExpertModelChanged { .. }
@@ -539,7 +545,8 @@ pub(super) fn wrap_child_session_transport_event(
                 event: SessionEvent::AutoContinueChanged(event),
             }
         }
-        SessionTransportEvent::FastModeChanged { .. }
+        SessionTransportEvent::HistorianStatus { .. }
+        | SessionTransportEvent::FastModeChanged { .. }
         | SessionTransportEvent::ModelChanged { .. }
         | SessionTransportEvent::ExpertModelChanged { .. }
         | SessionTransportEvent::ExpertAllowedModelsChanged { .. }

@@ -174,6 +174,19 @@ impl AgentTemplate {
         )
     }
 
+    pub fn historian() -> Self {
+        let mut template = Self::read_only(
+            "historian",
+            "后台历史整理",
+            crate::historian::HISTORIAN_PROMPT,
+        );
+        template.timeout_secs = Some(600);
+        template.max_tool_calls = Some(0);
+        template.expected_result_shape =
+            "Three-tier history JSON with source coverage and derived facts".into();
+        template
+    }
+
     pub fn reviewer() -> Self {
         Self {
             name: "reviewer".into(),
@@ -211,6 +224,7 @@ impl AgentTemplate {
             "librarian" => Some(Self::librarian()),
             "general" => Some(Self::general()),
             "reviewer" => Some(Self::reviewer()),
+            "historian" => Some(Self::historian()),
             _ => None,
         }
     }
@@ -224,6 +238,7 @@ impl AgentTemplate {
             Self::librarian(),
             Self::general(),
             Self::reviewer(),
+            Self::historian(),
         ]
     }
 

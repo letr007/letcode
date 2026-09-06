@@ -64,10 +64,15 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
         return Vec::new();
     }
 
-    let status = if let Some(start_frame) = state.active_compaction_animation_start_frame() {
+    let mut status = if let Some(start_frame) = state.active_compaction_animation_start_frame() {
         // 压缩中：指示条转为开火车式往返扫描，隐藏过期的 token 数字。
         let animation_frame = state.status_spinner_frame.wrapping_sub(start_frame);
-        compaction_indicator_spans(animation_frame, theme)
+        let mut spans = compaction_indicator_spans(animation_frame, theme);
+        spans.push(Span::styled(
+            format!(" {}", state.t("runtime.compacting_context")),
+            footer_dim_style(theme),
+        ));
+        spans
     } else {
         let mut spans = state
             .active_model_token_usage()
@@ -87,6 +92,21 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
         }
         spans
     };
+    if state.active_compaction_animation_start_frame().is_none()
+        && let Some((session_id, running, failed)) = &state.historian_status
+        && state.session_id.as_ref() == Some(session_id)
+        && (*running || *failed)
+    {
+        status.insert(
+            0,
+            Span::styled(
+                if *failed { "󰁯! " } else { "󰁯 " },
+                Style::default()
+                    .fg(if *failed { theme.warning } else { theme.accent })
+                    .bg(theme.root_bg),
+            ),
+        );
+    }
     let status_width = spans_width(&status);
     if status_width > max_width {
         return truncate_spans_display_width(status, max_width);
@@ -1225,5 +1245,31 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("~50%"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod historian_footer_tests {
+    use super::*;
+    fn text(state: &TuiState) -> String {
+        footer_hint_spans(state, crate::tui::Theme::dark(), 80)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+    #[test]
+    fn background_icon_does_not_enable_the_blocking_animation() {
+        let mut state = TuiState::default();
+        state.session_id = Some("s".into());
+        state.historian_status = Some(("s".into(), true, false));
+        assert!(text(&state).contains("󰁯"));
+        assert!(state.active_compaction_animation_start_frame().is_none());
+        state.compaction_active = true;
+        assert!(!text(&state).contains("󰁯"));
+        assert!(state.active_compaction_animation_start_frame().is_some());
+        assert!(text(&state).contains(&state.t("runtime.compacting_context")));
+        state.compaction_active = false;
+        state.session_id = Some("another-session".into());
+        assert!(!text(&state).contains("󰁯"));
     }
 }

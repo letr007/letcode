@@ -89,6 +89,10 @@ cache metadata 在 `PromptPlan` 层描述 stable prefix，在 `ModelRequestInput
 
 Agent 将 observation 与 logical request ID、turn/iteration/attempt、model、protocol、工具数量和 budget 组合为 `LlmRequestTelemetry`。物理重试复用同一 logical request anchor；只有发生新的迭代、请求投影或 route 变化时才建立新的逻辑请求上下文。
 
+## 三档历史与事实
+
+`HistoryPublished` 保存产物而不退休原始尾部，`HistoryApplied` 冻结基线/增量档位和事实选择。新历史块以动态会话材料进入协议消息，而非提升为系统指令；Historian 本身的静态约束仍走原生高权威字段。事实不再同时进入普通 evidence 提示。详见[历史整理与证据恢复](context-history.md)。
+
 ## One-shot 请求
 
 compaction 和其它窄用途 helper 使用 `build_oneshot_text_request` 构造只有受保护 user input 的最小 `PromptPlan`，关闭 reasoning、tools、parallel tool calls 和 Fast Mode。随后仍沿用同一条 `PromptPlan -> ModelRequestInput -> ProtocolBinding -> ModelRuntime` 链路。

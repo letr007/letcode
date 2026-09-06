@@ -759,6 +759,20 @@ where
                 AgentEvent::ContextCompactionFailed { .. } => {
                     let _ = session_transport_tx.send(SessionTransportEvent::CompactionFailed);
                 }
+                event @ (AgentEvent::HistoryPublished { .. }
+                | AgentEvent::HistoryApplied { .. }) => {
+                    let applied = matches!(&event, AgentEvent::HistoryApplied { .. });
+                    let mut recorder = transcript
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+                    persist_agent_event(&mut recorder, &event)?;
+                    drop(recorder);
+                    if applied {
+                        compaction_persisted.store(true, Ordering::Release);
+                        let _ = session_transport_tx
+                            .send(SessionTransportEvent::CompactionCommitted { summary: None });
+                    }
+                }
                 AgentEvent::ContextCompacted(event) => {
                     let summary = event.summary.clone();
                     let mut recorder = transcript
@@ -794,6 +808,9 @@ where
     let shutdown = matches!(compaction_result, ManualCompactionOperation::Shutdown);
     match compaction_result {
         ManualCompactionOperation::Interrupted | ManualCompactionOperation::Shutdown => {
+            if let Some(historian) = &agent.historian_runtime {
+                historian.cancel();
+            }
             // Manual compaction is not a model turn: do not write
             // TurnInterrupted. Restore the mutable agent from durable state so
             // the next command starts cleanly.
@@ -1049,6 +1066,12 @@ async fn run_engine_loop(
     agent.set_auto_review_service(Some(
         sticky_auto_reviewer.clone() as std::sync::Arc<dyn crate::agent::AutoReviewService>
     ));
+    agent.historian_runtime = Some(Arc::new(crate::session::historian::HistorianRuntime::new(
+        subagent_runtime.clone(),
+        sessions_dir.clone(),
+        Arc::clone(&transcript),
+        session_transport_tx.clone(),
+    )));
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
     let mut visible_child_session_id = None;
@@ -1064,6 +1087,7 @@ async fn run_engine_loop(
                     break;
                 }
                 while reload_rx.try_recv().is_ok() {}
+                if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                 let previous_primary_route = agent.primary_route().cloned();
                 let previous_expert_model_routes = expert_model_routes.clone();
                 let previous_expert_allowed_models = expert_allowed_models.clone();
@@ -1190,6 +1214,9 @@ async fn run_engine_loop(
                     }
                     agent.set_subagent_child_factory(Arc::new(expert_factory));
                     expert_allowed_models = updated_allowed_models;
+                    if agent_name == "historian" {
+                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
+                    }
                     if agent_name == "reviewer" {
                         sticky_auto_reviewer.clear_sticky_session();
                     }
@@ -1258,6 +1285,9 @@ async fn run_engine_loop(
                     }
                     agent.set_subagent_child_factory(Arc::new(expert_factory));
                     expert_model_routes = updated_expert_model_routes;
+                    if agent_name == "historian" {
+                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
+                    }
                     if agent_name == "reviewer" {
                         sticky_auto_reviewer.clear_sticky_session();
                     }
@@ -1382,7 +1412,8 @@ async fn run_engine_loop(
                             expert_model_routes = updated_expert_model_routes;
                             // A sticky reviewer session records its actual route. Drop it after a
                             // primary-route change so the next review starts with the new policy.
-                            sticky_auto_reviewer.clear_sticky_session();
+                            if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
+                        sticky_auto_reviewer.clear_sticky_session();
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                                 model_id: model_id.clone(),
                             });
@@ -1456,6 +1487,9 @@ async fn run_engine_loop(
                                 | SessionEngineCommand::Redo
                                 | SessionEngineCommand::NavigateHistory { .. }
                         );
+                        if history_navigation {
+                            if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
+                        }
                         let prepared_history_factory = std::cell::RefCell::new(None);
                         let prepared_history_routes = std::cell::RefCell::new(None);
                         let current_primary_route = agent.primary_route().cloned();
@@ -1530,7 +1564,8 @@ async fn run_engine_loop(
                             ) {
                                 expert_model_routes = routes;
                                 agent.set_subagent_child_factory(Arc::new(factory));
-                                sticky_auto_reviewer.clear_sticky_session();
+                                if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
+                        sticky_auto_reviewer.clear_sticky_session();
                             }
                         if matches!(command, SessionEngineCommand::ViewParent) {
                             visible_child_session_id = None;
@@ -2104,6 +2139,7 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::ResumeSession(prefix) => {
+                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
 
                         let session_id = match crate::session::resolve_session_prefix(
                             &sessions_dir,
@@ -2265,6 +2301,7 @@ async fn run_engine_loop(
                         }
                         expert_model_routes = resumed_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));
+                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         sticky_auto_reviewer.clear_sticky_session();
                         let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
                             session_id: resumed_event_session_id,
@@ -2287,6 +2324,7 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::NewSession => {
+                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         let prepared_route = match agent
                             .prepare_primary_route(new_session_default_route.clone())
                         {
@@ -2414,6 +2452,7 @@ async fn run_engine_loop(
                         let new_session_model_id = agent.route_display_name();
                         expert_model_routes = new_session_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));
+                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         sticky_auto_reviewer.clear_sticky_session();
                         for (agent_name, route) in &expert_model_routes {
                             let _ = session_transport_tx.send(
@@ -2485,6 +2524,7 @@ async fn run_engine_loop(
                         Some(control_tx.clone()),
                         Some(session_transport_tx.clone()),
                     );
+                let historian_control = agent.historian_runtime.clone();
                 let (interrupted, shutdown, interrupt_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
@@ -2519,6 +2559,7 @@ async fn run_engine_loop(
                             | ActiveSessionOperation::Shutdown) => {
                                 let is_shutdown =
                                     matches!(outcome, ActiveSessionOperation::Shutdown);
+                                if let Some(historian) = &historian_control { historian.cancel(); }
                                 // Capture the interrupt request while the subagent is
                                 // still active so the visible child session can be
                                 // reported. Then signal cancellation and poll the run

@@ -1180,6 +1180,8 @@ pub struct TuiState {
     pub permission_mode_label: String,
     pub pending_composer_settings: PendingComposerSettings,
     pub session_id: Option<String>,
+    pub historian_status: Option<(String, bool, bool)>,
+    pub historian_report_options: super::components::historian_report::ReportOptions,
     pub git_branch: Option<String>,
     pub current_context_branch: String,
     pub active_tool_call_id: Option<String>,
@@ -1277,6 +1279,8 @@ impl Default for TuiState {
             permission_mode_label: "default".into(),
             pending_composer_settings: PendingComposerSettings::default(),
             session_id: None,
+            historian_status: None,
+            historian_report_options: Default::default(),
             git_branch: None,
             current_context_branch: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             active_tool_call_id: None,
@@ -1503,6 +1507,22 @@ impl TuiState {
         if self.theme_id != theme_id || self.custom_theme != custom_theme {
             self.theme_id = theme_id;
             self.custom_theme = custom_theme;
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+        }
+    }
+
+    pub fn is_historian_child_view(&self) -> bool {
+        self.child_view_metadata()
+            .is_some_and(|meta| meta.agent_name == "historian")
+    }
+
+    pub fn set_historian_report_options(
+        &mut self,
+        options: super::components::historian_report::ReportOptions,
+    ) {
+        if self.historian_report_options != options {
+            self.historian_report_options = options;
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }

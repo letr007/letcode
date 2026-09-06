@@ -1185,6 +1185,15 @@ impl TuiRuntime {
                     );
                 }
             }
+            SessionTransportEvent::HistorianStatus {
+                session_id,
+                running,
+                failed,
+            } => {
+                if self.state.session_id.as_deref() == Some(session_id.as_str()) {
+                    self.state.historian_status = Some((session_id.clone(), *running, *failed));
+                }
+            }
             SessionTransportEvent::PermissionResolved(resolution)
                 if self.pending_permission_matches_call(&resolution.call_id, None) =>
             {
@@ -1377,7 +1386,16 @@ impl TuiRuntime {
                 self.state.apply_live_token_usage(token_usage.into());
                 suppress_session_event = true;
             }
-            SessionTransportEvent::CompactionCommitted { .. } => {
+            SessionTransportEvent::CompactionStarted => {
+                if self
+                    .state
+                    .toast()
+                    .is_some_and(|toast| toast.message == self.state.t("runtime.context_organized"))
+                {
+                    self.state.toast = None;
+                }
+            }
+            SessionTransportEvent::CompactionCommitted { summary } => {
                 let compacting_message = self.state.t("runtime.compacting_context");
                 if self
                     .state
@@ -1385,6 +1403,12 @@ impl TuiRuntime {
                     .is_some_and(|toast| toast.message == compacting_message)
                 {
                     self.state.toast = None;
+                }
+                if summary.is_none() && self.state.toast().is_none() {
+                    self.show_toast(
+                        self.state.t("runtime.context_organized"),
+                        ToastKind::Success,
+                    );
                 }
             }
             SessionTransportEvent::SessionTokenUsage(token_usage) => {
@@ -1875,6 +1899,22 @@ impl TuiRuntime {
                 navigation: SharedChildNavigation::Prev,
                 anchor_child_session_id: None,
             })),
+            InputAction::HistorianView(view) => {
+                if self.state.is_historian_child_view() {
+                    let mut options = self.state.historian_report_options;
+                    options.view = view;
+                    self.state.set_historian_report_options(options);
+                }
+                Ok(None)
+            }
+            InputAction::HistorianSources => {
+                if self.state.is_historian_child_view() {
+                    let mut options = self.state.historian_report_options;
+                    options.sources = !options.sources;
+                    self.state.set_historian_report_options(options);
+                }
+                Ok(None)
+            }
             InputAction::ChildParent => {
                 if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();

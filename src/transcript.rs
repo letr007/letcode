@@ -365,7 +365,6 @@ pub fn list_child_sessions_for_parent(
     )
 }
 
-#[cfg(test)]
 pub fn read_child_session_records(
     base_dir: impl AsRef<Path>,
     child_session_id: &str,
@@ -436,6 +435,7 @@ impl TranscriptEvent {
                 | Self::ToolCallCancelled { .. }
                 | Self::InternalContinuation { .. }
                 | Self::ContextCompaction(_)
+                | Self::HistoryApplied(_)
                 | Self::LogicalCheckpoint(_)
                 | Self::Error { .. }
         )

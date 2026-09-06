@@ -195,6 +195,8 @@ pub enum TranscriptEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    HistoryPublished(crate::context_history::HistoryPublication),
+    HistoryApplied(crate::context_history::HistoryApplication),
     ContextSummaryArtifactMetadata {
         node_id: String,
         artifact_id: String,

@@ -63,6 +63,8 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     snapshot.set_context_tree(context_tree.clone());
     snapshot.set_context_view(context_view.clone());
     snapshot.set_evidence(evidence.clone());
+    snapshot.history_archive =
+        crate::context_history::HistoryArchive::from_records(&resolved.records)?;
 
     let history_frame_ids = append_history_frames(&mut snapshot, &history_entries);
     append_context_frames(&mut snapshot, &context_view)?;
@@ -88,6 +90,10 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
 }
 
 fn evidence_is_retired(record: &EvidenceRecord, retired_spans: &[SourceSpan]) -> bool {
+    if record.tags.iter().any(|tag| tag == "historian_fact") {
+        // Fact lifetime is governed by explicit history revisions, not raw-tail retirement.
+        return false;
+    }
     let source_sequence = match &record.source {
         crate::evidence::EvidenceSource::Transcript { sequence } => Some(*sequence),
         _ => None,

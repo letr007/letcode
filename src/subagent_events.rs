@@ -165,6 +165,8 @@ pub async fn run_child_prompt(
                             | AgentEvent::AutoContinuationScheduled { .. }
                             | AgentEvent::ValidationAdvisory(_)
                             | AgentEvent::ToolExecutionSummary(_)
+                            | AgentEvent::HistoryPublished { .. }
+                            | AgentEvent::HistoryApplied { .. }
                             | AgentEvent::ContextCompacted(_)
                             | AgentEvent::TurnFinalized(_) => {}
                         }

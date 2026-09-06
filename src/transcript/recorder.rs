@@ -986,6 +986,11 @@ impl TranscriptRecorder {
             status: status.into(),
             summary: summary.into(),
         };
+        // Internal history work is audit/navigation data, not a project decision.
+        // Its actual facts are published through the typed history contract.
+        if agent_name == "historian" {
+            return self.append(result_event);
+        }
         let Some(result) = structured_result else {
             return self.append(result_event);
         };
@@ -1378,6 +1383,29 @@ impl TranscriptRecorder {
                 scope.actual_append_branch_id().clone(),
             )
         }
+    }
+
+    pub(crate) fn record_history_event(
+        &mut self,
+        event: TranscriptEvent,
+        expected_revision: u64,
+    ) -> Result<()> {
+        let records = read_records(self.path())?;
+        let cursor = transcript_projection::SessionContextCursor {
+            branch_id: self.current_context_branch_id.clone(),
+            leaf_sequence: None,
+        };
+        let scope = transcript_projection::context_compaction_validation_scope(
+            &records,
+            self.sequence,
+            cursor,
+        )?;
+        ensure!(
+            scope.checkout_revision() == expected_revision,
+            "historian checkout changed before publication"
+        );
+        transcript_projection::validate_history_event_in_scope(&scope, &event)?;
+        self.append_durable_on_branch(event, scope.actual_append_branch_id().clone())
     }
 
     pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {

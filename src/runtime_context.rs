@@ -359,6 +359,8 @@ pub(crate) struct RuntimeSnapshot {
     pub context_view: ContextViewProjection,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceRecord>,
+    #[serde(default)]
+    pub history_archive: crate::context_history::HistoryArchive,
     pub active_context: ActiveContextMetadata,
     pub compaction: CompactionState,
     #[serde(default, skip_serializing_if = "WorkflowState::is_empty")]
@@ -382,6 +384,7 @@ impl RuntimeSnapshot {
             context_tree: ContextTreeState::with_default_root(),
             context_view: ContextViewProjection::default(),
             evidence: Vec::new(),
+            history_archive: crate::context_history::HistoryArchive::default(),
             active_context: ActiveContextMetadata::new(branch_id),
             compaction: CompactionState {
                 retired_source_spans: Vec::new(),

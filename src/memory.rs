@@ -108,9 +108,45 @@ pub fn project_memory_objects(
         }
     }
 
-    for evidence in restore_evidence_records(records)? {
+    // Legacy observations retain their existing cross-session recall contract.
+    // New historian facts are materialized only along the selected branch;
+    // sibling publications must not revise each other's facts in a global scan.
+    let observations: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            !matches!(
+                r.event,
+                TranscriptEvent::HistoryPublished(_) | TranscriptEvent::HistoryApplied(_)
+            )
+        })
+        .cloned()
+        .collect();
+    for evidence in restore_evidence_records(&observations)? {
         if let Some(memory) = memory_from_evidence(session_id, &evidence) {
             memories.push(memory);
+        }
+    }
+    if records
+        .iter()
+        .any(|r| matches!(r.event, TranscriptEvent::HistoryApplied(_)))
+    {
+        let selected = crate::transcript::transcript_projection::selected_source_records(
+            records,
+            crate::transcript::transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+        )?;
+        let branch =
+            crate::transcript::transcript_projection::effective_branch_id_at_frontier(records)?;
+        for evidence in restore_evidence_records(&selected)?
+            .into_iter()
+            .filter(|e| e.tags.iter().any(|t| t == "historian_fact"))
+        {
+            if let Some(mut memory) = memory_from_evidence(session_id, &evidence) {
+                memory.branch_id = Some(branch.clone());
+                memories.push(memory);
+            }
         }
     }
 
@@ -192,7 +228,7 @@ pub fn validate_memory_recall_query(args: &serde_json::Value) -> Result<MemoryRe
     })
 }
 
-fn configured_memory_sessions_dir() -> Result<PathBuf> {
+pub(crate) fn configured_memory_sessions_dir() -> Result<PathBuf> {
     MEMORY_SESSIONS_DIR
         .lock()
         .map_err(|_| anyhow!("memory sessions dir lock poisoned"))?
@@ -249,6 +285,7 @@ fn evidence_path(source: &EvidenceSource) -> Option<String> {
         EvidenceSource::Command { .. }
         | EvidenceSource::Subagent { .. }
         | EvidenceSource::ToolCall { .. }
+        | EvidenceSource::Session { .. }
         | EvidenceSource::Transcript { .. } => None,
     }
 }
@@ -587,5 +624,210 @@ mod tests {
         assert_eq!(query.limit, 3);
 
         assert!(validate_memory_recall_query(&json!({"limit": 99})).is_err());
+    }
+}
+
+/// Project facts are derived from applied transcript publications, never from a
+/// second mutable store. Legacy observations keep their separate recall API.
+pub(crate) fn recall_project_facts(
+    root: &std::path::Path,
+    project_path: &str,
+    current_session: &str,
+) -> Result<Vec<EvidenceRecord>> {
+    let mut facts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut retired = std::collections::HashSet::new();
+    let mut retractions = Vec::new();
+    for session in list_sessions(&root)? {
+        let records = read_records(root.join(format!("{}.jsonl", session.session_id)))?;
+        let selected = crate::transcript::transcript_projection::selected_source_records(
+            &records,
+            crate::transcript::transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+        )?;
+        let branch =
+            crate::transcript::transcript_projection::effective_branch_id_at_frontier(&records)?;
+        let publication_ids: std::collections::HashSet<_> = selected
+            .iter()
+            .filter_map(|r| match &r.event {
+                TranscriptEvent::HistoryPublished(p)
+                    if p.project_path.as_deref() == Some(project_path) =>
+                {
+                    Some(format!("publication:{}", p.id))
+                }
+                _ => None,
+            })
+            .collect();
+        let archive = crate::context_history::HistoryArchive::from_records(&selected)?;
+        for id in &archive.applied_ids {
+            let p = &archive.publications[id];
+            if p.project_path.as_deref() == Some(project_path) {
+                let origin = selected
+                    .iter()
+                    .find(|record| {
+                        matches!(&record.event, TranscriptEvent::HistoryPublished(publication) if publication.id == p.id)
+                    })
+                    .expect("replayed publication has a journal origin");
+                for target in p
+                    .withdrawn_fact_ids
+                    .iter()
+                    .chain(p.facts.iter().flat_map(|f| f.supersedes.iter()))
+                {
+                    if let Some(local_id) = target.strip_prefix(&format!("{current_session}:fact:"))
+                    {
+                        retractions.push(EvidenceRecord {
+                            id: format!("retraction:{target}"),
+                            sequence: origin.sequence,
+                            timestamp_ms: origin.timestamp_ms,
+                            evidence_kind: EvidenceKind::Decision,
+                            title: "Fact withdrawn in another session".into(),
+                            summary: format!("Fact {target} was explicitly withdrawn or superseded; do not treat it as current."),
+                            detail: None,
+                            source: EvidenceSource::Session {
+                                session_id: session.session_id.clone(),
+                                branch_id: branch.clone(),
+                                entry_id: format!("compartment:{}", p.compartments[0].id),
+                            },
+                            tags: vec!["recalled_project_fact".into(), format!("withdraw_local_fact:{local_id}")],
+                        });
+                    }
+                }
+                retired.extend(
+                    p.withdrawn_fact_ids
+                        .iter()
+                        .chain(p.facts.iter().flat_map(|f| f.supersedes.iter()))
+                        .cloned(),
+                );
+            }
+        }
+        if session.session_id == current_session {
+            continue;
+        }
+        for mut fact in restore_evidence_records(&selected)?
+            .into_iter()
+            .filter(|e| e.tags.iter().any(|tag| publication_ids.contains(tag)))
+        {
+            // Most-recent session wins only for exact duplicate text. Distinct
+            // or conflicting observations retain their historical provenance.
+            let entry_id = format!("evidence:{}", fact.id);
+            fact.id = format!("{}:{}", session.session_id, fact.id);
+            fact.source = EvidenceSource::Session {
+                session_id: session.session_id.clone(),
+                branch_id: branch.clone(),
+                entry_id,
+            };
+            fact.tags.retain(|t| t != "historian_fact");
+            fact.tags.push("recalled_project_fact".into());
+            facts.push(fact);
+        }
+    }
+    facts.retain(|fact| !retired.contains(&fact.id));
+    facts.retain(|fact| seen.insert((fact.title.clone(), fact.summary.clone())));
+    facts.extend(
+        retractions
+            .into_iter()
+            .filter(|record| seen.insert((record.title.clone(), record.summary.clone()))),
+    );
+    Ok(facts)
+}
+
+#[cfg(test)]
+pub(crate) mod project_fact_tests {
+    use super::*;
+    use crate::context_history::*;
+    pub(crate) fn write_session(
+        root: &std::path::Path,
+        session: &str,
+        project: &str,
+        supersedes: Vec<String>,
+    ) {
+        use crate::transcript::TranscriptEvent as E;
+        let source_ids = vec!["raw:1".into()];
+        let publication = HistoryPublication {
+            id: format!("{session}-p"),
+            project_path: Some(project.into()),
+            external_fact_ids: supersedes.clone(),
+            source_ids: source_ids.clone(),
+            compartments: vec![HistoryCompartment {
+                id: format!("{session}-c"),
+                title: "Decision".into(),
+                source_ids: source_ids.clone(),
+                importance: 80,
+                detailed: "Decision made".into(),
+                compact: "Decision".into(),
+                anchor: "".into(),
+            }],
+            facts: vec![HistoryFact {
+                id: format!("{session}-f"),
+                category: HistoryFactCategory::Architecture,
+                text: format!("{session} design"),
+                source_ids,
+                supersedes,
+            }],
+            withdrawn_fact_ids: vec![],
+        };
+        let events = vec![
+            E::UserMessage {
+                content: "Decision".into(),
+            },
+            E::HistoryPublished(publication),
+            E::HistoryApplied(HistoryApplication {
+                publication_ids: vec![format!("{session}-p")],
+                baseline: vec![],
+                delta: vec![],
+                baseline_fact_ids: vec![format!("{session}-f")],
+                delta_fact_ids: vec![],
+                withdrawn_fact_ids: vec![],
+                first_kept_entry_id: None,
+                legacy_summary: None,
+            }),
+        ];
+        let text = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                serde_json::to_string(&crate::transcript::JournalRecordEnvelope {
+                    schema_version: crate::transcript::JOURNAL_SCHEMA_VERSION,
+                    event_id: format!("{session}:{}", index + 1),
+                    scope: crate::transcript::JournalScope::Global,
+                    base_revision: index as u64,
+                    resulting_revision: (index + 1) as u64,
+                    transaction_id: None,
+                    transaction_index: None,
+                    transaction_count: None,
+                    record: crate::transcript::TranscriptRecord {
+                        session_id: session.into(),
+                        sequence: (index + 1) as u64,
+                        timestamp_ms: (index + 1) as u128,
+                        context_branch_id: None,
+                        event,
+                    },
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(root.join(format!("{session}.jsonl")), text).unwrap();
+    }
+    #[test]
+    fn project_recall_is_scoped_and_honors_cross_session_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        write_session(root.path(), "a", "project", vec![]);
+        write_session(root.path(), "unrelated", "other-project", vec![]);
+        let initial = recall_project_facts(root.path(), "project", "current").unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].id, "a:fact:a-f");
+        write_session(root.path(), "b", "project", vec!["a:fact:a-f".into()]);
+        let revised = recall_project_facts(root.path(), "project", "current").unwrap();
+        assert_eq!(revised.len(), 1);
+        assert_eq!(revised[0].id, "b:fact:b-f");
+        assert!(
+            recall_project_facts(root.path(), "project", "b")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -1386,6 +1386,13 @@ where
     E: FnMut(AgentEvent) -> Efut + Send,
     Efut: Future<Output = Result<()>> + Send,
 {
+    if agent.historian_runtime.is_some() {
+        super::history_runtime::advance(agent, false, false, on_event).await?;
+        *protected_start_index = agent
+            .turn
+            .current_turn_start_index
+            .unwrap_or_else(|| agent.active_history_items().len());
+    }
     let prepared = match compaction::prepare_request_build(
         agent,
         protocol,
@@ -1410,6 +1417,26 @@ where
         }
         Err(error) => return Err(error),
     };
+    agent.history_budget_limit = Some(
+        prepared
+            .build
+            .budget
+            .input_budget_tokens
+            .saturating_sub(prepared.build.budget.estimated_prelude_tokens)
+            .saturating_sub(prepared.build.budget.estimated_protected_tokens)
+            .saturating_sub(prepared.build.budget.estimated_evidence_tokens),
+    );
+    if agent.runtime_snapshot_provider.is_some() && prepared.build.budget.truncated {
+        return compact_for_request_pressure(
+            agent,
+            protocol,
+            turn_prelude,
+            protected_start_index,
+            tool_definitions,
+            on_event,
+        )
+        .await;
+    }
     let classification = prepared.build.budget.request_classification();
     let Some(projected_usage) = agent.projected_token_usage() else {
         return Ok(prepared);

@@ -1,10 +1,12 @@
 use super::*;
+#[cfg(test)]
 use crate::protocol_frames::analyze_history_items;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 
 type EventCallback<'a> = dyn FnMut(AgentEvent) -> BoxFuture<'a, Result<()>> + Send + 'a;
 
+#[cfg(test)]
 enum PressureAdmissionError {
     /// Compaction installed but the successor still cannot fit the hard budget.
     /// History reclaim is kept so the session does not regress to the oversized
@@ -22,11 +24,13 @@ pub(super) struct PreparedRequestBuild {
     pub(super) epoch_preview: super::ActiveEpochPreview,
 }
 
+#[cfg(test)]
 struct PreparedCompaction {
     event: ContextCompactionEvent,
     local_state: Option<PreparedLocalCompaction>,
 }
 
+#[cfg(test)]
 struct PreparedLocalCompaction {
     current_turn_start_index: Option<usize>,
     runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
@@ -86,6 +90,7 @@ where
 }
 
 /// Shared select → summarize → prepare path for pressure and manual compact.
+#[cfg(test)]
 async fn prepare_compaction(
     agent: &mut Agent,
     trigger: CompactionTrigger,
@@ -222,6 +227,7 @@ where
     }))
 }
 
+#[cfg(test)]
 fn compacted_protocol_frames(
     agent: &Agent,
     candidate_frames: &[crate::protocol_frames::ProtocolFrame],
@@ -251,6 +257,7 @@ fn compacted_protocol_frames(
     Ok(frames)
 }
 
+#[cfg(test)]
 fn inherit_protocol_identity(
     candidate: Option<&mut crate::protocol_frames::ProtocolFrame>,
     retained: Option<&crate::protocol_frames::ProtocolFrame>,
@@ -263,6 +270,7 @@ fn inherit_protocol_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_prepared_compaction(agent: &mut Agent, prepared: PreparedLocalCompaction) {
     agent.turn.current_turn_start_index = prepared.current_turn_start_index;
     agent.runtime_snapshot = prepared.runtime_snapshot;
@@ -270,6 +278,7 @@ fn install_prepared_compaction(agent: &mut Agent, prepared: PreparedLocalCompact
     agent.clear_provider_usage_anchor();
 }
 
+#[cfg(test)]
 async fn commit_prepared_compaction(
     agent: &mut Agent,
     prepared: PreparedCompaction,
@@ -323,7 +332,70 @@ where
 {
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
+    if agent.runtime_snapshot_provider.is_some() {
+        // Each round must fold the existing archive or consume a raw prefix.
+        // Never let ordinary request truncation silently discard history slots.
+        let rounds = agent.active_protocol_frames().len().saturating_add(1);
+        for round in 0..rounds {
+            if round > 0 {
+                on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
+            }
+            let progressed =
+                match super::history_runtime::advance(agent, true, false, on_event).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+                        return Err(error);
+                    }
+                };
+            let next =
+                match pressure_successor_request(agent, protocol, turn_prelude, tool_definitions) {
+                    Ok(next) => next,
+                    Err(error) if progressed && is_recognized_request_budget_overflow(&error) => {
+                        // A smaller Historian may cover only part of an oversized
+                        // active turn. Preserve that commit and consume the next
+                        // complete prefix rather than stopping after the first one.
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+                        return Err(error);
+                    }
+                };
+            if !next.build.budget.truncated {
+                return Ok(next);
+            }
+            agent.history_budget_limit = Some(
+                next.build
+                    .budget
+                    .input_budget_tokens
+                    .saturating_sub(next.build.budget.estimated_prelude_tokens)
+                    .saturating_sub(next.build.budget.estimated_protected_tokens)
+                    .saturating_sub(next.build.budget.estimated_evidence_tokens),
+            );
+            if !progressed {
+                on_event(AgentEvent::ContextCompactionNoProgress(
+                    CompactionNoProgress {
+                        trigger,
+                        blockers: vec![CompactionBlocker::NoSafeBoundary],
+                    },
+                ))
+                .await?;
+                anyhow::bail!(
+                    "history cannot fit without dropping unprocessed context; use a larger input window or Historian route"
+                );
+            }
+        }
+        on_event(AgentEvent::ContextCompactionFailed { trigger }).await?;
+        anyhow::bail!("history compaction exhausted its source-bounded progress rounds");
+    }
 
+    #[cfg(not(test))]
+    return Err(anyhow::anyhow!(
+        "history compaction requires a persisted session"
+    ));
+
+    #[cfg(test)]
     async {
         // Build one durable compaction event. Tail pruning is part of the
         // append-only projection, never an unjournaled live mutation.
@@ -399,24 +471,50 @@ async fn attempt_compaction(
 where
 {
     async {
-        let prepared = match prepare_compaction(agent, trigger, on_event).await? {
-            Ok(prepared) => prepared,
-            Err(no_progress) => {
-                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
+        if agent.runtime_snapshot_provider.is_some() {
+            if super::history_runtime::advance(
+                agent,
+                true,
+                trigger == CompactionTrigger::Manual,
+                on_event,
+            )
+            .await?
+            {
+                return Ok(CompactionAttemptOutcome::Compacted {
+                    retained_items: agent.active_history_items().len(),
+                });
             }
-        };
+            let no_progress = CompactionNoProgress {
+                trigger,
+                blockers: vec![CompactionBlocker::NoSafeBoundary],
+            };
+            on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+            return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
+        }
+        #[cfg(not(test))]
+        anyhow::bail!("history compaction requires a persisted session");
+        #[cfg(test)]
+        {
+            let prepared = match prepare_compaction(agent, trigger, on_event).await? {
+                Ok(prepared) => prepared,
+                Err(no_progress) => {
+                    on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+                    return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
+                }
+            };
 
-        // The durable callback is the commit point. Provider-backed sessions
-        // then reload their canonical projection before reporting retention.
-        commit_prepared_compaction(agent, prepared, on_event).await?;
-        Ok(CompactionAttemptOutcome::Compacted {
-            retained_items: agent.active_history_items().len(),
-        })
+            // The durable callback is the commit point. Provider-backed sessions
+            // then reload their canonical projection before reporting retention.
+            commit_prepared_compaction(agent, prepared, on_event).await?;
+            Ok(CompactionAttemptOutcome::Compacted {
+                retained_items: agent.active_history_items().len(),
+            })
+        }
     }
     .await
 }
 
+#[cfg(test)]
 fn diagnostic_labels(blockers: &[CompactionBlocker]) -> String {
     blockers
         .iter()
@@ -464,6 +562,7 @@ pub(super) fn is_recognized_request_budget_overflow(error: &anyhow::Error) -> bo
     })
 }
 
+#[cfg(test)]
 fn fit_compaction_cut_to_summary_budget(
     agent: &Agent,
     live_history: &[HistoryItem],
@@ -548,6 +647,7 @@ fn fit_compaction_cut_to_summary_budget(
     }))
 }
 
+#[cfg(test)]
 async fn generate_context_summary(
     agent: &Agent,
     trigger: CompactionTrigger,
@@ -638,6 +738,7 @@ where
     Ok(trimmed.to_string())
 }
 
+#[cfg(test)]
 fn render_protected_workflow_facts(agent: &Agent) -> String {
     let mut facts = Vec::new();
     let unfinished_todos = agent
@@ -680,6 +781,7 @@ fn render_protected_workflow_facts(agent: &Agent) -> String {
     facts.join("\n\n")
 }
 
+#[cfg(test)]
 fn render_compaction_prompt_with_workflow_facts(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
@@ -694,6 +796,7 @@ fn render_compaction_prompt_with_workflow_facts(
     )
 }
 
+#[cfg(test)]
 fn render_compaction_prompt_with_serialized_history(
     previous_summary: Option<&str>,
     serialized_history: &str,
@@ -751,6 +854,7 @@ pub(super) fn default_preserve_recent_budget(input_budget: u64) -> u64 {
         .min(20_000)
 }
 
+#[cfg(test)]
 pub(super) fn describe_history_item(item: &HistoryItem) -> String {
     match item {
         HistoryItem::ContextSummary { text } => format!("摘要: {text}"),
@@ -792,10 +896,12 @@ pub(super) fn describe_history_item(item: &HistoryItem) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn render_compaction_history(items: &[HistoryItem]) -> String {
     render_compaction_history_with_item_ends(items).0
 }
 
+#[cfg(test)]
 fn render_compaction_history_with_item_ends(items: &[HistoryItem]) -> (String, Vec<usize>) {
     let mut rendered = String::new();
     let mut item_ends = Vec::with_capacity(items.len());
@@ -815,10 +921,12 @@ fn render_compaction_history_with_item_ends(items: &[HistoryItem]) -> (String, V
 /// guaranteed to be dropped by `COMPACTION_TOOL_OUTPUT_CHAR_CAP` anyway. Parse a
 /// bounded prefix instead of the whole payload, matching how Pi / OpenCode trim
 /// tool results before serializing them for the summarization request.
+#[cfg(test)]
 const TOOL_OUTPUT_PARSE_PREFIX_CAP: usize = 8 * 1024;
 
 /// Take up to `max_chars` characters without scanning past the cap
 /// (O(max_chars), not O(len)); truncation always lands on a char boundary.
+#[cfg(test)]
 fn bounded_take_chars(text: &str, max_chars: usize) -> &str {
     match text.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &text[..byte_idx],
@@ -826,6 +934,7 @@ fn bounded_take_chars(text: &str, max_chars: usize) -> &str {
     }
 }
 
+#[cfg(test)]
 fn render_tool_output_for_compaction(output_json: &str) -> String {
     // 有界解析：只解析前 TOOL_OUTPUT_PARSE_PREFIX_CAP 字符，之后的内容必会被
     // COMPACTION_TOOL_OUTPUT_CHAR_CAP 截掉，无需为整个大 JSON 付出 O(原始体积) 的
@@ -843,11 +952,13 @@ fn render_tool_output_for_compaction(output_json: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn sanitize_tool_output_value_for_compaction(mut value: Value) -> Value {
     strip_obvious_media_fields(&mut value, "$", false);
     value
 }
 
+#[cfg(test)]
 fn strip_obvious_media_fields(value: &mut Value, path: &str, force_strip: bool) {
     match value {
         Value::Object(map) => {
@@ -883,6 +994,7 @@ fn strip_obvious_media_fields(value: &mut Value, path: &str, force_strip: bool) 
     }
 }
 
+#[cfg(test)]
 fn field_name_looks_media_like(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
@@ -903,6 +1015,7 @@ fn field_name_looks_media_like(key: &str) -> bool {
     .any(|needle| key.contains(needle))
 }
 
+#[cfg(test)]
 fn value_looks_blob_like(value: &Value) -> bool {
     let Some(text) = value.as_str() else {
         return false;
@@ -913,6 +1026,7 @@ fn value_looks_blob_like(value: &Value) -> bool {
         || (trimmed.chars().count() >= 512 && looks_base64_like(trimmed))
 }
 
+#[cfg(test)]
 fn looks_base64_like(text: &str) -> bool {
     let compact = text.trim();
     !compact.is_empty()
@@ -921,6 +1035,7 @@ fn looks_base64_like(text: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-'))
 }
 
+#[cfg(test)]
 fn truncate_for_compaction(text: &str, max_chars: usize, marker: &str) -> String {
     let total_chars = text.chars().count();
     if total_chars <= max_chars {
@@ -1428,5 +1543,111 @@ max_output_tokens = 128
         let rendered = render_tool_output_for_compaction(&output);
         assert!(rendered.chars().count() <= COMPACTION_TOOL_OUTPUT_CHAR_CAP);
         assert!(rendered.contains(COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER));
+    }
+}
+
+#[cfg(test)]
+mod history_pressure_tests {
+    use super::*;
+    use crate::request_builder::HistoryToolCall;
+    use crate::transcript::{TranscriptEvent, TranscriptRecorder};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn pressure_consumes_multiple_route_bounded_prefixes() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                // At most one producer call per source frame; abort on admission.
+                for _ in 0..25 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 8192];
+                    let (header_end, length) = loop {
+                        let n = stream.read(&mut buffer).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                            break (end + 4, length);
+                        }
+                    };
+                    while bytes.len() < header_end + length {
+                        let n = stream.read(&mut buffer).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    let request: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    let prompt = request["input"].as_array().unwrap().iter().flat_map(|item| item["content"].as_array().into_iter().flatten())
+                        .filter_map(|part| part["text"].as_str())
+                        .find_map(|text| serde_json::from_str::<serde_json::Value>(text).ok().filter(|value| value.get("new_messages").is_some())).unwrap();
+                    let count = prompt["new_messages"].as_array().unwrap().len();
+                    let output = serde_json::json!({"compartments":[{"start":0,"end":count,"title":"Read sources","importance":70,"detailed":"Read source files","compact":"Read sources","anchor":"Sources"}],"facts":[],"unprocessed_from":null}).to_string();
+                    let delta = serde_json::json!({"type":"response.output_text.delta","delta":output});
+                    let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed"}});
+                    let body = format!("data: {delta}\n\ndata: {terminal}\n\n");
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let config = crate::model_runtime::RuntimeConfig::from_toml(&format!(r#"active_provider="test"
+[providers.test]
+protocol="responses"
+default_model="m"
+[providers.test.auth]
+type="none"
+[providers.test.endpoints]
+base_url="http://{address}"
+[providers.test.models.m]
+[providers.test.models.m.capabilities]
+generation={{max_output_tokens=true}}
+[providers.test.models.m.generation]
+max_output_tokens=128
+"#)).unwrap().resolve(&crate::model_runtime::ProtocolRegistry::builtins()).unwrap();
+            let mut agent = Agent::new("m", 5, 0);
+            agent.set_primary_route(crate::config::ModelRoute::new("test", "m"));
+            agent.set_resolved_model_route(Some(Arc::new(config.route("test", "m").unwrap().clone())));
+            agent.set_model_catalog(std::collections::HashMap::from([("m".into(), ModelRequestMetadata {
+                context_window: Some(12_000), effective_input_limit_tokens: Some(8_000), max_output_tokens: Some(128), ..Default::default()
+            })]));
+            let directory = tempfile::tempdir().unwrap();
+            let mut recorder = TranscriptRecorder::create(directory.path()).unwrap();
+            recorder.record_session_started("test/m").unwrap();
+            recorder.record_turn_started(crate::agent::TurnStartedEvent { turn_id:1, intent:"read sources".into(), directive:String::new(), validation_reminder:String::new() }).unwrap();
+            recorder.record_user_message("Read the source files").unwrap();
+            for index in 0..12 {
+                let id = format!("read-{index}");
+                recorder.record_assistant_tool_call_batch(None, None, None, vec![HistoryToolCall {call_id:id.clone(),name:"fs__read".into(),arguments_json:r#"{"path":"source.rs"}"#.into()}]).unwrap();
+                recorder.record_tool_call_finished(&id,"fs__read",true,crate::tool::ToolResult::ok("fs__read",serde_json::json!({"content":"source detail ".repeat(600)}))).unwrap();
+            }
+            let recorder = Arc::new(Mutex::new(recorder));
+            let projected = recorder.clone();
+            agent.set_runtime_snapshot_provider(Arc::new(move || {
+                let recorder = projected.lock().unwrap();
+                Ok(crate::transcript::transcript_projection::project_runtime_restore_snapshot(recorder.session_id().into(),crate::transcript::read_records(recorder.path())?,crate::transcript::transcript_projection::SessionContextCursor {branch_id:None,leaf_sequence:None},&[])?.snapshot)
+            }));
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+            agent.turn.current_turn_start_index = Some(0);
+            assert!(pressure_successor_request(&mut agent, ApiProtocol::Responses, &[], &[]).is_err());
+            let observed = recorder.clone();
+            let mut events = move |event| {
+                let result = crate::agent_event_journal::persist_agent_event(&mut observed.lock().unwrap(), &event).map(|_| ());
+                Box::pin(std::future::ready(result)) as BoxFuture<'_, Result<()>>
+            };
+            let successor = compact_for_request_pressure_with_callback(&mut agent, ApiProtocol::Responses, &[], &[], &mut events).await;
+            server.abort();
+            let successor = successor.unwrap();
+            assert!(!successor.build.budget.truncated);
+            let records = crate::transcript::read_records(recorder.lock().unwrap().path()).unwrap();
+            assert!(records.iter().filter(|r| matches!(r.event, TranscriptEvent::HistoryPublished(_))).count() >= 2);
+            assert!(!records.iter().any(|r| matches!(r.event, TranscriptEvent::ContextCompaction(_))));
+            let first_apply = records.iter().position(|r| matches!(r.event, TranscriptEvent::HistoryApplied(_))).unwrap();
+            agent.runtime_snapshot = crate::transcript::transcript_projection::project_runtime_restore_snapshot(records[0].session_id.clone(), records[..=first_apply].to_vec(), crate::transcript::transcript_projection::SessionContextCursor {branch_id:None,leaf_sequence:None}, &[]).unwrap().snapshot;
+            agent.clear_active_epoch();
+            let first_successor = pressure_successor_request(&mut agent, ApiProtocol::Responses, &[], &[]).err().expect("the first partial publication must still exceed the protected budget");
+            assert!(is_recognized_request_budget_overflow(&first_successor));
+        }).await.expect("pressure test timed out");
     }
 }

@@ -3,7 +3,9 @@ use crate::protocol_frames::{
     canonical_compaction_boundary_with_transcript,
 };
 use crate::request_builder::{HistoryItem, estimate_history_item_tokens};
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::bail;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnCut {
@@ -95,6 +97,7 @@ pub(crate) fn plan_turn_cut_with_transcript(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn compose_with_summary(
     summary_text: impl Into<String>,
     history: &[HistoryItem],

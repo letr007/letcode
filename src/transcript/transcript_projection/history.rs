@@ -68,6 +68,7 @@ pub(super) fn restore_history_projection(
     let mut history: Vec<HistoryProjectionEntry> = Vec::new();
     let mut active_turn_id = None;
     let mut active_segment_id = None;
+    let mut archive = crate::context_history::HistoryArchive::default();
     for record in records.iter() {
         match &record.event {
             TranscriptEvent::TurnStarted(event) => {
@@ -81,6 +82,84 @@ pub(super) fn restore_history_projection(
                 }
                 active_turn_id = Some(event.turn_id);
                 active_segment_id = Some(0);
+            }
+            TranscriptEvent::HistoryPublished(publication) => {
+                archive
+                    .publish(publication.clone())
+                    .expect("validated history publication");
+            }
+            TranscriptEvent::HistoryApplied(application) => {
+                archive
+                    .apply(application.clone())
+                    .expect("validated history application");
+                let tail_start = application
+                    .first_kept_entry_id
+                    .as_ref()
+                    .map(|id| {
+                        history
+                            .iter()
+                            .position(|entry| &entry.stable_key == id)
+                            .expect("validated history retained boundary")
+                    })
+                    .unwrap_or(history.len());
+                let retired_spans = merge_source_spans(
+                    history
+                        .iter()
+                        .take(tail_start)
+                        .flat_map(|entry| entry.source_spans.iter().copied()),
+                );
+                let mut baseline = archive.render(&application.baseline);
+                if let Some(legacy) = &application.legacy_summary {
+                    baseline = format!("{legacy}\n\n{baseline}");
+                }
+                let baseline_facts = archive.render_facts(&application.baseline_fact_ids);
+                if !baseline_facts.is_empty() {
+                    baseline.push_str(&format!("\n\nProject facts (historical observations, subject to later corrections):\n{baseline_facts}"));
+                }
+                let mut delta = archive.render(&application.delta);
+                let delta_facts = archive.render_facts(&application.delta_fact_ids);
+                if !delta_facts.is_empty() {
+                    delta.push_str(&format!("\n\nFact updates:\n{delta_facts}"));
+                }
+                if !application.withdrawn_fact_ids.is_empty() {
+                    delta.push_str(&format!(
+                        "\n\nWithdrawn facts: {}",
+                        application.withdrawn_fact_ids.join(", ")
+                    ));
+                }
+                let mut compacted = Vec::new();
+                for (slot, text) in [("baseline", baseline), ("delta", delta)] {
+                    if !text.trim().is_empty() {
+                        compacted.push(HistoryProjectionEntry {
+                            stable_key: format!(
+                                "history:{slot}:{}",
+                                crate::request_builder::sha256_hex(text.as_bytes())
+                            ),
+                            item: HistoryItem::context_summary(format!(
+                                "[Session history]\n{text}"
+                            )),
+                            source_spans: retired_spans.clone(),
+                            turn_id: None,
+                            segment_id: None,
+                            origin: HistoryProjectionOrigin::CompactionSummary,
+                        });
+                    }
+                }
+                // Even an entirely archived selection needs a retirement anchor.
+                if compacted.is_empty() {
+                    compacted.push(HistoryProjectionEntry {
+                        stable_key: format!("history:archive:{}", record.sequence),
+                        item: HistoryItem::context_summary(
+                            "[Session history]\nEarlier work is archived; use context__search to retrieve it.",
+                        ),
+                        source_spans: retired_spans,
+                        turn_id: None,
+                        segment_id: None,
+                        origin: HistoryProjectionOrigin::CompactionSummary,
+                    });
+                }
+                compacted.extend(history.drain(tail_start..));
+                history = compacted;
             }
             TranscriptEvent::ContextCompaction(event) => {
                 // Modern compactions carry a durable anchor from the exact

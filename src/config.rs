@@ -317,6 +317,7 @@ pub struct AgentsConfig {
     pub librarian: AgentConfig,
     pub general: AgentConfig,
     pub reviewer: AgentConfig,
+    pub historian: AgentConfig,
 }
 
 impl AgentsConfig {
@@ -345,6 +346,7 @@ impl AgentsConfig {
             "librarian" => Some(&self.librarian),
             "general" => Some(&self.general),
             "reviewer" => Some(&self.reviewer),
+            "historian" => Some(&self.historian),
             _ => None,
         }
     }
@@ -623,6 +625,7 @@ struct RawAgentsConfig {
     librarian: Option<RawAgentConfig>,
     general: Option<RawAgentConfig>,
     reviewer: Option<RawAgentConfig>,
+    historian: Option<RawAgentConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1135,6 +1138,7 @@ fn build_agents_config(
         librarian: build_agent_config(raw.librarian, "librarian", active_provider, providers)?,
         general: build_agent_config(raw.general, "general", active_provider, providers)?,
         reviewer: build_agent_config(raw.reviewer, "reviewer", active_provider, providers)?,
+        historian: build_agent_config(raw.historian, "historian", active_provider, providers)?,
     })
 }
 
@@ -2227,5 +2231,24 @@ base_url = "https://example.invalid"
         env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod historian_config_tests {
+    use super::*;
+    #[test]
+    fn historian_uses_the_existing_optional_expert_route_shape() {
+        let raw: RawAgentsConfig = toml::from_str(
+            "[historian]\nprovider=\"p\"\nmodel=\"small\"\nallowed_models=[\"p/small\"]",
+        )
+        .unwrap();
+        let historian = raw.historian.unwrap();
+        assert_eq!(historian.provider.as_deref(), Some("p"));
+        assert_eq!(historian.model.as_deref(), Some("small"));
+        assert!(AgentsConfig::default().config_for("historian").is_some());
+        assert!(AgentsConfig::default().route_for("historian").is_none());
+        assert!(crate::delegation::is_system_expert("historian"));
+        assert!(crate::delegation::find_expert("historian").is_none());
     }
 }

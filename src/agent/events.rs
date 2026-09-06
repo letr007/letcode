@@ -88,6 +88,7 @@ pub struct ContextCompactionEvent {
 
 impl ContextCompactionEvent {
     /// Constructs a legacy index-based event for compatibility callers.
+    #[cfg(test)]
     pub fn succeeded(summary: impl Into<String>, tail_start_index: usize) -> Self {
         Self {
             summary: summary.into(),
@@ -114,6 +115,7 @@ impl ContextCompactionEvent {
 
     /// Constructs a modern append-only event. `None` compacts the complete
     /// safe projection and retains no raw suffix.
+    #[cfg(test)]
     pub fn succeeded_at(summary: impl Into<String>, first_kept_entry_id: Option<String>) -> Self {
         assert!(
             first_kept_entry_id
@@ -497,6 +499,8 @@ pub enum AgentEvent {
         // Event payload retained for consumers that distinguish compaction triggers.
         trigger: CompactionTrigger,
     },
+    // Kept for transaction fixtures; production history publishes complete artifacts.
+    #[cfg_attr(not(test), allow(dead_code))]
     ContextCompactionDelta {
         delta: String,
     },
@@ -580,7 +584,18 @@ pub enum AgentEvent {
     },
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
+    // Compatibility event exercised by old-journal transaction fixtures only.
+    #[cfg_attr(not(test), allow(dead_code))]
     ContextCompacted(ContextCompactionEvent),
+    HistoryPublished {
+        publication: crate::context_history::HistoryPublication,
+        revision: u64,
+    },
+    HistoryApplied {
+        application: crate::context_history::HistoryApplication,
+        revision: u64,
+        blocking: bool,
+    },
     TurnFinalized(TurnFinalizedEvent),
     EvidenceRecorded(EvidenceRecord),
 }

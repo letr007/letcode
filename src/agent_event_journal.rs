@@ -138,6 +138,31 @@ pub fn persist_agent_event(
             recorder.record_tool_execution_summary(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
+        AgentEvent::HistoryPublished {
+            publication,
+            revision,
+        } => {
+            recorder.record_history_event(
+                crate::transcript::TranscriptEvent::HistoryPublished(publication.clone()),
+                *revision,
+            )?;
+            JournalEffect::persisted(ContextProjection::Advance)
+        }
+        AgentEvent::HistoryApplied {
+            application,
+            revision,
+            blocking,
+        } => {
+            recorder.record_history_event(
+                crate::transcript::TranscriptEvent::HistoryApplied(application.clone()),
+                *revision,
+            )?;
+            JournalEffect {
+                persisted: true,
+                context_projection: ContextProjection::Advance,
+                compaction_terminal: *blocking,
+            }
+        }
         AgentEvent::ContextCompacted(event) => {
             recorder.record_context_compaction(event.clone())?;
             JournalEffect {

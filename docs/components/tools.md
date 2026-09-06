@@ -14,7 +14,7 @@ Tools 将模型工具调用分派到本地 handler、subagent pool 和 MCP 服�
 - 命令与仓库：`shell__exec`、`search__rg`、`git__status`、`git__diff`、`git__log`；
 - 网络：`web__fetch`。
 
-六个 expert delegation tool 的用途是：explorer 只读探索、fixer 限定范围修复、oracle 根因/风险判断、designer 设计梳理、librarian 资料和证据整理、general 只读通用辅助。reviewer 是独立的 permission review 专家，不是 delegation tool；job control tools 也不创建新的 expert。
+六个 expert delegation tool 的用途是：explorer 只读探索、fixer 限定范围修复、oracle 根因/风险判断、designer 设计梳理、librarian 资料和证据整理、general 只读通用辅助。reviewer 和 historian 是内部系统专家，不是 delegation tool；job control tools 也不创建新的 expert。`context__search` / `context__expand` 提供有界、分支作用域内的历史与 evidence 原文查询，不恢复旧执行状态。
 
 `ToolRegistry` 按名称注册 handler。`register`、`try_register` 和 `remove` 维护目录；受保护的 context checkpoint/return 名称不能由动态工具注册。`spec()` 将 handler 转换为模型可见 `ToolSpec`，scope、可执行性和当前 runtime 能力会进一步筛选目录。
 

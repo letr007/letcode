@@ -685,7 +685,6 @@ impl SubagentPool {
         .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn complete_started_run_with_executor<F>(
         &self,
         started: StartedSubagentRun,
@@ -1057,6 +1056,11 @@ fn run_path_access(
         return Ok(RunPathAccess::Write(roots));
     }
 
+    // Tool-free internal workers consume a supplied snapshot, not repository
+    // files. They must not acquire a workspace read lock against active fixers.
+    if template.max_tool_calls == Some(0) && input.max_tool_calls.unwrap_or(0) == 0 {
+        return Ok(RunPathAccess::Read(Vec::new()));
+    }
     let roots = if input.allowed_paths.is_empty() && input.owned_paths.is_empty() {
         vec![crate::tool::workspace_root_for_subagent_lock()?]
     } else {

@@ -4,6 +4,8 @@ use super::state::{COMPOSER_ATTACHMENT_MARKER, DialogKind, TuiState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
+    HistorianView(super::components::historian_report::ReportView),
+    HistorianSources,
     Insert(char),
     Paste(String),
     PasteLongText(String),
@@ -192,6 +194,23 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         && !state.slash_panel_is_open()
     {
         return InputAction::ChildPrefix;
+    }
+
+    if state.is_historian_child_view()
+        && state.input_buffer.is_empty()
+        && !state.dialog_is_open()
+        && !state.child_navigation_prefix
+        && !has_non_shift_modifiers(key.modifiers)
+    {
+        use super::components::historian_report::ReportView;
+        match key.code {
+            KeyCode::Char('1') => return InputAction::HistorianView(ReportView::Compact),
+            KeyCode::Char('2') => return InputAction::HistorianView(ReportView::Detailed),
+            KeyCode::Char('3') => return InputAction::HistorianView(ReportView::Anchor),
+            KeyCode::Char('0') => return InputAction::HistorianView(ReportView::Raw),
+            KeyCode::Char('s') => return InputAction::HistorianSources,
+            _ => {}
+        }
     }
 
     if state.is_read_only_child_view()

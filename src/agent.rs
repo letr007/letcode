@@ -57,6 +57,7 @@ mod events;
 mod evidence_memory;
 #[path = "agent/history_compact.rs"]
 mod history_compact;
+mod history_runtime;
 #[path = "agent/protocol_stream.rs"]
 mod protocol_stream;
 #[path = "agent/tool_execution.rs"]
@@ -608,6 +609,7 @@ const SESSION_TITLE_PRELUDE: &str = r#"为用户的第一条消息生成简洁�
 只返回标题文本。
 不要使用引号、项目符号、Markdown、前缀或解释。
 保持具体，且不超过 80 个字符。"#;
+#[cfg(test)]
 const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构化执行检查点，供后续模型从当前状态继续工作。
 近期原始消息仍会保留在检查点之后。
 
@@ -634,7 +636,9 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 - 保留并逐字引用重要的路径、命令、错误信息、标识符、接口名、配置键、测试名。
 - 每个 section 均必须存在；无内容写「无」。
 - 不得输出保留标记 `[retained-facts:v1]`。"#;
+#[cfg(test)]
 const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
+#[cfg(test)]
 const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [工具输出已为压缩而截断]";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
@@ -694,6 +698,9 @@ pub struct Agent {
     primary_route_factory: Option<Arc<dyn PrimaryRouteFactory>>,
     question_handler: Option<QuestionCallback>,
     auto_review_service: Option<Arc<dyn AutoReviewService>>,
+    pub(crate) historian_runtime: Option<Arc<crate::session::historian::HistorianRuntime>>,
+    last_historian_work: Option<String>,
+    history_budget_limit: Option<u64>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     /// Run-local directory authorization for delegated children. Never inherited.
     subagent_path_scope: Option<Arc<SubagentPathScope>>,
@@ -946,6 +953,9 @@ impl AgentFactory {
             subagent_child_factory: parent.subagent_child_factory.clone(),
             primary_route_factory: parent.primary_route_factory.clone(),
             question_handler: None,
+            historian_runtime: None,
+            last_historian_work: None,
+            history_budget_limit: None,
             auto_review_service: if template.name == "reviewer" {
                 None
             } else {
@@ -1251,12 +1261,22 @@ impl Agent {
         );
         let history = self.active_history_items();
         crate::protocol_frames::validate_history_items_complete(&history, None)?;
+        let mut snapshot_with_recall;
+        let snapshot = if self.turn.recalled_project_facts.is_empty() {
+            &self.runtime_snapshot
+        } else {
+            snapshot_with_recall = self.runtime_snapshot.clone();
+            snapshot_with_recall
+                .evidence
+                .extend(self.turn.recalled_project_facts.iter().cloned());
+            &snapshot_with_recall
+        };
         let planned = build_request_with_policy(
             RequestBuilderInput {
                 model_id: &self.model,
                 model,
                 prelude: turn_prelude,
-                snapshot: &self.runtime_snapshot,
+                snapshot,
                 tools,
             },
             frozen.as_ref(),
@@ -1438,6 +1458,9 @@ impl Agent {
             primary_route_factory: None,
             question_handler: None,
             auto_review_service: None,
+            historian_runtime: None,
+            last_historian_work: None,
+            history_budget_limit: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             subagent_path_scope: None,
             compaction_config: CompactionConfig::default(),
@@ -3015,6 +3038,13 @@ impl Agent {
             ToolExecutionContext::default()
         };
         context.question_handler = self.question_handler.clone();
+        context.history_cursor = self.runtime_snapshot.session_id.as_ref().map(|session_id| {
+            crate::context_history::HistoryCursor {
+                session_id: session_id.clone(),
+                branch_id: self.runtime_snapshot.active_context.branch_id.clone(),
+                leaf_sequence: self.runtime_snapshot.leaf_sequence,
+            }
+        });
         Ok(context)
     }
 
@@ -3042,6 +3072,9 @@ impl Agent {
             primary_route_factory: None,
             question_handler: None,
             auto_review_service: None,
+            historian_runtime: None,
+            last_historian_work: None,
+            history_budget_limit: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             subagent_path_scope: None,
             compaction_config: CompactionConfig::default(),
@@ -3072,6 +3105,51 @@ impl Agent {
             resolved_runtime_catalog: self.resolved_runtime_catalog.clone(),
             retained_route_preparations: self.retained_route_preparations.clone(),
         }
+    }
+
+    pub(crate) async fn run_historian_text(
+        &self,
+        user_input: &str,
+    ) -> Result<(String, Vec<crate::historian::UsageUpdate>)> {
+        let route = self
+            .resolved_model_route()
+            .ok_or_else(|| anyhow!("historian requires a resolved route"))?;
+        let mut model = self.active_model_metadata();
+        model.supports_reasoning = false;
+        model.reasoning_effort = None;
+        model.reasoning_summary = None;
+        model.supports_tools = false;
+        model.parallel_tool_calls = false;
+        model.fast_mode = false;
+        let build = protocol_stream::preflight_resolved_oneshot_text_request(
+            route,
+            model.clone(),
+            &self.prelude,
+            user_input,
+        )?;
+        let input = crate::model_runtime::projection::model_request_from_prompt_plan(
+            route,
+            &model,
+            &build.prompt_plan,
+            &[],
+        )
+        .map_err(anyhow::Error::msg)?;
+        let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
+            .execute_text_oneshot_with_usage(
+                route,
+                &input,
+                |_| async { Ok(()) },
+                || async { Ok(()) },
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok((
+            text,
+            usage
+                .into_iter()
+                .filter_map(crate::historian::UsageUpdate::from_event)
+                .collect(),
+        ))
     }
 
     pub(crate) async fn run_resolved_text_oneshot(&self, user_input: &str) -> Result<String> {
@@ -3798,6 +3876,14 @@ impl Agent {
             self.turn.pressure_compaction.suppress();
         }
         self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
+        if let Some(historian) = &self.historian_runtime {
+            if let Some(session_id) = &self.runtime_snapshot.session_id {
+                let project = crate::tool::workspace_root_for_subagent_lock()?
+                    .to_string_lossy()
+                    .into_owned();
+                self.turn.recalled_project_facts = historian.project_facts(&project, session_id)?;
+            }
+        }
 
         // Anchored bootstrap hook: runs BEFORE the current user message is
         // appended to history (protocol_stream calls this first), so the first
@@ -4895,6 +4981,7 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
 
 /// Copy non-protocol runtime surfaces from `source` onto `target` without
 /// touching active protocol payloads. Used when rebuilding protocol shells.
+#[cfg(test)]
 fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &RuntimeSnapshot) {
     target.child_sessions = source.child_sessions.clone();
     target.prompt_contributors = source.prompt_contributors.clone();
@@ -4921,6 +5008,7 @@ fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &Ru
     target.recompute_protected_frame_ids();
 }
 
+#[cfg(test)]
 pub(super) fn rebind_active_protocol_from_history(
     snapshot: &mut RuntimeSnapshot,
     history: &[HistoryItem],
@@ -4968,6 +5056,7 @@ struct TurnRuntimeState {
     // separate from the persisted setting, which records the LLM's last choice.
     auto_continue_active: bool,
     frozen_evidence: Option<FrozenTurnEvidence>,
+    recalled_project_facts: Vec<EvidenceRecord>,
     pressure_compaction: PressureCompactionState,
 }
 
@@ -4986,6 +5075,7 @@ impl TurnRuntimeState {
             counters: TurnCounters::default(),
             auto_continue_active: false,
             frozen_evidence: None,
+            recalled_project_facts: Vec::new(),
             pressure_compaction: PressureCompactionState::default(),
         }
     }

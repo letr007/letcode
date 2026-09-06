@@ -39,7 +39,8 @@ use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
 use super::{
-    composer::one_line_snippet, reviewer_cards, structured_subagent, todo_card, tool_card,
+    composer::one_line_snippet, historian_report, reviewer_cards, structured_subagent, todo_card,
+    tool_card,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +263,9 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 state.status_spinner_frame,
                 tool_output_expanded_for_item(state, item),
                 is_reviewer_child_view(state),
+                state
+                    .is_historian_child_view()
+                    .then_some(state.historian_report_options),
                 state.thoughts_display,
                 index + 1 < items.len() && matches!(items[index + 1], TimelineItem::Reasoning(_)),
                 state.tools_display,
@@ -776,6 +780,9 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         state.status_spinner_frame,
         tool_output_expanded_for_item(state, item),
         is_reviewer_child_view(state),
+        state
+            .is_historian_child_view()
+            .then_some(state.historian_report_options),
         state.thoughts_display,
         next_reasoning,
         state.tools_display,
@@ -859,6 +866,7 @@ struct TimelineItemComponent<'a> {
     frame: usize,
     expanded_output: bool,
     reviewer_view: bool,
+    historian_view: Option<historian_report::ReportOptions>,
     thoughts_display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
     tools_display: crate::command::ToolsDisplayMode,
@@ -878,6 +886,22 @@ impl Component<Style> for TimelineItemComponent<'_> {
             return;
         }
 
+        if let Some(options) = self.historian_view
+            && let TimelineItem::Assistant(message) = self.item
+            && let Some(report) = historian_report::parse_report(message_text(message))
+        {
+            *document = pad_card_document(
+                historian_report::render_report(
+                    &report,
+                    options,
+                    self.theme,
+                    card_content_width(self.width),
+                    self.translator,
+                ),
+                self.width,
+            );
+            return;
+        }
         let mut out = TimelineDocument {
             document: std::mem::take(document),
         };
@@ -1004,6 +1028,7 @@ fn render_timeline_item_document(
     frame: usize,
     expanded_output: bool,
     reviewer_view: bool,
+    historian_view: Option<historian_report::ReportOptions>,
     thoughts_display: crate::command::ThoughtsDisplayMode,
     next_reasoning: bool,
     tools_display: crate::command::ToolsDisplayMode,
@@ -1020,6 +1045,7 @@ fn render_timeline_item_document(
         frame,
         expanded_output,
         reviewer_view,
+        historian_view,
         thoughts_display,
         next_reasoning,
         tools_display,
@@ -2360,6 +2386,7 @@ mod tests {
                     state.status_spinner_frame,
                     false,
                     false,
+                    None,
                     display,
                     false,
                     state.tools_display,
@@ -2582,6 +2609,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             crate::command::ThoughtsDisplayMode::Full,
             false,
             crate::command::ToolsDisplayMode::Detailed,
@@ -2597,6 +2625,7 @@ mod tests {
             0,
             true,
             false,
+            None,
             crate::command::ThoughtsDisplayMode::Full,
             false,
             crate::command::ToolsDisplayMode::Detailed,
@@ -2641,6 +2670,7 @@ mod tests {
             0,
             true,
             false,
+            None,
             crate::command::ThoughtsDisplayMode::Full,
             false,
             crate::command::ToolsDisplayMode::Detailed,
@@ -2733,6 +2763,7 @@ mod tests {
                         0,
                         false,
                         false,
+                        None,
                         crate::command::ThoughtsDisplayMode::Full,
                         false,
                         crate::command::ToolsDisplayMode::Detailed,
@@ -2769,6 +2800,7 @@ mod tests {
                 0,
                 false,
                 false,
+                None,
                 crate::command::ThoughtsDisplayMode::Full,
                 false,
                 crate::command::ToolsDisplayMode::Detailed,
@@ -4031,7 +4063,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_compaction_renders_opening_rule_then_preview_body() {
+    fn streaming_compaction_renders_rules_only_when_summary_text_arrives() {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::CompactionStarted);
 
@@ -4040,7 +4072,7 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(started.iter().filter(|line| *line == &rule).count(), 1);
+        assert_eq!(started.iter().filter(|line| *line == &rule).count(), 0);
         assert!(!started.iter().any(|line| line.contains('…')));
 
         state.apply_event(SessionEvent::CompactionPreviewDelta {
