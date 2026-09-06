@@ -285,6 +285,146 @@ mod tests {
         assert_eq!(runtime.state().phase, AppPhase::Completed);
     }
 
+    #[test]
+    fn successful_prompt_dispatch_adds_immediate_local_echo() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("same");
+        let command = runtime
+            .handle_input_action(crate::tui::InputAction::Submit)
+            .expect("submit succeeds")
+            .expect("prompt command");
+        let RuntimeCommand::SubmitPrompt(prompt) = &command else {
+            panic!("expected prompt command");
+        };
+        let submission_id = prompt.id.clone();
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+
+        dispatch_command(&mut runtime, command, &ingress, true);
+
+        assert!(matches!(
+            engine.try_recv_control(),
+            Ok(SessionEngineControl::Command(
+                crate::session::engine::SessionEngineCommand::Prompt(submitted)
+            )) if submitted.id == submission_id
+        ));
+        assert_eq!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    crate::tui::TimelineItem::User(message)
+                        if message.submission_id.as_deref() == Some(submission_id.as_str())
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn matching_user_message_event_does_not_duplicate_local_echo() {
+        let mut runtime = runtime();
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+        runtime.state_mut().set_input("same");
+        let command = runtime
+            .handle_input_action(crate::tui::InputAction::Submit)
+            .expect("submit succeeds")
+            .expect("prompt command");
+        let RuntimeCommand::SubmitPrompt(prompt) = &command else {
+            panic!("expected prompt command");
+        };
+        let submitted_prompt = prompt.clone();
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        dispatch_command(&mut runtime, command, &ingress, true);
+        let _ = engine.try_recv_control();
+
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            crate::tui::UserMessageEvent::from_submission(submitted_prompt.clone()),
+        ));
+
+        assert_eq!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    crate::tui::TimelineItem::User(message)
+                        if message.submission_id.as_deref() == Some(submitted_prompt.id.as_str())
+                ))
+                .count(),
+            1
+        );
+        runtime.apply_session_transport_event(SessionTransportEvent::ToolPending(
+            crate::session::ToolPendingEvent::new("read-1", "fs__read"),
+        ));
+        assert!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .any(|item| { matches!(item, crate::tui::TimelineItem::Tool(_)) })
+        );
+    }
+
+    #[test]
+    fn different_submission_id_with_same_text_remains_visible() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("same");
+        let command = runtime
+            .handle_input_action(crate::tui::InputAction::Submit)
+            .expect("submit succeeds")
+            .expect("prompt command");
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        dispatch_command(&mut runtime, command, &ingress, true);
+        let _ = engine.try_recv_control();
+
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            crate::tui::UserMessageEvent::new("same"),
+        ));
+
+        assert_eq!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    crate::tui::TimelineItem::User(message) if message.text == "same"
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_prompt_dispatch_does_not_create_local_echo() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("same");
+        let command = runtime
+            .handle_input_action(crate::tui::InputAction::Submit)
+            .expect("submit succeeds")
+            .expect("prompt command");
+        let (engine, ingress, _egress) = SessionEngine::new();
+        drop(engine);
+
+        dispatch_command(&mut runtime, command, &ingress, true);
+
+        assert!(
+            !runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .any(|item| matches!(item, crate::tui::TimelineItem::User(_)))
+        );
+    }
+
     #[tokio::test]
     async fn double_escape_dispatches_frontend_neutral_interrupt() {
         let mut runtime = runtime();

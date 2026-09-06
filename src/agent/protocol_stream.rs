@@ -127,6 +127,14 @@ where
     let protocol = resolved_protocol(&route)?;
     let turn_prelude =
         agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
+    if let Some(historian) = &agent.historian_runtime
+        && let Some(session_id) = &agent.runtime_snapshot.session_id
+    {
+        let project = crate::tool::workspace_root_for_subagent_lock()?
+            .to_string_lossy()
+            .into_owned();
+        agent.turn.recalled_project_facts = historian.project_facts(&project, session_id).await?;
+    }
     let protected_start_index = agent.active_history_items().len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);

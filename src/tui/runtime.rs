@@ -1355,6 +1355,16 @@ impl TuiRuntime {
                     suppress_session_event = self
                         .state
                         .activate_queued_user_message(&user_message.submission_id);
+                } else if self.state.timeline.items().iter().any(|item| {
+                    matches!(
+                        item,
+                        crate::tui::TimelineItem::User(message)
+                            if !message.queued
+                                && message.submission_id.as_deref()
+                                    == Some(user_message.submission_id.as_str())
+                    )
+                }) {
+                    suppress_session_event = true;
                 }
             }
             SessionTransportEvent::AssistantDelta(_)

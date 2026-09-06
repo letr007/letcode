@@ -54,12 +54,21 @@ impl HistorianRuntime {
             pending: Mutex::new(None),
         }
     }
-    pub(crate) fn project_facts(
+    pub(crate) async fn project_facts(
         &self,
         project: &str,
         session: &str,
     ) -> Result<Vec<crate::evidence::EvidenceRecord>> {
-        crate::memory::recall_project_facts(&self.sessions_dir, project, session)
+        let sessions_dir = self.sessions_dir.clone();
+        let project = project.to_owned();
+        let session = session.to_owned();
+        // Journal reads and replay must not block the session task that forwards
+        // runner events and handles interrupts. The worker only returns data;
+        // dropping this await cannot install facts into a subsequent turn.
+        tokio::task::spawn_blocking(move || {
+            crate::memory::recall_project_facts(&sessions_dir, &project, &session)
+        })
+        .await?
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -269,5 +278,73 @@ impl Drop for HistorianRuntime {
                 self.pool.cancel_run(&job.run_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod project_fact_tests {
+    use super::*;
+
+    fn historian(
+        sessions_dir: &std::path::Path,
+        transcript_dir: &std::path::Path,
+    ) -> HistorianRuntime {
+        let recorder = TranscriptRecorder::create(transcript_dir).unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        HistorianRuntime::new(
+            SubagentPool::new(),
+            sessions_dir.to_owned(),
+            Arc::new(Mutex::new(recorder)),
+            event_tx,
+        )
+    }
+
+    #[test]
+    fn project_fact_recall_yields_while_waiting_for_journal_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript_dir = tempfile::tempdir().unwrap();
+        crate::memory::project_fact_tests::write_session(root.path(), "a", "project", vec![]);
+        crate::memory::project_fact_tests::write_session(root.path(), "b", "other", vec![]);
+        let expected =
+            crate::memory::recall_project_facts(root.path(), "project", "current").unwrap();
+        assert!(!expected.is_empty());
+        let historian = historian(root.path(), transcript_dir.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Hold the journal worker queue so pending recall is deterministic,
+            // independent of machine speed or the size of the fixture.
+            let (release, wait) = std::sync::mpsc::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+            });
+            let mut recall = Box::pin(historian.project_facts("project", "current"));
+            let immediate = recall.as_mut().now_or_never();
+            release.send(()).unwrap();
+            assert!(
+                immediate.is_none(),
+                "journal replay must run off the async executor"
+            );
+            assert_eq!(recall.await.unwrap(), expected);
+            worker.await.unwrap().unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn project_fact_recall_propagates_journal_read_errors() {
+        let root = tempfile::NamedTempFile::new().unwrap();
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let historian = historian(root.path(), transcript_dir.path());
+        let error = historian
+            .project_facts("project", "current")
+            .await
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<std::io::Error>().is_some(),
+            "{error:#}"
+        );
     }
 }

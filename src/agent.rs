@@ -3876,14 +3876,6 @@ impl Agent {
             self.turn.pressure_compaction.suppress();
         }
         self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
-        if let Some(historian) = &self.historian_runtime {
-            if let Some(session_id) = &self.runtime_snapshot.session_id {
-                let project = crate::tool::workspace_root_for_subagent_lock()?
-                    .to_string_lossy()
-                    .into_owned();
-                self.turn.recalled_project_facts = historian.project_facts(&project, session_id)?;
-            }
-        }
 
         // Anchored bootstrap hook: runs BEFORE the current user message is
         // appended to history (protocol_stream calls this first), so the first
