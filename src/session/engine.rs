@@ -210,13 +210,13 @@ impl SessionEngine {
 
     /// Start the backend control loop and transfer all execution resources into it.
     pub fn start(
-        agent: Agent,
+        mut agent: Agent,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         model_label: String,
         config: SessionEngineConfig,
     ) -> Result<(Self, SessionEngineProjection)> {
-        // `main` synchronizes the initial scope before startup; subsequent session
-        // switches are synchronized by this engine's control loop.
+        // Bind the initial session before any turn can prepare history work.
+        rehydrate_agent_from_transcript(&mut agent, &transcript)?;
         let model_id = agent.route_display_name();
         let api_key_configured = route_has_api_key(&config.route_api_key_configured, &model_id);
         let permission_mode_label = agent.permission_mode().to_string();
@@ -2969,6 +2969,64 @@ mod tests {
         Arc::new(StdMutex::new(
             TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
         ))
+    }
+
+    #[tokio::test]
+    async fn fresh_session_can_prepare_history_without_a_restore() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            fs::write(
+                &config_path,
+                r#"
+active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.test.models.model]
+"#,
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).unwrap();
+            let mut recorder = TranscriptRecorder::create(&config.global.sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            let transcript = Arc::new(StdMutex::new(recorder));
+            let mut agent = Agent::new("model", 1, 1);
+            agent.set_primary_route(ModelRoute::new("test", "model"));
+            agent.set_resolved_model_route(Some(Arc::new(
+                config
+                    .runtime_catalog
+                    .route("test", "model")
+                    .unwrap()
+                    .clone(),
+            )));
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript, "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+            ingress.submit(SessionCommand::Compact).unwrap();
+            loop {
+                match events.recv().await.expect("engine event stream") {
+                    SessionTransportEvent::CompactionNoProgress { .. } => break,
+                    event @ (SessionTransportEvent::CompactionFailed
+                    | SessionTransportEvent::Error(_)) => {
+                        panic!("empty history must report no progress: {event:?}");
+                    }
+                    _ => {}
+                }
+            }
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+        })
+        .await
+        .expect("new-session history preparation timed out");
     }
 
     fn add_child(

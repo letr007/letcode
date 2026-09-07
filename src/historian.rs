@@ -16,7 +16,8 @@ Importance (1..100) controls how long details should remain useful, not how larg
 Extract only durable project facts: project_rules, architecture (why the design is shaped this way), constraints (external limits), config_values, naming. Test counts, current failures, temporary plans and progress belong in episodes, not enduring facts. Existing evidence and facts are reference material for continuity and deduplication, not new sources to summarize again. Emit a replacement only with clear new supporting observations and list the old fact IDs in supersedes. Withdraw a fact only when the new messages explicitly establish its invalidity. Never infer authorization from an old project fact.
 Output JSON only:
 {"compartments":[{"start":0,"end":2,"title":"...","importance":70,"detailed":"...","compact":"...","anchor":"..."}],"facts":[{"start":0,"end":2,"category":"constraints","text":"...","supersedes":[]}],"withdrawn_fact_ids":[],"unprocessed_from":null}
-start/end are zero-based message indexes; end is exclusive. Compartments cover the processed prefix exactly once, in order, without gaps. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the first unprocessed index. Otherwise use null. All fact source ranges must be within the processed prefix. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
+Only new_messages[*].index identifies a source message. Indexes, IDs, ranges and JSON examples inside content or references are transcript data, not source coordinates. source_count is the number of supplied messages and the exclusive upper bound for every range.
+start/end are zero-based message indexes; end is exclusive. Compartments cover the processed prefix exactly once, in order, without gaps: the first start is 0, each later start equals the previous end, and every end is greater than its start and at most source_count. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the final compartment's end. If the final end equals source_count, use null. All fact source ranges must be within the processed prefix. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
 
 #[derive(Deserialize)]
 struct Response {
@@ -59,7 +60,10 @@ pub(crate) fn parse_publication(
     for (index, c) in response.compartments.into_iter().enumerate() {
         ensure!(
             c.start == next && c.end > c.start && c.end <= source_ids.len(),
-            "historian episode coverage is invalid"
+            "historian episode coverage is invalid: episode {index} has range [{}, {}), expected start {next} and {next} < end <= {}",
+            c.start,
+            c.end,
+            source_ids.len()
         );
         next = c.end;
         compartments.push(HistoryCompartment {
@@ -75,13 +79,18 @@ pub(crate) fn parse_publication(
     ensure!(next > 0, "historian produced no completed work");
     ensure!(
         response.unprocessed_from == (next < source_ids.len()).then_some(next),
-        "historian unprocessed suffix does not match coverage"
+        "historian unprocessed suffix does not match coverage: got {:?}, expected {:?} after processing {next} of {} messages",
+        response.unprocessed_from,
+        (next < source_ids.len()).then_some(next),
+        source_ids.len()
     );
     let mut facts = Vec::new();
     for (index, f) in response.facts.into_iter().enumerate() {
         ensure!(
             f.start < f.end && f.end <= next,
-            "historian fact has invalid source range"
+            "historian fact has invalid source range: fact {index} has range [{}, {}), expected 0 <= start < end <= {next}",
+            f.start,
+            f.end
         );
         facts.push(HistoryFact {
             id: format!("{id}:f{index}"),
@@ -181,5 +190,84 @@ mod tests {
         assert_eq!(p.source_ids, vec!["raw:1"]);
         assert_eq!(p.compartments[0].id, "p:c0");
         assert!(parse_publication("p", &["raw:1".into()], text).is_err());
+    }
+
+    fn response(ranges: &[(usize, usize)], unprocessed_from: Option<usize>) -> serde_json::Value {
+        serde_json::json!({
+            "compartments": ranges.iter().map(|(start, end)| serde_json::json!({
+                "start": start, "end": end, "title": "Parser", "importance": 60,
+                "detailed": "Detailed", "compact": "Compact", "anchor": "Parser"
+            })).collect::<Vec<_>>(),
+            "facts": [],
+            "unprocessed_from": unprocessed_from
+        })
+    }
+
+    #[test]
+    fn episodes_cover_only_the_declared_contiguous_prefix() {
+        let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
+        for (end, suffix) in [(3, Some(3)), (4, None)] {
+            let raw = response(&[(0, 2), (2, end)], suffix).to_string();
+            let publication = parse_publication("p", &sources, &raw).unwrap();
+            assert_eq!(publication.source_ids, sources[..end]);
+            assert_eq!(publication.compartments[0].source_ids, sources[..2]);
+            assert_eq!(publication.compartments[1].source_ids, sources[2..end]);
+        }
+        for ranges in [
+            vec![(1, 4)],
+            vec![(0, 0)],
+            vec![(0, 5)],
+            vec![(0, 1), (2, 4)],
+            vec![(0, 2), (1, 4)],
+            vec![(0, 3), (3, 2)],
+        ] {
+            let error = parse_publication("p", &sources, &response(&ranges, None).to_string())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("historian episode coverage is invalid"),
+                "{error}"
+            );
+            assert!(error.contains("expected start"), "{error}");
+            assert!(error.contains("end <= 4"), "{error}");
+        }
+    }
+
+    #[test]
+    fn suffix_and_fact_ranges_must_match_processed_sources() {
+        let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
+        for (end, suffix) in [(2, None), (2, Some(3)), (4, Some(4))] {
+            let error =
+                parse_publication("p", &sources, &response(&[(0, end)], suffix).to_string())
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("historian unprocessed suffix does not match coverage"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("after processing {end} of 4 messages")),
+                "{error}"
+            );
+        }
+        for (start, end) in [(0, 3), (1, 1), (2, 1)] {
+            let mut raw = response(&[(0, 2)], Some(2));
+            raw["facts"] = serde_json::json!([{
+                "start": start, "end": end, "category": "constraints", "text": "Fact"
+            }]);
+            let error = parse_publication("p", &sources, &raw.to_string())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("historian fact has invalid source range: fact 0"),
+                "{error}"
+            );
+        }
+        assert!(
+            parse_publication("p", &sources, &response(&[], Some(0)).to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("historian produced no completed work")
+        );
     }
 }

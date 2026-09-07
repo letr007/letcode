@@ -104,8 +104,9 @@ impl HistorianRuntime {
         if pending.is_some() {
             return Ok(());
         }
+        let summary = format!("Organize {} history items", work.source_ids.len());
         let input = NormalizedSubagentInput {
-            objective: work.prompt.clone(),
+            objective: summary.clone(),
             success_criteria: vec!["Three-tier history with complete source coverage".into()],
             allowed_paths: vec![],
             forbidden_paths: vec![],
@@ -119,7 +120,9 @@ impl HistorianRuntime {
         let invocation = SubagentInvocation {
             input,
             model: None,
-            prompt: work.prompt.clone(),
+            // Pool lifecycle records contain the task label, not the source
+            // transcript. The executor receives the full input separately.
+            prompt: summary,
             parent_tool_call_id: None,
         };
         let started = self.pool.start_named_governed(
@@ -156,7 +159,8 @@ impl HistorianRuntime {
             let external_fact_ids = work.external_fact_ids.clone();
             let source_session_id = work.session_id.clone();
             let source_branch_id = work.branch_id.clone();
-            let result = pool.complete_started_run_with_executor(started, move |agent, prompt, child, _, _, _| {
+            let prompt = work.prompt.clone();
+            let result = pool.complete_started_run_with_executor(started, move |agent, _, child, _, _, _| {
                 async move {
                     child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_user_message(format!("Historian · {} history items\n\nModel: {}", source_ids.len(), agent.model()))?;
                     let started_at = std::time::Instant::now();

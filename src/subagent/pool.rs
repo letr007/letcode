@@ -915,6 +915,16 @@ impl SubagentPool {
                     task.clone(),
                     pool_ordinal,
                 )?;
+                let snapshot = transcript_projection::project_runtime_restore_snapshot(
+                    child_session_id.clone(),
+                    read_records_allow_partial_tail(child_recorder.path())?,
+                    transcript_projection::SessionContextCursor {
+                        branch_id: None,
+                        leaf_sequence: None,
+                    },
+                    &[],
+                )?;
+                child_agent.restore_runtime_snapshot(snapshot.snapshot)?;
                 Ok((
                     run_id,
                     child_session_id,

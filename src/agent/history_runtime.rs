@@ -19,7 +19,13 @@ fn persisted_history_snapshot(agent: &Agent) -> Result<RuntimeSnapshot> {
         snapshot.session_id == agent.runtime_snapshot.session_id
             && snapshot.active_context.branch_id == agent.runtime_snapshot.active_context.branch_id
             && snapshot.context_scope_revision == agent.runtime_snapshot.context_scope_revision,
-        "history source scope changed before preparation"
+        "history source scope changed before preparation: active session={:?}, branch={}, revision={}; persisted session={:?}, branch={}, revision={}",
+        agent.runtime_snapshot.session_id,
+        agent.runtime_snapshot.active_context.branch_id,
+        agent.runtime_snapshot.context_scope_revision,
+        snapshot.session_id,
+        snapshot.active_context.branch_id,
+        snapshot.context_scope_revision
     );
     Ok(snapshot)
 }
@@ -113,7 +119,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
             .enumerate()
             .map(|(index, item)| serde_json::json!({"index":index,"content":item}))
             .collect();
-        let prompt = serde_json::json!({"references":references,"project_facts":facts,"new_messages":new_messages}).to_string();
+        let prompt = serde_json::json!({"source_count":source_ids.len(),"references":references,"project_facts":facts,"new_messages":new_messages}).to_string();
         match protocol_stream::preflight_resolved_oneshot_text_request(
             route,
             helper.active_model_metadata(),
@@ -558,6 +564,11 @@ mod tests {
                 assert_eq!(instructions.matches("You are Historian").count(),1);
                 assert!(!request["input"].to_string().contains("You are Historian"));
                 assert!(request.get("tools").is_none() || request["tools"].as_array().unwrap().is_empty());
+                let input = request["input"].as_array().unwrap().iter()
+                    .filter_map(|message| message["content"].as_array()).flatten()
+                    .filter_map(|part| part["text"].as_str())
+                    .find_map(|text| serde_json::from_str::<serde_json::Value>(text).ok().filter(|value| value.get("new_messages").is_some())).unwrap();
+                assert_eq!(input["source_count"].as_u64().unwrap() as usize, input["new_messages"].as_array().unwrap().len());
                 if attempt==0 { assert!(request["input"].to_string().contains("EXACT-TAIL-CONSTRAINT")); }
                 if attempt==1 { accepted.notify_one(); release.notified().await; }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -635,6 +646,18 @@ max_output_tokens=4096
                 _ => None,
             }).unwrap();
             let child_records = crate::transcript::read_child_session_records(directory.path(), child_id).unwrap();
+            for record in records.iter().chain(&child_records) {
+                match &record.event {
+                    TranscriptEvent::SubagentStarted { agent_name, summary, .. } if agent_name == "historian" => {
+                        assert_eq!(summary, "Organize 4 history items");
+                    }
+                    TranscriptEvent::SubagentLifecycle { agent_name, detail: Some(detail), .. } if agent_name == "historian" => {
+                        assert!(!detail.contains("EXACT-TAIL-CONSTRAINT"));
+                        assert!(!detail.contains("new_messages"));
+                    }
+                    _ => {}
+                }
+            }
             let report = crate::transcript::restore_session_history(&child_records).unwrap().into_iter().find_map(|item| {
                 if let HistoryItem::AssistantTurn { text: Some(content), .. } = item { serde_json::from_str::<crate::historian::HistorianReport>(&content).ok() } else { None }
             }).expect("persisted structured Historian report");
@@ -1156,13 +1179,21 @@ max_output_tokens=128
     fn historian_sources_reject_a_different_persisted_scope() {
         let root = tempfile::tempdir().unwrap();
         let (mut agent, _recorder) = agent_with_recorder(root.path());
-        agent.runtime_snapshot.context_scope_revision += 1;
-        assert!(
-            work(&agent, true)
+        let original = agent.runtime_snapshot.clone();
+        for field in ["session", "branch", "revision"] {
+            agent.runtime_snapshot = original.clone();
+            match field {
+                "session" => agent.runtime_snapshot.session_id = None,
+                "branch" => agent.runtime_snapshot.active_context.branch_id = "other".into(),
+                _ => agent.runtime_snapshot.context_scope_revision += 1,
+            }
+            let error = work(&agent, true)
                 .err()
                 .expect("scope mismatch")
-                .to_string()
-                .contains("scope changed")
-        );
+                .to_string();
+            assert!(error.contains("scope changed"), "{field}: {error}");
+            assert!(error.contains("active session="), "{error}");
+            assert!(error.contains("persisted session="), "{error}");
+        }
     }
 }

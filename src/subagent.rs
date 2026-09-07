@@ -164,6 +164,48 @@ mod tests {
         assert_eq!(result.status, SubagentStatus::Cancelled);
     }
 
+    #[tokio::test]
+    async fn new_child_starts_with_canonical_runtime_snapshot() {
+        let runtime = SubagentPool::new();
+        let started = runtime
+            .start_named_governed(
+                &test_agent(),
+                "explorer",
+                crate::agent::SubagentInvocation {
+                    prompt: "inspect".into(),
+                    input: test_governance().input,
+                    model: None,
+                    parent_tool_call_id: None,
+                },
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                None,
+            )
+            .expect("child run starts");
+        let expected_session_id = started.receipt().child_session_id.clone();
+
+        let result = runtime
+            .complete_started_run_with_executor(started, move |agent, _, _, _, _, _| {
+                let snapshot = agent.runtime_snapshot_for_test();
+                assert_eq!(
+                    snapshot.session_id.as_deref(),
+                    Some(expected_session_id.as_str())
+                );
+                assert_eq!(
+                    snapshot.active_context.branch_id,
+                    crate::transcript::ROOT_CONTEXT_BRANCH_ID
+                );
+                assert_eq!(snapshot.context_scope_revision, 0);
+                async { Ok("ok".into()) }.boxed()
+            })
+            .await
+            .expect("child run completes");
+
+        assert_eq!(result.status, SubagentStatus::Completed);
+    }
+
     #[test]
     fn child_agents_do_not_expose_recursive_subagent_tools() {
         let agent = test_agent();
