@@ -611,10 +611,11 @@ pub fn source_entries(
             });
         }
     }
-    let active_facts: BTreeSet<_> = crate::evidence::restore_evidence_records(records)?
-        .into_iter()
+    let evidence = crate::evidence::restore_evidence_records(records)?;
+    let active_facts: BTreeSet<_> = evidence
+        .iter()
         .filter(|e| e.tags.iter().any(|t| t == "historian_fact"))
-        .map(|e| e.id)
+        .map(|e| e.id.as_str())
         .collect();
     for record in records {
         if let crate::transcript::TranscriptEvent::HistoryPublished(p) = &record.event {
@@ -628,13 +629,13 @@ pub fn source_entries(
                         "{:?}\n{}\nEffective in this view: {}",
                         f.category,
                         f.text,
-                        active_facts.contains(&fact_id)
+                        active_facts.contains(fact_id.as_str())
                     ),
                 });
             }
         }
     }
-    for e in crate::evidence::restore_evidence_records(records)? {
+    for e in evidence {
         if e.tags.iter().any(|t| t == "historian_fact") {
             continue;
         }

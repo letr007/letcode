@@ -18,30 +18,50 @@ pub(crate) fn history_input(
     project_facts: &[Value],
 ) -> UserMessageContent {
     let mut attachments = Vec::new();
-    let new_messages: Vec<_> = history.iter().enumerate().map(|(index, item)| {
+    let mut new_messages = Vec::with_capacity(history.len());
+    for (index, item) in history.iter().enumerate() {
         let content = match item {
             ProtocolItem::UserMessage { content } => {
-                let parts: Vec<_> = content.parts().into_iter().map(|part| match part {
-                    UserMessagePart::Text { text } => json!({"kind":"text","text":text}),
-                    UserMessagePart::Image { attachment } => json!({
-                        "kind":"image",
-                        "attachment":history_image(&attachment, &mut attachments)
-                    }),
-                }).collect();
+                let parts: Vec<_> = content
+                    .parts()
+                    .into_iter()
+                    .map(|part| match part {
+                        UserMessagePart::Text { text } => json!({"kind":"text","text":text}),
+                        UserMessagePart::Image { attachment } => json!({
+                            "kind":"image",
+                            "attachment":history_image(attachment, &mut attachments)
+                        }),
+                    })
+                    .collect();
                 json!({"kind":"user_message","parts":parts,"selected_skills":content.selected_skills})
             }
-            ProtocolItem::AssistantTurn { text, reasoning_content, calls, .. } => {
+            ProtocolItem::AssistantTurn {
+                text,
+                reasoning_content,
+                calls,
+                ..
+            } => {
                 json!({"kind":"assistant_turn","text":text,"reasoning_content":reasoning_content,"calls":calls})
             }
-            ProtocolItem::ToolOutput { call_id, output_json, images } => {
-                let images: Vec<_> = images.iter().map(|image| history_image(image, &mut attachments)).collect();
+            ProtocolItem::ToolOutput {
+                call_id,
+                output_json,
+                images,
+            } => {
+                let images: Vec<_> = images
+                    .iter()
+                    .cloned()
+                    .map(|image| history_image(image, &mut attachments))
+                    .collect();
                 json!({"kind":"tool_output","call_id":call_id,"output_json":output_json,"images":images})
             }
             ProtocolItem::ContextSummary { text } => json!({"kind":"context_summary","text":text}),
-            ProtocolItem::InternalContinuation { text } => json!({"kind":"internal_continuation","text":text}),
+            ProtocolItem::InternalContinuation { text } => {
+                json!({"kind":"internal_continuation","text":text})
+            }
         };
-        json!({"index":index,"content":content})
-    }).collect();
+        new_messages.push(json!({"index":index,"content":content}));
+    }
     let text = json!({
         "source_count":history.len(),
         "references":references,
@@ -52,14 +72,14 @@ pub(crate) fn history_input(
     UserMessageContent::new(text, attachments)
 }
 
-fn history_image(image: &UserImageAttachment, attachments: &mut Vec<UserImageAttachment>) -> Value {
+fn history_image(image: UserImageAttachment, attachments: &mut Vec<UserImageAttachment>) -> Value {
     let descriptor = json!({
         "attachment_index":attachments.len(),
         "id":image.id,
         "label":image.label,
         "mime":image.mime
     });
-    attachments.push(image.clone());
+    attachments.push(image);
     descriptor
 }
 

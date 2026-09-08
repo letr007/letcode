@@ -1612,20 +1612,21 @@ pub(super) fn preflight_resolved_oneshot_text_request(
     prelude: &[PromptMessage],
     user_text: &str,
 ) -> Result<crate::request_builder::BuildResult> {
-    preflight_resolved_oneshot_request(
+    prepare_resolved_oneshot_request(
         route,
         model,
         prelude,
-        &crate::user_content::UserMessageContent::new(user_text, vec![]),
+        &UserMessageContent::new(user_text, vec![]),
     )
+    .map(|(build, _)| build)
 }
 
-pub(super) fn preflight_resolved_oneshot_request(
+pub(super) fn prepare_resolved_oneshot_request(
     route: &crate::model_runtime::ResolvedModelRoute,
     mut model: ModelRequestMetadata,
     prelude: &[PromptMessage],
-    user_content: &crate::user_content::UserMessageContent,
-) -> Result<crate::request_builder::BuildResult> {
+    user_content: &UserMessageContent,
+) -> Result<(crate::request_builder::BuildResult, ModelRequestInput)> {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
     model.reasoning_summary = None;
@@ -1639,7 +1640,7 @@ pub(super) fn preflight_resolved_oneshot_request(
         .binding
         .prepare_request(&input)
         .map_err(anyhow::Error::new)?;
-    Ok(build)
+    Ok((build, input))
 }
 
 pub(super) async fn stream_resolved_oneshot_text_async<F, Fut, R, Rfut>(

@@ -3114,26 +3114,12 @@ impl Agent {
         let route = self
             .resolved_model_route()
             .ok_or_else(|| anyhow!("historian requires a resolved route"))?;
-        let mut model = self.active_model_metadata();
-        model.supports_reasoning = false;
-        model.reasoning_effort = None;
-        model.reasoning_summary = None;
-        model.supports_tools = false;
-        model.parallel_tool_calls = false;
-        model.fast_mode = false;
-        let build = protocol_stream::preflight_resolved_oneshot_request(
+        let (_, input) = protocol_stream::prepare_resolved_oneshot_request(
             route,
-            model.clone(),
+            self.active_model_metadata(),
             &self.prelude,
             user_input,
         )?;
-        let input = crate::model_runtime::projection::model_request_from_prompt_plan(
-            route,
-            &model,
-            &build.prompt_plan,
-            &[],
-        )
-        .map_err(anyhow::Error::msg)?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
             .execute_text_oneshot_with_usage(
                 route,

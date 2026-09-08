@@ -115,7 +115,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
             })
             .collect::<Result<Vec<_>>>()?;
         let input = crate::historian::history_input(&history[start..end], &references, &facts);
-        match protocol_stream::preflight_resolved_oneshot_request(
+        match protocol_stream::prepare_resolved_oneshot_request(
             route,
             helper.active_model_metadata(),
             &helper.prelude,
@@ -376,6 +376,29 @@ fn reconcile_recalled_facts(agent: &mut Agent) {
     }
 }
 
+async fn apply_history<E, Efut>(
+    agent: &mut Agent,
+    application: HistoryApplication,
+    blocking: bool,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut + Send + ?Sized,
+    Efut: Future<Output = Result<()>> + Send,
+{
+    on_event(AgentEvent::HistoryApplied {
+        application,
+        revision: agent.runtime_snapshot.context_scope_revision,
+        blocking,
+    })
+    .await?;
+    agent.reload_runtime_snapshot_from_provider()?;
+    reconcile_recalled_facts(agent);
+    agent.clear_active_epoch();
+    agent.clear_provider_usage_anchor();
+    Ok(())
+}
+
 pub(super) async fn advance<E, Efut>(
     agent: &mut Agent,
     blocking: bool,
@@ -427,16 +450,7 @@ where
         .sum();
     let execute = blocking || raw_tokens >= input_budget.saturating_mul(65) / 100;
     if execute && let Some(application) = pending_application(agent, blocking)? {
-        on_event(AgentEvent::HistoryApplied {
-            application,
-            revision: agent.runtime_snapshot.context_scope_revision,
-            blocking,
-        })
-        .await?;
-        agent.reload_runtime_snapshot_from_provider()?;
-        reconcile_recalled_facts(agent);
-        agent.clear_active_epoch();
-        agent.clear_provider_usage_anchor();
+        apply_history(agent, application, blocking, on_event).await?;
         return Ok(true);
     }
     if !execute {
@@ -503,16 +517,7 @@ where
         agent.reload_runtime_snapshot_from_provider()?;
     }
     if let Some(application) = pending_application(agent, true)? {
-        on_event(AgentEvent::HistoryApplied {
-            application,
-            revision: agent.runtime_snapshot.context_scope_revision,
-            blocking,
-        })
-        .await?;
-        agent.reload_runtime_snapshot_from_provider()?;
-        reconcile_recalled_facts(agent);
-        agent.clear_active_epoch();
-        agent.clear_provider_usage_anchor();
+        apply_history(agent, application, blocking, on_event).await?;
         return Ok(true);
     }
     Ok(false)
@@ -770,7 +775,7 @@ max_output_tokens=128
                     parallel_tool_calls: false,
                     ..Default::default()
                 };
-                let result = protocol_stream::preflight_resolved_oneshot_request(
+                let result = protocol_stream::prepare_resolved_oneshot_request(
                     route,
                     metadata.clone(),
                     &prelude,
@@ -785,7 +790,7 @@ max_output_tokens=128
                     );
                     continue;
                 }
-                let build = result.unwrap();
+                let (build, input) = result.unwrap();
                 assert!(!build.budget.truncated);
                 assert!(build.budget.estimated_request_tokens < 20_000);
                 assert!(
@@ -804,7 +809,7 @@ max_output_tokens=128
                     );
                 }
                 let larger = crate::historian::history_input(&larger_history, &[], &[]);
-                let larger_build = protocol_stream::preflight_resolved_oneshot_request(
+                let (larger_build, _) = protocol_stream::prepare_resolved_oneshot_request(
                     route,
                     metadata.clone(),
                     &prelude,
@@ -826,13 +831,6 @@ max_output_tokens=128
                     )
                     .is_err()
                 );
-                let input = crate::model_runtime::projection::model_request_from_prompt_plan(
-                    route,
-                    &metadata,
-                    &build.prompt_plan,
-                    &[],
-                )
-                .unwrap();
                 let prepared = route.binding.prepare_request(&input).unwrap();
                 let body: Value = serde_json::from_slice(&prepared.body).unwrap();
                 let messages = if protocol == "responses" {
