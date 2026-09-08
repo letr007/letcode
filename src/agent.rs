@@ -3107,9 +3107,9 @@ impl Agent {
         }
     }
 
-    pub(crate) async fn run_historian_text(
+    pub(crate) async fn run_historian(
         &self,
-        user_input: &str,
+        user_input: &UserMessageContent,
     ) -> Result<(String, Vec<crate::historian::UsageUpdate>)> {
         let route = self
             .resolved_model_route()
@@ -3121,7 +3121,7 @@ impl Agent {
         model.supports_tools = false;
         model.parallel_tool_calls = false;
         model.fast_mode = false;
-        let build = protocol_stream::preflight_resolved_oneshot_text_request(
+        let build = protocol_stream::preflight_resolved_oneshot_request(
             route,
             model.clone(),
             &self.prelude,

@@ -1584,7 +1584,14 @@ mod history_pressure_tests {
                     let prompt = request["input"].as_array().unwrap().iter().flat_map(|item| item["content"].as_array().into_iter().flatten())
                         .filter_map(|part| part["text"].as_str())
                         .find_map(|text| serde_json::from_str::<serde_json::Value>(text).ok().filter(|value| value.get("new_messages").is_some())).unwrap();
-                    let count = prompt["new_messages"].as_array().unwrap().len();
+                    let source_messages = prompt["new_messages"].as_array().unwrap();
+                    let has_user_image = source_messages.iter().any(|message| message["content"]["kind"] == "user_message");
+                    let image_count = request["input"].as_array().unwrap().iter()
+                        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                        .filter(|part| part["type"] == "input_image").count();
+                    assert_eq!(image_count, usize::from(has_user_image));
+                    assert!(!prompt.to_string().contains("data:image/png;base64,"));
+                    let count = source_messages.len();
                     let output = serde_json::json!({"compartments":[{"start":0,"end":count,"title":"Read sources","importance":70,"detailed":"Read source files","compact":"Read sources","anchor":"Sources"}],"facts":[],"unprocessed_from":null}).to_string();
                     let delta = serde_json::json!({"type":"response.output_text.delta","delta":output});
                     let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed"}});
@@ -1602,6 +1609,7 @@ type="none"
 base_url="http://{address}"
 [providers.test.models.m]
 [providers.test.models.m.capabilities]
+input_images=true
 generation={{max_output_tokens=true}}
 [providers.test.models.m.generation]
 max_output_tokens=128
@@ -1616,7 +1624,12 @@ max_output_tokens=128
             let mut recorder = TranscriptRecorder::create(directory.path()).unwrap();
             recorder.record_session_started("test/m").unwrap();
             recorder.record_turn_started(crate::agent::TurnStartedEvent { turn_id:1, intent:"read sources".into(), directive:String::new(), validation_reminder:String::new() }).unwrap();
-            recorder.record_user_message("Read the source files").unwrap();
+            recorder.record_user_message_content(crate::user_content::UserMessageContent::new("Read the source files", vec![
+                crate::user_content::UserImageAttachment {
+                    id: "source-image".into(), label: "source image".into(), mime: "image/png".into(),
+                    data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=".into(),
+                }
+            ])).unwrap();
             for index in 0..12 {
                 let id = format!("read-{index}");
                 recorder.record_assistant_tool_call_batch(None, None, None, vec![HistoryToolCall {call_id:id.clone(),name:"fs__read".into(),arguments_json:r#"{"path":"source.rs"}"#.into()}]).unwrap();

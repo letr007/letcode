@@ -114,17 +114,12 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
                     .ok_or_else(|| anyhow!("historian source has no durable identity"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let new_messages: Vec<_> = history[start..end]
-            .iter()
-            .enumerate()
-            .map(|(index, item)| serde_json::json!({"index":index,"content":item}))
-            .collect();
-        let prompt = serde_json::json!({"source_count":source_ids.len(),"references":references,"project_facts":facts,"new_messages":new_messages}).to_string();
-        match protocol_stream::preflight_resolved_oneshot_text_request(
+        let input = crate::historian::history_input(&history[start..end], &references, &facts);
+        match protocol_stream::preflight_resolved_oneshot_request(
             route,
             helper.active_model_metadata(),
             &helper.prelude,
-            &prompt,
+            &input,
         ) {
             Ok(_) => {
                 let identity = format!(
@@ -144,7 +139,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
                     branch_id: snapshot.active_context.branch_id.clone(),
                     revision: snapshot.context_scope_revision,
                     source_ids,
-                    prompt,
+                    input,
                     project_path: crate::tool::workspace_root_for_subagent_lock()?
                         .to_string_lossy()
                         .into_owned(),
@@ -495,7 +490,7 @@ where
             false,
             Some(0),
         )?;
-        let raw = helper.run_resolved_text_oneshot(&work.prompt).await?;
+        let (raw, _) = helper.run_historian(&work.input).await?;
         let mut publication =
             crate::historian::parse_publication(&work.id, &work.source_ids, &raw)?;
         publication.project_path = Some(work.project_path.clone());
@@ -569,7 +564,19 @@ mod tests {
                     .filter_map(|part| part["text"].as_str())
                     .find_map(|text| serde_json::from_str::<serde_json::Value>(text).ok().filter(|value| value.get("new_messages").is_some())).unwrap();
                 assert_eq!(input["source_count"].as_u64().unwrap() as usize, input["new_messages"].as_array().unwrap().len());
-                if attempt==0 { assert!(request["input"].to_string().contains("EXACT-TAIL-CONSTRAINT")); }
+                if attempt==0 {
+                    assert!(input.to_string().contains("EXACT-TAIL-CONSTRAINT"));
+                    assert!(!input.to_string().contains("data:image/png;base64,"));
+                    assert!(!input.to_string().contains("OPAQUE-REPLAY"));
+                    assert!(input.to_string().contains("READABLE-REASONING"));
+                    let images: Vec<_> = request["input"].as_array().unwrap().iter()
+                        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                        .filter_map(|part| part["image_url"].as_str()).collect();
+                    assert_eq!(images, vec![
+                        "data:image/png;base64,dXNlci1pbWFnZQ==",
+                        "data:image/png;base64,dG9vbC1pbWFnZQ==",
+                    ]);
+                }
                 if attempt==1 { accepted.notify_one(); release.notified().await; }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let output=serde_json::json!({"compartments":[{"start":0,"end":if attempt==0 {4} else {1},"title":"Parser fix","importance":70,"detailed":"Fixed UTF-8 parser offsets","compact":"Parser offset fix","anchor":"UTF-8 parser"}],"facts":[],"unprocessed_from":null}).to_string();
@@ -598,20 +605,29 @@ backoff_multiplier=1.0
 jitter_secs=0
 [providers.test.models."test-model"]
 [providers.test.models."test-model".capabilities]
+input_images=true
 generation={{max_output_tokens=true}}
 [providers.test.models."test-model".generation]
 max_output_tokens=4096
 "#)).unwrap().resolve(&crate::model_runtime::ProtocolRegistry::builtins()).unwrap();
             let route=config.route("test","test-model").unwrap().clone();
             let mut agent=Agent::new("test-model",5,0);
+            agent.set_model_catalog(std::collections::HashMap::from([("test-model".into(), ModelRequestMetadata {
+                context_window: Some(32_768), max_output_tokens: Some(4096), ..Default::default()
+            })]));
             agent.set_primary_route(crate::config::ModelRoute::new("test","test-model"));
             agent.set_resolved_model_route(Some(Arc::new(route)));
             let directory=tempfile::tempdir().unwrap();
             let mut recorder=TranscriptRecorder::create(directory.path()).unwrap();
             recorder.record_session_started("test/test-model").unwrap();
-            recorder.record_user_message("Fix parser").unwrap();
-            recorder.record_assistant_tool_call_batch(None,None,None,vec![HistoryToolCall { call_id:"read-1".into(),name:"fs__read".into(),arguments_json:r#"{"path":"parser.rs"}"#.into() }]).unwrap();
-            recorder.record_tool_call_finished("read-1","fs__read",true,crate::tool::ToolResult::ok("fs__read",serde_json::json!({"content":format!("{} EXACT-TAIL-CONSTRAINT","detail ".repeat(500))}))).unwrap();
+            recorder.record_user_message_content(UserMessageContent::new("Fix parser", vec![
+                crate::user_content::UserImageAttachment::from_bytes("user image", "image/png", b"user-image")
+            ])).unwrap();
+            let replay = r#"[{"type":"redacted_thinking","data":"OPAQUE-REPLAY"}]"#.to_string();
+            recorder.record_assistant_tool_call_batch(None,Some("READABLE-REASONING".into()),Some(replay),vec![HistoryToolCall { call_id:"read-1".into(),name:"fs__read".into(),arguments_json:r#"{"path":"parser.rs"}"#.into() }]).unwrap();
+            recorder.record_tool_call_finished("read-1","fs__read",true,crate::tool::ToolResult::ok("fs__read",serde_json::json!({"content":format!("{} EXACT-TAIL-CONSTRAINT","detail ".repeat(500))})).with_images(vec![
+                crate::user_content::UserImageAttachment::from_bytes("tool image", "image/png", b"tool-image")
+            ])).unwrap();
             recorder.record_assistant_message("Fixed UTF-8 parser offsets").unwrap();
             let recorder=Arc::new(Mutex::new(recorder));
             let projected=recorder.clone();
@@ -693,6 +709,202 @@ max_output_tokens=4096
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+
+    #[test]
+    fn historian_preflight_uses_native_images_and_readable_text_in_all_protocols() {
+        use crate::user_content::UserImageAttachment;
+        use serde_json::{Value, json};
+        let image = UserImageAttachment::from_bytes("user image", "image/png", &vec![37; 120_000]);
+        let tool_image =
+            UserImageAttachment::from_bytes("tool image", "image/png", b"tool-image-data");
+        let replay = crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
+            &json!([{"type":"redacted_thinking","data":"OPAQUE-ONLY".repeat(20_000)}]).to_string(),
+        )
+        .unwrap();
+        let history = vec![
+            HistoryItem::user_content(UserMessageContent::new("USER-TEXT", vec![image.clone()])),
+            HistoryItem::AssistantTurn {
+                text: Some("ASSISTANT-TEXT".into()),
+                reasoning_content: Some("READABLE-REASONING".into()),
+                replay: Some(replay),
+                calls: vec![],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "image-call".into(),
+                output_json: "TOOL-TEXT".into(),
+                images: vec![tool_image.clone()],
+            },
+        ];
+        let content = crate::historian::history_input(&history, &[], &[]);
+        let prelude = [
+            PromptMessage::system(crate::historian::HISTORIAN_PROMPT),
+            PromptMessage::developer("DYNAMIC-CONTEXT"),
+        ];
+        for protocol in ["responses", "completions", "anthropic"] {
+            for input_images in [true, false] {
+                let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(
+                    r#"active_provider="p"
+[providers.p]
+protocol="{protocol}"
+default_model="m"
+[providers.p.auth]
+type="none"
+[providers.p.endpoints]
+base_url="http://127.0.0.1:1"
+[providers.p.models.m.capabilities]
+input_images={input_images}
+generation={{max_output_tokens=true}}
+[providers.p.models.m.generation]
+max_output_tokens=128
+"#
+                ))
+                .unwrap()
+                .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+                .unwrap();
+                let route = catalog.route("p", "m").unwrap();
+                let metadata = ModelRequestMetadata {
+                    context_window: Some(32_768),
+                    max_output_tokens: Some(128),
+                    supports_reasoning: false,
+                    supports_tools: false,
+                    parallel_tool_calls: false,
+                    ..Default::default()
+                };
+                let result = protocol_stream::preflight_resolved_oneshot_request(
+                    route,
+                    metadata.clone(),
+                    &prelude,
+                    &content,
+                );
+                if !input_images {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("unsupported_request_field")
+                    );
+                    continue;
+                }
+                let build = result.unwrap();
+                assert!(!build.budget.truncated);
+                assert!(build.budget.estimated_request_tokens < 20_000);
+                assert!(
+                    build.budget.estimated_request_tokens
+                        >= image.visual_token_charge() + tool_image.visual_token_charge()
+                );
+                let mut larger_history = history.clone();
+                if let HistoryItem::UserMessage { content } = &mut larger_history[0] {
+                    *content = UserMessageContent::new(
+                        "USER-TEXT",
+                        vec![UserImageAttachment::from_bytes(
+                            "user image",
+                            "image/png",
+                            &vec![38; 240_000],
+                        )],
+                    );
+                }
+                let larger = crate::historian::history_input(&larger_history, &[], &[]);
+                let larger_build = protocol_stream::preflight_resolved_oneshot_request(
+                    route,
+                    metadata.clone(),
+                    &prelude,
+                    &larger,
+                )
+                .unwrap();
+                assert_eq!(
+                    build.budget.estimated_request_tokens,
+                    larger_build.budget.estimated_request_tokens,
+                    "encoded image bytes must not become text tokens"
+                );
+                let journal_text = json!({"new_messages":history}).to_string();
+                assert!(
+                    protocol_stream::preflight_resolved_oneshot_text_request(
+                        route,
+                        metadata.clone(),
+                        &prelude,
+                        &journal_text
+                    )
+                    .is_err()
+                );
+                let input = crate::model_runtime::projection::model_request_from_prompt_plan(
+                    route,
+                    &metadata,
+                    &build.prompt_plan,
+                    &[],
+                )
+                .unwrap();
+                let prepared = route.binding.prepare_request(&input).unwrap();
+                let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+                let messages = if protocol == "responses" {
+                    &body["input"]
+                } else {
+                    &body["messages"]
+                };
+                let blocks: Vec<_> = messages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message["role"] == "user")
+                    .flat_map(|message| message["content"].as_array().unwrap())
+                    .collect();
+                let texts: Vec<_> = blocks
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect();
+                let text = texts.join("\n");
+                for marker in [
+                    "USER-TEXT",
+                    "ASSISTANT-TEXT",
+                    "READABLE-REASONING",
+                    "TOOL-TEXT",
+                ] {
+                    assert!(text.contains(marker));
+                }
+                assert!(!text.contains("OPAQUE-ONLY"));
+                assert!(!text.contains("data:image/png;base64,"));
+                let payload: Value = serde_json::from_str(texts[0]).unwrap();
+                assert_eq!(
+                    payload["new_messages"][0]["content"]["parts"][1]["attachment"]["attachment_index"],
+                    0
+                );
+                assert_eq!(
+                    payload["new_messages"][2]["content"]["images"][0]["attachment_index"],
+                    1
+                );
+                let images: Vec<_> = blocks
+                    .iter()
+                    .filter_map(|part| match protocol {
+                        "responses" => part["image_url"].as_str().map(str::to_string),
+                        "completions" => part["image_url"]["url"].as_str().map(str::to_string),
+                        _ => part["source"]["data"]
+                            .as_str()
+                            .map(|data| format!("data:image/png;base64,{data}")),
+                    })
+                    .collect();
+                assert_eq!(
+                    images,
+                    vec![image.data_url.clone(), tool_image.data_url.clone()]
+                );
+                assert_eq!(body.to_string().matches("You are Historian").count(), 1);
+                assert!(!text.contains("You are Historian"));
+                let system = match protocol {
+                    "responses" => body["instructions"].to_string(),
+                    "completions" => body["messages"][0]["content"].to_string(),
+                    _ => body["system"].to_string(),
+                };
+                assert!(system.contains("You are Historian"));
+                assert!(!system.contains("USER-TEXT"));
+                assert!(!system.contains("READABLE-REASONING"));
+                if protocol != "anthropic" {
+                    assert!(!system.contains("DYNAMIC-CONTEXT"));
+                }
+                assert!(
+                    body.get("tools").is_none() || body["tools"].as_array().unwrap().is_empty()
+                );
+            }
+        }
+    }
+
     #[test]
     fn three_protocols_replay_frozen_slots_and_keep_baseline_before_delta() {
         for protocol in ["responses", "completions", "anthropic"] {
@@ -1068,7 +1280,7 @@ max_output_tokens=128
             .collect();
         assert_eq!(prepared.source_ids, expected);
         assert_eq!(prepared.source_ids.len(), 10);
-        assert!(prepared.prompt.contains("unique body first-7"));
+        assert!(prepared.input.text.contains("unique body first-7"));
         let mut publication = crate::historian::parse_publication(&prepared.id,&prepared.source_ids,&serde_json::json!({
             "compartments":[{"start":0,"end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"}],
             "facts":[{"start":0,"end":10,"category":"architecture","text":"Source fact","supersedes":[]}],"unprocessed_from":null

@@ -1561,14 +1561,16 @@ where
     Ok(successor)
 }
 
-fn build_oneshot_text_request(
+fn build_oneshot_request(
     model_id: &str,
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
-    user_text: &str,
+    user_content: &crate::user_content::UserMessageContent,
 ) -> Result<crate::request_builder::BuildResult> {
     let mut snapshot = RuntimeSnapshot::new("helper-oneshot");
-    let frames = crate::protocol_frames::history_items_to_frames(&[HistoryItem::user(user_text)]);
+    let frames = crate::protocol_frames::history_items_to_frames(&[HistoryItem::user_content(
+        user_content.clone(),
+    )]);
     for (ordinal, frame) in frames.into_iter().enumerate() {
         let stable_key = frame.stable_prompt_key();
         let runtime_frame = RuntimeFrame::new(
@@ -1603,11 +1605,26 @@ fn build_oneshot_text_request(
     )
 }
 
+#[cfg(test)]
 pub(super) fn preflight_resolved_oneshot_text_request(
+    route: &crate::model_runtime::ResolvedModelRoute,
+    model: ModelRequestMetadata,
+    prelude: &[PromptMessage],
+    user_text: &str,
+) -> Result<crate::request_builder::BuildResult> {
+    preflight_resolved_oneshot_request(
+        route,
+        model,
+        prelude,
+        &crate::user_content::UserMessageContent::new(user_text, vec![]),
+    )
+}
+
+pub(super) fn preflight_resolved_oneshot_request(
     route: &crate::model_runtime::ResolvedModelRoute,
     mut model: ModelRequestMetadata,
     prelude: &[PromptMessage],
-    user_text: &str,
+    user_content: &crate::user_content::UserMessageContent,
 ) -> Result<crate::request_builder::BuildResult> {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
@@ -1615,8 +1632,7 @@ pub(super) fn preflight_resolved_oneshot_text_request(
     model.supports_tools = false;
     model.parallel_tool_calls = false;
     model.fast_mode = false;
-    let build =
-        build_oneshot_text_request(&route.model_override, model.clone(), prelude, user_text)?;
+    let build = build_oneshot_request(&route.model_override, model.clone(), prelude, user_content)?;
     let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
     route
@@ -1646,8 +1662,12 @@ where
     model.supports_tools = false;
     model.parallel_tool_calls = false;
     model.fast_mode = false;
-    let build =
-        build_oneshot_text_request(&route.model_override, model.clone(), prelude, user_text)?;
+    let build = build_oneshot_request(
+        &route.model_override,
+        model.clone(),
+        prelude,
+        &crate::user_content::UserMessageContent::new(user_text, vec![]),
+    )?;
     let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
     ModelRuntime::default()

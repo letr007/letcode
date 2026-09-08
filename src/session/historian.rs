@@ -20,7 +20,7 @@ pub(crate) struct HistoryWork {
     pub branch_id: String,
     pub revision: u64,
     pub source_ids: Vec<String>,
-    pub prompt: String,
+    pub input: crate::user_content::UserMessageContent,
     pub project_path: String,
     pub external_fact_ids: Vec<String>,
 }
@@ -159,12 +159,12 @@ impl HistorianRuntime {
             let external_fact_ids = work.external_fact_ids.clone();
             let source_session_id = work.session_id.clone();
             let source_branch_id = work.branch_id.clone();
-            let prompt = work.prompt.clone();
+            let input = work.input.clone();
             let result = pool.complete_started_run_with_executor(started, move |agent, _, child, _, _, _| {
                 async move {
                     child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_user_message(format!("Historian · {} history items\n\nModel: {}", source_ids.len(), agent.model()))?;
                     let started_at = std::time::Instant::now();
-                    let (raw, usage) = agent.run_historian_text(&prompt).await?;
+                    let (raw, usage) = agent.run_historian(&input).await?;
                     let mut publication = crate::historian::parse_publication(&publication_id, &source_ids, &raw)?;
                     publication.project_path = Some(project_path);
                     publication.external_fact_ids = external_fact_ids;
