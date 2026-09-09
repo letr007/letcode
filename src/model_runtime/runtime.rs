@@ -221,6 +221,7 @@ pub(crate) struct TurnLocalResponsesTransport {
     steer_receiver:
         Arc<StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<ResponseSteerRequest>>>>,
     cached_successor: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+    server_owned_steers: Arc<StdMutex<Vec<PendingSteer>>>,
 }
 
 impl TurnLocalResponsesTransport {
@@ -235,6 +236,7 @@ impl TurnLocalResponsesTransport {
             steer_handle: Arc::new(StdMutex::new(None)),
             steer_receiver: Arc::new(StdMutex::new(None)),
             cached_successor: Arc::new(tokio::sync::Mutex::new(None)),
+            server_owned_steers: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -348,6 +350,7 @@ impl ModelTransport for TurnLocalResponsesTransport {
         }
         let steer_receiver = self.steer_receiver.clone();
         let steer_handle = self.steer_handle.lock().unwrap().clone();
+        let pending_steers = std::mem::take(&mut *self.server_owned_steers.lock().unwrap());
         drop(session_guard);
         let stream = websocket_response_stream(
             self.session.clone(),
@@ -357,10 +360,12 @@ impl ModelTransport for TurnLocalResponsesTransport {
             self.poisoned_response.clone(),
             self.force_http.clone(),
             self.cached_successor.clone(),
+            self.server_owned_steers.clone(),
             route.binding.clone(),
             steer_handle,
             steer_receiver,
             cached_successor,
+            pending_steers,
             route.auth.credential.clone().unwrap_or_default(),
         );
         Ok(TransportResponse::from_responses_websocket_stream(
@@ -421,6 +426,7 @@ struct PendingSteer {
     submission: UserMessageSubmission,
     target_response_id: Option<String>,
     server_steer_id: Option<String>,
+    waiting_for_required_input: bool,
 }
 
 fn steer_details(
@@ -466,6 +472,57 @@ fn bind_accepted_steer(
                 .with_code("steer_accepted_without_pending_submission")
         })?;
     pending.server_steer_id = Some(server_steer_id);
+    Ok(())
+}
+
+fn bind_pending_steer(
+    pending_steers: &mut [PendingSteer],
+    value: &serde_json::Value,
+) -> Result<(), ModelFailure> {
+    bind_accepted_steer(pending_steers, value)?;
+    let (_, previous_response_id, server_steer_id) = steer_details(value)?;
+    let server_steer_id = server_steer_id.expect("accepted binding requires an id");
+    let pending = pending_steers
+        .iter_mut()
+        .find(|pending| {
+            pending.server_steer_id.as_deref() == Some(server_steer_id.as_str())
+                && pending.target_response_id.as_deref() == Some(previous_response_id.as_str())
+        })
+        .expect("accepted binding identifies the pending submission");
+    let reason = value
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
+                .with_code("steer_pending_missing_reason")
+        })?;
+    if reason == "waiting_for_required_input" {
+        let required_input = value
+            .get("required_input")
+            .and_then(serde_json::Value::as_array)
+            .filter(|required| !required.is_empty())
+            .ok_or_else(|| {
+                ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
+                    .with_code("steer_pending_missing_required_input")
+            })?;
+        let _ = required_input;
+        pending.waiting_for_required_input = true;
+    }
+    Ok(())
+}
+
+fn park_server_owned_steers(
+    slot: &Arc<StdMutex<Vec<PendingSteer>>>,
+    pending_steers: &mut Vec<PendingSteer>,
+) -> Result<(), ModelFailure> {
+    let mut stored = slot.lock().unwrap();
+    if !stored.is_empty() {
+        return Err(
+            ModelFailure::new(FailurePhase::Finish, FailureKind::Internal)
+                .with_code("server_owned_steer_already_parked"),
+        );
+    }
+    stored.append(pending_steers);
     Ok(())
 }
 
@@ -575,12 +632,14 @@ fn websocket_response_stream(
     poisoned: Arc<AtomicBool>,
     force_http: Arc<AtomicBool>,
     cached_successor: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+    server_owned_steers: Arc<StdMutex<Vec<PendingSteer>>>,
     binding: Arc<dyn super::ProtocolBinding>,
     steer_handle: Option<ResponseSteerHandle>,
     steer_receiver: Arc<
         StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<ResponseSteerRequest>>>,
     >,
     cached_first: Option<Vec<u8>>,
+    initial_pending_steers: Vec<PendingSteer>,
     secret: String,
 ) -> WebsocketResponseStream {
     let terminal = Arc::new(AtomicBool::new(false));
@@ -593,11 +652,12 @@ fn websocket_response_stream(
             force_full,
             next_prompt_unit_start,
             cached_successor,
+            server_owned_steers,
             binding,
             steer_receiver,
             cached_first,
             None::<String>,
-            Vec::<PendingSteer>::new(),
+            initial_pending_steers,
             false,
             false,
             secret,
@@ -608,6 +668,7 @@ fn websocket_response_stream(
             force_full,
             next_prompt_unit_start,
             cached_successor,
+            server_owned_steers,
             binding,
             steer_receiver,
             mut cached_first,
@@ -649,6 +710,7 @@ fn websocket_response_stream(
                                 submission: request.submission,
                                 target_response_id: response_id.clone(),
                                 server_steer_id: None,
+                                waiting_for_required_input: false,
                             });
                             if let (Some(response_id), Some(request)) =
                                 (response_id, pending_steers.last().cloned())
@@ -667,6 +729,7 @@ fn websocket_response_stream(
                                                 force_full,
                                                 next_prompt_unit_start,
                                                 cached_successor,
+                                                server_owned_steers,
                                                 binding,
                                                 steer_receiver,
                                                 cached_first,
@@ -691,6 +754,7 @@ fn websocket_response_stream(
                                             force_full,
                                             next_prompt_unit_start,
                                             cached_successor,
+                                            server_owned_steers,
                                             binding,
                                             steer_receiver,
                                             cached_first,
@@ -723,6 +787,7 @@ fn websocket_response_stream(
                                     force_full,
                                     next_prompt_unit_start,
                                     cached_successor,
+                                    server_owned_steers,
                                     binding,
                                     steer_receiver,
                                     cached_first,
@@ -742,17 +807,53 @@ fn websocket_response_stream(
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
                     if event_type == "response.created" {
-                        if let Some(handle) = &steer_handle {
-                            handle.response_created();
-                        }
                         current_response_id = value
                             .as_ref()
                             .and_then(|v| v.get("response"))
                             .and_then(|v| v.get("id"))
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned);
+                        if pending_steers
+                            .first()
+                            .is_some_and(|pending| pending.server_steer_id.is_some())
+                        {
+                            let commit = pending_steers.remove(0).submission;
+                            if let Some(handle) = &steer_handle {
+                                handle.steer_committed();
+                            }
+                            let synthetic = serde_json::json!({
+                                "type": "response.steer.commit",
+                                "steer_submission_id": commit.id,
+                                "input": commit.content,
+                            })
+                            .to_string()
+                            .into_bytes();
+                            return Some((
+                                Ok(synthetic),
+                                (
+                                    session_handle,
+                                    previous_response_id,
+                                    force_full,
+                                    next_prompt_unit_start,
+                                    cached_successor,
+                                    server_owned_steers,
+                                    binding,
+                                    steer_receiver,
+                                    Some(raw),
+                                    current_response_id,
+                                    pending_steers,
+                                    false,
+                                    false,
+                                    secret,
+                                ),
+                            ));
+                        }
+                        if let Some(handle) = &steer_handle {
+                            handle.response_created();
+                        }
                         if let (Some(response_id), Some(request)) =
                             (current_response_id.as_deref(), pending_steers.last_mut())
+                            && request.server_steer_id.is_none()
                         {
                             if request.target_response_id.is_none() {
                                 request.target_response_id = Some(response_id.to_owned());
@@ -771,6 +872,7 @@ fn websocket_response_stream(
                                             force_full,
                                             next_prompt_unit_start,
                                             cached_successor,
+                                            server_owned_steers,
                                             binding,
                                             steer_receiver,
                                             cached_first,
@@ -793,6 +895,7 @@ fn websocket_response_stream(
                                         force_full,
                                         next_prompt_unit_start,
                                         cached_successor,
+                                        server_owned_steers,
                                         binding,
                                         steer_receiver,
                                         cached_first,
@@ -810,13 +913,18 @@ fn websocket_response_stream(
                         event_type,
                         "response.steer.accepted" | "response.steer.pending"
                     ) {
-                        let accepted = value.as_ref().ok_or_else(|| {
+                        let acknowledgement = value.as_ref().ok_or_else(|| {
                             ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
-                                .with_code("steer_accepted_malformed")
+                                .with_code("steer_acknowledgement_malformed")
                         });
-                        if let Err(error) = accepted
-                            .and_then(|value| bind_accepted_steer(&mut pending_steers, value))
-                        {
+                        let bind = acknowledgement.and_then(|value| {
+                            if event_type == "response.steer.pending" {
+                                bind_pending_steer(&mut pending_steers, value)
+                            } else {
+                                bind_accepted_steer(&mut pending_steers, value)
+                            }
+                        });
+                        if let Err(error) = bind {
                             *guard = None;
                             return Some((
                                 Err(error),
@@ -826,6 +934,7 @@ fn websocket_response_stream(
                                     force_full,
                                     next_prompt_unit_start,
                                     cached_successor,
+                                    server_owned_steers,
                                     binding,
                                     steer_receiver,
                                     cached_first,
@@ -868,6 +977,7 @@ fn websocket_response_stream(
                                         force_full,
                                         next_prompt_unit_start,
                                         cached_successor,
+                                        server_owned_steers,
                                         binding,
                                         steer_receiver,
                                         cached_first,
@@ -884,6 +994,7 @@ fn websocket_response_stream(
                             submission: request.submission,
                             target_response_id: current_response_id.clone(),
                             server_steer_id: None,
+                            waiting_for_required_input: false,
                         };
                         if is_failed_terminal {
                             let submission = request.submission.clone();
@@ -912,6 +1023,7 @@ fn websocket_response_stream(
                                     force_full,
                                     next_prompt_unit_start,
                                     cached_successor,
+                                    server_owned_steers,
                                     binding,
                                     steer_receiver,
                                     cached_first,
@@ -941,6 +1053,7 @@ fn websocket_response_stream(
                                     force_full,
                                     next_prompt_unit_start,
                                     cached_successor,
+                                    server_owned_steers,
                                     binding,
                                     steer_receiver,
                                     cached_first,
@@ -966,6 +1079,7 @@ fn websocket_response_stream(
                                             force_full,
                                             next_prompt_unit_start,
                                             cached_successor,
+                                            server_owned_steers,
                                             binding,
                                             steer_receiver,
                                             cached_first,
@@ -988,6 +1102,7 @@ fn websocket_response_stream(
                                     force_full,
                                     next_prompt_unit_start,
                                     cached_successor,
+                                    server_owned_steers,
                                     binding,
                                     steer_receiver,
                                     cached_first,
@@ -1014,6 +1129,56 @@ fn websocket_response_stream(
                         *previous_response_id.lock().await = terminal_response_id.clone();
                         *force_full.lock().await = terminal_response_id.is_none();
                         *next_prompt_unit_start.lock().await = None;
+                    }
+                    if successful_terminal
+                        && pending_steers
+                            .iter()
+                            .any(|pending| pending.waiting_for_required_input)
+                    {
+                        if let Err(error) =
+                            park_server_owned_steers(&server_owned_steers, &mut pending_steers)
+                        {
+                            *guard = None;
+                            return Some((
+                                Err(error),
+                                (
+                                    session_handle,
+                                    previous_response_id,
+                                    force_full,
+                                    next_prompt_unit_start,
+                                    cached_successor,
+                                    server_owned_steers,
+                                    binding,
+                                    steer_receiver,
+                                    cached_first,
+                                    current_response_id,
+                                    pending_steers,
+                                    steer_accepted,
+                                    true,
+                                    secret,
+                                ),
+                            ));
+                        }
+                        terminal_for_stream.store(true, Ordering::Release);
+                        return Some((
+                            Ok(raw),
+                            (
+                                session_handle,
+                                previous_response_id,
+                                force_full,
+                                next_prompt_unit_start,
+                                cached_successor,
+                                server_owned_steers,
+                                binding,
+                                steer_receiver,
+                                cached_first,
+                                current_response_id,
+                                pending_steers,
+                                true,
+                                true,
+                                secret,
+                            ),
+                        ));
                     }
                     if event_type == "error"
                         && value
@@ -1057,6 +1222,7 @@ fn websocket_response_stream(
                                         submission: request.submission,
                                         target_response_id: response_id.clone(),
                                         server_steer_id: None,
+                                        waiting_for_required_input: false,
                                     });
                                     if let (Some(response_id), Some(request)) =
                                         (response_id, pending_steers.last().cloned())
@@ -1076,6 +1242,7 @@ fn websocket_response_stream(
                                                         force_full,
                                                         next_prompt_unit_start,
                                                         cached_successor,
+                                                        server_owned_steers,
                                                         binding,
                                                         steer_receiver,
                                                         cached_first,
@@ -1100,6 +1267,7 @@ fn websocket_response_stream(
                                                     force_full,
                                                     next_prompt_unit_start,
                                                     cached_successor,
+                                                    server_owned_steers,
                                                     binding,
                                                     steer_receiver,
                                                     cached_first,
@@ -1127,6 +1295,7 @@ fn websocket_response_stream(
                                             force_full,
                                             next_prompt_unit_start,
                                             cached_successor,
+                                            server_owned_steers,
                                             binding,
                                             steer_receiver,
                                             cached_first,
@@ -1150,16 +1319,21 @@ fn websocket_response_stream(
                                 successor_type,
                                 "response.steer.accepted" | "response.steer.pending"
                             ) {
-                                let accepted = successor_value.as_ref().ok_or_else(|| {
+                                let acknowledgement = successor_value.as_ref().ok_or_else(|| {
                                     ModelFailure::new(
                                         FailurePhase::Decode,
                                         FailureKind::MalformedResponse,
                                     )
-                                    .with_code("steer_accepted_malformed")
+                                    .with_code("steer_acknowledgement_malformed")
                                 });
-                                if let Err(error) = accepted.and_then(|value| {
-                                    bind_accepted_steer(&mut pending_steers, value)
-                                }) {
+                                let bind = acknowledgement.and_then(|value| {
+                                    if successor_type == "response.steer.pending" {
+                                        bind_pending_steer(&mut pending_steers, value)
+                                    } else {
+                                        bind_accepted_steer(&mut pending_steers, value)
+                                    }
+                                });
+                                if let Err(error) = bind {
                                     *guard = None;
                                     return Some((
                                         Err(error),
@@ -1169,6 +1343,7 @@ fn websocket_response_stream(
                                             force_full,
                                             next_prompt_unit_start,
                                             cached_successor,
+                                            server_owned_steers,
                                             binding,
                                             steer_receiver,
                                             cached_first,
@@ -1181,6 +1356,56 @@ fn websocket_response_stream(
                                     ));
                                 }
                                 steer_accepted = true;
+                                if pending_steers
+                                    .iter()
+                                    .any(|pending| pending.waiting_for_required_input)
+                                {
+                                    if let Err(error) = park_server_owned_steers(
+                                        &server_owned_steers,
+                                        &mut pending_steers,
+                                    ) {
+                                        *guard = None;
+                                        return Some((
+                                            Err(error),
+                                            (
+                                                session_handle,
+                                                previous_response_id,
+                                                force_full,
+                                                next_prompt_unit_start,
+                                                cached_successor,
+                                                server_owned_steers,
+                                                binding,
+                                                steer_receiver,
+                                                cached_first,
+                                                current_response_id,
+                                                pending_steers,
+                                                steer_accepted,
+                                                true,
+                                                secret,
+                                            ),
+                                        ));
+                                    }
+                                    terminal_for_stream.store(true, Ordering::Release);
+                                    return Some((
+                                        Ok(original_terminal),
+                                        (
+                                            session_handle,
+                                            previous_response_id,
+                                            force_full,
+                                            next_prompt_unit_start,
+                                            cached_successor,
+                                            server_owned_steers,
+                                            binding,
+                                            steer_receiver,
+                                            cached_first,
+                                            current_response_id,
+                                            pending_steers,
+                                            true,
+                                            true,
+                                            secret,
+                                        ),
+                                    ));
+                                }
                                 continue;
                             }
                             if successor_type == "response.steer.failed" {
@@ -1210,6 +1435,7 @@ fn websocket_response_stream(
                                                 force_full,
                                                 next_prompt_unit_start,
                                                 cached_successor,
+                                                server_owned_steers,
                                                 binding,
                                                 steer_receiver,
                                                 cached_first,
@@ -1247,6 +1473,7 @@ fn websocket_response_stream(
                                         force_full,
                                         next_prompt_unit_start,
                                         cached_successor,
+                                        server_owned_steers,
                                         binding,
                                         steer_receiver,
                                         cached_first,
@@ -1279,6 +1506,7 @@ fn websocket_response_stream(
                                         force_full,
                                         next_prompt_unit_start,
                                         cached_successor,
+                                        server_owned_steers,
                                         binding,
                                         steer_receiver,
                                         cached_first,
@@ -1309,6 +1537,7 @@ fn websocket_response_stream(
                                                 force_full,
                                                 next_prompt_unit_start,
                                                 cached_successor,
+                                                server_owned_steers,
                                                 binding,
                                                 steer_receiver,
                                                 cached_first,
@@ -1340,6 +1569,7 @@ fn websocket_response_stream(
                                         force_full,
                                         next_prompt_unit_start,
                                         cached_successor,
+                                        server_owned_steers,
                                         binding,
                                         steer_receiver,
                                         Some(original_terminal),
@@ -1382,6 +1612,7 @@ fn websocket_response_stream(
                                         force_full,
                                         next_prompt_unit_start,
                                         cached_successor,
+                                        server_owned_steers,
                                         binding,
                                         steer_receiver,
                                         cached_first,
@@ -1420,6 +1651,7 @@ fn websocket_response_stream(
                                 force_full,
                                 next_prompt_unit_start,
                                 cached_successor,
+                                server_owned_steers,
                                 binding,
                                 steer_receiver,
                                 cached_first,
@@ -1450,6 +1682,7 @@ fn websocket_response_stream(
                                 force_full,
                                 next_prompt_unit_start,
                                 cached_successor,
+                                server_owned_steers,
                                 binding,
                                 steer_receiver,
                                 cached_first,
@@ -1474,6 +1707,7 @@ fn websocket_response_stream(
                         force_full,
                         next_prompt_unit_start,
                         cached_successor,
+                        server_owned_steers,
                         binding,
                         steer_receiver,
                         cached_first,
@@ -3332,6 +3566,172 @@ reasoning = true
     }
 
     #[tokio::test]
+    async fn websocket_required_input_pending_resumes_and_commits_without_resending() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let Message::Text(first_create) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected initial response.create");
+            };
+            let first_create: serde_json::Value = serde_json::from_str(&first_create).unwrap();
+            assert_eq!(first_create["type"], "response.create");
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.created","response":{"id":"resp-1","status":"in_progress"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(steer) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected response.steer");
+            };
+            let steer: serde_json::Value = serde_json::from_str(&steer).unwrap();
+            assert_eq!(steer["type"], "response.steer");
+            assert_eq!(steer["previous_response_id"], "resp-1");
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.steer.accepted","steer":{"id":"steer-1","previous_response_id":"resp-1"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"search"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"search","arguments":"{}"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp-1","status":"completed"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.steer.pending","reason":"waiting_for_required_input","required_input":[{"type":"function_call_output","call_id":"call-1"}],"steer":{"id":"steer-1","previous_response_id":"resp-1"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+
+            let Message::Text(continuation) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected explicit response.create continuation");
+            };
+            let continuation: serde_json::Value = serde_json::from_str(&continuation).unwrap();
+            assert_eq!(continuation["type"], "response.create");
+            assert_eq!(continuation["previous_response_id"], "resp-1");
+            assert!(continuation["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "call-1"
+                })
+            }));
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.created","response":{"id":"resp-2","status":"in_progress"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp-2","status":"completed"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let route = route_for_local_server(address);
+        let request = local_responses_request(&route);
+        let continuation_request = route
+            .binding
+            .prepare_request(&ModelRequestInput::new(
+                "model",
+                vec![
+                    ModelMessage {
+                        role: super::super::MessageRole::Assistant,
+                        content: vec![ContentPart::ToolCall {
+                            id: "call-1".into(),
+                            name: "search".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    ModelMessage {
+                        role: super::super::MessageRole::Tool,
+                        content: vec![ContentPart::ToolResult {
+                            id: "call-1".into(),
+                            content: vec![ContentPart::Text("result".into())],
+                        }],
+                    },
+                ],
+            ))
+            .unwrap();
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = ResponseSteerHandle::new(true);
+        let transport = Arc::new(TurnLocalResponsesTransport::new());
+        transport.set_steer_receiver(steer_rx).await;
+        transport.set_steer_handle(handle.clone());
+        let runtime = ModelRuntime::new_responses_websocket(transport);
+        let steer_task = tokio::spawn({
+            let handle = handle.clone();
+            let steer_tx = steer_tx.clone();
+            async move {
+                handle.wait_available().await;
+                assert_eq!(handle.try_claim(), ResponseSteerDecision::Accepted);
+                steer_tx
+                    .send(ResponseSteerRequest {
+                        submission: UserMessageSubmission::new(
+                            "pending-steer",
+                            crate::user_content::UserMessageContent::from("continue after tools"),
+                        ),
+                    })
+                    .unwrap();
+            }
+        });
+
+        let mut first_observer = RecordingObserver::default();
+        let first = runtime
+            .execute_prepared_attempt(&route, request.clone(), &mut first_observer)
+            .await
+            .expect("required-input pending must release the tool batch");
+        steer_task.await.unwrap();
+        assert_eq!(first.terminal, TerminalStatus::ToolUse);
+        assert_eq!(first.snapshot.completed_tools.len(), 1);
+        assert_eq!(first.snapshot.completed_tools[0].id, "call-1");
+        assert!(
+            !first_observer
+                .events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::SteerCommit { .. }))
+        );
+        assert!(handle.pending());
+
+        let mut continuation_observer = RecordingObserver::default();
+        let continuation = runtime
+            .execute_prepared_attempt(&route, continuation_request, &mut continuation_observer)
+            .await
+            .expect("explicit continuation must receive the queued steer");
+        assert_eq!(continuation.terminal, TerminalStatus::Completed);
+        let commit = continuation_observer
+            .events
+            .iter()
+            .position(|event| matches!(event, ModelEvent::SteerCommit { .. }))
+            .expect("successor creation commits server-owned steer");
+        let metadata = continuation_observer
+            .events
+            .iter()
+            .position(|event| matches!(event, ModelEvent::ResponseMetadata { .. }))
+            .expect("successor response.created is preserved");
+        assert!(commit < metadata);
+        assert!(!handle.pending());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn websocket_disconnect_after_steer_is_unknown_and_not_retryable() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3478,7 +3878,7 @@ reasoning = true
     }
 
     #[test]
-    fn accepted_server_id_binds_and_pending_returns_local_submission() {
+    fn accepted_server_id_binds_and_pending_remains_server_owned() {
         let mut pending = vec![
             PendingSteer {
                 submission: UserMessageSubmission::new(
@@ -3487,6 +3887,7 @@ reasoning = true
                 ),
                 target_response_id: Some("resp-1".into()),
                 server_steer_id: None,
+                waiting_for_required_input: false,
             },
             PendingSteer {
                 submission: UserMessageSubmission::new(
@@ -3495,6 +3896,7 @@ reasoning = true
                 ),
                 target_response_id: Some("resp-1".into()),
                 server_steer_id: None,
+                waiting_for_required_input: false,
             },
         ];
         bind_accepted_steer(
@@ -3505,16 +3907,19 @@ reasoning = true
             }),
         )
         .unwrap();
-        let submission = take_pending_steer(
+        bind_pending_steer(
             &mut pending,
             &serde_json::json!({
                 "type": "response.steer.pending",
+                "reason": "waiting_for_required_input",
+                "required_input": [{"type": "function_call_output", "call_id": "call-1"}],
                 "steer": {"id": "server-2", "previous_response_id": "resp-1"}
             }),
         )
         .unwrap();
-        assert_eq!(submission.id, "local-1");
-        assert_eq!(pending[0].submission.id, "local-2");
+        assert_eq!(pending[0].submission.id, "local-1");
+        assert!(pending[0].waiting_for_required_input);
+        assert_eq!(pending[1].submission.id, "local-2");
         let failed_submission = take_pending_steer(
             &mut pending,
             &serde_json::json!({
@@ -3526,7 +3931,7 @@ reasoning = true
             }),
         )
         .unwrap();
-        assert_eq!(failed_submission.id, "local-2");
+        assert_eq!(failed_submission.id, "local-1");
     }
 
     #[tokio::test]

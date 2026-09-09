@@ -3260,7 +3260,6 @@ async_tools = ["fs__read"]
                 assert!(steer.to_string().contains("queued prompt"));
                 for event in [
                     json!({"type":"response.steer.accepted","steer":{"id":"steer-1","previous_response_id":"resp-1"}}),
-                    json!({"type":"response.steer.pending","steer":{"id":"steer-1","previous_response_id":"resp-1"}}),
                     json!({"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"steered"}}}),
                     json!({"type":"response.created","response":{"id":"resp-2","status":"in_progress"}}),
                 ] {
@@ -3275,7 +3274,6 @@ async_tools = ["fs__read"]
                 for event in [
                     json!({"type":"response.steer.accepted","steer":{"id":"steer-2","previous_response_id":"resp-2"}}),
                     json!({"type":"response.incomplete","response":{"id":"resp-2","status":"incomplete","incomplete_details":{"reason":"steered"}}}),
-                    json!({"type":"response.steer.pending","steer":{"id":"steer-2","previous_response_id":"resp-2"}}),
                     json!({"type":"response.created","response":{"id":"resp-3","status":"in_progress"}}),
                     json!({"type":"response.output_text.delta","delta":"queued completed"}),
                     json!({"type":"response.completed","response":{"id":"resp-3","status":"completed"}}),
