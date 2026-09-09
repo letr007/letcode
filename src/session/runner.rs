@@ -346,6 +346,29 @@ where {
         turn_continuation_queue: Arc<Mutex<crate::agent::TurnContinuationQueue>>,
     ) -> Result<String>
 where {
+        self.run_prompt_with_continuations_and_steer(
+            agent,
+            prompt,
+            turn_continuation_queue,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_prompt_with_continuations_and_steer(
+        &self,
+        agent: &mut Agent,
+        prompt: UserMessageSubmission,
+        turn_continuation_queue: Arc<Mutex<crate::agent::TurnContinuationQueue>>,
+        steer_receiver: Option<
+            tokio::sync::mpsc::UnboundedReceiver<
+                crate::model_runtime::runtime::ResponseSteerRequest,
+            >,
+        >,
+        steer_handle: Option<crate::model_runtime::runtime::ResponseSteerHandle>,
+    ) -> Result<String>
+where {
         let continuation_queue = Arc::clone(&turn_continuation_queue);
         let mut continuation_guard = agent.turn_continuation_provider_guard(Arc::new(move || {
             let mut queue = continuation_queue
@@ -353,8 +376,14 @@ where {
                 .map_err(|_| anyhow!("turn continuation queue poisoned"))?;
             Ok(queue.drain_ready())
         }));
-        self.run_prompt_with_options(continuation_guard.agent(), prompt, true)
-            .await
+        self.run_prompt_with_options_and_steer(
+            continuation_guard.agent(),
+            prompt,
+            true,
+            steer_receiver,
+            steer_handle,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -576,11 +605,17 @@ where {
         }
     }
 
-    async fn run_prompt_with_options(
+    async fn run_prompt_with_options_and_steer(
         &self,
         agent: &mut Agent,
         prompt: UserMessageSubmission,
         record_user_prompt: bool,
+        steer_receiver: Option<
+            tokio::sync::mpsc::UnboundedReceiver<
+                crate::model_runtime::runtime::ResponseSteerRequest,
+            >,
+        >,
+        steer_handle: Option<crate::model_runtime::runtime::ResponseSteerHandle>,
     ) -> Result<String>
 where {
         let prompt_content = prompt.content.clone();
@@ -687,7 +722,7 @@ where {
         let tool_batch_state =
             Arc::new(tokio::sync::Mutex::new(ToolBatchReconciliation::default()));
         let response = agent
-            .run_stream_content_with_interactions_async(
+            .run_stream_content_with_interactions_and_steer_async(
                 prompt_content.clone(),
                 move |delta| {
                     let sender = sender.clone();
@@ -927,6 +962,13 @@ where {
                                         SessionTransportEvent::ProcessIssue(issue),
                                     )?;
                                 }
+                                AgentEvent::UserMessage { submission } => send_scoped_event(
+                                    &sender,
+                                    child_session_id.as_deref(),
+                                    agent_name.as_deref(),
+                                    parent_tool_call_id.as_deref(),
+                                    SessionTransportEvent::UserMessage(UserMessageEvent::from_submission(submission)),
+                                )?,
                                 AgentEvent::AssistantMessage { .. }
                                 | AgentEvent::AssistantToolCallBatch { .. }
                                 | AgentEvent::InternalContinuation { .. } => {}
@@ -1229,6 +1271,8 @@ where {
                         }
                     }
                 },
+                steer_receiver,
+                steer_handle,
             )
             .await;
         match response {

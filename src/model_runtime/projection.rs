@@ -154,6 +154,7 @@ pub(crate) fn model_request_from_prompt_plan(
             description: tool.description.clone(),
             parameters: tool.parameters.clone(),
             strict: tool.strict,
+            async_call: route.async_tools.contains(&tool.name),
         })
         .collect();
     request.generation = generation_settings(route, metadata)?;

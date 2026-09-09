@@ -401,6 +401,9 @@ impl ProtocolAppendState {
                         call_id
                     );
                 }
+                ProtocolFrameItem::UserMessage { .. }
+                    if self.historical_incomplete_groups.is_empty()
+                        && self.tail_open_group.is_some() => {}
                 _ if self.has_incomplete_tool_call_groups() => {
                     bail!(
                         "cannot append {:?} while assistant tool call group is incomplete",
@@ -470,6 +473,7 @@ impl ProtocolAppendState {
                     self.completed_groups.push(group);
                 }
             }
+            ProtocolFrameItem::UserMessage { .. } if self.tail_open_group.is_some() => {}
             _ => {
                 if let Some(group) = self.tail_open_group.take() {
                     self.historical_incomplete_groups.push(group);
@@ -658,6 +662,7 @@ pub(crate) fn analyze_history_items(
                     tool_call_groups.push(group.finish_complete());
                 }
             }
+            ProtocolFrameItem::UserMessage { .. } if pending_group.is_some() => {}
             _ => {
                 if let Some(group) = pending_group.take() {
                     tool_call_groups.push(group.finish_incomplete());
@@ -1218,6 +1223,85 @@ mod tests {
             )
             .expect_err("historical incomplete state remains globally blocking");
         assert!(error.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn steered_user_can_interleave_assistant_call_and_tool_output() {
+        let history = vec![
+            HistoryItem::AssistantTurn {
+                text: None,
+                reasoning_content: None,
+                replay: None,
+                calls: vec![tool_call("call-1")],
+            },
+            HistoryItem::user("steer while the async tool is running"),
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: "{}".into(),
+                images: Vec::new(),
+            },
+        ];
+
+        let transcript = validate_history_items_complete(&history, Some(0))
+            .expect("steered user input may precede an outstanding async tool result");
+        assert_eq!(transcript.tool_call_groups.len(), 1);
+        assert_eq!(
+            transcript.tool_call_groups[0].status,
+            ToolCallGroupStatus::Complete
+        );
+        assert_eq!(transcript.tool_call_groups[0].tool_output_indexes, vec![2]);
+
+        let frames = history_items_to_frames(&history)
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut frame)| {
+                frame.runtime_frame_id = Some(RuntimeFrameId::from_persisted(index as u64 + 1));
+                frame
+            })
+            .collect::<Vec<_>>();
+        let incremental = ProtocolAppendState::from_frames(&frames, Some(0))
+            .expect("incremental state preserves the interleaved open tool group");
+        assert!(!incremental.has_incomplete_tool_call_groups());
+        assert_eq!(incremental.tool_call_groups(), transcript.tool_call_groups);
+    }
+
+    #[test]
+    fn incremental_append_accepts_steered_user_before_matching_tool_output() {
+        let assistant = ProtocolFrameItem::AssistantTurn {
+            text: None,
+            reasoning_content: None,
+            replay: None,
+            calls: vec![tool_call("call-1")],
+        };
+        let mut incremental = ProtocolAppendState::empty();
+        incremental
+            .append(0, RuntimeFrameId::from_persisted(1), &assistant, Some(0))
+            .unwrap();
+        incremental
+            .append(
+                1,
+                RuntimeFrameId::from_persisted(2),
+                &ProtocolFrameItem::user("steer"),
+                Some(0),
+            )
+            .expect("user steer may interleave before the tool result");
+        assert_eq!(
+            incremental.incomplete_tool_call_ids(),
+            BTreeSet::from(["call-1".to_owned()])
+        );
+        incremental
+            .append(
+                2,
+                RuntimeFrameId::from_persisted(3),
+                &ProtocolFrameItem::ToolOutput {
+                    call_id: "call-1".into(),
+                    output_json: "{}".into(),
+                    images: Vec::new(),
+                },
+                Some(0),
+            )
+            .expect("matching output closes the interleaved tool group");
+        assert!(!incremental.has_incomplete_tool_call_groups());
     }
 
     #[test]

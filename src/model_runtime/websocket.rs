@@ -9,6 +9,11 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::handshake::derive_accept_k
 
 type Socket = WebSocketStream<reqwest::Upgraded>;
 
+pub(crate) enum WsReadEvent {
+    Text(Vec<u8>),
+    Steer(crate::model_runtime::runtime::ResponseSteerRequest),
+}
+
 /// A turn-local, single-lane WebSocket session. Callers own the session and
 /// must await each send before reading or sending the next frame.
 pub(crate) struct TurnLocalWsSession {
@@ -113,6 +118,41 @@ impl TurnLocalWsSession {
             })?;
         self.last_sent_text_bytes = Some(text_bytes);
         Ok(())
+    }
+
+    pub(crate) async fn next_text_or_control(
+        &mut self,
+        steer_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            crate::model_runtime::runtime::ResponseSteerRequest,
+        >,
+        secrets: &[&str],
+    ) -> Result<WsReadEvent, ModelFailure> {
+        loop {
+            tokio::select! {
+                request = steer_rx.recv() => {
+                    return request.map(WsReadEvent::Steer).ok_or_else(|| {
+                        ModelFailure::new(FailurePhase::Finish, FailureKind::MalformedResponse)
+                            .with_code("steer_receiver_closed")
+                    });
+                }
+                message = self.socket.next() => match message {
+                    Some(Ok(Message::Text(text))) => return Ok(WsReadEvent::Text(text.as_bytes().to_vec())),
+                    Some(Ok(Message::Ping(payload))) => {
+                        self.socket.send(Message::Pong(payload)).await.map_err(|error| {
+                            ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+                                .with_code("websocket_pong_failed")
+                                .with_retry_hint(RetryHint::Retryable)
+                                .with_detail_redacted(error.to_string(), secrets)
+                        })?;
+                    }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    Some(Ok(Message::Close(frame))) => return Err(websocket_close_failure(frame, self.last_sent_text_bytes, secrets)),
+                    None => return Err(websocket_close_failure(None, self.last_sent_text_bytes, secrets)),
+                    Some(Ok(Message::Binary(_))) => return Err(ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse).with_code("websocket_binary_frame")),
+                    Some(Err(error)) => return Err(websocket_io_failure(error, self.last_sent_text_bytes, secrets)),
+                }
+            }
+        }
     }
 
     pub(crate) async fn next_text(&mut self, secrets: &[&str]) -> Result<Vec<u8>, ModelFailure> {

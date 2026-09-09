@@ -58,6 +58,279 @@ where
     result
 }
 
+pub(super) struct PreparedParallelToolCall {
+    call: HistoryToolCall,
+    args: Value,
+    permission_class: crate::permission::ToolPermissionClass,
+    context: ToolExecutionContext,
+    permission_generation: u64,
+}
+
+pub(super) struct ParallelToolCall {
+    call: HistoryToolCall,
+    args: Value,
+    permission_class: crate::permission::ToolPermissionClass,
+    directive: ExecutionDirective,
+    turn_id: u64,
+    task: Option<tokio::task::JoinHandle<ParallelBatchRecord>>,
+}
+
+impl ParallelToolCall {
+    pub(super) fn call_id(&self) -> &str {
+        &self.call.call_id
+    }
+
+    pub(super) fn call(&self) -> &HistoryToolCall {
+        &self.call
+    }
+
+    pub(super) async fn join(mut self) -> Result<ParallelBatchRecord> {
+        let result = self
+            .task
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("parallel tool task already joined"))?
+            .await;
+        // Keep the handle in `self.task` until the await completes. If this join
+        // future is dropped, `Drop for ParallelToolCall` can still abort it.
+        let _ = self.task.take();
+        match result {
+            Ok(record) => Ok(record),
+            Err(error) => {
+                let output = ToolResult::err(
+                    &self.call.name,
+                    format!("parallel tool task failed: {error}"),
+                );
+                Ok(ParallelBatchRecord {
+                    record: ToolExecutionRecord::new(
+                        &self.call,
+                        Some(self.args.clone()),
+                        self.permission_class,
+                        self.directive,
+                        ToolExecutionStatus::Executed,
+                        None,
+                        output,
+                    ),
+                    completion: ToolSpanCompletion::new(langfuse_trace::tool_span(
+                        self.turn_id,
+                        &self.call.name,
+                        &self.call.call_id,
+                        self.call.arguments_json.len(),
+                    )),
+                })
+            }
+        }
+    }
+}
+
+fn prepare_parallel_tool_call(
+    agent: &Agent,
+    call: &HistoryToolCall,
+) -> Result<PreparedParallelToolCall> {
+    let mut call = call.clone();
+    call.name = agent.resolve_tool_alias(&call.name);
+    let args = serde_json::from_str::<Value>(&call.arguments_json)
+        .map_err(|error| anyhow::anyhow!("parallel tool preflight changed: {error}"))?;
+    let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
+    if agent.tools.parallelism(&call.name) != ToolParallelism::Parallel
+        || !is_executable_tool(agent, &call.name)
+        || !agent.tools.scope().allows_tool(&call.name)
+        || restricted_by_directive_with_class(
+            &call.name,
+            &args,
+            permission_class,
+            agent.turn.policy.directive,
+        )
+        .is_some()
+        || external_workspace_access_for_tool(&call.name, &args).is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "parallel tool preflight changed for '{}'",
+            call.name
+        ));
+    }
+    let context = agent.tool_execution_context_for(&call.name, false)?;
+    let state = agent
+        .permission_session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
+    let (mode, permission_generation, decision, grant_allowed) = state.approval_snapshot(
+        crate::tool::permission_resource_for_tool(&call.name, &args).as_ref(),
+        &call.name,
+        &args,
+        permission_class,
+        agent.turn.policy.directive,
+        false,
+        crate::permission::is_internal_tool(&call.name),
+    );
+    let decision = if mode.supports_session_grants() && grant_allowed {
+        PermissionDecision::Allow
+    } else {
+        decision
+    };
+    if decision != PermissionDecision::Allow {
+        return Err(anyhow::anyhow!(
+            "parallel tool '{}' unexpectedly requires approval",
+            call.name
+        ));
+    }
+    Ok(PreparedParallelToolCall {
+        call,
+        args,
+        permission_class,
+        context,
+        permission_generation,
+    })
+}
+
+async fn emit_parallel_tool_call_started<E, Efut>(
+    prepared: &PreparedParallelToolCall,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    on_event(AgentEvent::ToolCallStarted {
+        call_id: prepared.call.call_id.clone(),
+        name: prepared.call.name.clone(),
+        args: prepared.args.clone(),
+    })
+    .await
+}
+
+fn parallel_tool_call_permission_is_current(
+    agent: &Agent,
+    prepared: &PreparedParallelToolCall,
+) -> Result<bool> {
+    let state = agent
+        .permission_session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
+    let (mode, generation, decision, grant_allowed) = state.approval_snapshot(
+        crate::tool::permission_resource_for_tool(&prepared.call.name, &prepared.args).as_ref(),
+        &prepared.call.name,
+        &prepared.args,
+        prepared.permission_class,
+        agent.turn.policy.directive,
+        false,
+        crate::permission::is_internal_tool(&prepared.call.name),
+    );
+    let decision = if mode.supports_session_grants() && grant_allowed {
+        PermissionDecision::Allow
+    } else {
+        decision
+    };
+    Ok(generation == prepared.permission_generation && decision == PermissionDecision::Allow)
+}
+
+fn spawn_prepared_parallel_tool_call(
+    agent: &Agent,
+    prepared: PreparedParallelToolCall,
+) -> ParallelToolCall {
+    let tools = agent.tools.clone();
+    let timeout_secs = agent.tool_timeout_secs;
+    let directive = agent.turn.policy.directive;
+    let turn_id = agent.turn.turn_id;
+    let call = prepared.call.clone();
+    let args = prepared.args.clone();
+    let permission_class = prepared.permission_class;
+    let context = prepared.context;
+    let task_call = call.clone();
+    let task_args = args.clone();
+    let completion = ToolSpanCompletion::new(langfuse_trace::tool_span(
+        turn_id,
+        &call.name,
+        &call.call_id,
+        call.arguments_json.len(),
+    ));
+    let span = completion.span();
+    let task = tokio::spawn(
+        async move {
+            let tool_timeout = non_shell_tool_timeout_secs(timeout_secs, &task_call.name);
+            let output = if let Some(timeout_secs) = tool_timeout {
+                match tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    tools.call_with_context(&task_call.name, task_args.clone(), context),
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    Err(_) => timed_out_tool_result(&task_call.name, timeout_secs),
+                }
+            } else {
+                tools
+                    .call_with_context(&task_call.name, task_args.clone(), context)
+                    .await
+            };
+            let status = if output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("status"))
+                .and_then(Value::as_str)
+                == Some("timed_out")
+            {
+                ToolExecutionStatus::TimedOut
+            } else {
+                ToolExecutionStatus::Executed
+            };
+            ParallelBatchRecord {
+                record: ToolExecutionRecord::new(
+                    &task_call,
+                    Some(task_args),
+                    permission_class,
+                    directive,
+                    status,
+                    None,
+                    output,
+                ),
+                completion,
+            }
+        }
+        .instrument(span),
+    );
+    ParallelToolCall {
+        call,
+        args,
+        permission_class,
+        directive,
+        turn_id,
+        task: Some(task),
+    }
+}
+
+impl Drop for ParallelToolCall {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+pub(super) async fn start_parallel_tool_call<E, Efut>(
+    agent: &Agent,
+    call: &HistoryToolCall,
+    on_event: &mut E,
+) -> Result<Option<ParallelToolCall>>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let prepared = match prepare_parallel_tool_call(agent, call) {
+        Ok(prepared) => prepared,
+        Err(_) => return Ok(None),
+    };
+    emit_parallel_tool_call_started(&prepared, on_event).await?;
+    if !parallel_tool_call_permission_is_current(agent, &prepared)? {
+        on_event(AgentEvent::ToolCallCancelled {
+            call_id: prepared.call.call_id.clone(),
+            name: prepared.call.name.clone(),
+        })
+        .await?;
+        return Ok(None);
+    }
+    Ok(Some(spawn_prepared_parallel_tool_call(agent, prepared)))
+}
+
 pub(super) async fn execute_parallel_tool_call_batch<E, Efut>(
     agent: &mut Agent,
     calls: &[HistoryToolCall],
@@ -67,91 +340,29 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let mut prepared = Vec::with_capacity(calls.len());
-    for call in calls {
-        // Resolve anchored-bootstrap aliases so preflight checks run against
-        // the real tool name (permissions, parallelism, scope).
-        let call = {
-            let mut resolved = call.clone();
-            resolved.name = agent.resolve_tool_alias(&call.name);
-            resolved
-        };
-        let args = serde_json::from_str::<Value>(&call.arguments_json)
-            .map_err(|error| anyhow::anyhow!("parallel tool preflight changed: {error}"))?;
-        let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
-        if agent.tools.parallelism(&call.name) != ToolParallelism::Parallel
-            || !is_executable_tool(agent, &call.name)
-            || !agent.tools.scope().allows_tool(&call.name)
-            || restricted_by_directive_with_class(
-                &call.name,
-                &args,
-                permission_class,
-                agent.turn.policy.directive,
-            )
-            .is_some()
-            || external_workspace_access_for_tool(&call.name, &args).is_some()
-        {
-            return Err(anyhow::anyhow!(
-                "parallel tool preflight changed for '{}'",
-                call.name
-            ));
-        }
-        let context = agent.tool_execution_context_for(&call.name, false)?;
-        prepared.push((call.clone(), args, permission_class, context));
+    let prepared = calls
+        .iter()
+        .map(|call| prepare_parallel_tool_call(agent, call))
+        .collect::<Result<Vec<_>>>()?;
+    let permission_generation = prepared
+        .first()
+        .map(|call| call.permission_generation)
+        .unwrap_or_default();
+    if prepared
+        .iter()
+        .any(|call| call.permission_generation != permission_generation)
+    {
+        return Err(anyhow::anyhow!("parallel permission preflight changed"));
     }
-
-    let permission_generation = {
-        let state = agent
-            .permission_session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
-        let mut permission_generation = None;
-        for (call, args, permission_class, _) in &prepared {
-            let (mode, generation, decision, grant_allowed) = state.approval_snapshot(
-                crate::tool::permission_resource_for_tool(&call.name, args).as_ref(),
-                &call.name,
-                args,
-                *permission_class,
-                agent.turn.policy.directive,
-                false,
-                crate::permission::is_internal_tool(&call.name),
-            );
-            let decision = if mode.supports_session_grants() && grant_allowed {
-                PermissionDecision::Allow
-            } else {
-                decision
-            };
-            if decision != PermissionDecision::Allow {
-                return Err(anyhow::anyhow!(
-                    "parallel tool '{}' unexpectedly requires approval",
-                    call.name
-                ));
-            }
-            match permission_generation {
-                Some(expected) if expected != generation => {
-                    return Err(anyhow::anyhow!("parallel permission preflight changed"));
-                }
-                None => permission_generation = Some(generation),
-                _ => {}
-            }
-        }
-        permission_generation
-    };
 
     // Do not expose any call as started until every call in this batch has
     // completed structural and permission preflight successfully.
-    for (index, (call, args, _, _)) in prepared.iter().enumerate() {
-        if let Err(error) = on_event(AgentEvent::ToolCallStarted {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            args: args.clone(),
-        })
-        .await
-        {
+    for (index, call) in prepared.iter().enumerate() {
+        if let Err(error) = emit_parallel_tool_call_started(call, on_event).await {
             cancel_parallel_calls_best_effort(
                 prepared[..=index]
                     .iter()
-                    .map(|(call, _, _, _)| (call.call_id.clone(), call.name.clone()))
+                    .map(|call| (call.call.call_id.clone(), call.call.name.clone()))
                     .collect(),
                 on_event,
             )
@@ -165,32 +376,31 @@ where
             .permission_session
             .lock()
             .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
-        prepared
-            .iter()
-            .find_map(|(call, args, permission_class, _)| {
-                let (mode, generation, decision, grant_allowed) = state.approval_snapshot(
-                    crate::tool::permission_resource_for_tool(&call.name, args).as_ref(),
-                    &call.name,
-                    args,
-                    *permission_class,
-                    agent.turn.policy.directive,
-                    false,
-                    crate::permission::is_internal_tool(&call.name),
-                );
-                let decision = if mode.supports_session_grants() && grant_allowed {
-                    PermissionDecision::Allow
-                } else {
-                    decision
-                };
-                (Some(generation) != permission_generation || decision != PermissionDecision::Allow)
-                    .then(|| call.name.clone())
-            })
+        prepared.iter().find_map(|call| {
+            let (mode, generation, decision, grant_allowed) = state.approval_snapshot(
+                crate::tool::permission_resource_for_tool(&call.call.name, &call.args).as_ref(),
+                &call.call.name,
+                &call.args,
+                call.permission_class,
+                agent.turn.policy.directive,
+                false,
+                crate::permission::is_internal_tool(&call.call.name),
+            );
+            let decision = if mode.supports_session_grants() && grant_allowed {
+                PermissionDecision::Allow
+            } else {
+                decision
+            };
+            (Some(generation) != Some(permission_generation)
+                || decision != PermissionDecision::Allow)
+                .then(|| call.call.name.clone())
+        })
     };
     if let Some(call_name) = changed_permission_call {
         cancel_parallel_calls_best_effort(
             prepared
                 .iter()
-                .map(|(call, _, _, _)| (call.call_id.clone(), call.name.clone()))
+                .map(|call| (call.call.call_id.clone(), call.call.name.clone()))
                 .collect(),
             on_event,
         )
@@ -200,69 +410,14 @@ where
         ));
     }
 
-    let tools = agent.tools.clone();
-    let timeout_secs = agent.tool_timeout_secs;
-    let directive = agent.turn.policy.directive;
-    let turn_id = agent.turn.turn_id;
-    let records = join_all(
-        prepared
-            .into_iter()
-            .map(|(call, args, permission_class, context)| {
-                let tools = tools.clone();
-                let completion = ToolSpanCompletion::new(langfuse_trace::tool_span(
-                    turn_id,
-                    &call.name,
-                    &call.call_id,
-                    call.arguments_json.len(),
-                ));
-                let span = completion.span();
-                async move {
-                    let tool_timeout = non_shell_tool_timeout_secs(timeout_secs, &call.name);
-                    let output = if let Some(timeout_secs) = tool_timeout {
-                        match tokio::time::timeout(
-                            Duration::from_secs(timeout_secs),
-                            tools.call_with_context(&call.name, args.clone(), context),
-                        )
-                        .await
-                        {
-                            Ok(output) => output,
-                            Err(_) => timed_out_tool_result(&call.name, timeout_secs),
-                        }
-                    } else {
-                        tools
-                            .call_with_context(&call.name, args.clone(), context)
-                            .await
-                    };
-                    let status = if output
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("status"))
-                        .and_then(Value::as_str)
-                        == Some("timed_out")
-                    {
-                        ToolExecutionStatus::TimedOut
-                    } else {
-                        ToolExecutionStatus::Executed
-                    };
-                    ParallelBatchRecord {
-                        record: ToolExecutionRecord::new(
-                            &call,
-                            Some(args),
-                            permission_class,
-                            directive,
-                            status,
-                            None,
-                            output,
-                        ),
-                        completion,
-                    }
-                }
-                .instrument(span)
-            }),
-    )
-    .await;
-
-    Ok(records)
+    let tasks = prepared
+        .into_iter()
+        .map(|prepared| spawn_prepared_parallel_tool_call(agent, prepared))
+        .collect::<Vec<_>>();
+    join_all(tasks.into_iter().map(ParallelToolCall::join))
+        .await
+        .into_iter()
+        .collect()
 }
 
 pub(super) async fn cancel_parallel_calls_best_effort<E, Efut>(
@@ -1231,6 +1386,77 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::Notify;
+
+    fn test_parallel_batch_record(call: &HistoryToolCall) -> ParallelBatchRecord {
+        ParallelBatchRecord {
+            record: ToolExecutionRecord {
+                call_id: call.call_id.clone(),
+                tool_name: call.name.clone(),
+                arguments: Some(serde_json::json!({})),
+                permission_class: crate::permission::ToolPermissionClass::Read,
+                directive: ExecutionDirective::None,
+                status: ToolExecutionStatus::Executed,
+                rejection: None,
+                output: ToolResult::ok(&call.name, serde_json::json!({})),
+                effects: ToolEffects {
+                    kind: ToolEffectKind::Read,
+                    primary_path: None,
+                    edited_paths: Vec::new(),
+                    command: None,
+                },
+            },
+            completion: ToolSpanCompletion::new(tracing::Span::none()),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_parallel_join_future_aborts_the_tool_task() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let call = HistoryToolCall {
+            call_id: "call-1".into(),
+            name: "test-tool".into(),
+            arguments_json: "{}".into(),
+        };
+        let task_started = Arc::clone(&started);
+        let task_release = Arc::clone(&release);
+        let task_completed = Arc::clone(&completed);
+        let task_call = call.clone();
+        let task = tokio::spawn(async move {
+            task_started.notify_one();
+            task_release.notified().await;
+            task_completed.store(true, Ordering::Release);
+            test_parallel_batch_record(&task_call)
+        });
+        let parallel = ParallelToolCall {
+            call,
+            args: serde_json::json!({}),
+            permission_class: crate::permission::ToolPermissionClass::Read,
+            directive: ExecutionDirective::None,
+            turn_id: 0,
+            task: Some(task),
+        };
+        started.notified().await;
+
+        let mut join = Box::pin(parallel.join());
+        let pending = std::future::poll_fn(|cx| match join.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => panic!("tool task unexpectedly completed"),
+        });
+        pending.await;
+        drop(join);
+        release.notify_one();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!completed.load(Ordering::Acquire));
+    }
 
     #[test]
     fn question_is_exempt_from_global_tool_timeout() {

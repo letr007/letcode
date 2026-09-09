@@ -1021,6 +1021,45 @@ impl ToolHandler for ParallelCountingReadTool {
     }
 }
 
+struct DelayedParallelReadTool {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ToolHandler for DelayedParallelReadTool {
+    fn name(&self) -> &str {
+        "test__delayed_parallel"
+    }
+
+    fn description(&self) -> &str {
+        "delayed parallel read test tool"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> crate::permission::ToolPermissionClass {
+        crate::permission::ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(json!({"started": true}))
+    }
+}
+
 struct ExclusiveReadTool {
     name: &'static str,
     active: Arc<AtomicUsize>,
@@ -1061,6 +1100,90 @@ impl ToolHandler for ExclusiveReadTool {
         self.active.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({"name": self.name}))
     }
+}
+
+#[tokio::test]
+async fn async_parallel_tool_is_spawned_before_join_and_waits_for_release() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: true,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    agent.register_tool(DelayedParallelReadTool {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+    let call = test_tool_call("test__delayed_parallel", "{}");
+    let mut events = Vec::new();
+    let task = super::tool_execution::start_parallel_tool_call(&agent, &call, &mut |event| {
+        events.push(event);
+        std::future::ready(Ok(()))
+    })
+    .await
+    .expect("parallel preflight should succeed")
+    .expect("parallel task should be spawned");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("spawned tool should start before the join");
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::ToolCallStarted { .. }]
+    ));
+
+    release.notify_one();
+    let record = task
+        .join()
+        .await
+        .expect("parallel task should return a record");
+    assert!(record.record.output.ok);
+}
+
+#[tokio::test]
+async fn single_parallel_tool_permission_change_after_started_does_not_execute() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: true,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    agent.register_tool(ParallelCountingReadTool {
+        name: "test__permission_race",
+        active: Arc::clone(&active),
+        max_active: Arc::clone(&max_active),
+    });
+    let permission_session = Arc::clone(&agent.permission_session);
+    let mut events = Vec::new();
+    let call = test_tool_call("test__permission_race", "{}");
+    let task = super::tool_execution::start_parallel_tool_call(&agent, &call, &mut |event| {
+        events.push(event);
+        if matches!(events.last(), Some(AgentEvent::ToolCallStarted { .. })) {
+            permission_session
+                .lock()
+                .expect("permission lock")
+                .clear_grants();
+        }
+        std::future::ready(Ok(()))
+    })
+    .await
+    .expect("permission race should be observable");
+
+    assert!(task.is_none());
+    assert_eq!(max_active.load(Ordering::SeqCst), 0);
+    assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::ToolCallCancelled { call_id, .. } if call_id == &call.call_id)
+    }));
 }
 
 #[tokio::test]
@@ -1111,6 +1234,51 @@ async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
         outputs,
         vec!["call-test__parallel_one", "call-test__parallel_two"]
     );
+}
+
+#[tokio::test]
+async fn partial_assistant_call_is_persisted_before_reconciled_tool_output() {
+    let mut agent = test_agent();
+    let call = test_tool_call("test__partial", "{}");
+    agent
+        .append_assistant_tool_calls("partial", std::slice::from_ref(&call))
+        .expect("partial assistant call should persist");
+    let record = test_execution_record(
+        &call.name,
+        ToolResult {
+            ok: true,
+            tool: call.name.clone(),
+            data: Some(json!({"reconciled": true})),
+            images: Vec::new(),
+            error: None,
+        },
+    );
+    agent
+        .record_tool_call_result(&call, record, &mut |_| async { Ok(()) })
+        .await
+        .expect("tool output should reconcile");
+
+    let history = agent.history_for_test();
+    let assistant_index = history
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                HistoryItem::AssistantTurn { calls, .. }
+                    if calls.iter().any(|item| item.call_id == call.call_id)
+            )
+        })
+        .expect("assistant call should be present");
+    let output_index = history
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
+            )
+        })
+        .expect("tool output should be present");
+    assert!(assistant_index < output_index);
 }
 
 #[tokio::test]
@@ -4739,6 +4907,86 @@ fn config_agents_file_loads_before_workspace_instructions_without_duplicates() {
     assert!(instructions[1].text.ends_with("workspace instructions"));
 
     fs::remove_dir_all(root).expect("test directory should be removed");
+}
+
+#[test]
+fn astra_strategy_injects_one_turn_scoped_harness_without_mutating_base_prelude() {
+    let catalog = crate::model_runtime::RuntimeConfig::from_toml(
+        r#"active_provider = "openai"
+[providers.openai]
+default_model = "gpt-6-astra"
+[providers.openai.auth]
+type = "none"
+[providers.openai.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.openai.models.gpt-6-astra]
+"#,
+    )
+    .unwrap()
+    .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+    .unwrap();
+    let route = ModelRoute::new("openai", "gpt-6-astra");
+    let resolved = Arc::new(catalog.route("openai", "gpt-6-astra").unwrap().clone());
+    let mut agent = test_agent();
+    let base_prelude_len = agent.prelude.len();
+    agent.set_resolved_runtime_catalog(Some(catalog));
+    agent.set_model_route_authority(route, Arc::clone(&resolved));
+
+    let first_prelude = agent.prepare_turn_prelude("Inspect the repository.");
+    let second_prelude = agent.prepare_turn_prelude("Now implement the change.");
+    for prelude in [&first_prelude, &second_prelude] {
+        let harness = prelude
+            .iter()
+            .filter(|message| message.text.contains("GPT-6 Astra 工作指引"))
+            .collect::<Vec<_>>();
+        assert_eq!(harness.len(), 1);
+        assert_eq!(harness[0].role, crate::request_builder::PromptRole::System);
+    }
+    assert_eq!(agent.prelude.len(), base_prelude_len);
+    assert!(
+        agent
+            .prelude
+            .iter()
+            .all(|message| !message.text.contains("GPT-6 Astra 工作指引"))
+    );
+
+    let history = [HistoryItem::user("Inspect the repository.")];
+    let mut metadata = agent.active_model_metadata();
+    metadata.parallel_tool_calls = false;
+    let build = build_test_request(TestRequestBuilderInput {
+        model_id: &resolved.model_override,
+        model: metadata.clone(),
+        prelude: &first_prelude,
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+    })
+    .unwrap();
+    let input = crate::model_runtime::projection::model_request_from_prompt_plan(
+        &resolved,
+        &metadata,
+        &build.prompt_plan,
+        &[],
+    )
+    .unwrap();
+    let request = resolved.binding.prepare_request(&input).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    let instructions = body["instructions"].as_str().unwrap();
+    assert_eq!(instructions.matches("GPT-6 Astra 工作指引").count(), 1);
+    assert!(!body["input"].to_string().contains("GPT-6 Astra 工作指引"));
+
+    let (_, helper_input) = super::protocol_stream::prepare_resolved_oneshot_request(
+        &resolved,
+        metadata,
+        &[PromptMessage::system("helper instructions")],
+        &crate::user_content::UserMessageContent::from("summarize"),
+    )
+    .unwrap();
+    let helper_request = resolved.binding.prepare_request(&helper_input).unwrap();
+    let helper_body: serde_json::Value = serde_json::from_slice(&helper_request.body).unwrap();
+    assert!(!helper_body.to_string().contains("GPT-6 Astra 工作指引"));
+    assert!(helper_body.get("reasoning").is_none());
 }
 
 #[test]

@@ -1847,6 +1847,9 @@ impl Agent {
         {
             metadata.reasoning_effort = Some(effort.clone());
         }
+        if let Some(route) = self.resolved_model_route() {
+            route.strategy.normalize_request_metadata(&mut metadata);
+        }
         metadata.fast_mode = self.fast_mode_enabled();
         metadata
     }
@@ -2890,6 +2893,17 @@ impl Agent {
                         .incomplete_tool_call_ids()
                         .contains(call_id)
             )
+            && !matches!(
+                &next_item,
+                crate::protocol_frames::ProtocolFrameItem::UserMessage { .. }
+                    if !self
+                        .protocol_append_state
+                        .has_historical_incomplete_tool_call_groups()
+                        && !self
+                            .protocol_append_state
+                            .incomplete_tool_call_ids()
+                            .is_empty()
+            )
         {
             bail!(
                 "cannot append {:?} while assistant tool call group is incomplete",
@@ -3256,6 +3270,51 @@ impl Agent {
         Afut: Future<Output = Result<PermissionApproval>> + Send,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
     {
+        self.run_stream_content_with_interactions_and_steer_async(
+            user_content,
+            on_delta,
+            on_event,
+            approve,
+            ask_question,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_stream_content_with_interactions_and_steer_async<
+        F,
+        E,
+        A,
+        Q,
+        Dfut,
+        Efut,
+        Afut,
+        Qfut,
+    >(
+        &mut self,
+        user_content: UserMessageContent,
+        on_delta: F,
+        on_event: E,
+        approve: A,
+        ask_question: Q,
+        steer_receiver: Option<
+            tokio::sync::mpsc::UnboundedReceiver<
+                crate::model_runtime::runtime::ResponseSteerRequest,
+            >,
+        >,
+        steer_handle: Option<crate::model_runtime::runtime::ResponseSteerHandle>,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Dfut + Send,
+        E: FnMut(AgentEvent) -> Efut + Send,
+        A: FnMut(PermissionRequest) -> Afut + Send,
+        Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
+        Dfut: Future<Output = Result<()>> + Send,
+        Efut: Future<Output = Result<()>> + Send,
+        Afut: Future<Output = Result<PermissionApproval>> + Send,
+        Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
+    {
         let mut question_handler_guard =
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
 
@@ -3273,6 +3332,8 @@ impl Agent {
                 on_delta,
                 on_event,
                 approve,
+                steer_receiver,
+                steer_handle,
             )
             .await;
         }
@@ -3874,17 +3935,20 @@ impl Agent {
         {
             let phase = anchored.phase(&self.active_history_items());
             self.anchored_request_phase = Some(phase);
-            return Ok(anchored.prelude(
+            let mut turn_prelude = anchored.prelude(
                 &phase,
                 &self.prelude,
                 Some(runtime_context_message()),
                 self.skill_prelude_message(),
                 turn.developer_context_message(),
                 &manual_skill_material,
-            ));
+            );
+            self.append_model_strategy_prelude(&mut turn_prelude);
+            return Ok(turn_prelude);
         }
 
         let mut turn_prelude = self.prelude.clone();
+        self.append_model_strategy_prelude(&mut turn_prelude);
         turn_prelude.push(runtime_context_message());
         if let Some(message) = self.skill_prelude_message() {
             turn_prelude.push(message);
@@ -3894,6 +3958,15 @@ impl Agent {
             turn_prelude.push(message);
         }
         Ok(turn_prelude)
+    }
+
+    fn append_model_strategy_prelude(&self, prelude: &mut Vec<PromptMessage>) {
+        if let Some(message) = self
+            .resolved_model_route()
+            .and_then(|route| route.strategy.interactive_prelude_message())
+        {
+            prelude.push(message);
+        }
     }
 
     fn manual_skill_material_messages(

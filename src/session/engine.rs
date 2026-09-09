@@ -2524,7 +2524,16 @@ async fn run_engine_loop(
                         Some(control_tx.clone()),
                         Some(session_transport_tx.clone()),
                     );
+                let (steer_tx, steer_rx) = mpsc::unbounded_channel();
                 let historian_control = agent.historian_runtime.clone();
+                let steer_handle = agent.resolved_model_route().map(|route| {
+                    crate::model_runtime::runtime::ResponseSteerHandle::new(
+                        route.strategy == crate::model_runtime::strategy::ModelStrategyId::Astra
+                            && route.protocol_id.as_str() == "responses"
+                            && route.websocket
+                            && route.binding.supports_websocket_steer(),
+                    )
+                });
                 let (interrupted, shutdown, interrupt_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
@@ -2535,10 +2544,12 @@ async fn run_engine_loop(
                                 Arc::clone(&turn_continuation_queue),
                             ))
                         } else {
-                            Box::pin(runner.run_prompt_with_continuations(
+                            Box::pin(runner.run_prompt_with_continuations_and_steer(
                                 &mut agent,
                                 prompt,
                                 Arc::clone(&turn_continuation_queue),
+                                Some(steer_rx),
+                                steer_handle.clone(),
                             ))
                         };
                     tokio::pin!(run);
@@ -2611,6 +2622,47 @@ async fn run_engine_loop(
                             }
                             ActiveSessionOperation::Command(command) => match command {
                                 Some(SessionEngineCommand::Prompt(prompt)) => {
+                                    let steer_decision = if prompt.content.selected_skills.is_empty() {
+                                        steer_handle.as_ref().map(|handle| handle.try_claim())
+                                    } else {
+                                        None
+                                    };
+                                    match steer_decision {
+                                        Some(crate::model_runtime::runtime::ResponseSteerDecision::Accepted)
+                                            if steer_tx.send(crate::model_runtime::runtime::ResponseSteerRequest {
+                                                submission: prompt.clone(),
+                                            }).is_ok() => {
+                                                let _ = session_transport_tx.send(SessionTransportEvent::QueuedPromptAccepted {
+                                                    prompt,
+                                                });
+                                                continue;
+                                            }
+                                        Some(crate::model_runtime::runtime::ResponseSteerDecision::Deferred) => {
+                                            if let Ok(mut queue) = turn_continuation_queue.lock() {
+                                                queue.mark_user_prompt_queued();
+                                            }
+                                            enqueue_deferred_command(
+                                                &mut parked_commands,
+                                                SessionEngineCommand::Prompt(prompt),
+                                            );
+                                            continue;
+                                        }
+                                        Some(crate::model_runtime::runtime::ResponseSteerDecision::Accepted) => {
+                                            if let Some(handle) = &steer_handle {
+                                                handle.defer_claim();
+                                            }
+                                            if let Ok(mut queue) = turn_continuation_queue.lock() {
+                                                queue.mark_user_prompt_queued();
+                                            }
+                                            enqueue_deferred_command(
+                                                &mut parked_commands,
+                                                SessionEngineCommand::Prompt(prompt),
+                                            );
+                                            continue;
+                                        }
+                                        Some(crate::model_runtime::runtime::ResponseSteerDecision::Unsupported)
+                                        | None => {}
+                                    }
                                     if let Ok(mut queue) = turn_continuation_queue.lock() {
                                         queue.mark_user_prompt_queued();
                                     }

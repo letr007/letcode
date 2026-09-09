@@ -124,12 +124,13 @@ async fn main() -> Result<()> {
         .flat_map(|(provider_name, provider)| {
             provider.models.iter().map(move |(model_id, model)| {
                 let route = config::ModelRoute::new(provider_name, model_id);
+                let metadata = model.request_metadata();
                 AvailableModel::with_context_window_and_reasoning(
                     route.display_name(),
                     provider.model_label(model_id),
                     model.context_window,
-                    model.reasoning_effort.clone(),
-                    model.request_metadata().selectable_reasoning_efforts(),
+                    metadata.reasoning_effort.clone(),
+                    metadata.selectable_reasoning_efforts(),
                 )
             })
         })

@@ -69,6 +69,10 @@ pub fn persist_agent_event(
             recorder.record_assistant_message(content.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
+        AgentEvent::UserMessage { submission } => {
+            recorder.record_user_message_content(submission.content.clone())?;
+            JournalEffect::persisted(ContextProjection::None)
+        }
         AgentEvent::AssistantToolCallBatch {
             text,
             reasoning_content,
@@ -404,6 +408,63 @@ mod tests {
                     ..
                 }
             ] if first == "Final" && second == "Recovered"
+        ));
+    }
+
+    #[test]
+    fn steer_user_is_journaled_after_assistant_and_before_tool_output() {
+        let mut recorder = recorder("steer-canonical-order");
+        persist_agent_event(
+            &mut recorder,
+            &AgentEvent::AssistantToolCallBatch {
+                text: Some("call".into()),
+                reasoning_content: None,
+                reasoning_wire: None,
+                calls: vec![crate::request_builder::HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        )
+        .expect("persist assistant call");
+        persist_agent_event(
+            &mut recorder,
+            &AgentEvent::UserMessage {
+                submission: crate::user_content::UserMessageSubmission::new(
+                    "steer-1",
+                    crate::user_content::UserMessageContent::from("continue"),
+                ),
+            },
+        )
+        .expect("persist steer user");
+        persist_agent_event(
+            &mut recorder,
+            &AgentEvent::ToolCallFinished {
+                call_id: "call-1".into(),
+                name: "lookup".into(),
+                ok: true,
+                output: ToolResult::ok("lookup", json!({"ok": true})),
+            },
+        )
+        .expect("persist tool output");
+        let records = read_records(recorder.path()).expect("read canonical order");
+        assert!(matches!(
+            records.as_slice(),
+            [
+                crate::transcript::TranscriptRecord {
+                    event: TranscriptEvent::AssistantTurn(_),
+                    ..
+                },
+                crate::transcript::TranscriptRecord {
+                    event: TranscriptEvent::UserMessage { .. },
+                    ..
+                },
+                crate::transcript::TranscriptRecord {
+                    event: TranscriptEvent::ToolCallFinished { .. },
+                    ..
+                },
+            ]
         ));
     }
 

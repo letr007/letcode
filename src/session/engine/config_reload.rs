@@ -33,7 +33,7 @@ pub(crate) fn model_catalog_updated_event(config: &AppConfig) -> ModelCatalogUpd
                         provider: provider_name.clone(),
                         context_window_tokens: model.context_window,
                         reasoning: ModelCatalogReasoning {
-                            effort: model
+                            effort: metadata
                                 .reasoning_effort
                                 .as_ref()
                                 .map(|effort| effort.as_str().to_string()),

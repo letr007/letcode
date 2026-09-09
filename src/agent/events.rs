@@ -1,3 +1,4 @@
+use crate::user_content::UserMessageSubmission;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -530,6 +531,9 @@ pub enum AgentEvent {
     },
     AssistantMessage {
         content: String,
+    },
+    UserMessage {
+        submission: UserMessageSubmission,
     },
     AssistantToolCallBatch {
         text: Option<String>,

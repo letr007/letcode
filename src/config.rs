@@ -791,7 +791,7 @@ fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
                         &global_retry,
                         &format!("providers.{name}.retry"),
                     )?),
-                    flavor: provider.flavor.unwrap_or_default(),
+                    flavor: provider.flavor,
                     auth,
                     endpoints,
                     transport: provider.transport,
@@ -926,7 +926,7 @@ fn project_resolved_model_config(model: &ResolvedModelRoute) -> Result<ModelConf
         retention,
         namespace: model.cache.namespace.clone(),
     };
-    Ok(ModelConfig {
+    let mut config = ModelConfig {
         display_name: model.display.clone(),
         protocol,
         anthropic_thinking,
@@ -948,7 +948,12 @@ fn project_resolved_model_config(model: &ResolvedModelRoute) -> Result<ModelConf
                 .generation_defaults
                 .parallel_tool_calls
                 .unwrap_or(false),
-    })
+    };
+    let mut metadata = config.request_metadata();
+    model.strategy.normalize_request_metadata(&mut metadata);
+    config.reasoning_effort = metadata.reasoning_effort;
+    config.reasoning_efforts = metadata.reasoning_efforts;
+    Ok(config)
 }
 
 fn project_provider_config(provider: &ResolvedProvider) -> Result<ProviderConfig> {
@@ -1510,6 +1515,141 @@ namespace = "standard-cache"
         assert!(standard.capabilities.tools);
         assert!(standard.generation.max_output_tokens);
         assert!(loaded.providers["standard"].models["standard-model"].supports_tools);
+    }
+
+    #[test]
+    fn astra_strategy_is_inferred_and_can_be_overridden_explicitly() {
+        let inferred = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "gpt-6-astra",
+            r#"[capabilities]
+reasoning = true
+generation = { reasoning = true }
+"#,
+        )))
+        .expect("astra model should infer its strategy");
+        let inferred_route = inferred
+            .runtime_catalog
+            .route("openai", "gpt-6-astra")
+            .unwrap();
+        assert_eq!(
+            inferred_route.strategy,
+            crate::model_runtime::strategy::ModelStrategyId::Astra
+        );
+        assert_eq!(inferred_route.protocol_id.as_str(), "responses");
+        assert_eq!(inferred_route.flavor, ProviderFlavor::Standard);
+        let metadata = inferred.providers["openai"].models["gpt-6-astra"].request_metadata();
+        assert_eq!(metadata.reasoning_effort, Some(ModelReasoningEffort::Low));
+        assert_eq!(
+            metadata.selectable_reasoning_efforts(),
+            vec![
+                ModelReasoningEffort::Low,
+                ModelReasoningEffort::Medium,
+                ModelReasoningEffort::High,
+                ModelReasoningEffort::Xhigh,
+                ModelReasoningEffort::Max,
+            ]
+        );
+
+        let overridden = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "gpt-6-astra",
+            "strategy = \"default\"\nprotocol = \"completions\"\n",
+        )))
+        .expect("explicit default strategy should override inference");
+        let overridden_route = overridden
+            .runtime_catalog
+            .route("openai", "gpt-6-astra")
+            .unwrap();
+        assert_eq!(
+            overridden_route.strategy,
+            crate::model_runtime::strategy::ModelStrategyId::Default
+        );
+        assert_eq!(overridden_route.protocol_id.as_str(), "completions");
+
+        let explicit_efforts = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "gpt-6-astra",
+            r#"[capabilities]
+reasoning = true
+generation = { reasoning = true }
+[generation]
+reasoning_efforts = ["high"]
+"#,
+        )))
+        .expect("explicit Astra reasoning efforts should remain authoritative");
+        let metadata =
+            explicit_efforts.providers["openai"].models["gpt-6-astra"].request_metadata();
+        assert_eq!(metadata.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert_eq!(metadata.reasoning_efforts, vec![ModelReasoningEffort::High]);
+    }
+
+    #[test]
+    fn astra_strategy_owns_protocol_defaults_but_rejects_incompatible_overrides() {
+        let inferred = r#"active_provider = "openai"
+[providers.openai]
+default_model = "gpt-6-astra"
+[providers.openai.auth]
+type = "bearer"
+credential = "secret-value"
+[providers.openai.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.openai.models.gpt-6-astra]
+"#;
+        let loaded = AppConfig::load_from_path(&write_temp_config(inferred))
+            .expect("strategy defaults should supply protocol and flavor");
+        let route = loaded
+            .runtime_catalog
+            .route("openai", "gpt-6-astra")
+            .unwrap();
+        assert_eq!(route.protocol_id.as_str(), "responses");
+        assert_eq!(route.flavor, ProviderFlavor::Standard);
+
+        let incompatible = config(
+            "openai",
+            "alias",
+            "strategy = \"astra\"\nprotocol = \"completions\"\n",
+        );
+        let error = AppConfig::load_from_path(&write_temp_config(incompatible))
+            .expect_err("incompatible explicit protocol must fail");
+        assert!(format!("{error:#}").contains("requires protocol 'responses'"));
+
+        let missing_generation_support = config(
+            "openai",
+            "gpt-6-astra",
+            "[capabilities]\nreasoning = true\n",
+        );
+        let error = AppConfig::load_from_path(&write_temp_config(missing_generation_support))
+            .expect_err("strategy-provided effort requires generation support");
+        assert!(
+            format!("{error:#}")
+                .contains("requires capabilities.generation.reasoning when reasoning is enabled")
+        );
+    }
+
+    #[test]
+    fn strategy_changes_runtime_fingerprint_and_unknown_values_fail() {
+        let default = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "alias",
+            "strategy = \"default\"\n",
+        )))
+        .unwrap();
+        let astra = AppConfig::load_from_path(&write_temp_config(config(
+            "openai",
+            "alias",
+            "strategy = \"astra\"\n",
+        )))
+        .unwrap();
+        assert_ne!(
+            default.runtime_catalog.fingerprint(),
+            astra.runtime_catalog.fingerprint()
+        );
+
+        let unknown = config("openai", "alias", "strategy = \"unknown\"\n");
+        let error = AppConfig::load_from_path(&write_temp_config(unknown))
+            .expect_err("unknown strategy must fail");
+        assert!(format!("{error:#}").contains("unknown variant"));
     }
 
     #[test]

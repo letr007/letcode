@@ -11,12 +11,14 @@ pub(crate) mod adapters;
 pub(crate) mod decorator;
 pub(crate) mod projection;
 pub(crate) mod runtime;
+pub(crate) mod strategy;
 pub(crate) mod websocket;
 
+use crate::user_content::UserMessageSubmission;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::pin::Pin;
@@ -538,6 +540,19 @@ pub trait ProtocolBinding: Send + Sync {
         &self,
         input: &ModelRequestInput,
     ) -> Result<PreparedHttpRequest, ModelFailure>;
+    fn supports_websocket_steer(&self) -> bool {
+        false
+    }
+    fn websocket_steer_frame(
+        &self,
+        _previous_response_id: &str,
+        _submission: &UserMessageSubmission,
+    ) -> Result<Vec<u8>, ModelFailure> {
+        Err(
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_steer_unsupported_protocol"),
+        )
+    }
     fn websocket_frame(
         &self,
         _request: &PreparedHttpRequest,
@@ -554,6 +569,14 @@ pub trait ProtocolBinding: Send + Sync {
         request: &PreparedHttpRequest,
         stable_request: Option<&PreparedHttpRequest>,
     ) -> Result<PreparedRequestInspection, ModelFailure>;
+    fn decode_http_error(
+        &self,
+        _status: u16,
+        _body: &[u8],
+        _retry_hint: RetryHint,
+    ) -> Option<ModelFailure> {
+        None
+    }
     fn new_decoder(&self) -> Box<dyn ModelStreamDecoder>;
     fn new_websocket_decoder(&self) -> Box<dyn ModelStreamDecoder> {
         self.new_decoder()
@@ -698,6 +721,7 @@ pub struct ToolDefinition {
     pub description: String,
     pub parameters: Value,
     pub strict: bool,
+    pub async_call: bool,
 }
 
 impl ToolDefinition {
@@ -707,6 +731,7 @@ impl ToolDefinition {
             description: description.into(),
             parameters,
             strict: true,
+            async_call: false,
         }
     }
 }
@@ -958,6 +983,15 @@ pub enum ModelEvent {
     ResponseMetadata {
         response_id: String,
     },
+    SteerCommit {
+        submission: UserMessageSubmission,
+    },
+    SteerPending {
+        submission: UserMessageSubmission,
+    },
+    SteerFailed {
+        submission: UserMessageSubmission,
+    },
     Terminal {
         status: TerminalStatus,
     },
@@ -973,6 +1007,7 @@ pub enum TerminalStatus {
     Refusal,
     Pause,
     Incomplete,
+    Steered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1748,6 +1783,8 @@ pub struct RuntimeGenerationConfig {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeGenerationDefaults {
     #[serde(default)]
+    pub async_tools: Vec<String>,
+    #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
@@ -1835,6 +1872,8 @@ pub struct RuntimeModelConfig {
     #[serde(default)]
     pub display: Option<String>,
     #[serde(default)]
+    pub strategy: Option<strategy::ModelStrategyId>,
+    #[serde(default)]
     pub context_window: Option<u64>,
     #[serde(default)]
     pub effective_input_limit_tokens: Option<u64>,
@@ -1866,7 +1905,7 @@ pub struct RuntimeProviderConfig {
     #[serde(default)]
     pub retry: Option<RuntimeRetryConfig>,
     #[serde(default)]
-    pub flavor: ProviderFlavor,
+    pub flavor: Option<ProviderFlavor>,
     pub auth: RuntimeAuthConfig,
     pub endpoints: RuntimeEndpoints,
     #[serde(default)]
@@ -1896,6 +1935,36 @@ pub struct RuntimeRetryConfig {
     pub exponential_backoff: bool,
     pub backoff_multiplier: f32,
     pub jitter_secs: u64,
+}
+
+fn resolved_model_strategy(
+    model_name: &str,
+    model: &RuntimeModelConfig,
+) -> strategy::ModelStrategyId {
+    strategy::ModelStrategyId::resolve(model.strategy, model_name, model.model_override.as_deref())
+}
+
+fn resolved_model_protocol<'a>(
+    provider: &'a RuntimeProviderConfig,
+    model_name: &str,
+    model: &'a RuntimeModelConfig,
+) -> &'a str {
+    model
+        .protocol
+        .as_deref()
+        .or(provider.protocol.as_deref())
+        .unwrap_or_else(|| resolved_model_strategy(model_name, model).default_protocol())
+}
+
+fn resolved_model_flavor(
+    provider: &RuntimeProviderConfig,
+    model_name: &str,
+    model: &RuntimeModelConfig,
+) -> ProviderFlavor {
+    model
+        .flavor
+        .or(provider.flavor)
+        .unwrap_or_else(|| resolved_model_strategy(model_name, model).default_flavor())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1989,10 +2058,9 @@ impl RuntimeConfig {
             }
         })?;
         for (provider_name, provider) in &self.providers {
-            if !matches!(
-                provider.flavor,
-                ProviderFlavor::Standard | ProviderFlavor::Deepseek
-            ) {
+            if provider.flavor.is_some_and(|flavor| {
+                !matches!(flavor, ProviderFlavor::Standard | ProviderFlavor::Deepseek)
+            }) {
                 return Err(RuntimeConfigError::InvalidValue {
                     field: format!("providers.{provider_name}.flavor"),
                     reason: "unsupported provider flavor".into(),
@@ -2094,13 +2162,28 @@ impl RuntimeConfig {
                 }
             }
             for (model_name, model) in &provider.models {
-                let protocol = model
-                    .protocol
-                    .as_deref()
-                    .or(provider.protocol.as_deref())
-                    .unwrap_or("responses");
+                let strategy = resolved_model_strategy(model_name, model);
+                let protocol = resolved_model_protocol(provider, model_name, model);
                 let generation = &model.capabilities.generation;
-                let effective_flavor = model.flavor.unwrap_or(provider.flavor);
+                let effective_flavor = resolved_model_flavor(provider, model_name, model);
+                strategy
+                    .validate_binding(protocol, effective_flavor)
+                    .map_err(|reason| RuntimeConfigError::InvalidValue {
+                        field: format!("providers.{provider_name}.models.{model_name}.strategy"),
+                        reason,
+                    })?;
+                strategy
+                    .validate_generation(
+                        &model.generation,
+                        model.capabilities.reasoning,
+                        generation.reasoning,
+                    )
+                    .map_err(|reason| RuntimeConfigError::InvalidValue {
+                        field: format!(
+                            "providers.{provider_name}.models.{model_name}.generation.reasoning_effort"
+                        ),
+                        reason,
+                    })?;
                 if effective_flavor == ProviderFlavor::Deepseek && protocol == "anthropic" {
                     return Err(RuntimeConfigError::IncompatibleFlavor {
                         flavor: effective_flavor,
@@ -2174,7 +2257,7 @@ impl RuntimeConfig {
                     protocol,
                     &model.protocol_settings,
                 )?;
-                validate_generation_defaults(provider_name, model_name, protocol, model)?;
+                validate_generation_defaults(provider_name, model_name, protocol, strategy, model)?;
                 if endpoint_query
                     .keys()
                     .any(|key| provider.query.contains_key(key))
@@ -2424,10 +2507,41 @@ fn validate_generation_defaults(
     provider: &str,
     model: &str,
     protocol: &str,
+    strategy: strategy::ModelStrategyId,
     config: &RuntimeModelConfig,
 ) -> Result<(), RuntimeConfigError> {
     let path = |field: &str| format!("providers.{provider}.models.{model}.generation.{field}");
     let generation = &config.capabilities.generation;
+    if !config.generation.async_tools.is_empty() {
+        if strategy != strategy::ModelStrategyId::Astra || protocol != "responses" {
+            return Err(RuntimeConfigError::InvalidValue {
+                field: path("async_tools"),
+                reason: "is only supported for the Astra strategy with the responses protocol"
+                    .into(),
+            });
+        }
+        if !config.capabilities.tools {
+            return Err(RuntimeConfigError::InvalidValue {
+                field: path("async_tools"),
+                reason: "requires capabilities.tools = true".into(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for tool in &config.generation.async_tools {
+            if tool.trim().is_empty() {
+                return Err(RuntimeConfigError::InvalidValue {
+                    field: path("async_tools"),
+                    reason: "entries must not be empty".into(),
+                });
+            }
+            if !seen.insert(tool) {
+                return Err(RuntimeConfigError::InvalidValue {
+                    field: path("async_tools"),
+                    reason: "must not contain duplicate tool names".into(),
+                });
+            }
+        }
+    }
     if protocol == "responses" && config.capabilities.generation.stop_sequences {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("stop_sequences"),
@@ -2990,11 +3104,13 @@ impl ResolvedProvider {
         let mut models = BTreeMap::new();
         let auth = config.auth.snapshot(name)?;
         for (model_name, model) in &config.models {
-            let protocol_name = model
-                .protocol
-                .as_deref()
-                .or(config.protocol.as_deref())
-                .unwrap_or("responses");
+            let strategy = resolved_model_strategy(model_name, model);
+            let model_override = model
+                .model_override
+                .clone()
+                .unwrap_or_else(|| model_name.clone());
+            let protocol_name = resolved_model_protocol(config, model_name, model);
+            let effective_flavor = resolved_model_flavor(config, model_name, model);
             let protocol = ProtocolId::new(protocol_name)
                 .map_err(|_| RuntimeConfigError::UnknownProtocol(protocol_name.to_owned()))?;
             if registry.lookup(&protocol).is_none() {
@@ -3014,11 +3130,9 @@ impl ResolvedProvider {
                     display: model.display.clone(),
                     context_window: model.context_window,
                     effective_input_limit_tokens: model.effective_input_limit_tokens,
-                    model_override: model
-                        .model_override
-                        .clone()
-                        .unwrap_or_else(|| model_name.clone()),
-                    flavor: model.flavor.unwrap_or(config.flavor),
+                    model_override: model_override.clone(),
+                    strategy,
+                    flavor: effective_flavor,
                     protocol_id: protocol.clone(),
                     endpoint: endpoint.clone(),
                     auth: auth.clone(),
@@ -3027,6 +3141,7 @@ impl ResolvedProvider {
                     capabilities: model.capabilities.clone().into(),
                     generation: model.capabilities.generation.clone().into(),
                     generation_defaults: model.generation.clone(),
+                    async_tools: model.generation.async_tools.iter().cloned().collect(),
                     cache: model.cache.clone(),
                     protocol_settings: model.protocol_settings.clone(),
                     retry: config.retry.clone(),
@@ -3052,16 +3167,10 @@ impl ResolvedProvider {
                                 )?,
                             ),
                             endpoint.clone(),
-                            BindingFlavor::new(model.flavor.unwrap_or(config.flavor).as_str())
-                                .expect("valid flavor"),
+                            BindingFlavor::new(effective_flavor.as_str()).expect("valid flavor"),
                             ProfileSettings {
                                 display_name: None,
-                                model: Some(
-                                    model
-                                        .model_override
-                                        .clone()
-                                        .unwrap_or_else(|| model_name.clone()),
-                                ),
+                                model: Some(model_override),
                             },
                             model.protocol_settings.clone(),
                             model.capabilities.clone().into(),
@@ -3076,7 +3185,7 @@ impl ResolvedProvider {
         }
         Ok(Self {
             name: name.to_owned(),
-            flavor: config.flavor,
+            flavor: config.flavor.unwrap_or_default(),
             default_model: config.default_model.clone().unwrap_or_default(),
             retry: config.retry.clone(),
             auth: auth.clone(),
@@ -3098,6 +3207,7 @@ pub struct ResolvedModelRoute {
     pub context_window: Option<u64>,
     pub effective_input_limit_tokens: Option<u64>,
     pub model_override: String,
+    pub strategy: strategy::ModelStrategyId,
     pub flavor: ProviderFlavor,
     pub protocol_id: ProtocolId,
     pub endpoint: String,
@@ -3107,6 +3217,7 @@ pub struct ResolvedModelRoute {
     pub capabilities: RouteCapabilities,
     pub generation: GenerationSupport,
     pub generation_defaults: RuntimeGenerationDefaults,
+    pub async_tools: BTreeSet<String>,
     pub cache: RuntimeCacheConfig,
     pub protocol_settings: ProtocolSettings,
     pub retry: Option<RuntimeRetryConfig>,
@@ -3254,6 +3365,7 @@ pub struct ModelFingerprint {
     pub context_window: Option<u64>,
     pub effective_input_limit_tokens: Option<u64>,
     pub model_override: String,
+    pub strategy: strategy::ModelStrategyId,
     pub flavor: ProviderFlavor,
     pub protocol_id: ProtocolId,
     pub endpoint: String,
@@ -3262,6 +3374,7 @@ pub struct ModelFingerprint {
     pub capabilities: RouteCapabilities,
     pub generation: GenerationSupport,
     pub generation_defaults: RuntimeGenerationDefaults,
+    pub async_tools: BTreeSet<String>,
     pub cache: RuntimeCacheConfig,
     pub protocol_settings: ProtocolSettings,
     pub websocket: bool,
@@ -3277,6 +3390,7 @@ impl fmt::Debug for ModelFingerprint {
                 &self.effective_input_limit_tokens,
             )
             .field("model_override", &self.model_override)
+            .field("strategy", &self.strategy)
             .field("flavor", &self.flavor)
             .field("protocol_id", &self.protocol_id)
             .field("endpoint", &self.endpoint)
@@ -3285,6 +3399,7 @@ impl fmt::Debug for ModelFingerprint {
             .field("capabilities", &self.capabilities)
             .field("generation", &self.generation)
             .field("generation_defaults", &self.generation_defaults)
+            .field("async_tools", &self.async_tools)
             .field("cache", &self.cache)
             .field("protocol_settings", &"<redacted>")
             .field("websocket", &self.websocket)
@@ -3335,6 +3450,7 @@ impl RuntimeFingerprint {
                                             effective_input_limit_tokens: route
                                                 .effective_input_limit_tokens,
                                             model_override: route.model_override.clone(),
+                                            strategy: route.strategy,
                                             flavor: route.flavor,
                                             protocol_id: route.protocol_id.clone(),
                                             endpoint: route.endpoint.clone(),
@@ -3343,6 +3459,7 @@ impl RuntimeFingerprint {
                                             capabilities: route.capabilities.clone(),
                                             generation: route.generation.clone(),
                                             generation_defaults: route.generation_defaults.clone(),
+                                            async_tools: route.async_tools.clone(),
                                             cache: route.cache.clone(),
                                             protocol_settings: route.protocol_settings.clone(),
                                             websocket: route.websocket,
@@ -4365,5 +4482,291 @@ protocol = "completions"
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), b"first");
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), b"second");
         assert!(response.next_chunk().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod async_tools_tests {
+    use super::{
+        BindingFlavor, BindingIdentity, ContentPart, FailureKind, GenerationSupport, MessageRole,
+        ModelEvent, ModelRequestInput, ProfileIdentity, ProtocolBindInput, ProtocolBinding,
+        ProtocolId, ProtocolRegistry, RetryHint, RouteCapabilities, RouteIdentity, RuntimeConfig,
+        TerminalStatus, ToolDefinition,
+    };
+    use serde_json::json;
+
+    fn astra_config(async_tools: &str) -> String {
+        format!(
+            r#"active_provider = "vendor"
+[providers.vendor]
+protocol = "responses"
+default_model = "gpt-6-astra"
+[providers.vendor.auth]
+type = "none"
+[providers.vendor.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.vendor.models.gpt-6-astra]
+strategy = "astra"
+[providers.vendor.models.gpt-6-astra.capabilities]
+tools = true
+[providers.vendor.models.gpt-6-astra.generation]
+async_tools = {async_tools}
+"#
+        )
+    }
+
+    fn responses_binding() -> std::sync::Arc<dyn ProtocolBinding> {
+        let adapter = ProtocolRegistry::builtins()
+            .lookup_str("responses")
+            .expect("Responses adapter");
+        adapter
+            .bind(ProtocolBindInput::new(
+                BindingIdentity::new(
+                    ProtocolId::new("responses").unwrap(),
+                    ProfileIdentity::new("vendor").unwrap(),
+                    RouteIdentity::new("vendor/model").unwrap(),
+                ),
+                "https://example.invalid/v1/responses",
+                BindingFlavor::new("standard").unwrap(),
+                Default::default(),
+                Default::default(),
+                RouteCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                GenerationSupport::default(),
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn async_tool_config_requires_astra_responses_tools_and_unique_names() {
+        let route = RuntimeConfig::from_toml(&astra_config("[\"lookup\", \"notify\"]"))
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap();
+        assert_eq!(
+            route
+                .route("vendor", "gpt-6-astra")
+                .unwrap()
+                .async_tools
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["lookup", "notify"]
+        );
+
+        for tools in ["[\"lookup\", \"lookup\"]", "[\"\"]"] {
+            let error = RuntimeConfig::from_toml(&astra_config(tools)).unwrap_err();
+            assert!(error.to_string().contains("async_tools"));
+        }
+
+        let unsupported =
+            astra_config("[\"lookup\"]").replace("strategy = \"astra\"", "strategy = \"default\"");
+        let error = RuntimeConfig::from_toml(&unsupported).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only supported for the Astra strategy")
+        );
+    }
+
+    #[test]
+    fn async_tools_change_route_fingerprint() {
+        let first = RuntimeConfig::from_toml(&astra_config("[\"lookup\"]"))
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap();
+        let second = RuntimeConfig::from_toml(&astra_config("[\"notify\"]"))
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap();
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn responses_wire_marks_only_declared_tools_and_keeps_replay_canonical() {
+        let binding = responses_binding();
+        let mut input = ModelRequestInput::new("model", Vec::new());
+        let mut async_tool = ToolDefinition::new("lookup", "lookup", json!({"type":"object"}));
+        async_tool.async_call = true;
+        input.tools = vec![
+            async_tool,
+            ToolDefinition::new("plain", "plain", json!({"type":"object"})),
+        ];
+        input.messages.push(crate::model_runtime::ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::ToolCall {
+                id: "call-1".into(),
+                name: "lookup".into(),
+                arguments: json!({}),
+            }],
+        });
+        let body: serde_json::Value =
+            serde_json::from_slice(&binding.prepare_request(&input).unwrap().body).unwrap();
+        assert_eq!(body["tools"][0]["async"], true);
+        assert!(body["tools"][1].get("async").is_none());
+        assert!(body["input"][0].get("async").is_none());
+    }
+
+    #[test]
+    fn responses_steer_frame_is_exact_and_rejects_selected_skills() {
+        let binding = responses_binding();
+        let submission = crate::user_content::UserMessageSubmission::new(
+            "steer-1",
+            crate::user_content::UserMessageContent::from_parts(vec![
+                crate::user_content::UserMessagePart::Text {
+                    text: "continue".into(),
+                },
+                crate::user_content::UserMessagePart::Image {
+                    attachment: crate::user_content::UserImageAttachment::from_bytes(
+                        "diagram",
+                        "image/png",
+                        &[1, 2, 3],
+                    ),
+                },
+            ]),
+        );
+        let frame: serde_json::Value = serde_json::from_slice(
+            &binding
+                .websocket_steer_frame("resp-1", &submission)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["type"], "response.steer");
+        assert_eq!(frame["previous_response_id"], "resp-1");
+        assert_eq!(frame["input"][0]["role"], "user");
+        assert_eq!(frame["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(frame["input"][0]["content"][1]["type"], "input_image");
+        assert!(
+            frame["input"][0]["content"][1]["image_url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+        assert_eq!(frame.as_object().unwrap().len(), 3);
+
+        let invalid = crate::user_content::UserMessageSubmission::new(
+            "steer-2",
+            crate::user_content::UserMessageContent::from("continue")
+                .with_selected_skills(vec!["cloudbase".into()]),
+        );
+        assert_eq!(
+            binding
+                .websocket_steer_frame("resp-1", &invalid)
+                .unwrap_err()
+                .code
+                .as_deref(),
+            Some("websocket_steer_selected_skills")
+        );
+    }
+
+    #[test]
+    fn responses_decoder_rejects_steer_outcome_without_submission_id() {
+        let binding = responses_binding();
+        let mut decoder = binding.new_websocket_decoder();
+        let error = decoder
+            .push(br#"{"type":"response.steer.pending","input":"continue"}"#)
+            .unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("invalid_event"));
+    }
+
+    #[test]
+    fn responses_decoder_accepts_steered_incomplete_as_a_success_boundary() {
+        let binding = responses_binding();
+        let mut decoder = binding.new_websocket_decoder();
+        let events = decoder
+            .push(br#"{"type":"response.steer.commit","steer_submission_id":"steer-1","input":"continue"}"#)
+            .unwrap();
+        let terminal_events = decoder
+            .push(br#"{"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"steered"}}}"#)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::SteerCommit { submission } if submission.id == "steer-1"
+        )));
+        assert!(terminal_events.iter().any(|event| matches!(
+            event,
+            ModelEvent::Terminal {
+                status: TerminalStatus::Steered
+            }
+        )));
+        assert!(decoder.finish().is_ok());
+    }
+
+    #[test]
+    fn responses_decoder_accepts_async_function_call_field_without_changing_events() {
+        let binding = responses_binding();
+        let mut decoder = binding.new_decoder();
+        let chunk = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"async\":true}}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item-1\",\"arguments\":\"{}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"async\":true,\"arguments\":\"{}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let events = decoder.push(chunk.as_bytes()).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::ToolStarted { id, .. } if id == "call-1"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::ToolDone { id, .. } if id == "call-1"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Terminal { .. }))
+        );
+    }
+
+    #[test]
+    fn responses_403_misalignment_error_is_invalid_and_never_retryable() {
+        let binding = responses_binding();
+        let failure = binding
+            .decode_http_error(
+                403,
+                br#"{"error":{"code":"misalignment_policy_violation","message":"blocked"}}"#,
+                RetryHint::Retryable,
+            )
+            .expect("Responses error envelope");
+        assert_eq!(failure.kind, FailureKind::InvalidRequest);
+        assert_eq!(
+            failure.code.as_deref(),
+            Some("misalignment_policy_violation")
+        );
+        assert_eq!(failure.status, Some(403));
+        assert_eq!(failure.retry_hint, RetryHint::Never);
+    }
+
+    #[test]
+    fn responses_http_error_uses_transport_status_for_existing_retry_classification() {
+        let binding = responses_binding();
+        let failure = binding
+            .decode_http_error(
+                503,
+                br#"{"error":{"status":400,"code":"provider_error","message":"unavailable"}}"#,
+                RetryHint::Retryable,
+            )
+            .expect("Responses error envelope");
+        assert_eq!(failure.kind, FailureKind::Http);
+        assert_eq!(failure.status, Some(503));
+        assert_eq!(failure.retry_hint, RetryHint::Retryable);
+
+        let failure = binding
+            .decode_http_error(
+                400,
+                br#"{"error":{"code":"server_error","message":"bad request"}}"#,
+                RetryHint::Retryable,
+            )
+            .expect("Responses error envelope");
+        assert_eq!(failure.kind, FailureKind::Http);
+        assert_eq!(failure.status, Some(400));
+        assert_eq!(failure.retry_hint, RetryHint::Never);
     }
 }
