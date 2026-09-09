@@ -12,12 +12,13 @@ use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::engine::{
     ActiveSessionOperation, InterruptRequest, ManualCompactionOperation, SessionEngineCommand,
-    SessionEngineControl, derive_interrupt_request, enqueue_deferred_command,
-    flush_parked_commands, format_background_subagent_completion, initial_session_metadata,
-    manual_compaction_session_token_usage, next_idle_session_command, park_active_turn_command,
-    record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
-    select_active_session_operation, select_manual_compaction_operation, send_subagent_interrupted,
-    wait_for_subagent_cancel_settle,
+    SessionEngineControl, derive_interrupt_request, discard_queued_prompts,
+    enqueue_deferred_command, flush_parked_commands, format_background_subagent_completion,
+    initial_session_metadata, manual_compaction_session_token_usage, next_idle_session_command,
+    park_active_turn_command, record_interrupt_transcript, rehydrate_agent_from_transcript,
+    run_manual_compaction, select_active_session_operation,
+    select_active_session_operation_with_events, select_manual_compaction_operation,
+    send_subagent_interrupted, wait_for_subagent_cancel_settle,
 };
 use crate::session::restore::restored_session_token_usage;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
@@ -198,6 +199,30 @@ fn runtime_with_experts(available_experts: Vec<AvailableExpert>) -> TuiRuntime {
 
 fn runtime() -> TuiRuntime {
     runtime_with_experts(Vec::new())
+}
+
+fn live_steer_runtime() -> TuiRuntime {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    TuiRuntime::new(
+        TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+        rx,
+        vec![AvailableModel::new("gpt-5.5", "GPT-5.5").with_live_steer(true)],
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    )
+}
+
+fn runtime_without_live_steer() -> TuiRuntime {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    TuiRuntime::new(
+        TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+        rx,
+        vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    )
 }
 
 struct ReasoningTransitionProbe {
@@ -585,6 +610,7 @@ fn model_catalog_update_refreshes_open_picker_without_toast() {
             label: "GPT-4 refreshed".into(),
             provider: "openai".into(),
             context_window_tokens: Some(128_000),
+            supports_live_steer: false,
             reasoning: ModelCatalogReasoning {
                 effort: None,
                 efforts: Vec::new(),
@@ -618,6 +644,7 @@ fn model_catalog_update_refreshes_open_picker_without_toast() {
                 label: "GPT-4 refreshed".into(),
                 provider: "openai".into(),
                 context_window_tokens: Some(128_000),
+                supports_live_steer: false,
                 reasoning: ModelCatalogReasoning {
                     effort: None,
                     efforts: Vec::new(),
@@ -636,6 +663,7 @@ fn model_catalog_update_refreshes_open_picker_without_toast() {
                     label: "GPT-5.5 updated".into(),
                     provider: "openai".into(),
                     context_window_tokens: Some(200_000),
+                    supports_live_steer: false,
                     reasoning: ModelCatalogReasoning {
                         effort: Some("high".into()),
                         efforts: vec!["none".into(), "high".into()],
@@ -646,6 +674,7 @@ fn model_catalog_update_refreshes_open_picker_without_toast() {
                     label: "GPT-4 refreshed".into(),
                     provider: "openai".into(),
                     context_window_tokens: Some(128_000),
+                    supports_live_steer: false,
                     reasoning: ModelCatalogReasoning {
                         effort: None,
                         efforts: Vec::new(),
@@ -681,6 +710,7 @@ fn model_catalog_update_refreshes_open_picker_without_toast() {
                 label: "GPT-4 refreshed".into(),
                 provider: "openai".into(),
                 context_window_tokens: Some(128_000),
+                supports_live_steer: false,
                 reasoning: ModelCatalogReasoning {
                     effort: None,
                     efforts: Vec::new(),
@@ -713,6 +743,7 @@ fn model_catalog_update_preserves_expert_allowlist_checks() {
                 label: "GPT-5.5 refreshed".into(),
                 provider: "openai".into(),
                 context_window_tokens: None,
+                supports_live_steer: false,
                 reasoning: ModelCatalogReasoning {
                     effort: None,
                     efforts: Vec::new(),
@@ -2800,8 +2831,8 @@ fn dispatched_queued_prompt_failure_before_ack_clears_handoff_without_redispatch
 }
 
 #[test]
-fn old_error_done_before_queued_prompt_accept_does_not_consume_handoff() {
-    let mut runtime = runtime();
+fn live_steer_error_preserves_single_inflight_handoff() {
+    let mut runtime = live_steer_runtime();
     runtime.session_turn_active = true;
     runtime.state_mut().phase = AppPhase::Running;
     runtime.state_mut().set_input("follow up 1");
@@ -2813,7 +2844,6 @@ fn old_error_done_before_queued_prompt_accept_does_not_consume_handoff() {
         .handle_input_action(InputAction::Submit)
         .expect("second queue succeeds");
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
     let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
         runtime.take_next_queued_prompt_command()
     else {
@@ -2855,10 +2885,14 @@ fn old_error_done_before_queued_prompt_accept_does_not_consume_handoff() {
     assert!(runtime.state().timeline.items().iter().any(
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
         ));
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up 2".into()))
+    );
 }
 
 #[test]
-fn old_done_before_queued_prompt_ack_does_not_dispatch_next_prompt() {
+fn done_before_queued_prompt_commit_does_not_dispatch_next_prompt() {
     let mut runtime = runtime();
     runtime.session_turn_active = true;
     runtime.state_mut().phase = AppPhase::Running;
@@ -2872,7 +2906,6 @@ fn old_done_before_queued_prompt_ack_does_not_dispatch_next_prompt() {
         .expect("second queue succeeds");
 
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
     let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
         runtime.take_next_queued_prompt_command()
     else {
@@ -2905,6 +2938,11 @@ fn old_done_before_queued_prompt_ack_does_not_dispatch_next_prompt() {
     assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
     assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
     assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up 2".into()))
+    );
     assert!(runtime.state().timeline.items().iter().any(
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
         ));
@@ -2948,16 +2986,13 @@ fn manual_submit_during_queued_handoff_is_queued_behind_pending_prompt() {
 }
 
 #[test]
-fn queued_prompt_dispatches_after_turn_done() {
-    let mut runtime = runtime();
+fn queued_prompt_dispatches_immediately() {
+    let mut runtime = live_steer_runtime();
     runtime.state_mut().phase = AppPhase::Running;
     runtime.state_mut().set_input("follow up");
     runtime
         .handle_input_action(InputAction::Submit)
         .expect("queue succeeds");
-
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
     let command = runtime.take_next_queued_prompt_command();
 
@@ -2991,6 +3026,164 @@ fn queued_prompt_dispatches_after_turn_done() {
             )
             .count(),
         1
+    );
+}
+
+#[test]
+fn streaming_delta_does_not_clear_ready_queued_prompt() {
+    let mut runtime = live_steer_runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("assistant output"),
+    ));
+    runtime.apply_session_transport_event(SessionTransportEvent::ReasoningDelta(
+        ReasoningDeltaEvent::new("reasoning-1", "thinking"),
+    ));
+
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+    );
+}
+
+#[test]
+fn non_live_steer_queued_prompt_waits_for_tool_batch_boundary() {
+    let mut runtime = runtime_without_live_steer();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds");
+
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    runtime.apply_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("assistant output"),
+    ));
+    runtime.apply_session_transport_event(SessionTransportEvent::ReasoningDelta(
+        ReasoningDeltaEvent::new("reasoning-1", "thinking"),
+    ));
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+    );
+}
+
+#[test]
+fn non_live_steer_reasoning_done_releases_queued_prompt() {
+    let mut runtime = runtime_without_live_steer();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ReasoningDelta(
+        ReasoningDeltaEvent::new("reasoning-1", "thinking"),
+    ));
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ReasoningDone(
+        ReasoningDoneEvent::new("reasoning-1", "thinking"),
+    ));
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+    );
+}
+
+#[test]
+fn selected_skills_disable_immediate_live_steer_until_step_boundary() {
+    let mut runtime = live_steer_runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    assert!(runtime.state_mut().add_composer_skill("rust-audit".into()));
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds");
+
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
+    let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
+    else {
+        panic!("expected queued submit command after tool batch");
+    };
+    assert_eq!(prompt.content.text, "follow up");
+    assert_eq!(prompt.content.selected_skills, vec!["rust-audit"]);
+}
+
+#[test]
+fn catalog_update_after_done_preserves_queued_dispatch() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    runtime.handle_input_action(InputAction::Submit).unwrap();
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(
+        ModelCatalogUpdatedEvent {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-5.5".into(),
+                label: "GPT-5.5".into(),
+                provider: "openai".into(),
+                context_window_tokens: None,
+                supports_live_steer: false,
+                reasoning: ModelCatalogReasoning {
+                    effort: None,
+                    efforts: Vec::new(),
+                },
+            }],
+        },
+    ));
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+    );
+}
+
+#[test]
+fn model_catalog_hot_update_changes_live_steer_dispatch_capability() {
+    let mut runtime = runtime_without_live_steer();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds");
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ModelCatalogUpdated(
+        ModelCatalogUpdatedEvent {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-5.5".into(),
+                label: "GPT-5.5".into(),
+                provider: "openai".into(),
+                context_window_tokens: None,
+                supports_live_steer: true,
+                reasoning: ModelCatalogReasoning {
+                    effort: None,
+                    efforts: Vec::new(),
+                },
+            }],
+        },
+    ));
+
+    assert!(runtime.available_models()[0].supports_live_steer);
+    assert_eq!(
+        runtime.take_next_queued_prompt_command(),
+        Some(RuntimeCommand::SubmitPrompt("follow up".into()))
     );
 }
 
@@ -3126,14 +3319,9 @@ fn queued_prompt_dispatches_after_tool_batch_finished() {
     assert_eq!(runtime.take_next_queued_prompt_command(), None);
 
     runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
-
     assert_eq!(
         runtime.take_next_queued_prompt_command(),
         Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-    );
-    assert_eq!(
-        runtime.queued_prompt_lifecycle.dispatched_prompt(),
-        Some("follow up")
     );
 }
 
@@ -3161,7 +3349,7 @@ fn non_terminal_error_does_not_drop_or_dispatch_queued_prompt() {
 }
 
 #[test]
-fn prompt_after_non_terminal_error_still_queues_until_done() {
+fn queued_prompt_after_non_terminal_error_waits_for_step_boundary() {
     let mut runtime = runtime();
     runtime.state_mut().phase = AppPhase::Running;
     runtime.session_turn_active = true;
@@ -3169,6 +3357,12 @@ fn prompt_after_non_terminal_error_still_queues_until_done() {
     runtime
         .handle_input_action(InputAction::Submit)
         .expect("first queue succeeds");
+    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
+        runtime.take_next_queued_prompt_command()
+    else {
+        panic!("expected first queued submit command");
+    };
 
     runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
         "failed to view child transcript",
@@ -3184,19 +3378,23 @@ fn prompt_after_non_terminal_error_still_queues_until_done() {
         vec!["follow up 1".to_string(), "follow up 2".to_string()]
     );
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+        UserMessageEvent::from_submission(first_submission),
+    ));
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
 
     assert_eq!(
         runtime.take_next_queued_prompt_command(),
-        Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
+        Some(RuntimeCommand::SubmitPrompt("follow up 2".into()))
     );
     assert_eq!(
         runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 1".to_string(), "follow up 2".to_string()]
+        vec!["follow up 2".to_string()]
     );
     assert!(matches!(
         runtime.state().timeline.items().iter().find(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1")),
-        Some(TimelineItem::User(message)) if message.queued
+        Some(TimelineItem::User(message)) if !message.queued
     ));
 }
 
@@ -4445,6 +4643,41 @@ fn parked_commands_stay_before_later_deferred_commands() {
         Ok(SessionTransportEvent::Notice(notice))
             if notice.message == "Change queued for after the current turn"
     ));
+}
+
+#[test]
+fn interrupted_prompts_are_discarded_but_settings_survive() {
+    let prompt = |id| {
+        SessionEngineCommand::Prompt(UserMessageSubmission::new(
+            id,
+            crate::user_content::UserMessageContent::from("queued prompt"),
+        ))
+    };
+    let mut deferred_commands = VecDeque::from([
+        prompt("deferred-prompt"),
+        SessionEngineCommand::SetModel("deferred-model".into()),
+    ]);
+    let mut parked_commands = VecDeque::from([
+        SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Auto),
+        prompt("parked-prompt"),
+    ]);
+
+    discard_queued_prompts(&mut deferred_commands);
+    discard_queued_prompts(&mut parked_commands);
+    flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Auto
+        ))
+    ));
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "deferred-model"
+    ));
+    assert!(deferred_commands.is_empty());
+    assert!(parked_commands.is_empty());
 }
 
 #[test]

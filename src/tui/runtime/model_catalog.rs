@@ -15,6 +15,7 @@ pub(crate) struct AvailableModel {
     pub(crate) context_window_tokens: Option<u64>,
     pub(crate) reasoning_effort: Option<ModelReasoningEffort>,
     pub(crate) reasoning_efforts: Vec<ModelReasoningEffort>,
+    pub(crate) supports_live_steer: bool,
 }
 
 impl AvailableModel {
@@ -35,6 +36,7 @@ impl AvailableModel {
                 .iter()
                 .map(|effort| parse_catalog_reasoning_effort(effort))
                 .collect(),
+            supports_live_steer: entry.supports_live_steer,
         }
     }
 
@@ -48,6 +50,7 @@ impl AvailableModel {
             context_window_tokens: None,
             reasoning_effort: None,
             reasoning_efforts: Vec::new(),
+            supports_live_steer: false,
         }
     }
 
@@ -65,6 +68,7 @@ impl AvailableModel {
             context_window_tokens,
             reasoning_effort: None,
             reasoning_efforts: Vec::new(),
+            supports_live_steer: false,
         }
     }
 
@@ -83,7 +87,13 @@ impl AvailableModel {
             context_window_tokens,
             reasoning_effort,
             reasoning_efforts,
+            supports_live_steer: false,
         }
+    }
+
+    pub(crate) fn with_live_steer(mut self, supports_live_steer: bool) -> Self {
+        self.supports_live_steer = supports_live_steer;
+        self
     }
 }
 

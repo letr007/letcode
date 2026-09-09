@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
             )
         })
         .collect::<IndexMap<_, _>>();
+    let runtime_catalog = &config.runtime_catalog;
 
     let available_models = config
         .providers
@@ -131,6 +132,11 @@ async fn main() -> Result<()> {
                     model.context_window,
                     metadata.reasoning_effort.clone(),
                     metadata.selectable_reasoning_efforts(),
+                )
+                .with_live_steer(
+                    runtime_catalog
+                        .route(provider_name, model_id)
+                        .is_some_and(|route| route.supports_live_steer()),
                 )
             })
         })

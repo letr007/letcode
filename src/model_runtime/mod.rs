@@ -3227,6 +3227,13 @@ pub struct ResolvedModelRoute {
 }
 
 impl ResolvedModelRoute {
+    pub fn supports_live_steer(&self) -> bool {
+        self.strategy == strategy::ModelStrategyId::Astra
+            && self.protocol_id.as_str() == "responses"
+            && self.websocket
+            && self.binding.supports_websocket_steer()
+    }
+
     pub fn binding(&self) -> &Arc<dyn ProtocolBinding> {
         &self.binding
     }
@@ -4537,6 +4544,41 @@ async_tools = {async_tools}
                 GenerationSupport::default(),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn live_steer_requires_resolved_astra_strategy_and_websocket() {
+        for (strategy, websocket, expected) in [
+            ("astra", true, true),
+            ("astra", false, false),
+            ("default", true, false),
+            ("default", false, false),
+        ] {
+            let config = astra_config("[]")
+                .replace(
+                    "strategy = \"astra\"",
+                    &format!("strategy = \"{strategy}\""),
+                )
+                .replace(
+                    "[providers.vendor.models.gpt-6-astra.generation]\nasync_tools = []\n",
+                    "",
+                );
+            let config = format!(
+                "{config}\n[providers.vendor.models.gpt-6-astra.transport]\nwebsocket = {websocket}\n"
+            );
+            let catalog = RuntimeConfig::from_toml(&config)
+                .unwrap()
+                .resolve(&ProtocolRegistry::builtins())
+                .unwrap();
+            assert_eq!(
+                catalog
+                    .route("vendor", "gpt-6-astra")
+                    .unwrap()
+                    .supports_live_steer(),
+                expected,
+                "strategy={strategy}, websocket={websocket}"
+            );
+        }
     }
 
     #[test]

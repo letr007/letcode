@@ -131,6 +131,7 @@ pub(crate) struct ModelCatalogEntry {
     pub provider: String,
     pub context_window_tokens: Option<u64>,
     pub reasoning: ModelCatalogReasoning,
+    pub supports_live_steer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

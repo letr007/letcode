@@ -44,6 +44,8 @@ const STEER_DISABLED: u8 = 4;
 #[derive(Clone, Debug)]
 pub(crate) struct ResponseSteerHandle {
     state: Arc<AtomicU8>,
+    available: Arc<tokio::sync::Notify>,
+    returned_submissions: Arc<StdMutex<Vec<UserMessageSubmission>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +63,32 @@ impl ResponseSteerHandle {
             } else {
                 STEER_UNSUPPORTED
             })),
+            available: Arc::new(tokio::sync::Notify::new()),
+            returned_submissions: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    pub(crate) async fn wait_available(&self) {
+        loop {
+            let notified = self.available.notified();
+            if self.state.load(Ordering::Acquire) == STEER_AVAILABLE {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn has_returned_submissions(&self) -> bool {
+        !self.returned_submissions.lock().unwrap().is_empty()
+    }
+
+    pub(crate) fn take_returned_submissions(&self) -> Vec<UserMessageSubmission> {
+        std::mem::take(&mut *self.returned_submissions.lock().unwrap())
+    }
+
+    fn return_submission(&self, submission: UserMessageSubmission) {
+        self.steer_failed();
+        self.returned_submissions.lock().unwrap().push(submission);
     }
 
     pub(crate) fn try_claim(&self) -> ResponseSteerDecision {
@@ -82,12 +109,18 @@ impl ResponseSteerHandle {
     }
 
     fn response_created(&self) {
-        let _ = self.state.compare_exchange(
-            STEER_UNAVAILABLE,
-            STEER_AVAILABLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .state
+            .compare_exchange(
+                STEER_UNAVAILABLE,
+                STEER_AVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.available.notify_one();
+        }
     }
 
     fn steer_committed(&self) {
@@ -424,7 +457,8 @@ fn bind_accepted_steer(
     let pending = pending_steers
         .iter_mut()
         .find(|pending| {
-            pending.server_steer_id.is_none()
+            (pending.server_steer_id.is_none()
+                || pending.server_steer_id.as_deref() == Some(server_steer_id.as_str()))
                 && pending.target_response_id.as_deref() == Some(previous_response_id.as_str())
         })
         .ok_or_else(|| {
@@ -772,7 +806,10 @@ fn websocket_response_stream(
                             }
                         }
                     }
-                    if event_type == "response.steer.accepted" {
+                    if matches!(
+                        event_type,
+                        "response.steer.accepted" | "response.steer.pending"
+                    ) {
                         let accepted = value.as_ref().ok_or_else(|| {
                             ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
                                 .with_code("steer_accepted_malformed")
@@ -800,7 +837,10 @@ fn websocket_response_stream(
                                 ),
                             ));
                         }
+                        // Both acknowledgements retain server ownership. Only a
+                        // successor response.created commits the submission.
                         steer_accepted = true;
+                        continue;
                     }
                     let successful_terminal =
                         is_successful_steer_terminal(event_type, value.as_ref());
@@ -1106,7 +1146,10 @@ fn websocket_response_stream(
                                 .and_then(|value| value.get("type"))
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or_default();
-                            if successor_type == "response.steer.accepted" {
+                            if matches!(
+                                successor_type,
+                                "response.steer.accepted" | "response.steer.pending"
+                            ) {
                                 let accepted = successor_value.as_ref().ok_or_else(|| {
                                     ModelFailure::new(
                                         FailurePhase::Decode,
@@ -1140,9 +1183,7 @@ fn websocket_response_stream(
                                 steer_accepted = true;
                                 continue;
                             }
-                            if successor_type == "response.steer.pending"
-                                || successor_type == "response.steer.failed"
-                            {
+                            if successor_type == "response.steer.failed" {
                                 let submission = match successor_value
                                     .as_ref()
                                     .ok_or_else(|| {
@@ -1181,13 +1222,15 @@ fn websocket_response_stream(
                                         ));
                                     }
                                 };
+                                if let Some(handle) = &steer_handle {
+                                    handle.return_submission(submission);
+                                    steer_accepted = false;
+                                    break;
+                                }
                                 *previous_response_id.lock().await = None;
                                 *force_full.lock().await = true;
                                 *next_prompt_unit_start.lock().await = None;
                                 *cached_successor.lock().await = None;
-                                if let Some(handle) = &steer_handle {
-                                    handle.steer_failed();
-                                }
                                 *guard = None;
                                 let synthetic = serde_json::json!({
                                     "type": successor_type,
@@ -1310,9 +1353,7 @@ fn websocket_response_stream(
                             }
                         }
                     }
-                    if event_type == "response.steer.pending"
-                        || event_type == "response.steer.failed"
-                    {
+                    if event_type == "response.steer.failed" {
                         if let Some(handle) = &steer_handle {
                             handle.steer_failed();
                         }
@@ -1353,6 +1394,11 @@ fn websocket_response_stream(
                                 ));
                             }
                         };
+                        if let Some(handle) = &steer_handle {
+                            handle.return_submission(submission);
+                            steer_accepted = false;
+                            continue;
+                        }
                         *previous_response_id.lock().await = None;
                         *force_full.lock().await = true;
                         *next_prompt_unit_start.lock().await = None;
@@ -3333,11 +3379,11 @@ reasoning = true
     }
 
     #[tokio::test]
-    async fn websocket_pending_and_failed_close_and_next_attempt_starts_full_create() {
+    async fn websocket_failed_without_engine_returns_input_and_starts_full_create() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (index, outcome) in [(0usize, "pending"), (1usize, "failed")] {
+            for (index, outcome) in [(0usize, "failed"), (1usize, "failed")] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = accept_async(stream).await.unwrap();
                 let Message::Text(create) = socket.next().await.unwrap().unwrap() else {
@@ -3386,7 +3432,7 @@ reasoning = true
         let transport = TurnLocalResponsesTransport::new();
         transport.set_steer_receiver(steer_rx).await;
         for index in 0..2 {
-            let expected_outcome = if index == 0 { "pending" } else { "failed" };
+            let expected_outcome = "failed";
             let response = transport
                 .send_prepared(&route, request.clone())
                 .await
@@ -3481,6 +3527,30 @@ reasoning = true
         )
         .unwrap();
         assert_eq!(failed_submission.id, "local-2");
+    }
+
+    #[tokio::test]
+    async fn steer_waiter_wakes_for_created_response_and_successor() {
+        let handle = ResponseSteerHandle::new(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let waiting = handle.wait_available();
+            let create = async {
+                tokio::task::yield_now().await;
+                handle.response_created();
+            };
+            tokio::join!(waiting, create);
+            assert_eq!(handle.try_claim(), ResponseSteerDecision::Accepted);
+            handle.steer_committed();
+            let waiting = handle.wait_available();
+            let create = async {
+                tokio::task::yield_now().await;
+                handle.response_created();
+            };
+            tokio::join!(waiting, create);
+            assert_eq!(handle.try_claim(), ResponseSteerDecision::Accepted);
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

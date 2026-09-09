@@ -32,6 +32,10 @@ pub(crate) fn model_catalog_updated_event(config: &AppConfig) -> ModelCatalogUpd
                         label: provider.model_label(model_id),
                         provider: provider_name.clone(),
                         context_window_tokens: model.context_window,
+                        supports_live_steer: config
+                            .runtime_catalog
+                            .route(provider_name, model_id)
+                            .is_some_and(|route| route.supports_live_steer()),
                         reasoning: ModelCatalogReasoning {
                             effort: metadata
                                 .reasoning_effort
