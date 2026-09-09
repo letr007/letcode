@@ -1237,6 +1237,55 @@ fn legacy_cancelled_tool_call_restores_as_terminal_output() {
 }
 
 #[test]
+fn early_tool_start_and_committed_batch_restore_one_call_group() {
+    let call = HistoryToolCall {
+        call_id: "early-call".into(),
+        name: "fs__read".into(),
+        arguments_json: "{}".into(),
+    };
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::ToolCallStarted {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                args: json!({}),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AssistantToolCallBatch {
+                text: Some("Inspecting".into()),
+                reasoning_content: None,
+                reasoning_wire: None,
+                calls: vec![call.clone()],
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::ToolCallCancelled {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+            },
+        ),
+    ];
+    let mut restored = restore_session_history_projection(&records);
+    assert_eq!(
+        restored
+            .iter()
+            .filter(|item| matches!(item,
+                HistoryItem::AssistantTurn { calls, .. } if !calls.is_empty()
+            ))
+            .count(),
+        1,
+        "early execution and durable batch describe the same call"
+    );
+    restored.push(HistoryItem::user("next prompt"));
+    crate::protocol_frames::validate_history_items_complete(&restored, None)
+        .expect("cancelled early execution leaves a complete history");
+}
+
+#[test]
 fn cancelled_durable_multi_call_batch_restores_every_terminal_output() {
     let calls = vec![
         HistoryToolCall {

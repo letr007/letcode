@@ -21,6 +21,7 @@ pub(super) struct HistoryProjectionEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HistoryProjectionOrigin {
     RawTranscript,
+    ToolCallStart,
     CompactionSummary,
     CompactionContinuation,
     LogicalCheckpointSummary,
@@ -572,6 +573,28 @@ fn append_history_projection_entry_from_transcript_record(
         return;
     }
     if let Some(item) = super::super::append_history_item_from_transcript_record(record) {
+        // Early execution emits lifecycle starts before the complete assistant
+        // batch. Promote that provisional group instead of declaring its calls twice.
+        if matches!(
+            record.event,
+            TranscriptEvent::AssistantTurn(_) | TranscriptEvent::AssistantToolCallBatch { .. }
+        ) && let HistoryItem::AssistantTurn { calls, .. } = &item
+            && let Some(previous) = history.last_mut()
+            && previous.origin == HistoryProjectionOrigin::ToolCallStart
+            && let HistoryItem::AssistantTurn { calls: started, .. } = &previous.item
+            && !started.is_empty()
+            && started
+                .iter()
+                .all(|start| calls.iter().any(|call| call.call_id == start.call_id))
+        {
+            previous.item = item;
+            previous
+                .source_spans
+                .extend(source_spans_for_history_record(record));
+            previous.origin = HistoryProjectionOrigin::RawTranscript;
+            previous.stable_key = format!("raw:{}", record.sequence);
+            return;
+        }
         // Legacy transcripts have one start record per call. Consecutive starts
         // are one assistant response until a result is appended.
         if matches!(record.event, TranscriptEvent::ToolCallStarted { .. })
@@ -594,7 +617,11 @@ fn append_history_projection_entry_from_transcript_record(
             source_spans: source_spans_for_history_record(record),
             turn_id: active_turn_id,
             segment_id: active_segment_id,
-            origin: HistoryProjectionOrigin::RawTranscript,
+            origin: if matches!(record.event, TranscriptEvent::ToolCallStarted { .. }) {
+                HistoryProjectionOrigin::ToolCallStart
+            } else {
+                HistoryProjectionOrigin::RawTranscript
+            },
             stable_key: format!("raw:{}", record.sequence),
         });
     }

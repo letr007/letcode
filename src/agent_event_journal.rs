@@ -469,6 +469,103 @@ mod tests {
     }
 
     #[test]
+    fn early_tool_execution_restores_after_completion_or_interruption() {
+        for interrupted in [false, true] {
+            let mut recorder = recorder(if interrupted {
+                "early-interrupted"
+            } else {
+                "early-completed"
+            });
+            persist_agent_event(
+                &mut recorder,
+                &AgentEvent::TurnStarted(crate::agent::TurnStartedEvent {
+                    turn_id: 1,
+                    intent: "engineering".into(),
+                    directive: "inspect".into(),
+                    validation_reminder: String::new(),
+                }),
+            )
+            .unwrap();
+            let calls = ["early-1", "early-2"].map(|id| crate::request_builder::HistoryToolCall {
+                call_id: id.into(),
+                name: "lookup".into(),
+                arguments_json: "{}".into(),
+            });
+            for call in &calls {
+                persist_agent_event(
+                    &mut recorder,
+                    &AgentEvent::ToolCallStarted {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        args: json!({}),
+                    },
+                )
+                .unwrap();
+            }
+            persist_agent_event(
+                &mut recorder,
+                &AgentEvent::AssistantToolCallBatch {
+                    text: Some("Inspecting".into()),
+                    reasoning_content: Some("Read both inputs".into()),
+                    reasoning_wire: None,
+                    calls: calls.to_vec(),
+                },
+            )
+            .unwrap();
+            persist_agent_event(
+                &mut recorder,
+                &AgentEvent::UserMessage {
+                    submission: crate::user_content::UserMessageSubmission::new(
+                        "steer",
+                        "follow up".into(),
+                    ),
+                },
+            )
+            .unwrap();
+            for (index, call) in calls.iter().enumerate() {
+                let event = if interrupted && index == 1 {
+                    AgentEvent::ToolCallCancelled {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                    }
+                } else {
+                    AgentEvent::ToolCallFinished {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        ok: true,
+                        output: ToolResult::ok("lookup", json!({"index": index})),
+                    }
+                };
+                persist_agent_event(&mut recorder, &event).unwrap();
+            }
+            if interrupted {
+                recorder.record_turn_interrupted(Some(1)).unwrap();
+            }
+            let records = read_records(recorder.path()).unwrap();
+            let mut history = restore_session_history(&records).unwrap();
+            assert_eq!(history.iter().filter(|item| matches!(item,
+                crate::request_builder::HistoryItem::AssistantTurn { calls, .. } if !calls.is_empty()
+            )).count(), 1);
+            assert!(history.iter().any(|item| matches!(item,
+                crate::request_builder::HistoryItem::AssistantTurn { text: Some(text), reasoning_content: Some(reasoning), calls, .. }
+                    if text == "Inspecting" && reasoning == "Read both inputs" && calls.len() == 2
+            )));
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|item| matches!(
+                        item,
+                        crate::request_builder::HistoryItem::ToolOutput { .. }
+                    ))
+                    .count(),
+                2
+            );
+            history.push(crate::request_builder::HistoryItem::user("next prompt"));
+            crate::protocol_frames::validate_history_items_complete(&history, None).unwrap();
+        }
+    }
+
+    #[test]
     fn assistant_tool_call_reasoning_content_persists_and_restores() {
         let mut recorder = recorder("assistant-tool-reasoning");
         let event = AgentEvent::AssistantToolCallBatch {
