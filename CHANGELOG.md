@@ -7,9 +7,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增增量三层历史：按会话分支保存历史段与冻结选择，每段历史一次生成 Detailed、Compact 和 Anchor 三种表述，预算变化时按档位重选或归档；归档只改变活跃表示，不删除 transcript。
+- 新增内置 Historian 后台整理：未配置时继承主模型，也可通过 `[agents.historian]` 单独路由；整理只在 footer 显示状态，不插入主时间线工具卡，并可在子视图查看概览、分段正文、模型、耗时和用量报告。
+- 新增 `context__search` 和 `context__expand`：在当前分支作用域内检索原始会话、归档历史段与 evidence，并按来源 ID 只读展开原文，不恢复旧执行状态。
+- 新增按模型配置的异步工具：`generation.async_tools` 列出的工具可在流式响应期间提前执行，完整工具批次到达后归并为同一调用组；仅适用于 Astra 策略搭配 Responses 协议。
+
 ### Breaking
 
 - 移除 Anchored Bootstrap 实验及其 `[experiments.anchored_bootstrap]` 配置段与 `/anchored` 命令；已启用该实验的配置需删除对应段落，否则加载时会因未知字段报错。
+
+### Changed
+
+- 项目记忆改为按工作区路径隔离的独立记忆库：回合持久化后由后台增量提取并保存到配置目录的 SQLite，`memory__recall` 直接查询该库，不再扫描或重新提炼旧 session；首次启用只登记当前 journal 进度。
+- 降低历史回放开销，校验时复用已发布前缀的投影状态，仅在分支路径变化时重建。
+
+### Fixed
+
+- 修复历史树投影遇到已应用的历史记录时崩溃，导致 `/tree`、`/undo` 和 `/redo` 不可用的问题。
 
 ## [0.11.0] - 2026-09-05
 
