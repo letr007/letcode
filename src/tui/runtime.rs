@@ -1189,10 +1189,8 @@ impl TuiRuntime {
                 session_id,
                 running,
                 failed,
-            } => {
-                if self.state.session_id.as_deref() == Some(session_id.as_str()) {
-                    self.state.historian_status = Some((session_id.clone(), *running, *failed));
-                }
+            } if self.state.session_id.as_deref() == Some(session_id.as_str()) => {
+                self.state.historian_status = Some((session_id.clone(), *running, *failed));
             }
             SessionTransportEvent::PermissionResolved(resolution)
                 if self.pending_permission_matches_call(&resolution.call_id, None) =>
@@ -1393,14 +1391,12 @@ impl TuiRuntime {
                 self.state.apply_live_token_usage(token_usage.into());
                 suppress_session_event = true;
             }
-            SessionTransportEvent::CompactionStarted => {
-                if self
-                    .state
-                    .toast()
-                    .is_some_and(|toast| toast.message == self.state.t("runtime.context_organized"))
-                {
-                    self.state.toast = None;
-                }
+            SessionTransportEvent::CompactionStarted
+                if self.state.toast().is_some_and(|toast| {
+                    toast.message == self.state.t("runtime.context_organized")
+                }) =>
+            {
+                self.state.toast = None;
             }
             SessionTransportEvent::CompactionCommitted { summary } => {
                 let compacting_message = self.state.t("runtime.compacting_context");

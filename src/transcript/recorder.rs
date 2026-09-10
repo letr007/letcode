@@ -176,6 +176,7 @@ impl TranscriptWriterLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
             .with_context(|| {
                 format!(
@@ -407,7 +408,7 @@ impl TranscriptRecorder {
         writer_lock: TranscriptWriterLock,
     ) -> Result<Self> {
         let file_path = session_path(base_dir, session_id);
-        journal::ensure_resumable_content(&file_path, &content)?;
+        journal::ensure_resumable_content(&file_path, content)?;
         ensure!(
             !content_tail_is_uncommitted_transaction(&file_path, content)?,
             "transcript has an uncommitted transaction tail and cannot safely accept new records"

@@ -303,18 +303,17 @@ impl ProtocolAdapter for AnthropicAdapter {
                     .with_code("invalid_anthropic_betas"),
             );
         }
-        if let Some(thinking) = &settings.anthropic_thinking {
-            if !matches!(thinking.mode.as_str(), "disabled" | "adaptive" | "budget")
+        if let Some(thinking) = &settings.anthropic_thinking
+            && (!matches!(thinking.mode.as_str(), "disabled" | "adaptive" | "budget")
                 || (thinking.mode == "budget" && thinking.budget_tokens.unwrap_or(0) < 1024)
                 || (thinking.mode != "budget" && thinking.budget_tokens.is_some())
                 || (thinking.mode != "disabled"
-                    && (!input.capabilities.reasoning || !input.generation_support.reasoning))
-            {
-                return Err(
-                    ModelFailure::new(FailurePhase::Bind, FailureKind::InvalidRequest)
-                        .with_code("invalid_anthropic_thinking"),
-                );
-            }
+                    && (!input.capabilities.reasoning || !input.generation_support.reasoning)))
+        {
+            return Err(
+                ModelFailure::new(FailurePhase::Bind, FailureKind::InvalidRequest)
+                    .with_code("invalid_anthropic_thinking"),
+            );
         }
         Ok(Arc::new(AnthropicBinding {
             identity: input.binding_identity,
@@ -356,14 +355,14 @@ impl ProtocolBinding for AnthropicBinding {
             return Err(unsupported("max_output_tokens", "capability disabled"));
         }
         let max_tokens = input.generation.max_output_tokens.unwrap_or(1024);
-        if let Some(thinking) = &self.settings.anthropic_thinking {
-            if thinking.mode == "budget" && thinking.budget_tokens.unwrap_or(0) >= max_tokens as u64
-            {
-                return Err(unsupported(
-                    "anthropic_thinking.budget_tokens",
-                    "must be less than max_tokens",
-                ));
-            }
+        if let Some(thinking) = &self.settings.anthropic_thinking
+            && thinking.mode == "budget"
+            && thinking.budget_tokens.unwrap_or(0) >= max_tokens as u64
+        {
+            return Err(unsupported(
+                "anthropic_thinking.budget_tokens",
+                "must be less than max_tokens",
+            ));
         }
         if input.cache.enabled && !self.capabilities.prompt_cache {
             return Err(unsupported("prompt_cache", "capability disabled"));
@@ -1693,34 +1692,34 @@ impl CompletionsDecoder {
             }
             _ => return Err(completions_invalid("unknown finish reason")),
         }
-        if !self.usage_emitted {
-            if let Some(usage) = &self.usage {
-                output.push(ModelEvent::Usage {
-                    input_tokens: usage.prompt_tokens,
-                    output_tokens: usage.completion_tokens,
-                    total_tokens: usage.total_tokens,
-                    reasoning_tokens: usage
-                        .completion_tokens_details
-                        .as_ref()
-                        .and_then(|d| d.reasoning_tokens),
-                    cached_input_tokens: usage
-                        .prompt_tokens_details
-                        .as_ref()
-                        .and_then(|d| d.cached_tokens),
-                });
-                if let Some(details) = &usage.prompt_tokens_details {
-                    let read_tokens = details.cached_tokens.unwrap_or(0);
-                    let write_tokens = details.cache_write_tokens.unwrap_or(0);
-                    if read_tokens > 0 || write_tokens > 0 {
-                        output.push(ModelEvent::Cache {
-                            hit: read_tokens > 0,
-                            read_tokens,
-                            write_tokens,
-                        });
-                    }
+        if !self.usage_emitted
+            && let Some(usage) = &self.usage
+        {
+            output.push(ModelEvent::Usage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens),
+                cached_input_tokens: usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens),
+            });
+            if let Some(details) = &usage.prompt_tokens_details {
+                let read_tokens = details.cached_tokens.unwrap_or(0);
+                let write_tokens = details.cache_write_tokens.unwrap_or(0);
+                if read_tokens > 0 || write_tokens > 0 {
+                    output.push(ModelEvent::Cache {
+                        hit: read_tokens > 0,
+                        read_tokens,
+                        write_tokens,
+                    });
                 }
-                self.usage_emitted = true;
             }
+            self.usage_emitted = true;
         }
         if let Some(index) = output
             .iter()
@@ -2212,7 +2211,7 @@ impl CompletionsRequest {
             message_indices.push(index);
             if binding.flavor == CompletionsFlavor::DeepSeek
                 && message.role == MessageRole::Assistant
-                && (reasoning.is_empty() == false || !calls.is_empty())
+                && (!reasoning.is_empty() || !calls.is_empty())
             {
                 messages.push(CompletionsMessage {
                     role,
@@ -3398,14 +3397,11 @@ impl IncrementalSseFramer {
 
     fn drain_lines(&mut self, flush_partial: bool) -> Result<Vec<SseEvent>, std::str::Utf8Error> {
         let mut events = Vec::new();
-        loop {
-            let Some(index) = self
-                .buffer
-                .iter()
-                .position(|byte| *byte == b'\n' || *byte == b'\r')
-            else {
-                break;
-            };
+        while let Some(index) = self
+            .buffer
+            .iter()
+            .position(|byte| *byte == b'\n' || *byte == b'\r')
+        {
             let line = self.buffer.drain(..index).collect::<Vec<_>>();
             let delimiter = self.buffer[0];
             self.buffer.drain(..1);

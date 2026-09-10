@@ -52,7 +52,7 @@ fn metadata_record_at(sequence: u64, event: TranscriptEvent) -> TranscriptRecord
 
 #[test]
 fn history_validation_cache_reuses_only_an_extended_prefix() {
-    let records = vec![
+    let records = [
         record_at(
             1,
             TranscriptEvent::UserMessage {

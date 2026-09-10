@@ -59,13 +59,13 @@ impl HistorianRuntime {
         self.pending.lock().is_ok_and(|pending| pending.is_some())
     }
     pub(crate) fn cancel(&self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            if let Some(job) = pending.take() {
-                if let Ok(mut cancelled) = job.cancelled.lock() {
-                    *cancelled = true;
-                }
-                self.pool.cancel_run(&job.run_id);
+        if let Ok(mut pending) = self.pending.lock()
+            && let Some(job) = pending.take()
+        {
+            if let Ok(mut cancelled) = job.cancelled.lock() {
+                *cancelled = true;
             }
+            self.pool.cancel_run(&job.run_id);
         }
         self.emit(false, false);
     }
@@ -258,13 +258,13 @@ impl HistorianRuntime {
 }
 impl Drop for HistorianRuntime {
     fn drop(&mut self) {
-        if let Ok(pending) = self.pending.get_mut() {
-            if let Some(job) = pending.take() {
-                if let Ok(mut cancelled) = job.cancelled.lock() {
-                    *cancelled = true;
-                }
-                self.pool.cancel_run(&job.run_id);
+        if let Ok(pending) = self.pending.get_mut()
+            && let Some(job) = pending.take()
+        {
+            if let Ok(mut cancelled) = job.cancelled.lock() {
+                *cancelled = true;
             }
+            self.pool.cancel_run(&job.run_id);
         }
     }
 }

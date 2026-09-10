@@ -377,7 +377,7 @@ where
                 name,
                 arguments_json: arguments.to_string(),
             };
-            let within_limit = self.agent.max_tool_calls.map_or(true, |limit| {
+            let within_limit = self.agent.max_tool_calls.is_none_or(|limit| {
                 self.tool_call_count
                     .saturating_add(self.pending_async_tools.len())
                     .saturating_add(1)
@@ -524,7 +524,7 @@ where
         let mut seen = BTreeSet::new();
         for event in &partial.events {
             if let ModelEvent::ToolStarted { id, name } = event
-                && executed.contains(id) == false
+                && !executed.contains(id)
                 && seen.insert(id.clone())
             {
                 ordered.push((id.clone(), name.clone()));

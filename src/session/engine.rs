@@ -1221,9 +1221,8 @@ async fn run_engine_loop(
                     }
                     agent.set_subagent_child_factory(Arc::new(expert_factory));
                     expert_allowed_models = updated_allowed_models;
-                    if agent_name == "historian" {
-                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                    }
+                    if agent_name == "historian"
+                        && let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                     if agent_name == "reviewer" {
                         sticky_auto_reviewer.clear_sticky_session();
                     }
@@ -1292,9 +1291,8 @@ async fn run_engine_loop(
                     }
                     agent.set_subagent_child_factory(Arc::new(expert_factory));
                     expert_model_routes = updated_expert_model_routes;
-                    if agent_name == "historian" {
-                        if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                    }
+                    if agent_name == "historian"
+                        && let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                     if agent_name == "reviewer" {
                         sticky_auto_reviewer.clear_sticky_session();
                     }
@@ -1491,9 +1489,8 @@ async fn run_engine_loop(
                                 | SessionEngineCommand::Redo
                                 | SessionEngineCommand::NavigateHistory { .. }
                         );
-                        if history_navigation {
-                            if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                        }
+                        if history_navigation
+                            && let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         let prepared_history_factory = std::cell::RefCell::new(None);
                         let prepared_history_routes = std::cell::RefCell::new(None);
                         let current_primary_route = agent.primary_route().cloned();

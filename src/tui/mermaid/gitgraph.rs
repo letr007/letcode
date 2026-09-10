@@ -358,10 +358,10 @@ fn parse(source: &str) -> Option<ir::Diagram> {
         match command {
             "commit" => {
                 let metadata = parse_metadata(rest, rest_base)?;
-                if let Some(id) = &metadata.id {
-                    if !commit_ids.insert(id.text.clone()) {
-                        return None;
-                    }
+                if let Some(id) = &metadata.id
+                    && !commit_ids.insert(id.text.clone())
+                {
+                    return None;
                 }
                 items.push(ir::Item::Commit(ir::Commit {
                     id: metadata.id,

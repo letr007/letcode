@@ -1414,7 +1414,7 @@ namespace = "standard-cache"
 
     #[test]
     fn astra_strategy_is_inferred_and_can_be_overridden_explicitly() {
-        let inferred = AppConfig::load_from_path(&write_temp_config(config(
+        let inferred = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "gpt-6-astra",
             r#"[capabilities]
@@ -1446,7 +1446,7 @@ generation = { reasoning = true }
             ]
         );
 
-        let overridden = AppConfig::load_from_path(&write_temp_config(config(
+        let overridden = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "gpt-6-astra",
             "strategy = \"default\"\nprotocol = \"completions\"\n",
@@ -1462,7 +1462,7 @@ generation = { reasoning = true }
         );
         assert_eq!(overridden_route.protocol_id.as_str(), "completions");
 
-        let explicit_efforts = AppConfig::load_from_path(&write_temp_config(config(
+        let explicit_efforts = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "gpt-6-astra",
             r#"[capabilities]
@@ -1491,7 +1491,7 @@ credential = "secret-value"
 base_url = "https://example.invalid/v1"
 [providers.openai.models.gpt-6-astra]
 "#;
-        let loaded = AppConfig::load_from_path(&write_temp_config(inferred))
+        let loaded = AppConfig::load_from_path(write_temp_config(inferred))
             .expect("strategy defaults should supply protocol and flavor");
         let route = loaded
             .runtime_catalog
@@ -1505,7 +1505,7 @@ base_url = "https://example.invalid/v1"
             "alias",
             "strategy = \"astra\"\nprotocol = \"completions\"\n",
         );
-        let error = AppConfig::load_from_path(&write_temp_config(incompatible))
+        let error = AppConfig::load_from_path(write_temp_config(incompatible))
             .expect_err("incompatible explicit protocol must fail");
         assert!(format!("{error:#}").contains("requires protocol 'responses'"));
 
@@ -1514,7 +1514,7 @@ base_url = "https://example.invalid/v1"
             "gpt-6-astra",
             "[capabilities]\nreasoning = true\n",
         );
-        let error = AppConfig::load_from_path(&write_temp_config(missing_generation_support))
+        let error = AppConfig::load_from_path(write_temp_config(missing_generation_support))
             .expect_err("strategy-provided effort requires generation support");
         assert!(
             format!("{error:#}")
@@ -1524,13 +1524,13 @@ base_url = "https://example.invalid/v1"
 
     #[test]
     fn strategy_changes_runtime_fingerprint_and_unknown_values_fail() {
-        let default = AppConfig::load_from_path(&write_temp_config(config(
+        let default = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "alias",
             "strategy = \"default\"\n",
         )))
         .unwrap();
-        let astra = AppConfig::load_from_path(&write_temp_config(config(
+        let astra = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "alias",
             "strategy = \"astra\"\n",
@@ -1542,7 +1542,7 @@ base_url = "https://example.invalid/v1"
         );
 
         let unknown = config("openai", "alias", "strategy = \"unknown\"\n");
-        let error = AppConfig::load_from_path(&write_temp_config(unknown))
+        let error = AppConfig::load_from_path(write_temp_config(unknown))
             .expect_err("unknown strategy must fail");
         assert!(format!("{error:#}").contains("unknown variant"));
     }
@@ -1559,7 +1559,7 @@ websocket = true
 websocket = false
 "#,
         );
-        let loaded = AppConfig::load_from_path(&write_temp_config(text)).unwrap();
+        let loaded = AppConfig::load_from_path(write_temp_config(text)).unwrap();
         for (model, expected) in [("enabled", true), ("other", false), ("disabled", false)] {
             assert_eq!(
                 loaded
@@ -1623,7 +1623,7 @@ model_override = "wire-model"
             "base_url = \"https://legacy.invalid\"",
             "auth_mode = \"bearer\"",
         ] {
-            let error = AppConfig::load_from_path(&write_temp_config(&format!(
+            let error = AppConfig::load_from_path(write_temp_config(format!(
                 "{}\n{}\n",
                 config("openai", "model", ""),
                 legacy
@@ -1643,7 +1643,7 @@ model_override = "wire-model"
             "cache_control = true",
             "anthropic_betas = [\"legacy\"]",
         ] {
-            let error = AppConfig::load_from_path(&write_temp_config(&format!(
+            let error = AppConfig::load_from_path(write_temp_config(format!(
                 "{}\n{}\n",
                 config("openai", "model", ""),
                 legacy
@@ -1659,7 +1659,7 @@ model_override = "wire-model"
 
     #[test]
     fn capabilities_default_off_and_typed_cache_settings_validate() {
-        let loaded = AppConfig::load_from_path(&write_temp_config(config("openai", "model", "")))
+        let loaded = AppConfig::load_from_path(write_temp_config(config("openai", "model", "")))
             .expect("minimal new config should load");
         let route = loaded.runtime_catalog.route("openai", "model").unwrap();
         assert_eq!(route.capabilities, RouteCapabilities::default());
@@ -1671,7 +1671,7 @@ model_override = "wire-model"
             "model",
             "[cache]\nenabled = false\nretention = \"24h\"\n",
         );
-        let error = AppConfig::load_from_path(&write_temp_config(invalid));
+        let error = AppConfig::load_from_path(write_temp_config(invalid));
         assert!(error.is_err(), "disabled cache retention must fail");
     }
 
@@ -1759,7 +1759,7 @@ model_override = "wire-model"
 
     #[test]
     fn persists_new_schema_without_overwriting_external_changes() {
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(format!(
             "{}\n[agents.explorer]\nmodel = \"model\"\n",
             config("openai", "model", "")
         ));
@@ -1803,7 +1803,7 @@ model_override = "wire-model"
 
     #[test]
     fn rejects_retry_attempts_above_maximum() {
-        let error = AppConfig::load_from_path(&write_temp_config(config(
+        let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
             "[global.retry]\nmax_attempts = 9001\n",
@@ -1814,7 +1814,7 @@ model_override = "wire-model"
 
     #[test]
     fn provider_retry_can_override_backoff_mode_interval_and_attempts() {
-        let loaded = AppConfig::load_from_path(&write_temp_config(
+        let loaded = AppConfig::load_from_path(write_temp_config(
             r#"active_provider = "openai"
 [global.retry]
 enabled = true
@@ -1858,7 +1858,7 @@ base_url = "https://example.invalid/v1"
             "[capabilities]\nreasoning = true\n[generation]\nreasoning_effort = \"provider ultra\"",
         ] {
             assert!(
-                AppConfig::load_from_path(&write_temp_config(config("openai", "model", extra)))
+                AppConfig::load_from_path(write_temp_config(config("openai", "model", extra)))
                     .is_err(),
                 "invalid reasoning config should be rejected: {extra}"
             );
@@ -1868,7 +1868,7 @@ base_url = "https://example.invalid/v1"
     #[test]
     fn model_parallel_tool_calls_default_to_disabled_and_can_be_enabled() {
         let default_config =
-            AppConfig::load_from_path(&write_temp_config(config("openai", "model", "")))
+            AppConfig::load_from_path(write_temp_config(config("openai", "model", "")))
                 .expect("default config should load");
         assert!(!default_config.providers["openai"].models["model"].parallel_tool_calls);
 
@@ -1877,7 +1877,7 @@ base_url = "https://example.invalid/v1"
             "model",
             "[capabilities]\nparallel_tool_calls = true\ngeneration = { parallel_tool_calls = true }\n[generation]\nparallel_tool_calls = true",
         );
-        let enabled_config = AppConfig::load_from_path(&write_temp_config(enabled))
+        let enabled_config = AppConfig::load_from_path(write_temp_config(enabled))
             .expect("enabled config should load");
         assert!(enabled_config.providers["openai"].models["model"].parallel_tool_calls);
     }
@@ -1889,7 +1889,7 @@ base_url = "https://example.invalid/v1"
             "claude-opus",
             "protocol = \"anthropic\"\n[protocol_settings]\nanthropic_betas = [\"context-1m-2025-08-07\"]",
         );
-        let loaded = AppConfig::load_from_path(&write_temp_config(anthropic))
+        let loaded = AppConfig::load_from_path(write_temp_config(anthropic))
             .expect("anthropic beta config loads");
         assert_eq!(
             loaded.providers["anyrouter"].models["claude-opus"].anthropic_betas,
@@ -1901,7 +1901,7 @@ base_url = "https://example.invalid/v1"
             "model",
             "[protocol_settings]\nanthropic_betas = [\"context-1m-2025-08-07\"]",
         );
-        let error = AppConfig::load_from_path(&write_temp_config(invalid))
+        let error = AppConfig::load_from_path(write_temp_config(invalid))
             .expect_err("non-anthropic beta config should be rejected");
         assert!(format!("{error:#}").contains("protocol"));
     }
@@ -1909,7 +1909,7 @@ base_url = "https://example.invalid/v1"
     #[test]
     fn anthropic_model_override_requires_provider_auth_mode() {
         let missing = config("mixed", "claude", "protocol = \"anthropic\"");
-        let loaded = AppConfig::load_from_path(&write_temp_config(missing))
+        let loaded = AppConfig::load_from_path(write_temp_config(missing))
             .expect("named auth is supplied by the new schema");
         assert_eq!(
             loaded.providers["mixed"].auth_mode,
@@ -1928,7 +1928,7 @@ credential = "config-key"
 base_url = "https://example.invalid/v1"
 [providers.mixed.models.claude]
 "#;
-        let loaded = AppConfig::load_from_path(&write_temp_config(configured))
+        let loaded = AppConfig::load_from_path(write_temp_config(configured))
             .expect("configured override should load");
         assert_eq!(
             loaded.providers["mixed"].auth_mode,
@@ -1938,7 +1938,7 @@ base_url = "https://example.invalid/v1"
 
     #[test]
     fn rejects_zero_model_effective_input_limit_tokens() {
-        let error = AppConfig::load_from_path(&write_temp_config(config(
+        let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
             "effective_input_limit_tokens = 0",
@@ -1949,7 +1949,7 @@ base_url = "https://example.invalid/v1"
 
     #[test]
     fn parses_provider_qualified_expert_routes_and_preserves_duplicate_model_ids() {
-        let loaded = AppConfig::load_from_path(&write_temp_config(
+        let loaded = AppConfig::load_from_path(write_temp_config(
             r#"active_provider = "primary"
 [agents.explorer]
 model = "shared"
@@ -1999,7 +1999,7 @@ base_url = "https://expert.invalid/v1"
 
     #[test]
     fn parses_and_validates_expert_allowed_models() {
-        let loaded = AppConfig::load_from_path(&write_temp_config(
+        let loaded = AppConfig::load_from_path(write_temp_config(
             r#"active_provider = "primary"
 [agents.explorer]
 model = "shared"
@@ -2046,7 +2046,7 @@ base_url = "https://expert.invalid/v1"
                 );
             }
             assert!(
-                AppConfig::load_from_path(&write_temp_config(text)).is_err(),
+                AppConfig::load_from_path(write_temp_config(text)).is_err(),
                 "{allowed}"
             );
         }
@@ -2064,38 +2064,38 @@ credential = "key"
 base_url = "https://example.invalid"
 [providers.openai.models.model]
 "#;
-        assert!(AppConfig::load_from_path(&write_temp_config(incomplete)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(incomplete)).is_err());
 
         let unknown_provider = config(
             "openai",
             "model",
             "[agents.explorer]\nprovider = \"missing\"\nmodel = \"model\"",
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(unknown_provider)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(unknown_provider)).is_err());
 
         let unknown_model = config(
             "openai",
             "model",
             "[agents.explorer]\nprovider = \"openai\"\nmodel = \"missing\"",
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(unknown_model)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(unknown_model)).is_err());
     }
 
     #[test]
     fn rejects_unknown_subagent_name_and_model_override() {
         let unknown_agent = config("openai", "model", "[agents.nosuch]\nmodel = \"model\"");
-        assert!(AppConfig::load_from_path(&write_temp_config(unknown_agent)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(unknown_agent)).is_err());
         let unknown_model = config(
             "openai",
             "model",
             "[agents.explorer]\nmodel = \"missing-model\"",
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(unknown_model)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(unknown_model)).is_err());
     }
 
     #[test]
     fn rejects_reasoning_parameters_when_reasoning_is_disabled() {
-        let error = AppConfig::load_from_path(&write_temp_config(config(
+        let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
             "[capabilities]\nreasoning = false\n[generation]\nreasoning_effort = \"medium\"",
@@ -2106,7 +2106,7 @@ base_url = "https://example.invalid"
 
     #[test]
     fn rejects_out_of_range_sampling_parameters() {
-        let error = AppConfig::load_from_path(&write_temp_config(config(
+        let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
             "[capabilities]\ngeneration = { temperature = true }\n[generation]\ntemperature = 3.0",
@@ -2117,9 +2117,9 @@ base_url = "https://example.invalid"
 
     #[test]
     fn persists_expert_allowed_models_without_rewriting_unrelated_config() {
-        let path = write_temp_config(&format!(
-            "# keep this comment\nactive_provider = \"primary\"\n\n[providers.primary]\nprotocol = \"responses\"\ndefault_model = \"old\"\nflavor = \"standard\"\n[providers.primary.auth]\ntype = \"bearer\"\ncredential = \"primary-key\"\n[providers.primary.endpoints]\nbase_url = \"https://primary.invalid/v1\"\n[providers.primary.models.old]\n\n[providers.expert]\nprotocol = \"responses\"\ndefault_model = \"shared\"\nflavor = \"standard\"\n[providers.expert.auth]\ntype = \"bearer\"\ncredential = \"expert-key\"\n[providers.expert.endpoints]\nbase_url = \"https://expert.invalid/v1\"\n[providers.expert.models.shared]\n\n[agents.explorer]\nmodel = \"old\"\n# preserve this trailing comment\n"
-        ));
+        let path = write_temp_config(
+            "# keep this comment\nactive_provider = \"primary\"\n\n[providers.primary]\nprotocol = \"responses\"\ndefault_model = \"old\"\nflavor = \"standard\"\n[providers.primary.auth]\ntype = \"bearer\"\ncredential = \"primary-key\"\n[providers.primary.endpoints]\nbase_url = \"https://primary.invalid/v1\"\n[providers.primary.models.old]\n\n[providers.expert]\nprotocol = \"responses\"\ndefault_model = \"shared\"\nflavor = \"standard\"\n[providers.expert.auth]\ntype = \"bearer\"\ncredential = \"expert-key\"\n[providers.expert.endpoints]\nbase_url = \"https://expert.invalid/v1\"\n[providers.expert.models.shared]\n\n[agents.explorer]\nmodel = \"old\"\n# preserve this trailing comment\n",
+        );
         persist_expert_allowed_models(
             &path,
             "explorer",
@@ -2140,7 +2140,7 @@ base_url = "https://example.invalid"
     #[test]
     fn persists_through_config_symlink_without_replacing_it() {
         use std::os::unix::fs::symlink;
-        let target = write_temp_config(&format!(
+        let target = write_temp_config(format!(
             "{}\n\n[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\"]",
             config("openai", "model", "")
         ));
@@ -2162,7 +2162,7 @@ base_url = "https://example.invalid"
 
     #[test]
     fn rejects_invalid_mcp_local_config() {
-        let error = AppConfig::load_from_path(&write_temp_config(&format!(
+        let error = AppConfig::load_from_path(write_temp_config(format!(
             "{}\n\n[mcp.empty]\ntype = \"local\"\ncommand = []",
             config("openai", "model", "")
         )))
@@ -2172,7 +2172,7 @@ base_url = "https://example.invalid"
 
     #[test]
     fn rejects_remote_mcp_oauth_until_supported() {
-        let error = AppConfig::load_from_path(&write_temp_config(&format!(
+        let error = AppConfig::load_from_path(write_temp_config(format!(
             "{}\n\n[mcp.docs]\ntype = \"remote\"\nurl = \"https://example.invalid/mcp\"\noauth = true",
             config("openai", "model", "")
         )))
@@ -2183,20 +2183,20 @@ base_url = "https://example.invalid"
     #[test]
     fn rejects_unknown_fields_and_zero_limits_and_empty_identifiers() {
         let root_unknown = format!("unexpected = true\n{}", config("openai", "model", ""));
-        assert!(AppConfig::load_from_path(&write_temp_config(root_unknown)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(root_unknown)).is_err());
         let zero = format!(
             "[global]\nmax_iterations = 0\n\n{}",
             config("openai", "model", "")
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(zero)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(zero)).is_err());
         let empty = config("openai", "model", "default_model = \"   \"");
-        assert!(AppConfig::load_from_path(&write_temp_config(empty)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(empty)).is_err());
     }
 
     #[test]
     fn errors_when_active_provider_is_missing() {
         let error =
-            AppConfig::load_from_path(&write_temp_config(config("openai", "model", "").replace(
+            AppConfig::load_from_path(write_temp_config(config("openai", "model", "").replace(
                 "active_provider = \"openai\"",
                 "active_provider = \"missing\"",
             )))
@@ -2211,27 +2211,27 @@ base_url = "https://example.invalid"
             "model",
             "[cache]\nenabled = false\nretention = \"in_memory\"",
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(disabled)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(disabled)).is_err());
         let completions = config(
             "openai",
             "model",
             "protocol = \"completions\"\n[cache]\nenabled = true\nretention = \"24h\"",
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(completions)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(completions)).is_err());
         for namespace in ["   ", &"a".repeat(65), "valid\u{0007}name"] {
             let value = config(
                 "openai",
                 "model",
                 &format!("[cache]\nenabled = true\nnamespace = {namespace:?}"),
             );
-            assert!(AppConfig::load_from_path(&write_temp_config(value)).is_err());
+            assert!(AppConfig::load_from_path(write_temp_config(value)).is_err());
         }
         let unknown = config(
             "openai",
             "model",
             "[cache]\nenabled = true\nlayout = \"v1\"",
         );
-        assert!(AppConfig::load_from_path(&write_temp_config(unknown)).is_err());
+        assert!(AppConfig::load_from_path(write_temp_config(unknown)).is_err());
     }
 
     fn loaded_config_for_allowlist(allowed_models: &str) -> String {

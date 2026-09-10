@@ -34,7 +34,11 @@ pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRender
                     .unwrap_or(0)
                     .checked_add(3)?,
             )
-            .max((inline_width <= width).then_some(inline_width).unwrap_or(0));
+            .max(if inline_width <= width {
+                inline_width
+            } else {
+                0
+            });
         if section_width > width {
             return None;
         }

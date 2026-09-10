@@ -659,8 +659,7 @@ fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() 
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert!(lines[..lines.len() - 1].iter().all(|line| {
-        serde_json::from_str::<Value>(line).unwrap()["schema_version"]
-            == Value::from(JOURNAL_SCHEMA_VERSION)
+        serde_json::from_str::<Value>(line).unwrap()["schema_version"] == JOURNAL_SCHEMA_VERSION
     }));
     assert_eq!(
         serde_json::from_str::<Value>(lines.last().unwrap()).unwrap()["schema_version"],

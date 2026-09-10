@@ -1481,17 +1481,14 @@ impl OpaqueReplayState {
 }
 
 /// The only supported provider/model flavor during the staged runtime cutover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderFlavor {
+    #[default]
     Standard,
     Deepseek,
-}
-
-impl Default for ProviderFlavor {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 impl ProviderFlavor {
@@ -2524,29 +2521,29 @@ fn validate_generation_defaults(
             reason: "Responses does not support stop sequences".into(),
         });
     }
-    if let Some(value) = config.generation.temperature {
-        if !value.is_finite() || !(0.0..=2.0).contains(&value) || !generation.temperature {
-            return Err(RuntimeConfigError::InvalidValue {
-                field: path("temperature"),
-                reason: "requires capability and must be between 0 and 2".into(),
-            });
-        }
+    if let Some(value) = config.generation.temperature
+        && (!value.is_finite() || !(0.0..=2.0).contains(&value) || !generation.temperature)
+    {
+        return Err(RuntimeConfigError::InvalidValue {
+            field: path("temperature"),
+            reason: "requires capability and must be between 0 and 2".into(),
+        });
     }
-    if let Some(value) = config.generation.top_p {
-        if !value.is_finite() || !(0.0..=1.0).contains(&value) || !generation.top_p {
-            return Err(RuntimeConfigError::InvalidValue {
-                field: path("top_p"),
-                reason: "requires capability and must be between 0 and 1".into(),
-            });
-        }
+    if let Some(value) = config.generation.top_p
+        && (!value.is_finite() || !(0.0..=1.0).contains(&value) || !generation.top_p)
+    {
+        return Err(RuntimeConfigError::InvalidValue {
+            field: path("top_p"),
+            reason: "requires capability and must be between 0 and 1".into(),
+        });
     }
-    if let Some(value) = config.generation.max_output_tokens {
-        if value == 0 || value > u32::MAX as u64 || !generation.max_output_tokens {
-            return Err(RuntimeConfigError::InvalidValue {
-                field: path("max_output_tokens"),
-                reason: "requires capability and must be between 1 and u32::MAX".into(),
-            });
-        }
+    if let Some(value) = config.generation.max_output_tokens
+        && (value == 0 || value > u32::MAX as u64 || !generation.max_output_tokens)
+    {
+        return Err(RuntimeConfigError::InvalidValue {
+            field: path("max_output_tokens"),
+            reason: "requires capability and must be between 1 and u32::MAX".into(),
+        });
     }
     if config.generation.reasoning_effort.is_some()
         || !config.generation.reasoning_efforts.is_empty()
@@ -2579,13 +2576,13 @@ fn validate_generation_defaults(
                 });
             }
         }
-        if let Some(default_effort) = &config.generation.reasoning_effort {
-            if !valid_effort(default_effort) {
-                return Err(RuntimeConfigError::InvalidValue {
-                    field: path("reasoning_effort"),
-                    reason: "must be a valid reasoning identifier".into(),
-                });
-            }
+        if let Some(default_effort) = &config.generation.reasoning_effort
+            && !valid_effort(default_effort)
+        {
+            return Err(RuntimeConfigError::InvalidValue {
+                field: path("reasoning_effort"),
+                reason: "must be a valid reasoning identifier".into(),
+            });
         }
         if let Some(default_effort) = &config.generation.reasoning_effort
             && !config.generation.reasoning_efforts.is_empty()
@@ -3462,10 +3459,10 @@ pub fn retry_hint_from_headers(headers: &reqwest::header::HeaderMap) -> RetryHin
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return RetryHint::RetryAfterSeconds(seconds);
     }
-    if let Ok(at) = httpdate::parse_http_date(value.trim()) {
-        if let Ok(delay) = at.duration_since(std::time::SystemTime::now()) {
-            return RetryHint::RetryAfterSeconds(delay.as_secs());
-        }
+    if let Ok(at) = httpdate::parse_http_date(value.trim())
+        && let Ok(delay) = at.duration_since(std::time::SystemTime::now())
+    {
+        return RetryHint::RetryAfterSeconds(delay.as_secs());
     }
     RetryHint::Retryable
 }

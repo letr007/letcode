@@ -125,10 +125,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
                     snapshot.context_scope_revision,
                     source_ids.join("|")
                 );
-                let id = format!(
-                    "{}",
-                    crate::request_builder::sha256_hex(identity.as_bytes())
-                );
+                let id = crate::request_builder::sha256_hex(identity.as_bytes()).to_string();
                 return Ok(Some(HistoryWork {
                     id,
                     session_id,
@@ -168,14 +165,11 @@ fn pending_application(agent: &Agent, hard: bool) -> Result<Option<HistoryApplic
     let mut offset = 0;
     let mut publication_ids = Vec::new();
     let mut new_compartments = Vec::new();
-    loop {
-        let Some(first) = raw
-            .get(offset)
-            .and_then(|f| f.source_provenance.as_ref())
-            .and_then(|p| p.source_id.as_ref())
-        else {
-            break;
-        };
+    while let Some(first) = raw
+        .get(offset)
+        .and_then(|f| f.source_provenance.as_ref())
+        .and_then(|p| p.source_id.as_ref())
+    {
         let Some(p) = archive
             .publications
             .values()

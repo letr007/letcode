@@ -1266,37 +1266,38 @@ max_output_tokens = 128
             .await
             .expect("local Responses retry test timed out");
 
-            let events = events.lock().unwrap();
-            if final_failure || reject_reset {
-                assert!(result.is_err());
-                assert_eq!(agent.history_for_test(), original);
-                assert!(
-                    !events
-                        .iter()
-                        .any(|event| matches!(event, AgentEvent::ContextCompacted(_)))
-                );
-                assert!(matches!(
-                    events.last(),
-                    Some(AgentEvent::ContextCompactionFailed { .. })
-                ));
-            } else {
-                result.expect("summary succeeds after retry");
-                assert_eq!(
-                    agent.history_for_test(),
-                    vec![HistoryItem::context_summary("successful summary")]
-                );
-                assert!(matches!(
-                    events.as_slice(),
-                    [
-                        AgentEvent::ContextCompactionStarted { trigger: CompactionTrigger::Manual },
-                        AgentEvent::ContextCompactionDelta { delta },
-                        AgentEvent::ContextCompactionStarted { trigger: CompactionTrigger::Manual },
-                        AgentEvent::ContextCompactionDelta { delta: second },
-                        AgentEvent::ContextCompacted(committed),
-                    ] if delta == "failed attempt" && second == "successful summary" && committed.summary == "successful summary"
-                ));
+            {
+                let events = events.lock().unwrap();
+                if final_failure || reject_reset {
+                    assert!(result.is_err());
+                    assert_eq!(agent.history_for_test(), original);
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, AgentEvent::ContextCompacted(_)))
+                    );
+                    assert!(matches!(
+                        events.last(),
+                        Some(AgentEvent::ContextCompactionFailed { .. })
+                    ));
+                } else {
+                    result.expect("summary succeeds after retry");
+                    assert_eq!(
+                        agent.history_for_test(),
+                        vec![HistoryItem::context_summary("successful summary")]
+                    );
+                    assert!(matches!(
+                        events.as_slice(),
+                        [
+                            AgentEvent::ContextCompactionStarted { trigger: CompactionTrigger::Manual },
+                            AgentEvent::ContextCompactionDelta { delta },
+                            AgentEvent::ContextCompactionStarted { trigger: CompactionTrigger::Manual },
+                            AgentEvent::ContextCompactionDelta { delta: second },
+                            AgentEvent::ContextCompacted(committed),
+                        ] if delta == "failed attempt" && second == "successful summary" && committed.summary == "successful summary"
+                    ));
+                }
             }
-            drop(events);
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await
                 .expect("local Responses server timed out")
