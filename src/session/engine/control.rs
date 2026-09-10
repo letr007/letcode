@@ -47,8 +47,6 @@ pub(crate) enum SessionEngineCommand {
     ResumeSession(String),
     NewSession,
     ToggleMcpServer(String),
-    /// Toggle the anchored bootstrap experiment for this session.
-    AnchoredToggle,
     #[cfg(test)]
     InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
 }
@@ -92,7 +90,6 @@ impl SessionEngineCommand {
                 model_ids,
             },
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
-            SessionCommand::AnchoredToggle => Self::AnchoredToggle,
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
             SessionCommand::SetFakeClient(client) => Self::SetFakeClient(client),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
@@ -128,9 +125,6 @@ pub(crate) fn session_engine_command_as_session_command(
         }
         SessionEngineCommand::SetPermissionMode(mode) => {
             Some(crate::session::SessionCommand::SetPermissionMode(*mode))
-        }
-        SessionEngineCommand::AnchoredToggle => {
-            Some(crate::session::SessionCommand::AnchoredToggle)
         }
         SessionEngineCommand::ToggleFastMode => {
             Some(crate::session::SessionCommand::ToggleFastMode)
@@ -221,7 +215,6 @@ pub(crate) fn session_engine_command_as_idle_session_command(
         | crate::session::SessionCommand::ResumeSession(_)
         | crate::session::SessionCommand::NewSession
         | crate::session::SessionCommand::ToggleMcpServer(_)
-        | crate::session::SessionCommand::AnchoredToggle
         | crate::session::SessionCommand::Interrupt => None,
     }
 }
@@ -314,7 +307,6 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         | SessionEngineCommand::ViewChild { .. }
         | SessionEngineCommand::ViewParent
         | SessionEngineCommand::ToggleFastMode
-        | SessionEngineCommand::AnchoredToggle
         | SessionEngineCommand::ResumeSession(_)
         | SessionEngineCommand::NewSession
         | SessionEngineCommand::ToggleMcpServer(_) => None,

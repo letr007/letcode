@@ -1165,8 +1165,6 @@ pub struct TuiState {
     pub model_label: String,
     pub fast_mode_enabled: bool,
     pub language: Option<crate::tui::i18n::Language>,
-    /// Anchored bootstrap experiment active for the current session (composer badge).
-    pub anchored_active: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
     pub sidebar_model_token_usage: Option<ModelTokenUsage>,
     pub output_token_rate: Option<u64>,
@@ -1267,7 +1265,6 @@ impl Default for TuiState {
             model_label: "pending runtime model".into(),
             fast_mode_enabled: false,
             language: None,
-            anchored_active: false,
             model_token_usage: None,
             sidebar_model_token_usage: None,
             output_token_rate: None,
@@ -1384,10 +1381,6 @@ impl TuiState {
 
     pub fn set_fast_mode_enabled(&mut self, enabled: bool) {
         self.fast_mode_enabled = enabled;
-    }
-
-    pub fn set_anchored_active(&mut self, active: bool) {
-        self.anchored_active = active;
     }
 
     pub fn set_model_context_window(&mut self, context_window_tokens: Option<u64>) {

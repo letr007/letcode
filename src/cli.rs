@@ -907,8 +907,7 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         | CommandIntent::Resume(_)
         | CommandIntent::NewSession
         | CommandIntent::Child(_)
-        | CommandIntent::Parent
-        | CommandIntent::AnchoredToggle => unreachable!(
+        | CommandIntent::Parent => unreachable!(
             "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
         ),
     }
@@ -925,9 +924,6 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
             }
         }
         SessionCommand::SetPermissionMode(mode) => ReplCommand::PermissionSet(mode),
-        SessionCommand::AnchoredToggle => ReplCommand::Unsupported(
-            "CLI does not support /anchored yet; use the TUI to toggle the experiment.".into(),
-        ),
         SessionCommand::SetModel(model_id) => ReplCommand::ModelSet(model_id),
         SessionCommand::SetExpertModel { .. }
         | SessionCommand::SetExpertAllowedModels { .. } => ReplCommand::Unsupported(

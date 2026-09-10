@@ -12,7 +12,6 @@
 
 mod agent;
 mod agent_event_journal;
-mod anchored_bootstrap;
 mod cli;
 mod code_analysis;
 mod command;
@@ -50,7 +49,6 @@ mod user_content;
 mod workflow_state;
 
 use agent::{Agent, ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
-use anchored_bootstrap::AnchoredBootstrap;
 use anyhow::{Context, Result, anyhow, bail};
 use config::AppConfig;
 use delegation::supported_agent_names;
@@ -142,9 +140,6 @@ async fn main() -> Result<()> {
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
-    agent.set_anchored(AnchoredBootstrap::from_config(
-        &config.experiments.anchored_bootstrap,
-    ))?;
     agent.set_fast_mode(FastMode::load(
         &config.config_path,
         config.fast_mode_enabled,

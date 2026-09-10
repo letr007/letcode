@@ -1429,9 +1429,6 @@ async fn run_engine_loop(
                                     SessionTransportEvent::ReasoningEffortChanged { effort },
                                 );
                             }
-                            let _ = session_transport_tx.send(SessionTransportEvent::AnchoredChanged {
-                                active: agent.anchored_active(),
-                            });
                             let route_api_keys = route_api_key_configured
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
@@ -2078,24 +2075,6 @@ async fn run_engine_loop(
                         flush_parked_commands(&mut deferred_commands, &mut parked_commands);
                         continue;
                     }
-                    SessionEngineCommand::AnchoredToggle => {
-                        let before = agent.anchored_active();
-                        let notice = agent.toggle_anchored();
-                        let after = agent.anchored_active();
-                        // Only broadcast the badge change when the toggle actually
-                        // flipped; on an off-whitelist/unconfigured session the
-                        // notice alone explains the state.
-                        if before != after {
-                            let _ = session_transport_tx
-                                .send(SessionTransportEvent::AnchoredChanged { active: after });
-                        }
-                        if notice.contains("unavailable") {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                NoticeEvent::info(notice),
-                            ));
-                        }
-                        continue;
-                    }
                     SessionEngineCommand::Compact => {
                         let active_route_has_credentials = {
                             let route_api_keys = route_api_key_configured
@@ -2472,9 +2451,6 @@ async fn run_engine_loop(
                         let _ = session_transport_tx.send(started_event);
                         let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                             model_id: new_session_model_id,
-                        });
-                        let _ = session_transport_tx.send(SessionTransportEvent::AnchoredChanged {
-                            active: agent.anchored_active(),
                         });
                         continue;
                     }

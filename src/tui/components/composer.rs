@@ -894,10 +894,6 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
         spans.push(Span::styled(" · ", dim));
         spans.push(Span::styled("fast", accent));
     }
-    if state.anchored_active {
-        spans.push(Span::styled(" · ", dim));
-        spans.push(Span::styled("anchored", accent));
-    }
     if let Some(client) = state.fake_client {
         let fake_style = Style::default()
             .fg(theme.fake)

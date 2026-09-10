@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- 移除 Anchored Bootstrap 实验及其 `[experiments.anchored_bootstrap]` 配置段与 `/anchored` 命令；已启用该实验的配置需删除对应段落，否则加载时会因未知字段报错。
+
 ## [0.11.0] - 2026-09-05
 
 ### Added
