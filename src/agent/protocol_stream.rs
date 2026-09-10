@@ -548,18 +548,26 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    async fn persist_partial_assistant_filtered(
+    /// A turn exists only when it carries text or tool calls. Reasoning and opaque
+    /// replay are payload: no transcript record and no provider message can carry
+    /// them alone, so a partial turn reduced to reasoning is dropped.
+    ///
+    /// Returns whether the attempt has an assistant turn in history.
+    async fn record_assistant_turn(
         &mut self,
         assistant: &ModelMessage,
         allowed_call_ids: Option<&BTreeSet<String>>,
-    ) -> std::result::Result<(), ModelFailure> {
+    ) -> std::result::Result<bool, ModelFailure> {
         if self.attempt_assistant_persisted {
-            return Ok(());
+            return Ok(true);
         }
         let (text, reasoning, replay, calls) =
             assistant_history_parts_filtered(assistant, allowed_call_ids);
-        if text.is_empty() && reasoning.is_empty() && replay.is_none() && calls.is_empty() {
-            return Ok(());
+        // The flag tracks that this attempt's assistant output was handled, not that
+        // a turn exists.
+        self.attempt_assistant_persisted = true;
+        if text.is_empty() && calls.is_empty() {
+            return Ok(false);
         }
         self.agent
             .append_history_item(HistoryItem::AssistantTurn {
@@ -569,15 +577,12 @@ where
                 calls: calls.clone(),
             })
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
-        self.attempt_assistant_persisted = true;
         if calls.is_empty() {
-            if !text.is_empty() {
-                (self.on_event)(AgentEvent::AssistantMessage { content: text })
-                    .await
-                    .map_err(|error| {
-                        runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
-                    })?;
-            }
+            (self.on_event)(AgentEvent::AssistantMessage { content: text })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
         } else {
             (self.on_event)(AgentEvent::AssistantToolCallBatch {
                 text: (!text.is_empty()).then_some(text),
@@ -588,7 +593,17 @@ where
             .await
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    async fn persist_partial_assistant_filtered(
+        &mut self,
+        assistant: &ModelMessage,
+        allowed_call_ids: Option<&BTreeSet<String>>,
+    ) -> std::result::Result<(), ModelFailure> {
+        self.record_assistant_turn(assistant, allowed_call_ids)
+            .await
+            .map(|_| ())
     }
 
     async fn reject_tool_batch_impl(
@@ -1151,36 +1166,31 @@ where
         &mut self,
         assistant: &ModelMessage,
     ) -> std::result::Result<(), ModelFailure> {
-        let (text, reasoning, replay, calls) = assistant_history_parts(assistant);
-        self.agent
-            .append_history_item(HistoryItem::AssistantTurn {
-                text: (!text.is_empty()).then_some(text.clone()),
-                reasoning_content: (!reasoning.is_empty()).then_some(reasoning.clone()),
-                replay: replay.clone(),
-                calls: calls.clone(),
-            })
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
-        self.attempt_assistant_persisted = true;
+        let recorded = self.record_assistant_turn(assistant, None).await?;
         if let Some(ws_transport) = &self.ws_transport {
-            let frontier = self
-                .agent
-                .active_protocol_frames()
-                .iter()
-                .rev()
-                .find_map(|frame| {
-                    matches!(
-                        frame.item,
-                        crate::protocol_frames::ProtocolFrameItem::AssistantTurn { .. }
-                    )
-                    .then(|| {
-                        frame
-                            .source_provenance
-                            .as_ref()
-                            .and_then(|provenance| provenance.source_span)
-                            .map(|span| span.end_sequence)
+            // Resuming from an earlier turn's frontier would replay the wrong chain.
+            let frontier = if recorded {
+                self.agent
+                    .active_protocol_frames()
+                    .iter()
+                    .rev()
+                    .find_map(|frame| {
+                        matches!(
+                            frame.item,
+                            crate::protocol_frames::ProtocolFrameItem::AssistantTurn { .. }
+                        )
+                        .then(|| {
+                            frame
+                                .source_provenance
+                                .as_ref()
+                                .and_then(|provenance| provenance.source_span)
+                                .map(|span| span.end_sequence)
+                        })
+                        .flatten()
                     })
-                    .flatten()
-                });
+            } else {
+                None
+            };
             if let (Some(prepared), Some(frontier)) = (&self.prepared, frontier) {
                 if let Some(inspection) = &prepared.inspection {
                     self.ws_previous = Some(WsRequestSnapshot {
@@ -1241,24 +1251,6 @@ where
         }
         if let Some(usage) = self.usage {
             self.agent.install_provider_usage_anchor(usage);
-        }
-        if calls.is_empty() {
-            if !text.is_empty() {
-                (self.on_event)(AgentEvent::AssistantMessage { content: text })
-                    .await
-                    .map_err(|error| {
-                        runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
-                    })?;
-            }
-        } else {
-            (self.on_event)(AgentEvent::AssistantToolCallBatch {
-                text: (!text.is_empty()).then_some(text),
-                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-                reasoning_wire: replay.and_then(|value| value.payload_json()),
-                calls,
-            })
-            .await
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
         }
         Ok(())
     }
@@ -2384,5 +2376,74 @@ parallel_tool_calls = true
             item,
             HistoryItem::ToolOutput { call_id, .. } if call_id == "call-plain"
         )));
+    }
+
+    #[tokio::test]
+    async fn rejecting_an_incomplete_tool_batch_keeps_a_reasoning_only_turn_out_of_history() {
+        let mut agent = Agent::new("model", 4, 4);
+        agent.runtime_snapshot.current_turn_id = Some(1);
+        agent.turn.turn_id = 1;
+        let route = recovery_route();
+        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut on_event = {
+            let events = std::sync::Arc::clone(&events);
+            move |event: AgentEvent| {
+                events.lock().expect("events lock").push(event);
+                async { Ok::<(), anyhow::Error>(()) }
+            }
+        };
+        let mut approve = |_request: PermissionRequest| async {
+            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
+        };
+        let mut driver = resolved_driver(
+            &mut agent,
+            route,
+            &mut on_delta,
+            &mut on_event,
+            &mut approve,
+        );
+        let partial = ModelAttemptSnapshot {
+            assistant: ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![
+                    ContentPart::Reasoning {
+                        item_id: "reasoning".into(),
+                        text: "plan the exploration".into(),
+                        replay: None,
+                    },
+                    ContentPart::ToolCall {
+                        id: "call-explore".into(),
+                        name: "workflow__todos".into(),
+                        arguments: plain_tool_arguments(),
+                    },
+                ],
+            },
+            completed_tools: Vec::new(),
+            events: vec![ModelEvent::ToolStarted {
+                id: "call-explore".into(),
+                name: "workflow__todos".into(),
+            }],
+            ..ModelAttemptSnapshot::default()
+        };
+        let failure = ModelFailure::new(
+            crate::model_runtime::FailurePhase::Decode,
+            crate::model_runtime::FailureKind::MalformedResponse,
+        )
+        .with_code("invalid_completions_event");
+        TurnDriver::reject_tool_batch(&mut driver, &partial, &failure)
+            .await
+            .unwrap();
+        assert!(driver.agent.history_for_test().is_empty());
+        let cancelled = events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCallCancelled { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cancelled, vec!["call-explore".to_string()]);
     }
 }

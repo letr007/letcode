@@ -1236,6 +1236,30 @@ max_output_tokens=128
     }
 
     #[test]
+    fn live_history_matches_the_journal_projection() {
+        // The live view may lead the journal, but it must never hold an item the
+        // journal cannot express: a restart projects this same history.
+        let root = tempfile::tempdir().unwrap();
+        let (mut agent, recorder) = agent_with_recorder(root.path());
+        recorder
+            .lock()
+            .unwrap()
+            .record_user_message("Inspect source")
+            .unwrap();
+        agent
+            .append_history_item(HistoryItem::user("Inspect source"))
+            .unwrap();
+        append_live_group(&mut agent, &recorder, "first", 2);
+
+        assert_eq!(
+            agent.active_history_items(),
+            persisted_history_snapshot(&agent)
+                .unwrap()
+                .active_history_items()
+        );
+    }
+
+    #[test]
     fn historian_sources_reject_a_different_persisted_scope() {
         let root = tempfile::tempdir().unwrap();
         let (mut agent, _recorder) = agent_with_recorder(root.path());

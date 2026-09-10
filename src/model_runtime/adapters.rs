@@ -2243,11 +2243,14 @@ impl CompletionsRequest {
                     _ => {}
                 }
             }
-            if message.role == MessageRole::Assistant
-                && content.is_empty()
-                && calls.is_empty()
-                && (binding.flavor != CompletionsFlavor::DeepSeek || reasoning.is_empty())
-            {
+            if message.role == MessageRole::Assistant && content.is_empty() && calls.is_empty() {
+                // Completions providers require content or tool calls; reasoning_content
+                // alone is not a message.
+                tracing::warn!(
+                    message_index = index,
+                    model = %input.control.model,
+                    "omitting assistant message without content or tool calls"
+                );
                 continue;
             }
             message_indices.push(index);
@@ -4868,7 +4871,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_completions_preserves_text_reasoning_and_omits_opaque_only_turns() {
+    fn deepseek_completions_preserves_reasoning_with_content_and_omits_turnless_assistants() {
         let binding = completions_binding("deepseek");
         let mut input = ModelRequestInput::new(
             "deepseek",
@@ -4876,11 +4879,14 @@ mod tests {
                 ModelMessage::text(MessageRole::User, "question"),
                 ModelMessage {
                     role: MessageRole::Assistant,
-                    content: vec![ContentPart::Reasoning {
-                        item_id: "reasoning".into(),
-                        text: "plain reasoning".into(),
-                        replay: None,
-                    }],
+                    content: vec![
+                        ContentPart::Reasoning {
+                            item_id: "reasoning".into(),
+                            text: "plain reasoning".into(),
+                            replay: None,
+                        },
+                        ContentPart::Text("answer".into()),
+                    ],
                 },
                 ModelMessage {
                     role: MessageRole::Assistant,
@@ -4892,17 +4898,28 @@ mod tests {
                         ),
                     }],
                 },
+                ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentPart::Reasoning {
+                        item_id: "orphan".into(),
+                        text: "orphan reasoning".into(),
+                        replay: None,
+                    }],
+                },
                 ModelMessage::text(MessageRole::User, "continue"),
             ],
         );
-        input.message_origins = ["question", "reasoning", "opaque", "continue"]
+        input.message_origins = ["question", "reasoning", "opaque", "orphan", "continue"]
             .map(str::to_owned)
             .to_vec();
         let prepared = binding.prepare_request(&input).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][1]["content"], "answer");
         assert_eq!(body["messages"][1]["reasoning_content"], "plain reasoning");
-        assert!(!body.to_string().contains("opaque"));
+        let wire = body.to_string();
+        assert!(!wire.contains("opaque"));
+        assert!(!wire.contains("orphan reasoning"));
         let inspection = binding.inspect_prepared_request(&prepared, None).unwrap();
         assert_eq!(
             inspection.prompt_units[2].semantic_segment_ids,
