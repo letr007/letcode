@@ -87,7 +87,8 @@ active_provider = "openai"
 # Optional; defaults to false.
 fast_mode = false
 
-# Optional; all values below have defaults.
+# Optional; tool_timeout_secs, sessions_dir, and log_file have defaults.
+# max_iterations and max_tool_calls are unlimited when omitted.
 [global]
 # max_iterations = 64
 # max_tool_calls = 128

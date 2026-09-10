@@ -87,7 +87,8 @@ active_provider = "openai"
 # 可选；默认 false。
 fast_mode = false
 
-# 可选；以下均有默认值。
+# 可选；tool_timeout_secs、sessions_dir、log_file 有默认值。
+# max_iterations 与 max_tool_calls 省略时不设上限。
 [global]
 # max_iterations = 64
 # max_tool_calls = 128
