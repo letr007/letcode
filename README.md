@@ -195,6 +195,7 @@ reasoning = true
 reasoning_summary = true
 text_verbosity = true
 parallel_tool_calls = true
+# structured_output = "json_schema" # json_object | json_schema; omit when the endpoint enforces neither
 
 [providers.openai.models."gpt-5.5".generation]
 temperature = 0.2

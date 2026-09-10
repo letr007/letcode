@@ -13,6 +13,7 @@
 - 新增内置 Historian 后台整理：未配置时继承主模型，也可通过 `[agents.historian]` 单独路由；整理只在 footer 显示状态，不插入主时间线工具卡，并可在子视图查看概览、分段正文、模型、耗时和用量报告。
 - 新增 `context__search` 和 `context__expand`：在当前分支作用域内检索原始会话、归档历史段与 evidence，并按来源 ID 只读展开原文，不恢复旧执行状态。
 - 新增按模型配置的异步工具：`generation.async_tools` 列出的工具可在流式响应期间提前执行，完整工具批次到达后归并为同一调用组；仅适用于 Astra 策略搭配 Responses 协议。
+- 新增按路由声明的结构化输出：`capabilities.generation.structured_output` 可声明 `json_object` 或 `json_schema`，Responses、Chat Completions 与 Anthropic 分别映射各自线格式；未声明时请求不会附加格式约束。内置 Historian 在声明 `json_schema` 的路由上改用强制 schema，未声明时保持原有 prompt 约束。
 
 ### Breaking
 
