@@ -55,10 +55,10 @@ pub(crate) fn list_context_branches(
 }
 
 pub(super) fn resolve_branch_context(
-    records: Vec<TranscriptRecord>,
+    records: &[TranscriptRecord],
     cursor: SessionContextCursor,
 ) -> anyhow::Result<ResolvedBranchContext> {
-    let index = build_branch_index(&records)?;
+    let index = build_branch_index(records)?;
     let branch_id = cursor
         .branch_id
         .unwrap_or_else(|| resolve_active_branch_id(&index, None));
@@ -91,7 +91,7 @@ pub(super) fn resolve_branch_context(
         )
         .then_some(record.sequence)
     });
-    let records = collect_branch_path_records(&records, &index, &branch_id, leaf_sequence)?;
+    let records = collect_branch_path_records(records, &index, &branch_id, leaf_sequence)?;
     Ok(ResolvedBranchContext {
         branch_id,
         leaf_sequence,

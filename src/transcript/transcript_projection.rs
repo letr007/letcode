@@ -174,7 +174,7 @@ pub(crate) fn project_context_tree_for_active_branch(
     current_branch_id: Option<&str>,
 ) -> anyhow::Result<crate::context_tree::ContextTreeState> {
     let resolved = resolve_branch_context(
-        records.to_vec(),
+        records,
         SessionContextCursor {
             branch_id: current_branch_id.map(str::to_owned),
             leaf_sequence: None,
@@ -231,7 +231,7 @@ pub(crate) fn context_compaction_validation_scope(
             == expected_frontier,
         "context compaction journal frontier does not match committed transcript"
     );
-    let resolved = resolve_branch_context(journal_records.clone(), cursor.clone())?;
+    let resolved = resolve_branch_context(&journal_records, cursor)?;
     let actual_append_branch_id =
         (resolved.branch_id != ROOT_CONTEXT_BRANCH_ID).then(|| resolved.branch_id.clone());
     Ok(ContextCompactionValidationScope {
@@ -245,7 +245,7 @@ pub(crate) fn build_session_context_snapshot(
     records: Vec<TranscriptRecord>,
     cursor: SessionContextCursor,
 ) -> anyhow::Result<SessionRestoreSnapshot> {
-    let resolved = resolve_branch_context(records.clone(), cursor)?;
+    let resolved = resolve_branch_context(&records, cursor)?;
     validate_projection_events(
         &session_id,
         &records,
@@ -282,7 +282,7 @@ pub(crate) fn project_runtime_restore_snapshot(
     cursor: SessionContextCursor,
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<RuntimeRestoreSnapshot> {
-    let resolved = resolve_branch_context(records.clone(), cursor)?;
+    let resolved = resolve_branch_context(&records, cursor)?;
     validate_projection_events(
         &session_id,
         &records,
@@ -396,7 +396,7 @@ pub(crate) fn validate_context_projection_events(
     records: &[TranscriptRecord],
 ) -> anyhow::Result<()> {
     resolve_branch_context(
-        records.to_vec(),
+        records,
         SessionContextCursor {
             branch_id: None,
             leaf_sequence: None,
@@ -663,7 +663,7 @@ pub(crate) fn selected_source_records(
     records: &[TranscriptRecord],
     cursor: SessionContextCursor,
 ) -> anyhow::Result<Vec<TranscriptRecord>> {
-    let resolved = resolve_branch_context(records.to_vec(), cursor)?;
+    let resolved = resolve_branch_context(records, cursor)?;
     validate_projection_events("", records, &resolved.records)?;
     Ok(resolved.records)
 }

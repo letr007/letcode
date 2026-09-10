@@ -68,7 +68,7 @@ pub(crate) fn validate_logical_checkpoint_candidate(
     // Metadata at the journal frontier is not a content leaf. Resolve the
     // branch at its content boundary while retaining the full prefix for scope.
     let journal_scope = resolve_branch_context(
-        journal_records.clone(),
+        &journal_records,
         SessionContextCursor {
             branch_id: Some(resolved_branch_id.clone()),
             leaf_sequence: Some(content_boundary),
@@ -183,7 +183,7 @@ pub(crate) fn prepare_logical_checkpoint_candidate(
     let index = build_branch_index(&journal_records)?;
     let boundary = branch_tip_for_records(&journal_records, &index, &branch_id)?;
     let scope = resolve_branch_context(
-        journal_records.clone(),
+        &journal_records,
         SessionContextCursor {
             branch_id: Some(branch_id.clone()),
             leaf_sequence: Some(boundary),
