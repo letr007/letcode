@@ -116,6 +116,7 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
             helper.active_model_metadata(),
             &helper.prelude,
             &input,
+            crate::historian::structured_output(route.generation.structured_output).as_ref(),
         ) {
             Ok(_) => {
                 let identity = format!(
@@ -742,6 +743,7 @@ max_output_tokens=128
                     metadata.clone(),
                     &prelude,
                     &content,
+                    None,
                 );
                 if !input_images {
                     assert!(
@@ -776,6 +778,7 @@ max_output_tokens=128
                     metadata.clone(),
                     &prelude,
                     &larger,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(

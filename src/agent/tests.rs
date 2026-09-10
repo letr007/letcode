@@ -4981,6 +4981,7 @@ base_url = "https://example.invalid/v1"
         metadata,
         &[PromptMessage::system("helper instructions")],
         &crate::user_content::UserMessageContent::from("summarize"),
+        None,
     )
     .unwrap();
     let helper_request = resolved.binding.prepare_request(&helper_input).unwrap();

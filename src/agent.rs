@@ -2971,6 +2971,7 @@ impl Agent {
             self.active_model_metadata(),
             &self.prelude,
             user_input,
+            crate::historian::structured_output(route.generation.structured_output).as_ref(),
         )?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
             .execute_text_oneshot_with_usage(

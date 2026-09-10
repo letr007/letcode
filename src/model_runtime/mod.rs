@@ -385,6 +385,7 @@ pub struct GenerationSupport {
     pub text_verbosity: bool,
     pub parallel_tool_calls: bool,
     pub priority_service: bool,
+    pub structured_output: Option<StructuredOutputSupport>,
 }
 
 /// Input accepted by an adapter. Requests and replay data are intentionally
@@ -744,6 +745,58 @@ pub struct GenerationSettings {
     pub verbosity: Option<Verbosity>,
     pub parallel_tool_calls: Option<bool>,
     pub priority_service: Option<bool>,
+    pub structured_output: Option<StructuredOutput>,
+}
+
+/// Structured-output request. The variants mirror the two contracts that exist
+/// across the supported protocols: schema-enforced output, and JSON-only output
+/// whose shape is not enforced by the provider.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StructuredOutput {
+    JsonObject,
+    JsonSchema(StructuredOutputSchema),
+}
+
+impl StructuredOutput {
+    pub fn kind(&self) -> StructuredOutputSupport {
+        match self {
+            Self::JsonObject => StructuredOutputSupport::JsonObject,
+            Self::JsonSchema(_) => StructuredOutputSupport::JsonSchema,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructuredOutputSchema {
+    pub name: String,
+    pub schema: Value,
+    pub strict: bool,
+}
+
+/// Structured-output contract a route advertises through
+/// `capabilities.generation.structured_output`. A route that omits it declares
+/// no structured-output support, and a request asking for one fails in prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredOutputSupport {
+    JsonObject,
+    JsonSchema,
+}
+
+impl StructuredOutputSupport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JsonObject => "json_object",
+            Self::JsonSchema => "json_schema",
+        }
+    }
+
+    pub fn supports(self, requested: StructuredOutputSupport) -> bool {
+        match self {
+            Self::JsonSchema => true,
+            Self::JsonObject => requested == Self::JsonObject,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1750,6 +1803,8 @@ pub struct RuntimeGenerationConfig {
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub priority_service: bool,
+    #[serde(default)]
+    pub structured_output: Option<StructuredOutputSupport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -1812,6 +1867,7 @@ impl From<RuntimeGenerationDefaults> for GenerationSupport {
             text_verbosity: value.text_verbosity.is_some(),
             parallel_tool_calls: value.parallel_tool_calls.unwrap_or(false),
             priority_service: false,
+            structured_output: None,
         }
     }
 }
@@ -1828,6 +1884,7 @@ impl From<RuntimeGenerationConfig> for GenerationSupport {
             text_verbosity: value.text_verbosity,
             parallel_tool_calls: value.parallel_tool_calls,
             priority_service: value.priority_service,
+            structured_output: value.structured_output,
         }
     }
 }
@@ -3975,6 +4032,49 @@ base_url = "https://example.invalid/v1"
 {model_extra}
 "#
         )
+    }
+
+    #[test]
+    fn structured_output_capability_is_resolved_from_model_configuration() {
+        let resolve = |setting: &str| {
+            RuntimeConfig::from_toml(&runtime_config("vendor", "type = \"none\"", "", setting))
+                .unwrap()
+                .resolve(&ProtocolRegistry::builtins())
+                .unwrap()
+        };
+        let undeclared = resolve("");
+        let schema = resolve(
+            "[providers.vendor.models.model.capabilities.generation]\nstructured_output = \"json_schema\"",
+        );
+        let object = resolve(
+            "[providers.vendor.models.model.capabilities.generation]\nstructured_output = \"json_object\"",
+        );
+        assert_eq!(
+            undeclared
+                .route("vendor", "model")
+                .unwrap()
+                .generation
+                .structured_output,
+            None
+        );
+        assert_eq!(
+            schema
+                .route("vendor", "model")
+                .unwrap()
+                .generation
+                .structured_output,
+            Some(StructuredOutputSupport::JsonSchema)
+        );
+        assert_eq!(
+            object
+                .route("vendor", "model")
+                .unwrap()
+                .generation
+                .structured_output,
+            Some(StructuredOutputSupport::JsonObject)
+        );
+        assert!(StructuredOutputSupport::JsonSchema.supports(StructuredOutputSupport::JsonObject));
+        assert!(!StructuredOutputSupport::JsonObject.supports(StructuredOutputSupport::JsonSchema));
     }
 
     #[test]

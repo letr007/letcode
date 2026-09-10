@@ -590,14 +590,30 @@ impl ProtocolBinding for AnthropicBinding {
         {
             last.cache_control = Some(AnthropicCacheControl { kind: "ephemeral" });
         }
-        let output_config = settings
+        let effort = settings
             .filter(|settings| settings.mode == "adaptive")
-            .map(|_| {
-                Ok(AnthropicOutputConfig {
-                    effort: anthropic_reasoning_effort(input.generation.reasoning.effort.as_ref())?,
-                })
-            })
+            .map(|_| anthropic_reasoning_effort(input.generation.reasoning.effort.as_ref()))
             .transpose()?;
+        let format = match input.generation.structured_output.as_ref() {
+            None => None,
+            Some(super::StructuredOutput::JsonSchema(schema)) => {
+                require_declared_structured_output(
+                    super::StructuredOutputSupport::JsonSchema,
+                    self.generation_support.structured_output,
+                )?;
+                Some(AnthropicOutputFormat::JsonSchema {
+                    schema: schema.schema.clone(),
+                })
+            }
+            Some(super::StructuredOutput::JsonObject) => {
+                return Err(unsupported(
+                    "structured_output",
+                    "Anthropic can express json_schema only",
+                ));
+            }
+        };
+        let output_config = (effort.is_some() || format.is_some())
+            .then_some(AnthropicOutputConfig { effort, format });
         let request = AnthropicRequest {
             model: input.control.model.clone(),
             max_tokens,
@@ -731,7 +747,17 @@ struct AnthropicThinking {
 
 #[derive(Debug, Serialize)]
 struct AnthropicOutputConfig {
-    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<AnthropicOutputFormat>,
+}
+
+/// Anthropic carries the schema alone: the OpenAI name/strict envelope is absent.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicOutputFormat {
+    JsonSchema { schema: Value },
 }
 #[derive(Debug, Serialize)]
 struct AnthropicMessage {
@@ -2032,6 +2058,22 @@ struct CompletionsRequest {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<CompletionsTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<CompletionsResponseFormat>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CompletionsResponseFormat {
+    JsonObject,
+    JsonSchema { json_schema: CompletionsJsonSchema },
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionsJsonSchema {
+    name: String,
+    schema: Value,
+    strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2362,6 +2404,10 @@ impl CompletionsRequest {
                 "priority service capability is disabled",
             ));
         }
+        let response_format = completions_response_format(
+            g.structured_output.as_ref(),
+            binding.generation_support.structured_output,
+        )?;
         let request = Self {
             model: input.control.model.clone(),
             messages,
@@ -2407,6 +2453,7 @@ impl CompletionsRequest {
                     },
                 }),
             prompt_cache_key: None,
+            response_format,
             tools,
         };
         Ok((request, message_indices))
@@ -2813,6 +2860,19 @@ struct ResponsesReasoning {
 struct ResponsesTextOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     verbosity: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<ResponsesTextFormat>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesTextFormat {
+    JsonObject,
+    JsonSchema {
+        name: String,
+        schema: Value,
+        strict: bool,
+    },
 }
 
 impl ResponsesRequest {
@@ -2931,9 +2991,15 @@ impl ResponsesRequest {
         } else {
             None
         };
-        let text = generation.verbosity.map(|verbosity| ResponsesTextOptions {
-            verbosity: Some(text_verbosity(verbosity)),
-        });
+        let format = responses_text_format(
+            generation.structured_output.as_ref(),
+            binding.generation_support.structured_output,
+        )?;
+        let text =
+            (generation.verbosity.is_some() || format.is_some()).then(|| ResponsesTextOptions {
+                verbosity: generation.verbosity.map(text_verbosity),
+                format,
+            });
         let prompt_cache_key = input.cache.enabled.then(|| cache_key(binding, input));
         let prompt_cache_retention = input.cache.retention.map(|retention| match retention {
             super::CacheRetention::InMemory => "in_memory",
@@ -3193,6 +3259,59 @@ fn require_generation(requested: bool, supported: bool, field: &str) -> Result<(
         ));
     }
     Ok(())
+}
+
+/// The route declares which structured-output contracts it supports; a request
+/// asking for a contract the route did not declare fails in prepare.
+fn require_declared_structured_output(
+    requested: super::StructuredOutputSupport,
+    supported: Option<super::StructuredOutputSupport>,
+) -> Result<(), ModelFailure> {
+    if supported.is_some_and(|supported| supported.supports(requested)) {
+        return Ok(());
+    }
+    Err(unsupported(
+        "structured_output",
+        &format!("{} capability is disabled", requested.as_str()),
+    ))
+}
+
+fn completions_response_format(
+    requested: Option<&super::StructuredOutput>,
+    supported: Option<super::StructuredOutputSupport>,
+) -> Result<Option<CompletionsResponseFormat>, ModelFailure> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    require_declared_structured_output(requested.kind(), supported)?;
+    Ok(Some(match requested {
+        super::StructuredOutput::JsonObject => CompletionsResponseFormat::JsonObject,
+        super::StructuredOutput::JsonSchema(schema) => CompletionsResponseFormat::JsonSchema {
+            json_schema: CompletionsJsonSchema {
+                name: schema.name.clone(),
+                schema: schema.schema.clone(),
+                strict: schema.strict,
+            },
+        },
+    }))
+}
+
+fn responses_text_format(
+    requested: Option<&super::StructuredOutput>,
+    supported: Option<super::StructuredOutputSupport>,
+) -> Result<Option<ResponsesTextFormat>, ModelFailure> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    require_declared_structured_output(requested.kind(), supported)?;
+    Ok(Some(match requested {
+        super::StructuredOutput::JsonObject => ResponsesTextFormat::JsonObject,
+        super::StructuredOutput::JsonSchema(schema) => ResponsesTextFormat::JsonSchema {
+            name: schema.name.clone(),
+            schema: schema.schema.clone(),
+            strict: schema.strict,
+        },
+    }))
 }
 
 fn unsupported(field: &str, detail: &str) -> ModelFailure {
@@ -4323,6 +4442,14 @@ mod tests {
 
     fn anthropic_binding(settings: &str) -> Result<Arc<dyn ProtocolBinding>, ModelFailure> {
         let (capabilities, generation) = all_support();
+        anthropic_binding_with(settings, capabilities, generation)
+    }
+
+    fn anthropic_binding_with(
+        settings: &str,
+        capabilities: RouteCapabilities,
+        generation: GenerationSupport,
+    ) -> Result<Arc<dyn ProtocolBinding>, ModelFailure> {
         let settings = toml::from_str::<toml::Value>(settings).unwrap();
         AnthropicAdapter::new().bind(ProtocolBindInput::new(
             BindingIdentity::new(
@@ -4341,6 +4468,14 @@ mod tests {
 
     fn completions_binding(flavor: &str) -> Arc<dyn ProtocolBinding> {
         let (capabilities, generation) = all_support();
+        completions_binding_with(flavor, capabilities, generation)
+    }
+
+    fn completions_binding_with(
+        flavor: &str,
+        capabilities: RouteCapabilities,
+        generation: GenerationSupport,
+    ) -> Arc<dyn ProtocolBinding> {
         CompletionsAdapter::new()
             .bind(ProtocolBindInput::new(
                 BindingIdentity::new(
@@ -4379,6 +4514,7 @@ mod tests {
                 text_verbosity: true,
                 parallel_tool_calls: true,
                 priority_service: true,
+                structured_output: None,
             },
         )
     }
@@ -5387,6 +5523,117 @@ anthropic_thinking = { mode = "adaptive" }"#,
         );
     }
 
+    fn structured_schema() -> super::super::StructuredOutputSchema {
+        super::super::StructuredOutputSchema {
+            name: "demo".into(),
+            strict: true,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn structured_request() -> ModelRequestInput {
+        let mut request = ModelRequestInput::new(
+            "structured",
+            vec![ModelMessage::text(MessageRole::User, "hello")],
+        );
+        request.generation.structured_output = Some(super::super::StructuredOutput::JsonSchema(
+            structured_schema(),
+        ));
+        request
+    }
+
+    #[test]
+    fn structured_output_maps_to_each_protocol_contract() {
+        let (capabilities, mut generation) = all_support();
+        generation.structured_output = Some(super::super::StructuredOutputSupport::JsonSchema);
+        let request = structured_request();
+
+        let responses = binding("standard", capabilities.clone(), generation.clone());
+        let body: Value =
+            serde_json::from_slice(&responses.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], "demo");
+        assert_eq!(body["text"]["format"]["strict"], true);
+
+        let completions =
+            completions_binding_with("standard", capabilities.clone(), generation.clone());
+        let body: Value =
+            serde_json::from_slice(&completions.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "demo");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+
+        let anthropic =
+            anthropic_binding_with("", capabilities.clone(), generation.clone()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&anthropic.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert!(body["output_config"]["format"].get("name").is_none());
+        assert!(body["output_config"]["format"].get("strict").is_none());
+    }
+
+    #[test]
+    fn json_object_maps_to_text_and_response_format_and_anthropic_rejects_it() {
+        let (capabilities, mut generation) = all_support();
+        generation.structured_output = Some(super::super::StructuredOutputSupport::JsonObject);
+        let mut request = ModelRequestInput::new(
+            "structured",
+            vec![ModelMessage::text(MessageRole::User, "hello")],
+        );
+        request.generation.structured_output = Some(super::super::StructuredOutput::JsonObject);
+
+        let responses = binding("standard", capabilities.clone(), generation.clone());
+        let body: Value =
+            serde_json::from_slice(&responses.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+
+        let completions =
+            completions_binding_with("standard", capabilities.clone(), generation.clone());
+        let body: Value =
+            serde_json::from_slice(&completions.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_object");
+
+        let anthropic = anthropic_binding_with("", capabilities, generation).unwrap();
+        let error = anthropic.prepare_request(&request).unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("unsupported_request_field"));
+    }
+
+    #[test]
+    fn structured_output_requires_a_declared_capability() {
+        let (capabilities, generation) = all_support();
+        let request = structured_request();
+        let prepared = [
+            binding("standard", capabilities.clone(), generation.clone()).prepare_request(&request),
+            completions_binding_with("standard", capabilities.clone(), generation.clone())
+                .prepare_request(&request),
+            anthropic_binding_with("", capabilities, generation)
+                .unwrap()
+                .prepare_request(&request),
+        ];
+        for result in prepared {
+            let error = result.unwrap_err();
+            assert_eq!(error.code.as_deref(), Some("unsupported_request_field"));
+        }
+    }
+
+    #[test]
+    fn responses_websocket_frame_preserves_structured_output() {
+        let (capabilities, mut generation) = all_support();
+        generation.structured_output = Some(super::super::StructuredOutputSupport::JsonSchema);
+        let binding = binding("standard", capabilities, generation);
+        let request = binding.prepare_request(&structured_request()).unwrap();
+        let frame: Value =
+            serde_json::from_slice(&binding.websocket_frame(&request, None, None).unwrap())
+                .unwrap();
+        assert_eq!(frame["text"]["format"]["type"], "json_schema");
+        assert_eq!(frame["text"]["format"]["name"], "demo");
+    }
+
     #[test]
     fn standard_request_golden_maps_controls_messages_generation_and_cache() {
         let (capabilities, generation) = all_support();
@@ -5416,6 +5663,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
             verbosity: Some(Verbosity::Low),
             parallel_tool_calls: Some(true),
             priority_service: Some(true),
+            structured_output: None,
         };
         request.cache = CacheIntent {
             enabled: true,

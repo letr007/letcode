@@ -2090,6 +2090,7 @@ pub(super) fn preflight_resolved_oneshot_text_request(
         model,
         prelude,
         &UserMessageContent::new(user_text, vec![]),
+        None,
     )
     .map(|(build, _)| build)
 }
@@ -2099,6 +2100,7 @@ pub(super) fn prepare_resolved_oneshot_request(
     mut model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_content: &UserMessageContent,
+    structured_output: Option<&crate::model_runtime::StructuredOutput>,
 ) -> Result<(crate::request_builder::BuildResult, ModelRequestInput)> {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
@@ -2107,8 +2109,11 @@ pub(super) fn prepare_resolved_oneshot_request(
     model.parallel_tool_calls = false;
     model.fast_mode = false;
     let build = build_oneshot_request(&route.model_override, model.clone(), prelude, user_content)?;
-    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+    let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
+    // Set before the binding preflight so the preflight validates the request
+    // that will actually be sent.
+    input.generation.structured_output = structured_output.cloned();
     route
         .binding
         .prepare_request(&input)

@@ -165,6 +165,59 @@ pub(crate) fn parse_publication(
     Ok(publication)
 }
 
+/// The structured-output contract to request from a route. A route that declares
+/// no structured-output support keeps the prompt-only contract.
+pub(crate) fn structured_output(
+    support: Option<crate::model_runtime::StructuredOutputSupport>,
+) -> Option<crate::model_runtime::StructuredOutput> {
+    use crate::model_runtime::{StructuredOutput, StructuredOutputSupport};
+    match support {
+        Some(StructuredOutputSupport::JsonSchema) => {
+            Some(StructuredOutput::JsonSchema(output_schema()))
+        }
+        Some(StructuredOutputSupport::JsonObject) => Some(StructuredOutput::JsonObject),
+        None => None,
+    }
+}
+
+/// Strict-mode subset: every object lists all its properties as required and
+/// sets `additionalProperties: false`, and `unprocessed_from` uses a null union
+/// instead of an omitted field. Range/length constraints are not part of the
+/// subset and stay in the prompt instead.
+fn output_schema() -> crate::model_runtime::StructuredOutputSchema {
+    crate::model_runtime::StructuredOutputSchema {
+        name: "historian_publication".into(),
+        strict: true,
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "compartments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {"type": "integer"},
+                            "end": {"type": "integer"},
+                            "title": {"type": "string"},
+                            "importance": {"type": "integer"},
+                            "detailed": {"type": "string"},
+                            "compact": {"type": "string"},
+                            "anchor": {"type": "string"}
+                        },
+                        "required": ["start", "end", "title", "importance", "detailed", "compact", "anchor"],
+                        "additionalProperties": false
+                    }
+                },
+                "facts": {"type": "array", "items": {"type": "string"}},
+                "withdrawn_fact_ids": {"type": "array", "items": {"type": "string"}},
+                "unprocessed_from": {"type": ["integer", "null"]}
+            },
+            "required": ["compartments", "facts", "withdrawn_fact_ids", "unprocessed_from"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 /// Host-authored child report, distinct from the model's unvalidated response.
 /// Generation precedes the parent publication commit; it does not imply application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,5 +450,59 @@ mod tests {
                 .to_string()
                 .contains("historian produced no completed work")
         );
+    }
+
+    /// The provider rejects schemas that break the strict subset it enforces.
+    /// Both rules below were observed as `invalid_json_schema` responses.
+    fn assert_strict_schema(schema: &Value) {
+        if schema.get("type").and_then(Value::as_str) == Some("array") {
+            assert!(schema.get("items").is_some(), "strict arrays declare items");
+        }
+        if let Some(items) = schema.get("items") {
+            assert_strict_schema(items);
+        }
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return;
+        }
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("object schema declares properties");
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("object schema declares required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(required.len(), properties.len());
+        for key in properties.keys() {
+            assert!(required.contains(&key.as_str()), "{key} must be required");
+        }
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&Value::Bool(false))
+        );
+        for property in properties.values() {
+            assert_strict_schema(property);
+        }
+    }
+
+    #[test]
+    fn declared_structured_output_follows_the_route_capability() {
+        use crate::model_runtime::{StructuredOutput, StructuredOutputSupport};
+        assert!(structured_output(None).is_none());
+        assert!(matches!(
+            structured_output(Some(StructuredOutputSupport::JsonObject)),
+            Some(StructuredOutput::JsonObject)
+        ));
+        let Some(StructuredOutput::JsonSchema(schema)) =
+            structured_output(Some(StructuredOutputSupport::JsonSchema))
+        else {
+            panic!("json_schema support must request an enforced schema");
+        };
+        assert_eq!(schema.name, "historian_publication");
+        assert!(schema.strict);
+        assert_strict_schema(&schema.schema);
     }
 }

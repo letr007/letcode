@@ -192,6 +192,7 @@ fn generation_settings(
             .map(|value| u32::try_from(value).map_err(|_| "max_output_tokens exceeds u32"))
             .transpose()?,
         stop_sequences: Vec::new(),
+        structured_output: None,
         reasoning: ReasoningIntent {
             enabled: metadata.reasoning_effort.is_some()
                 || metadata.reasoning_summary.is_some()
