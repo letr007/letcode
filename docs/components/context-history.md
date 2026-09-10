@@ -16,7 +16,7 @@ Historian 每次处理一段尚未整理的、协议完整的历史前缀，按�
 
 ## 准备、发布与应用
 
-`HistoryPublished` 保存经过来源覆盖校验的历史段和候选事实。`HistoryApplied` 选择哪些历史段、档位及事实进入当前上下文，并退休已被覆盖的原始前缀。发布本身不改变活跃事实或删除原始消息。
+`HistoryPublished` 保存经过来源覆盖校验的历史段；旧日志中的事实字段继续兼容读取。`HistoryApplied` 选择哪些历史段和档位进入当前上下文，并退休已被覆盖的原始前缀。发布本身不删除原始消息。
 
 活跃历史分为稳定基线、增量区和近期原始尾部。常规请求复用已选择的表述；增量更新尽量保持基线不变。预算压力、显式压缩或增量过大时重新物化基线。重新物化不意味着 provider 缓存已失效，也不保证某种费用节省。
 
@@ -38,21 +38,21 @@ model = "your-model"
 
 后台调用会产生额外用量。子视图报告 provider 返回的 usage/cache 事件；缺失用量时明确显示未报告，不伪造数字。事件可能是累计更新，不能直接全部相加。
 
-## Evidence 与 memory
+## Evidence 与项目记忆
 
-工具观察继续进入现有 EvidenceRecord。Historian 提炼的长期事实关联其原始消息范围；事实在应用后进入有效 evidence 投影，通过显式替代或撤销更新。原始观察和被替代的事实仍保留在 journal。
+工具观察、子代理结果和来源引用继续进入会话内的 EvidenceRecord。Evidence 参与当前会话的选择与审计，但不再兼任跨会话项目记忆库。旧日志中已经发布和应用的事实仍按原有投影恢复，session JSONL 不迁移、不改写。
 
-选中的事实随冻结历史基线或增量区呈现，不再通过普通 evidence 提示重复注入。memory 继续投影决策、验证、诊断及旧实验结果；新的 Historian 事实按照选择的会话分支恢复，不将兄弟分支的事实更新混合为一份状态。
+新的项目记忆由独立后台 worker 在完整 turn 持久化后增量提取，复用 Historian 的无工具 one-shot 路由，但使用独立任务 prompt。数据按规范化 workspace 路径隔离，保存在配置目录的 SQLite 读模型中；首次启用只登记当前 journal frontier，不扫描或重新提炼旧 session。session undo、checkout 或删除不会自动撤销已经记录的项目知识。
 
-同一工作区的会话自动召回已应用的项目事实，保留来源会话、分支和条目 ID。外部会话显式替代或撤销某条事实后，来源会话在下一回合的请求边界记录撤销应用，将它移出当前事实槽；后续档位重选不会重新激活它。原 publication 与原始消息不被改写，仍可按来源查询。
+普通请求不自动注入整份项目记忆。模型仅在任务需要时调用 `memory__recall`，按关键词、代码路径、类型和状态检索；结果保留来源 session、branch 和 `raw:N` ID，以便通过 history 工具回查。记忆可能不完整或过时，不是执行授权，也不能覆盖当前代码、用户要求和高权威配置。
 
-历史事实是有来源、可能过时的材料，不是新的执行授权，也不能覆盖当前用户要求和系统配置。
+记忆库明确报告 `missing`、`synchronizing`、`failed`、`empty` 或 `ready`，索引缺失或失败时不会静默回退到 session 全量重放。
 
 ## 搜索和展开
 
 - `context__search`：检索原始会话、归档历史段及 evidence，返回有界预览和来源 ID。
 - `context__expand`：按 ID 读取历史段对应原始消息，或 evidence 摘录。分页 offset/limit 以字符计；搜索分页以结果条数计。
-- `memory__recall`：保留原有结构化跨会话记忆查询入口。
+- `memory__recall`：按关键词、路径、类型和状态查询当前工作区的独立项目记忆库；不扫描 session JSONL，也不会把全部记忆自动注入普通请求。
 
 默认作用于当前 session/branch/leaf。指定其它会话或分支时，结果明确带上该来源。展开是只读，不恢复旧 runtime、不重复执行历史工具。Evidence detail 是摘录，不等同完整工具正文。
 
@@ -62,7 +62,7 @@ model = "your-model"
 
 后台工作只显示 footer 图标，不插入主时间线工具卡、不改变主任务忙碌状态。失败图标提示查看详情。
 
-通过已有子会话导航可查看 Historian 的结构化报告：概览、分段正文、事实变化、模型、耗时和用量。默认显示精简版；在 Historian 子视图且命令输入为空时，按 `1` 查看精简、`2` 查看详细、`3` 查看线索、`0` 查看完整报告 JSON、`s` 切换完整来源 ID。切换只改变查看方式，不改变主模型采用的档位。来源是可复制的引用，不是直接打开原文的按钮。
+通过已有子会话导航可查看会话压缩 Historian 的结构化报告：概览、分段正文、模型、耗时和用量；旧报告仍可能包含事实字段。默认显示精简版；在 Historian 子视图且命令输入为空时，按 `1` 查看精简、`2` 查看详细、`3` 查看线索、`0` 查看完整报告 JSON、`s` 切换完整来源 ID。切换只改变查看方式，不改变主模型采用的档位。来源是可复制的引用，不是直接打开原文的按钮。项目记忆 worker 不插入主时间线工具卡。
 
 报告显示“产物已生成”，不据此推断主会话已发布或应用。用量与缓存分别显示各自最近一次 provider 更新，不累加；缺失值显示“未报告”，完整更新保存在报告 JSON 中。旧 Markdown 报告仍按原文显示。内部整理报告不作为普通项目 Decision evidence 再次注入主模型。
 
@@ -75,5 +75,7 @@ model = "your-model"
 - `src/agent/history_runtime.rs`：前缀准备、请求边界应用与预算处理。
 - `src/session/historian.rs`：内部专家池任务、取消和发布。
 - `src/transcript/transcript_projection/`：分支恢复、来源校验与活跃投影。
-- `src/evidence.rs`、`src/memory.rs`：观察、事实与记忆投影。
+- `src/evidence.rs`：会话内观察、来源与旧事实兼容投影。
+- `src/project_memory/`：workspace 隔离的 SQLite store、增量提取和后台 worker。
+- `src/memory.rs`、`src/tool/memory.rs`：项目记忆查询参数与只读工具入口。
 - `src/tool/context_history.rs`、`src/tool/fold_artifact.rs`：原文查询与大输出保存。

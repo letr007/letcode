@@ -1072,6 +1072,13 @@ async fn run_engine_loop(
         Arc::clone(&transcript),
         session_transport_tx.clone(),
     )));
+    let mut memory_worker = crate::project_memory::MemoryWorker::default();
+    let memory_refresh_period = std::time::Duration::from_secs(30);
+    let mut memory_refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + memory_refresh_period,
+        memory_refresh_period,
+    );
+    memory_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
     let mut visible_child_session_id = None;
@@ -2855,7 +2862,26 @@ async fn run_engine_loop(
                     parked_commands.clear();
                     break;
                 }
+                // A terminal turn is now durable. Record its journal frontier;
+                // the periodic worker batches pending turns without adding a model
+                // call to every turn boundary.
+                match transcript.lock() {
+                    Ok(recorder) => {
+                        if let Err(error) = crate::project_memory::enroll(&recorder) {
+                            tracing::warn!(error = %error, "could not update project memory source");
+                        }
+                    }
+                    Err(_) => tracing::warn!("could not update poisoned project memory source"),
+                }
                 flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+            }
+            _ = memory_refresh.tick() => {
+                if let Err(error) = memory_worker.tick(&agent).await {
+                    tracing::warn!(error = %error, "project memory worker unavailable");
+                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                        "Background memory processing is unavailable; see the application log",
+                    )));
+                }
             }
             _ = child_refresh.tick(), if visible_child_session_id.is_some() => {
                 refresh_visible_child_session_view(
@@ -2917,6 +2943,9 @@ async fn run_engine_loop(
                 let _ = session_transport_tx.send(SessionTransportEvent::McpToolsDiscovered(servers));
             }
         }
+    }
+    if let Err(error) = memory_worker.shutdown().await {
+        tracing::warn!(error = %error, "project memory worker shutdown failed");
     }
 }
 

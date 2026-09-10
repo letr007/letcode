@@ -325,12 +325,6 @@ pub fn evidence_context_message(
         text.push_str(&item.compact_line());
         text.push('\n');
     }
-    if selected
-        .iter()
-        .any(|record| record.tags.iter().any(|tag| tag == "recalled_project_fact"))
-    {
-        text.insert_str(0, "[Session memory]\n");
-    }
     let dropped = evidence.len().saturating_sub(selected.len());
     (Some(text), ids, dropped)
 }
@@ -383,11 +377,6 @@ fn select_relevant_evidence(
 }
 
 fn evidence_score(record: &EvidenceRecord, query_tokens: &HashSet<String>) -> i32 {
-    // Recalled project facts are standing memory, not incidental query hits.
-    // They share the existing bounded evidence surface and are frozen per turn.
-    if record.tags.iter().any(|tag| tag == "recalled_project_fact") {
-        return i32::MAX;
-    }
     let mut score = 0;
     if query_tokens.is_empty() {
         if matches!(

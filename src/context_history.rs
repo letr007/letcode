@@ -885,44 +885,6 @@ mod history_integration_tests {
     }
 
     #[test]
-    fn memory_projects_facts_from_one_selected_branch() {
-        let (mut records, p, a) = fixture();
-        records.push(record(4, E::HistoryPublished(p.clone())));
-        records.push(record(5, E::HistoryApplied(a.clone())));
-        records.push(record(
-            6,
-            E::ContextBranchCreated {
-                branch_id: "alternative".into(),
-                parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 3,
-                label: None,
-            },
-        ));
-        let mut other = p;
-        other.facts[0].text = "Sibling alternative constraint".into();
-        let mut published = record(7, E::HistoryPublished(other));
-        published.context_branch_id = Some("alternative".into());
-        records.push(published);
-        let mut applied = record(8, E::HistoryApplied(a));
-        applied.context_branch_id = Some("alternative".into());
-        records.push(applied);
-        records.push(record(
-            9,
-            E::ContextCheckout {
-                branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
-                leaf_sequence: 5,
-            },
-        ));
-        let memories = crate::memory::project_memory_objects("history-test", &records).unwrap();
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].summary, "Parser offsets are byte offsets");
-        assert_eq!(
-            memories[0].branch_id.as_deref(),
-            Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID)
-        );
-    }
-
-    #[test]
     fn legacy_bootstrap_cannot_be_dropped_by_an_application() {
         let (mut records, mut p, mut a) = fixture();
         records.push(record(

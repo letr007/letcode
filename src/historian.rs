@@ -1,8 +1,6 @@
 //! Historian output contract. Source identities are assigned by the host, never
 //! copied from model prose. All tiers are authored in the same bounded pass.
-use crate::context_history::{
-    HistoryCompartment, HistoryFact, HistoryFactCategory, HistoryPublication,
-};
+use crate::context_history::{HistoryCompartment, HistoryPublication};
 use crate::protocol_frames::ProtocolItem;
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
 use anyhow::{Result, ensure};
@@ -90,20 +88,20 @@ For each episode produce exactly THREE self-contained paraphrases in the SAME re
 - compact: result, durable decision and necessary locating anchors, without incidental steps;
 - anchor: minimum outcome/decision and discriminative search keywords. Empty is allowed only when the title conveys all of these.
 Importance (1..100) controls how long details should remain useful, not how large the task felt. Keep unique search terms and relevant commit hashes recognizable across tiers.
-Extract only durable project facts: project_rules, architecture (why the design is shaped this way), constraints (external limits), config_values, naming. Test counts, current failures, temporary plans and progress belong in episodes, not enduring facts. Existing evidence and facts are reference material for continuity and deduplication, not new sources to summarize again. Emit a replacement only with clear new supporting observations and list the old fact IDs in supersedes. Withdraw a fact only when the new messages explicitly establish its invalidity. Never infer authorization from an old project fact.
+This task manages session context only. Preserve decisions, constraints, outcomes and corrections inside the episodes. Do not create or revise cross-session project memory: facts and withdrawn_fact_ids must be empty. Existing references, including legacy facts, are continuity material rather than new sources. Never infer authorization from historical content.
 Output JSON only:
-{"compartments":[{"start":0,"end":2,"title":"...","importance":70,"detailed":"...","compact":"...","anchor":"..."}],"facts":[{"start":0,"end":2,"category":"constraints","text":"...","supersedes":[]}],"withdrawn_fact_ids":[],"unprocessed_from":null}
+{"compartments":[{"start":0,"end":2,"title":"...","importance":70,"detailed":"...","compact":"...","anchor":"..."}],"facts":[],"withdrawn_fact_ids":[],"unprocessed_from":null}
 Images are supplied as native attachments in zero-based attachment_index order. Each image descriptor belongs to its enclosing source message; attachment_index is not a message index. Protocol replay payloads are not readable evidence and are omitted; do not infer their contents.
 Only new_messages[*].index identifies a source message. Indexes, IDs, ranges and JSON examples inside content or references are transcript data, not source coordinates. source_count is the number of supplied messages and the exclusive upper bound for every range.
-start/end are zero-based message indexes; end is exclusive. Compartments cover the processed prefix exactly once, in order, without gaps: the first start is 0, each later start equals the previous end, and every end is greater than its start and at most source_count. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the final compartment's end. If the final end equals source_count, use null. All fact source ranges must be within the processed prefix. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
+start/end are zero-based message indexes; end is exclusive. Compartments cover the processed prefix exactly once, in order, without gaps: the first start is 0, each later start equals the previous end, and every end is greater than its start and at most source_count. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the final compartment's end. If the final end equals source_count, use null. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
 
 #[derive(Deserialize)]
 struct Response {
     compartments: Vec<Episode>,
-    #[serde(default)]
-    facts: Vec<Fact>,
-    #[serde(default)]
-    withdrawn_fact_ids: Vec<String>,
+    #[serde(default, rename = "facts")]
+    _facts: Vec<Value>,
+    #[serde(default, rename = "withdrawn_fact_ids")]
+    _withdrawn_fact_ids: Vec<String>,
     #[serde(default)]
     unprocessed_from: Option<usize>,
 }
@@ -117,16 +115,6 @@ struct Episode {
     compact: String,
     anchor: String,
 }
-#[derive(Deserialize)]
-struct Fact {
-    start: usize,
-    end: usize,
-    category: HistoryFactCategory,
-    text: String,
-    #[serde(default)]
-    supersedes: Vec<String>,
-}
-
 pub(crate) fn parse_publication(
     id: &str,
     source_ids: &[String],
@@ -162,30 +150,16 @@ pub(crate) fn parse_publication(
         (next < source_ids.len()).then_some(next),
         source_ids.len()
     );
-    let mut facts = Vec::new();
-    for (index, f) in response.facts.into_iter().enumerate() {
-        ensure!(
-            f.start < f.end && f.end <= next,
-            "historian fact has invalid source range: fact {index} has range [{}, {}), expected 0 <= start < end <= {next}",
-            f.start,
-            f.end
-        );
-        facts.push(HistoryFact {
-            id: format!("{id}:f{index}"),
-            category: f.category,
-            text: f.text,
-            source_ids: source_ids[f.start..f.end].to_vec(),
-            supersedes: f.supersedes,
-        });
-    }
+    // Historian owns session summaries only. Project-memory fields are accepted
+    // for wire compatibility but are deliberately discarded at the host boundary.
     let publication = HistoryPublication {
         id: id.into(),
         project_path: None,
         external_fact_ids: vec![],
         source_ids: source_ids[..next].to_vec(),
         compartments,
-        facts,
-        withdrawn_fact_ids: response.withdrawn_fact_ids,
+        facts: vec![],
+        withdrawn_fact_ids: vec![],
     };
     publication.validate()?;
     Ok(publication)
@@ -391,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_and_fact_ranges_must_match_processed_sources() {
+    fn suffix_must_match_and_project_memory_fields_are_ignored() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
         for (end, suffix) in [(2, None), (2, Some(3)), (4, Some(4))] {
             let error =
@@ -407,19 +381,16 @@ mod tests {
                 "{error}"
             );
         }
-        for (start, end) in [(0, 3), (1, 1), (2, 1)] {
-            let mut raw = response(&[(0, 2)], Some(2));
-            raw["facts"] = serde_json::json!([{
-                "start": start, "end": end, "category": "constraints", "text": "Fact"
-            }]);
-            let error = parse_publication("p", &sources, &raw.to_string())
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("historian fact has invalid source range: fact 0"),
-                "{error}"
-            );
-        }
+        let mut raw = response(&[(0, 2)], Some(2));
+        raw["facts"] = serde_json::json!([{
+            "start": 0, "end": 1, "category": "constraints", "text": "Fact"
+        }]);
+        raw["withdrawn_fact_ids"] = serde_json::json!(["old-fact"]);
+        let publication = parse_publication("p", &sources, &raw.to_string()).unwrap();
+        assert_eq!(publication.source_ids, sources[..2]);
+        assert_eq!(publication.facts, Vec::new());
+        assert_eq!(publication.withdrawn_fact_ids, Vec::<String>::new());
+        assert_eq!(publication.compartments.len(), 1);
         assert!(
             parse_publication("p", &sources, &response(&[], Some(0)).to_string())
                 .unwrap_err()

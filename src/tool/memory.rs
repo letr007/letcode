@@ -20,7 +20,7 @@ impl ToolHandler for MemoryRecallTool {
     }
 
     fn description(&self) -> &'static str {
-        "Recall useful experiment results, decisions, validations, or diagnostics from recent top-level sessions before repeating investigation or retrying a failed approach."
+        "Search system-maintained project memory for the current workspace by keywords, code symbols or paths. Read-only; no session scan or automatic history import. Returns source session/branch/raw IDs for context__expand. Memories can be incomplete or outdated; verify against current code. Use short keywords (including Chinese), not a full question."
     }
 
     fn parameters(&self) -> Value {
@@ -54,7 +54,13 @@ impl ToolHandler for MemoryRecallTool {
 
     async fn execute(&self, args: Value) -> Result<Value> {
         let query = memory_domain::validate_memory_recall_query(&args)?;
-        let memories = memory_domain::recall_recent_memories(&query)?;
-        Ok(json!({"memories": memories}))
+        let store = crate::project_memory::configured_store()?
+            .ok_or_else(|| anyhow::anyhow!("project memory is not configured"))?;
+        tokio::task::spawn_blocking(move || {
+            let memories = store.query(&query)?;
+            let status = store.status()?;
+            Ok(json!({"memories": memories, "status": status}))
+        })
+        .await?
     }
 }

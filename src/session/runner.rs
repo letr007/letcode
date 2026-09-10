@@ -585,6 +585,19 @@ where {
 where {
         let prompt_content = prompt.content.clone();
         let prompt_text = prompt_content.text.clone();
+        if self.child_session_id.is_none()
+            && let Some(transcript) = &self.transcript
+        {
+            let recorder = transcript
+                .lock()
+                .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+            if let Err(error) = crate::project_memory::enroll(&recorder) {
+                warn!(error = %error, "could not register project memory source");
+                self.emit(SessionTransportEvent::Notice(NoticeEvent::info(
+                    "Project memory recording is unavailable; see the application log",
+                )))?;
+            }
+        }
         if let Some(transcript) = self.transcript.clone() {
             agent.clear_logical_checkpoint_candidate_provider();
             agent.set_runtime_snapshot_provider(Arc::new(move || {

@@ -31,6 +31,7 @@ mod memory;
 pub(crate) mod model_runtime;
 mod permission;
 mod process_tree;
+mod project_memory;
 mod protocol_frames;
 mod request_builder;
 mod retry;
@@ -153,6 +154,7 @@ async fn main() -> Result<()> {
         tui::preferences::TuiPreferences::load_from_dir(&config.config_dir);
     let startup_fake_client = startup_preferences.fake_client;
     let workspace_dir = env::current_dir()?;
+    project_memory::configure(&config.config_dir.join("memory"), &workspace_dir)?;
     agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
     agent.set_default_protocol(active_provider.protocol);
     let model_catalog = active_provider

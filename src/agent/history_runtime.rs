@@ -83,21 +83,17 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
         .collect();
     let mut facts = Vec::new();
     let mut fact_tokens = 0;
-    let mut external_fact_ids = Vec::new();
+    let external_fact_ids = Vec::new();
     for evidence in snapshot
         .evidence
         .iter()
         .rev()
         .filter(|e| e.tags.iter().any(|t| t == "historian_fact"))
-        .chain(agent.turn.recalled_project_facts.iter())
     {
         let item = serde_json::json!({"id":evidence.id.strip_prefix("fact:").unwrap_or(&evidence.id),"text":evidence.summary});
         let cost = (item.to_string().len() as u64).div_ceil(3);
         if fact_tokens + cost <= crate::request_builder::evidence_budget_tokens(budget) {
             facts.push(item);
-            if evidence.tags.iter().any(|t| t == "recalled_project_fact") {
-                external_fact_ids.push(evidence.id.clone());
-            }
             fact_tokens += cost;
         }
     }
@@ -311,71 +307,6 @@ fn pending_application(agent: &Agent, hard: bool) -> Result<Option<HistoryApplic
     }))
 }
 
-fn external_retraction_application(agent: &Agent) -> Result<Option<HistoryApplication>> {
-    let archive = &agent.runtime_snapshot.history_archive;
-    let Some(previous) = archive.application.as_ref() else {
-        return Ok(None);
-    };
-    let known: std::collections::BTreeSet<_> = archive
-        .applied_ids
-        .iter()
-        .filter_map(|id| archive.publications.get(id))
-        .flat_map(|p| p.facts.iter().map(|f| &f.id))
-        .collect();
-    let revoked: std::collections::BTreeSet<String> = agent
-        .turn
-        .recalled_project_facts
-        .iter()
-        .flat_map(|f| f.tags.iter())
-        .filter_map(|t| t.strip_prefix("withdraw_local_fact:"))
-        .filter(|id| known.contains(&id.to_string()) && !archive.withdrawn_fact_ids.contains(*id))
-        .map(str::to_string)
-        .collect();
-    if revoked.is_empty() {
-        return Ok(None);
-    }
-    let mut application = previous.clone();
-    application.publication_ids.clear();
-    application
-        .baseline_fact_ids
-        .retain(|id| !revoked.contains(id));
-    application
-        .delta_fact_ids
-        .retain(|id| !revoked.contains(id));
-    application.withdrawn_fact_ids.extend(revoked);
-    application.withdrawn_fact_ids.sort();
-    application.withdrawn_fact_ids.dedup();
-    application.first_kept_entry_id = persisted_history_snapshot(agent)?
-        .active_protocol_frames()
-        .iter()
-        .find(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
-        .and_then(|f| f.source_provenance.as_ref())
-        .and_then(|p| p.source_id.clone());
-    Ok(Some(application))
-}
-
-fn reconcile_recalled_facts(agent: &mut Agent) {
-    let archive = &agent.runtime_snapshot.history_archive;
-    let retired: std::collections::HashSet<_> = archive
-        .applied_ids
-        .iter()
-        .filter_map(|id| archive.publications.get(id))
-        .flat_map(|p| {
-            p.withdrawn_fact_ids
-                .iter()
-                .chain(p.facts.iter().flat_map(|f| f.supersedes.iter()))
-        })
-        .collect();
-    let before = agent.turn.recalled_project_facts.len();
-    agent
-        .turn
-        .recalled_project_facts
-        .retain(|fact| !retired.contains(&fact.id));
-    if before != agent.turn.recalled_project_facts.len() {
-        agent.turn.frozen_evidence = None;
-    }
-}
-
 async fn apply_history<E, Efut>(
     agent: &mut Agent,
     application: HistoryApplication,
@@ -393,7 +324,6 @@ where
     })
     .await?;
     agent.reload_runtime_snapshot_from_provider()?;
-    reconcile_recalled_facts(agent);
     agent.clear_active_epoch();
     agent.clear_provider_usage_anchor();
     Ok(())
@@ -412,19 +342,6 @@ where
     if agent.runtime_snapshot_provider.is_none() {
         return Ok(false);
     }
-    if let Some(application) = external_retraction_application(agent)? {
-        on_event(AgentEvent::HistoryApplied {
-            application,
-            revision: agent.runtime_snapshot.context_scope_revision,
-            blocking,
-        })
-        .await?;
-        agent.reload_runtime_snapshot_from_provider()?;
-        agent.turn.frozen_evidence = None;
-        agent.clear_active_epoch();
-        agent.clear_provider_usage_anchor();
-        return Ok(true);
-    }
     let runtime = agent.historian_runtime.clone();
     if let Some(runtime) = &runtime {
         let snapshot = &agent.runtime_snapshot;
@@ -433,7 +350,10 @@ where
             &snapshot.active_context.branch_id,
             snapshot.context_scope_revision,
         ) {
-            Ok(Some(_)) => agent.reload_runtime_snapshot_from_provider()?,
+            Ok(Some(publication)) => {
+                agent.reload_runtime_snapshot_from_provider()?;
+                agent.last_historian_work = Some(publication.id);
+            }
             Ok(None) => {}
             Err(error) if blocking => return Err(error),
             Err(error) => {
@@ -464,7 +384,6 @@ where
             if !blocking && agent.last_historian_work.as_ref() == Some(&work.id) {
                 return Ok(false);
             }
-            agent.last_historian_work = Some(work.id.clone());
             runtime.start(agent, work)?;
         }
         if !blocking {
@@ -479,7 +398,8 @@ where
         let revision = agent.runtime_snapshot.context_scope_revision;
         tokio::time::timeout(std::time::Duration::from_secs(610), async {
             loop {
-                if runtime.poll(&session, &branch, revision)?.is_some() {
+                if let Some(publication) = runtime.poll(&session, &branch, revision)? {
+                    agent.last_historian_work = Some(publication.id);
                     return Ok::<_, anyhow::Error>(());
                 }
                 if !runtime.is_running() {
@@ -509,11 +429,13 @@ where
             crate::historian::parse_publication(&work.id, &work.source_ids, &raw)?;
         publication.project_path = Some(work.project_path.clone());
         publication.external_fact_ids = work.external_fact_ids.clone();
+        let publication_id = publication.id.clone();
         on_event(AgentEvent::HistoryPublished {
             publication,
             revision: work.revision,
         })
         .await?;
+        agent.last_historian_work = Some(publication_id);
         agent.reload_runtime_snapshot_from_provider()?;
     }
     if let Some(application) = pending_application(agent, true)? {
@@ -540,7 +462,7 @@ mod tests {
             let accepted=second_accepted.clone();
             let release=release_second.clone();
             let server=tokio::spawn(async move {
-              for attempt in 0..2 {
+              for attempt in 0..3 {
                 let (mut stream,_)=listener.accept().await.unwrap();
                 let mut bytes=Vec::new();
                 let mut buffer=[0u8;4096];
@@ -649,7 +571,9 @@ max_output_tokens=4096
             let pool=crate::subagent::SubagentPool::new();
             let runtime=Arc::new(crate::session::historian::HistorianRuntime::new(pool.clone(),directory.path().into(),recorder.clone(),tx));
             agent.historian_runtime=Some(runtime.clone());
-            runtime.start(&agent,work(&agent,true).unwrap().unwrap()).unwrap();
+            let first_work = work(&agent, true).unwrap().unwrap();
+            let first_work_id = first_work.id.clone();
+            runtime.start(&agent, first_work).unwrap();
             assert!(runtime.is_running());
             recorder.lock().unwrap().record_user_message("New work during history preparation").unwrap();
             let observed=recorder.clone();
@@ -662,6 +586,7 @@ max_output_tokens=4096
             let records=crate::transcript::read_records(recorder.lock().unwrap().path()).unwrap();
             assert_eq!(records.iter().filter(|r|matches!(r.event,TranscriptEvent::HistoryPublished(_))).count(),1);
             assert_eq!(records.iter().filter(|r|matches!(r.event,TranscriptEvent::HistoryApplied(_))).count(),1);
+            assert_eq!(agent.last_historian_work.as_deref(), Some(first_work_id.as_str()));
             let child_id = records.iter().find_map(|record| match &record.event {
                 TranscriptEvent::SubagentStarted { child_session_id, agent_name, .. } if agent_name == "historian" => Some(child_session_id),
                 _ => None,
@@ -699,14 +624,57 @@ max_output_tokens=4096
             assert_eq!(restored_selection.baseline.len(),1,"a larger budget may restore archived tiers without an LLM call");
             events(AgentEvent::HistoryApplied {application:restored_selection,revision:0,blocking:false}).await.unwrap();
             agent.reload_runtime_snapshot_from_provider().unwrap();
-            runtime.start(&agent,work(&agent,true).unwrap().unwrap()).unwrap();
-            second_accepted.notified().await;
-            runtime.cancel();
-            release_second.notify_one();
+            let second_work = work(&agent, true).unwrap().unwrap();
+            let second_work_id = second_work.id.clone();
+            let observed = recorder.clone();
+            let mut events = move |event| {
+                let result = crate::agent_event_journal::persist_agent_event(
+                    &mut observed.lock().unwrap(),
+                    &event,
+                )
+                .map(|_| ());
+                std::future::ready(result)
+            };
+            let mut advancing = Box::pin(advance(&mut agent, true, true, &mut events));
+            let result = tokio::select! {
+                result = &mut advancing => result,
+                _ = second_accepted.notified() => {
+                    runtime.cancel();
+                    release_second.notify_one();
+                    (&mut advancing).await
+                }
+            };
+            drop(advancing);
+            assert!(result.is_err(), "cancellation must not publish the work");
+            while pool.is_running() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_ne!(
+                agent.last_historian_work.as_deref(),
+                Some(second_work_id.as_str()),
+                "cancelled work must not be recorded as successful"
+            );
+
+            let retry_work = work(&agent, true).unwrap().unwrap();
+            assert_eq!(retry_work.id, second_work_id);
+            let observed = recorder.clone();
+            let mut events = move |event| {
+                let result = crate::agent_event_journal::persist_agent_event(
+                    &mut observed.lock().unwrap(),
+                    &event,
+                )
+                .map(|_| ());
+                std::future::ready(result)
+            };
+            assert!(advance(&mut agent, true, true, &mut events).await.unwrap());
+            assert_eq!(
+                agent.last_historian_work.as_deref(),
+                Some(second_work_id.as_str()),
+                "only the successful retry may record the work"
+            );
             server.await.unwrap();
-            while pool.is_running() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
             let cancelled_records=crate::transcript::read_records(recorder.lock().unwrap().path()).unwrap();
-            assert_eq!(cancelled_records.iter().filter(|r|matches!(r.event,TranscriptEvent::HistoryPublished(_))).count(),1,"cancelled work must not publish late");
+            assert_eq!(cancelled_records.iter().filter(|r|matches!(r.event,TranscriptEvent::HistoryPublished(_))).count(),2,"cancelled work must not publish late");
         }).await.expect("historian test timed out");
     }
 }
@@ -933,21 +901,6 @@ max_output_tokens=128
                 supports_tools: false,
                 ..Default::default()
             };
-            let recalled = crate::evidence::EvidenceRecord {
-                id: "other:fact:f".into(),
-                sequence: 1,
-                timestamp_ms: 0,
-                evidence_kind: crate::evidence::EvidenceKind::Decision,
-                title: "Project memory".into(),
-                summary: "RECALLED-FACT".into(),
-                detail: None,
-                source: crate::evidence::EvidenceSource::Session {
-                    session_id: "other".into(),
-                    branch_id: "root".into(),
-                    entry_id: "evidence:fact:f".into(),
-                },
-                tags: vec!["recalled_project_fact".into()],
-            };
             let prepare = |delta: &str| {
                 let history = vec![
                     HistoryItem::context_summary("[Session history]\nFROZEN-BASELINE"),
@@ -966,7 +919,7 @@ max_output_tokens=128
                         history: &history,
                         protected_start_index: 2,
                         tools: &[],
-                        evidence: std::slice::from_ref(&recalled),
+                        evidence: &[],
                     },
                 )
                 .unwrap();
@@ -1012,100 +965,10 @@ max_output_tokens=128
                 "anthropic" => {
                     assert!(value["system"].to_string().contains("SYSTEM-AUTHORITY"));
                     assert!(!value["system"].to_string().contains("FROZEN-BASELINE"));
-                    assert!(!value["system"].to_string().contains("RECALLED-FACT"));
                 }
                 _ => assert_eq!(first.matches("SYSTEM-AUTHORITY").count(), 1),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod retraction_tests {
-    use super::*;
-    #[tokio::test]
-    async fn resuming_fact_owner_applies_external_retraction_without_rewriting_history() {
-        let root = tempfile::tempdir().unwrap();
-        crate::memory::project_fact_tests::write_session(root.path(), "a", "project", vec![]);
-        crate::memory::project_fact_tests::write_session(
-            root.path(),
-            "b",
-            "project",
-            vec!["a:fact:a-f".into()],
-        );
-        let records = crate::transcript::read_records(root.path().join("a.jsonl")).unwrap();
-        let snapshot = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-            "a".into(),
-            records.clone(),
-            crate::transcript::transcript_projection::SessionContextCursor {
-                branch_id: None,
-                leaf_sequence: None,
-            },
-            &[],
-        )
-        .unwrap()
-        .snapshot;
-        let mut agent = Agent::new("m", 1, 0);
-        agent.runtime_snapshot = snapshot;
-        agent.turn.recalled_project_facts =
-            crate::memory::recall_project_facts(root.path(), "project", "a").unwrap();
-        let mut recorder =
-            crate::transcript::TranscriptRecorder::open_existing(root.path(), "a").unwrap();
-        let path = recorder.path().to_path_buf();
-        agent.set_runtime_snapshot_provider(Arc::new(move || {
-            Ok(
-                crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-                    "a".into(),
-                    crate::transcript::read_records(&path)?,
-                    crate::transcript::transcript_projection::SessionContextCursor {
-                        branch_id: None,
-                        leaf_sequence: None,
-                    },
-                    &[],
-                )?
-                .snapshot,
-            )
-        }));
-        let application = external_retraction_application(&agent).unwrap().unwrap();
-        assert!(!application.baseline_fact_ids.contains(&"a-f".to_string()));
-        assert!(application.withdrawn_fact_ids.contains(&"a-f".to_string()));
-        let mut events = |event| {
-            std::future::ready(
-                crate::agent_event_journal::persist_agent_event(&mut recorder, &event).map(|_| ()),
-            )
-        };
-        assert!(
-            advance(&mut agent, false, false, &mut events)
-                .await
-                .unwrap(),
-            "reconcile even below the background threshold"
-        );
-        assert!(
-            external_retraction_application(&agent).unwrap().is_none(),
-            "the same retraction is not applied twice"
-        );
-        let hard = pending_application(&agent, true).unwrap().unwrap();
-        assert!(hard.baseline_fact_ids.is_empty() && hard.delta_fact_ids.is_empty());
-        events(AgentEvent::HistoryApplied {
-            application: hard,
-            revision: agent.runtime_snapshot.context_scope_revision,
-            blocking: false,
-        })
-        .await
-        .unwrap();
-        agent.reload_runtime_snapshot_from_provider().unwrap();
-        let records = crate::transcript::read_records(root.path().join("a.jsonl")).unwrap();
-        let restored = &agent.runtime_snapshot;
-        let third_session =
-            crate::memory::recall_project_facts(root.path(), "project", "third").unwrap();
-        assert_eq!(third_session.len(), 1);
-        assert_eq!(third_session[0].id, "b:fact:b-f");
-        assert!(restored.evidence.is_empty());
-        assert!(restored.history_archive.effective_fact_ids(&[]).is_empty());
-        assert!(
-            matches!(&records[1].event,crate::transcript::TranscriptEvent::HistoryPublished(p) if p.facts[0].text=="a design")
-        );
-        assert!(crate::transcript::restore_session_history(&records).unwrap().iter().all(|item|!matches!(item,HistoryItem::ContextSummary {text} if text.contains("a design"))));
     }
 }
 
@@ -1281,10 +1144,9 @@ max_output_tokens=128
         assert!(prepared.input.text.contains("unique body first-7"));
         let mut publication = crate::historian::parse_publication(&prepared.id,&prepared.source_ids,&serde_json::json!({
             "compartments":[{"start":0,"end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"}],
-            "facts":[{"start":0,"end":10,"category":"architecture","text":"Source fact","supersedes":[]}],"unprocessed_from":null
+            "facts":[],"unprocessed_from":null
         }).to_string()).unwrap();
         publication.project_path = Some(prepared.project_path);
-        let fact_id = publication.facts[0].id.clone();
         recorder
             .lock()
             .unwrap()
@@ -1351,17 +1213,8 @@ max_output_tokens=128
             .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
             .map(|f| f.item)
             .collect();
-        // External fact retraction is another application with no retired raw
-        // prefix. Its retained boundary must also use persisted identity.
-        let mut fact = agent
-            .runtime_snapshot
-            .evidence
-            .iter()
-            .find(|e| e.id == format!("fact:{fact_id}"))
-            .unwrap()
-            .clone();
-        fact.tags = vec![format!("withdraw_local_fact:{fact_id}")];
-        agent.turn.recalled_project_facts = vec![fact];
+        // Reapplying the frozen selection must retain the persisted raw boundary.
+        let application = pending_application(&agent, true).unwrap();
         let observed = recorder.clone();
         let mut events = move |event| {
             std::future::ready(
@@ -1372,11 +1225,11 @@ max_output_tokens=128
                 .map(|_| ()),
             )
         };
-        assert!(
-            advance(&mut agent, false, false, &mut events)
+        if let Some(application) = application {
+            apply_history(&mut agent, application, false, &mut events)
                 .await
-                .unwrap()
-        );
+                .unwrap();
+        }
         let actual_tail: Vec<_> = agent
             .active_history_items()
             .into_iter()

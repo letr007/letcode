@@ -1397,11 +1397,7 @@ fn evidence_message_segment(input: &PromptPlanBuildInput<'_>) -> Option<NewPromp
     Some(NewPromptSegment {
         contributor_kind: PromptContributorKind::Evidence,
         contributor_label: Some("selected_evidence".to_string()),
-        role: if evidence_message.starts_with("[Session memory]\n") {
-            PromptSegmentRole::User
-        } else {
-            PromptSegmentRole::Developer
-        },
+        role: PromptSegmentRole::Developer,
         stability: PromptSegmentStability::Volatile,
         retention: PromptSegmentRetention::Droppable,
         protection: PromptSegmentProtection {

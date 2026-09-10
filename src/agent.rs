@@ -1261,16 +1261,7 @@ impl Agent {
         );
         let history = self.active_history_items();
         crate::protocol_frames::validate_history_items_complete(&history, None)?;
-        let mut snapshot_with_recall;
-        let snapshot = if self.turn.recalled_project_facts.is_empty() {
-            &self.runtime_snapshot
-        } else {
-            snapshot_with_recall = self.runtime_snapshot.clone();
-            snapshot_with_recall
-                .evidence
-                .extend(self.turn.recalled_project_facts.iter().cloned());
-            &snapshot_with_recall
-        };
+        let snapshot = &self.runtime_snapshot;
         let planned = build_request_with_policy(
             RequestBuilderInput {
                 model_id: &self.model,
@@ -5049,7 +5040,6 @@ struct TurnRuntimeState {
     // separate from the persisted setting, which records the LLM's last choice.
     auto_continue_active: bool,
     frozen_evidence: Option<FrozenTurnEvidence>,
-    recalled_project_facts: Vec<EvidenceRecord>,
     pressure_compaction: PressureCompactionState,
 }
 
@@ -5068,7 +5058,6 @@ impl TurnRuntimeState {
             counters: TurnCounters::default(),
             auto_continue_active: false,
             frozen_evidence: None,
-            recalled_project_facts: Vec::new(),
             pressure_compaction: PressureCompactionState::default(),
         }
     }

@@ -183,7 +183,7 @@ impl AgentTemplate {
         template.timeout_secs = Some(600);
         template.max_tool_calls = Some(0);
         template.expected_result_shape =
-            "Three-tier history JSON with source coverage and derived facts".into();
+            "Three-tier session history JSON with source coverage".into();
         template
     }
 
