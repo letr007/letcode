@@ -3003,9 +3003,49 @@ fn queued_prompt_dispatches_immediately() {
     assert_eq!(runtime.state().phase, AppPhase::Running);
     assert!(matches!(
         runtime.state().timeline.items().last(),
-        Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued
+        Some(TimelineItem::User(message))
+            if message.text == "follow up" && message.queued && !message.steering
     ));
 
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+        prompt: submission.clone(),
+    });
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::User(message))
+            if message.text == "follow up"
+                && message.queued
+                && message.steering
+                && !message.waiting_for_input
+    ));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptWaitingForInput {
+        prompt: submission.clone(),
+    });
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::User(message))
+            if message.text == "follow up"
+                && message.queued
+                && !message.steering
+                && message.waiting_for_input
+    ));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptSteerFailed {
+        prompt: submission.clone(),
+    });
+    assert!(matches!(
+        runtime.state().timeline.items().last(),
+        Some(TimelineItem::User(message))
+            if message.text == "follow up"
+                && message.queued
+                && !message.steering
+                && !message.waiting_for_input
+    ));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+        prompt: submission.clone(),
+    });
     runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
         UserMessageEvent::from_submission(submission),
     ));
@@ -3013,7 +3053,11 @@ fn queued_prompt_dispatches_immediately() {
     assert_eq!(runtime.queued_prompts.len(), 0);
     assert!(matches!(
         runtime.state().timeline.items().last(),
-        Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
+        Some(TimelineItem::User(message))
+            if message.text == "follow up"
+                && !message.queued
+                && !message.steering
+                && !message.waiting_for_input
     ));
     assert_eq!(
         runtime

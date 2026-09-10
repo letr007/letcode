@@ -535,6 +535,12 @@ pub enum AgentEvent {
     UserMessage {
         submission: UserMessageSubmission,
     },
+    SteerPending {
+        submission: UserMessageSubmission,
+    },
+    SteerFailed {
+        submission: UserMessageSubmission,
+    },
     AssistantToolCallBatch {
         text: Option<String>,
         reasoning_content: Option<String>,

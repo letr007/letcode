@@ -969,6 +969,24 @@ where {
                                     parent_tool_call_id.as_deref(),
                                     SessionTransportEvent::UserMessage(UserMessageEvent::from_submission(submission)),
                                 )?,
+                                AgentEvent::SteerPending { submission } => send_scoped_event(
+                                    &sender,
+                                    child_session_id.as_deref(),
+                                    agent_name.as_deref(),
+                                    parent_tool_call_id.as_deref(),
+                                    SessionTransportEvent::QueuedPromptWaitingForInput {
+                                        prompt: submission,
+                                    },
+                                )?,
+                                AgentEvent::SteerFailed { submission } => send_scoped_event(
+                                    &sender,
+                                    child_session_id.as_deref(),
+                                    agent_name.as_deref(),
+                                    parent_tool_call_id.as_deref(),
+                                    SessionTransportEvent::QueuedPromptSteerFailed {
+                                        prompt: submission,
+                                    },
+                                )?,
                                 AgentEvent::AssistantMessage { .. }
                                 | AgentEvent::AssistantToolCallBatch { .. }
                                 | AgentEvent::InternalContinuation { .. } => {}

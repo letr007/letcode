@@ -132,6 +132,15 @@ impl ResponseSteerHandle {
         );
     }
 
+    fn pending_continuation_parked(&self) {
+        let _ = self.state.compare_exchange(
+            STEER_PENDING,
+            STEER_UNAVAILABLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     pub(crate) fn steer_failed(&self) {
         let _ = self.state.compare_exchange(
             STEER_PENDING,
@@ -320,6 +329,37 @@ impl ModelTransport for TurnLocalResponsesTransport {
                     .with_code("websocket_session_missing"),
             );
         };
+        let mut pending_steers = std::mem::take(&mut *self.server_owned_steers.lock().unwrap());
+        let required_continuation = if pending_steers.is_empty() {
+            None
+        } else {
+            let target = pending_steers[0]
+                .target_response_id
+                .clone()
+                .ok_or_else(|| {
+                    ModelFailure::new(FailurePhase::Finish, FailureKind::Internal)
+                        .with_code("server_owned_steer_missing_target")
+                })?;
+            if pending_steers.iter().any(|pending| {
+                pending.target_response_id.as_deref() != Some(target.as_str())
+                    || pending.required_input.is_empty()
+            }) {
+                return Err(
+                    ModelFailure::new(FailurePhase::Finish, FailureKind::Internal)
+                        .with_code("server_owned_steer_inconsistent_required_input"),
+                );
+            }
+            let mut required_input = Vec::new();
+            for required in pending_steers
+                .iter()
+                .flat_map(|pending| pending.required_input.iter())
+            {
+                if !required_input.contains(required) {
+                    required_input.push(required.clone());
+                }
+            }
+            Some((target, required_input))
+        };
         let previous_response_id = self.previous_response_id.lock().await.clone();
         let can_continue = !*self.force_full.lock().await && previous_response_id.is_some();
         let incremental_prompt_unit_start = if can_continue {
@@ -331,12 +371,34 @@ impl ModelTransport for TurnLocalResponsesTransport {
             .then_some(previous_response_id.as_deref())
             .flatten();
         let cached_successor = self.cached_successor.lock().await.take();
+        if cached_successor.is_some() && required_continuation.is_some() {
+            return Err(
+                ModelFailure::new(FailurePhase::Finish, FailureKind::Internal)
+                    .with_code("server_owned_steer_has_cached_successor"),
+            );
+        }
         if cached_successor.is_none() {
-            let frame = route.binding.websocket_frame(
-                &request,
-                frame_previous_response_id,
-                incremental_prompt_unit_start,
-            )?;
+            let frame = if let Some((target, required_input)) = &required_continuation {
+                match route
+                    .binding
+                    .websocket_required_input_frame(&request, target, required_input)
+                {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        self.server_owned_steers
+                            .lock()
+                            .unwrap()
+                            .append(&mut pending_steers);
+                        return Err(error);
+                    }
+                }
+            } else {
+                route.binding.websocket_frame(
+                    &request,
+                    frame_previous_response_id,
+                    incremental_prompt_unit_start,
+                )?
+            };
             if let Err(error) = session
                 .send_text(
                     frame,
@@ -344,13 +406,26 @@ impl ModelTransport for TurnLocalResponsesTransport {
                 )
                 .await
             {
+                if required_continuation.is_some() {
+                    self.server_owned_steers
+                        .lock()
+                        .unwrap()
+                        .append(&mut pending_steers);
+                }
                 *session_guard = None;
-                return Err(error);
+                return Err(unknown_steer_failure(
+                    error,
+                    required_continuation.is_some(),
+                ));
+            }
+            if let Some((target, _)) = &required_continuation {
+                *self.previous_response_id.lock().await = Some(target.clone());
+                *self.force_full.lock().await = false;
+                *self.next_prompt_unit_start.lock().await = None;
             }
         }
         let steer_receiver = self.steer_receiver.clone();
         let steer_handle = self.steer_handle.lock().unwrap().clone();
-        let pending_steers = std::mem::take(&mut *self.server_owned_steers.lock().unwrap());
         drop(session_guard);
         let stream = websocket_response_stream(
             self.session.clone(),
@@ -426,7 +501,7 @@ struct PendingSteer {
     submission: UserMessageSubmission,
     target_response_id: Option<String>,
     server_steer_id: Option<String>,
-    waiting_for_required_input: bool,
+    required_input: Vec<serde_json::Value>,
 }
 
 fn steer_details(
@@ -478,7 +553,7 @@ fn bind_accepted_steer(
 fn bind_pending_steer(
     pending_steers: &mut [PendingSteer],
     value: &serde_json::Value,
-) -> Result<(), ModelFailure> {
+) -> Result<UserMessageSubmission, ModelFailure> {
     bind_accepted_steer(pending_steers, value)?;
     let (_, previous_response_id, server_steer_id) = steer_details(value)?;
     let server_steer_id = server_steer_id.expect("accepted binding requires an id");
@@ -497,18 +572,17 @@ fn bind_pending_steer(
                 .with_code("steer_pending_missing_reason")
         })?;
     if reason == "waiting_for_required_input" {
-        let required_input = value
+        pending.required_input = value
             .get("required_input")
             .and_then(serde_json::Value::as_array)
             .filter(|required| !required.is_empty())
+            .cloned()
             .ok_or_else(|| {
                 ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
                     .with_code("steer_pending_missing_required_input")
             })?;
-        let _ = required_input;
-        pending.waiting_for_required_input = true;
     }
-    Ok(())
+    Ok(pending.submission.clone())
 }
 
 fn park_server_owned_steers(
@@ -710,7 +784,7 @@ fn websocket_response_stream(
                                 submission: request.submission,
                                 target_response_id: response_id.clone(),
                                 server_steer_id: None,
-                                waiting_for_required_input: false,
+                                required_input: Vec::new(),
                             });
                             if let (Some(response_id), Some(request)) =
                                 (response_id, pending_steers.last().cloned())
@@ -919,15 +993,57 @@ fn websocket_response_stream(
                         });
                         let bind = acknowledgement.and_then(|value| {
                             if event_type == "response.steer.pending" {
-                                bind_pending_steer(&mut pending_steers, value)
+                                bind_pending_steer(&mut pending_steers, value).map(Some)
                             } else {
-                                bind_accepted_steer(&mut pending_steers, value)
+                                bind_accepted_steer(&mut pending_steers, value).map(|()| None)
                             }
                         });
-                        if let Err(error) = bind {
-                            *guard = None;
+                        let pending_submission = match bind {
+                            Ok(submission) => submission,
+                            Err(error) => {
+                                *guard = None;
+                                return Some((
+                                    Err(error),
+                                    (
+                                        session_handle,
+                                        previous_response_id,
+                                        force_full,
+                                        next_prompt_unit_start,
+                                        cached_successor,
+                                        server_owned_steers,
+                                        binding,
+                                        steer_receiver,
+                                        cached_first,
+                                        current_response_id,
+                                        pending_steers,
+                                        steer_accepted,
+                                        true,
+                                        secret,
+                                    ),
+                                ));
+                            }
+                        };
+                        // Both acknowledgements retain server ownership. Only a
+                        // successor response.created commits the submission.
+                        steer_accepted = true;
+                        if let Some(submission) = pending_submission
+                            && pending_steers
+                                .iter()
+                                .any(|pending| !pending.required_input.is_empty())
+                        {
+                            if let Some(handle) = &steer_handle {
+                                handle.pending_continuation_parked();
+                            }
+                            let synthetic = serde_json::json!({
+                                "type": "response.steer.pending",
+                                "reason": "waiting_for_required_input",
+                                "steer_submission_id": submission.id,
+                                "input": submission.content,
+                            })
+                            .to_string()
+                            .into_bytes();
                             return Some((
-                                Err(error),
+                                Ok(synthetic),
                                 (
                                     session_handle,
                                     previous_response_id,
@@ -940,15 +1056,12 @@ fn websocket_response_stream(
                                     cached_first,
                                     current_response_id,
                                     pending_steers,
-                                    steer_accepted,
-                                    true,
+                                    false,
+                                    false,
                                     secret,
                                 ),
                             ));
                         }
-                        // Both acknowledgements retain server ownership. Only a
-                        // successor response.created commits the submission.
-                        steer_accepted = true;
                         continue;
                     }
                     let successful_terminal =
@@ -994,7 +1107,7 @@ fn websocket_response_stream(
                             submission: request.submission,
                             target_response_id: current_response_id.clone(),
                             server_steer_id: None,
-                            waiting_for_required_input: false,
+                            required_input: Vec::new(),
                         };
                         if is_failed_terminal {
                             let submission = request.submission.clone();
@@ -1133,7 +1246,7 @@ fn websocket_response_stream(
                     if successful_terminal
                         && pending_steers
                             .iter()
-                            .any(|pending| pending.waiting_for_required_input)
+                            .any(|pending| !pending.required_input.is_empty())
                     {
                         if let Err(error) =
                             park_server_owned_steers(&server_owned_steers, &mut pending_steers)
@@ -1222,7 +1335,7 @@ fn websocket_response_stream(
                                         submission: request.submission,
                                         target_response_id: response_id.clone(),
                                         server_steer_id: None,
-                                        waiting_for_required_input: false,
+                                        required_input: Vec::new(),
                                     });
                                     if let (Some(response_id), Some(request)) =
                                         (response_id, pending_steers.last().cloned())
@@ -1328,37 +1441,41 @@ fn websocket_response_stream(
                                 });
                                 let bind = acknowledgement.and_then(|value| {
                                     if successor_type == "response.steer.pending" {
-                                        bind_pending_steer(&mut pending_steers, value)
+                                        bind_pending_steer(&mut pending_steers, value).map(Some)
                                     } else {
                                         bind_accepted_steer(&mut pending_steers, value)
+                                            .map(|()| None)
                                     }
                                 });
-                                if let Err(error) = bind {
-                                    *guard = None;
-                                    return Some((
-                                        Err(error),
-                                        (
-                                            session_handle,
-                                            previous_response_id,
-                                            force_full,
-                                            next_prompt_unit_start,
-                                            cached_successor,
-                                            server_owned_steers,
-                                            binding,
-                                            steer_receiver,
-                                            cached_first,
-                                            current_response_id,
-                                            pending_steers,
-                                            steer_accepted,
-                                            true,
-                                            secret,
-                                        ),
-                                    ));
-                                }
+                                let pending_submission = match bind {
+                                    Ok(submission) => submission,
+                                    Err(error) => {
+                                        *guard = None;
+                                        return Some((
+                                            Err(error),
+                                            (
+                                                session_handle,
+                                                previous_response_id,
+                                                force_full,
+                                                next_prompt_unit_start,
+                                                cached_successor,
+                                                server_owned_steers,
+                                                binding,
+                                                steer_receiver,
+                                                cached_first,
+                                                current_response_id,
+                                                pending_steers,
+                                                steer_accepted,
+                                                true,
+                                                secret,
+                                            ),
+                                        ));
+                                    }
+                                };
                                 steer_accepted = true;
                                 if pending_steers
                                     .iter()
-                                    .any(|pending| pending.waiting_for_required_input)
+                                    .any(|pending| !pending.required_input.is_empty())
                                 {
                                     if let Err(error) = park_server_owned_steers(
                                         &server_owned_steers,
@@ -1385,9 +1502,22 @@ fn websocket_response_stream(
                                             ),
                                         ));
                                     }
-                                    terminal_for_stream.store(true, Ordering::Release);
+                                    let submission = pending_submission.expect(
+                                        "required-input pending acknowledgement has a submission",
+                                    );
+                                    if let Some(handle) = &steer_handle {
+                                        handle.pending_continuation_parked();
+                                    }
+                                    let synthetic = serde_json::json!({
+                                        "type": "response.steer.pending",
+                                        "reason": "waiting_for_required_input",
+                                        "steer_submission_id": submission.id,
+                                        "input": submission.content,
+                                    })
+                                    .to_string()
+                                    .into_bytes();
                                     return Some((
-                                        Ok(original_terminal),
+                                        Ok(synthetic),
                                         (
                                             session_handle,
                                             previous_response_id,
@@ -1397,11 +1527,11 @@ fn websocket_response_stream(
                                             server_owned_steers,
                                             binding,
                                             steer_receiver,
-                                            cached_first,
+                                            Some(original_terminal),
                                             current_response_id,
                                             pending_steers,
-                                            true,
-                                            true,
+                                            false,
+                                            false,
                                             secret,
                                         ),
                                     ));
@@ -2387,7 +2517,10 @@ impl AttemptAccumulator {
         if self.events.iter().any(|event| {
             matches!(
                 event,
-                ModelEvent::SteerPending { .. } | ModelEvent::SteerFailed { .. }
+                ModelEvent::SteerPending {
+                    waiting_for_required_input: false,
+                    ..
+                } | ModelEvent::SteerFailed { .. }
             )
         }) {
             return Err(ModelAttemptFailure {
@@ -2619,12 +2752,11 @@ impl TurnOrchestrator {
             let result = match result {
                 Ok(result) => result,
                 Err(error)
-                    if error.partial.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            ModelEvent::SteerPending { .. } | ModelEvent::SteerFailed { .. }
-                        )
-                    }) =>
+                    if error
+                        .partial
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, ModelEvent::SteerFailed { .. })) =>
                 {
                     driver
                         .recover_iteration(&error.partial, &error.failure)
@@ -3626,11 +3758,12 @@ reasoning = true
             let continuation: serde_json::Value = serde_json::from_str(&continuation).unwrap();
             assert_eq!(continuation["type"], "response.create");
             assert_eq!(continuation["previous_response_id"], "resp-1");
-            assert!(continuation["input"].as_array().is_some_and(|input| {
-                input.iter().any(|item| {
-                    item["type"] == "function_call_output" && item["call_id"] == "call-1"
-                })
-            }));
+            let input = continuation["input"]
+                .as_array()
+                .expect("continuation input");
+            assert_eq!(input.len(), 1);
+            assert_eq!(input[0]["type"], "function_call_output");
+            assert_eq!(input[0]["call_id"], "call-1");
             socket
                 .send(Message::Text(
                     r#"{"type":"response.created","response":{"id":"resp-2","status":"in_progress"}}"#.into(),
@@ -3675,7 +3808,7 @@ reasoning = true
         let transport = Arc::new(TurnLocalResponsesTransport::new());
         transport.set_steer_receiver(steer_rx).await;
         transport.set_steer_handle(handle.clone());
-        let runtime = ModelRuntime::new_responses_websocket(transport);
+        let runtime = ModelRuntime::new_responses_websocket(transport.clone());
         let steer_task = tokio::spawn({
             let handle = handle.clone();
             let steer_tx = steer_tx.clone();
@@ -3708,8 +3841,20 @@ reasoning = true
                 .iter()
                 .any(|event| matches!(event, ModelEvent::SteerCommit { .. }))
         );
-        assert!(handle.pending());
+        assert!(first_observer.events.iter().any(|event| matches!(
+            event,
+            ModelEvent::SteerPending {
+                waiting_for_required_input: true,
+                ..
+            }
+        )));
+        assert!(!handle.pending());
+        assert!(!handle.availability());
 
+        // Simulate the real driver losing its ordinary incremental boundary.
+        // Required-input continuation must still target the response that owns
+        // the accepted steer and must not send a fresh full request.
+        transport.reset_chain().await;
         let mut continuation_observer = RecordingObserver::default();
         let continuation = runtime
             .execute_prepared_attempt(&route, continuation_request, &mut continuation_observer)
@@ -3887,7 +4032,7 @@ reasoning = true
                 ),
                 target_response_id: Some("resp-1".into()),
                 server_steer_id: None,
-                waiting_for_required_input: false,
+                required_input: Vec::new(),
             },
             PendingSteer {
                 submission: UserMessageSubmission::new(
@@ -3896,7 +4041,7 @@ reasoning = true
                 ),
                 target_response_id: Some("resp-1".into()),
                 server_steer_id: None,
-                waiting_for_required_input: false,
+                required_input: Vec::new(),
             },
         ];
         bind_accepted_steer(
@@ -3918,7 +4063,7 @@ reasoning = true
         )
         .unwrap();
         assert_eq!(pending[0].submission.id, "local-1");
-        assert!(pending[0].waiting_for_required_input);
+        assert_eq!(pending[0].required_input.len(), 1);
         assert_eq!(pending[1].submission.id, "local-2");
         let failed_submission = take_pending_steer(
             &mut pending,

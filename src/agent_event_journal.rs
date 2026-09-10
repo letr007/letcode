@@ -193,6 +193,8 @@ pub fn persist_agent_event(
         | AgentEvent::LlmRetryScheduled(_)
         | AgentEvent::LlmRetryStarted(_)
         | AgentEvent::ModelStreamIssue { .. }
+        | AgentEvent::SteerPending { .. }
+        | AgentEvent::SteerFailed { .. }
         | AgentEvent::ToolCallPending { .. }
         | AgentEvent::ToolOutputDelta { .. }
         | AgentEvent::ToolCallBatchFinished => JournalEffect::IGNORED,

@@ -1311,6 +1311,14 @@ impl TuiRuntime {
             }
             SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
+                self.state.mark_queued_user_message_steering(&prompt.id);
+            }
+            SessionTransportEvent::QueuedPromptWaitingForInput { prompt } => {
+                self.state
+                    .mark_queued_user_message_waiting_for_input(&prompt.id);
+            }
+            SessionTransportEvent::QueuedPromptSteerFailed { prompt } => {
+                self.state.mark_queued_user_message_queued(&prompt.id);
             }
             SessionTransportEvent::SessionTitleUpdated { session_id, title }
                 if self.state.session_id.as_deref() == Some(session_id) =>

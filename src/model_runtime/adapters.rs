@@ -2606,6 +2606,83 @@ impl ProtocolBinding for ResponsesBinding {
         })
     }
 
+    fn websocket_required_input_frame(
+        &self,
+        request: &PreparedHttpRequest,
+        previous_response_id: &str,
+        required_input: &[serde_json::Value],
+    ) -> Result<Vec<u8>, ModelFailure> {
+        let mut body: Value = serde_json::from_slice(&request.body).map_err(|error| {
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_required_input_request")
+                .with_detail(error.to_string())
+        })?;
+        let fields = body.as_object_mut().ok_or_else(|| {
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_required_input_shape")
+        })?;
+        let input = fields
+            .get("input")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                    .with_code("websocket_required_input_items")
+            })?;
+        let mut selected = Vec::with_capacity(required_input.len());
+        for required in required_input {
+            let item_type = required
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
+                        .with_code("steer_required_input_missing_type")
+                })?;
+            let (key, id) = if let Some(call_id) = required.get("call_id").and_then(Value::as_str) {
+                ("call_id", call_id)
+            } else if let Some(approval_id) =
+                required.get("approval_request_id").and_then(Value::as_str)
+            {
+                ("approval_request_id", approval_id)
+            } else {
+                return Err(ModelFailure::new(
+                    FailurePhase::Decode,
+                    FailureKind::MalformedResponse,
+                )
+                .with_code("steer_required_input_missing_id"));
+            };
+            let matches = input
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some(item_type)
+                        && item.get(key).and_then(Value::as_str) == Some(id)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(
+                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                        .with_code(if matches.is_empty() {
+                            "websocket_required_input_missing_output"
+                        } else {
+                            "websocket_required_input_duplicate_output"
+                        })
+                        .with_detail(format!("required {item_type} {key}={id}")),
+                );
+            }
+            selected.push(matches[0].clone());
+        }
+        fields.insert("input".into(), Value::Array(selected));
+        fields.insert("type".into(), Value::String("response.create".into()));
+        fields.insert(
+            "previous_response_id".into(),
+            Value::String(previous_response_id.to_owned()),
+        );
+        serde_json::to_vec(&body).map_err(|error| {
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::Internal)
+                .with_code("websocket_required_input_serialization")
+                .with_detail(error.to_string())
+        })
+    }
+
     fn websocket_frame(
         &self,
         request: &PreparedHttpRequest,
@@ -3532,6 +3609,8 @@ struct ResponsesStreamEvent {
     #[serde(default)]
     input: Option<Value>,
     #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
     steer_submission_id: Option<String>,
     #[serde(default, alias = "status_code")]
     status: Option<Value>,
@@ -3908,6 +3987,8 @@ impl ResponsesDecoder {
             "response.steer.pending" => {
                 output.push(ModelEvent::SteerPending {
                     submission: Self::steer_submission(&event)?,
+                    waiting_for_required_input: event.reason.as_deref()
+                        == Some("waiting_for_required_input"),
                 });
             }
             "response.steer.failed" => {

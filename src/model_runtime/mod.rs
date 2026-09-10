@@ -553,6 +553,17 @@ pub trait ProtocolBinding: Send + Sync {
                 .with_code("websocket_steer_unsupported_protocol"),
         )
     }
+    fn websocket_required_input_frame(
+        &self,
+        _request: &PreparedHttpRequest,
+        _previous_response_id: &str,
+        _required_input: &[serde_json::Value],
+    ) -> Result<Vec<u8>, ModelFailure> {
+        Err(
+            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                .with_code("websocket_required_input_unsupported_protocol"),
+        )
+    }
     fn websocket_frame(
         &self,
         _request: &PreparedHttpRequest,
@@ -988,6 +999,7 @@ pub enum ModelEvent {
     },
     SteerPending {
         submission: UserMessageSubmission,
+        waiting_for_required_input: bool,
     },
     SteerFailed {
         submission: UserMessageSubmission,

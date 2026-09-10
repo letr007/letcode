@@ -165,6 +165,12 @@ pub(crate) enum SessionTransportEvent {
     QueuedPromptAccepted {
         prompt: UserMessageSubmission,
     },
+    QueuedPromptWaitingForInput {
+        prompt: UserMessageSubmission,
+    },
+    QueuedPromptSteerFailed {
+        prompt: UserMessageSubmission,
+    },
     TodoSnapshot(TodoSnapshotEvent),
     AutoContinueChanged(AutoContinueChangedEvent),
     FastModeChanged {
@@ -361,7 +367,9 @@ impl SessionTransportEvent {
             | Self::BackgroundSubagentCompleted { .. }
             | Self::ModelCatalogUpdated(_)
             | Self::SettingChangeFailed { .. }
-            | Self::QueuedPromptAccepted { .. } => None,
+            | Self::QueuedPromptAccepted { .. }
+            | Self::QueuedPromptWaitingForInput { .. }
+            | Self::QueuedPromptSteerFailed { .. } => None,
             Self::TodoSnapshot(event) => Some(SessionEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => {
                 Some(SessionEvent::AutoContinueChanged(event.clone()))
@@ -554,6 +562,9 @@ pub(super) fn wrap_child_session_transport_event(
         | SessionTransportEvent::PermissionModeChanged { .. }
         | SessionTransportEvent::ReasoningEffortChanged { .. }
         | SessionTransportEvent::BackgroundSubagentCompleted { .. }
+        | SessionTransportEvent::QueuedPromptAccepted { .. }
+        | SessionTransportEvent::QueuedPromptWaitingForInput { .. }
+        | SessionTransportEvent::QueuedPromptSteerFailed { .. }
         | SessionTransportEvent::SettingChangeFailed { .. } => event,
         SessionTransportEvent::PermissionResolved(event) => {
             SessionTransportEvent::ChildSessionEvent {

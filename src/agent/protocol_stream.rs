@@ -1097,7 +1097,28 @@ where
             ModelEvent::SteerCommit { submission } => {
                 self.committed_steer = Some(submission.clone());
             }
-            ModelEvent::SteerPending { submission } | ModelEvent::SteerFailed { submission } => {
+            ModelEvent::SteerPending {
+                submission,
+                waiting_for_required_input,
+            } => {
+                if *waiting_for_required_input {
+                    (self.on_event)(AgentEvent::SteerPending {
+                        submission: submission.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                    })?;
+                }
+            }
+            ModelEvent::SteerFailed { submission } => {
+                (self.on_event)(AgentEvent::SteerFailed {
+                    submission: submission.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                })?;
                 self.fallback_steer = Some(submission.clone());
             }
             ModelEvent::Usage {
@@ -2546,6 +2567,72 @@ parallel_tool_calls = true
             committed_steer: None,
             fallback_steer: None,
         }
+    }
+
+    #[tokio::test]
+    async fn required_input_pending_does_not_enter_local_fallback() {
+        let mut agent = Agent::new("model", 4, 4);
+        let route = recovery_route();
+        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
+        let observed = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let observed_events = std::sync::Arc::clone(&observed);
+        let mut on_event = move |event: AgentEvent| {
+            observed_events.lock().unwrap().push(event);
+            async { Ok::<(), anyhow::Error>(()) }
+        };
+        let mut approve = |_request: PermissionRequest| async {
+            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
+        };
+        let mut driver = resolved_driver(
+            &mut agent,
+            route,
+            &mut on_delta,
+            &mut on_event,
+            &mut approve,
+        );
+        let submission =
+            UserMessageSubmission::new("pending", UserMessageContent::from("continue after tools"));
+
+        TurnDriver::observe_event(
+            &mut driver,
+            &ModelEvent::SteerPending {
+                submission: submission.clone(),
+                waiting_for_required_input: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            driver.fallback_steer.is_none(),
+            "server-owned pending input must not enter local fallback"
+        );
+
+        TurnDriver::observe_event(
+            &mut driver,
+            &ModelEvent::SteerFailed {
+                submission: submission.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            driver
+                .fallback_steer
+                .as_ref()
+                .map(|submission| submission.id.as_str()),
+            Some("pending")
+        );
+        drop(driver);
+
+        let observed = observed.lock().unwrap();
+        assert!(matches!(
+            observed.first(),
+            Some(AgentEvent::SteerPending { submission }) if submission.id == "pending"
+        ));
+        assert!(matches!(
+            observed.get(1),
+            Some(AgentEvent::SteerFailed { submission }) if submission.id == "pending"
+        ));
     }
 
     #[tokio::test]

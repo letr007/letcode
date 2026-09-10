@@ -1537,7 +1537,11 @@ fn build_user_message(
         );
     }
 
-    if message.queued {
+    if message.waiting_for_input {
+        push_user_card_line_into(out, "", Some("WAITING FOR INPUT"), width, theme, None);
+    } else if message.steering {
+        push_user_card_line_into(out, "", Some("STEERING"), width, theme, None);
+    } else if message.queued {
         push_user_card_line_into(out, "", Some("QUEUED"), width, theme, None);
     }
 
@@ -1546,7 +1550,7 @@ fn build_user_message(
 }
 
 /// 与 `push_user_card_line` 等价的构造，并同时记录 Span 级来源。
-/// `origin` 为 `None` 表示装饰行（顶部 spacer / QUEUED badge / 底部 spacer），
+/// `origin` 为 `None` 表示装饰行（顶部 spacer / 状态 badge / 底部 spacer），
 /// 否则为 `(block_index, content_prefix_chars, source_start, source_end)`。
 fn push_user_card_line_into(
     out: &mut TimelineDocument,
@@ -2750,6 +2754,8 @@ mod tests {
                 selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
+                steering: false,
+                waiting_for_input: false,
             }),
         ];
 
@@ -2791,6 +2797,8 @@ mod tests {
             selected_skills: Vec::new(),
             streaming: false,
             queued: false,
+            steering: false,
+            waiting_for_input: false,
         });
         let ordinary_lines =
             crate::tui::transcript_ratatui::document_to_ratatui(&render_timeline_item_document(
@@ -2824,6 +2832,8 @@ mod tests {
             selected_skills: Vec::new(),
             streaming: false,
             queued: false,
+            steering: false,
+            waiting_for_input: false,
         });
         let review_decision = TimelineItem::Assistant(MessageView {
             id: None,
@@ -2834,6 +2844,8 @@ mod tests {
             selected_skills: Vec::new(),
             streaming: false,
             queued: false,
+            steering: false,
+            waiting_for_input: false,
         });
         for item in [&review_request, &review_decision] {
             let document = try_render_reviewer_view_item(item, theme, width)
@@ -4197,6 +4209,38 @@ mod tests {
             lines.iter().any(|line| line.contains("QUEUED")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn queued_user_message_renders_steer_lifecycle_badges() {
+        let mut state = TuiState::default();
+        state.push_queued_user_message_preview(UserMessageSubmission::new(
+            "steer-1",
+            UserMessageContent::from("follow up"),
+        ));
+        assert!(state.mark_queued_user_message_steering("steer-1"));
+
+        let lines = transcript_lines(&state, Theme::dark(), 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines.iter().any(|line| line.contains("STEERING")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("QUEUED")));
+
+        assert!(state.mark_queued_user_message_waiting_for_input("steer-1"));
+        let lines = transcript_lines(&state, Theme::dark(), 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            lines.iter().any(|line| line.contains("WAITING FOR INPUT")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("STEERING")));
     }
 
     #[test]
