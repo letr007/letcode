@@ -2068,10 +2068,6 @@ async fn run_engine_loop(
                             parked_commands.clear();
                             break;
                         }
-                        if interrupted {
-                            discard_queued_prompts(&mut deferred_commands);
-                            discard_queued_prompts(&mut parked_commands);
-                        }
                         flush_parked_commands(&mut deferred_commands, &mut parked_commands);
                         continue;
                     }
@@ -2528,12 +2524,7 @@ async fn run_engine_loop(
                         Some(control_tx.clone()),
                         Some(session_transport_tx.clone()),
                     );
-                let (steer_tx, steer_rx) = mpsc::unbounded_channel();
                 let historian_control = agent.historian_runtime.clone();
-                let live_steer = agent.resolved_model_route().is_some_and(|route| route.supports_live_steer());
-                let steer_handle = agent.resolved_model_route().map(|_| {
-                    crate::model_runtime::runtime::ResponseSteerHandle::new(live_steer)
-                });
                 let (interrupted, shutdown, interrupt_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
@@ -2544,12 +2535,10 @@ async fn run_engine_loop(
                                 Arc::clone(&turn_continuation_queue),
                             ))
                         } else {
-                            Box::pin(runner.run_prompt_with_continuations_and_steer(
+                            Box::pin(runner.run_prompt_with_continuations(
                                 &mut agent,
                                 prompt,
                                 Arc::clone(&turn_continuation_queue),
-                                Some(steer_rx),
-                                steer_handle.clone(),
                             ))
                         };
                     tokio::pin!(run);
@@ -2558,32 +2547,14 @@ async fn run_engine_loop(
                     let mut interrupt_failure = None;
 
                     loop {
-                        let can_wait_for_steer = steer_handle.as_ref().is_some_and(|handle| !handle.has_returned_submissions())
-                            && parked_steer_prompt_index(&parked_commands).is_some();
-                        let operation = tokio::select! {
-                            biased;
-                            operation = select_active_session_operation_with_events(
-                                &mut control_rx,
-                                &mut deferred_commands,
-                                run.as_mut(),
-                                Some(&mut runner_event_rx),
-                            ) => operation,
-                            _ = async {
-                                match &steer_handle {
-                                    Some(handle) => handle.wait_available().await,
-                                    None => std::future::pending::<()>().await,
-                                }
-                            }, if can_wait_for_steer => {
-                                try_steer_parked_prompt(
-                                    &mut parked_commands,
-                                    steer_handle.as_ref().unwrap(),
-                                    &steer_tx,
-                                    &session_transport_tx,
-                                );
-                                continue;
-                            }
-                        };
-                        match operation {
+                        match select_active_session_operation_with_events(
+                            &mut control_rx,
+                            &mut deferred_commands,
+                            run.as_mut(),
+                            Some(&mut runner_event_rx),
+                        )
+                        .await
+                        {
                             outcome @ (ActiveSessionOperation::Interrupted
                             | ActiveSessionOperation::Shutdown) => {
                                 let is_shutdown =
@@ -2629,11 +2600,6 @@ async fn run_engine_loop(
                             }
                             ActiveSessionOperation::RunnerEvent(event) => {
                                 let _ = session_transport_tx.send(event);
-                                // A busy event stream must not starve the availability
-                                // notification while the model is still generating.
-                                if let Some(handle) = &steer_handle {
-                                    try_steer_parked_prompt(&mut parked_commands, handle, &steer_tx, &session_transport_tx);
-                                }
                             }
                             ActiveSessionOperation::Completed(_) => {
                                 forward_queued_runner_events(
@@ -2645,28 +2611,14 @@ async fn run_engine_loop(
                             }
                             ActiveSessionOperation::Command(command) => match command {
                                 Some(SessionEngineCommand::Prompt(prompt)) => {
-                                    if !live_steer || !prompt.content.selected_skills.is_empty() {
-                                        if let Ok(mut queue) = turn_continuation_queue.lock() {
-                                            queue.mark_user_prompt_queued();
-                                        }
-                                        deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));
-                                        let _ = session_transport_tx.send(SessionTransportEvent::AssistantDone {
-                                            message_id: None,
-                                        });
-                                        break;
+                                    if let Ok(mut queue) = turn_continuation_queue.lock() {
+                                        queue.mark_user_prompt_queued();
                                     }
-                                    enqueue_deferred_command(
-                                        &mut parked_commands,
-                                        SessionEngineCommand::Prompt(prompt),
-                                    );
-                                    if let Some(handle) = &steer_handle {
-                                        try_steer_parked_prompt(
-                                            &mut parked_commands,
-                                            handle,
-                                            &steer_tx,
-                                            &session_transport_tx,
-                                        );
-                                    }
+                                    deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));
+                                    let _ = session_transport_tx.send(SessionTransportEvent::AssistantDone {
+                                        message_id: None,
+                                    });
+                                    break;
                                 }
                                 Some(SessionEngineCommand::ViewChild {
                                     navigation,
@@ -2823,16 +2775,6 @@ async fn run_engine_loop(
                     parked_commands.clear();
                     break;
                 }
-                let was_interrupted = interrupted.is_some();
-                if !was_interrupted && !shutdown {
-                    if let Some(handle) = &steer_handle {
-                        // Explicitly rejected steers return to ordinary FIFO only
-                        // after the active task finishes; do not interrupt its run.
-                        for submission in handle.take_returned_submissions().into_iter().rev() {
-                            parked_commands.push_front(SessionEngineCommand::Prompt(submission));
-                        }
-                    }
-                }
                 if let Some(interrupt) = interrupted {
                     let persisted_interrupt = match record_interrupt_transcript(&transcript, &interrupt) {
                         Ok(()) => true,
@@ -2912,10 +2854,6 @@ async fn run_engine_loop(
                     deferred_commands.clear();
                     parked_commands.clear();
                     break;
-                }
-                if was_interrupted {
-                    discard_queued_prompts(&mut deferred_commands);
-                    discard_queued_prompts(&mut parked_commands);
                 }
                 flush_parked_commands(&mut deferred_commands, &mut parked_commands);
             }
@@ -3012,18 +2950,10 @@ pub(crate) fn format_background_subagent_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::PrimaryRouteFactory;
     use crate::request_builder::ModelReasoningEffort;
-    use crate::session::UserMessageEvent;
-    use futures_util::{SinkExt, StreamExt};
     use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-    use tokio_tungstenite::tungstenite::protocol::Role;
-    use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
     fn temp_sessions_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -3039,62 +2969,6 @@ mod tests {
         Arc::new(StdMutex::new(
             TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
         ))
-    }
-
-    async fn accept_test_websocket(mut stream: TcpStream) -> WebSocketStream<TcpStream> {
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            request.push(stream.read_u8().await.unwrap());
-            assert!(request.len() < 16_384, "websocket handshake is too large");
-        }
-        let request_text = String::from_utf8(request).unwrap();
-        assert!(
-            request_text.starts_with("GET "),
-            "unexpected websocket request: {request_text}"
-        );
-        let key = request_text
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("sec-websocket-key")
-                    .then_some(value.trim())
-            })
-            .expect("websocket key");
-        let accept = derive_accept_key(key.as_bytes());
-        let response = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        WebSocketStream::from_raw_socket(stream, Role::Server, None).await
-    }
-
-    async fn next_websocket_text(
-        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> serde_json::Value {
-        loop {
-            match socket.next().await.expect("websocket request") {
-                Ok(Message::Text(text)) => return serde_json::from_str(&text).unwrap(),
-                Ok(Message::Ping(payload)) => {
-                    socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .expect("websocket pong");
-                }
-                Ok(Message::Close(_)) => panic!("provider closed websocket unexpectedly"),
-                Ok(_) => {}
-                Err(error) => panic!("websocket request failed: {error}"),
-            }
-        }
-    }
-
-    async fn send_response_event(
-        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        event: serde_json::Value,
-    ) {
-        socket
-            .send(Message::Text(event.to_string().into()))
-            .await
-            .expect("websocket response event");
     }
 
     #[tokio::test]
@@ -3153,528 +3027,6 @@ base_url = "http://127.0.0.1:1"
         })
         .await
         .expect("new-session history preparation timed out");
-    }
-
-    #[tokio::test]
-    async fn websocket_steers_queued_prompts_on_the_active_connection() {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let port = address.port();
-            let directory = tempfile::tempdir().unwrap();
-            let config_path = directory.path().join("letcode.toml");
-            fs::write(
-                &config_path,
-                format!(
-                    r#"
-active_provider = "test"
-[providers.test]
-protocol = "responses"
-default_model = "gpt-6-astra"
-flavor = "standard"
-[providers.test.auth]
-type = "bearer"
-credential = "test-key"
-[providers.test.endpoints]
-base_url = "http://localhost:{port}/v1"
-[providers.test.models."gpt-6-astra"]
-context_window = 100000
-effective_input_limit_tokens = 90000
-[providers.test.models."gpt-6-astra".capabilities]
-tools = true
-reasoning = true
-[providers.test.models."gpt-6-astra".capabilities.generation]
-reasoning = true
-[providers.test.models."gpt-6-astra".transport]
-websocket = true
-[providers.test.models."gpt-6-astra".generation]
-async_tools = ["fs__read"]
-"#
-                ),
-            )
-            .unwrap();
-            let mut config = AppConfig::load_from_path(&config_path).unwrap();
-            config.global.sessions_dir = directory.path().join("sessions");
-            let route = config
-                .runtime_catalog
-                .route("test", "gpt-6-astra")
-                .unwrap();
-            assert!(route.websocket);
-            assert_eq!(
-                route.strategy,
-                crate::model_runtime::strategy::ModelStrategyId::Astra
-            );
-            let mut recorder = TranscriptRecorder::create(&config.global.sessions_dir).unwrap();
-            recorder.record_session_started("test/gpt-6-astra").unwrap();
-            recorder.record_session_title("websocket regression").unwrap();
-            let transcript = Arc::new(StdMutex::new(recorder));
-            let mut agent = Agent::new("gpt-6-astra", 4, 4);
-            let route = ModelRoute::new("test", "gpt-6-astra");
-            agent.set_primary_route(route.clone());
-            let factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
-                config.providers.clone(),
-                config.global.retry.clone(),
-                config.runtime_catalog.clone(),
-            ));
-            let prepared = factory.prepare_route(route.clone()).unwrap();
-            agent.set_primary_route_factory(factory);
-            crate::session::settings::apply_model_route_with(
-                &mut agent,
-                &transcript,
-                route,
-                prepared,
-            )
-            .unwrap();
-            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
-            let (mut engine, _) =
-                SessionEngine::start(agent, transcript.clone(), "gpt-6-astra".into(), settings)
-                    .unwrap();
-            let ingress = engine.take_ingress();
-            let mut events = engine.take_event_egress().into_receiver();
-            let server_ingress = ingress.clone();
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_test_websocket(stream).await;
-                let first_request = next_websocket_text(&mut socket).await;
-                assert_eq!(first_request["type"], "response.create");
-                server_ingress
-                    .submit(SessionCommand::SubmitPrompt(
-                        crate::user_content::UserMessageSubmission::new(
-                            "queued",
-                            crate::user_content::UserMessageContent::from("queued prompt"),
-                        ),
-                    ))
-                    .unwrap();
-                for event in [
-                    json!({"type":"response.created","response":{"id":"resp-1","status":"in_progress"}}),
-                    json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item-c1","call_id":"c1","name":"fs__read"}}),
-                    json!({"type":"response.function_call_arguments.done","item_id":"item-c1","arguments":"{\"path\":\"src/session/engine.rs\",\"offset\":1,\"limit\":2}"}),
-                    json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item-c1","call_id":"c1","name":"fs__read","arguments":"{\"path\":\"src/session/engine.rs\",\"offset\":1,\"limit\":2}"}}),
-                ] {
-                    send_response_event(&mut socket, event).await;
-                }
-                let steer = next_websocket_text(&mut socket).await;
-                assert_eq!(steer["type"], "response.steer");
-                assert_eq!(steer["previous_response_id"], "resp-1");
-                assert!(steer.to_string().contains("queued prompt"));
-                for event in [
-                    json!({"type":"response.steer.accepted","steer":{"id":"steer-1","previous_response_id":"resp-1"}}),
-                    json!({"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"steered"}}}),
-                    json!({"type":"response.created","response":{"id":"resp-2","status":"in_progress"}}),
-                ] {
-                    send_response_event(&mut socket, event).await;
-                }
-                // A second queued message must target the successor, not restart
-                // the task or be attached to the terminated parent response.
-                let steer = next_websocket_text(&mut socket).await;
-                assert_eq!(steer["type"], "response.steer");
-                assert_eq!(steer["previous_response_id"], "resp-2");
-                assert!(steer.to_string().contains("second queued prompt"));
-                for event in [
-                    json!({"type":"response.steer.accepted","steer":{"id":"steer-2","previous_response_id":"resp-2"}}),
-                    json!({"type":"response.incomplete","response":{"id":"resp-2","status":"incomplete","incomplete_details":{"reason":"steered"}}}),
-                    json!({"type":"response.created","response":{"id":"resp-3","status":"in_progress"}}),
-                    json!({"type":"response.output_text.delta","delta":"queued completed"}),
-                    json!({"type":"response.completed","response":{"id":"resp-3","status":"completed"}}),
-                ] {
-                    send_response_event(&mut socket, event).await;
-                }
-            });
-            ingress
-                .submit(SessionCommand::SubmitPrompt(
-                    crate::user_content::UserMessageSubmission::new(
-                        "first",
-                        crate::user_content::UserMessageContent::from("first prompt"),
-                    ),
-                ))
-                .unwrap();
-            let mut user_messages = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while user_messages.len() < 3 {
-                    match events.recv().await.expect("engine events") {
-                        SessionTransportEvent::UserMessage(message) => {
-                            if message.submission_id == "queued" {
-                                ingress.submit(SessionCommand::SubmitPrompt(
-                                    crate::user_content::UserMessageSubmission::new("queued-2", "second queued prompt".into())
-                                )).unwrap();
-                            }
-                            user_messages.push(message);
-                        }
-                        SessionTransportEvent::Error(error) => panic!("engine failed: {error:?}"),
-                        SessionTransportEvent::Done => panic!("turn ended before queued messages were steered"),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .expect("engine emitted both user messages");
-            assert!(user_messages.iter().any(|message| {
-                message.submission_id == "first" && !message.queued
-            }));
-            assert!(user_messages.iter().any(|message| {
-                message.submission_id == "queued" && !message.queued
-            }));
-            loop {
-                match events.recv().await.expect("engine events") {
-                    SessionTransportEvent::Done => break,
-                    SessionTransportEvent::Error(error) => panic!("engine failed: {error:?}"),
-                    _ => {}
-                }
-            }
-            server.await.unwrap();
-            ingress.shutdown().unwrap();
-            engine.join().await.unwrap();
-
-            let records = read_records(transcript.lock().unwrap().path()).unwrap();
-            let history = crate::transcript::restore_session_history(&records).unwrap();
-            crate::protocol_frames::validate_history_items_complete(&history, None).unwrap();
-            assert!(records.iter().any(|record| {
-                matches!(&record.event, TranscriptEvent::UserMessage { content, .. } if content.text == "first prompt")
-            }));
-            assert!(records.iter().any(|record| {
-                matches!(&record.event, TranscriptEvent::UserMessage { content, .. } if content.text == "queued prompt")
-            }));
-            let start = records.iter().position(|record| {
-                matches!(&record.event, TranscriptEvent::ToolCallStarted { call_id, .. } if call_id == "c1")
-            }).unwrap();
-            let batch = records.iter().position(|record| {
-                matches!(&record.event, TranscriptEvent::AssistantTurn(turn) if turn.calls.iter().any(|call| call.call_id == "c1"))
-            }).unwrap();
-            assert!(start < batch, "async tool execution starts before the complete assistant batch");
-            assert!(records.iter().any(|record| {
-                matches!(&record.event, TranscriptEvent::ToolCallFinished { call_id, .. } if call_id == "c1")
-            }));
-        })
-        .await
-        .expect("websocket queued prompt regression timed out");
-    }
-
-    #[tokio::test]
-    async fn websocket_interrupt_discards_queued_prompt_and_accepts_new_input() {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let directory = tempfile::tempdir().unwrap();
-            let config_path = directory.path().join("letcode.toml");
-            fs::write(
-                &config_path,
-                format!(
-                    r#"
-active_provider = "test"
-[providers.test]
-protocol = "responses"
-default_model = "gpt-6-astra"
-flavor = "standard"
-[providers.test.auth]
-type = "bearer"
-credential = "test-key"
-[providers.test.endpoints]
-base_url = "http://localhost:{port}/v1"
-[providers.test.models."gpt-6-astra"]
-context_window = 100000
-effective_input_limit_tokens = 90000
-[providers.test.models."gpt-6-astra".capabilities]
-tools = true
-reasoning = true
-[providers.test.models."gpt-6-astra".capabilities.generation]
-reasoning = true
-[providers.test.models."gpt-6-astra".transport]
-websocket = true
-[providers.test.models."gpt-6-astra".generation]
-async_tools = ["fs__read"]
-"#
-                ),
-            )
-            .unwrap();
-            let mut config = AppConfig::load_from_path(&config_path).unwrap();
-            config.global.sessions_dir = directory.path().join("sessions");
-            let mut recorder = TranscriptRecorder::create(&config.global.sessions_dir).unwrap();
-            recorder.record_session_started("test/gpt-6-astra").unwrap();
-            recorder.record_session_title("interrupt regression").unwrap();
-            let transcript = Arc::new(StdMutex::new(recorder));
-            let mut agent = Agent::new("gpt-6-astra", 4, 4);
-            let route = ModelRoute::new("test", "gpt-6-astra");
-            agent.set_primary_route(route.clone());
-            let factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
-                config.providers.clone(),
-                config.global.retry.clone(),
-                config.runtime_catalog.clone(),
-            ));
-            let prepared = factory.prepare_route(route.clone()).unwrap();
-            agent.set_primary_route_factory(factory);
-            crate::session::settings::apply_model_route_with(
-                &mut agent,
-                &transcript,
-                route,
-                prepared,
-            )
-            .unwrap();
-            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
-            let (mut engine, _) =
-                SessionEngine::start(agent, transcript.clone(), "gpt-6-astra".into(), settings)
-                    .unwrap();
-            let ingress = engine.take_ingress();
-            let server_ingress = ingress.clone();
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_test_websocket(stream).await;
-                let _ = next_websocket_text(&mut socket).await;
-                server_ingress
-                    .submit(SessionCommand::SubmitPrompt(
-                        crate::user_content::UserMessageSubmission::new(
-                            "queued",
-                            crate::user_content::UserMessageContent::from("must be cancelled"),
-                        ),
-                    ))
-                    .unwrap();
-                // This FIFO view command acknowledges that the engine has
-                // consumed and parked the preceding prompt while steer is unavailable.
-                server_ingress.submit(SessionCommand::ViewParent).unwrap();
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut next_socket = accept_test_websocket(stream).await;
-                let request = next_websocket_text(&mut next_socket).await;
-                assert!(request.to_string().contains("new input"));
-                assert!(!request.to_string().contains("must be cancelled"));
-                for event in [
-                    json!({"type":"response.created","response":{"id":"resp-new","status":"in_progress"}}),
-                    json!({"type":"response.output_text.delta","delta":"new input completed"}),
-                    json!({"type":"response.completed","response":{"id":"resp-new","status":"completed"}}),
-                ] {
-                    send_response_event(&mut next_socket, event).await;
-                }
-            });
-            let mut events = engine.take_event_egress().into_receiver();
-            ingress
-                .submit(SessionCommand::SubmitPrompt(
-                    crate::user_content::UserMessageSubmission::new(
-                        "first",
-                        crate::user_content::UserMessageContent::from("first prompt"),
-                    ),
-                ))
-                .unwrap();
-            loop {
-                match events.recv().await.expect("engine events") {
-                    SessionTransportEvent::ParentSessionViewed { .. } => break,
-                    SessionTransportEvent::Error(error) => panic!("engine failed: {error:?}"),
-                    _ => {}
-                }
-            }
-            ingress.request_interrupt().unwrap();
-            let mut interrupted = false;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !interrupted {
-                    if let Some(event) = events.recv().await {
-                        interrupted = matches!(event, SessionTransportEvent::Interrupted);
-                    }
-                }
-            })
-            .await
-            .expect("interrupt event");
-            ingress
-                .submit(SessionCommand::SubmitPrompt(
-                    crate::user_content::UserMessageSubmission::new(
-                        "new",
-                        crate::user_content::UserMessageContent::from("new input"),
-                    ),
-                ))
-                .unwrap();
-            let mut user_messages = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !user_messages
-                    .iter()
-                    .any(|message: &UserMessageEvent| message.submission_id == "new")
-                {
-                    if let Some(SessionTransportEvent::UserMessage(message)) = events.recv().await {
-                        user_messages.push(message);
-                    }
-                }
-            })
-            .await
-            .expect("new input user message");
-            assert!(!user_messages
-                .iter()
-                .any(|message| message.submission_id == "queued"));
-            loop {
-                match events.recv().await.expect("engine events") {
-                    SessionTransportEvent::Done => break,
-                    SessionTransportEvent::Error(error) => panic!("engine failed: {error:?}"),
-                    _ => {}
-                }
-            }
-            server.await.unwrap();
-            ingress.shutdown().unwrap();
-            engine.join().await.unwrap();
-
-            let records = read_records(transcript.lock().unwrap().path()).unwrap();
-            let history = crate::transcript::restore_session_history(&records).unwrap();
-            crate::protocol_frames::validate_history_items_complete(&history, None).unwrap();
-            assert!(records.iter().any(|record| {
-                matches!(&record.event, TranscriptEvent::UserMessage { content, .. } if content.text == "first prompt")
-            }));
-            assert!(records.iter().any(|record| {
-                matches!(&record.event, TranscriptEvent::UserMessage { content, .. } if content.text == "new input")
-            }));
-            assert!(!records.iter().any(|record| {
-                matches!(&record.event, TranscriptEvent::UserMessage { content, .. } if content.text == "must be cancelled")
-            }));
-        })
-        .await
-        .expect("websocket interrupt regression timed out");
-    }
-
-    #[tokio::test]
-    async fn queued_prompts_respect_step_boundaries_and_steer_fallback() {
-        for mode in [
-            "step_tool",
-            "step_cot",
-            "rejected_active",
-            "rejected_terminal",
-        ] {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-                let address = listener.local_addr().unwrap();
-                let directory = tempfile::tempdir().unwrap();
-                let config_path = directory.path().join("letcode.toml");
-                let step_insertion = mode.starts_with("step_");
-                let strategy = if step_insertion { "default" } else { "astra" };
-                fs::write(&config_path, format!(r#"
-active_provider = "test"
-[providers.test]
-protocol = "responses"
-default_model = "model"
-flavor = "standard"
-[providers.test.auth]
-type = "bearer"
-credential = "test-key"
-[providers.test.endpoints]
-base_url = "http://{address}/v1"
-[providers.test.models.model]
-strategy = "{strategy}"
-context_window = 100000
-effective_input_limit_tokens = 90000
-[providers.test.models.model.capabilities]
-tools = true
-reasoning = true
-[providers.test.models.model.capabilities.generation]
-reasoning = true
-[providers.test.models.model.transport]
-websocket = true
-"#)).unwrap();
-                let mut config = AppConfig::load_from_path(&config_path).unwrap();
-                config.global.sessions_dir = directory.path().join("sessions");
-                let mut recorder = TranscriptRecorder::create(&config.global.sessions_dir).unwrap();
-                recorder.record_session_started("test/model").unwrap();
-                recorder.record_session_title("queued input").unwrap();
-                let transcript = Arc::new(StdMutex::new(recorder));
-                let mut agent = Agent::new("model", 4, 4);
-                let route = ModelRoute::new("test", "model");
-                agent.set_primary_route(route.clone());
-                let factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
-                    config.providers.clone(), config.global.retry.clone(), config.runtime_catalog.clone(),
-                ));
-                let prepared = factory.prepare_route(route.clone()).unwrap();
-                agent.set_primary_route_factory(factory);
-                crate::session::settings::apply_model_route_with(&mut agent, &transcript, route, prepared).unwrap();
-                let settings = crate::session_engine_config(&config, Default::default(), String::new());
-                let (mut engine, _) = SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
-                let ingress = engine.take_ingress();
-                let mut events = engine.take_event_egress().into_receiver();
-                let server_ingress = ingress.clone();
-                let server = tokio::spawn(async move {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let mut socket = accept_test_websocket(stream).await;
-                    let _ = next_websocket_text(&mut socket).await;
-                    if !step_insertion {
-                        server_ingress.submit(SessionCommand::SubmitPrompt(
-                            crate::user_content::UserMessageSubmission::new("queued", "queued input".into())
-                        )).unwrap();
-                    }
-                    send_response_event(&mut socket, json!({"type":"response.created","response":{"id":"resp-1","status":"in_progress"}})).await;
-                    let failed = json!({"type":"response.steer.failed","steer":{"previous_response_id":"resp-1","input":[{"role":"user","content":[{"type":"input_text","text":"queued input"}]}]}});
-                    if !step_insertion {
-                        let steer = next_websocket_text(&mut socket).await;
-                        assert_eq!(steer["type"], "response.steer");
-                        if mode == "rejected_active" { send_response_event(&mut socket, failed.clone()).await; }
-                    }
-                    if mode == "step_cot" {
-                        for event in [
-                            json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"reasoning-1","summary":[]}}),
-                            json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-1","summary_index":0,"delta":"completed thought"}),
-                            json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-1","summary_index":0,"text":"completed thought"}),
-                        ] { send_response_event(&mut socket, event).await; }
-                    } else {
-                    for event in [
-                        json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"fs__read"}}),
-                        json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"fs__read","arguments":"{\"path\":\"src/session/engine.rs\",\"offset\":1,\"limit\":1}"}}),
-                        json!({"type":"response.completed","response":{"id":"resp-1","status":"completed"}}),
-                    ] { send_response_event(&mut socket, event).await; }
-                    }
-                    if mode == "rejected_terminal" { send_response_event(&mut socket, failed).await; }
-                    if !step_insertion {
-                    // The original task continues on this connection, with tool
-                    // outputs and without consuming the ordinary queued prompt.
-                    let continuation = next_websocket_text(&mut socket).await;
-                    assert_eq!(continuation["type"], "response.create");
-                    assert!(continuation.to_string().contains("function_call_output"));
-                    assert!(!continuation.to_string().contains("queued input"));
-                    for event in [
-                        json!({"type":"response.created","response":{"id":"resp-2","status":"in_progress"}}),
-                        json!({"type":"response.output_text.delta","delta":"original task complete"}),
-                        json!({"type":"response.completed","response":{"id":"resp-2","status":"completed"}}),
-                    ] { send_response_event(&mut socket, event).await; }
-                    }
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let mut socket = accept_test_websocket(stream).await;
-                    let queued = next_websocket_text(&mut socket).await;
-                    assert_eq!(queued["type"], "response.create");
-                    assert!(queued.to_string().contains("queued input"));
-                    for event in [
-                        json!({"type":"response.created","response":{"id":"resp-3","status":"in_progress"}}),
-                        json!({"type":"response.output_text.delta","delta":"queued task complete"}),
-                        json!({"type":"response.completed","response":{"id":"resp-3","status":"completed"}}),
-                    ] { send_response_event(&mut socket, event).await; }
-                });
-                ingress.submit(SessionCommand::SubmitPrompt(
-                    crate::user_content::UserMessageSubmission::new("first", "original task".into())
-                )).unwrap();
-                let mut done = 0;
-                let mut queued_seen = false;
-                let mut step_finished = false;
-                while done < if step_insertion { 1 } else { 2 } {
-                    match events.recv().await.expect("engine events") {
-                        event if step_insertion && !step_finished && matches!((&event, mode),
-                            (SessionTransportEvent::ToolBatchFinished, "step_tool") |
-                            (SessionTransportEvent::ReasoningDone(_), "step_cot")
-                        ) => {
-                            step_finished = true;
-                            // The frontend dispatches ordinary input at the completed step.
-                            ingress.submit(SessionCommand::SubmitPrompt(
-                                crate::user_content::UserMessageSubmission::new("queued", "queued input".into())
-                            )).unwrap();
-                        }
-                        SessionTransportEvent::UserMessage(message) if message.submission_id == "queued" => {
-                            assert_eq!(done, if step_insertion { 0 } else { 1 }, "wrong insertion boundary: {mode}");
-                            assert!(!step_insertion || step_finished);
-                            assert!(!queued_seen);
-                            queued_seen = true;
-                        }
-                        SessionTransportEvent::Done => done += 1,
-                        SessionTransportEvent::Interrupted => panic!("queued input interrupted task"),
-                        SessionTransportEvent::Error(error) => panic!("{mode}: {error:?}"),
-                        _ => {}
-                    }
-                }
-                assert!(queued_seen);
-                server.await.unwrap();
-                ingress.shutdown().unwrap();
-                engine.join().await.unwrap();
-                let records = read_records(transcript.lock().unwrap().path()).unwrap();
-                let history = crate::transcript::restore_session_history(&records).unwrap();
-                crate::protocol_frames::validate_history_items_complete(&history, None).unwrap();
-            }).await.expect(mode);
-        }
     }
 
     fn add_child(

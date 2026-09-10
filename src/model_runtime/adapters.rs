@@ -5,7 +5,6 @@ use super::{
     PreparedRequestCacheInspection, PreparedRequestInspection, ProtocolAdapter, ProtocolBindInput,
     ProtocolBinding, ProtocolId, ReplayProducer, ReplayScope, RetryHint, TerminalStatus,
 };
-use crate::user_content::{UserMessageContent, UserMessagePart, UserMessageSubmission};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -2470,53 +2469,6 @@ impl ResponsesBinding {
 }
 
 impl ProtocolBinding for ResponsesBinding {
-    fn supports_websocket_steer(&self) -> bool {
-        true
-    }
-
-    fn websocket_steer_frame(
-        &self,
-        previous_response_id: &str,
-        submission: &UserMessageSubmission,
-    ) -> Result<Vec<u8>, ModelFailure> {
-        if !submission.content.selected_skills.is_empty() {
-            return Err(
-                ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                    .with_code("websocket_steer_selected_skills"),
-            );
-        }
-        let content = submission.content.parts();
-        if content.is_empty() {
-            return Err(
-                ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                    .with_code("websocket_steer_empty_input"),
-            );
-        }
-        let blocks = content
-            .into_iter()
-            .map(|part| match part {
-                UserMessagePart::Text { text } => serde_json::json!({
-                    "type": "input_text",
-                    "text": text,
-                }),
-                UserMessagePart::Image { attachment } => serde_json::json!({
-                    "type": "input_image",
-                    "image_url": attachment.data_url,
-                }),
-            })
-            .collect::<Vec<_>>();
-        serde_json::to_vec(&serde_json::json!({
-            "type": "response.steer",
-            "previous_response_id": previous_response_id,
-            "input": [{"role": "user", "content": blocks}],
-        }))
-        .map_err(|error| {
-            ModelFailure::new(FailurePhase::Prepare, FailureKind::Internal)
-                .with_code("websocket_steer_serialization")
-                .with_detail(error.to_string())
-        })
-    }
-
     fn binding_identity(&self) -> &BindingIdentity {
         &self.identity
     }
@@ -2603,83 +2555,6 @@ impl ProtocolBinding for ResponsesBinding {
             protocol_headers,
             body,
             prompt_unit_origins: responses_prompt_unit_origins(self, input),
-        })
-    }
-
-    fn websocket_required_input_frame(
-        &self,
-        request: &PreparedHttpRequest,
-        previous_response_id: &str,
-        required_input: &[serde_json::Value],
-    ) -> Result<Vec<u8>, ModelFailure> {
-        let mut body: Value = serde_json::from_slice(&request.body).map_err(|error| {
-            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                .with_code("websocket_required_input_request")
-                .with_detail(error.to_string())
-        })?;
-        let fields = body.as_object_mut().ok_or_else(|| {
-            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                .with_code("websocket_required_input_shape")
-        })?;
-        let input = fields
-            .get("input")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                    .with_code("websocket_required_input_items")
-            })?;
-        let mut selected = Vec::with_capacity(required_input.len());
-        for required in required_input {
-            let item_type = required
-                .get("type")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
-                        .with_code("steer_required_input_missing_type")
-                })?;
-            let (key, id) = if let Some(call_id) = required.get("call_id").and_then(Value::as_str) {
-                ("call_id", call_id)
-            } else if let Some(approval_id) =
-                required.get("approval_request_id").and_then(Value::as_str)
-            {
-                ("approval_request_id", approval_id)
-            } else {
-                return Err(ModelFailure::new(
-                    FailurePhase::Decode,
-                    FailureKind::MalformedResponse,
-                )
-                .with_code("steer_required_input_missing_id"));
-            };
-            let matches = input
-                .iter()
-                .filter(|item| {
-                    item.get("type").and_then(Value::as_str) == Some(item_type)
-                        && item.get(key).and_then(Value::as_str) == Some(id)
-                })
-                .collect::<Vec<_>>();
-            if matches.len() != 1 {
-                return Err(
-                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                        .with_code(if matches.is_empty() {
-                            "websocket_required_input_missing_output"
-                        } else {
-                            "websocket_required_input_duplicate_output"
-                        })
-                        .with_detail(format!("required {item_type} {key}={id}")),
-                );
-            }
-            selected.push(matches[0].clone());
-        }
-        fields.insert("input".into(), Value::Array(selected));
-        fields.insert("type".into(), Value::String("response.create".into()));
-        fields.insert(
-            "previous_response_id".into(),
-            Value::String(previous_response_id.to_owned()),
-        );
-        serde_json::to_vec(&body).map_err(|error| {
-            ModelFailure::new(FailurePhase::Prepare, FailureKind::Internal)
-                .with_code("websocket_required_input_serialization")
-                .with_detail(error.to_string())
         })
     }
 
@@ -3606,12 +3481,6 @@ struct ResponsesStreamEvent {
     code: Option<Value>,
     #[serde(default)]
     message: Option<Value>,
-    #[serde(default)]
-    input: Option<Value>,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    steer_submission_id: Option<String>,
     #[serde(default, alias = "status_code")]
     status: Option<Value>,
 }
@@ -3665,17 +3534,9 @@ struct ResponsesStreamResponse {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
-    incomplete_details: Option<ResponsesIncompleteDetails>,
-    #[serde(default)]
     usage: Option<ResponsesUsage>,
     #[serde(default)]
     error: Option<ResponsesError>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Default)]
-struct ResponsesIncompleteDetails {
-    #[serde(default)]
-    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -3978,24 +3839,6 @@ impl ResponsesDecoder {
                     _ => {}
                 }
             }
-            "response.steer.accepted" => {}
-            "response.steer.commit" => {
-                output.push(ModelEvent::SteerCommit {
-                    submission: Self::steer_submission(&event)?,
-                });
-            }
-            "response.steer.pending" => {
-                output.push(ModelEvent::SteerPending {
-                    submission: Self::steer_submission(&event)?,
-                    waiting_for_required_input: event.reason.as_deref()
-                        == Some("waiting_for_required_input"),
-                });
-            }
-            "response.steer.failed" => {
-                output.push(ModelEvent::SteerFailed {
-                    submission: Self::steer_submission(&event)?,
-                });
-            }
             "response.completed" => {
                 if self.terminal {
                     return Err(decode_invalid("duplicate terminal event"));
@@ -4037,13 +3880,9 @@ impl ResponsesDecoder {
                     ));
                 }
                 self.emit_usage(response.usage.as_ref(), output);
-                let status = response
-                    .incomplete_details
-                    .as_ref()
-                    .and_then(|details| details.reason.as_deref())
-                    .filter(|reason| *reason == "steered")
-                    .map_or(TerminalStatus::Incomplete, |_| TerminalStatus::Steered);
-                output.push(ModelEvent::Terminal { status });
+                output.push(ModelEvent::Terminal {
+                    status: TerminalStatus::Incomplete,
+                });
                 self.terminal = true;
             }
             "response.failed" => {
@@ -4092,69 +3931,6 @@ impl ResponsesDecoder {
             _ => {}
         }
         Ok(())
-    }
-
-    fn steer_submission(
-        event: &ResponsesStreamEvent,
-    ) -> Result<UserMessageSubmission, ModelFailure> {
-        let id = event
-            .steer_submission_id
-            .clone()
-            .ok_or_else(|| decode_invalid("steer submission id is required"))?;
-        let input = event
-            .input
-            .clone()
-            .ok_or_else(|| decode_invalid("steer input is required"))?;
-        let content = if let Some(text) = input.as_str() {
-            UserMessageContent::from(text)
-        } else if let Some(value) = input.get("parts") {
-            serde_json::from_value::<UserMessageContent>(serde_json::json!({"parts": value}))
-                .map_err(|error| decode_invalid(&format!("invalid steer input: {error}")))?
-        } else if let Some(array) = input.as_array() {
-            let mut parts = Vec::new();
-            for item in array {
-                let blocks = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map_or_else(|| std::slice::from_ref(item), |blocks| blocks.as_slice());
-                for block in blocks {
-                    let block_type = block.get("type").and_then(Value::as_str);
-                    if block_type == Some("input_text") || block.get("text").is_some() {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            parts.push(UserMessagePart::Text {
-                                text: text.to_owned(),
-                            });
-                        }
-                    } else if block_type == Some("input_image") || block.get("image_url").is_some()
-                    {
-                        let url = block.get("image_url").and_then(|value| {
-                            value
-                                .as_str()
-                                .or_else(|| value.get("url").and_then(Value::as_str))
-                        });
-                        if let Some(url) = url {
-                            parts.push(UserMessagePart::Image {
-                                attachment: crate::user_content::UserImageAttachment {
-                                    id: format!("remote-image-{}", parts.len()),
-                                    label: "steer image".into(),
-                                    mime: url
-                                        .split(';')
-                                        .next()
-                                        .unwrap_or("image/png")
-                                        .trim_start_matches("data:")
-                                        .to_owned(),
-                                    data_url: url.to_owned(),
-                                },
-                            });
-                        }
-                    }
-                }
-            }
-            UserMessageContent::from_parts(parts)
-        } else {
-            return Err(decode_invalid("invalid steer input"));
-        };
-        Ok(UserMessageSubmission::new(id, content))
     }
 
     fn emit_reasoning_done(

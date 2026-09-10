@@ -1899,20 +1899,6 @@ impl TuiState {
         self.reset_slash_panel();
     }
 
-    pub fn mark_queued_user_message_steering(&mut self, submission_id: &str) -> bool {
-        self.timeline
-            .mark_queued_user_message_steering(submission_id)
-    }
-
-    pub fn mark_queued_user_message_waiting_for_input(&mut self, submission_id: &str) -> bool {
-        self.timeline
-            .mark_queued_user_message_waiting_for_input(submission_id)
-    }
-
-    pub fn mark_queued_user_message_queued(&mut self, submission_id: &str) -> bool {
-        self.timeline.mark_queued_user_message_queued(submission_id)
-    }
-
     pub fn activate_queued_user_message(&mut self, submission_id: &str) -> bool {
         if !self.timeline.activate_queued_user_message(submission_id) {
             return false;

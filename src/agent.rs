@@ -2893,17 +2893,6 @@ impl Agent {
                         .incomplete_tool_call_ids()
                         .contains(call_id)
             )
-            && !matches!(
-                &next_item,
-                crate::protocol_frames::ProtocolFrameItem::UserMessage { .. }
-                    if !self
-                        .protocol_append_state
-                        .has_historical_incomplete_tool_call_groups()
-                        && !self
-                            .protocol_append_state
-                            .incomplete_tool_call_ids()
-                            .is_empty()
-            )
         {
             bail!(
                 "cannot append {:?} while assistant tool call group is incomplete",
@@ -3270,51 +3259,6 @@ impl Agent {
         Afut: Future<Output = Result<PermissionApproval>> + Send,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
     {
-        self.run_stream_content_with_interactions_and_steer_async(
-            user_content,
-            on_delta,
-            on_event,
-            approve,
-            ask_question,
-            None,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn run_stream_content_with_interactions_and_steer_async<
-        F,
-        E,
-        A,
-        Q,
-        Dfut,
-        Efut,
-        Afut,
-        Qfut,
-    >(
-        &mut self,
-        user_content: UserMessageContent,
-        on_delta: F,
-        on_event: E,
-        approve: A,
-        ask_question: Q,
-        steer_receiver: Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                crate::model_runtime::runtime::ResponseSteerRequest,
-            >,
-        >,
-        steer_handle: Option<crate::model_runtime::runtime::ResponseSteerHandle>,
-    ) -> Result<String>
-    where
-        F: FnMut(&str) -> Dfut + Send,
-        E: FnMut(AgentEvent) -> Efut + Send,
-        A: FnMut(PermissionRequest) -> Afut + Send,
-        Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
-        Dfut: Future<Output = Result<()>> + Send,
-        Efut: Future<Output = Result<()>> + Send,
-        Afut: Future<Output = Result<PermissionApproval>> + Send,
-        Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
-    {
         let mut question_handler_guard =
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
 
@@ -3332,8 +3276,6 @@ impl Agent {
                 on_delta,
                 on_event,
                 approve,
-                steer_receiver,
-                steer_handle,
             )
             .await;
         }

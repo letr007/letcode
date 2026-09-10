@@ -148,9 +148,6 @@ pub async fn run_child_prompt(
                             | AgentEvent::TurnStarted(_)
                             | AgentEvent::EvidenceRecorded(_) => {}
                             AgentEvent::ModelStreamIssue { .. }
-                            | AgentEvent::UserMessage { .. }
-                            | AgentEvent::SteerPending { .. }
-                            | AgentEvent::SteerFailed { .. }
                             | AgentEvent::AssistantMessage { .. }
                             | AgentEvent::AssistantToolCallBatch { .. }
                             | AgentEvent::InternalContinuation { .. }

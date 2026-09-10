@@ -371,58 +371,6 @@ pub(crate) fn flush_parked_commands(
     }
 }
 
-/// Remove prompts that were queued for the cancelled turn while retaining
-/// unrelated settings and controls.
-pub(crate) fn discard_queued_prompts(commands: &mut VecDeque<SessionEngineCommand>) {
-    commands.retain(|command| !matches!(command, SessionEngineCommand::Prompt(_)));
-}
-
-pub(super) fn parked_steer_prompt_index(
-    commands: &VecDeque<SessionEngineCommand>,
-) -> Option<usize> {
-    // Do not steer a later prompt ahead of an earlier prompt that requires
-    // ordinary queuing (for example one with selected skills).
-    let index = commands
-        .iter()
-        .position(|command| matches!(command, SessionEngineCommand::Prompt(_)))?;
-    matches!(&commands[index], SessionEngineCommand::Prompt(prompt) if prompt.content.selected_skills.is_empty())
-        .then_some(index)
-}
-
-pub(crate) fn try_steer_parked_prompt(
-    commands: &mut VecDeque<SessionEngineCommand>,
-    handle: &crate::model_runtime::runtime::ResponseSteerHandle,
-    steer_tx: &mpsc::UnboundedSender<crate::model_runtime::runtime::ResponseSteerRequest>,
-    events: &mpsc::UnboundedSender<SessionTransportEvent>,
-) {
-    if handle.has_returned_submissions() {
-        // A rejected earlier submission must keep its FIFO position.
-        return;
-    }
-    let Some(index) = parked_steer_prompt_index(commands) else {
-        return;
-    };
-    if handle.try_claim() != crate::model_runtime::runtime::ResponseSteerDecision::Accepted {
-        return;
-    }
-    let SessionEngineCommand::Prompt(prompt) = &commands[index] else {
-        unreachable!()
-    };
-    if steer_tx
-        .send(crate::model_runtime::runtime::ResponseSteerRequest {
-            submission: prompt.clone(),
-        })
-        .is_err()
-    {
-        handle.defer_claim();
-        return;
-    }
-    let SessionEngineCommand::Prompt(prompt) = commands.remove(index).unwrap() else {
-        unreachable!()
-    };
-    let _ = events.send(SessionTransportEvent::QueuedPromptAccepted { prompt });
-}
-
 fn drain_queued_session_controls(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,

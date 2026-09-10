@@ -131,7 +131,6 @@ pub(crate) struct ModelCatalogEntry {
     pub provider: String,
     pub context_window_tokens: Option<u64>,
     pub reasoning: ModelCatalogReasoning,
-    pub supports_live_steer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,12 +162,6 @@ pub(crate) enum SessionTransportEvent {
     RetryScheduled(RetryLifecycleEvent),
     RetryStarted(RetryLifecycleEvent),
     QueuedPromptAccepted {
-        prompt: UserMessageSubmission,
-    },
-    QueuedPromptWaitingForInput {
-        prompt: UserMessageSubmission,
-    },
-    QueuedPromptSteerFailed {
         prompt: UserMessageSubmission,
     },
     TodoSnapshot(TodoSnapshotEvent),
@@ -367,9 +360,7 @@ impl SessionTransportEvent {
             | Self::BackgroundSubagentCompleted { .. }
             | Self::ModelCatalogUpdated(_)
             | Self::SettingChangeFailed { .. }
-            | Self::QueuedPromptAccepted { .. }
-            | Self::QueuedPromptWaitingForInput { .. }
-            | Self::QueuedPromptSteerFailed { .. } => None,
+            | Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(SessionEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => {
                 Some(SessionEvent::AutoContinueChanged(event.clone()))
@@ -562,9 +553,6 @@ pub(super) fn wrap_child_session_transport_event(
         | SessionTransportEvent::PermissionModeChanged { .. }
         | SessionTransportEvent::ReasoningEffortChanged { .. }
         | SessionTransportEvent::BackgroundSubagentCompleted { .. }
-        | SessionTransportEvent::QueuedPromptAccepted { .. }
-        | SessionTransportEvent::QueuedPromptWaitingForInput { .. }
-        | SessionTransportEvent::QueuedPromptSteerFailed { .. }
         | SessionTransportEvent::SettingChangeFailed { .. } => event,
         SessionTransportEvent::PermissionResolved(event) => {
             SessionTransportEvent::ChildSessionEvent {

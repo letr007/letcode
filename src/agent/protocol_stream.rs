@@ -2,10 +2,10 @@ use super::*;
 use crate::model_runtime::projection::model_request_from_prompt_plan;
 use crate::model_runtime::runtime::{
     AttemptOutcome, CompletedToolCall, ModelAttemptResult, ModelAttemptSnapshot, ModelRuntime,
-    TurnContinuationDecision, TurnDriver, TurnLimits, TurnOrchestrator,
+    TurnContinuationDecision, TurnDriver, TurnLimits, TurnOrchestrator, failure_with_cleanup,
 };
 use crate::model_runtime::{ModelEvent, ModelFailure, ModelMessage, ModelRequestInput};
-use crate::user_content::{UserMessageContent, UserMessageSubmission};
+use crate::user_content::UserMessageContent;
 use std::collections::{BTreeMap, BTreeSet};
 
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
@@ -163,10 +163,6 @@ pub(super) async fn run_resolved_turn_async<F, E, A, Dfut, Efut, Afut>(
     mut on_delta: F,
     mut on_event: E,
     mut approve: A,
-    steer_receiver: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::model_runtime::runtime::ResponseSteerRequest>,
-    >,
-    steer_handle: Option<crate::model_runtime::runtime::ResponseSteerHandle>,
 ) -> Result<String>
 where
     F: FnMut(&str) -> Dfut + Send,
@@ -229,12 +225,6 @@ where
     let ws_transport = if should_use_responses_websocket(&route) {
         let transport =
             std::sync::Arc::new(crate::model_runtime::runtime::TurnLocalResponsesTransport::new());
-        if let Some(receiver) = steer_receiver {
-            transport.set_steer_receiver(receiver).await;
-        }
-        if let Some(handle) = steer_handle {
-            transport.set_steer_handle(handle);
-        }
         Some(transport)
     } else {
         None
@@ -277,8 +267,6 @@ where
         count_recovered_tool_calls: false,
         reconciled_async_tool_ids: BTreeSet::new(),
         attempt_assistant_persisted: false,
-        committed_steer: None,
-        fallback_steer: None,
     };
     TurnOrchestrator::new(runtime, limits)
         .run(&route, &mut driver)
@@ -339,8 +327,6 @@ struct ResolvedTurnDriver<'a, F, E, A> {
     count_recovered_tool_calls: bool,
     reconciled_async_tool_ids: BTreeSet<String>,
     attempt_assistant_persisted: bool,
-    committed_steer: Option<UserMessageSubmission>,
-    fallback_steer: Option<UserMessageSubmission>,
 }
 
 impl<'a, F, E, A, Dfut, Efut, Afut> ResolvedTurnDriver<'a, F, E, A>
@@ -527,18 +513,6 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    async fn append_steer_user(
-        &mut self,
-        submission: UserMessageSubmission,
-    ) -> std::result::Result<(), ModelFailure> {
-        self.agent
-            .append_history_item(HistoryItem::user_content(submission.content.clone()))
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
-        (self.on_event)(AgentEvent::UserMessage { submission })
-            .await
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))
-    }
-
     fn async_call_ids(&self) -> BTreeSet<String> {
         let mut ids = self.reconciled_async_tool_ids.clone();
         ids.extend(
@@ -547,23 +521,6 @@ where
                 .map(|tool| tool.call_id().to_owned()),
         );
         ids
-    }
-
-    async fn consume_steer_inputs(&mut self) -> std::result::Result<(), ModelFailure> {
-        if let Some(submission) = self.committed_steer.take() {
-            self.append_steer_user(submission).await?;
-        }
-        if let Some(submission) = self.fallback_steer.take() {
-            self.append_steer_user(submission).await?;
-            (self.on_event)(AgentEvent::ModelStreamIssue {
-                message: "Response steer was not committed; using a local fallback".into(),
-                detail: None,
-                action: "Continuing with a fresh model request".into(),
-            })
-            .await
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
-        }
-        Ok(())
     }
 
     fn unexecuted_tool_calls(
@@ -587,58 +544,6 @@ where
             }
         }
         ordered
-    }
-
-    async fn reject_tool_batch_impl(
-        &mut self,
-        partial: &ModelAttemptSnapshot,
-        failure: &ModelFailure,
-    ) -> std::result::Result<(), ModelFailure> {
-        if let Some(ws_transport) = &self.ws_transport {
-            self.ws_previous = None;
-            ws_transport.reset_chain().await;
-        }
-        let executed = self.async_call_ids();
-        let persist_error = self
-            .persist_partial_assistant_filtered(&partial.assistant, Some(&executed))
-            .await;
-        let steer_error = if persist_error.is_ok() || self.attempt_assistant_persisted {
-            self.consume_steer_inputs().await.err()
-        } else {
-            None
-        };
-        let reconcile_error = if persist_error.is_ok() || self.attempt_assistant_persisted {
-            self.count_recovered_tool_calls = false;
-            self.reconcile_pending_async_tools().await.err()
-        } else {
-            self.drain_pending_async_tools().await.err()
-        };
-        let pending_ordered = self.unexecuted_tool_calls(partial, &executed);
-        let cancel_error = emit_pending_tool_call_cancellations(&pending_ordered, self.on_event)
-            .await
-            .err()
-            .map(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error));
-        let errors = [
-            persist_error.err(),
-            steer_error,
-            reconcile_error,
-            cancel_error,
-        ]
-        .into_iter()
-        .flatten()
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(runtime_failure(
-                crate::model_runtime::FailurePhase::Finish,
-                format!(
-                    "{failure}; failed to reject tool batch cleanly: {}",
-                    errors.join("; ")
-                ),
-            ))
-        }
     }
 }
 
@@ -692,6 +597,48 @@ where
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
         }
         Ok(())
+    }
+
+    async fn reject_tool_batch_impl(
+        &mut self,
+        partial: &ModelAttemptSnapshot,
+        failure: &ModelFailure,
+    ) -> std::result::Result<(), ModelFailure> {
+        if let Some(ws_transport) = &self.ws_transport {
+            self.ws_previous = None;
+            ws_transport.reset_chain().await;
+        }
+        let executed = self.async_call_ids();
+        let persist_error = self
+            .persist_partial_assistant_filtered(&partial.assistant, Some(&executed))
+            .await;
+        let reconcile_error = if persist_error.is_ok() || self.attempt_assistant_persisted {
+            self.count_recovered_tool_calls = false;
+            self.reconcile_pending_async_tools().await.err()
+        } else {
+            self.drain_pending_async_tools().await.err()
+        };
+        let pending_ordered = self.unexecuted_tool_calls(partial, &executed);
+        let cancel_error = emit_pending_tool_call_cancellations(&pending_ordered, self.on_event)
+            .await
+            .err()
+            .map(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error));
+        let errors = [persist_error.err(), reconcile_error, cancel_error]
+            .into_iter()
+            .flatten()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(runtime_failure(
+                crate::model_runtime::FailurePhase::Finish,
+                format!(
+                    "{failure}; failed to reject tool batch cleanly: {}",
+                    errors.join("; ")
+                ),
+            ))
+        }
     }
 }
 
@@ -1094,33 +1041,6 @@ where
             } => {
                 self.observe_async_tool_done(id, name, arguments).await?;
             }
-            ModelEvent::SteerCommit { submission } => {
-                self.committed_steer = Some(submission.clone());
-            }
-            ModelEvent::SteerPending {
-                submission,
-                waiting_for_required_input,
-            } => {
-                if *waiting_for_required_input {
-                    (self.on_event)(AgentEvent::SteerPending {
-                        submission: submission.clone(),
-                    })
-                    .await
-                    .map_err(|error| {
-                        runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
-                    })?;
-                }
-            }
-            ModelEvent::SteerFailed { submission } => {
-                (self.on_event)(AgentEvent::SteerFailed {
-                    submission: submission.clone(),
-                })
-                .await
-                .map_err(|error| {
-                    runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
-                })?;
-                self.fallback_steer = Some(submission.clone());
-            }
             ModelEvent::Usage {
                 input_tokens,
                 output_tokens,
@@ -1178,6 +1098,61 @@ where
     ) -> std::result::Result<(), ModelFailure> {
         self.persist_partial_assistant_filtered(assistant, None)
             .await
+    }
+
+    async fn reject_tool_batch(
+        &mut self,
+        partial: &ModelAttemptSnapshot,
+        failure: &ModelFailure,
+    ) -> std::result::Result<(), ModelFailure> {
+        self.reject_tool_batch_impl(partial, failure).await
+    }
+
+    async fn abort_iteration(
+        &mut self,
+        partial: &ModelAttemptSnapshot,
+        failure: &ModelFailure,
+    ) -> std::result::Result<(), ModelFailure> {
+        if let Some(ws_transport) = &self.ws_transport {
+            self.ws_previous = None;
+            ws_transport.reset_chain().await;
+        }
+        let persist_error = self.persist_partial_assistant(&partial.assistant).await;
+        let reconcile_error = if persist_error.is_ok() || self.attempt_assistant_persisted {
+            self.reconcile_pending_async_tools().await
+        } else {
+            self.drain_pending_async_tools().await
+        };
+        let pending_ordered = partial
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::ToolStarted { id, name }
+                    if !self.reconciled_async_tool_ids.contains(id) =>
+                {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        emit_pending_tool_call_cancellations(&pending_ordered, self.on_event)
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        let errors = [persist_error.err(), reconcile_error.err()]
+            .into_iter()
+            .flatten()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            return Err(runtime_failure(
+                crate::model_runtime::FailurePhase::Finish,
+                format!(
+                    "{failure}; failed to preserve pending tool results: {}",
+                    errors.join("; ")
+                ),
+            ));
+        }
+        Ok(())
     }
 
     async fn persist_assistant(
@@ -1296,13 +1271,6 @@ where
         Ok(())
     }
 
-    async fn before_tools(&mut self) -> std::result::Result<(), ModelFailure> {
-        if let Some(submission) = self.committed_steer.take() {
-            self.append_steer_user(submission).await?;
-        }
-        Ok(())
-    }
-
     async fn execute_tools(
         &mut self,
         tools: &[CompletedToolCall],
@@ -1384,77 +1352,6 @@ where
         Ok(())
     }
 
-    async fn reject_tool_batch(
-        &mut self,
-        partial: &ModelAttemptSnapshot,
-        failure: &ModelFailure,
-    ) -> std::result::Result<(), ModelFailure> {
-        self.reject_tool_batch_impl(partial, failure).await
-    }
-
-    async fn abort_iteration(
-        &mut self,
-        partial: &ModelAttemptSnapshot,
-        failure: &ModelFailure,
-    ) -> std::result::Result<(), ModelFailure> {
-        if let Some(ws_transport) = &self.ws_transport {
-            self.ws_previous = None;
-            ws_transport.reset_chain().await;
-        }
-        let fallback_steer = self.fallback_steer.take();
-        let persist_error = self.persist_partial_assistant(&partial.assistant).await;
-        let committed_error = if let Some(submission) = self.committed_steer.take() {
-            self.append_steer_user(submission).await.err()
-        } else {
-            None
-        };
-        if let Some(submission) = fallback_steer {
-            self.append_steer_user(submission).await?;
-            (self.on_event)(AgentEvent::ModelStreamIssue {
-                message: "Response steer fell back to a local user message".into(),
-                detail: None,
-                action: "Continuing with a fresh model request".into(),
-            })
-            .await
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
-        }
-        let reconcile_error = if persist_error.is_ok() || self.attempt_assistant_persisted {
-            self.reconcile_pending_async_tools().await
-        } else {
-            self.drain_pending_async_tools().await
-        };
-        let pending_ordered = partial
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                ModelEvent::ToolStarted { id, name }
-                    if !self.reconciled_async_tool_ids.contains(id) =>
-                {
-                    Some((id.clone(), name.clone()))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        emit_pending_tool_call_cancellations(&pending_ordered, self.on_event)
-            .await
-            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
-        let errors = [persist_error.err(), committed_error, reconcile_error.err()]
-            .into_iter()
-            .flatten()
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            return Err(runtime_failure(
-                crate::model_runtime::FailurePhase::Finish,
-                format!(
-                    "{failure}; failed to preserve pending tool results: {}",
-                    errors.join("; ")
-                ),
-            ));
-        }
-        Ok(())
-    }
-
     async fn recover_iteration(
         &mut self,
         partial: &ModelAttemptSnapshot,
@@ -1465,91 +1362,23 @@ where
             ws_transport.reset_chain().await;
         }
 
-        let fallback_present = self.fallback_steer.is_some();
-        if fallback_present {
-            let reconciled = self.reconciled_async_tool_ids.clone();
-            let new_tool_count = partial
-                .completed_tools
-                .iter()
-                .filter(|tool| !reconciled.contains(&tool.id))
-                .count();
-            let next_tool_total = self
-                .tool_call_count
-                .saturating_add(self.recovered_tool_calls)
-                .saturating_add(new_tool_count);
-            if !self.bypass_tool_limit()
-                && self
-                    .agent
-                    .max_tool_calls
-                    .is_some_and(|limit| next_tool_total > limit)
-            {
-                let max_failure = ModelFailure::new(
-                    crate::model_runtime::FailurePhase::Finish,
-                    crate::model_runtime::FailureKind::InvalidRequest,
-                )
-                .with_code("max_tool_calls");
-                if let Err(cleanup) = self.reject_tool_batch_impl(partial, &max_failure).await {
-                    return Err(crate::model_runtime::runtime::failure_with_cleanup(
-                        max_failure,
-                        cleanup,
-                    ));
-                }
-                return Err(max_failure);
-            }
-        }
-
-        let allowed_async = (!fallback_present).then(|| self.async_call_ids());
+        let allowed_async = self.async_call_ids();
         let persist_result = self
-            .persist_partial_assistant_filtered(&partial.assistant, allowed_async.as_ref())
+            .persist_partial_assistant_filtered(&partial.assistant, Some(&allowed_async))
             .await;
         if let Err(persist_error) = persist_result {
             if let Err(cleanup) = self.drain_pending_async_tools().await {
-                return Err(crate::model_runtime::runtime::failure_with_cleanup(
-                    persist_error,
-                    cleanup,
-                ));
+                return Err(failure_with_cleanup(persist_error, cleanup));
             }
             return Err(persist_error);
-        }
-
-        if let Err(error) = self.consume_steer_inputs().await {
-            return Err(crate::model_runtime::runtime::failure_with_cleanup(
-                failure.clone(),
-                error,
-            ));
         }
 
         self.count_recovered_tool_calls = true;
         if let Err(error) = self.reconcile_pending_async_tools().await {
             self.count_recovered_tool_calls = false;
-            return Err(crate::model_runtime::runtime::failure_with_cleanup(
-                failure.clone(),
-                error,
-            ));
+            return Err(failure_with_cleanup(failure.clone(), error));
         }
 
-        if fallback_present {
-            let execute_result = self.execute_tools(&partial.completed_tools).await;
-            self.count_recovered_tool_calls = false;
-            if let Err(error) = execute_result {
-                return Err(crate::model_runtime::runtime::failure_with_cleanup(
-                    failure.clone(),
-                    error,
-                ));
-            }
-            let mut executed = self.async_call_ids();
-            executed.extend(partial.completed_tools.iter().map(|tool| tool.id.clone()));
-            let pending_ordered = self.unexecuted_tool_calls(partial, &executed);
-            emit_pending_tool_call_cancellations(&pending_ordered, self.on_event)
-                .await
-                .map_err(|error| {
-                    crate::model_runtime::runtime::failure_with_cleanup(
-                        failure.clone(),
-                        runtime_failure(crate::model_runtime::FailurePhase::Finish, error),
-                    )
-                })?;
-            return Ok(());
-        }
         self.count_recovered_tool_calls = false;
 
         let executed = self.async_call_ids();
@@ -1557,7 +1386,7 @@ where
         emit_pending_tool_call_cancellations(&pending_ordered, self.on_event)
             .await
             .map_err(|error| {
-                crate::model_runtime::runtime::failure_with_cleanup(
+                failure_with_cleanup(
                     failure.clone(),
                     runtime_failure(crate::model_runtime::FailurePhase::Finish, error),
                 )
@@ -1588,10 +1417,6 @@ where
         &mut self,
         _result: &ModelAttemptResult,
     ) -> std::result::Result<TurnContinuationDecision, ModelFailure> {
-        if let Some(submission) = self.committed_steer.take() {
-            self.append_steer_user(submission).await?;
-            return Ok(TurnContinuationDecision::Continue);
-        }
         (self.on_event)(AgentEvent::TurnContinuationBoundary)
             .await
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
@@ -2408,18 +2233,9 @@ where
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-    use crate::model_runtime::runtime::{
-        ModelRuntime, ModelTransport, TurnLimits, TurnOrchestrator,
-    };
-    use crate::model_runtime::{
-        ContentPart, MessageRole, PreparedHttpRequest, ProtocolRegistry, ResolvedModelRoute,
-        RuntimeConfig, TransportResponse,
-    };
+    use crate::model_runtime::runtime::TurnDriver;
+    use crate::model_runtime::{ContentPart, MessageRole, ProtocolRegistry, RuntimeConfig};
     use crate::permission::PermissionApproval;
-    use async_trait::async_trait;
-    use futures_util::stream;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     fn recovery_route() -> std::sync::Arc<crate::model_runtime::ResolvedModelRoute> {
         let catalog = RuntimeConfig::from_toml(
@@ -2457,62 +2273,6 @@ parallel_tool_calls = true
             name: name.into(),
             arguments,
         }
-    }
-
-    #[derive(Default)]
-    struct RecoveryTransport {
-        responses: Mutex<VecDeque<TransportResponse>>,
-    }
-
-    #[async_trait]
-    impl ModelTransport for RecoveryTransport {
-        async fn send_prepared(
-            &self,
-            _route: &ResolvedModelRoute,
-            _request: PreparedHttpRequest,
-        ) -> std::result::Result<TransportResponse, ModelFailure> {
-            self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-                ModelFailure::new(
-                    crate::model_runtime::FailurePhase::Transport,
-                    crate::model_runtime::FailureKind::Internal,
-                )
-                .with_code("missing_recovery_response")
-            })
-        }
-    }
-
-    fn websocket_response(events: Vec<serde_json::Value>) -> TransportResponse {
-        let body = stream::iter(
-            events
-                .into_iter()
-                .map(|event| Ok::<Vec<u8>, ModelFailure>(serde_json::to_vec(&event).unwrap())),
-        );
-        TransportResponse::from_responses_websocket_stream(200, BTreeMap::new(), body)
-    }
-
-    fn tool_events(call_id: &str, item_id: &str) -> Vec<serde_json::Value> {
-        let arguments = plain_tool_arguments();
-        vec![
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "item": {
-                    "type": "function_call",
-                    "id": item_id,
-                    "call_id": call_id,
-                    "name": "workflow__todos"
-                }
-            }),
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "function_call",
-                    "id": item_id,
-                    "call_id": call_id,
-                    "name": "workflow__todos",
-                    "arguments": arguments.to_string()
-                }
-            }),
-        ]
     }
 
     fn resolved_driver<'a, F, E, A, Dfut, Efut, Afut>(
@@ -2564,203 +2324,7 @@ parallel_tool_calls = true
             count_recovered_tool_calls: false,
             reconciled_async_tool_ids: BTreeSet::new(),
             attempt_assistant_persisted: false,
-            committed_steer: None,
-            fallback_steer: None,
         }
-    }
-
-    #[tokio::test]
-    async fn required_input_pending_does_not_enter_local_fallback() {
-        let mut agent = Agent::new("model", 4, 4);
-        let route = recovery_route();
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let observed = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let observed_events = std::sync::Arc::clone(&observed);
-        let mut on_event = move |event: AgentEvent| {
-            observed_events.lock().unwrap().push(event);
-            async { Ok::<(), anyhow::Error>(()) }
-        };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route,
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        let submission =
-            UserMessageSubmission::new("pending", UserMessageContent::from("continue after tools"));
-
-        TurnDriver::observe_event(
-            &mut driver,
-            &ModelEvent::SteerPending {
-                submission: submission.clone(),
-                waiting_for_required_input: true,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            driver.fallback_steer.is_none(),
-            "server-owned pending input must not enter local fallback"
-        );
-
-        TurnDriver::observe_event(
-            &mut driver,
-            &ModelEvent::SteerFailed {
-                submission: submission.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            driver
-                .fallback_steer
-                .as_ref()
-                .map(|submission| submission.id.as_str()),
-            Some("pending")
-        );
-        drop(driver);
-
-        let observed = observed.lock().unwrap();
-        assert!(matches!(
-            observed.first(),
-            Some(AgentEvent::SteerPending { submission }) if submission.id == "pending"
-        ));
-        assert!(matches!(
-            observed.get(1),
-            Some(AgentEvent::SteerFailed { submission }) if submission.id == "pending"
-        ));
-    }
-
-    #[tokio::test]
-    async fn fallback_completed_plain_tool_executes_once_in_history_order_and_budget() {
-        let mut agent = Agent::new("model", 4, 4);
-        agent.runtime_snapshot.current_turn_id = Some(1);
-        agent.turn.turn_id = 1;
-        let route = recovery_route();
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let mut on_event = |_event: AgentEvent| async { Ok::<(), anyhow::Error>(()) };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route,
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        driver.fallback_steer = Some(UserMessageSubmission::new(
-            "fallback",
-            UserMessageContent::from("fallback input"),
-        ));
-        let arguments = plain_tool_arguments();
-        let partial = ModelAttemptSnapshot {
-            assistant: ModelMessage {
-                role: MessageRole::Assistant,
-                content: vec![ContentPart::ToolCall {
-                    id: "call-plain".into(),
-                    name: "workflow__todos".into(),
-                    arguments: arguments.clone(),
-                }],
-            },
-            completed_tools: vec![completed_tool("call-plain", "workflow__todos", arguments)],
-            ..ModelAttemptSnapshot::default()
-        };
-        let failure = ModelFailure::new(
-            crate::model_runtime::FailurePhase::Transport,
-            crate::model_runtime::FailureKind::Http,
-        );
-
-        TurnDriver::recover_iteration(&mut driver, &partial, &failure)
-            .await
-            .unwrap();
-        assert_eq!(TurnDriver::take_recovered_tool_calls(&mut driver), 1);
-        assert_eq!(TurnDriver::take_recovered_tool_calls(&mut driver), 0);
-
-        let history = driver.agent.history_for_test();
-        assert!(matches!(
-            history.as_slice(),
-            [
-                HistoryItem::AssistantTurn { calls, .. },
-                HistoryItem::UserMessage { .. },
-                HistoryItem::ToolOutput { call_id, .. },
-            ] if calls.len() == 1
-                && calls[0].call_id == "call-plain"
-                && call_id == "call-plain"
-        ));
-    }
-
-    #[tokio::test]
-    async fn committed_steer_survives_normal_tool_budget_rejection_without_rejected_calls() {
-        let mut agent = Agent::new("model", 4, 1);
-        agent.runtime_snapshot.current_turn_id = Some(1);
-        agent.turn.turn_id = 1;
-        let route = recovery_route();
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let mut on_event = |_event: AgentEvent| async { Ok::<(), anyhow::Error>(()) };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route,
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        driver.committed_steer = Some(UserMessageSubmission::new(
-            "committed",
-            UserMessageContent::from("continue"),
-        ));
-        let arguments = plain_tool_arguments();
-        let partial = ModelAttemptSnapshot {
-            assistant: ModelMessage {
-                role: MessageRole::Assistant,
-                content: vec![
-                    ContentPart::Text("partial".into()),
-                    ContentPart::ToolCall {
-                        id: "call-a".into(),
-                        name: "workflow__todos".into(),
-                        arguments: arguments.clone(),
-                    },
-                    ContentPart::ToolCall {
-                        id: "call-b".into(),
-                        name: "workflow__todos".into(),
-                        arguments,
-                    },
-                ],
-            },
-            completed_tools: vec![
-                completed_tool("call-a", "workflow__todos", plain_tool_arguments()),
-                completed_tool("call-b", "workflow__todos", plain_tool_arguments()),
-            ],
-            ..ModelAttemptSnapshot::default()
-        };
-        let failure = ModelFailure::new(
-            crate::model_runtime::FailurePhase::Finish,
-            crate::model_runtime::FailureKind::InvalidRequest,
-        )
-        .with_code("max_tool_calls");
-        TurnDriver::reject_tool_batch(&mut driver, &partial, &failure)
-            .await
-            .unwrap();
-        let history = driver.agent.history_for_test();
-        assert!(matches!(
-            history.as_slice(),
-            [
-                HistoryItem::AssistantTurn { text: Some(text), calls, .. },
-                HistoryItem::UserMessage { .. },
-            ] if text == "partial" && calls.is_empty()
-        ));
-        assert!(
-            !history
-                .iter()
-                .any(|item| matches!(item, HistoryItem::ToolOutput { .. }))
-        );
     }
 
     #[tokio::test]
@@ -2823,291 +2387,5 @@ parallel_tool_calls = true
             item,
             HistoryItem::ToolOutput { call_id, .. } if call_id == "call-plain"
         )));
-    }
-
-    #[tokio::test]
-    async fn fallback_budget_rejection_keeps_user_and_rejects_plain_calls() {
-        let mut agent = Agent::new("model", 4, 0);
-        agent.runtime_snapshot.current_turn_id = Some(1);
-        agent.turn.turn_id = 1;
-        let route = recovery_route();
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let mut on_event = |_event: AgentEvent| async { Ok::<(), anyhow::Error>(()) };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route,
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        driver.fallback_steer = Some(UserMessageSubmission::new(
-            "fallback",
-            UserMessageContent::from("fallback input"),
-        ));
-        let partial = ModelAttemptSnapshot {
-            assistant: ModelMessage {
-                role: MessageRole::Assistant,
-                content: vec![
-                    ContentPart::Text("partial".into()),
-                    ContentPart::ToolCall {
-                        id: "call-rejected".into(),
-                        name: "workflow__todos".into(),
-                        arguments: plain_tool_arguments(),
-                    },
-                ],
-            },
-            completed_tools: vec![completed_tool(
-                "call-rejected",
-                "workflow__todos",
-                plain_tool_arguments(),
-            )],
-            ..ModelAttemptSnapshot::default()
-        };
-        let failure = ModelFailure::new(
-            crate::model_runtime::FailurePhase::Transport,
-            crate::model_runtime::FailureKind::Http,
-        );
-        let error = TurnDriver::recover_iteration(&mut driver, &partial, &failure)
-            .await
-            .expect_err("fallback call exceeds zero tool budget");
-        assert_eq!(error.code.as_deref(), Some("max_tool_calls"));
-        let history = driver.agent.history_for_test();
-        assert!(matches!(
-            history.as_slice(),
-            [
-                HistoryItem::AssistantTurn { text: Some(text), calls, .. },
-                HistoryItem::UserMessage { .. },
-            ] if text == "partial" && calls.is_empty()
-        ));
-        assert!(
-            !history
-                .iter()
-                .any(|item| matches!(item, HistoryItem::ToolOutput { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn fallback_completed_tool_cancels_later_started_call() {
-        let mut agent = Agent::new("model", 4, 4);
-        agent.runtime_snapshot.current_turn_id = Some(1);
-        agent.turn.turn_id = 1;
-        let route = recovery_route();
-        let events = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let observed = events.clone();
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let mut on_event = move |event: AgentEvent| {
-            observed.lock().unwrap().push(event);
-            std::future::ready(Ok::<(), anyhow::Error>(()))
-        };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route,
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        driver.fallback_steer = Some(UserMessageSubmission::new(
-            "fallback",
-            UserMessageContent::from("fallback input"),
-        ));
-        let partial = ModelAttemptSnapshot {
-            assistant: ModelMessage {
-                role: MessageRole::Assistant,
-                content: vec![
-                    ContentPart::ToolCall {
-                        id: "call-a".into(),
-                        name: "workflow__todos".into(),
-                        arguments: plain_tool_arguments(),
-                    },
-                    ContentPart::ToolCall {
-                        id: "call-b".into(),
-                        name: "workflow__todos".into(),
-                        arguments: plain_tool_arguments(),
-                    },
-                ],
-            },
-            events: vec![
-                ModelEvent::ToolStarted {
-                    id: "call-a".into(),
-                    name: "workflow__todos".into(),
-                },
-                ModelEvent::ToolDone {
-                    id: "call-a".into(),
-                    name: "workflow__todos".into(),
-                    arguments: plain_tool_arguments(),
-                },
-                ModelEvent::ToolStarted {
-                    id: "call-b".into(),
-                    name: "workflow__todos".into(),
-                },
-            ],
-            completed_tools: vec![completed_tool(
-                "call-a",
-                "workflow__todos",
-                plain_tool_arguments(),
-            )],
-            ..ModelAttemptSnapshot::default()
-        };
-        let failure = ModelFailure::new(
-            crate::model_runtime::FailurePhase::Transport,
-            crate::model_runtime::FailureKind::Http,
-        );
-        TurnDriver::recover_iteration(&mut driver, &partial, &failure)
-            .await
-            .unwrap();
-        let history = driver.agent.history_for_test();
-        assert_eq!(
-            history
-                .iter()
-                .filter(|item| matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == "call-a"))
-                .count(),
-            1
-        );
-        assert!(!history.iter().any(
-            |item| matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == "call-b")
-        ));
-        assert!(events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            AgentEvent::ToolCallCancelled { call_id, .. } if call_id == "call-b"
-        )));
-    }
-
-    #[tokio::test]
-    async fn auto_continue_fallback_bypasses_internal_tool_budget_precheck() {
-        let mut agent = Agent::new("model", 4, 0);
-        agent.runtime_snapshot.current_turn_id = Some(1);
-        agent.turn.turn_id = 1;
-        agent.turn.auto_continue_active = true;
-        let route = recovery_route();
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let mut on_event = |_event: AgentEvent| async { Ok::<(), anyhow::Error>(()) };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route,
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        driver.fallback_steer = Some(UserMessageSubmission::new(
-            "fallback",
-            UserMessageContent::from("fallback input"),
-        ));
-        let partial = ModelAttemptSnapshot {
-            assistant: ModelMessage {
-                role: MessageRole::Assistant,
-                content: vec![ContentPart::ToolCall {
-                    id: "call-a".into(),
-                    name: "workflow__todos".into(),
-                    arguments: plain_tool_arguments(),
-                }],
-            },
-            completed_tools: vec![completed_tool(
-                "call-a",
-                "workflow__todos",
-                plain_tool_arguments(),
-            )],
-            ..ModelAttemptSnapshot::default()
-        };
-        let failure = ModelFailure::new(
-            crate::model_runtime::FailurePhase::Transport,
-            crate::model_runtime::FailureKind::Http,
-        );
-        TurnDriver::recover_iteration(&mut driver, &partial, &failure)
-            .await
-            .unwrap();
-        assert_eq!(TurnDriver::take_recovered_tool_calls(&mut driver), 1);
-        assert!(driver.agent.history_for_test().iter().any(
-            |item| matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == "call-a")
-        ));
-    }
-
-    #[tokio::test]
-    async fn recovered_tool_counts_against_limit_before_later_tool_b_executes() {
-        let mut agent = Agent::new("model", 4, 1);
-        agent.runtime_snapshot.current_turn_id = Some(1);
-        agent.turn.turn_id = 1;
-        let route = recovery_route();
-        agent.set_resolved_model_route(Some(route.clone()));
-        let first_response = {
-            let mut events = tool_events("call-a", "item-a");
-            events.push(serde_json::json!({
-                "type": "response.steer.failed",
-                "steer_submission_id": "fallback",
-                "input": "fallback input"
-            }));
-            websocket_response(events)
-        };
-        let second_response = {
-            let mut events = tool_events("call-b", "item-b");
-            events.push(serde_json::json!({
-                "type": "response.completed",
-                "response": {"status": "requires_action"}
-            }));
-            websocket_response(events)
-        };
-        let transport = std::sync::Arc::new(RecoveryTransport {
-            responses: Mutex::new(VecDeque::from([first_response, second_response])),
-        });
-        let runtime = ModelRuntime::new_responses_websocket(transport.clone());
-        let mut on_delta = |_text: &str| async { Ok::<(), anyhow::Error>(()) };
-        let mut on_event = |_event: AgentEvent| async { Ok::<(), anyhow::Error>(()) };
-        let mut approve = |_request: PermissionRequest| async {
-            Ok::<PermissionApproval, anyhow::Error>(PermissionApproval::AllowOnce)
-        };
-        let mut driver = resolved_driver(
-            &mut agent,
-            route.clone(),
-            &mut on_delta,
-            &mut on_event,
-            &mut approve,
-        );
-        let error = TurnOrchestrator::new(
-            runtime,
-            TurnLimits {
-                max_iterations: 4,
-                max_tool_calls: Some(1),
-            },
-        )
-        .run(&route, &mut driver)
-        .await
-        .expect_err("tool B must exceed the recovered tool budget");
-        assert_eq!(error.code.as_deref(), Some("max_tool_calls"));
-        assert!(transport.responses.lock().unwrap().is_empty());
-
-        let history = driver.agent.history_for_test();
-        assert!(matches!(
-            history.as_slice(),
-            [
-                HistoryItem::AssistantTurn { calls: calls_a, .. },
-                HistoryItem::UserMessage { .. },
-                HistoryItem::ToolOutput { call_id: output_a, .. },
-            ] if calls_a.len() == 1
-                && calls_a[0].call_id == "call-a"
-                && output_a == "call-a"
-        ));
-        assert_eq!(
-            history
-                .iter()
-                .filter(|item| matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == "call-a"))
-                .count(),
-            1
-        );
-        assert!(!history.iter().any(|item| matches!(
-            item,
-            HistoryItem::AssistantTurn { calls, .. }
-                if calls.iter().any(|call| call.call_id == "call-b")
-        )));
-        assert!(!history.iter().any(
-            |item| matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == "call-b")
-        ));
     }
 }

@@ -14,7 +14,6 @@ pub(crate) mod runtime;
 pub(crate) mod strategy;
 pub(crate) mod websocket;
 
-use crate::user_content::UserMessageSubmission;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -540,30 +539,6 @@ pub trait ProtocolBinding: Send + Sync {
         &self,
         input: &ModelRequestInput,
     ) -> Result<PreparedHttpRequest, ModelFailure>;
-    fn supports_websocket_steer(&self) -> bool {
-        false
-    }
-    fn websocket_steer_frame(
-        &self,
-        _previous_response_id: &str,
-        _submission: &UserMessageSubmission,
-    ) -> Result<Vec<u8>, ModelFailure> {
-        Err(
-            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                .with_code("websocket_steer_unsupported_protocol"),
-        )
-    }
-    fn websocket_required_input_frame(
-        &self,
-        _request: &PreparedHttpRequest,
-        _previous_response_id: &str,
-        _required_input: &[serde_json::Value],
-    ) -> Result<Vec<u8>, ModelFailure> {
-        Err(
-            ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                .with_code("websocket_required_input_unsupported_protocol"),
-        )
-    }
     fn websocket_frame(
         &self,
         _request: &PreparedHttpRequest,
@@ -994,16 +969,6 @@ pub enum ModelEvent {
     ResponseMetadata {
         response_id: String,
     },
-    SteerCommit {
-        submission: UserMessageSubmission,
-    },
-    SteerPending {
-        submission: UserMessageSubmission,
-        waiting_for_required_input: bool,
-    },
-    SteerFailed {
-        submission: UserMessageSubmission,
-    },
     Terminal {
         status: TerminalStatus,
     },
@@ -1019,7 +984,6 @@ pub enum TerminalStatus {
     Refusal,
     Pause,
     Incomplete,
-    Steered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3239,13 +3203,6 @@ pub struct ResolvedModelRoute {
 }
 
 impl ResolvedModelRoute {
-    pub fn supports_live_steer(&self) -> bool {
-        self.strategy == strategy::ModelStrategyId::Astra
-            && self.protocol_id.as_str() == "responses"
-            && self.websocket
-            && self.binding.supports_websocket_steer()
-    }
-
     pub fn binding(&self) -> &Arc<dyn ProtocolBinding> {
         &self.binding
     }
@@ -4559,41 +4516,6 @@ async_tools = {async_tools}
     }
 
     #[test]
-    fn live_steer_requires_resolved_astra_strategy_and_websocket() {
-        for (strategy, websocket, expected) in [
-            ("astra", true, true),
-            ("astra", false, false),
-            ("default", true, false),
-            ("default", false, false),
-        ] {
-            let config = astra_config("[]")
-                .replace(
-                    "strategy = \"astra\"",
-                    &format!("strategy = \"{strategy}\""),
-                )
-                .replace(
-                    "[providers.vendor.models.gpt-6-astra.generation]\nasync_tools = []\n",
-                    "",
-                );
-            let config = format!(
-                "{config}\n[providers.vendor.models.gpt-6-astra.transport]\nwebsocket = {websocket}\n"
-            );
-            let catalog = RuntimeConfig::from_toml(&config)
-                .unwrap()
-                .resolve(&ProtocolRegistry::builtins())
-                .unwrap();
-            assert_eq!(
-                catalog
-                    .route("vendor", "gpt-6-astra")
-                    .unwrap()
-                    .supports_live_steer(),
-                expected,
-                "strategy={strategy}, websocket={websocket}"
-            );
-        }
-    }
-
-    #[test]
     fn async_tool_config_requires_astra_responses_tools_and_unique_names() {
         let route = RuntimeConfig::from_toml(&astra_config("[\"lookup\", \"notify\"]"))
             .unwrap()
@@ -4661,90 +4583,6 @@ async_tools = {async_tools}
         assert_eq!(body["tools"][0]["async"], true);
         assert!(body["tools"][1].get("async").is_none());
         assert!(body["input"][0].get("async").is_none());
-    }
-
-    #[test]
-    fn responses_steer_frame_is_exact_and_rejects_selected_skills() {
-        let binding = responses_binding();
-        let submission = crate::user_content::UserMessageSubmission::new(
-            "steer-1",
-            crate::user_content::UserMessageContent::from_parts(vec![
-                crate::user_content::UserMessagePart::Text {
-                    text: "continue".into(),
-                },
-                crate::user_content::UserMessagePart::Image {
-                    attachment: crate::user_content::UserImageAttachment::from_bytes(
-                        "diagram",
-                        "image/png",
-                        &[1, 2, 3],
-                    ),
-                },
-            ]),
-        );
-        let frame: serde_json::Value = serde_json::from_slice(
-            &binding
-                .websocket_steer_frame("resp-1", &submission)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(frame["type"], "response.steer");
-        assert_eq!(frame["previous_response_id"], "resp-1");
-        assert_eq!(frame["input"][0]["role"], "user");
-        assert_eq!(frame["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(frame["input"][0]["content"][1]["type"], "input_image");
-        assert!(
-            frame["input"][0]["content"][1]["image_url"]
-                .as_str()
-                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
-        );
-        assert_eq!(frame.as_object().unwrap().len(), 3);
-
-        let invalid = crate::user_content::UserMessageSubmission::new(
-            "steer-2",
-            crate::user_content::UserMessageContent::from("continue")
-                .with_selected_skills(vec!["cloudbase".into()]),
-        );
-        assert_eq!(
-            binding
-                .websocket_steer_frame("resp-1", &invalid)
-                .unwrap_err()
-                .code
-                .as_deref(),
-            Some("websocket_steer_selected_skills")
-        );
-    }
-
-    #[test]
-    fn responses_decoder_rejects_steer_outcome_without_submission_id() {
-        let binding = responses_binding();
-        let mut decoder = binding.new_websocket_decoder();
-        let error = decoder
-            .push(br#"{"type":"response.steer.pending","input":"continue"}"#)
-            .unwrap_err();
-        assert_eq!(error.code.as_deref(), Some("invalid_event"));
-    }
-
-    #[test]
-    fn responses_decoder_accepts_steered_incomplete_as_a_success_boundary() {
-        let binding = responses_binding();
-        let mut decoder = binding.new_websocket_decoder();
-        let events = decoder
-            .push(br#"{"type":"response.steer.commit","steer_submission_id":"steer-1","input":"continue"}"#)
-            .unwrap();
-        let terminal_events = decoder
-            .push(br#"{"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"steered"}}}"#)
-            .unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ModelEvent::SteerCommit { submission } if submission.id == "steer-1"
-        )));
-        assert!(terminal_events.iter().any(|event| matches!(
-            event,
-            ModelEvent::Terminal {
-                status: TerminalStatus::Steered
-            }
-        )));
-        assert!(decoder.finish().is_ok());
     }
 
     #[test]

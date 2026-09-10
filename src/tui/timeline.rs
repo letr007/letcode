@@ -225,8 +225,6 @@ pub struct MessageView {
     pub selected_skills: Vec<String>,
     pub streaming: bool,
     pub queued: bool,
-    pub steering: bool,
-    pub waiting_for_input: bool,
 }
 
 #[cfg(test)]
@@ -514,8 +512,6 @@ impl Timeline {
                     selected_skills: Vec::new(),
                     streaming: false,
                     queued: false,
-                    steering: false,
-                    waiting_for_input: false,
                 })),
                 ConversationRole::Summary if is_runtime_context_section(&message.content) => {}
                 ConversationRole::Summary => timeline.push_restored_compaction(message.content),
@@ -529,8 +525,6 @@ impl Timeline {
                         selected_skills: Vec::new(),
                         streaming: false,
                         queued: false,
-                        steering: false,
-                        waiting_for_input: false,
                     }))
                 }
             }
@@ -644,8 +638,6 @@ impl Timeline {
             selected_skills: event.content.selected_skills,
             streaming: false,
             queued: event.queued,
-            steering: false,
-            waiting_for_input: false,
         }));
     }
 
@@ -660,8 +652,6 @@ impl Timeline {
                 selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
-                steering: false,
-                waiting_for_input: false,
             }),
             MessageRole::Assistant => TimelineItem::Assistant(MessageView {
                 id: None,
@@ -672,8 +662,6 @@ impl Timeline {
                 selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
-                steering: false,
-                waiting_for_input: false,
             }),
         });
     }
@@ -714,8 +702,6 @@ impl Timeline {
             selected_skills: Vec::new(),
             streaming: true,
             queued: false,
-            steering: false,
-            waiting_for_input: false,
         }));
     }
 
@@ -744,55 +730,6 @@ impl Timeline {
         }
     }
 
-    pub fn mark_queued_user_message_steering(&mut self, submission_id: &str) -> bool {
-        let Some(index) = self.queued_user_message_index(submission_id) else {
-            return false;
-        };
-        if let TimelineItem::User(message) = &mut self.items[index] {
-            message.steering = true;
-            message.waiting_for_input = false;
-        }
-        self.bump_revision(index);
-        true
-    }
-
-    pub fn mark_queued_user_message_waiting_for_input(&mut self, submission_id: &str) -> bool {
-        let Some(index) = self.queued_user_message_index(submission_id) else {
-            return false;
-        };
-        if let TimelineItem::User(message) = &mut self.items[index] {
-            message.steering = false;
-            message.waiting_for_input = true;
-        }
-        self.bump_revision(index);
-        true
-    }
-
-    pub fn mark_queued_user_message_queued(&mut self, submission_id: &str) -> bool {
-        let Some(index) = self.queued_user_message_index(submission_id) else {
-            return false;
-        };
-        if let TimelineItem::User(message) = &mut self.items[index] {
-            message.steering = false;
-            message.waiting_for_input = false;
-        }
-        self.bump_revision(index);
-        true
-    }
-
-    fn queued_user_message_index(&self, submission_id: &str) -> Option<usize> {
-        self.items.iter().position(|item| {
-            matches!(
-                item,
-                TimelineItem::User(MessageView {
-                    submission_id: Some(id),
-                    queued: true,
-                    ..
-                }) if id == submission_id
-            )
-        })
-    }
-
     pub fn activate_queued_user_message(&mut self, submission_id: &str) -> bool {
         let Some(index) = self.items.iter().position(|item| {
             matches!(
@@ -809,8 +746,6 @@ impl Timeline {
 
         if let TimelineItem::User(message) = &mut self.items[index] {
             message.queued = false;
-            message.steering = false;
-            message.waiting_for_input = false;
         }
         self.bump_revision(index);
         true
@@ -823,8 +758,6 @@ impl Timeline {
                 && message.queued
             {
                 message.queued = false;
-                message.steering = false;
-                message.waiting_for_input = false;
                 self.bump_revision(index);
                 activated = activated.saturating_add(1);
             }

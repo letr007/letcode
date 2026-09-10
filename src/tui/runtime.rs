@@ -1244,7 +1244,6 @@ impl TuiRuntime {
                 self.apply_restored_model(model_id.clone());
                 self.state.set_provider_label_from_model_route(model_id);
                 self.state.clear_pending_model_if(model_id);
-                self.refresh_queued_prompt_dispatch_readiness();
             }
             SessionTransportEvent::ExpertModelChanged {
                 agent_name,
@@ -1306,19 +1305,10 @@ impl TuiRuntime {
             }
             SessionTransportEvent::ModelCatalogUpdated(catalog) => {
                 self.apply_model_catalog_update(catalog);
-                self.refresh_queued_prompt_dispatch_readiness();
                 suppress_session_event = true;
             }
             SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
-                self.state.mark_queued_user_message_steering(&prompt.id);
-            }
-            SessionTransportEvent::QueuedPromptWaitingForInput { prompt } => {
-                self.state
-                    .mark_queued_user_message_waiting_for_input(&prompt.id);
-            }
-            SessionTransportEvent::QueuedPromptSteerFailed { prompt } => {
-                self.state.mark_queued_user_message_queued(&prompt.id);
             }
             SessionTransportEvent::SessionTitleUpdated { session_id, title }
                 if self.state.session_id.as_deref() == Some(session_id) =>
@@ -1362,7 +1352,6 @@ impl TuiRuntime {
                     self.queued_prompt_lifecycle
                         .resolve_user_message(&user_message.submission_id);
                     self.queued_prompts.pop_front();
-                    self.mark_dispatch_ready_for_live_steer();
                     suppress_session_event = self
                         .state
                         .activate_queued_user_message(&user_message.submission_id);
@@ -1383,24 +1372,9 @@ impl TuiRuntime {
             | SessionTransportEvent::ToolPending(_)
             | SessionTransportEvent::ToolCancelled(_)
             | SessionTransportEvent::ToolStarted(_)
-            | SessionTransportEvent::ToolOutputDelta(_)
-                if !self.queued_prompt_can_live_steer() =>
-            {
+            | SessionTransportEvent::ToolOutputDelta(_) => {
                 self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
-            SessionTransportEvent::ReasoningDone(_)
-                if !self.queued_prompts.is_empty()
-                    && !self.queued_prompt_lifecycle.has_inflight_handoff() =>
-            {
-                self.queued_prompt_lifecycle.mark_dispatch_ready();
-            }
-            SessionTransportEvent::AssistantDelta(_)
-            | SessionTransportEvent::ReasoningDelta(_)
-            | SessionTransportEvent::ReasoningDone(_)
-            | SessionTransportEvent::ToolPending(_)
-            | SessionTransportEvent::ToolCancelled(_)
-            | SessionTransportEvent::ToolStarted(_)
-            | SessionTransportEvent::ToolOutputDelta(_) => {}
             SessionTransportEvent::TokenUsage(token_usage) => {
                 let mut token_usage = token_usage.clone();
                 self.state.merge_parent_prompt_composition(&mut token_usage);
@@ -2583,37 +2557,6 @@ impl TuiRuntime {
         self.history_draft = None;
     }
 
-    fn current_model_supports_live_steer(&self) -> bool {
-        self.available_models
-            .iter()
-            .find(|model| model.id == self.state.model_id)
-            .is_some_and(|model| model.supports_live_steer)
-    }
-
-    fn queued_prompt_can_live_steer(&self) -> bool {
-        self.current_model_supports_live_steer()
-            && self
-                .queued_prompts
-                .front()
-                .is_some_and(|prompt| prompt.content.selected_skills.is_empty())
-    }
-
-    fn mark_dispatch_ready_for_live_steer(&mut self) {
-        if self.queued_prompt_can_live_steer() {
-            self.queued_prompt_lifecycle.mark_dispatch_ready();
-        }
-    }
-
-    fn refresh_queued_prompt_dispatch_readiness(&mut self) {
-        if self.has_active_or_pending_session_turn() {
-            if self.queued_prompt_can_live_steer() {
-                self.queued_prompt_lifecycle.mark_dispatch_ready();
-            } else {
-                self.queued_prompt_lifecycle.clear_dispatch_ready();
-            }
-        }
-    }
-
     fn queue_prompt(&mut self, prompt: UserMessageSubmission) {
         let submitted_draft = composer_draft_for_submission(&self.state);
         self.state.clear_input();
@@ -2622,7 +2565,6 @@ impl TuiRuntime {
         self.submitted_prompts.push(prompt.content.text.clone());
         self.submitted_prompt_drafts.push(submitted_draft);
         self.queued_prompts.push_back(prompt.clone());
-        self.mark_dispatch_ready_for_live_steer();
         self.state.push_queued_user_message_preview(prompt);
         self.state.toast = None;
     }
