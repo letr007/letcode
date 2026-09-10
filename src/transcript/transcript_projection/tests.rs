@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::{CompactionCheckpoint, CompactionFileOperations, ContextCompactionEvent};
 use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent, ValidationAdvisory};
+use crate::context_history::HistoryApplication;
 use crate::context_tree::ContextNodeStatus;
 use crate::context_view::{
     ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
@@ -3006,4 +3007,44 @@ fn navigation_restore_validates_root_compaction_on_root_scope() {
         restored.is_ok(),
         "undo navigation must validate the root compaction on root scope, got: {restored:?}"
     );
+}
+
+#[test]
+fn session_history_tree_projects_applied_history_entries() {
+    let records = [
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("hello"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::HistoryApplied(HistoryApplication {
+                publication_ids: Vec::new(),
+                baseline: Vec::new(),
+                delta: Vec::new(),
+                baseline_fact_ids: Vec::new(),
+                delta_fact_ids: Vec::new(),
+                withdrawn_fact_ids: Vec::new(),
+                first_kept_entry_id: None,
+                legacy_summary: None,
+            }),
+        ),
+        record_at(
+            3,
+            TranscriptEvent::AssistantMessage {
+                content: "world".into(),
+            },
+        ),
+    ];
+
+    let entries = project_session_history_tree(&records);
+
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[1].sequence, 2);
+    assert_eq!(entries[1].kind, SessionHistoryEntryKind::Other);
+    assert_eq!(entries[1].label, "History applied");
+    // The applied-history record sits between the user turn and its reply.
+    assert_eq!(entries[2].parent_id.as_deref(), Some("entry-2"));
 }

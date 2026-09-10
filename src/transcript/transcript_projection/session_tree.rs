@@ -223,6 +223,11 @@ fn entry_details(
             "Context compacted".into(),
             None,
         ),
+        TranscriptEvent::HistoryApplied(_) => (
+            SessionHistoryEntryKind::Other,
+            "History applied".into(),
+            None,
+        ),
         TranscriptEvent::LogicalCheckpoint(_) => (
             SessionHistoryEntryKind::Other,
             "Logical checkpoint".into(),
