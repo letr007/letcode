@@ -14,6 +14,7 @@
 - 新增 `context__search` 和 `context__expand`：在当前分支作用域内检索原始会话、归档历史段与 evidence，并按来源 ID 只读展开原文，不恢复旧执行状态。
 - 新增按模型配置的异步工具：`generation.async_tools` 列出的工具可在流式响应期间提前执行，完整工具批次到达后归并为同一调用组；仅适用于 Astra 策略搭配 Responses 协议。
 - 新增按路由声明的结构化输出：`capabilities.generation.structured_output` 可声明 `json_object` 或 `json_schema`，Responses、Chat Completions 与 Anthropic 分别映射各自线格式；未声明时请求不会附加格式约束。内置 Historian 在声明 `json_schema` 的路由上改用强制 schema，未声明时保持原有 prompt 约束。
+- 新增子代理结果归一化：路由声明 `capabilities.generation.structured_output` 时，子代理完成后按强制 schema 追加一次无工具调用，生成 `status`、`summary` 与各列表字段；未声明时保持原有 prompt 约束。
 
 ### Breaking
 
@@ -23,6 +24,7 @@
 
 - 项目记忆改为按工作区路径隔离的独立记忆库：回合持久化后由后台增量提取并保存到配置目录的 SQLite，`memory__recall` 直接查询该库，不再扫描或重新提炼旧 session；首次启用只登记当前 journal 进度。
 - 降低历史回放开销，校验时复用已发布前缀的投影状态，仅在分支路径变化时重建。
+- 子代理运行状态改为只反映宿主事实：子代理自身给出的 `failed`、`blocked`、`changes_requested` 等判定原样保留在结构化结果中并交给父代理，不再被翻译成运行失败或静默丢弃；子代理卡片同时显示运行状态与该判定。
 
 ### Fixed
 
@@ -30,6 +32,8 @@
 - 修复上下文压缩后模型看不到当前 todo 列表与 auto-continue 状态、可能忘记未完成工作的问题。
 - 修复历史树投影遇到已应用的历史记录时崩溃，导致 `/tree`、`/undo` 和 `/redo` 不可用的问题。
 - 修复流式工具调用被截断时，仅剩推理内容的部分回复会写入历史，导致后续请求被上游以 `content or tool_calls must be set` 拒绝、会话在重启前无法继续的问题。
+- 修复子代理结构化结果里的否定判定（如 `FAIL`、`changes_requested`、`NO-GO`）被当作成功、父代理收到成功工具结果，以及只读子代理给出 `blocked` 结论时被记为运行失败的问题。
+- 修复声明 `json_schema` 结构化输出的路由上，项目记忆抽取会套用 Historian 发布 schema、静默产出空更新的问题。
 
 ## [0.11.0] - 2026-09-05
 
