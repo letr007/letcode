@@ -76,6 +76,9 @@ impl ModelTransport for TurnLocalResponsesTransport {
             );
         }
         if self.force_http.load(Ordering::Acquire) {
+            // The request keeps the headers it was prepared with, so a
+            // request decorator that targeted the WebSocket path has its
+            // headers ride this HTTP fallback as well.
             return ResolvedProviderTransport
                 .send_prepared(route, request)
                 .await;

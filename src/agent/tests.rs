@@ -223,22 +223,100 @@ fn fake_modes_select_only_their_target_protocol() {
 }
 
 #[test]
-fn fake_context_is_stable_for_a_turn_and_has_no_provider_secret() {
+fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
+    let mut agent = test_agent();
+    let mut declared = crate::config::FakeConfig::default();
+    declared.identity.installation_id = Some("declared-installation".into());
+    declared.client.version = Some("9.9.9".into());
+    declared.clock.timezone = Some("Asia/Shanghai".into());
+    declared.clock.date = Some("2001-02-03".into());
+    // Startup installs the declared values even with the fake switched off.
+    agent.set_fake_config(declared);
+
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses protocol supports codex fake");
+    let context = agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("fake context is available");
+    assert_eq!(context.installation_id, "declared-installation");
+    assert_eq!(context.current_date.as_deref(), Some("2001-02-03"));
+    assert_eq!(context.timezone, "Asia/Shanghai");
+    assert!(
+        context
+            .headers()
+            .iter()
+            .any(|(name, value)| name == "user-agent" && value.contains("9.9.9"))
+    );
+
+    // A reload followed by re-enabling must pick up the new declared id too.
+    let mut reloaded = crate::config::FakeConfig::default();
+    reloaded.identity.installation_id = Some("reloaded-installation".into());
+    agent.set_fake_config(reloaded);
+    agent
+        .set_fake_client(None)
+        .expect("disabling the fake is infallible");
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses protocol supports codex fake");
+    assert_eq!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Codex)
+            .expect("fake context is available")
+            .installation_id,
+        "reloaded-installation"
+    );
+}
+
+#[test]
+fn fake_context_is_resolved_once_per_turn_and_has_no_provider_secret() {
     let mut agent = test_agent();
     agent
         .set_fake_client(Some(crate::fake::FakeClient::Codex))
         .expect("responses protocol supports codex fake");
+    // Both consumers in a turn (the prompt block and the request decorator)
+    // read one resolution, so they share an identity and the host facts behind
+    // it are read from the system once.
     let first = agent
         .fake_turn_context(crate::fake::FakeClient::Codex)
         .expect("fake context is available");
     let second = agent
         .fake_turn_context(crate::fake::FakeClient::Codex)
         .expect("fake context remains available");
-    assert_eq!(first.session_id, second.session_id);
-    assert_ne!(first.turn_id, second.turn_id);
+    assert_eq!(first, second);
+
+    // The next turn resolves again and is its own turn.
+    agent
+        .try_prepare_turn_prelude("another turn")
+        .expect("turn prelude can be prepared");
+    let next = agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("fake context is available for the next turn");
+    assert_eq!(next.session_id, first.session_id);
+    assert_ne!(next.turn_id, first.turn_id);
+
     let metadata = first.turn_metadata_json().to_string();
     assert!(!metadata.contains("api_key"));
     assert!(!metadata.contains("Authorization"));
+}
+
+#[test]
+fn declaring_a_fake_value_refreshes_the_cached_turn_context() {
+    let mut agent = test_agent();
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses protocol supports codex fake");
+    let derived = agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("fake context is available");
+    let mut declared = crate::config::FakeConfig::default();
+    declared.clock.date = Some("2001-02-03".into());
+    agent.set_fake_config(declared);
+    let refreshed = agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("fake context remains available");
+    assert_ne!(derived.current_date, refreshed.current_date);
+    assert_eq!(refreshed.current_date.as_deref(), Some("2001-02-03"));
 }
 
 fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {

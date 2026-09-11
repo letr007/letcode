@@ -723,7 +723,14 @@ pub struct Agent {
     fast_mode: Option<Arc<crate::fast_mode::FastMode>>,
     fake_client: Option<crate::fake::FakeClient>,
     fake_installation_id: String,
+    fake_config: crate::config::FakeConfig,
     fake_identity: Option<crate::fake::CodexIdentity>,
+    /// Resolved once per turn: the prompt block and the request decorator are
+    /// built at different points of the same turn, so resolving per call would
+    /// read the clock and the repository twice and hand one turn two different
+    /// identities. The guarded value is plain data, so a poisoned lock carries
+    /// no broken invariant and is recovered from.
+    fake_context_cache: std::sync::Mutex<Option<(u64, crate::fake::CodexRequestContext)>>,
     resolved_model_route: Option<Arc<ResolvedModelRoute>>,
     resolved_runtime_catalog: Option<ResolvedRuntimeCatalog>,
     retained_route_preparations: HashMap<String, RetainedRoutePreparation>,
@@ -976,7 +983,10 @@ impl AgentFactory {
             fast_mode: parent.fast_mode.clone(),
             fake_client: parent.fake_client,
             fake_installation_id: parent.fake_installation_id.clone(),
+            fake_config: parent.fake_config.clone(),
             fake_identity: parent.fake_identity.clone(),
+            // Owned per agent: turn ids are not shared with the parent.
+            fake_context_cache: std::sync::Mutex::new(None),
             resolved_model_route: runtime_route,
             resolved_runtime_catalog: runtime_catalog
                 .or_else(|| parent.resolved_runtime_catalog.clone()),
@@ -1445,7 +1455,9 @@ impl Agent {
             tool_timeout_secs: Some(60),
             fake_client: None,
             fake_installation_id: crate::fake::CodexIdentity::new("letcode").installation_id,
+            fake_config: crate::config::FakeConfig::default(),
             fake_identity: None,
+            fake_context_cache: std::sync::Mutex::new(None),
             resolved_model_route: None,
             resolved_runtime_catalog: None,
             retained_route_preparations: HashMap::new(),
@@ -1563,6 +1575,7 @@ impl Agent {
         if let Some(identity) = &mut self.fake_identity {
             identity.installation_id = self.fake_installation_id.clone();
         }
+        self.clear_fake_context_cache();
     }
 
     pub(crate) fn set_fake_client(
@@ -1585,8 +1598,16 @@ impl Agent {
             }
         }
         self.fake_client = client;
-        self.fake_identity =
-            client.map(|_| crate::fake::CodexIdentity::new(self.fake_installation_id.clone()));
+        // A declared installation id wins over the seed value, so enabling the
+        // fake mid-session picks up `[fake]` as well.
+        let installation_id = self
+            .fake_config
+            .identity
+            .installation_id
+            .clone()
+            .unwrap_or_else(|| self.fake_installation_id.clone());
+        self.fake_identity = client.map(|_| crate::fake::CodexIdentity::new(installation_id));
+        self.clear_fake_context_cache();
         Ok(())
     }
 
@@ -1594,18 +1615,50 @@ impl Agent {
         self.fake_client
     }
 
+    /// Installs the declared `[fake]` values. Called at startup and on
+    /// configuration reload; identity stays frozen for the session while these
+    /// values are re-resolved on every turn.
+    pub(crate) fn set_fake_config(&mut self, config: crate::config::FakeConfig) {
+        self.fake_config = config;
+        self.clear_fake_context_cache();
+    }
+
+    pub(crate) fn fake_config(&self) -> &crate::config::FakeConfig {
+        &self.fake_config
+    }
+
+    /// Returns this turn's resolved fake context, computing it at most once.
     pub(crate) fn fake_turn_context(
         &self,
         profile: crate::fake::FakeClient,
     ) -> Option<crate::fake::CodexRequestContext> {
-        (self.fake_client == Some(crate::fake::FakeClient::Auto)
-            || self.fake_client == Some(profile))
-        .then(|| {
-            self.fake_identity
-                .as_ref()
-                .map(|identity| identity.turn_context())
-        })
-        .flatten()
+        if self.fake_client != Some(crate::fake::FakeClient::Auto)
+            && self.fake_client != Some(profile)
+        {
+            return None;
+        }
+        let identity = self.fake_identity.as_ref()?;
+        let turn_id = self.turn.turn_id;
+        let mut cache = self
+            .fake_context_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_turn_id, context)) = cache.as_ref()
+            && *cached_turn_id == turn_id
+        {
+            return Some(context.clone());
+        }
+        let context = identity.turn_context(&self.fake_config, None);
+        *cache = Some((turn_id, context.clone()));
+        Some(context)
+    }
+
+    fn clear_fake_context_cache(&self) {
+        let mut cache = self
+            .fake_context_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cache = None;
     }
 
     pub fn fast_mode(&self) -> Option<&Arc<crate::fast_mode::FastMode>> {
@@ -2002,7 +2055,7 @@ impl Agent {
             None,
             effective_input_budget_tokens(model.clone(), &tools),
         );
-        let runtime_message = runtime_context_message();
+        let runtime_message = runtime_context_message(fake_codex_context(self).as_ref());
         let skill_message = self.skill_prelude_message();
         let mut prelude = self.prelude.clone();
         prelude.push(runtime_message);
@@ -2952,7 +3005,9 @@ impl Agent {
             fast_mode: None,
             fake_client: None,
             fake_installation_id: self.fake_installation_id.clone(),
+            fake_config: self.fake_config.clone(),
             fake_identity: None,
+            fake_context_cache: std::sync::Mutex::new(None),
             resolved_model_route: self.resolved_model_route.clone(),
             resolved_runtime_catalog: self.resolved_runtime_catalog.clone(),
             retained_route_preparations: self.retained_route_preparations.clone(),
@@ -3723,7 +3778,7 @@ impl Agent {
 
         let mut turn_prelude = self.prelude.clone();
         self.append_model_strategy_prelude(&mut turn_prelude);
-        turn_prelude.push(runtime_context_message());
+        turn_prelude.push(runtime_context_message(fake_codex_context(self).as_ref()));
         if let Some(message) = self.skill_prelude_message() {
             turn_prelude.push(message);
         }
@@ -5432,8 +5487,22 @@ fn default_agent_prelude() -> Vec<PromptMessage> {
     vec![PromptMessage::system(DEFAULT_AGENT_PRELUDE)]
 }
 
-fn runtime_context_message() -> PromptMessage {
-    runtime_context_message_from_parts(&current_date_label(), &timezone_label())
+/// Resolves the Codex-shaped context when the Codex profile is active for the
+/// current protocol. The Anthropic profile keeps its native runtime context.
+fn fake_codex_context(agent: &Agent) -> Option<crate::fake::CodexRequestContext> {
+    (agent.active_protocol() == ApiProtocol::Responses)
+        .then(|| agent.fake_turn_context(crate::fake::FakeClient::Codex))
+        .flatten()
+}
+
+fn runtime_context_message(fake: Option<&crate::fake::CodexRequestContext>) -> PromptMessage {
+    match fake {
+        Some(context) => PromptMessage::developer_with_origin(
+            context.environment_context_text(),
+            PromptMessageOrigin::RuntimeClock,
+        ),
+        None => runtime_context_message_from_parts(&current_date_label(), &timezone_label()),
+    }
 }
 
 fn runtime_context_message_from_parts(date: &str, timezone: &str) -> PromptMessage {

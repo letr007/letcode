@@ -199,6 +199,7 @@ where
         max_iterations: agent.max_iterations.unwrap_or(usize::MAX),
         max_tool_calls: agent.max_tool_calls,
     };
+    let responses_websocket = should_use_responses_websocket(&route);
     let fake_decorator = agent.fake_client().and_then(|client| {
         let profile = match route.protocol_id.as_str() {
             "responses" => crate::fake::FakeClient::Codex,
@@ -210,11 +211,12 @@ where
                 client,
                 &route.protocol_id,
                 context,
+                responses_websocket,
             )
             .ok()
         })
     });
-    let ws_transport = if should_use_responses_websocket(&route) {
+    let ws_transport = if responses_websocket {
         let transport =
             std::sync::Arc::new(crate::model_runtime::runtime::TurnLocalResponsesTransport::new());
         Some(transport)

@@ -8,6 +8,9 @@ use std::collections::BTreeSet;
 pub struct FakeRequestDecorator {
     client: FakeClient,
     context: CodexRequestContext,
+    /// The WebSocket transport negotiates its protocol version with a beta
+    /// header the HTTP transport does not send.
+    responses_websocket: bool,
 }
 
 impl FakeRequestDecorator {
@@ -15,6 +18,7 @@ impl FakeRequestDecorator {
         client: FakeClient,
         protocol_id: &ProtocolId,
         context: CodexRequestContext,
+        responses_websocket: bool,
     ) -> Result<Self, ModelFailure> {
         if !client.supports_protocol_id(protocol_id) {
             return Err(
@@ -22,7 +26,11 @@ impl FakeRequestDecorator {
                     .with_code("fake_protocol_mismatch"),
             );
         }
-        Ok(Self { client, context })
+        Ok(Self {
+            client,
+            context,
+            responses_websocket,
+        })
     }
 
     /// Decorate adapter-prepared wire data without wrapping or replacing the
@@ -51,7 +59,14 @@ impl FakeRequestDecorator {
                         .with_code("fake_request_serialization")
                         .with_detail(error.to_string())
                 })?;
-                self.merge_headers(&mut request, self.context.headers())?;
+                let mut headers = self.context.headers();
+                if self.responses_websocket {
+                    headers.push((
+                        "openai-beta".into(),
+                        crate::fake::CODEX_RESPONSES_WEBSOCKET_BETA.to_string(),
+                    ));
+                }
+                self.merge_headers(&mut request, headers)?;
             }
             "anthropic" => {
                 self.merge_headers(&mut request, self.context.anthropic_headers())?;
@@ -129,10 +144,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_decorator_changes_typed_request_metadata_without_leaking_local_state() {
+    fn codex_decorator_carries_declared_metadata_without_credentials() {
         let protocol = ProtocolId::new("responses").unwrap();
-        let context = CodexIdentity::new("fake-installation").turn_context();
-        let decorator = FakeRequestDecorator::new(FakeClient::Codex, &protocol, context).unwrap();
+        let context = CodexIdentity::new("fake-installation")
+            .turn_context(&crate::config::FakeConfig::default(), None);
+        let decorator =
+            FakeRequestDecorator::new(FakeClient::Codex, &protocol, context, false).unwrap();
         let decorated = decorator
             .decorate(
                 &protocol,
@@ -174,17 +191,25 @@ mod tests {
                 .cloned()
                 .collect::<String>()
         );
-        assert!(!wire.contains("/Users/"));
         assert!(!wire.contains("authorization"));
         assert!(!wire.contains("api-key"));
+        // The turn metadata is a compatibility projection of the declared
+        // identity, not a second source of truth.
+        assert!(
+            decorated
+                .protocol_headers
+                .values()
+                .any(|value| value.contains("fake-installation"))
+        );
     }
 
     #[test]
     fn anthropic_decorator_preserves_native_body_and_reserved_headers() {
         let protocol = ProtocolId::new("anthropic").unwrap();
-        let context = CodexIdentity::new("fake-installation").turn_context();
+        let context = CodexIdentity::new("fake-installation")
+            .turn_context(&crate::config::FakeConfig::default(), None);
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, context).unwrap();
+            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, context, false).unwrap();
         let original = serde_json::json!({
             "model":"claude",
             "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
@@ -207,9 +232,38 @@ mod tests {
 
     #[test]
     fn decorator_rejects_incompatible_protocols() {
-        let context = CodexIdentity::new("fake-installation").turn_context();
+        let context = CodexIdentity::new("fake-installation")
+            .turn_context(&crate::config::FakeConfig::default(), None);
         let completions = ProtocolId::new("completions").unwrap();
-        assert!(FakeRequestDecorator::new(FakeClient::Auto, &completions, context).is_err());
+        assert!(FakeRequestDecorator::new(FakeClient::Auto, &completions, context, false).is_err());
+    }
+
+    #[test]
+    fn only_websocket_responses_requests_carry_the_beta_header() {
+        let protocol = ProtocolId::new("responses").unwrap();
+        let context = CodexIdentity::new("fake-installation")
+            .turn_context(&crate::config::FakeConfig::default(), None);
+        let body = serde_json::json!({
+            "model": "gpt",
+            "instructions": "system",
+            "input": [{"type":"message"}],
+            "tools": []
+        });
+
+        let http = FakeRequestDecorator::new(FakeClient::Codex, &protocol, context.clone(), false)
+            .unwrap()
+            .decorate(&protocol, request("responses", body.clone()))
+            .unwrap();
+        assert!(!http.protocol_headers.contains_key("openai-beta"));
+
+        let websocket = FakeRequestDecorator::new(FakeClient::Codex, &protocol, context, true)
+            .unwrap()
+            .decorate(&protocol, request("responses", body))
+            .unwrap();
+        assert_eq!(
+            websocket.protocol_headers["openai-beta"],
+            crate::fake::CODEX_RESPONSES_WEBSOCKET_BETA
+        );
     }
 
     struct TerminalDecoder;

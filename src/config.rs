@@ -61,6 +61,43 @@ const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
+/// Mirrors the Codex turn-metadata extension limits so declared extra keys
+/// cannot exceed what a real client would send.
+const MAX_FAKE_EXTRA_ENTRIES: usize = 16;
+const MAX_FAKE_EXTRA_KEY_BYTES: usize = 64;
+const MAX_FAKE_EXTRA_VALUE_BYTES: usize = 128;
+/// Keys the turn metadata owns. A declared `[fake.extra]` entry may not shadow
+/// them, mirroring the reserved-key rule the upstream metadata shape applies.
+const RESERVED_FAKE_EXTRA_KEYS: &[&str] = &[
+    "installation_id",
+    "x-codex-installation-id",
+    "session_id",
+    "thread_id",
+    "agent_name",
+    "turn_id",
+    "window_id",
+    "x-codex-window-id",
+    "x-codex-turn-metadata",
+    "x-codex-parent-thread-id",
+    "x-openai-subagent",
+    "request_kind",
+    "root_turn_id",
+    "parent_turn_id",
+    "parent_thread_id",
+    "forked_from_thread_id",
+    "subagent_kind",
+    "thread_source",
+    "sandbox",
+    "sandbox_mode",
+    "auto_review_enabled",
+    "node_repl_auto_review_required",
+    "node_repl_disabled",
+    "workspaces",
+    "turn_started_at_unix_ms",
+    "tool_namespaces_info",
+    "code_mode_tool_names",
+    "compaction",
+];
 const MAX_RETRY_ATTEMPTS: usize = 9_000;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
 mod persistence;
@@ -84,6 +121,7 @@ pub struct AppConfig {
     pub mcp: IndexMap<String, McpServerConfig>,
     pub providers: IndexMap<String, ProviderConfig>,
     pub runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
+    pub fake: FakeConfig,
 }
 
 impl AppConfig {
@@ -193,6 +231,7 @@ impl AppConfig {
             mode: raw.permissions.unwrap_or_default().mode.unwrap_or_default(),
         };
         let tools = build_tools_config(raw.tools.unwrap_or_default())?;
+        let fake = build_fake_config(raw.fake.unwrap_or_default())?;
         let agents =
             build_agents_config(raw.agents.unwrap_or_default(), &active_provider, &providers)?;
         let mcp = raw
@@ -213,6 +252,7 @@ impl AppConfig {
             mcp,
             providers,
             runtime_catalog: resolved_catalog,
+            fake,
         })
     }
 
@@ -410,6 +450,62 @@ pub struct PermissionsConfig {
     pub mode: PermissionMode,
 }
 
+/// Declarative values used when the session-level `/fake` switch is on.
+///
+/// Every field is optional. Absent values resolve in [`crate::fake`] rather
+/// than here: outward-facing attributes (OS, architecture, terminal, working
+/// directory) come from the real host, identity values are generated, and
+/// attributes letcode has no equivalent for fall back to Codex-typical values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeConfig {
+    pub identity: FakeIdentityConfig,
+    pub clock: FakeClockConfig,
+    pub client: FakeClientProfileConfig,
+    pub environment: FakeEnvironmentConfig,
+    pub extra: IndexMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeIdentityConfig {
+    pub installation_id: Option<String>,
+    pub agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeClockConfig {
+    /// IANA zone name (for example `Asia/Shanghai`). When absent the real
+    /// host zone is used.
+    pub timezone: Option<String>,
+    /// Explicit `YYYY-MM-DD` override. When absent the date is derived from
+    /// the real clock in the declared zone.
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeClientProfileConfig {
+    pub version: Option<String>,
+    pub originator: Option<String>,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub terminal: Option<String>,
+    pub beta_features: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeEnvironmentConfig {
+    pub sandbox: Option<String>,
+    pub sandbox_mode: Option<String>,
+    pub auto_review_enabled: Option<bool>,
+    pub node_repl_auto_review_required: Option<bool>,
+    pub node_repl_disabled: Option<bool>,
+    pub cwd: Option<String>,
+    pub workspace: Option<String>,
+    pub shell: Option<String>,
+    pub git_commit_hash: Option<String>,
+    pub git_remote_url: Option<String>,
+    pub git_has_changes: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolsConfig {
     pub parallelism: IndexMap<String, crate::tool::ToolParallelism>,
@@ -546,6 +642,60 @@ struct RawAppConfig {
     mcp: IndexMap<String, RawMcpServerConfig>,
     #[serde(default)]
     providers: IndexMap<String, RawProviderConfig>,
+    #[serde(default)]
+    fake: Option<RawFakeConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFakeConfig {
+    identity: Option<RawFakeIdentityConfig>,
+    clock: Option<RawFakeClockConfig>,
+    client: Option<RawFakeClientConfig>,
+    environment: Option<RawFakeEnvironmentConfig>,
+    #[serde(default)]
+    extra: IndexMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFakeIdentityConfig {
+    installation_id: Option<String>,
+    agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFakeClockConfig {
+    timezone: Option<String>,
+    date: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFakeClientConfig {
+    version: Option<String>,
+    originator: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    terminal: Option<String>,
+    beta_features: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFakeEnvironmentConfig {
+    sandbox: Option<String>,
+    sandbox_mode: Option<String>,
+    auto_review_enabled: Option<bool>,
+    node_repl_auto_review_required: Option<bool>,
+    node_repl_disabled: Option<bool>,
+    cwd: Option<String>,
+    workspace: Option<String>,
+    shell: Option<String>,
+    git_commit_hash: Option<String>,
+    git_remote_url: Option<String>,
+    git_has_changes: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -957,6 +1107,92 @@ fn build_tools_config(raw: RawToolsConfig) -> Result<ToolsConfig> {
         })
         .collect::<Result<IndexMap<_, _>>>()?;
     Ok(ToolsConfig { parallelism })
+}
+
+fn build_fake_config(raw: RawFakeConfig) -> Result<FakeConfig> {
+    let identity = raw.identity.unwrap_or_default();
+    let clock = raw.clock.unwrap_or_default();
+    let client = raw.client.unwrap_or_default();
+    let environment = raw.environment.unwrap_or_default();
+
+    Ok(FakeConfig {
+        identity: FakeIdentityConfig {
+            installation_id: optional_non_empty(
+                "fake.identity.installation_id",
+                identity.installation_id,
+            )?,
+            agent_name: optional_non_empty("fake.identity.agent_name", identity.agent_name)?,
+        },
+        clock: FakeClockConfig {
+            timezone: optional_non_empty("fake.clock.timezone", clock.timezone)?,
+            date: optional_non_empty("fake.clock.date", clock.date)?,
+        },
+        client: FakeClientProfileConfig {
+            version: optional_non_empty("fake.client.version", client.version)?,
+            originator: optional_non_empty("fake.client.originator", client.originator)?,
+            os: optional_non_empty("fake.client.os", client.os)?,
+            arch: optional_non_empty("fake.client.arch", client.arch)?,
+            terminal: optional_non_empty("fake.client.terminal", client.terminal)?,
+            beta_features: client.beta_features,
+        },
+        environment: FakeEnvironmentConfig {
+            sandbox: optional_non_empty("fake.environment.sandbox", environment.sandbox)?,
+            sandbox_mode: optional_non_empty(
+                "fake.environment.sandbox_mode",
+                environment.sandbox_mode,
+            )?,
+            auto_review_enabled: environment.auto_review_enabled,
+            node_repl_auto_review_required: environment.node_repl_auto_review_required,
+            node_repl_disabled: environment.node_repl_disabled,
+            cwd: optional_non_empty("fake.environment.cwd", environment.cwd)?,
+            workspace: optional_non_empty("fake.environment.workspace", environment.workspace)?,
+            shell: optional_non_empty("fake.environment.shell", environment.shell)?,
+            git_commit_hash: optional_non_empty(
+                "fake.environment.git_commit_hash",
+                environment.git_commit_hash,
+            )?,
+            git_remote_url: optional_non_empty(
+                "fake.environment.git_remote_url",
+                environment.git_remote_url,
+            )?,
+            git_has_changes: environment.git_has_changes,
+        },
+        extra: build_fake_extra(raw.extra)?,
+    })
+}
+
+fn build_fake_extra(extra: IndexMap<String, String>) -> Result<IndexMap<String, String>> {
+    if extra.len() > MAX_FAKE_EXTRA_ENTRIES {
+        bail!("fake.extra may contain at most {MAX_FAKE_EXTRA_ENTRIES} entries");
+    }
+    for (key, value) in &extra {
+        if key.len() > MAX_FAKE_EXTRA_KEY_BYTES || !valid_fake_extra_key(key) {
+            bail!("fake.extra keys must be short ASCII identifiers: '{key}'");
+        }
+        if value.len() > MAX_FAKE_EXTRA_VALUE_BYTES {
+            bail!(
+                "fake.extra values may contain at most {MAX_FAKE_EXTRA_VALUE_BYTES} bytes: '{key}'"
+            );
+        }
+        if RESERVED_FAKE_EXTRA_KEYS.contains(&key.as_str()) {
+            bail!("fake.extra may not declare the reserved key '{key}'");
+        }
+    }
+    Ok(extra)
+}
+
+fn valid_fake_extra_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// A declared but blank string is treated as absent, so an empty value is never
+/// emitted on the wire by accident.
+fn optional_non_empty(label: &str, value: Option<String>) -> Result<Option<String>> {
+    value
+        .map(|value| required_non_empty(label, value))
+        .transpose()
 }
 
 fn build_mcp_server_config(
@@ -1799,6 +2035,135 @@ model_override = "wire-model"
         drop(second);
         drop(lock);
         acquire_config_lock(&target).unwrap();
+    }
+
+    #[test]
+    fn fake_section_is_absent_by_default() {
+        let loaded = AppConfig::load_from_path(write_temp_config(config("openai", "model", "")))
+            .expect("config should load");
+        assert_eq!(loaded.fake, FakeConfig::default());
+    }
+
+    #[test]
+    fn fake_section_loads_declared_values() {
+        let loaded = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            r#"[fake.identity]
+installation_id = "declared-installation"
+agent_name = "declared-agent"
+[fake.clock]
+timezone = "Asia/Shanghai"
+date = "2026-01-02"
+[fake.client]
+version = "1.2.3"
+originator = "codex_cli_rs"
+beta_features = ["one", "two"]
+[fake.environment]
+sandbox_mode = "read-only"
+auto_review_enabled = true
+[fake.extra]
+custom_key = "custom value"
+"#,
+        )))
+        .expect("config should load");
+
+        assert_eq!(
+            loaded.fake.identity.installation_id.as_deref(),
+            Some("declared-installation")
+        );
+        assert_eq!(
+            loaded.fake.identity.agent_name.as_deref(),
+            Some("declared-agent")
+        );
+        assert_eq!(loaded.fake.clock.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(loaded.fake.clock.date.as_deref(), Some("2026-01-02"));
+        assert_eq!(loaded.fake.client.version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            loaded.fake.client.beta_features.as_deref(),
+            Some(["one".to_string(), "two".to_string()].as_slice())
+        );
+        assert_eq!(
+            loaded.fake.environment.sandbox_mode.as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(loaded.fake.environment.auto_review_enabled, Some(true));
+        assert_eq!(
+            loaded.fake.extra.get("custom_key").map(String::as_str),
+            Some("custom value")
+        );
+    }
+
+    #[test]
+    fn fake_section_rejects_unknown_keys() {
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[fake]\nunknown_key = 1\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("failed to parse config file"));
+    }
+
+    #[test]
+    fn fake_rejects_blank_declared_values() {
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[fake.clock]\ntimezone = \"   \"\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("fake.clock.timezone cannot be empty"));
+    }
+
+    #[test]
+    fn fake_extra_rejects_reserved_keys() {
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[fake.extra]\nsession_id = \"other\"\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("reserved key 'session_id'"));
+
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[fake.extra]\nworkspaces = \"text\"\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("reserved key 'workspaces'"));
+    }
+
+    #[test]
+    fn fake_extra_enforces_upstream_extension_limits() {
+        let too_many = (0..17)
+            .map(|index| format!("key{index} = \"value\"\n"))
+            .collect::<String>();
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            &format!("[fake.extra]\n{too_many}"),
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("at most 16 entries"));
+
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[fake.extra]\n\"1bad\" = \"value\"\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("must be short ASCII identifiers"));
+
+        let long = "v".repeat(129);
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            &format!("[fake.extra]\nkey = \"{long}\"\n"),
+        )))
+        .expect_err("config should be rejected");
+        assert!(format!("{error:#}").contains("at most 128 bytes"));
     }
 
     #[test]

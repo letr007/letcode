@@ -277,7 +277,8 @@ pub(crate) fn apply_config_reload(
     let settings_unchanged = agent.compaction_config() == &config.global.compaction
         && agent.tool_timeout_secs() == config.global.tool_timeout_secs
         && agent.retry_config() == &next_agent_retry
-        && agent.tool_parallelism_overrides() == &next_parallelism;
+        && agent.tool_parallelism_overrides() == &next_parallelism
+        && agent.fake_config() == &config.fake;
     let current_route_runtime_unchanged = route_runtime_fingerprint_eq(
         runtime_catalog.fingerprint(),
         &next_runtime_fingerprint,
@@ -328,6 +329,9 @@ pub(crate) fn apply_config_reload(
     // Intentionally perform the only remaining fallible mutation first; all later
     // agent mutations are infallible for these already validated inputs.
     agent.set_tool_parallelism(next_parallelism)?;
+    if agent.fake_config() != &config.fake {
+        agent.set_fake_config(config.fake.clone());
+    }
     if agent.compaction_config() != &config.global.compaction {
         agent.set_compaction_config(config.global.compaction.clone());
     }

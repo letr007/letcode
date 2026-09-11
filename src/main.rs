@@ -181,6 +181,9 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| config.global.retry.clone()),
     );
     agent.set_permission_mode(config.permissions.mode);
+    // Declared `[fake]` values are installed whether or not the fake is enabled
+    // at startup, so `/fake` uses them whenever it is switched on.
+    agent.set_fake_config(config.fake.clone());
     let primary_route_factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
         config.providers.clone(),
         config.global.retry.clone(),
@@ -190,10 +193,20 @@ async fn main() -> Result<()> {
     agent.apply_prepared_route(prepared_active_route);
     if let Some(fake_client) = startup_fake_client {
         if fake_client.supports_protocol(agent.active_protocol()) {
-            let installation_id = startup_preferences.ensure_fake_installation_id();
-            startup_preferences
-                .save_to_dir(&config.config_dir)
-                .map_err(|error| anyhow!("failed to persist fake installation id: {error}"))?;
+            // `letcode.toml` is the authoritative source; the preferences file is
+            // only the persistence slot for a generated id.
+            let installation_id = match config.fake.identity.installation_id.clone() {
+                Some(declared) => declared,
+                None => {
+                    let generated = startup_preferences.ensure_fake_installation_id();
+                    startup_preferences
+                        .save_to_dir(&config.config_dir)
+                        .map_err(|error| {
+                            anyhow!("failed to persist fake installation id: {error}")
+                        })?;
+                    generated
+                }
+            };
             agent.set_fake_installation_id(installation_id);
             agent.set_fake_client(Some(fake_client))?;
         } else {
