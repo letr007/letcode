@@ -1701,6 +1701,35 @@ fn double_escape_confirms_running_turn_interrupt() {
 }
 
 #[test]
+fn ctrl_c_arms_interrupt_confirmation_while_turn_is_running() {
+    let mut runtime = runtime();
+    runtime.state.phase = AppPhase::Running;
+
+    let first = runtime
+        .handle_input_action(InputAction::Quit)
+        .expect("first ctrl-c hint succeeds");
+    assert_eq!(first, None);
+    assert!(!runtime.state().quit_requested);
+
+    let second = runtime
+        .handle_input_action(InputAction::Quit)
+        .expect("second ctrl-c returns interrupt");
+    assert_eq!(second, Some(RuntimeCommand::Interrupt));
+    assert!(!runtime.state().quit_requested);
+}
+
+#[test]
+fn ctrl_c_quits_once_the_session_is_idle() {
+    let mut runtime = runtime();
+
+    let command = runtime
+        .handle_input_action(InputAction::Quit)
+        .expect("idle ctrl-c quits");
+    assert_eq!(command, None);
+    assert!(runtime.state().quit_requested);
+}
+
+#[test]
 fn interrupt_confirmation_survives_tick() {
     let mut runtime = runtime();
     runtime.state.phase = AppPhase::Running;

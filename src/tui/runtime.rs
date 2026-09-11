@@ -1757,10 +1757,13 @@ impl TuiRuntime {
         if !matches!(
             action,
             InputAction::Interrupt
+                | InputAction::Quit
                 | InputAction::Tick
                 | InputAction::ChildPrefix
                 | InputAction::ToggleSidebar
         ) {
+            // Ctrl+C shares the interrupt confirmation while work is in flight, so the
+            // pending confirmation must survive the second press.
             self.interrupt_confirmation_pending = false;
         }
 
@@ -2217,6 +2220,12 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Quit => {
+                // A running turn keeps control: Ctrl+C stops work in flight (same
+                // confirmation as Esc) instead of ending the session and cancelling
+                // its subagents. It quits directly only once the session is idle.
+                if self.has_active_or_pending_session_turn() {
+                    return self.handle_interrupt();
+                }
                 let _ = self.cancel_pending_question(
                     "question cancelled because the application is quitting",
                 );
@@ -2589,8 +2598,10 @@ impl TuiRuntime {
 
         if !self.interrupt_confirmation_pending {
             self.interrupt_confirmation_pending = true;
-            self.state
-                .show_toast(self.state.t("runtime.press_esc_again"), ToastKind::Info);
+            self.state.show_toast(
+                self.state.t("runtime.press_again_to_interrupt"),
+                ToastKind::Info,
+            );
             return Ok(None);
         }
 
