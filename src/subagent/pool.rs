@@ -519,7 +519,15 @@ impl SubagentPool {
         sessions_dir: impl AsRef<Path>,
         parent_records: &[crate::transcript::TranscriptRecord],
     ) -> Vec<ChildSessionSummary> {
-        let mut children = list_child_sessions_for_parent(sessions_dir, parent_records);
+        Self::child_sessions_from_summaries(list_child_sessions_for_parent(
+            sessions_dir,
+            parent_records,
+        ))
+    }
+
+    pub(crate) fn child_sessions_from_summaries(
+        mut children: Vec<ChildSessionSummary>,
+    ) -> Vec<ChildSessionSummary> {
         // Synthesize stable ordinals for legacy rows (pool_ordinal == 0).
         let mut next = children
             .iter()

@@ -12,8 +12,7 @@ use anyhow::Result;
 
 use crate::agent::Agent;
 use crate::session::child_view::{
-    current_session_records, project_child_session_view, project_parent_session_view,
-    sessions_dir_from_transcript,
+    project_child_session_view_from_file, project_parent_session_view, sessions_dir_from_transcript,
 };
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
@@ -698,11 +697,14 @@ impl SessionCoordinator {
             None => sessions_dir_from_transcript(transcript),
         };
         match dir.and_then(|dir| {
-            let (parent_session_id, parent_records) = current_session_records(transcript)?;
-            project_child_session_view(
+            let parent_session_id = transcript
+                .lock()
+                .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
+                .session_id()
+                .to_string();
+            project_child_session_view_from_file(
                 dir,
                 parent_session_id,
-                &parent_records,
                 navigation,
                 anchor_child_session_id,
             )

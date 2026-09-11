@@ -31,8 +31,10 @@ pub(crate) use context_tree::replay_context_tree;
 #[path = "transcript_projection/job_board.rs"]
 mod job_board;
 
-pub(crate) use job_board::project_child_session_summaries;
 pub(crate) use job_board::project_job_board;
+pub(crate) use job_board::{
+    project_child_session_summaries, project_child_session_summaries_from_file,
+};
 
 #[path = "transcript_projection/branch.rs"]
 mod branch;

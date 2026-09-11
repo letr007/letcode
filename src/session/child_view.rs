@@ -15,9 +15,11 @@ use crate::session::restore::{
 };
 use crate::subagent::SubagentPool;
 use crate::transcript::transcript_projection::project_runtime_restore_snapshot;
-use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
+use crate::transcript::transcript_projection::{
+    RuntimeRestoreSnapshot, SessionContextCursor, project_child_session_summaries_from_file,
+};
 use crate::transcript::{
-    ChildSessionSummary, TranscriptRecord, TranscriptRecorder,
+    ChildSessionSummary, TranscriptRecord, TranscriptRecorder, child_sessions_dir,
     read_child_session_records_allow_partial_tail, read_records,
 };
 
@@ -149,6 +151,44 @@ pub fn project_child_session_view(
     let sessions_dir = sessions_dir.as_ref();
     let parent_session_id = parent_session_id.into();
     let children = list_child_sessions_for_view(sessions_dir, parent_records);
+    project_child_session_view_with_children(
+        sessions_dir,
+        parent_session_id,
+        children,
+        navigation,
+        anchor_child_session_id,
+    )
+}
+
+/// Project a child view while discovering parent children from a streaming scan.
+pub fn project_child_session_view_from_file(
+    sessions_dir: impl AsRef<Path>,
+    parent_session_id: impl Into<String>,
+    navigation: ChildNavigation,
+    anchor_child_session_id: Option<&str>,
+) -> Result<Option<ChildViewProjection>> {
+    let sessions_dir = sessions_dir.as_ref();
+    let parent_session_id = parent_session_id.into();
+    let parent_path = sessions_dir.join(format!("{parent_session_id}.jsonl"));
+    let children =
+        project_child_session_summaries_from_file(&child_sessions_dir(sessions_dir), &parent_path)?;
+    let children = SubagentPool::child_sessions_from_summaries(children);
+    project_child_session_view_with_children(
+        sessions_dir,
+        parent_session_id,
+        children,
+        navigation,
+        anchor_child_session_id,
+    )
+}
+
+fn project_child_session_view_with_children(
+    sessions_dir: &Path,
+    parent_session_id: String,
+    children: Vec<ChildSessionSummary>,
+    navigation: ChildNavigation,
+    anchor_child_session_id: Option<&str>,
+) -> Result<Option<ChildViewProjection>> {
     let Some(index) = select_child_navigation_index(&children, navigation, anchor_child_session_id)
     else {
         return Ok(None);
