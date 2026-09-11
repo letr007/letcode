@@ -579,7 +579,6 @@ fn fit_compaction_cut_to_summary_budget(
         return Ok(None);
     }
 
-    let workflow_facts = render_protected_workflow_facts(agent);
     let (serialized_history, item_ends) = render_compaction_history_with_item_ends(&planned.prefix);
     let prelude = [PromptMessage::system(CONTEXT_COMPACTION_PRELUDE)];
     let mut low = 0usize;
@@ -600,7 +599,6 @@ fn fit_compaction_cut_to_summary_budget(
             planned.previous_summary.as_deref(),
             serialized_prefix,
             split_active_turn,
-            &workflow_facts,
         );
         let Some(route) = agent.resolved_model_route() else {
             return Err(anyhow::anyhow!(
@@ -658,11 +656,10 @@ async fn generate_context_summary(
 ) -> Result<String>
 where
 {
-    let prompt = render_compaction_prompt_with_workflow_facts(
+    let prompt = render_compaction_prompt_with_serialized_history(
         previous_summary,
-        head_for_summary,
+        &render_compaction_history(head_for_summary),
         split_active_turn,
-        &render_protected_workflow_facts(agent),
     );
     // Narrow oneshot stream: no nested Agent turn, no tools, reasoning forced off.
     // Preview deltas and retry resets share one queue so a retry reset is
@@ -739,86 +736,17 @@ where
 }
 
 #[cfg(test)]
-fn render_protected_workflow_facts(agent: &Agent) -> String {
-    let mut facts = Vec::new();
-    let unfinished_todos = agent
-        .runtime_snapshot
-        .workflow
-        .todos
-        .iter()
-        .filter(|todo| todo.status.is_unfinished())
-        .map(|todo| format!("- todo {}: {} ({:?})", todo.id, todo.content, todo.status))
-        .collect::<Vec<_>>();
-    if !unfinished_todos.is_empty() {
-        facts.push(format!("待办：\n{}", unfinished_todos.join("\n")));
-    }
-
-    if agent.turn.counters.validation_effects > 0 {
-        facts.push(format!(
-            "验证：已记录 {} 项，其中失败 {} 项。",
-            agent.turn.counters.validation_effects, agent.turn.counters.failed_validation_effects
-        ));
-    }
-
-    let decisions = agent
-        .runtime_snapshot
-        .evidence
-        .iter()
-        .filter(|evidence| {
-            matches!(
-                evidence.evidence_kind,
-                crate::evidence::EvidenceKind::Decision
-            )
-        })
-        .map(|evidence| format!("- {}: {}", evidence.title, evidence.summary))
-        .collect::<Vec<_>>();
-    if !decisions.is_empty() {
-        facts.push(format!("已解决问题与专家协调：\n{}", decisions.join("\n")));
-    }
-
-    // Question answers already appear in the bounded history serialization;
-    // do not duplicate them as a separate facts section.
-    facts.join("\n\n")
-}
-
-#[cfg(test)]
-fn render_compaction_prompt_with_workflow_facts(
-    previous_summary: Option<&str>,
-    head_for_summary: &[HistoryItem],
-    split_active_turn: bool,
-    workflow_facts: &str,
-) -> String {
-    render_compaction_prompt_with_serialized_history(
-        previous_summary,
-        &render_compaction_history(head_for_summary),
-        split_active_turn,
-        workflow_facts,
-    )
-}
-
-#[cfg(test)]
 fn render_compaction_prompt_with_serialized_history(
     previous_summary: Option<&str>,
     serialized_history: &str,
     split_active_turn: bool,
-    workflow_facts: &str,
 ) -> String {
     let split_turn_instruction = split_active_turn.then_some(
         "本次是活动回合的前缀压缩：提供的历史（包括用户消息）都会退休并纳入摘要；仅 cut point 之后的原始尾部会被保留。",
     );
-    let facts_block = (!workflow_facts.trim().is_empty()).then(|| {
-        format!(
-            "\n\n受保护工作流事实（必须合并，不得被大工具输出挤出；缺失或无法解析的事实必须明确标为未知）：\n{}",
-            workflow_facts
-        )
-    });
-    let common = format!(
-        "{}{}",
-        facts_block.unwrap_or_default(),
-        split_turn_instruction
-            .map(|instruction| format!("\n\n{instruction}"))
-            .unwrap_or_default(),
-    );
+    let common = split_turn_instruction
+        .map(|instruction| format!("\n\n{instruction}"))
+        .unwrap_or_default();
     match previous_summary {
         Some(previous_summary) => {
             // Preserve the previous checkpoint intact. The canonical one-shot
@@ -1506,19 +1434,6 @@ max_output_tokens = 128
             .expect("budget fitting does not technically fail");
 
         assert!(fitted.is_none());
-    }
-
-    #[test]
-    fn protected_workflow_facts_omit_empty_sections() {
-        let agent = test_agent();
-        assert!(render_protected_workflow_facts(&agent).is_empty());
-        let prompt = render_compaction_prompt_with_workflow_facts(
-            None,
-            &[HistoryItem::user("hi")],
-            false,
-            "",
-        );
-        assert!(!prompt.contains("受保护工作流事实"));
     }
 
     #[test]
