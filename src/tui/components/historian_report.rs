@@ -318,16 +318,19 @@ fn text(doc: &mut Document<Style>, value: &str, style: Style, width: usize) {
         } else {
             Break::SoftWrap
         };
-        doc.push_line(
-            Line {
-                spans: vec![Span::source(
-                    chunk.text.clone(),
-                    style,
-                    SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
-                )],
-            },
-            boundary,
-        );
+        let spans = if chunk.text.is_empty() {
+            // Empty visual lines (for example from a title with a leading or
+            // trailing newline) have no source range. A zero-length source range
+            // is intentionally rejected by Document::validate.
+            Vec::new()
+        } else {
+            vec![Span::source(
+                chunk.text.clone(),
+                style,
+                SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
+            )]
+        };
+        doc.push_line(Line { spans }, boundary);
     }
 }
 
@@ -428,6 +431,21 @@ pub(crate) mod tests {
                 && raw.contains("input_tokens")
                 && raw.contains("Detailed-only")
         );
+    }
+
+    #[test]
+    fn historian_report_handles_empty_visual_chunks_without_invalid_source_ranges() {
+        let mut report = sample_report();
+        report.publication.compartments[0].title = "\nTitle with a blank line\n".into();
+        let doc = render_report(
+            &report,
+            ReportOptions::default(),
+            Theme::dark(),
+            80,
+            &Translator::new(Language::En),
+        );
+
+        assert!(doc.validate());
     }
 
     #[test]
