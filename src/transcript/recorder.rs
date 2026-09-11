@@ -1050,6 +1050,10 @@ impl TranscriptRecorder {
         }))
     }
 
+    pub fn record_historian_exchange(&mut self, exchange: HistorianExchangeEvent) -> Result<()> {
+        self.append(TranscriptEvent::HistorianExchange(exchange))
+    }
+
     pub fn record_turn_started(&mut self, event: TurnStartedEvent) -> Result<()> {
         self.append(TranscriptEvent::TurnStarted(event))
     }
@@ -1778,6 +1782,7 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::InternalContinuation { .. }
             | TranscriptEvent::TurnInterrupted { .. }
             | TranscriptEvent::Evidence { .. }
+            | TranscriptEvent::HistorianExchange(_)
     ) || matches!(event, TranscriptEvent::ContextCompaction(_))
 }
 

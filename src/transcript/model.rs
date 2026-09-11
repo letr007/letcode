@@ -87,6 +87,31 @@ pub enum HistoryNavigationOperation {
     Redo,
 }
 
+/// The request is derived from the parent session, so only its size is recorded
+/// here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorianExchangeEvent {
+    pub run_id: String,
+    pub source_count: usize,
+    /// Serialized size of the history payload handed to the provider. The fixed
+    /// template prelude is not part of this number.
+    pub payload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Characters in the complete response, before any excerpting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_chars: Option<u64>,
+    /// `prepared`, `rejected` or `failed`.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Response text; oversized responses keep their head and tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptEvent {
@@ -124,6 +149,7 @@ pub enum TranscriptEvent {
         status: String,
         summary: String,
     },
+    HistorianExchange(HistorianExchangeEvent),
     ModelChanged {
         previous_model: String,
         new_model: String,

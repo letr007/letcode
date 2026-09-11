@@ -243,6 +243,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::ToolExecutionSummary(_)
             | TranscriptEvent::LogicalCheckpoint(_)
             | TranscriptEvent::Evidence { .. }
+            | TranscriptEvent::HistorianExchange(_)
             | TranscriptEvent::Unknown => {}
         }
     }

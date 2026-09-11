@@ -584,7 +584,7 @@ mod tests {
                 }
                 if attempt==1 { accepted.notify_one(); release.notified().await; }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let output=serde_json::json!({"compartments":[{"start":0,"end":if attempt==0 {4} else {1},"title":"Parser fix","importance":70,"detailed":"Fixed UTF-8 parser offsets","compact":"Parser offset fix","anchor":"UTF-8 parser"}],"facts":[],"unprocessed_from":null}).to_string();
+                let output=serde_json::json!({"compartments":[{"end":if attempt==0 {4} else {1},"title":"Parser fix","importance":70,"detailed":"Fixed UTF-8 parser offsets","compact":"Parser offset fix","anchor":"UTF-8 parser"}],"facts":[]}).to_string();
                 let delta=serde_json::json!({"type":"response.output_text.delta","delta":output});
                 let terminal=serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":200,"output_tokens":60,"total_tokens":260}}});
                 let body=format!("data: {delta}\n\ndata: {terminal}\n\n");
@@ -670,6 +670,16 @@ max_output_tokens=4096
                 _ => None,
             }).unwrap();
             let child_records = crate::transcript::read_child_session_records(directory.path(), child_id).unwrap();
+            let exchange = child_records.iter().find_map(|record| match &record.event {
+                TranscriptEvent::HistorianExchange(exchange) => Some(exchange.clone()),
+                _ => None,
+            }).expect("an accepted publication records the exchange");
+            assert_eq!(exchange.outcome, "prepared");
+            assert_eq!(exchange.source_count, 4);
+            assert!(exchange.payload_bytes > 0);
+            assert_eq!(exchange.input_tokens, Some(200));
+            assert_eq!(exchange.output_tokens, Some(60));
+            assert!(exchange.response.is_none());
             for record in records.iter().chain(&child_records) {
                 match &record.event {
                     TranscriptEvent::SubagentStarted { agent_name, summary, .. } if agent_name == "historian" => {
@@ -1057,6 +1067,7 @@ mod live_source_tests {
     use super::*;
     use crate::transcript::{TranscriptEvent, TranscriptRecorder};
     use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn agent_with_recorder(root: &std::path::Path) -> (Agent, Arc<Mutex<TranscriptRecorder>>) {
         let config = crate::model_runtime::RuntimeConfig::from_toml(
@@ -1165,6 +1176,234 @@ max_output_tokens=128
     }
 
     #[tokio::test]
+    async fn rejected_publication_records_the_historian_exchange() {
+        // Driven to its terminal state by polling, so the test never waits on
+        // wall-clock time.
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let (header_end, length) = loop {
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(at) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
+                        let end = at + 4;
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let publication = serde_json::json!({
+                    "compartments": [{
+                        "end": 0,
+                        "title": "Rejected",
+                        "importance": 95,
+                        "detailed": "not covered",
+                        "compact": "not covered",
+                        "anchor": "rejected"
+                    }],
+                    "facts": []
+                })
+                .to_string();
+                let delta = serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": publication
+                });
+                let terminal = serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "usage": {"input_tokens": 321, "output_tokens": 45, "total_tokens": 366}
+                    }
+                });
+                let body = format!("data: {delta}\n\ndata: {terminal}\n\n");
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let config = crate::model_runtime::RuntimeConfig::from_toml(&format!(
+                r#"active_provider="test"
+[providers.test]
+protocol="responses"
+default_model="test-model"
+[providers.test.auth]
+type="none"
+[providers.test.endpoints]
+base_url="http://{address}"
+[providers.test.retry]
+enabled=false
+max_attempts=1
+max_recovery_attempts=1
+initial_delay_secs=1
+exponential_backoff=false
+backoff_multiplier=1.0
+jitter_secs=0
+[providers.test.models."test-model"]
+[providers.test.models."test-model".capabilities]
+input_images=true
+generation={{max_output_tokens=true}}
+[providers.test.models."test-model".generation]
+max_output_tokens=4096
+"#
+            ))
+            .unwrap()
+            .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+            .unwrap();
+            let route = config.route("test", "test-model").unwrap().clone();
+            let mut agent = Agent::new("test-model", 5, 0);
+            agent.set_model_catalog(std::collections::HashMap::from([(
+                "test-model".into(),
+                ModelRequestMetadata {
+                    context_window: Some(32_768),
+                    max_output_tokens: Some(4096),
+                    ..Default::default()
+                },
+            )]));
+            agent.set_primary_route(crate::config::ModelRoute::new("test", "test-model"));
+            agent.set_resolved_model_route(Some(Arc::new(route)));
+            let directory = tempfile::tempdir().unwrap();
+            let mut recorder = TranscriptRecorder::create(directory.path()).unwrap();
+            recorder.record_session_started("test/test-model").unwrap();
+            recorder
+                .record_user_message_content(UserMessageContent::new("Fix parser", vec![]))
+                .unwrap();
+            recorder
+                .record_assistant_tool_call_batch(
+                    None,
+                    Some("READABLE-REASONING".into()),
+                    None,
+                    vec![HistoryToolCall {
+                        call_id: "read-1".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"parser.rs"}"#.into(),
+                    }],
+                )
+                .unwrap();
+            recorder
+                .record_tool_call_finished(
+                    "read-1",
+                    "fs__read",
+                    true,
+                    crate::tool::ToolResult::ok(
+                        "fs__read",
+                        serde_json::json!({"content":"parser detail"}),
+                    ),
+                )
+                .unwrap();
+            recorder
+                .record_assistant_message("Fixed UTF-8 parser offsets")
+                .unwrap();
+            let recorder = Arc::new(Mutex::new(recorder));
+            let projected = recorder.clone();
+            agent.set_runtime_snapshot_provider(Arc::new(move || {
+                let recorder = projected.lock().unwrap();
+                let records = crate::transcript::read_records(recorder.path())?;
+                Ok(crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                    recorder.session_id().to_string(),
+                    records,
+                    crate::transcript::transcript_projection::SessionContextCursor {
+                        branch_id: None,
+                        leaf_sequence: None,
+                    },
+                    &[],
+                )?
+                .snapshot)
+            }));
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let runtime = Arc::new(crate::session::historian::HistorianRuntime::new(
+                crate::subagent::SubagentPool::new(),
+                directory.path().into(),
+                recorder.clone(),
+                tx,
+            ));
+            agent.historian_runtime = Some(runtime.clone());
+            let prepared = work(&agent, true, None).unwrap().unwrap();
+            let source_count = prepared.source_ids.len();
+            runtime.start(&agent, prepared).unwrap();
+            let session = agent.runtime_snapshot.session_id.clone().unwrap_or_default();
+            let branch = agent.runtime_snapshot.active_context.branch_id.clone();
+            let revision = agent.runtime_snapshot.context_scope_revision;
+            let mut rounds = 0;
+            loop {
+                match runtime.poll(&session, &branch, revision) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => panic!("a rejected publication must not reach the host"),
+                    Err(_) => break,
+                }
+                rounds += 1;
+                assert!(rounds < 100_000, "historian run did not finish");
+                tokio::task::yield_now().await;
+            }
+            let records = crate::transcript::read_records(recorder.lock().unwrap().path()).unwrap();
+            let child_id = records
+                .iter()
+                .find_map(|record| match &record.event {
+                    TranscriptEvent::SubagentStarted {
+                        child_session_id,
+                        agent_name,
+                        ..
+                    } if agent_name == "historian" => Some(child_session_id.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let child_records =
+                crate::transcript::read_child_session_records(directory.path(), &child_id).unwrap();
+            let exchange = child_records
+                .iter()
+                .find_map(|record| match &record.event {
+                    TranscriptEvent::HistorianExchange(exchange) => Some(exchange.clone()),
+                    _ => None,
+                })
+                .expect("a rejected publication records the exchange");
+            assert_eq!(exchange.outcome, "rejected");
+            assert_eq!(exchange.source_count, source_count);
+            assert!(exchange.payload_bytes > 0);
+            assert_eq!(exchange.input_tokens, Some(321));
+            assert_eq!(exchange.output_tokens, Some(45));
+            assert!(
+                exchange
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("episode cut is invalid"),
+                "unexpected rejection reason: {:?}",
+                exchange.error
+            );
+            let response = exchange.response.unwrap_or_default();
+            assert_eq!(
+                exchange.response_chars,
+                Some(response.chars().count() as u64)
+            );
+            assert!(response.contains("\"end\":0"));
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn persisted_sources_prepare_and_apply_while_live_appends_keep_request_identity() {
         let root = tempfile::tempdir().unwrap();
         let (mut agent, recorder) = agent_with_recorder(root.path());
@@ -1223,7 +1462,7 @@ max_output_tokens=128
         assert_eq!(prepared.source_ids.len(), 10);
         assert!(prepared.input.text.contains("unique body first-7"));
         let mut publication = crate::historian::parse_publication(&prepared.id,&prepared.source_ids,&serde_json::json!({
-            "compartments":[{"start":0,"end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"}],
+            "compartments":[{"end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"}],
             "facts":[],"unprocessed_from":null
         }).to_string()).unwrap();
         publication.project_path = Some(prepared.project_path);
@@ -1258,7 +1497,7 @@ max_output_tokens=128
         );
         let second = work(&agent, true, None).unwrap().unwrap();
         let publication = crate::historian::parse_publication(&second.id, &second.source_ids,
-            &serde_json::json!({"compartments":[{"start":0,"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}],"facts":[],"unprocessed_from":null}).to_string()).unwrap();
+            &serde_json::json!({"compartments":[{"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}],"facts":[]}).to_string()).unwrap();
         recorder
             .lock()
             .unwrap()

@@ -1508,7 +1508,7 @@ mod history_pressure_tests {
                     assert_eq!(image_count, usize::from(has_user_image));
                     assert!(!prompt.to_string().contains("data:image/png;base64,"));
                     let count = source_messages.len();
-                    let output = serde_json::json!({"compartments":[{"start":0,"end":count,"title":"Read sources","importance":70,"detailed":"Read source files","compact":"Read sources","anchor":"Sources"}],"facts":[],"unprocessed_from":null}).to_string();
+                    let output = serde_json::json!({"compartments":[{"end":count,"title":"Read sources","importance":70,"detailed":"Read source files","compact":"Read sources","anchor":"Sources"}],"facts":[]}).to_string();
                     let delta = serde_json::json!({"type":"response.output_text.delta","delta":output});
                     let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed"}});
                     let body = format!("data: {delta}\n\ndata: {terminal}\n\n");

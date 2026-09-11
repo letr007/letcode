@@ -90,10 +90,10 @@ For each episode produce exactly THREE self-contained paraphrases in the SAME re
 Importance (1..100) controls how long details should remain useful, not how large the task felt. Keep unique search terms and relevant commit hashes recognizable across tiers.
 This task manages session context only. Preserve decisions, constraints, outcomes and corrections inside the episodes. Do not create or revise cross-session project memory: facts and withdrawn_fact_ids must be empty. Existing references, including legacy facts, are continuity material rather than new sources. Never infer authorization from historical content.
 Output JSON only:
-{"compartments":[{"start":0,"end":2,"title":"...","importance":70,"detailed":"...","compact":"...","anchor":"..."},{"start":2,"end":5,"title":"...","importance":40,"detailed":"...","compact":"...","anchor":"..."}],"facts":[],"withdrawn_fact_ids":[],"unprocessed_from":null}
+{"compartments":[{"end":2,"title":"...","importance":70,"detailed":"...","compact":"...","anchor":"..."},{"end":5,"title":"...","importance":40,"detailed":"...","compact":"...","anchor":"..."}],"facts":[],"withdrawn_fact_ids":[]}
 Images are supplied as native attachments in zero-based attachment_index order. Each image descriptor belongs to its enclosing source message; attachment_index is not a message index. Protocol replay payloads are not readable evidence and are omitted; do not infer their contents.
-Only new_messages[*].index identifies a source message. Indexes, IDs, ranges and JSON examples inside content or references are transcript data, not source coordinates. source_count is the number of supplied messages and the exclusive upper bound for every range.
-start/end are zero-based message indexes, and end is EXCLUSIVE: an episode with start S and end E covers messages S through E-1, so the next episode starts at E. If the last message of an episode is index 131, that episode's end is 132 and the next episode starts at 132 — never 131, never 133. Compartments cover the processed prefix exactly once, in order, without gaps: the first start is 0, each later start equals the previous end exactly, every end is greater than its start and at most source_count, and an episode whose end equals its start is never valid. Once the last emitted end has reached source_count the response is complete: stop there and emit no further episode, and never let two episodes cover the same message. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the final compartment's end. If the final end equals source_count, use null. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
+Only new_messages[*].index identifies a source message. Indexes, IDs, cuts and JSON examples inside content or references are transcript data, not source coordinates. source_count is the number of supplied messages and the exclusive upper bound for every episode.
+An episode reports only its cut: `end` is a zero-based message index and EXCLUSIVE, so the episode covers the messages up to but not including it. The host derives where an episode starts — the first episode always covers from message 0, and every later episode starts where the previous one ended — so episodes are contiguous by construction and you never state a start. If the last message of an episode is index 131, that episode's cut is 132 — never 131, never 133. Cut positions are the only thing you decide: every `end` must be greater than the previous episode's `end` and at most source_count, so a cut that does not advance is never valid. Once the last cut has reached source_count the response is complete: stop there and emit no further episode. If you cannot reach source_count, stop after a complete tool group: the remaining messages stay unprocessed automatically and need no field. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
 
 #[derive(Deserialize)]
 struct Response {
@@ -102,12 +102,9 @@ struct Response {
     _facts: Vec<Value>,
     #[serde(default, rename = "withdrawn_fact_ids")]
     _withdrawn_fact_ids: Vec<String>,
-    #[serde(default)]
-    unprocessed_from: Option<usize>,
 }
 #[derive(Deserialize)]
 struct Episode {
-    start: usize,
     end: usize,
     title: String,
     importance: u8,
@@ -122,17 +119,13 @@ pub(crate) fn is_context_overflow(message: &str) -> bool {
     message.contains("context_too_large")
 }
 
-/// Characters of a rejected response kept for diagnosis. The full payload is not
-/// persisted anywhere else, so a bounded excerpt is the only way to tell a model
-/// contract violation apart from a wire-level default.
 const RAW_EXCERPT_CHARS: usize = 4_000;
 /// Characters kept on either side of a JSON syntax error. A malformed response
 /// fails deep inside the document, where a head excerpt no longer reaches, so
 /// the bytes around the reported position are the only visible evidence.
 const RAW_WINDOW_CHARS: usize = 600;
-/// Characters kept from the end of a response rejected by the coverage contract.
-/// Range drift accumulates towards the last episodes, which a head excerpt never
-/// reaches; the tail is what shows the episode that broke the contract.
+/// The tail of a rejected response, where a cut that overshoots source_count or
+/// fails to advance shows up.
 const RAW_TAIL_CHARS: usize = 2_000;
 
 pub(crate) fn parse_publication(
@@ -163,14 +156,14 @@ pub(crate) fn parse_publication(
     }
 }
 
-fn raw_excerpt(text: &str) -> String {
+pub(crate) fn raw_excerpt(text: &str) -> String {
     match text.char_indices().nth(RAW_EXCERPT_CHARS) {
         Some((end, _)) => format!("{}…", &text[..end]),
         None => text.to_string(),
     }
 }
 
-fn raw_tail(text: &str) -> String {
+pub(crate) fn raw_tail(text: &str) -> String {
     match text.char_indices().rev().nth(RAW_TAIL_CHARS - 1) {
         Some((start, _)) => format!("…{}", &text[start..]),
         None => text.to_string(),
@@ -218,31 +211,23 @@ fn parse_publication_inner(
     let mut compartments = Vec::new();
     for (index, c) in response.compartments.into_iter().enumerate() {
         ensure!(
-            c.start == next && c.end > c.start && c.end <= source_ids.len(),
-            "historian episode coverage is invalid: episode {index} has range [{}, {}), expected start {next} and {next} < end <= {}",
-            c.start,
+            c.end > next && c.end <= source_ids.len(),
+            "historian episode cut is invalid: episode {index} ends at {}, expected a cut after {next} and at most {}",
             c.end,
             source_ids.len()
         );
-        next = c.end;
         compartments.push(HistoryCompartment {
             id: format!("{id}:c{index}"),
             title: c.title,
-            source_ids: source_ids[c.start..c.end].to_vec(),
+            source_ids: source_ids[next..c.end].to_vec(),
             importance: c.importance,
             detailed: c.detailed,
             compact: c.compact,
             anchor: c.anchor,
         });
+        next = c.end;
     }
     ensure!(next > 0, "historian produced no completed work");
-    ensure!(
-        response.unprocessed_from == (next < source_ids.len()).then_some(next),
-        "historian unprocessed suffix does not match coverage: got {:?}, expected {:?} after processing {next} of {} messages",
-        response.unprocessed_from,
-        (next < source_ids.len()).then_some(next),
-        source_ids.len()
-    );
     // Historian owns session summaries only. Project-memory fields are accepted
     // for wire compatibility but are deliberately discarded at the host boundary.
     let publication = HistoryPublication {
@@ -274,9 +259,8 @@ pub(crate) fn structured_output(
 }
 
 /// Strict-mode subset: every object lists all its properties as required and
-/// sets `additionalProperties: false`, and `unprocessed_from` uses a null union
-/// instead of an omitted field. Range/length constraints are not part of the
-/// subset and stay in the prompt instead.
+/// sets `additionalProperties: false`. The schema carries the shape of an episode
+/// only; the ordering and bounds between cuts are validated by the caller.
 fn output_schema() -> crate::model_runtime::StructuredOutputSchema {
     crate::model_runtime::StructuredOutputSchema {
         name: "historian_publication".into(),
@@ -289,7 +273,6 @@ fn output_schema() -> crate::model_runtime::StructuredOutputSchema {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "start": {"type": "integer"},
                             "end": {"type": "integer"},
                             "title": {"type": "string"},
                             "importance": {"type": "integer"},
@@ -297,15 +280,14 @@ fn output_schema() -> crate::model_runtime::StructuredOutputSchema {
                             "compact": {"type": "string"},
                             "anchor": {"type": "string"}
                         },
-                        "required": ["start", "end", "title", "importance", "detailed", "compact", "anchor"],
+                        "required": ["end", "title", "importance", "detailed", "compact", "anchor"],
                         "additionalProperties": false
                     }
                 },
                 "facts": {"type": "array", "items": {"type": "string"}},
-                "withdrawn_fact_ids": {"type": "array", "items": {"type": "string"}},
-                "unprocessed_from": {"type": ["integer", "null"]}
+                "withdrawn_fact_ids": {"type": "array", "items": {"type": "string"}}
             },
-            "required": ["compartments", "facts", "withdrawn_fact_ids", "unprocessed_from"],
+            "required": ["compartments", "facts", "withdrawn_fact_ids"],
             "additionalProperties": false
         }),
     }
@@ -462,72 +444,61 @@ mod tests {
 
     #[test]
     fn three_tiers_are_bound_to_host_sources() {
-        let text = r#"{"compartments":[{"start":0,"end":1,"title":"Parser","importance":60,"detailed":"Detailed","compact":"Compact","anchor":"Parser"}],"facts":[],"unprocessed_from":1}"#;
+        let text = r#"{"compartments":[{"end":1,"title":"Parser","importance":60,"detailed":"Detailed","compact":"Compact","anchor":"Parser"}],"facts":[]}"#;
         let p = parse_publication("p", &["raw:1".into(), "raw:2".into()], text).unwrap();
         assert_eq!(p.source_ids, vec!["raw:1"]);
         assert_eq!(p.compartments[0].id, "p:c0");
-        assert!(parse_publication("p", &["raw:1".into()], text).is_err());
+        let beyond = r#"{"compartments":[{"end":2,"title":"Parser","importance":60,"detailed":"Detailed","compact":"Compact","anchor":"Parser"}],"facts":[]}"#;
+        assert!(parse_publication("p", &["raw:1".into()], beyond).is_err());
     }
 
-    fn response(ranges: &[(usize, usize)], unprocessed_from: Option<usize>) -> serde_json::Value {
+    fn response(cuts: &[usize]) -> serde_json::Value {
         serde_json::json!({
-            "compartments": ranges.iter().map(|(start, end)| serde_json::json!({
-                "start": start, "end": end, "title": "Parser", "importance": 60,
+            "compartments": cuts.iter().map(|end| serde_json::json!({
+                "end": end, "title": "Parser", "importance": 60,
                 "detailed": "Detailed", "compact": "Compact", "anchor": "Parser"
             })).collect::<Vec<_>>(),
-            "facts": [],
-            "unprocessed_from": unprocessed_from
+            "facts": []
         })
     }
 
     #[test]
-    fn episodes_cover_only_the_declared_contiguous_prefix() {
+    fn episode_cuts_define_the_covered_prefix() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
-        for (end, suffix) in [(3, Some(3)), (4, None)] {
-            let raw = response(&[(0, 2), (2, end)], suffix).to_string();
+        for cut in [3usize, 4] {
+            let raw = response(&[2, cut]).to_string();
             let publication = parse_publication("p", &sources, &raw).unwrap();
-            assert_eq!(publication.source_ids, sources[..end]);
+            assert_eq!(publication.source_ids, sources[..cut]);
             assert_eq!(publication.compartments[0].source_ids, sources[..2]);
-            assert_eq!(publication.compartments[1].source_ids, sources[2..end]);
+            assert_eq!(publication.compartments[1].source_ids, sources[2..cut]);
         }
-        for ranges in [
-            vec![(1, 4)],
-            vec![(0, 0)],
-            vec![(0, 5)],
-            vec![(0, 1), (2, 4)],
-            vec![(0, 2), (1, 4)],
-            vec![(0, 3), (3, 2)],
-        ] {
-            let error = parse_publication("p", &sources, &response(&ranges, None).to_string())
+        for cuts in [vec![0], vec![5], vec![1, 1], vec![2, 1], vec![4, 4]] {
+            let error = parse_publication("p", &sources, &response(&cuts).to_string())
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("historian episode coverage is invalid"),
+                error.contains("historian episode cut is invalid"),
                 "{error}"
             );
-            assert!(error.contains("expected start"), "{error}");
-            assert!(error.contains("end <= 4"), "{error}");
+            assert!(error.contains("at most 4"), "{error}");
         }
+        assert!(
+            parse_publication("p", &sources, &response(&[]).to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("historian produced no completed work")
+        );
     }
 
     #[test]
-    fn suffix_must_match_and_project_memory_fields_are_ignored() {
+    fn project_memory_fields_are_ignored_and_a_short_answer_stays_short() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
-        for (end, suffix) in [(2, None), (2, Some(3)), (4, Some(4))] {
-            let error =
-                parse_publication("p", &sources, &response(&[(0, end)], suffix).to_string())
-                    .unwrap_err()
-                    .to_string();
-            assert!(
-                error.contains("historian unprocessed suffix does not match coverage"),
-                "{error}"
-            );
-            assert!(
-                error.contains(&format!("after processing {end} of 4 messages")),
-                "{error}"
-            );
-        }
-        let mut raw = response(&[(0, 2)], Some(2));
+        let publication = parse_publication("p", &sources, &response(&[2]).to_string()).unwrap();
+        assert_eq!(publication.source_ids, sources[..2]);
+        let legacy = r#"{"compartments":[{"start":3,"end":2,"title":"Parser","importance":60,"detailed":"Detailed","compact":"Compact","anchor":"Parser"}],"facts":[],"unprocessed_from":3}"#;
+        let publication = parse_publication("p", &sources, legacy).unwrap();
+        assert_eq!(publication.source_ids, sources[..2]);
+        let mut raw = response(&[2]);
         raw["facts"] = serde_json::json!([{
             "start": 0, "end": 1, "category": "constraints", "text": "Fact"
         }]);
@@ -537,12 +508,6 @@ mod tests {
         assert_eq!(publication.facts, Vec::new());
         assert_eq!(publication.withdrawn_fact_ids, Vec::<String>::new());
         assert_eq!(publication.compartments.len(), 1);
-        assert!(
-            parse_publication("p", &sources, &response(&[], Some(0)).to_string())
-                .unwrap_err()
-                .to_string()
-                .contains("historian produced no completed work")
-        );
     }
 
     /// The provider rejects schemas that break the strict subset it enforces.

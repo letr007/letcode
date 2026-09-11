@@ -39,7 +39,8 @@ mod session_index;
 
 pub(crate) use model::TranscriptFileFingerprint;
 pub use model::{
-    HistoryNavigationOperation, TranscriptAssistantTurn, TranscriptEvent, TranscriptRecord,
+    HistorianExchangeEvent, HistoryNavigationOperation, TranscriptAssistantTurn, TranscriptEvent,
+    TranscriptRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

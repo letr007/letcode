@@ -9,7 +9,7 @@ use crate::session::runner::{
 use crate::session::{AssistantDeltaEvent, SessionEvent};
 use crate::subagent::{SubagentPool, SubagentStatus};
 use crate::tool::NormalizedSubagentInput;
-use crate::transcript::{TranscriptEvent, TranscriptRecorder};
+use crate::transcript::{HistorianExchangeEvent, TranscriptEvent, TranscriptRecorder};
 use anyhow::{Result, anyhow, ensure};
 use futures_util::FutureExt;
 use std::sync::{Arc, Mutex};
@@ -180,6 +180,7 @@ impl HistorianRuntime {
             Some(subagent_event_sender(self.event_tx.clone())),
         )?;
         let run_id = started.run_id().to_string();
+        let exchange_run_id = run_id.clone();
         let (tx, rx) = oneshot::channel();
         let cancelled = Arc::new(Mutex::new(false));
         *pending = Some(Pending {
@@ -225,9 +226,25 @@ impl HistorianRuntime {
                         });
                         std::future::ready(Ok::<(), ModelFailure>(()))
                     };
+                    let payload_bytes = serde_json::to_string(&input)
+                        .map(|payload| payload.len() as u64)
+                        .unwrap_or_default();
                     let outcome = async {
-                        let (raw, usage) = agent.run_historian(&input, on_delta).await?;
-                        let mut publication = crate::historian::parse_publication(&publication_id, &source_ids, &raw)?;
+                        let (raw, usage) = match agent.run_historian(&input, on_delta).await {
+                            Ok(exchange) => exchange,
+                            Err(error) => {
+                                record_exchange(&child, &exchange_run_id, source_ids.len(), payload_bytes, &[], Exchange::Failed(error.to_string()));
+                                return Err(error);
+                            }
+                        };
+                        let mut publication = match crate::historian::parse_publication(&publication_id, &source_ids, &raw) {
+                            Ok(publication) => publication,
+                            Err(error) => {
+                                record_exchange(&child, &exchange_run_id, source_ids.len(), payload_bytes, &usage, Exchange::Rejected { error: error.to_string(), response: &raw });
+                                return Err(error);
+                            }
+                        };
+                        record_exchange(&child, &exchange_run_id, source_ids.len(), payload_bytes, &usage, Exchange::Prepared);
                         publication.project_path = Some(project_path);
                         publication.external_fact_ids = external_fact_ids;
                         let report = crate::historian::HistorianReport {
@@ -368,6 +385,68 @@ impl HistorianRuntime {
         }
     }
 }
+
+const EXCHANGE_RESPONSE_CHARS: usize = 32_768;
+
+enum Exchange<'a> {
+    Prepared,
+    Rejected { error: String, response: &'a str },
+    Failed(String),
+}
+
+/// Diagnostic failures are logged, never propagated.
+fn record_exchange(
+    child: &Arc<Mutex<TranscriptRecorder>>,
+    run_id: &str,
+    source_count: usize,
+    payload_bytes: u64,
+    usage: &[crate::historian::UsageUpdate],
+    exchange: Exchange<'_>,
+) {
+    let (outcome, error, response) = match exchange {
+        Exchange::Prepared => ("prepared", None, None),
+        Exchange::Rejected { error, response } => ("rejected", Some(error), Some(response)),
+        Exchange::Failed(error) => ("failed", Some(error), None),
+    };
+    let tokens = usage.iter().rev().find_map(|update| match update {
+        crate::historian::UsageUpdate::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => Some((*input_tokens, *output_tokens)),
+        crate::historian::UsageUpdate::Cache { .. } => None,
+    });
+    let event = HistorianExchangeEvent {
+        run_id: run_id.to_string(),
+        source_count,
+        payload_bytes,
+        input_tokens: tokens.map(|(input, _)| input),
+        output_tokens: tokens.map(|(_, output)| output),
+        response_chars: response.map(|text| text.chars().count() as u64),
+        outcome: outcome.to_string(),
+        error,
+        response: response.map(exchange_response),
+    };
+    let recorded = child
+        .lock()
+        .map_err(|_| anyhow!("historian child transcript poisoned"))
+        .and_then(|mut recorder| recorder.record_historian_exchange(event));
+    if let Err(error) = recorded {
+        tracing::warn!(error = %error, "historian exchange diagnostics not recorded");
+    }
+}
+
+fn exchange_response(raw: &str) -> String {
+    if raw.chars().count() <= EXCHANGE_RESPONSE_CHARS {
+        return raw.to_string();
+    }
+    format!(
+        "{}…[response truncated]…{}",
+        crate::historian::raw_excerpt(raw),
+        crate::historian::raw_tail(raw)
+    )
+}
+
 impl Drop for HistorianRuntime {
     fn drop(&mut self) {
         if let Ok(pending) = self.pending.get_mut()
