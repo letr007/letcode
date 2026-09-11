@@ -256,7 +256,19 @@ impl HistorianRuntime {
                             elapsed_ms: started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                             usage,
                         };
-                        child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(serde_json::to_string(&report)?)?;
+                        let report_json = serde_json::to_string(&report)?;
+                        child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(report_json.clone())?;
+                        for event in [
+                            SessionEvent::AssistantDone { message_id: None },
+                            SessionEvent::AssistantDelta(AssistantDeltaEvent::new(report_json)),
+                        ] {
+                            let _ = delta_tx.send(SessionTransportEvent::ChildSessionEvent {
+                                child_session_id: child_session_id.clone(),
+                                agent_name: Some("historian".to_string()),
+                                parent_tool_call_id: None,
+                                event,
+                            });
+                        }
                         let summary = serde_json::json!({"status":"completed","summary":format!("Prepared {} history episodes",publication.compartments.len())}).to_string();
                         *produced_child.lock().map_err(|_| anyhow!("historian result poisoned"))? = Some(publication);
                         Ok(summary)

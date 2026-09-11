@@ -5060,6 +5060,63 @@ fn repeated_child_view_projection_does_not_reset_live_child_state() {
 }
 
 #[test]
+fn child_view_keeps_the_stream_and_ends_with_the_recorded_report() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "historian".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    let child_event = |event| SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("historian".into()),
+        parent_tool_call_id: None,
+        event,
+    };
+
+    for event in [
+        SessionEvent::AssistantDelta(AssistantDeltaEvent::new("{\"compartments\":[{\"end\":3}")),
+        SessionEvent::AssistantDone { message_id: None },
+    ] {
+        runtime.apply_session_transport_event(child_event(event));
+    }
+    runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
+
+    let report = serde_json::to_string(&crate::tui::components::historian_report::tests::sample_report())
+        .expect("serializable report");
+    for event in [
+        SessionEvent::AssistantDelta(AssistantDeltaEvent::new(report.clone())),
+        SessionEvent::AssistantDone { message_id: None },
+        SessionEvent::Done,
+    ] {
+        runtime.apply_session_transport_event(child_event(event));
+    }
+    runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
+
+    let assistant: Vec<&str> = runtime
+        .state()
+        .active_timeline()
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Assistant(message) => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant.len(), 2);
+    assert!(assistant[0].contains("\"compartments\""));
+    assert!(
+        crate::tui::components::historian_report::parse_report(assistant[1]).is_some(),
+        "the recorded report is the last assistant item, so the child view renders it"
+    );
+}
+
+#[test]
 fn adjacent_child_transport_events_merge_only_within_the_same_scope() {
     let mut queue = VecDeque::new();
     for (child, delta) in [("child-a", "a"), ("child-a", "b"), ("child-b", "c")] {
