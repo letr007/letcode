@@ -34,7 +34,7 @@ provider = "your-provider"
 model = "your-model"
 ```
 
-模型必须已经在对应 provider 中配置。Historian 使用统一 ModelRuntime 的无工具 one-shot 请求，静态任务约束进入协议原生高权威字段，不进入主 Agent 的工具循环，不递归委派。处理范围会按 Historian 路由的请求预算预检。
+模型必须已经在对应 provider 中配置。优先选用声明 `structured_output = "json_schema"` 的路由：严格模式由 provider 在解码层约束 JSON 语法。声明 `json_object` 的路由只表达“输出 JSON”的意图，模型仍可能返回语法损坏的响应，宿主只能整次拒绝该次发布。Historian 使用统一 ModelRuntime 的无工具 one-shot 请求，静态任务约束进入协议原生高权威字段，不进入主 Agent 的工具循环，不递归委派。处理范围会按 Historian 路由的请求预算预检。
 
 后台调用会产生额外用量。子视图报告 provider 返回的 usage/cache 事件；缺失用量时明确显示未报告，不伪造数字。事件可能是累计更新，不能直接全部相加。
 
