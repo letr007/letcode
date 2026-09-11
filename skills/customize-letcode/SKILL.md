@@ -82,7 +82,7 @@ mode = "default" # safe | default | auto | yolo（solo 是 yolo 的别名）
 # provider = "openai"
 # model = "gpt-5.5"
 # allowed_models = ["openai/gpt-5.5"] # 单次委派可选路由；不改变默认模型
-# 同样适用于：fixer, oracle, designer, librarian, general, reviewer
+# 同样适用于：fixer, oracle, designer, librarian, general, reviewer, historian
 
 [tools.parallelism]
 # "fs__read" = "parallel"   # 只能收窄已经声明 Parallel 的工具
@@ -206,7 +206,9 @@ namespace = "my-cache"
 - 本地 MCP 的 `command` 必须是字符串数组，不能是单个字符串。`type` 必填。
   remote 不能设 `command`/`environment`；local 不能设 `url`/`headers`/`oauth`。
 - 内置 expert agent 键固定为：`explorer`、`fixer`、`oracle`、`designer`、
-  `librarian`、`general`、`reviewer`。其中六个可委派 expert 是 explorer/fixer/oracle/designer/librarian/general，reviewer 仅用于权限自动审查；没有自由形式的 agent map。
+  `librarian`、`general`、`reviewer`、`historian`。其中六个可委派 expert 是 explorer/fixer/oracle/designer/librarian/general，reviewer 仅用于权限自动审查，historian 仅用于历史整理；没有自由形式的 agent map。
+- `[agents.historian]` 发布结构化 JSON 契约：优先给它声明
+  `capabilities.generation.structured_output = "json_schema"` 的路由，由上游在解码层约束 JSON 语法。声明 `json_object` 的路由只表达“输出 JSON”的意图，模型仍可能返回语法损坏的响应，宿主只能整次拒绝。
 - `agents.<expert>.allowed_models` 仅接受 `provider/model`，用于 `agent__*`
   单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的

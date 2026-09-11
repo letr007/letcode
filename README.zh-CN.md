@@ -119,7 +119,12 @@ mode = "default" # solo 是 yolo 的兼容别名
 # provider = "openai"
 # model = "gpt-5.5"
 # allowed_models = ["openai/gpt-5.5"]
-# 同样适用于 fixer、oracle、designer、librarian、general、reviewer。
+# 同样适用于 fixer、oracle、designer、librarian、general、reviewer、historian。
+# reviewer 与 historian 是内部系统专家，没有对应的 agent__* 委派工具。
+# Historian 发布结构化 JSON 契约：优先给它声明
+# capabilities.generation.structured_output = "json_schema" 的路由，由上游在解码层约束
+# JSON 语法；声明 json_object 的路由只表达“输出 JSON”的意图，模型仍可能返回语法损坏的响应，
+# 宿主只能整次拒绝。
 
 # 可选；只能收窄工具自身声明的并行能力。
 [tools.parallelism]

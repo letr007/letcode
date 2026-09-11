@@ -119,7 +119,11 @@ mode = "default" # solo remains accepted as a yolo alias
 # provider = "openai"
 # model = "gpt-5.5"
 # allowed_models = ["openai/gpt-5.5"]
-# The same shape applies to fixer, oracle, designer, librarian, general, and reviewer.
+# The same shape applies to fixer, oracle, designer, librarian, general, reviewer, and historian.
+# reviewer and historian are internal system experts, so no agent__* tool targets them.
+# Historian publishes a structured JSON contract: give it a route that declares
+# capabilities.generation.structured_output = "json_schema", so the endpoint constrains the JSON
+# syntax. A json_object route only states the intent there, and a malformed response is rejected whole.
 
 # Optional; this can only narrow parallelism declared by a tool itself.
 [tools.parallelism]
