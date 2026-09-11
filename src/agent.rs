@@ -2947,6 +2947,10 @@ impl Agent {
             ToolExecutionContext::default()
         };
         context.question_handler = self.question_handler.clone();
+        context.allow_tool_result_images = self
+            .resolved_model_route
+            .as_deref()
+            .is_some_and(|route| route.capabilities.tool_result_images);
         context.history_cursor = self.runtime_snapshot.session_id.as_ref().map(|session_id| {
             crate::context_history::HistoryCursor {
                 session_id: session_id.clone(),

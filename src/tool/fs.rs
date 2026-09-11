@@ -293,6 +293,18 @@ async fn read_file(args: Value, context: ToolExecutionContext) -> Result<ToolRes
     }
 
     if let Some(mime) = supported_image_mime(&path) {
+        if !context.allow_tool_result_images {
+            return Ok(ToolResult::err_with_data(
+                "fs__read",
+                "the current model does not support image tool results; image was not read",
+                json!({
+                    "path": display_workspace_relative(&path)?,
+                    "kind": "image",
+                    "mime": mime,
+                    "bytes": metadata.len(),
+                }),
+            ));
+        }
         return read_image_file(&path, &metadata, mime).await;
     }
 

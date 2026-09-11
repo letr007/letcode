@@ -42,6 +42,11 @@ pub(crate) fn model_request_from_prompt_plan(
                         crate::user_content::UserMessagePart::Text { text } => {
                             parts.push(ContentPart::Text(text));
                         }
+                        crate::user_content::UserMessagePart::Image { attachment }
+                            if !route.capabilities.input_images =>
+                        {
+                            parts.push(ContentPart::Text(attachment.placeholder_summary()));
+                        }
                         crate::user_content::UserMessagePart::Image { attachment } => {
                             let prefix = format!("data:{};base64,", attachment.mime);
                             let encoded =
@@ -118,7 +123,15 @@ pub(crate) fn model_request_from_prompt_plan(
                 },
             ) => {
                 let mut content = vec![ContentPart::Text(output_json.clone())];
+                if !route.capabilities.tool_result_images {
+                    for image in images {
+                        content.push(ContentPart::Text(image.placeholder_summary()));
+                    }
+                }
                 for image in images {
+                    if !route.capabilities.tool_result_images {
+                        continue;
+                    }
                     let prefix = format!("data:{};base64,", image.mime);
                     let encoded = image
                         .data_url

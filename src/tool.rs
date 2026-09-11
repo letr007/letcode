@@ -336,6 +336,7 @@ pub type QuestionCallback = Arc<dyn Fn(QuestionRequest) -> QuestionCallbackFutur
 pub struct ToolExecutionContext {
     pub(crate) history_cursor: Option<crate::context_history::HistoryCursor>,
     pub allow_outside_workspace: bool,
+    pub(crate) allow_tool_result_images: bool,
     pub question_handler: Option<QuestionCallback>,
     prepared_writable_leaf: Option<PreparedWritableLeaf>,
     prepared_apply_patch: Option<PreparedApplyPatch>,
@@ -345,6 +346,7 @@ impl std::fmt::Debug for ToolExecutionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolExecutionContext")
             .field("allow_outside_workspace", &self.allow_outside_workspace)
+            .field("allow_tool_result_images", &self.allow_tool_result_images)
             .field(
                 "question_handler",
                 &self.question_handler.as_ref().map(|_| "<question_handler>"),
@@ -371,6 +373,7 @@ impl ToolExecutionContext {
     pub fn outside_workspace_granted() -> Self {
         Self {
             allow_outside_workspace: true,
+            allow_tool_result_images: false,
             history_cursor: None,
             question_handler: None,
             prepared_writable_leaf: None,
@@ -1311,7 +1314,11 @@ mod tests {
                     "offset": 1,
                     "limit": 10,
                 }),
-                ToolExecutionContext::outside_workspace_granted(),
+                {
+                    let mut context = ToolExecutionContext::outside_workspace_granted();
+                    context.allow_tool_result_images = true;
+                    context
+                },
             )
             .await;
 
