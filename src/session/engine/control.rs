@@ -260,10 +260,23 @@ pub(crate) fn handle_active_turn_command(
     }
 }
 
+/// Transcript navigation request carried out while compaction is still running.
+pub(crate) enum ManualCompactionNavigation {
+    ViewChild {
+        navigation: crate::command::ChildNavigation,
+        anchor_child_session_id: Option<String>,
+    },
+    ViewParent,
+}
+
 pub(crate) enum ManualCompactionOperation<T> {
     Interrupted,
     Shutdown,
     Completed(T),
+    /// Serviced while the compaction future stays pinned: reading a transcript
+    /// does not touch the agent, so manual compaction no longer has to finish
+    /// before the child view can be opened.
+    Navigation(ManualCompactionNavigation),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -502,6 +515,63 @@ pub(crate) fn forward_queued_runner_events(
     }
 }
 
+/// Transcript navigation stays available while manual compaction runs. These are
+/// exactly the commands [`crate::session::SessionCommand::active_turn_disposition`]
+/// marks `Immediate`; everything else keeps waiting for the compaction outcome.
+fn manual_compaction_navigation(
+    command: &SessionEngineCommand,
+) -> Option<ManualCompactionNavigation> {
+    match command {
+        SessionEngineCommand::ViewChild {
+            navigation,
+            anchor_child_session_id,
+        } => Some(ManualCompactionNavigation::ViewChild {
+            navigation: *navigation,
+            anchor_child_session_id: anchor_child_session_id.clone(),
+        }),
+        SessionEngineCommand::ViewParent => Some(ManualCompactionNavigation::ViewParent),
+        _ => None,
+    }
+}
+
+struct DrainedManualCompactionControls {
+    shutdown: bool,
+    interrupted: bool,
+    navigation: Option<ManualCompactionNavigation>,
+}
+
+/// Same FIFO deferral as [`drain_queued_session_controls`], except that queued
+/// navigation is returned instead of parked, so a request that arrived before
+/// the loop was entered is still serviced during compaction.
+fn drain_manual_compaction_controls(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+) -> DrainedManualCompactionControls {
+    let mut drained = DrainedManualCompactionControls {
+        shutdown: false,
+        interrupted: false,
+        navigation: None,
+    };
+    loop {
+        match control_rx.try_recv() {
+            Ok(SessionEngineControl::Command(command)) => {
+                match manual_compaction_navigation(&command) {
+                    Some(navigation) if drained.navigation.is_none() => {
+                        drained.navigation = Some(navigation)
+                    }
+                    _ => enqueue_deferred_command(deferred_commands, command),
+                }
+            }
+            Ok(SessionEngineControl::Interrupt) => drained.interrupted = true,
+            Ok(SessionEngineControl::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                drained.shutdown = true;
+                return drained;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return drained,
+        }
+    }
+}
+
 pub(crate) async fn select_manual_compaction_operation<T, F>(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
@@ -511,21 +581,27 @@ where
     F: Future<Output = T> + ?Sized,
 {
     loop {
-        match drain_queued_session_controls(control_rx, deferred_commands) {
-            QueuedSessionEngineControlSignal::Interrupt => {
-                return ManualCompactionOperation::Interrupted;
-            }
-            QueuedSessionEngineControlSignal::Shutdown => {
-                return ManualCompactionOperation::Shutdown;
-            }
-            QueuedSessionEngineControlSignal::NoSignal => {}
+        let drained = drain_manual_compaction_controls(control_rx, deferred_commands);
+        if drained.shutdown {
+            return ManualCompactionOperation::Shutdown;
+        }
+        if drained.interrupted {
+            return ManualCompactionOperation::Interrupted;
+        }
+        if let Some(navigation) = drained.navigation {
+            return ManualCompactionOperation::Navigation(navigation);
         }
 
         tokio::select! {
             biased;
             control = control_rx.recv() => match control {
                 Some(SessionEngineControl::Command(command)) => {
-                    enqueue_deferred_command(deferred_commands, command)
+                    match manual_compaction_navigation(&command) {
+                        Some(navigation) => {
+                            return ManualCompactionOperation::Navigation(navigation)
+                        }
+                        None => enqueue_deferred_command(deferred_commands, command),
+                    }
                 }
                 Some(SessionEngineControl::Interrupt) => {
                     return match drain_queued_session_controls(control_rx, deferred_commands) {

@@ -702,8 +702,11 @@ pub(crate) async fn run_manual_compaction(
     agent: &mut Agent,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    sessions_dir: &std::path::Path,
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
+    visible_child_session_id: &mut Option<String>,
+    visible_child_view_state: &mut Option<VisibleChildViewState>,
 ) -> bool
 where
 {
@@ -802,11 +805,51 @@ where
     let compaction_result = {
         let compact = agent.compact_session_stream_async(on_event, &mut on_start);
         tokio::pin!(compact);
-        select_manual_compaction_operation(control_rx, deferred_commands, compact.as_mut()).await
+        loop {
+            match select_manual_compaction_operation(
+                control_rx,
+                deferred_commands,
+                compact.as_mut(),
+            )
+            .await
+            {
+                // Navigation only reads the transcript, so it is serviced without
+                // disturbing the pinned compaction future or the agent borrow.
+                ManualCompactionOperation::Navigation(navigation) => match navigation {
+                    ManualCompactionNavigation::ViewChild {
+                        navigation,
+                        anchor_child_session_id,
+                    } => {
+                        *visible_child_session_id =
+                            crate::session::SessionCoordinator::emit_view_child(
+                                &transcript,
+                                session_transport_tx,
+                                Some(sessions_dir),
+                                navigation,
+                                anchor_child_session_id.as_deref(),
+                            );
+                        *visible_child_view_state = None;
+                    }
+                    ManualCompactionNavigation::ViewParent => {
+                        crate::session::SessionCoordinator::emit_view_parent(
+                            &transcript,
+                            session_transport_tx,
+                            Some(sessions_dir),
+                        );
+                        *visible_child_session_id = None;
+                        *visible_child_view_state = None;
+                    }
+                },
+                terminal => break terminal,
+            }
+        }
     };
 
     let shutdown = matches!(compaction_result, ManualCompactionOperation::Shutdown);
     match compaction_result {
+        ManualCompactionOperation::Navigation(_) => {
+            unreachable!("navigation is serviced while compaction stays pinned")
+        }
         ManualCompactionOperation::Interrupted | ManualCompactionOperation::Shutdown => {
             if let Some(historian) = &agent.historian_runtime {
                 historian.cancel();
@@ -932,7 +975,7 @@ pub(crate) fn initial_session_metadata(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VisibleChildViewState {
+pub(crate) struct VisibleChildViewState {
     record_count: usize,
     index: usize,
     total: usize,
@@ -2106,8 +2149,11 @@ async fn run_engine_loop(
                             &mut agent,
                             &transcript,
                             &session_transport_tx,
+                            &sessions_dir,
                             &mut control_rx,
                             &mut deferred_commands,
+                            &mut visible_child_session_id,
+                            &mut visible_child_view_state,
                         )
                         .await;
                         if shutdown {

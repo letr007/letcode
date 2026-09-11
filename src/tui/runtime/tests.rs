@@ -11,7 +11,8 @@ use crate::context_view::{
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::engine::{
-    ActiveSessionOperation, InterruptRequest, ManualCompactionOperation, SessionEngineCommand,
+    ActiveSessionOperation, InterruptRequest, ManualCompactionNavigation,
+    ManualCompactionOperation, SessionEngineCommand,
     SessionEngineControl, derive_interrupt_request, enqueue_deferred_command,
     flush_parked_commands, format_background_subagent_completion, initial_session_metadata,
     manual_compaction_session_token_usage, next_idle_session_command, park_active_turn_command,
@@ -4579,6 +4580,96 @@ async fn queued_interrupt_then_shutdown_stops_manual_compaction() {
         )
         .await,
         ManualCompactionOperation::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn manual_compaction_services_queued_child_navigation() {
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut deferred_commands = VecDeque::new();
+    control_tx
+        .send(SessionEngineControl::Command(
+            SessionEngineCommand::ViewChild {
+                navigation: crate::command::ChildNavigation::Next,
+                anchor_child_session_id: Some("child-1".into()),
+            },
+        ))
+        .expect("queue view child");
+    let pending_operation = std::future::pending::<()>();
+    tokio::pin!(pending_operation);
+
+    let operation = select_manual_compaction_operation(
+        &mut control_rx,
+        &mut deferred_commands,
+        pending_operation.as_mut(),
+    )
+    .await;
+
+    assert!(matches!(
+        operation,
+        ManualCompactionOperation::Navigation(ManualCompactionNavigation::ViewChild {
+            navigation: crate::command::ChildNavigation::Next,
+            anchor_child_session_id: Some(anchor),
+        }) if anchor == "child-1"
+    ));
+    assert!(deferred_commands.is_empty());
+}
+
+#[tokio::test]
+async fn manual_compaction_services_child_navigation_while_waiting() {
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut deferred_commands = VecDeque::new();
+    let pending_operation = std::future::pending::<()>();
+    tokio::pin!(pending_operation);
+
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        let _ = control_tx.send(SessionEngineControl::Command(
+            SessionEngineCommand::ViewParent,
+        ));
+        // Keep the channel open for the duration of the select.
+        std::future::pending::<()>().await;
+    });
+
+    let operation = select_manual_compaction_operation(
+        &mut control_rx,
+        &mut deferred_commands,
+        pending_operation.as_mut(),
+    )
+    .await;
+
+    assert!(matches!(
+        operation,
+        ManualCompactionOperation::Navigation(ManualCompactionNavigation::ViewParent)
+    ));
+}
+
+#[tokio::test]
+async fn manual_compaction_still_defers_command_changes() {
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut deferred_commands = VecDeque::new();
+    control_tx
+        .send(SessionEngineControl::Command(SessionEngineCommand::SetModel(
+            "model-b".into(),
+        )))
+        .expect("queue set model");
+    control_tx
+        .send(SessionEngineControl::Shutdown)
+        .expect("queue shutdown");
+    let pending_operation = std::future::pending::<()>();
+    tokio::pin!(pending_operation);
+
+    let operation = select_manual_compaction_operation(
+        &mut control_rx,
+        &mut deferred_commands,
+        pending_operation.as_mut(),
+    )
+    .await;
+
+    assert!(matches!(operation, ManualCompactionOperation::Shutdown));
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "model-b"
     ));
 }
 
