@@ -321,6 +321,22 @@ where
     agent.reload_runtime_snapshot_from_provider()?;
     agent.clear_active_epoch();
     agent.clear_provider_usage_anchor();
+    // The retired conversation is replaced by summary text. Workflow state is
+    // snapshot state rather than transcript text, so restate it for the model;
+    // without this the todos the session is working through disappear here.
+    if let Some(text) = agent.runtime_snapshot.workflow.render_compaction_reminder()
+        && !matches!(
+            agent.active_history_items().last(),
+            Some(HistoryItem::InternalContinuation { text: last }) if last == &text
+        )
+    {
+        agent.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
+        on_event(AgentEvent::InternalContinuation {
+            text,
+            source: crate::transcript::InternalContinuationSource::CompactionReminder,
+        })
+        .await?;
+    }
     Ok(())
 }
 
@@ -1279,5 +1295,71 @@ max_output_tokens=128
             assert!(error.contains("active session="), "{error}");
             assert!(error.contains("persisted session="), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn history_application_restates_workflow_state_after_compaction() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut agent, recorder) = agent_with_recorder(root.path());
+        recorder
+            .lock()
+            .unwrap()
+            .record_todo_snapshot(vec![
+                TodoItem {
+                    id: "open".into(),
+                    content: "finish parser".into(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: "done".into(),
+                    content: "scaffold module".into(),
+                    status: TodoStatus::Completed,
+                },
+            ])
+            .unwrap();
+        agent.reload_runtime_snapshot_from_provider().unwrap();
+
+        let application = HistoryApplication {
+            publication_ids: Vec::new(),
+            baseline: Vec::new(),
+            delta: Vec::new(),
+            baseline_fact_ids: Vec::new(),
+            delta_fact_ids: Vec::new(),
+            withdrawn_fact_ids: Vec::new(),
+            first_kept_entry_id: None,
+            legacy_summary: None,
+        };
+        let mut events = Vec::new();
+        {
+            let mut on_event = |event: AgentEvent| {
+                let result = crate::agent_event_journal::persist_agent_event(
+                    &mut recorder.lock().unwrap(),
+                    &event,
+                )
+                .map(|_| ());
+                events.push(event);
+                std::future::ready(result)
+            };
+            apply_history(&mut agent, application, false, &mut on_event)
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::InternalContinuation {
+                source: crate::transcript::InternalContinuationSource::CompactionReminder,
+                ..
+            })
+        ));
+
+        // The reminder is durable, so a restart still shows the open work.
+        agent.reload_runtime_snapshot_from_provider().unwrap();
+        let history = agent.active_history_items();
+        let Some(HistoryItem::InternalContinuation { text }) = history.last() else {
+            panic!("expected the workflow reminder to survive the reload");
+        };
+        assert!(text.contains("finish parser"), "{text}");
+        assert!(!text.contains("scaffold module"), "{text}");
     }
 }

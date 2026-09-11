@@ -52,6 +52,9 @@ pub enum InternalContinuationSource {
     StreamRecovery,
     LogicalCheckpoint,
     SubagentCompletion,
+    /// Workflow state restated to the model after a compaction retired the
+    /// conversation that introduced it.
+    CompactionReminder,
 }
 
 /// Durable, provider-facing facts retained when a logical segment is closed.
