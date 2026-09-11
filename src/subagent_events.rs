@@ -196,7 +196,17 @@ pub async fn run_child_prompt(
         .await;
 
     match response {
-        Ok(message) => Ok(message),
+        Ok(message) => match crate::subagent::finalize_report(&agent, &message).await {
+            Ok(message) => Ok(message),
+            Err(error) => {
+                // The headless path has no event channel to publish on.
+                tracing::error!(
+                    error = %error,
+                    "subagent result normalization failed; keeping the raw report"
+                );
+                Ok(message)
+            }
+        },
         Err(error) => {
             let error_message = format!("{error:#}");
             record_transcript(&transcript, |recorder| {

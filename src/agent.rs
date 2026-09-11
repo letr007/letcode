@@ -2963,15 +2963,33 @@ impl Agent {
         &self,
         user_input: &UserMessageContent,
     ) -> Result<(String, Vec<crate::historian::UsageUpdate>)> {
+        self.run_structured_oneshot(user_input, crate::historian::structured_output)
+            .await
+    }
+
+    /// One non-tool model call whose structured-output contract is chosen by the
+    /// caller from the route's declared capability. A route that declares no
+    /// structured-output support keeps the caller's prompt-only contract.
+    pub(crate) async fn run_structured_oneshot<F>(
+        &self,
+        user_input: &UserMessageContent,
+        contract: F,
+    ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
+    where
+        F: FnOnce(
+            Option<crate::model_runtime::StructuredOutputSupport>,
+        ) -> Option<crate::model_runtime::StructuredOutput>,
+    {
         let route = self
             .resolved_model_route()
-            .ok_or_else(|| anyhow!("historian requires a resolved route"))?;
+            .ok_or_else(|| anyhow!("structured oneshot requires a resolved route"))?;
+        let structured_output = contract(route.generation.structured_output);
         let (_, input) = protocol_stream::prepare_resolved_oneshot_request(
             route,
             self.active_model_metadata(),
             &self.prelude,
             user_input,
-            crate::historian::structured_output(route.generation.structured_output).as_ref(),
+            structured_output.as_ref(),
         )?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
             .execute_text_oneshot_with_usage(
@@ -3242,7 +3260,7 @@ impl Agent {
 
     fn render_subagent_prompt(&self, tool_name: &str, input: &NormalizedSubagentInput) -> String {
         format!(
-            "{}\n\nReturn only a single JSON object with fields: status, summary, findings, files_read, files_changed, commands_run, validation, blockers, next_steps.",
+            "{}\n\nReturn only a single JSON object with fields: status, summary, findings, files_read, files_changed, commands_run, validation, blockers, next_steps. `status` and `summary` are strings; `findings`, `files_read`, `files_changed`, `commands_run`, `validation`, `blockers` and `next_steps` are arrays of strings. Keep details in those arrays instead of nesting them inside `summary`.",
             input.render_for_delegate(tool_name)
         )
     }

@@ -3,6 +3,7 @@ mod result;
 mod route_factory;
 
 pub use pool::{SubagentJob, SubagentPool, SubagentRunGovernance};
+pub(crate) use result::finalize_report;
 pub use result::{
     StructuredSubagentResult, SubagentFailureKind, SubagentRunSummary, SubagentStatus,
     looks_like_structured_subagent_output, try_parse_structured_subagent_result,
@@ -674,6 +675,42 @@ base_url = "https://test.example.invalid/v1"
             result.validation,
             vec!["cargo test failed", "cargo fmt not_run"]
         );
+    }
+
+    #[test]
+    fn declared_structured_output_follows_the_route_capability() {
+        use super::result::structured_output;
+        use crate::model_runtime::{StructuredOutput, StructuredOutputSupport};
+
+        assert!(structured_output(None).is_none());
+        assert_eq!(
+            structured_output(Some(StructuredOutputSupport::JsonObject)),
+            Some(StructuredOutput::JsonObject)
+        );
+        let Some(StructuredOutput::JsonSchema(schema)) =
+            structured_output(Some(StructuredOutputSupport::JsonSchema))
+        else {
+            panic!("json_schema support must request an enforced schema");
+        };
+        assert!(schema.strict);
+        assert_eq!(schema.schema["additionalProperties"], false);
+        for field in [
+            "status",
+            "summary",
+            "findings",
+            "files_read",
+            "files_changed",
+            "commands_run",
+            "validation",
+            "blockers",
+            "next_steps",
+        ] {
+            assert!(
+                schema.schema["properties"].get(field).is_some(),
+                "missing {field}"
+            );
+        }
+        assert_eq!(schema.schema["required"].as_array().map(Vec::len), Some(9));
     }
 
     #[test]
