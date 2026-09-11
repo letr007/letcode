@@ -9,39 +9,33 @@
 
 ### Added
 
-- 新增增量三层历史：按会话分支保存历史段与冻结选择，每段历史一次生成 Detailed、Compact 和 Anchor 三种表述，预算变化时按档位重选或归档；归档只改变活跃表示，不删除 transcript。
-- 新增内置 Historian 后台整理：未配置时继承主模型，也可通过 `[agents.historian]` 单独路由；整理只在 footer 显示状态，不插入主时间线工具卡，并可在子视图查看概览、分段正文、模型、耗时和用量报告。
+- 新增增量三层历史与内置 Historian 后台整理：按会话分支保存历史段与冻结选择，每段历史一次生成 Detailed、Compact 和 Anchor 三种表述，预算变化时按档位重选或归档，归档只改变活跃表示，不删除 transcript；Historian 未配置时继承主模型，也可通过 `[agents.historian]` 单独路由，只在 footer 显示状态，不插入主时间线工具卡，子视图可查看概览、分段正文、模型、耗时和用量报告。
 - 新增 `context__search` 和 `context__expand`：在当前分支作用域内检索原始会话、归档历史段与 evidence，并按来源 ID 只读展开原文，不恢复旧执行状态。
 - 新增按模型配置的异步工具：`generation.async_tools` 列出的工具可在流式响应期间提前执行，完整工具批次到达后归并为同一调用组；仅适用于 Astra 策略搭配 Responses 协议。
-- 新增按路由声明的结构化输出：`capabilities.generation.structured_output` 可声明 `json_object` 或 `json_schema`，Responses、Chat Completions 与 Anthropic 分别映射各自线格式；未声明时请求不会附加格式约束。内置 Historian 在声明 `json_schema` 的路由上改用强制 schema，未声明时保持原有 prompt 约束。
-- 新增子代理结果归一化：路由声明 `capabilities.generation.structured_output` 时，子代理完成后按强制 schema 追加一次无工具调用，生成 `status`、`summary` 与各列表字段；未声明时保持原有 prompt 约束。
+- 新增按路由声明的结构化输出：`capabilities.generation.structured_output` 可声明 `json_object` 或 `json_schema`，Responses、Chat Completions 与 Anthropic 分别映射各自线格式，未声明时请求不附加格式约束；内置 Historian 在声明 `json_schema` 的路由上使用强制 schema；子代理完成后按同一强制 schema 追加一次无工具调用，生成 `status`、`summary` 与各列表字段。
 
 ### Breaking
 
-- 移除 Anchored Bootstrap 实验及其 `[experiments.anchored_bootstrap]` 配置段与 `/anchored` 命令；已启用该实验的配置需删除对应段落，否则加载时会因未知字段报错。
+- 移除 Anchored Bootstrap 实验及其 `[experiments.anchored_bootstrap]` 配置段与 `/anchored` 命令；已启用该实验的配置需删除对应段落。
 
 ### Changed
 
-- 项目记忆改为按工作区路径隔离的独立记忆库：回合持久化后由后台增量提取并保存到配置目录的 SQLite，`memory__recall` 直接查询该库，不再扫描或重新提炼旧 session；首次启用只登记当前 journal 进度。
-- 降低历史回放开销，校验时复用已发布前缀的投影状态，仅在分支路径变化时重建。
-- 子代理运行状态改为只反映宿主事实：子代理自身给出的 `failed`、`blocked`、`changes_requested` 等判定原样保留在结构化结果中并交给父代理，不再被翻译成运行失败或静默丢弃；子代理卡片同时显示运行状态与该判定。
-- Historian 发布契约为「切点」：每个 episode 只声明左闭右开的 `end`，起始位置由宿主从前一段推导，因此首段必定从第 0 条消息开始，episode 之间不可能出现空洞、重叠或空区间；未整理到 `source_count` 时不再因后缀声明不一致被拒，而是作为合法的部分整理保留。
+- 项目记忆改为按工作区路径隔离的独立记忆库：回合持久化后由后台增量提取并保存到配置目录的 SQLite，`memory__recall` 直接查询该库；首次启用只登记当前 journal 进度。
+- 历史回放校验复用已发布前缀的投影状态，仅在分支路径变化时重建。
+- 子代理运行状态改为只反映宿主事实：子代理自身给出的 `failed`、`blocked`、`changes_requested` 等判定原样保留在结构化结果中并交给父代理，不再被当作运行成功或失败；子代理卡片同时显示运行状态与该判定。
+- Historian 发布契约为「切点」：每个 episode 只声明左闭右开的 `end`，起始位置由宿主从前一段推导，首段必定从第 0 条消息开始，episode 之间不会出现空洞、重叠或空区间；未整理到 `source_count` 时保留为合法的部分整理。
 
 ### Fixed
 
 - 修复回合或子代理运行中按 Ctrl+C 会直接退出会话并取消正在运行子代理的问题：运行中 Ctrl+C 现在与 Esc 一致，先提示确认中断，仅在空闲时直接退出。
-- 修复上下文压缩后模型看不到当前 todo 列表与 auto-continue 状态、可能忘记未完成工作的问题。
-- 修复历史树投影遇到已应用的历史记录时崩溃，导致 `/tree`、`/undo` 和 `/redo` 不可用的问题。
-- 修复流式工具调用被截断时，仅剩推理内容的部分回复会写入历史，导致后续请求被上游以 `content or tool_calls must be set` 拒绝、会话在重启前无法继续的问题。
-- 修复子代理结构化结果里的否定判定（如 `FAIL`、`changes_requested`、`NO-GO`）被当作成功、父代理收到成功工具结果，以及只读子代理给出 `blocked` 结论时被记为运行失败的问题。
-- 修复声明 `json_schema` 结构化输出的路由上，项目记忆抽取会套用 Historian 发布 schema、静默产出空更新的问题。
-- 修复 Historian 整理结果不符合发布契约后，会在同一历史前缀上反复自动重发、以及在上下文压力压缩中长时间等待后整轮失败的问题；现在同一前缀失败后不再自动重试，压缩会直接带出失败原因。
-- 修复上游以 `context_too_large` 拒绝 Historian 请求时无法收敛的问题：现在会缩小本次整理的消息范围后重试。
-- 修复 Historian 解析失败时丢弃模型原始输出、无法定位契约违约的问题：现在记录截断后的原始输出；JSON 语法错误时额外记录出错位置附近的原文，覆盖类失败时额外记录响应末尾。
-- 修复 Historian 后台整理在子会话视图中没有流式输出的问题：现在复用子会话增量通道，整理过程可见模型输出，并在产出报告后将该报告作为子会话的最后一条消息渲染出来。
-- 修复手动 `/compact` 期间无法切换到子代理视图的问题：压缩命令会延后到本轮结束，但子会话导航现在会在压缩进行中立即生效。
-- 改进 Historian 的区间契约提示：明确 `end` 为左闭右开、下一条必须从上一条的 `end` 开始、覆盖达到 `source_count` 后必须停止且不得重复覆盖，并给出连续两段的示例，减少因边界理解偏差导致的整理失败。
-- 修复 Historian 整理请求不留任何记录、失败后无法复盘的问题：每次整理都会把请求规模（消息数、payload 字节数）、上游报告的输入输出 token、结果与拒绝原因记入子会话 transcript，被拒绝时保留响应，超长响应保留首尾。
+- 修复上下文压缩后模型看不到当前 todo 列表与 auto-continue 状态的问题。
+- 修复历史树投影遇到已应用的历史记录时崩溃的问题。
+- 修复流式工具调用被截断时仅剩推理内容的部分回复会写入历史的问题。
+- 修复声明 `json_schema` 结构化输出的路由上项目记忆抽取套用 Historian 发布 schema 的问题。
+- 修复 Historian 整理结果不符合发布契约时在同一历史前缀上反复自动重发、在上下文压力压缩中长时间等待后整轮失败、以及上游以 `context_too_large` 拒绝时无法收敛的问题：同一前缀失败后停止自动重发，`context_too_large` 时缩小本次整理的消息范围后重试，压缩直接带出失败原因。
+- 修复 Historian 整理失败时不留记录的问题：每次整理把请求规模（消息数、payload 字节数）、上游报告的输入输出 token、结果与拒绝原因记入子会话 transcript；被拒绝时保留响应（超长保留首尾），日志记录截断后的原始输出、JSON 出错位置附近的原文与覆盖类失败的响应末尾。
+- 修复 Historian 后台整理在子会话视图中不显示输出的问题：整理过程流式写入模型输出，产出报告后将该报告作为最后一条消息渲染出来。
+- 修复手动 `/compact` 期间无法切换到子代理视图的问题：子会话导航现在会在压缩进行中立即生效。
 
 ## [0.11.0] - 2026-09-05
 
