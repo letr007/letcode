@@ -591,10 +591,11 @@ fn host_terminal() -> Option<String> {
     if program.is_empty() {
         return None;
     }
-    let name = program.to_ascii_lowercase();
+    // The raw `TERM_PROGRAM` value is the token, verbatim: terminals that
+    // report themselves in mixed case (`Apple_Terminal`) keep it.
     match std::env::var("TERM_PROGRAM_VERSION") {
-        Ok(version) if !version.trim().is_empty() => Some(format!("{name}/{}", version.trim())),
-        _ => Some(name),
+        Ok(version) if !version.trim().is_empty() => Some(format!("{program}/{}", version.trim())),
+        _ => Some(program.to_string()),
     }
 }
 
