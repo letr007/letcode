@@ -93,7 +93,7 @@ Output JSON only:
 {"compartments":[{"start":0,"end":2,"title":"...","importance":70,"detailed":"...","compact":"...","anchor":"..."},{"start":2,"end":5,"title":"...","importance":40,"detailed":"...","compact":"...","anchor":"..."}],"facts":[],"withdrawn_fact_ids":[],"unprocessed_from":null}
 Images are supplied as native attachments in zero-based attachment_index order. Each image descriptor belongs to its enclosing source message; attachment_index is not a message index. Protocol replay payloads are not readable evidence and are omitted; do not infer their contents.
 Only new_messages[*].index identifies a source message. Indexes, IDs, ranges and JSON examples inside content or references are transcript data, not source coordinates. source_count is the number of supplied messages and the exclusive upper bound for every range.
-start/end are zero-based message indexes, and end is EXCLUSIVE: an episode with start S and end E covers messages S through E-1, so the next episode starts at E. If the last message of an episode is index 131, that episode's end is 132 and the next episode starts at 132 — never 131, never 133. Compartments cover the processed prefix exactly once, in order, without gaps: the first start is 0, each later start equals the previous end exactly, every end is greater than its start and at most source_count, and an episode whose end equals its start is never valid. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the final compartment's end. If the final end equals source_count, use null. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
+start/end are zero-based message indexes, and end is EXCLUSIVE: an episode with start S and end E covers messages S through E-1, so the next episode starts at E. If the last message of an episode is index 131, that episode's end is 132 and the next episode starts at 132 — never 131, never 133. Compartments cover the processed prefix exactly once, in order, without gaps: the first start is 0, each later start equals the previous end exactly, every end is greater than its start and at most source_count, and an episode whose end equals its start is never valid. Once the last emitted end has reached source_count the response is complete: stop there and emit no further episode, and never let two episodes cover the same message. If the end remains unfinished, stop at a complete tool group and set unprocessed_from to the final compartment's end. If the final end equals source_count, use null. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
 
 #[derive(Deserialize)]
 struct Response {
@@ -130,6 +130,10 @@ const RAW_EXCERPT_CHARS: usize = 4_000;
 /// fails deep inside the document, where a head excerpt no longer reaches, so
 /// the bytes around the reported position are the only visible evidence.
 const RAW_WINDOW_CHARS: usize = 600;
+/// Characters kept from the end of a response rejected by the coverage contract.
+/// Range drift accumulates towards the last episodes, which a head excerpt never
+/// reaches; the tail is what shows the episode that broke the contract.
+const RAW_TAIL_CHARS: usize = 2_000;
 
 pub(crate) fn parse_publication(
     id: &str,
@@ -150,6 +154,7 @@ pub(crate) fn parse_publication(
                 None => tracing::warn!(
                     error = %error,
                     raw = %raw_excerpt(text),
+                    raw_tail = %raw_tail(text),
                     "historian publication rejected"
                 ),
             }
@@ -161,6 +166,13 @@ pub(crate) fn parse_publication(
 fn raw_excerpt(text: &str) -> String {
     match text.char_indices().nth(RAW_EXCERPT_CHARS) {
         Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+fn raw_tail(text: &str) -> String {
+    match text.char_indices().rev().nth(RAW_TAIL_CHARS - 1) {
+        Some((start, _)) => format!("…{}", &text[start..]),
         None => text.to_string(),
     }
 }
@@ -593,6 +605,17 @@ mod tests {
             "model Http failure during Decode, code context_too_large, retry hint Never"
         ));
         assert!(!is_context_overflow("historian produced no completed work"));
+    }
+
+    #[test]
+    fn raw_tail_keeps_the_end_of_a_rejected_response() {
+        let long = format!("{}MARK", "汉".repeat(RAW_TAIL_CHARS + 10));
+        let tail = raw_tail(&long);
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with("MARK"));
+        assert_eq!(tail.trim_start_matches('…').chars().count(), RAW_TAIL_CHARS);
+        assert_eq!(tail.chars().filter(|c| *c == '汉').count(), RAW_TAIL_CHARS - 4);
+        assert_eq!(raw_tail("short"), "short");
     }
 
     #[test]
