@@ -9,21 +9,23 @@
 
 ### Added
 
-- 新增增量三层历史与内置 Historian 后台整理：按会话分支保存历史段与冻结选择，每段历史一次生成 Detailed、Compact 和 Anchor 三种表述，预算变化时按档位重选或归档，归档只改变活跃表示，不删除 transcript；Historian 未配置时继承主模型，也可通过 `[agents.historian]` 单独路由，只在 footer 显示状态，不插入主时间线工具卡，子视图可查看概览、分段正文、模型、耗时和用量报告。
-- 新增 `context__search` 和 `context__expand`：在当前分支作用域内检索原始会话、归档历史段与 evidence，并按来源 ID 只读展开原文，不恢复旧执行状态。
-- 新增按模型配置的异步工具：`generation.async_tools` 列出的工具可在流式响应期间提前执行，完整工具批次到达后归并为同一调用组；仅适用于 Astra 策略搭配 Responses 协议。
-- 新增按路由声明的结构化输出：`capabilities.generation.structured_output` 可声明 `json_object` 或 `json_schema`，Responses、Chat Completions 与 Anthropic 分别映射各自线格式，未声明时请求不附加格式约束；内置 Historian 在声明 `json_schema` 的路由上使用强制 schema；子代理完成后按同一强制 schema 追加一次无工具调用，生成 `status`、`summary` 与各列表字段。
+- 新增 `[fake]` 配置段，为请求兼容模式声明可变信息。
+- 新增增量三层历史与内置 Historian 后台整理。
+- 新增 `context__search` 和 `context__expand`。
+- 新增按模型配置的异步工具，仅适用于 Astra 策略搭配 Responses 协议。
+- 新增按路由声明的结构化输出。
 
 ### Breaking
 
-- 移除 Anchored Bootstrap 实验及其 `[experiments.anchored_bootstrap]` 配置段与 `/anchored` 命令；已启用该实验的配置需删除对应段落。
+- 移除 Anchored Bootstrap 实验及其 `[experiments.anchored_bootstrap]` 配置段与 `/anchored` 命令。
 
 ### Changed
 
-- 项目记忆改为按工作区路径隔离的独立记忆库：回合持久化后由后台增量提取并保存到配置目录的 SQLite，`memory__recall` 直接查询该库；首次启用只登记当前 journal 进度。
+- 请求兼容模式不再只改 transport metadata：Codex profile 下运行时上下文改写为与真实客户端同形的 `<environment_context>` user 块，消息条数保持不变。
+- 请求兼容模式在 Responses WebSocket 路径上附带 `OpenAI-Beta: responses_websockets=2026-02-06`；HTTP 路径不发送该头。
+- 项目记忆改为按工作区路径隔离的独立记忆库。
 - 历史回放校验复用已发布前缀的投影状态，仅在分支路径变化时重建。
-- 子代理运行状态改为只反映宿主事实：子代理自身给出的 `failed`、`blocked`、`changes_requested` 等判定原样保留在结构化结果中并交给父代理，不再被当作运行成功或失败；子代理卡片同时显示运行状态与该判定。
-- Historian 发布契约为「切点」：每个 episode 只声明左闭右开的 `end`，起始位置由宿主从前一段推导，首段必定从第 0 条消息开始，episode 之间不会出现空洞、重叠或空区间；未整理到 `source_count` 时保留为合法的部分整理。
+- 子代理运行状态改为只反映宿主事实。
 
 ### Fixed
 
@@ -32,10 +34,10 @@
 - 修复历史树投影遇到已应用的历史记录时崩溃的问题。
 - 修复流式工具调用被截断时仅剩推理内容的部分回复会写入历史的问题。
 - 修复声明 `json_schema` 结构化输出的路由上项目记忆抽取套用 Historian 发布 schema 的问题。
-- 修复 Historian 整理结果不符合发布契约时在同一历史前缀上反复自动重发、在上下文压力压缩中长时间等待后整轮失败、以及上游以 `context_too_large` 拒绝时无法收敛的问题：同一前缀失败后停止自动重发，`context_too_large` 时缩小本次整理的消息范围后重试，压缩直接带出失败原因。
-- 修复 Historian 整理失败时不留记录的问题：每次整理把请求规模（消息数、payload 字节数）、上游报告的输入输出 token、结果与拒绝原因记入子会话 transcript；被拒绝时保留响应（超长保留首尾），日志记录截断后的原始输出、JSON 出错位置附近的原文与覆盖类失败的响应末尾。
-- 修复 Historian 后台整理在子会话视图中不显示输出的问题：整理过程流式写入模型输出，产出报告后将该报告作为最后一条消息渲染出来。
-- 修复手动 `/compact` 期间无法切换到子代理视图的问题：子会话导航现在会在压缩进行中立即生效。
+- 修复 Historian 整理结果不符合发布契约时在同一历史前缀上反复自动重发、在上下文压力压缩中长时间等待后整轮失败、以及上游以 `context_too_large` 拒绝时无法收敛的问题。
+- 修复 Historian 整理失败时不留记录的问题。
+- 修复 Historian 后台整理在子会话视图中不显示输出的问题。
+- 修复手动 `/compact` 期间无法切换到子代理视图的问题。
 
 ## [0.11.0] - 2026-09-05
 
