@@ -38,6 +38,14 @@ pub(super) fn render_subagent_lines(
         .or_else(|| structured.as_ref().map(|result| result.status.as_str()))
         .map(str::to_owned)
         .unwrap_or_else(|| subagent_status_label(tool.status, translator));
+    // The run status is host-reported; the child's own verdict is separate and
+    // stays visible when it differs.
+    let status = match structured.as_ref() {
+        Some(result) if !result.status.is_empty() && result.status != status => {
+            format!("{status} · {}", result.status)
+        }
+        _ => status,
+    };
     let child_id = data
         .as_ref()
         .and_then(|data| data.get("child_session_id"))

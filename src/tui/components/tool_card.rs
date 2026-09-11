@@ -1079,6 +1079,44 @@ mod tests {
     }
 
     #[test]
+    fn subagent_card_shows_a_child_verdict_that_differs_from_the_run_status() {
+        let tool = ToolView {
+            call_id: "run-verdict".into(),
+            name: "agent__oracle".into(),
+            summary: "oracle completed".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "oracle",
+                        "status": "completed",
+                        "summary": "gate not passed",
+                        "child_session_id": "child-verdict",
+                        "structured_result": {
+                            "status": "changes_requested",
+                            "summary": "Gate1 not passed",
+                            "malformed": false,
+                            "run_id": "run-verdict",
+                            "child_session_id": "child-verdict"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered[0].contains("completed · changes_requested"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
     fn subagent_card_collapsed_and_expanded_render_all_structured_items() {
         let tool = ToolView {
             call_id: "run-expanded".into(),

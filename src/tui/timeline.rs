@@ -1969,6 +1969,7 @@ impl Timeline {
             "child_session_id": result.child_session_id,
             "agent_name": result.agent_name,
             "status": result.status.as_str(),
+            "failure_kind": result.failure_kind.map(|kind| kind.as_str()),
             "summary": result.summary,
             "structured_result": result.structured_result,
             "active": false,
@@ -3090,6 +3091,72 @@ mod tests {
             [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
                 if background.summary == "explorer running"
                     && waiting.summary == "wait completed"
+        ));
+    }
+
+    #[test]
+    fn finished_subagent_tool_output_keeps_the_host_failure_kind() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "background-call".into(),
+            name: "agent__fixer".into(),
+            summary: "apply fix in background".into(),
+            arguments: Some(json!({"task": "apply fix", "background": true}).to_string()),
+        });
+        timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "background-call".into(),
+            name: "agent__fixer".into(),
+            summary: "fixer running".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "agent__fixer",
+                    "data": {
+                        "run_id": "run-fk",
+                        "child_session_id": "child-fk",
+                        "agent_name": "fixer",
+                        "status": "running",
+                        "summary": "apply fix",
+                        "active": true,
+                        "background": true
+                    }
+                })
+                .to_string(),
+            ),
+        });
+        assert!(timeline.begin_subagent_wait("wait-call", "run-fk"));
+        let result = crate::subagent::SubagentRunSummary {
+            run_id: "run-fk".into(),
+            child_session_id: "child-fk".into(),
+            agent_name: "fixer".into(),
+            status: crate::subagent::SubagentStatus::Failed,
+            failure_kind: Some(crate::subagent::SubagentFailureKind::Logical),
+            summary: "out-of-scope changes detected".into(),
+            structured_result: crate::subagent::StructuredSubagentResult {
+                status: "failed".into(),
+                summary: "out-of-scope changes detected".into(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-fk".into(),
+                child_session_id: "child-fk".into(),
+                raw_excerpt: None,
+            },
+        };
+
+        assert!(timeline.finish_subagent_wait("wait-call", &result));
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
+                if background.summary == "fixer running"
+                    && waiting.output.as_deref().is_some_and(|output| output
+                        .contains("\"failure_kind\":\"logical\""))
         ));
     }
 

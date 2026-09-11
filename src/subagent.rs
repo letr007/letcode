@@ -666,7 +666,6 @@ base_url = "https://test.example.invalid/v1"
     fn structured_result_parser_preserves_object_shaped_validation_outcomes() {
         let result = StructuredSubagentResult::from_model_output(
             r#"{"status":"completed","summary":"done","validation":[{"command":"cargo test","result":"failed"},{"command":"cargo fmt","result":"not_run"}]}"#,
-            SubagentStatus::Completed,
             "run-1",
             "child-1",
         );
@@ -678,7 +677,7 @@ base_url = "https://test.example.invalid/v1"
     }
 
     #[test]
-    fn runtime_failures_are_classified_hard_and_model_failures_logical() {
+    fn runtime_failures_are_hard_and_model_verdicts_do_not_change_run_status() {
         let hard = build_runtime_summary(
             "run-1",
             "child-1",
@@ -686,7 +685,7 @@ base_url = "https://test.example.invalid/v1"
             SubagentStatus::Failed,
             "provider connection failed".into(),
         );
-        let logical = build_completed_summary(
+        let reported = build_completed_summary(
             "run-2",
             "child-2",
             "fixer",
@@ -694,7 +693,10 @@ base_url = "https://test.example.invalid/v1"
         );
 
         assert_eq!(hard.failure_kind, Some(SubagentFailureKind::Hard));
-        assert_eq!(logical.failure_kind, Some(SubagentFailureKind::Logical));
+        assert_eq!(reported.status, SubagentStatus::Completed);
+        assert_eq!(reported.failure_kind, None);
+        assert_eq!(reported.structured_result.status, "failed");
+        assert_eq!(reported.summary, "task requirements not met");
     }
 
     #[test]

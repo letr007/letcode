@@ -77,25 +77,19 @@ pub struct StructuredSubagentResult {
 }
 
 impl StructuredSubagentResult {
-    pub(crate) fn from_model_output(
-        raw: &str,
-        fallback_status: SubagentStatus,
-        run_id: &str,
-        child_session_id: &str,
-    ) -> Self {
+    pub(crate) fn from_model_output(raw: &str, run_id: &str, child_session_id: &str) -> Self {
         let candidate = extract_json_candidate(raw).unwrap_or(raw.trim());
         match serde_json::from_str::<Value>(candidate) {
             Ok(Value::Object(map)) => {
                 let value = Value::Object(map);
                 let findings = list_field(&value, "findings");
-                let summary = string_field(&value, "summary")
-                    .filter(|text| !text.is_empty())
+                let summary = summary_field(&value)
                     .or_else(|| findings.first().cloned())
                     .unwrap_or_else(|| excerpt(raw));
                 Self {
                     status: string_field(&value, "status")
                         .filter(|text| !text.is_empty())
-                        .unwrap_or_else(|| fallback_status.as_str().to_string()),
+                        .unwrap_or_else(|| SubagentStatus::Completed.as_str().to_string()),
                     summary,
                     malformed: false,
                     findings,
@@ -111,7 +105,7 @@ impl StructuredSubagentResult {
                 }
             }
             _ => Self {
-                status: fallback_status.as_str().to_string(),
+                status: SubagentStatus::Completed.as_str().to_string(),
                 summary: excerpt(raw),
                 malformed: true,
                 findings: Vec::new(),
@@ -166,21 +160,16 @@ pub(crate) fn build_completed_summary(
     agent_name: &str,
     message: String,
 ) -> SubagentRunSummary {
-    let structured_result = StructuredSubagentResult::from_model_output(
-        &message,
-        SubagentStatus::Completed,
-        run_id,
-        child_session_id,
-    );
-    let status = map_structured_status(&structured_result.status);
-    let failure_kind =
-        (status != SubagentStatus::Completed).then_some(SubagentFailureKind::Logical);
+    let structured_result =
+        StructuredSubagentResult::from_model_output(&message, run_id, child_session_id);
     SubagentRunSummary {
         run_id: run_id.to_string(),
         child_session_id: child_session_id.to_string(),
         agent_name: agent_name.to_string(),
-        status,
-        failure_kind,
+        // The child loop returned, so the run completed. The model's own verdict
+        // stays in `structured_result.status`; it is not a run lifecycle state.
+        status: SubagentStatus::Completed,
+        failure_kind: None,
         summary: structured_result.summary.clone(),
         structured_result,
     }
@@ -240,15 +229,7 @@ pub fn try_parse_structured_subagent_result(raw: &str) -> Option<StructuredSubag
     let value = serde_json::from_str::<Value>(candidate).ok()?;
     let object = structured_result_object(&value)?;
     let status = string_field(&Value::Object(object.clone()), "status")?;
-    let summary = string_field(&Value::Object(object.clone()), "summary").or_else(|| {
-        object
-            .get("summary")
-            .and_then(|summary| summary.get("conclusion"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|summary| !summary.is_empty())
-            .map(str::to_string)
-    })?;
+    let summary = summary_field(&Value::Object(object.clone()))?;
     const LIST_FIELDS: [&str; 7] = [
         "blockers",
         "findings",
@@ -291,6 +272,21 @@ fn structured_result_object(value: &Value) -> Option<&serde_json::Map<String, Va
     .flatten()
     .find(|object| {
         object.get("status").and_then(Value::as_str).is_some() && object.contains_key("summary")
+    })
+}
+
+/// `summary` is a string field, but the older contract allowed objects such as
+/// `{"conclusion": "..."}`. Read both shapes so the runtime and the transcript
+/// renderer agree on the same text.
+fn summary_field(value: &Value) -> Option<String> {
+    string_field(value, "summary").or_else(|| {
+        value
+            .get("summary")
+            .and_then(|summary| summary.get("conclusion"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string)
     })
 }
 
@@ -405,16 +401,5 @@ pub(crate) fn classify_failure_status(message: &str) -> SubagentStatus {
         SubagentStatus::BudgetExhausted
     } else {
         SubagentStatus::Failed
-    }
-}
-
-fn map_structured_status(status: &str) -> SubagentStatus {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "completed" | "succeeded" | "success" => SubagentStatus::Completed,
-        "cancelled" | "canceled" => SubagentStatus::Cancelled,
-        "timed_out" | "timed out" | "timeout" => SubagentStatus::TimedOut,
-        "budget_exhausted" | "budget exhausted" => SubagentStatus::BudgetExhausted,
-        "failed" | "error" | "blocked" => SubagentStatus::Failed,
-        _ => SubagentStatus::Completed,
     }
 }

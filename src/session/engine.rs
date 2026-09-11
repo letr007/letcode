@@ -2940,11 +2940,15 @@ pub(crate) fn format_background_subagent_completion(
     let structured = serde_json::to_string_pretty(&result.structured_result)
         .unwrap_or_else(|_| result.summary.clone());
     format!(
-        "A background subagent has completed.\n\nagent: {}\nrun_id: {}\nchild_session_id: {}\nstatus: {}\n\n{}\n\nContinue the user's task using this result. Do not repeat work already completed.",
+        "A background subagent has completed.\n\nagent: {}\nrun_id: {}\nchild_session_id: {}\nstatus: {}\nfailure_kind: {}\n\n{}\n\nContinue the user's task using this result. Do not repeat work already completed.",
         result.agent_name,
         result.run_id,
         result.child_session_id,
         result.status.as_str(),
+        result
+            .failure_kind
+            .map(|kind| kind.as_str())
+            .unwrap_or("none"),
         structured
     )
 }
