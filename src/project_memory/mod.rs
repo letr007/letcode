@@ -143,7 +143,11 @@ async fn process_pending(store: MemoryStore, helper: Agent) -> Result<()> {
             batches += 1;
             let (text, usage) = tokio::time::timeout(
                 Duration::from_secs(180),
-                helper.run_structured_oneshot(&batch.input, extract::structured_output),
+                helper.run_structured_oneshot(
+                    &batch.input,
+                    extract::structured_output,
+                    |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
+                ),
             )
             .await
             .context("project memory extraction timed out")??;

@@ -233,6 +233,7 @@ pub(crate) async fn finalize_report(
         .run_structured_oneshot(
             &crate::user_content::UserMessageContent::new(prompt, Vec::new()),
             structured_output,
+            |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
         )
         .await?;
     Ok(text)

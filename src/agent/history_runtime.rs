@@ -30,7 +30,11 @@ fn persisted_history_snapshot(agent: &Agent) -> Result<RuntimeSnapshot> {
     Ok(snapshot)
 }
 
-pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
+pub(super) fn work(
+    agent: &Agent,
+    manual: bool,
+    pass_limit: Option<usize>,
+) -> Result<Option<HistoryWork>> {
     let snapshot = persisted_history_snapshot(agent)?;
     let frames = snapshot.active_protocol_frames();
     let history = crate::protocol_frames::history_items_from_frames(&frames);
@@ -97,9 +101,22 @@ pub(super) fn work(agent: &Agent, manual: bool) -> Result<Option<HistoryWork>> {
             fact_tokens += cost;
         }
     }
+    // A provider rejection for an oversized request is authoritative: no later
+    // local preflight can prove the window is large enough, so bound the prefix
+    // by the last length this session has not yet seen rejected.
+    let mut end = cut.cut_end;
+    if let Some(limit) = pass_limit {
+        let requested = start.saturating_add(limit).min(cut.cut_end);
+        let capped = crate::protocol_frames::canonical_compaction_boundary_with_transcript(
+            &analysis,
+            requested,
+        )?;
+        if capped > start {
+            end = capped;
+        }
+    }
     // Use the configured Historian route's actual preparation budget. Never
     // retire a message which did not fit into the producer input.
-    let mut end = cut.cut_end;
     while end > start {
         let source_ids = frames[start..end]
             .iter()
@@ -366,7 +383,6 @@ where
                 agent.last_historian_work = Some(publication.id);
             }
             Ok(None) => {}
-            Err(error) if blocking => return Err(error),
             Err(error) => {
                 tracing::warn!(error=%error,"historian unavailable; raw context remains active")
             }
@@ -388,16 +404,23 @@ where
         return Ok(false);
     }
     if let Some(runtime) = &runtime {
-        if !runtime.is_running() {
-            let Some(work) = work(agent, manual)? else {
-                return Ok(false);
-            };
-            if !blocking && agent.last_historian_work.as_ref() == Some(&work.id) {
-                return Ok(false);
-            }
-            runtime.start(agent, work)?;
-        }
         if !blocking {
+            if let Some(failure) = runtime.failure()
+                && failure.oversized
+            {
+                runtime.reduce_pass_limit(failure.source_len);
+            }
+            if !runtime.is_running() {
+                let Some(work) = work(agent, manual, runtime.pass_limit())? else {
+                    return Ok(false);
+                };
+                if agent.last_historian_work.as_ref() == Some(&work.id)
+                    || runtime.failed_for(&work.id)
+                {
+                    return Ok(false);
+                }
+                runtime.start(agent, work)?;
+            }
             return Ok(false);
         }
         let session = agent
@@ -407,25 +430,65 @@ where
             .unwrap_or_default();
         let branch = agent.runtime_snapshot.active_context.branch_id.clone();
         let revision = agent.runtime_snapshot.context_scope_revision;
-        tokio::time::timeout(std::time::Duration::from_secs(610), async {
-            loop {
-                if let Some(publication) = runtime.poll(&session, &branch, revision)? {
-                    agent.last_historian_work = Some(publication.id);
-                    return Ok::<_, anyhow::Error>(());
+        // A provider rejection for an oversized request is authoritative: the
+        // declared window cannot be trusted, so shrink the prefix and retry
+        // within this bounded preparation round rather than failing the turn.
+        let mut shrink_rounds = 0u8;
+        loop {
+            if !runtime.is_running() {
+                if let Some(failure) = runtime.failure()
+                    && failure.oversized
+                {
+                    runtime.reduce_pass_limit(failure.source_len);
                 }
-                if !runtime.is_running() {
-                    anyhow::bail!("historian stopped before publishing");
+                let Some(work) = work(agent, manual, runtime.pass_limit())? else {
+                    return Ok(false);
+                };
+                if runtime.failed_for(&work.id) {
+                    let detail = runtime
+                        .failure()
+                        .map(|failure| failure.message)
+                        .unwrap_or_else(|| "unknown failure".to_string());
+                    anyhow::bail!("historian history preparation failed: {detail}");
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                runtime.start(agent, work)?;
             }
-        })
-        .await
-        .map_err(|_| anyhow!("historian completion timed out"))??;
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(610), async {
+                loop {
+                    if let Some(publication) = runtime.poll(&session, &branch, revision)? {
+                        return Ok::<_, anyhow::Error>(publication);
+                    }
+                    if !runtime.is_running() {
+                        anyhow::bail!("historian stopped before publishing");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow!("historian completion timed out"))?;
+            match outcome {
+                Ok(publication) => {
+                    agent.last_historian_work = Some(publication.id);
+                    break;
+                }
+                Err(error) => {
+                    let oversized = runtime.failure().is_some_and(|failure| failure.oversized);
+                    if oversized && shrink_rounds < 6 {
+                        if let Some(failure) = runtime.failure() {
+                            runtime.reduce_pass_limit(failure.source_len);
+                        }
+                        shrink_rounds += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         agent.reload_runtime_snapshot_from_provider()?;
     } else {
         // Child-session and direct runner paths use the same producer contract
         // synchronously, without constructing recursive Historian sessions.
-        let Some(work) = work(agent, manual)? else {
+        let Some(work) = work(agent, manual, None)? else {
             return Ok(false);
         };
         let helper = AgentFactory::create_child_with_route_and_max_tool_calls(
@@ -435,7 +498,11 @@ where
             false,
             Some(0),
         )?;
-        let (raw, _) = helper.run_historian(&work.input).await?;
+        let (raw, _) = helper
+            .run_historian(&work.input, |_: &str| {
+                std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(()))
+            })
+            .await?;
         let mut publication =
             crate::historian::parse_publication(&work.id, &work.source_ids, &raw)?;
         publication.project_path = Some(work.project_path.clone());
@@ -582,7 +649,7 @@ max_output_tokens=4096
             let pool=crate::subagent::SubagentPool::new();
             let runtime=Arc::new(crate::session::historian::HistorianRuntime::new(pool.clone(),directory.path().into(),recorder.clone(),tx));
             agent.historian_runtime=Some(runtime.clone());
-            let first_work = work(&agent, true).unwrap().unwrap();
+            let first_work = work(&agent, true, None).unwrap().unwrap();
             let first_work_id = first_work.id.clone();
             runtime.start(&agent, first_work).unwrap();
             assert!(runtime.is_running());
@@ -635,7 +702,7 @@ max_output_tokens=4096
             assert_eq!(restored_selection.baseline.len(),1,"a larger budget may restore archived tiers without an LLM call");
             events(AgentEvent::HistoryApplied {application:restored_selection,revision:0,blocking:false}).await.unwrap();
             agent.reload_runtime_snapshot_from_provider().unwrap();
-            let second_work = work(&agent, true).unwrap().unwrap();
+            let second_work = work(&agent, true, None).unwrap().unwrap();
             let second_work_id = second_work.id.clone();
             let observed = recorder.clone();
             let mut events = move |event| {
@@ -666,7 +733,7 @@ max_output_tokens=4096
                 "cancelled work must not be recorded as successful"
             );
 
-            let retry_work = work(&agent, true).unwrap().unwrap();
+            let retry_work = work(&agent, true, None).unwrap().unwrap();
             assert_eq!(retry_work.id, second_work_id);
             let observed = recorder.clone();
             let mut events = move |event| {
@@ -1132,7 +1199,7 @@ max_output_tokens=128
         let before = agent.runtime_snapshot.clone();
         let frontier = agent.protocol_append_state.frontier_token();
         let generation = agent.protocol_append_state.generation();
-        let prepared = work(&agent, true).unwrap().unwrap();
+        let prepared = work(&agent, true, None).unwrap().unwrap();
         assert_eq!(
             agent.runtime_snapshot, before,
             "background preparation must not install a different runtime"
@@ -1189,7 +1256,7 @@ max_output_tokens=128
             agent.active_history_items().last(),
             Some(&tail.last().unwrap().item)
         );
-        let second = work(&agent, true).unwrap().unwrap();
+        let second = work(&agent, true, None).unwrap().unwrap();
         let publication = crate::historian::parse_publication(&second.id, &second.source_ids,
             &serde_json::json!({"compartments":[{"start":0,"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}],"facts":[],"unprocessed_from":null}).to_string()).unwrap();
         recorder
@@ -1287,7 +1354,7 @@ max_output_tokens=128
                 "branch" => agent.runtime_snapshot.active_context.branch_id = "other".into(),
                 _ => agent.runtime_snapshot.context_scope_revision += 1,
             }
-            let error = work(&agent, true)
+            let error = work(&agent, true, None)
                 .err()
                 .expect("scope mismatch")
                 .to_string();

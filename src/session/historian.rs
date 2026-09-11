@@ -2,9 +2,11 @@
 //! execution boundary as reviewer; only the host publishes validated artifacts.
 use crate::agent::{Agent, SubagentInvocation};
 use crate::context_history::HistoryPublication;
+use crate::model_runtime::ModelFailure;
 use crate::session::runner::{
     SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
 };
+use crate::session::{AssistantDeltaEvent, SessionEvent};
 use crate::subagent::{SubagentPool, SubagentStatus};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{TranscriptEvent, TranscriptRecorder};
@@ -26,18 +28,37 @@ pub(crate) struct HistoryWork {
 }
 struct Pending {
     run_id: String,
+    work_id: String,
+    source_len: usize,
     session_id: String,
     branch_id: String,
     revision: u64,
     receiver: oneshot::Receiver<Result<HistoryPublication>>,
     cancelled: Arc<Mutex<bool>>,
 }
+
+/// Terminal outcome of the most recent Historian attempt. The host keeps this so
+/// an identical source prefix is not re-dispatched at every later request
+/// boundary, and so an oversized prefix can shrink instead of failing forever.
+#[derive(Clone)]
+pub(crate) struct HistorianFailure {
+    pub work_id: String,
+    pub source_len: usize,
+    pub message: String,
+    pub oversized: bool,
+}
+
 pub(crate) struct HistorianRuntime {
     pool: SubagentPool,
     sessions_dir: std::path::PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: SessionTransportEventSender,
     pending: Mutex<Option<Pending>>,
+    /// Last terminal failure, cleared by the next successful publication.
+    failure: Mutex<Option<HistorianFailure>>,
+    /// Largest source prefix this session has not yet seen rejected as oversized.
+    /// Only ever reduced within a session, so discovery work is not repeated.
+    pass_limit: Mutex<Option<usize>>,
 }
 impl HistorianRuntime {
     pub(crate) fn new(
@@ -52,6 +73,45 @@ impl HistorianRuntime {
             transcript,
             event_tx,
             pending: Mutex::new(None),
+            failure: Mutex::new(None),
+            pass_limit: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn failure(&self) -> Option<HistorianFailure> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    pub(crate) fn pass_limit(&self) -> Option<usize> {
+        self.pass_limit.lock().ok().and_then(|limit| *limit)
+    }
+
+    pub(crate) fn failed_for(&self, work_id: &str) -> bool {
+        self.failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.as_ref().map(|failure| failure.work_id == work_id))
+            .unwrap_or(false)
+    }
+
+    fn record_failure(&self, failure: HistorianFailure) {
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = Some(failure);
+        }
+    }
+
+    fn clear_failure(&self) {
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Halve the accepted prefix length after an oversized rejection. Takes the
+    /// minimum so repeated observations of one failure stay idempotent.
+    pub(crate) fn reduce_pass_limit(&self, source_len: usize) {
+        let reduced = (source_len / 2).max(1);
+        if let Ok(mut limit) = self.pass_limit.lock() {
+            *limit = Some(limit.map_or(reduced, |current| current.min(reduced)));
         }
     }
 
@@ -124,6 +184,8 @@ impl HistorianRuntime {
         let cancelled = Arc::new(Mutex::new(false));
         *pending = Some(Pending {
             run_id,
+            work_id: work.id.clone(),
+            source_len: work.source_ids.len(),
             session_id: work.session_id.clone(),
             branch_id: work.branch_id.clone(),
             revision: work.revision,
@@ -144,27 +206,60 @@ impl HistorianRuntime {
             let source_session_id = work.session_id.clone();
             let source_branch_id = work.branch_id.clone();
             let input = work.input.clone();
-            let result = pool.complete_started_run_with_executor(started, move |agent, _, child, _, _, _| {
+            let delta_tx = event_tx.clone();
+            let result = pool.complete_started_run_with_executor(started, move |agent, _, child, _, child_session_id, _| {
                 async move {
                     child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_user_message(format!("Historian · {} history items\n\nModel: {}", source_ids.len(), agent.model()))?;
                     let started_at = std::time::Instant::now();
-                    let (raw, usage) = agent.run_historian(&input).await?;
-                    let mut publication = crate::historian::parse_publication(&publication_id, &source_ids, &raw)?;
-                    publication.project_path = Some(project_path);
-                    publication.external_fact_ids = external_fact_ids;
-                    let report = crate::historian::HistorianReport {
-                        kind: crate::historian::HistorianReportKind::Prepared,
-                        publication: publication.clone(),
-                        source_session_id,
-                        source_branch_id,
-                        model: agent.model().to_string(),
-                        elapsed_ms: started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                        usage,
+                    // Provisional text is surfaced on the existing child-session
+                    // channel. A retried attempt starts a new observation, so the
+                    // child view treats it as a separate message.
+                    let delta_sender = delta_tx.clone();
+                    let delta_child = child_session_id.clone();
+                    let on_delta = move |delta: &str| {
+                        let _ = delta_sender.send(SessionTransportEvent::ChildSessionEvent {
+                            child_session_id: delta_child.clone(),
+                            agent_name: Some("historian".to_string()),
+                            parent_tool_call_id: None,
+                            event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+                        });
+                        std::future::ready(Ok::<(), ModelFailure>(()))
                     };
-                    child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(serde_json::to_string(&report)?)?;
-                    let summary = serde_json::json!({"status":"completed","summary":format!("Prepared {} history episodes",publication.compartments.len())}).to_string();
-                    *produced_child.lock().map_err(|_| anyhow!("historian result poisoned"))? = Some(publication);
-                    Ok(summary)
+                    let outcome = async {
+                        let (raw, usage) = agent.run_historian(&input, on_delta).await?;
+                        let mut publication = crate::historian::parse_publication(&publication_id, &source_ids, &raw)?;
+                        publication.project_path = Some(project_path);
+                        publication.external_fact_ids = external_fact_ids;
+                        let report = crate::historian::HistorianReport {
+                            kind: crate::historian::HistorianReportKind::Prepared,
+                            publication: publication.clone(),
+                            source_session_id,
+                            source_branch_id,
+                            model: agent.model().to_string(),
+                            elapsed_ms: started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                            usage,
+                        };
+                        child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(serde_json::to_string(&report)?)?;
+                        let summary = serde_json::json!({"status":"completed","summary":format!("Prepared {} history episodes",publication.compartments.len())}).to_string();
+                        *produced_child.lock().map_err(|_| anyhow!("historian result poisoned"))? = Some(publication);
+                        Ok(summary)
+                    }
+                    .await;
+                    // Finalize the child view stream for every outcome; the host
+                    // reports failure separately through HistorianStatus.
+                    let _ = delta_tx.send(SessionTransportEvent::ChildSessionEvent {
+                        child_session_id: child_session_id.clone(),
+                        agent_name: Some("historian".to_string()),
+                        parent_tool_call_id: None,
+                        event: SessionEvent::AssistantDone { message_id: None },
+                    });
+                    let _ = delta_tx.send(SessionTransportEvent::ChildSessionEvent {
+                        child_session_id,
+                        agent_name: Some("historian".to_string()),
+                        parent_tool_call_id: None,
+                        event: SessionEvent::Done,
+                    });
+                    outcome
                 }.boxed()
             }).await;
             let result = (|| -> Result<HistoryPublication> {
@@ -245,8 +340,25 @@ impl HistorianRuntime {
         }
         match job.receiver.try_recv() {
             Ok(result) => {
+                let work_id = job.work_id.clone();
+                let source_len = job.source_len;
                 *guard = None;
-                result.map(Some)
+                match result {
+                    Ok(publication) => {
+                        self.clear_failure();
+                        Ok(Some(publication))
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        self.record_failure(HistorianFailure {
+                            work_id,
+                            source_len,
+                            oversized: crate::historian::is_context_overflow(&message),
+                            message,
+                        });
+                        Err(error)
+                    }
+                }
             }
             Err(oneshot::error::TryRecvError::Empty) => Ok(None),
             Err(oneshot::error::TryRecvError::Closed) => {
@@ -266,5 +378,57 @@ impl Drop for HistorianRuntime {
             }
             self.pool.cancel_run(&job.run_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(dir: &std::path::Path) -> HistorianRuntime {
+        let recorder = TranscriptRecorder::create(dir).expect("recorder");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        HistorianRuntime::new(
+            SubagentPool::new(),
+            dir.to_path_buf(),
+            Arc::new(Mutex::new(recorder)),
+            event_tx,
+        )
+    }
+
+    #[test]
+    fn pass_limit_only_shrinks_as_oversized_rejections_repeat() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime = runtime(dir.path());
+        assert_eq!(runtime.pass_limit(), None);
+        runtime.reduce_pass_limit(600);
+        assert_eq!(runtime.pass_limit(), Some(300));
+        runtime.reduce_pass_limit(600);
+        assert_eq!(runtime.pass_limit(), Some(300));
+        runtime.reduce_pass_limit(80);
+        assert_eq!(runtime.pass_limit(), Some(40));
+        runtime.reduce_pass_limit(1);
+        assert_eq!(runtime.pass_limit(), Some(1));
+    }
+
+    #[test]
+    fn failure_tracking_is_scoped_to_the_failed_work_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime = runtime(dir.path());
+        assert!(!runtime.failed_for("work-1"));
+        runtime.record_failure(HistorianFailure {
+            work_id: "work-1".into(),
+            source_len: 600,
+            message: "cancelled".into(),
+            oversized: false,
+        });
+        assert!(runtime.failed_for("work-1"));
+        assert!(!runtime.failed_for("work-2"));
+        assert_eq!(
+            runtime.failure().map(|failure| failure.source_len),
+            Some(600)
+        );
+        runtime.clear_failure();
+        assert!(runtime.failure().is_none());
     }
 }

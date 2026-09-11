@@ -2959,26 +2959,38 @@ impl Agent {
         }
     }
 
-    pub(crate) async fn run_historian(
+    pub(crate) async fn run_historian<F, Fut>(
         &self,
         user_input: &UserMessageContent,
-    ) -> Result<(String, Vec<crate::historian::UsageUpdate>)> {
-        self.run_structured_oneshot(user_input, crate::historian::structured_output)
+        on_delta: F,
+    ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
+    where
+        F: FnMut(&str) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
+    {
+        self.run_structured_oneshot(user_input, crate::historian::structured_output, on_delta)
             .await
     }
 
     /// One non-tool model call whose structured-output contract is chosen by the
     /// caller from the route's declared capability. A route that declares no
     /// structured-output support keeps the caller's prompt-only contract.
-    pub(crate) async fn run_structured_oneshot<F>(
+    ///
+    /// `on_delta` receives provisional text from every attempt; a retried
+    /// attempt starts a fresh observation, so callers that display deltas must
+    /// treat a retry as a new message rather than appended text.
+    pub(crate) async fn run_structured_oneshot<C, F, Fut>(
         &self,
         user_input: &UserMessageContent,
-        contract: F,
+        contract: C,
+        on_delta: F,
     ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
     where
-        F: FnOnce(
+        C: FnOnce(
             Option<crate::model_runtime::StructuredOutputSupport>,
         ) -> Option<crate::model_runtime::StructuredOutput>,
+        F: FnMut(&str) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
     {
         let route = self
             .resolved_model_route()
@@ -2992,12 +3004,7 @@ impl Agent {
             structured_output.as_ref(),
         )?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
-            .execute_text_oneshot_with_usage(
-                route,
-                &input,
-                |_| async { Ok(()) },
-                || async { Ok(()) },
-            )
+            .execute_text_oneshot_with_usage(route, &input, on_delta, || async { Ok(()) })
             .await
             .map_err(anyhow::Error::new)?;
         Ok((

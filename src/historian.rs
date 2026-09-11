@@ -115,7 +115,44 @@ struct Episode {
     compact: String,
     anchor: String,
 }
+/// True when a failed Historian request was rejected for exceeding the model
+/// window. The host cannot fit such a request any better than the provider, so
+/// the caller must shrink the source prefix instead of retrying it unchanged.
+pub(crate) fn is_context_overflow(message: &str) -> bool {
+    message.contains("context_too_large")
+}
+
+/// Characters of a rejected response kept for diagnosis. The full payload is not
+/// persisted anywhere else, so a bounded excerpt is the only way to tell a model
+/// contract violation apart from a wire-level default.
+const RAW_EXCERPT_CHARS: usize = 4_000;
+
 pub(crate) fn parse_publication(
+    id: &str,
+    source_ids: &[String],
+    text: &str,
+) -> Result<HistoryPublication> {
+    match parse_publication_inner(id, source_ids, text) {
+        Ok(publication) => Ok(publication),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                raw = %raw_excerpt(text),
+                "historian publication rejected"
+            );
+            Err(error)
+        }
+    }
+}
+
+fn raw_excerpt(text: &str) -> String {
+    match text.char_indices().nth(RAW_EXCERPT_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+fn parse_publication_inner(
     id: &str,
     source_ids: &[String],
     text: &str,
@@ -504,5 +541,22 @@ mod tests {
         assert_eq!(schema.name, "historian_publication");
         assert!(schema.strict);
         assert_strict_schema(&schema.schema);
+    }
+
+    #[test]
+    fn context_overflow_detection_matches_provider_size_rejections() {
+        assert!(is_context_overflow(
+            "model Http failure during Decode, code context_too_large, retry hint Never"
+        ));
+        assert!(!is_context_overflow("historian produced no completed work"));
+    }
+
+    #[test]
+    fn raw_excerpt_is_bounded_without_truncating_characters() {
+        let long: String = "汉".repeat(RAW_EXCERPT_CHARS + 10);
+        let excerpt = raw_excerpt(&long);
+        assert!(excerpt.ends_with('…'));
+        assert_eq!(excerpt.chars().filter(|c| *c == '汉').count(), RAW_EXCERPT_CHARS);
+        assert_eq!(raw_excerpt("short"), "short");
     }
 }
