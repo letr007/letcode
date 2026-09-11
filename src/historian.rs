@@ -126,6 +126,10 @@ pub(crate) fn is_context_overflow(message: &str) -> bool {
 /// persisted anywhere else, so a bounded excerpt is the only way to tell a model
 /// contract violation apart from a wire-level default.
 const RAW_EXCERPT_CHARS: usize = 4_000;
+/// Characters kept on either side of a JSON syntax error. A malformed response
+/// fails deep inside the document, where a head excerpt no longer reaches, so
+/// the bytes around the reported position are the only visible evidence.
+const RAW_WINDOW_CHARS: usize = 600;
 
 pub(crate) fn parse_publication(
     id: &str,
@@ -135,11 +139,20 @@ pub(crate) fn parse_publication(
     match parse_publication_inner(id, source_ids, text) {
         Ok(publication) => Ok(publication),
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                raw = %raw_excerpt(text),
-                "historian publication rejected"
-            );
+            match error.downcast_ref::<serde_json::Error>() {
+                Some(json) => tracing::warn!(
+                    error = %error,
+                    line = json.line(),
+                    column = json.column(),
+                    raw = %raw_syntax_window(text, json.line(), json.column()),
+                    "historian publication rejected"
+                ),
+                None => tracing::warn!(
+                    error = %error,
+                    raw = %raw_excerpt(text),
+                    "historian publication rejected"
+                ),
+            }
             Err(error)
         }
     }
@@ -150,6 +163,37 @@ fn raw_excerpt(text: &str) -> String {
         Some((end, _)) => format!("{}…", &text[..end]),
         None => text.to_string(),
     }
+}
+
+fn raw_syntax_window(text: &str, line: usize, column: usize) -> String {
+    let mut offset = line_start_offset(text, line) + column.saturating_sub(1);
+    offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .nth(RAW_WINDOW_CHARS)
+        .map_or(0, |(index, _)| index);
+    let end = text[offset..]
+        .char_indices()
+        .nth(RAW_WINDOW_CHARS)
+        .map_or(text.len(), |(index, _)| offset + index);
+    format!("…{}…", &text[start..end])
+}
+
+/// Byte offset where `line` starts. `serde_json` reports columns as byte
+/// offsets within the line, so the two must be added in bytes.
+fn line_start_offset(text: &str, line: usize) -> usize {
+    let mut offset = 0;
+    for _ in 1..line {
+        match text[offset..].find('\n') {
+            Some(index) => offset += index + 1,
+            None => return text.len(),
+        }
+    }
+    offset
 }
 
 fn parse_publication_inner(
@@ -558,5 +602,23 @@ mod tests {
         assert!(excerpt.ends_with('…'));
         assert_eq!(excerpt.chars().filter(|c| *c == '汉').count(), RAW_EXCERPT_CHARS);
         assert_eq!(raw_excerpt("short"), "short");
+    }
+
+    #[test]
+    fn syntax_window_reaches_an_error_past_the_head_excerpt() {
+        // A missing comma after a long string value: the head excerpt is already
+        // exhausted by the filler, so only the window around the error can show it.
+        let filler = "汉".repeat(RAW_EXCERPT_CHARS);
+        let text =
+            format!("{{\"compartments\":[{{\"detailed\":\"{filler}\" \"compact\":\"x\"}}]}}");
+        let error = parse_publication("p", &["raw:1".into()], &text)
+            .expect_err("missing comma must be rejected");
+        let json = error
+            .downcast_ref::<serde_json::Error>()
+            .expect("a syntax error is a json error");
+        let window = raw_syntax_window(&text, json.line(), json.column());
+        assert!(window.contains("compact"), "window missed the error: {window}");
+        assert!(window.chars().count() <= RAW_WINDOW_CHARS * 2 + 2);
+        assert!(!window.contains("compartments"), "window was not centered");
     }
 }
