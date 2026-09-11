@@ -23,6 +23,70 @@ Use only supplied source IDs. Keep each memory concise and independently underst
 Output JSON only:
 {"memories":[{"kind":"decision|validation|diagnostic|experiment_result","title":"...","summary":"...","status":"useful|active|blocked|dead_end","source_ids":["raw:12"],"paths":["src/example.rs"],"supersedes":[]}],"withdrawn_ids":[]}"#;
 
+/// JSON-only or schema-enforced memory contract. The prompt carries the memory
+/// shape and `parse_update` validates it; the historian publication schema does
+/// not apply to this call.
+pub(crate) fn structured_output(
+    support: Option<crate::model_runtime::StructuredOutputSupport>,
+) -> Option<crate::model_runtime::StructuredOutput> {
+    use crate::model_runtime::{StructuredOutput, StructuredOutputSupport};
+    match support {
+        Some(StructuredOutputSupport::JsonSchema) => {
+            Some(StructuredOutput::JsonSchema(memory_schema()))
+        }
+        Some(StructuredOutputSupport::JsonObject) => Some(StructuredOutput::JsonObject),
+        None => None,
+    }
+}
+
+/// Strict-mode subset: every object lists all its properties as required and
+/// sets `additionalProperties: false`.
+fn memory_schema() -> crate::model_runtime::StructuredOutputSchema {
+    crate::model_runtime::StructuredOutputSchema {
+        name: "project_memory_update".into(),
+        strict: true,
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["decision", "validation", "diagnostic", "experiment_result"]
+                            },
+                            "title": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["useful", "active", "blocked", "dead_end"]
+                            },
+                            "source_ids": {"type": "array", "items": {"type": "string"}},
+                            "paths": {"type": "array", "items": {"type": "string"}},
+                            "supersedes": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": [
+                            "kind",
+                            "title",
+                            "summary",
+                            "status",
+                            "source_ids",
+                            "paths",
+                            "supersedes"
+                        ],
+                        "additionalProperties": false
+                    }
+                },
+                "withdrawn_ids": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["memories", "withdrawn_ids"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExtractionBatch {
     pub end_sequence: u64,
@@ -435,6 +499,32 @@ mod tests {
         assert_eq!(batch.end_sequence, 4);
         assert_eq!(batch.source_ids, vec!["raw:3", "raw:4"]);
         assert!(!batch.input.text.contains("old"));
+    }
+
+    #[test]
+    fn declared_structured_output_uses_the_memory_contract() {
+        use crate::model_runtime::{StructuredOutput, StructuredOutputSupport};
+
+        assert!(structured_output(None).is_none());
+        assert_eq!(
+            structured_output(Some(StructuredOutputSupport::JsonObject)),
+            Some(StructuredOutput::JsonObject)
+        );
+        let Some(StructuredOutput::JsonSchema(schema)) =
+            structured_output(Some(StructuredOutputSupport::JsonSchema))
+        else {
+            panic!("json_schema support must request an enforced schema");
+        };
+        assert!(schema.strict);
+        assert_eq!(schema.schema["additionalProperties"], false);
+        assert_eq!(
+            schema.schema["required"],
+            json!(["memories", "withdrawn_ids"])
+        );
+        assert!(
+            schema.schema["properties"].get("compartments").is_none(),
+            "the memory contract must not reuse the historian publication schema"
+        );
     }
 
     #[test]

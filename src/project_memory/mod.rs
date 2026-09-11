@@ -141,8 +141,12 @@ async fn process_pending(store: MemoryStore, helper: Agent) -> Result<()> {
             let (known, batch) = prepared?;
             let Some(batch) = batch else { return Ok(()); };
             batches += 1;
-            let (text, usage) = tokio::time::timeout(Duration::from_secs(180), helper.run_historian(&batch.input))
-                .await.context("project memory extraction timed out")??;
+            let (text, usage) = tokio::time::timeout(
+                Duration::from_secs(180),
+                helper.run_structured_oneshot(&batch.input, extract::structured_output),
+            )
+            .await
+            .context("project memory extraction timed out")??;
             let update = extract::parse_update(&text, &batch, &known)?;
             let ids = known.iter().map(|record| record.id.clone()).collect::<Vec<_>>();
             let commit_store = store.clone();
