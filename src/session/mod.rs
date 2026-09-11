@@ -43,7 +43,7 @@ pub mod settings;
 
 #[cfg(test)]
 pub(crate) use child_view::project_parent_session_view;
-pub use child_view::{current_session_records, list_child_sessions_for_view};
+pub use child_view::current_session_records;
 pub(crate) use command::ActiveTurnCommandDisposition;
 pub use command::SessionCommand;
 pub use context_scope::sync_agent_context_scope_from_recorder;

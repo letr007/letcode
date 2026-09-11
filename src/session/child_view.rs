@@ -41,14 +41,6 @@ pub struct ChildViewProjection {
     pub runtime_context: RuntimeActiveContext,
 }
 
-/// List child sessions with stable pool ordinal synthesis for navigation UIs.
-pub fn list_child_sessions_for_view(
-    sessions_dir: impl AsRef<Path>,
-    parent_records: &[TranscriptRecord],
-) -> Vec<ChildSessionSummary> {
-    SubagentPool::child_sessions(sessions_dir, parent_records)
-}
-
 /// Resolve which child index to open for a navigation command.
 pub fn select_child_navigation_index(
     children: &[ChildSessionSummary],
@@ -136,28 +128,6 @@ pub fn project_parent_session_view(
         snapshot,
         runtime_context,
     })
-}
-
-/// Select and project a child session view package for navigation.
-///
-/// Returns `Ok(None)` when the parent has no child transcripts.
-pub fn project_child_session_view(
-    sessions_dir: impl AsRef<Path>,
-    parent_session_id: impl Into<String>,
-    parent_records: &[TranscriptRecord],
-    navigation: ChildNavigation,
-    anchor_child_session_id: Option<&str>,
-) -> Result<Option<ChildViewProjection>> {
-    let sessions_dir = sessions_dir.as_ref();
-    let parent_session_id = parent_session_id.into();
-    let children = list_child_sessions_for_view(sessions_dir, parent_records);
-    project_child_session_view_with_children(
-        sessions_dir,
-        parent_session_id,
-        children,
-        navigation,
-        anchor_child_session_id,
-    )
 }
 
 /// Project a child view while discovering parent children from a streaming scan.

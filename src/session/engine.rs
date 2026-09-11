@@ -1014,7 +1014,7 @@ async fn refresh_visible_child_session_view(
                 return;
             }
         };
-    let children = crate::session::list_child_sessions_for_view(sessions_dir, &parent_records);
+    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
     let Some((index, child)) = children
         .iter()
         .enumerate()
