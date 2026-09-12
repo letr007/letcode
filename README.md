@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/letr007/letcode/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/letr007/letcode/test.yml?branch=main&style=flat-square" alt="Test"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-0.11.0-informational?style=flat-square" alt="Changelog"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-0.12.0-informational?style=flat-square" alt="Changelog"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue?style=flat-square" alt="MIT License | Apache-2.0 License"></a>
 </p>
 
@@ -173,6 +173,7 @@ path = "responses"
 display = "GPT-5.5"
 # protocol = "completions" # overrides the provider protocol
 # flavor = "standard" # overrides the provider flavor; deepseek selects the explicit DeepSeek profile
+# strategy = "astra" # default | astra; inferred from the model name when omitted
 # context_window = 400000
 # effective_input_limit_tokens = 256000
 
@@ -211,6 +212,7 @@ reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto" # auto | concise | detailed
 text_verbosity = "medium" # low | medium | high
 parallel_tool_calls = true
+# async_tools = ["web__fetch"] # tool names; Astra strategy with the responses protocol and capabilities.tools = true
 
 [providers.openai.models."gpt-5.5".cache]
 enabled = false
@@ -222,6 +224,35 @@ enabled = false
 # anthropic_thinking = { mode = "adaptive" }
 # anthropic_betas = ["context-1m-2025-08-07"]
 [providers.openai.models."gpt-5.5".protocol_settings]
+
+# Request-compatibility values; whether they are used is decided per session by /fake.
+# [fake.identity]
+# installation_id = "00000000-0000-4000-8000-000000000000" # generated and persisted when omitted
+# agent_name = "Hypatia" # not reported when omitted
+# [fake.clock]
+# timezone = "Asia/Shanghai" # IANA name; read from the host when omitted
+# date = "2026-09-12" # resolved from the local clock in that zone when omitted
+# [fake.client]
+# version = "0.153.4"
+# originator = "Codex Desktop"
+# os = "Mac OS 26.4.1"
+# arch = "aarch64"
+# terminal = "Apple_Terminal"
+# beta_features = ["remote_compaction_v2"]
+# [fake.environment]
+# sandbox = "none"
+# sandbox_mode = "danger-full-access"
+# auto_review_enabled = false
+# node_repl_auto_review_required = false
+# node_repl_disabled = false
+# cwd = "/Users/me/project"
+# workspace = "/Users/me/project"
+# shell = "zsh"
+# git_commit_hash = "1f0c3a2"
+# git_remote_url = "git@github.com:owner/repo.git"
+# git_has_changes = false
+# [fake.extra] # free-form; at most 16 entries
+# custom_flag = "1"
 ```
 
 Provider credentials can use `credential_env` or the default environment variable named from the provider, for example `OPENAI_API_KEY`; endpoint URLs and protocol-specific paths are configured under `endpoints`.

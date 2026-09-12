@@ -140,6 +140,7 @@ base_url = "https://api.openai.com/v1"
 display = "GPT-5.5"
 # protocol = "completions"        # 可选：覆盖 provider protocol
 # flavor = "standard"             # 可选：覆盖 provider flavor
+# strategy = "astra"              # default | astra；省略时按模型名自动识别
 # model_override = "wire-model-id"
 # context_window = 400000
 # effective_input_limit_tokens = 256000
@@ -169,6 +170,7 @@ reasoning_summary = true
 text_verbosity = true
 parallel_tool_calls = true
 priority_service = false
+# structured_output = "json_schema"  # json_object | json_schema
 
 [providers.openai.models."gpt-5.5".generation]
 max_output_tokens = 128000
@@ -177,6 +179,7 @@ reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto"        # auto|concise|detailed
 text_verbosity = "medium"         # low|medium|high
 parallel_tool_calls = true
+# async_tools = ["web__fetch"]   # 异步工具名；仅 Astra 策略 + Responses，且需 capabilities.tools = true
 # temperature = 0.2
 # top_p = 1.0
 
@@ -190,6 +193,35 @@ namespace = "my-cache"
 [providers.openai.models."gpt-5.5".protocol_settings]
 # anthropic_thinking = { mode = "adaptive" }
 # anthropic_betas = ["context-1m-2025-08-07"]
+
+# 请求兼容模式；是否启用由会话内 /fake 决定。
+# [fake.identity]
+# installation_id = "00000000-0000-4000-8000-000000000000"  # 省略则生成并持久化
+# agent_name = "Hypatia"                 # 省略则不上报
+# [fake.clock]
+# timezone = "Asia/Shanghai"             # IANA 名
+# date = "2026-09-12"                    # 省略则按本机时钟在该时区换算
+# [fake.client]
+# version = "0.153.4"
+# originator = "Codex Desktop"
+# os = "Mac OS 26.4.1"
+# arch = "aarch64"
+# terminal = "Apple_Terminal"
+# beta_features = ["remote_compaction_v2"]
+# [fake.environment]
+# sandbox = "none"
+# sandbox_mode = "danger-full-access"
+# auto_review_enabled = false
+# node_repl_auto_review_required = false
+# node_repl_disabled = false
+# cwd = "/Users/me/project"
+# workspace = "/Users/me/project"
+# shell = "zsh"
+# git_commit_hash = "1f0c3a2"
+# git_remote_url = "git@github.com:owner/repo.git"
+# git_has_changes = false
+# [fake.extra]                          # 自由键值，上限 16 项
+# custom_flag = "1"
 ```
 
 形状说明：
@@ -213,6 +245,10 @@ namespace = "my-cache"
   单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的
   `reviewer` expert 来回答审批。
+- `generation.async_tools` 列出异步工具名，需同时满足 Astra 策略、`protocol = "responses"` 与 `capabilities.tools = true`；Astra 只支持 `low` 及以上的 reasoning effort。
+- `capabilities.generation.structured_output` 声明该路由的强制能力（非布尔值）：`json_schema` 由上游在解码层约束 JSON 语法，`json_object` 只表达“输出 JSON”的意图。
+- `[fake]` 省略的字段按真实主机或所模拟客户端的典型值推导；`identity.installation_id` 必须是 UUID，否则会被替换；`clock.timezone` 需为 IANA 名。
+- `[fake.extra]` 的键不超过 64 字节且首字符为 ASCII 字母、只含字母数字与 `_` `.` `-`，值不超过 128 字节；不得使用 turn metadata 已占用的键（如 `session_id`、`thread_id`、`turn_id`、`agent_name`、`request_kind`）。
 - `[providers.<name>.retry]` 从 `[global.retry]` 继承未填写字段。`enabled` 控制是否重试；`exponential_backoff = false` 时每次固定等待 `initial_delay_secs`（不叠加 jitter），`true` 时按 `backoff_multiplier` 指数增长并可叠加 `jitter_secs`。服务端有效的 `Retry-After` 仍优先。`max_attempts` 包含首次请求。
 
 ## Skills
