@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- 移除 `capabilities.prompt_cache`；`[cache] enabled = true` 成为 prompt cache 的唯一开关，它同时声明该路由支持 provider-native cache hint 并发送它。配置中的该能力行需删除。
+
+### Fixed
+
+- 修复未启用并行工具调用的路由仍携带 `parallel_tool_calls`（值为 `false`）导致 Completions 路由的带工具回合在预检阶段全部失败的问题：该字段现在只在路由确实启用并行工具调用时出现。
+
 ## [0.12.0] - 2026-09-12
 
 ### Added
