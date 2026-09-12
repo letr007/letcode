@@ -1957,7 +1957,7 @@ impl ProtocolBinding for CompletionsBinding {
         &self,
         input: &ModelRequestInput,
     ) -> Result<PreparedHttpRequest, ModelFailure> {
-        let (mut request, message_indices) = CompletionsRequest::from_input(self, input)?;
+        let (mut request, message_origins) = CompletionsRequest::from_input(self, input)?;
         if self.flavor == CompletionsFlavor::Standard && input.cache.enabled {
             request.prompt_cache_key = Some(cache_key_for_completions(self, input, &request)?);
         }
@@ -1977,12 +1977,8 @@ impl ProtocolBinding for CompletionsBinding {
             prompt_unit_origins: input
                 .segment_origins
                 .iter()
-                .chain(
-                    message_indices
-                        .iter()
-                        .filter_map(|index| input.message_origins.get(*index)),
-                )
                 .map(|origin| vec![origin.clone()])
+                .chain(message_origins)
                 .collect(),
         })
     }
@@ -2153,9 +2149,11 @@ impl CompletionsRequest {
     fn from_input(
         binding: &CompletionsBinding,
         input: &ModelRequestInput,
-    ) -> Result<(Self, Vec<usize>), ModelFailure> {
+    ) -> Result<(Self, Vec<Vec<String>>), ModelFailure> {
         let mut messages = Vec::new();
-        let mut message_indices = Vec::new();
+        let mut message_origins = Vec::new();
+        let mut pending_tool_result_images = Vec::new();
+        let mut pending_tool_result_origins = Vec::new();
         for segment in &input.segments {
             let role = if binding.flavor == CompletionsFlavor::DeepSeek {
                 "system"
@@ -2174,6 +2172,18 @@ impl CompletionsRequest {
             });
         }
         for (index, message) in input.messages.iter().enumerate() {
+            if message.role != MessageRole::Tool && !pending_tool_result_images.is_empty() {
+                messages.push(CompletionsMessage {
+                    role: "user",
+                    content: Some(CompletionsMessageContent::Parts(std::mem::take(
+                        &mut pending_tool_result_images,
+                    ))),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+                message_origins.push(std::mem::take(&mut pending_tool_result_origins));
+            }
             let role = match message.role {
                 MessageRole::User => "user",
                 MessageRole::Assistant => "assistant",
@@ -2183,7 +2193,7 @@ impl CompletionsRequest {
             let mut calls = Vec::new();
             let mut tool_id = None;
             let mut reasoning = String::new();
-            let mut tool_result_images = Vec::new();
+            let pending_tool_result_images_before = pending_tool_result_images.len();
             for part in &message.content {
                 match part {
                     ContentPart::Text(text) => {
@@ -2244,7 +2254,7 @@ impl CompletionsRequest {
                                             "tool result image translation requires input image capability",
                                         ));
                                     }
-                                    tool_result_images.push(CompletionsContent::Image {
+                                    pending_tool_result_images.push(CompletionsContent::Image {
                                         image_url: CompletionsImageUrl {
                                             url: format!("data:{media_type};base64,{}", base64_encode(data)),
                                         },
@@ -2257,6 +2267,12 @@ impl CompletionsRequest {
                     _ => {}
                 }
             }
+            if message.role == MessageRole::Tool
+                && pending_tool_result_images.len() > pending_tool_result_images_before
+                && let Some(origin) = input.message_origins.get(index)
+            {
+                pending_tool_result_origins.push(origin.clone());
+            }
             if message.role == MessageRole::Assistant && content.is_empty() && calls.is_empty() {
                 // Completions providers require content or tool calls; reasoning_content
                 // alone is not a message.
@@ -2267,7 +2283,14 @@ impl CompletionsRequest {
                 );
                 continue;
             }
-            message_indices.push(index);
+            message_origins.push(
+                input
+                    .message_origins
+                    .get(index)
+                    .cloned()
+                    .into_iter()
+                    .collect(),
+            );
             if binding.flavor == CompletionsFlavor::DeepSeek
                 && message.role == MessageRole::Assistant
                 && (!reasoning.is_empty() || !calls.is_empty())
@@ -2310,16 +2333,16 @@ impl CompletionsRequest {
                     reasoning_content: None,
                 });
             }
-            if !tool_result_images.is_empty() {
-                messages.push(CompletionsMessage {
-                    role: "user",
-                    content: Some(CompletionsMessageContent::Parts(tool_result_images)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                });
-                message_indices.push(index);
-            }
+        }
+        if !pending_tool_result_images.is_empty() {
+            messages.push(CompletionsMessage {
+                role: "user",
+                content: Some(CompletionsMessageContent::Parts(pending_tool_result_images)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            message_origins.push(pending_tool_result_origins);
         }
         if !input.tools.is_empty() && !binding.capabilities.tools {
             return Err(unsupported("tools", "tools capability is disabled"));
@@ -2483,7 +2506,7 @@ impl CompletionsRequest {
             response_format,
             tools,
         };
-        Ok((request, message_indices))
+        Ok((request, message_origins))
     }
 }
 
@@ -5822,6 +5845,82 @@ anthropic_thinking = { mode = "adaptive" }"#,
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"][0]["type"], "image_url");
         assert_eq!(body["messages"][1]["content"][0]["image_url"]["url"], "data:image/png;base64,AQID");
+    }
+
+    #[test]
+    fn completions_keeps_all_tool_messages_before_translated_images() {
+        let binding = completions_binding("deepseek");
+        let request = ModelRequestInput {
+            control: super::super::RequestControl::new("deepseek-flash"),
+            segments: vec![],
+            segment_origins: vec![],
+            messages: vec![
+                ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentPart::ToolCall {
+                        id: "call-1".into(), name: "read".into(), arguments: serde_json::json!({}),
+                    }, ContentPart::ToolCall {
+                        id: "call-2".into(), name: "read".into(), arguments: serde_json::json!({}),
+                    }, ContentPart::ToolCall {
+                        id: "call-3".into(), name: "read".into(), arguments: serde_json::json!({}),
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        id: "call-1".into(),
+                        content: vec![ContentPart::Text("first".into()), ContentPart::Image {
+                            media_type: "image/png".into(), data: vec![1],
+                        }],
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        id: "call-2".into(),
+                        content: vec![ContentPart::Text("second".into()), ContentPart::Image {
+                            media_type: "image/png".into(), data: vec![2],
+                        }],
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        id: "call-3".into(),
+                        content: vec![ContentPart::Text("third".into())],
+                    }],
+                },
+            ],
+            message_origins: vec![
+                "assistant".into(),
+                "tool-1".into(),
+                "tool-2".into(),
+                "tool-3".into(),
+            ],
+            tools: vec![], generation: GenerationSettings::default(), cache: CacheIntent::default(),
+        };
+        let prepared = binding.prepare_request(&request).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        binding.inspect_prepared_request(&prepared, None).unwrap();
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["content"], "first");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["content"], "second");
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][3]["content"], "third");
+        assert_eq!(body["messages"][4]["role"], "user");
+        assert_eq!(body["messages"][4]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            prepared.prompt_unit_origins,
+            vec![
+                vec!["assistant".to_string()],
+                vec!["tool-1".to_string()],
+                vec!["tool-2".to_string()],
+                vec!["tool-3".to_string()],
+                vec!["tool-1".to_string(), "tool-2".to_string()],
+            ]
+        );
     }
 
     #[test]
