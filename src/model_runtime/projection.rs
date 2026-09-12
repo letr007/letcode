@@ -225,9 +225,14 @@ fn generation_settings(
             ModelTextVerbosity::Medium => Verbosity::Medium,
             ModelTextVerbosity::High => Verbosity::High,
         }),
+        // A route that does not enable parallel tool calls must not see the field
+        // at all: Completions flavors differ per vendor, and a declared-off or
+        // undeclared capability means the endpoint does not support it.
         parallel_tool_calls: match route.protocol_id.as_str() {
-            "responses" | "completions" if metadata.supports_tools => {
-                Some(metadata.parallel_tool_calls)
+            "responses" | "completions"
+                if metadata.supports_tools && metadata.parallel_tool_calls =>
+            {
+                Some(true)
             }
             _ => None,
         },
@@ -441,6 +446,45 @@ parallel_tool_calls = true
                 }));
             }
             assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn disabled_parallel_tool_calls_stay_off_the_wire() {
+        use crate::request_builder::{TestRequestBuilderInput, build_test_request};
+        use crate::user_content::UserMessageContent;
+
+        let history = vec![HistoryItem::user_content(UserMessageContent::new(
+            "hello",
+            Vec::new(),
+        ))];
+        for protocol in ["responses", "completions"] {
+            let route = replay_test_route(protocol);
+            for enabled in [false, true] {
+                let model = ModelRequestMetadata {
+                    supports_tools: true,
+                    parallel_tool_calls: enabled,
+                    ..Default::default()
+                };
+                let build = build_test_request(TestRequestBuilderInput {
+                    model_id: "model",
+                    model: model.clone(),
+                    prelude: &[],
+                    history: &history,
+                    evidence: &[],
+                    tools: &[],
+                    protected_start_index: 0,
+                })
+                .unwrap();
+                let request =
+                    model_request_from_prompt_plan(&route, &model, &build.prompt_plan, &[])
+                        .unwrap();
+                assert_eq!(
+                    request.generation.parallel_tool_calls,
+                    enabled.then_some(true),
+                    "{protocol} parallel_tool_calls={enabled}"
+                );
+            }
         }
     }
 
