@@ -579,7 +579,10 @@ mod tests {
         assert!(tail.starts_with('…'));
         assert!(tail.ends_with("MARK"));
         assert_eq!(tail.trim_start_matches('…').chars().count(), RAW_TAIL_CHARS);
-        assert_eq!(tail.chars().filter(|c| *c == '汉').count(), RAW_TAIL_CHARS - 4);
+        assert_eq!(
+            tail.chars().filter(|c| *c == '汉').count(),
+            RAW_TAIL_CHARS - 4
+        );
         assert_eq!(raw_tail("short"), "short");
     }
 
@@ -588,7 +591,10 @@ mod tests {
         let long: String = "汉".repeat(RAW_EXCERPT_CHARS + 10);
         let excerpt = raw_excerpt(&long);
         assert!(excerpt.ends_with('…'));
-        assert_eq!(excerpt.chars().filter(|c| *c == '汉').count(), RAW_EXCERPT_CHARS);
+        assert_eq!(
+            excerpt.chars().filter(|c| *c == '汉').count(),
+            RAW_EXCERPT_CHARS
+        );
         assert_eq!(raw_excerpt("short"), "short");
     }
 
@@ -605,7 +611,10 @@ mod tests {
             .downcast_ref::<serde_json::Error>()
             .expect("a syntax error is a json error");
         let window = raw_syntax_window(&text, json.line(), json.column());
-        assert!(window.contains("compact"), "window missed the error: {window}");
+        assert!(
+            window.contains("compact"),
+            "window missed the error: {window}"
+        );
         assert!(window.chars().count() <= RAW_WINDOW_CHARS * 2 + 2);
         assert!(!window.contains("compartments"), "window was not centered");
     }

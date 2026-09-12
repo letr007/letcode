@@ -2256,7 +2256,10 @@ impl CompletionsRequest {
                                     }
                                     pending_tool_result_images.push(CompletionsContent::Image {
                                         image_url: CompletionsImageUrl {
-                                            url: format!("data:{media_type};base64,{}", base64_encode(data)),
+                                            url: format!(
+                                                "data:{media_type};base64,{}",
+                                                base64_encode(data)
+                                            ),
                                         },
                                     });
                                 }
@@ -5844,7 +5847,10 @@ anthropic_thinking = { mode = "adaptive" }"#,
         assert_eq!(body["messages"][0]["content"], "image metadata");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"][0]["type"], "image_url");
-        assert_eq!(body["messages"][1]["content"][0]["image_url"]["url"], "data:image/png;base64,AQID");
+        assert_eq!(
+            body["messages"][1]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
     }
 
     #[test]
@@ -5857,30 +5863,48 @@ anthropic_thinking = { mode = "adaptive" }"#,
             messages: vec![
                 ModelMessage {
                     role: MessageRole::Assistant,
-                    content: vec![ContentPart::ToolCall {
-                        id: "call-1".into(), name: "read".into(), arguments: serde_json::json!({}),
-                    }, ContentPart::ToolCall {
-                        id: "call-2".into(), name: "read".into(), arguments: serde_json::json!({}),
-                    }, ContentPart::ToolCall {
-                        id: "call-3".into(), name: "read".into(), arguments: serde_json::json!({}),
-                    }],
+                    content: vec![
+                        ContentPart::ToolCall {
+                            id: "call-1".into(),
+                            name: "read".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ContentPart::ToolCall {
+                            id: "call-2".into(),
+                            name: "read".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ContentPart::ToolCall {
+                            id: "call-3".into(),
+                            name: "read".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ],
                 },
                 ModelMessage {
                     role: MessageRole::Tool,
                     content: vec![ContentPart::ToolResult {
                         id: "call-1".into(),
-                        content: vec![ContentPart::Text("first".into()), ContentPart::Image {
-                            media_type: "image/png".into(), data: vec![1],
-                        }],
+                        content: vec![
+                            ContentPart::Text("first".into()),
+                            ContentPart::Image {
+                                media_type: "image/png".into(),
+                                data: vec![1],
+                            },
+                        ],
                     }],
                 },
                 ModelMessage {
                     role: MessageRole::Tool,
                     content: vec![ContentPart::ToolResult {
                         id: "call-2".into(),
-                        content: vec![ContentPart::Text("second".into()), ContentPart::Image {
-                            media_type: "image/png".into(), data: vec![2],
-                        }],
+                        content: vec![
+                            ContentPart::Text("second".into()),
+                            ContentPart::Image {
+                                media_type: "image/png".into(),
+                                data: vec![2],
+                            },
+                        ],
                     }],
                 },
                 ModelMessage {
@@ -5897,7 +5921,9 @@ anthropic_thinking = { mode = "adaptive" }"#,
                 "tool-2".into(),
                 "tool-3".into(),
             ],
-            tools: vec![], generation: GenerationSettings::default(), cache: CacheIntent::default(),
+            tools: vec![],
+            generation: GenerationSettings::default(),
+            cache: CacheIntent::default(),
         };
         let prepared = binding.prepare_request(&request).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();

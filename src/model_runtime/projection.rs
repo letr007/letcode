@@ -457,20 +457,29 @@ parallel_tool_calls = true
                 reasoning_content: None,
                 replay: None,
                 calls: vec![ProtocolToolCall {
-                    call_id: "read-1".into(), name: "read".into(), arguments_json: "{}".into(),
+                    call_id: "read-1".into(),
+                    name: "read".into(),
+                    arguments_json: "{}".into(),
                 }],
             },
             HistoryItem::ToolOutput {
-                call_id: "read-1".into(), output_json: "image metadata".into(), images: vec![image.clone()],
+                call_id: "read-1".into(),
+                output_json: "image metadata".into(),
+                images: vec![image.clone()],
             },
         ];
         for protocol in ["responses", "completions", "anthropic"] {
             for input_images in [false, true] {
                 // The Completions binding supports images in user messages,
                 // but its tool result representation is text-only.
-                let tool_image_modes: &[bool] = if protocol == "completions" { &[false] } else { &[false, true] };
+                let tool_image_modes: &[bool] = if protocol == "completions" {
+                    &[false]
+                } else {
+                    &[false, true]
+                };
                 for &tool_result_images in tool_image_modes {
-                    let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(r#"
+                    let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(
+                        r#"
 active_provider = "p"
 [providers.p]
 protocol = "{protocol}"
@@ -485,7 +494,11 @@ parallel_tool_calls = true
 generation = {{ parallel_tool_calls = true }}
 input_images = {input_images}
 tool_result_images = {tool_result_images}
-"#)).unwrap().resolve(&crate::model_runtime::ProtocolRegistry::builtins()).unwrap();
+"#
+                    ))
+                    .unwrap()
+                    .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+                    .unwrap();
                     let route = catalog.route("p", "m").unwrap();
                     let model = ModelRequestMetadata {
                         context_window: Some(64_000),
@@ -495,21 +508,45 @@ tool_result_images = {tool_result_images}
                         ..Default::default()
                     };
                     let build = build_test_request(TestRequestBuilderInput {
-                        model_id: "m", model: model.clone(), prelude: &[], history: &history,
-                        evidence: &[], tools: &[], protected_start_index: 0,
-                    }).unwrap();
-                    let request = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[]).unwrap();
+                        model_id: "m",
+                        model: model.clone(),
+                        prelude: &[],
+                        history: &history,
+                        evidence: &[],
+                        tools: &[],
+                        protected_start_index: 0,
+                    })
+                    .unwrap();
+                    let request =
+                        model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+                            .unwrap();
                     let user_parts = &request.messages[0].content;
-                    assert_eq!(user_parts.iter().any(|part| matches!(part, ContentPart::Image { .. })), input_images);
+                    assert_eq!(
+                        user_parts
+                            .iter()
+                            .any(|part| matches!(part, ContentPart::Image { .. })),
+                        input_images
+                    );
                     assert_eq!(user_parts.iter().any(|part| matches!(part, ContentPart::Text(text) if text.contains("[Image: frame.png]"))), !input_images);
-                    let ContentPart::ToolResult { content, .. } = &request.messages[2].content[0] else { panic!("tool result") };
-                    assert_eq!(content.iter().any(|part| matches!(part, ContentPart::Image { .. })), tool_result_images);
+                    let ContentPart::ToolResult { content, .. } = &request.messages[2].content[0]
+                    else {
+                        panic!("tool result")
+                    };
+                    assert_eq!(
+                        content
+                            .iter()
+                            .any(|part| matches!(part, ContentPart::Image { .. })),
+                        tool_result_images
+                    );
                     assert_eq!(content.iter().any(|part| matches!(part, ContentPart::Text(text) if text.contains("[Image: frame.png]"))), !tool_result_images);
                     route.binding.prepare_request(&request).unwrap_or_else(|error| panic!("{protocol} input_images={input_images} tool_result_images={tool_result_images}: {error:?}"));
-                    let visual_tokens = (u64::from(input_images) + u64::from(tool_result_images)) * image.visual_token_charge();
+                    let visual_tokens = (u64::from(input_images) + u64::from(tool_result_images))
+                        * image.visual_token_charge();
                     assert!(build.budget.estimated_request_tokens >= visual_tokens);
                     if visual_tokens == 0 {
-                        assert!(build.budget.estimated_request_tokens < image.visual_token_charge());
+                        assert!(
+                            build.budget.estimated_request_tokens < image.visual_token_charge()
+                        );
                     }
 
                     // Estimation retains missing payloads for capable models; only
@@ -519,16 +556,34 @@ tool_result_images = {tool_result_images}
                         if user_image {
                             let mut invalid = image.clone();
                             invalid.data_url.clear();
-                            missing[0] = HistoryItem::user_content(UserMessageContent::new("look", vec![invalid]));
+                            missing[0] = HistoryItem::user_content(UserMessageContent::new(
+                                "look",
+                                vec![invalid],
+                            ));
                         } else if let HistoryItem::ToolOutput { images, .. } = &mut missing[2] {
                             images[0].data_url.clear();
                         }
                         let estimate = build_test_request(TestRequestBuilderInput {
-                            model_id: "m", model: model.clone(), prelude: &[], history: &missing,
-                            evidence: &[], tools: &[], protected_start_index: 0,
-                        }).unwrap();
-                        let result = model_request_from_prompt_plan(route, &model, &estimate.prompt_plan, &[]);
-                        if if user_image { input_images } else { tool_result_images } {
+                            model_id: "m",
+                            model: model.clone(),
+                            prelude: &[],
+                            history: &missing,
+                            evidence: &[],
+                            tools: &[],
+                            protected_start_index: 0,
+                        })
+                        .unwrap();
+                        let result = model_request_from_prompt_plan(
+                            route,
+                            &model,
+                            &estimate.prompt_plan,
+                            &[],
+                        );
+                        if if user_image {
+                            input_images
+                        } else {
+                            tool_result_images
+                        } {
                             assert!(result.unwrap_err().contains("data URL"));
                         } else {
                             route.binding.prepare_request(&result.unwrap()).unwrap();

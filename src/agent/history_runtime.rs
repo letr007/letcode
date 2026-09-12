@@ -108,8 +108,7 @@ pub(super) fn work(
     if let Some(limit) = pass_limit {
         let requested = start.saturating_add(limit).min(cut.cut_end);
         let capped = crate::protocol_frames::canonical_compaction_boundary_with_transcript(
-            &analysis,
-            requested,
+            &analysis, requested,
         )?;
         if capped > start {
             end = capped;
@@ -841,22 +840,39 @@ max_output_tokens=128
                 if !input_images {
                     let (build, input) = result.unwrap();
                     let placeholders = UserMessageContent::from_parts(
-                        content.parts().into_iter().map(|part| match part {
-                            crate::user_content::UserMessagePart::Image { attachment } => {
-                                crate::user_content::UserMessagePart::Text {
-                                    text: attachment.placeholder_summary(),
+                        content
+                            .parts()
+                            .into_iter()
+                            .map(|part| match part {
+                                crate::user_content::UserMessagePart::Image { attachment } => {
+                                    crate::user_content::UserMessagePart::Text {
+                                        text: attachment.placeholder_summary(),
+                                    }
                                 }
-                            }
-                            part => part,
-                        }).collect(),
+                                part => part,
+                            })
+                            .collect(),
                     );
                     let (text_build, _) = protocol_stream::prepare_resolved_oneshot_request(
-                        route, metadata, &prelude, &placeholders, None,
-                    ).unwrap();
-                    assert_eq!(build.budget.estimated_request_tokens, text_build.budget.estimated_request_tokens);
-                    assert!(input.messages.iter().all(|message| message.content.iter().all(|part| {
-                        !matches!(part, crate::model_runtime::ContentPart::Image { .. })
-                    })));
+                        route,
+                        metadata,
+                        &prelude,
+                        &placeholders,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        build.budget.estimated_request_tokens,
+                        text_build.budget.estimated_request_tokens
+                    );
+                    assert!(
+                        input
+                            .messages
+                            .iter()
+                            .all(|message| message.content.iter().all(|part| {
+                                !matches!(part, crate::model_runtime::ContentPart::Image { .. })
+                            }))
+                    );
                     route.binding.prepare_request(&input).unwrap();
                     continue;
                 }

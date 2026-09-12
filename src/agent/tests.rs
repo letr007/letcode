@@ -341,7 +341,11 @@ fn install_active_epoch_route(agent: &mut Agent, protocol: ApiProtocol) {
     install_active_epoch_image_route(agent, protocol, false);
 }
 
-fn install_active_epoch_image_route(agent: &mut Agent, protocol: ApiProtocol, supports_images: bool) {
+fn install_active_epoch_image_route(
+    agent: &mut Agent,
+    protocol: ApiProtocol,
+    supports_images: bool,
+) {
     let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(
         r#"
 active_provider = "test"
@@ -672,43 +676,86 @@ fn image_usage_matches_cold_warm_and_provider_anchored_projections() {
         )]));
         install_active_epoch_image_route(&mut agent, ApiProtocol::Responses, supports_images);
         let tools = active_epoch_tools();
-        let cold = agent.preview_active_epoch(ApiProtocol::Responses, &[], &tools).unwrap();
+        let cold = agent
+            .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .unwrap();
         agent.commit_active_epoch(cold);
         agent.install_provider_usage_anchor(provider_usage(100));
-        let image = crate::user_content::UserImageAttachment::from_bytes("frame.png", "image/png", b"image bytes");
+        let image = crate::user_content::UserImageAttachment::from_bytes(
+            "frame.png",
+            "image/png",
+            b"image bytes",
+        );
         let mut history = active_epoch_history_with_complete_tool_group();
         if let HistoryItem::ToolOutput { images, .. } = &mut history[2] {
             images.push(image.clone());
         }
-        history.push(HistoryItem::user_content(UserMessageContent::new("look", vec![image.clone()])));
+        history.push(HistoryItem::user_content(UserMessageContent::new(
+            "look",
+            vec![image.clone()],
+        )));
         append_active_epoch_history(&mut agent, history.clone());
 
-        let warm = match agent.prepare_active_epoch(ApiProtocol::Responses, &[], &tools).unwrap() {
+        let warm = match agent
+            .prepare_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .unwrap()
+        {
             ActiveEpochPreparation::Warm(warm) => warm,
-            ActiveEpochPreparation::ColdRequired(reason) => panic!("image suffix requires cold planning: {reason:?}"),
+            ActiveEpochPreparation::ColdRequired(reason) => {
+                panic!("image suffix requires cold planning: {reason:?}")
+            }
         };
-        let cold = agent.preview_active_epoch(ApiProtocol::Responses, &[], &tools).unwrap();
-        assert_eq!(warm.build.budget.estimated_request_tokens, cold.build.budget.estimated_request_tokens);
+        let cold = agent
+            .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .unwrap();
         assert_eq!(
-            warm.build.prompt_plan.segments.iter().map(|segment| &segment.content).collect::<Vec<_>>(),
-            cold.build.prompt_plan.segments.iter().map(|segment| &segment.content).collect::<Vec<_>>(),
+            warm.build.budget.estimated_request_tokens,
+            cold.build.budget.estimated_request_tokens
+        );
+        assert_eq!(
+            warm.build
+                .prompt_plan
+                .segments
+                .iter()
+                .map(|segment| &segment.content)
+                .collect::<Vec<_>>(),
+            cold.build
+                .prompt_plan
+                .segments
+                .iter()
+                .map(|segment| &segment.content)
+                .collect::<Vec<_>>(),
         );
 
         let mut expected_suffix = history[1..].to_vec();
         if !supports_images {
-            if let HistoryItem::ToolOutput { output_json, images, .. } = &mut expected_suffix[1] {
+            if let HistoryItem::ToolOutput {
+                output_json,
+                images,
+                ..
+            } = &mut expected_suffix[1]
+            {
                 output_json.push_str(&format!("\n{}", image.placeholder_summary()));
                 images.clear();
             }
-            *expected_suffix.last_mut().unwrap() = HistoryItem::user_content(
-                UserMessageContent::from_parts(vec![
-                    crate::user_content::UserMessagePart::Text { text: "look".into() },
-                    crate::user_content::UserMessagePart::Text { text: image.placeholder_summary() },
-                ]),
-            );
+            *expected_suffix.last_mut().unwrap() =
+                HistoryItem::user_content(UserMessageContent::from_parts(vec![
+                    crate::user_content::UserMessagePart::Text {
+                        text: "look".into(),
+                    },
+                    crate::user_content::UserMessagePart::Text {
+                        text: image.placeholder_summary(),
+                    },
+                ]));
         }
-        let expected_tokens = expected_suffix.iter().map(estimate_trailing_history_item_tokens).sum::<u64>();
-        assert_eq!(agent.projected_token_usage().unwrap().used_tokens, 100 + expected_tokens);
+        let expected_tokens = expected_suffix
+            .iter()
+            .map(estimate_trailing_history_item_tokens)
+            .sum::<u64>();
+        assert_eq!(
+            agent.projected_token_usage().unwrap().used_tokens,
+            100 + expected_tokens
+        );
         assert_eq!(agent.history_for_test(), history);
     }
 }

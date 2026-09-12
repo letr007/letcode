@@ -12,9 +12,9 @@ use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::engine::{
     ActiveSessionOperation, InterruptRequest, ManualCompactionNavigation,
-    ManualCompactionOperation, SessionEngineCommand,
-    SessionEngineControl, derive_interrupt_request, enqueue_deferred_command,
-    flush_parked_commands, format_background_subagent_completion, initial_session_metadata,
+    ManualCompactionOperation, SessionEngineCommand, SessionEngineControl,
+    derive_interrupt_request, enqueue_deferred_command, flush_parked_commands,
+    format_background_subagent_completion, initial_session_metadata,
     manual_compaction_session_token_usage, next_idle_session_command, park_active_turn_command,
     record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
     select_active_session_operation, select_manual_compaction_operation, send_subagent_interrupted,
@@ -4649,9 +4649,9 @@ async fn manual_compaction_still_defers_command_changes() {
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let mut deferred_commands = VecDeque::new();
     control_tx
-        .send(SessionEngineControl::Command(SessionEngineCommand::SetModel(
-            "model-b".into(),
-        )))
+        .send(SessionEngineControl::Command(
+            SessionEngineCommand::SetModel("model-b".into()),
+        ))
         .expect("queue set model");
     control_tx
         .send(SessionEngineControl::Shutdown)
@@ -5087,8 +5087,9 @@ fn child_view_keeps_the_stream_and_ends_with_the_recorded_report() {
     }
     runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
 
-    let report = serde_json::to_string(&crate::tui::components::historian_report::tests::sample_report())
-        .expect("serializable report");
+    let report =
+        serde_json::to_string(&crate::tui::components::historian_report::tests::sample_report())
+            .expect("serializable report");
     for event in [
         SessionEvent::AssistantDelta(AssistantDeltaEvent::new(report.clone())),
         SessionEvent::AssistantDone { message_id: None },
