@@ -279,7 +279,6 @@ tools = true
 parallel_tool_calls = true
 reasoning = true
 input_images = true
-prompt_cache = true
 [providers.vendor.models.model.capabilities.generation]
 max_output_tokens = true
 parallel_tool_calls = true

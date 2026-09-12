@@ -190,7 +190,6 @@ parallel_tool_calls = true
 reasoning = true
 input_images = false
 tool_result_images = false
-prompt_cache = false
 priority_service = false
 [providers.openai.models."gpt-5.5".capabilities.generation]
 temperature = true
@@ -215,6 +214,7 @@ parallel_tool_calls = true
 # async_tools = ["web__fetch"] # 工具名；仅 Astra 策略 + responses 协议，且需 capabilities.tools = true
 
 [providers.openai.models."gpt-5.5".cache]
+# enabled = true 即声明并启用 provider-native prompt cache hint（唯一的开缓开关）
 enabled = false
 # retention = "in_memory" # in_memory | 24h；启用 cache 时设置
 # namespace = "openai"

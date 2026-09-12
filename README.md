@@ -190,7 +190,6 @@ parallel_tool_calls = true
 reasoning = true
 input_images = false
 tool_result_images = false
-prompt_cache = false
 priority_service = false
 [providers.openai.models."gpt-5.5".capabilities.generation]
 temperature = true
@@ -215,6 +214,7 @@ parallel_tool_calls = true
 # async_tools = ["web__fetch"] # tool names; Astra strategy with the responses protocol and capabilities.tools = true
 
 [providers.openai.models."gpt-5.5".cache]
+# enabled = true declares provider-native prompt cache hints and sends them.
 enabled = false
 # retention = "in_memory" # in_memory | 24h; set when cache is enabled
 # namespace = "openai"

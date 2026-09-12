@@ -369,7 +369,6 @@ pub struct RouteCapabilities {
     pub reasoning: bool,
     pub input_images: bool,
     pub tool_result_images: bool,
-    pub prompt_cache: bool,
     pub priority_service: bool,
 }
 
@@ -1775,8 +1774,6 @@ pub struct RuntimeCapabilities {
     #[serde(default)]
     pub tool_result_images: bool,
     #[serde(default)]
-    pub prompt_cache: bool,
-    #[serde(default)]
     pub priority_service: bool,
     #[serde(default)]
     pub generation: RuntimeGenerationConfig,
@@ -1849,7 +1846,6 @@ impl From<RuntimeCapabilities> for RouteCapabilities {
             reasoning: value.reasoning,
             input_images: value.input_images,
             tool_result_images: value.tool_result_images,
-            prompt_cache: value.prompt_cache,
             priority_service: value.priority_service,
         }
     }
@@ -3557,7 +3553,6 @@ mod tests {
         assert!(!capabilities.reasoning);
         assert!(!capabilities.input_images);
         assert!(!capabilities.tool_result_images);
-        assert!(!capabilities.prompt_cache);
         assert!(!capabilities.priority_service);
     }
 

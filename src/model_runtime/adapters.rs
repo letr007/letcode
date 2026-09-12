@@ -364,9 +364,6 @@ impl ProtocolBinding for AnthropicBinding {
                 "must be less than max_tokens",
             ));
         }
-        if input.cache.enabled && !self.capabilities.prompt_cache {
-            return Err(unsupported("prompt_cache", "capability disabled"));
-        }
         if input.cache.retention.is_some() {
             return Err(unsupported(
                 "prompt_cache_retention",
@@ -521,7 +518,7 @@ impl ProtocolBinding for AnthropicBinding {
             message_indices.push(index);
             messages.push(AnthropicMessage { role, content });
         }
-        if input.cache.enabled && self.capabilities.prompt_cache {
+        if input.cache.enabled {
             let prefix_count = input
                 .cache
                 .stable_prefix
@@ -2438,9 +2435,6 @@ impl CompletionsRequest {
                 "DeepSeek does not support prompt cache",
             ));
         }
-        if input.cache.enabled && !binding.capabilities.prompt_cache {
-            return Err(unsupported("cache", "prompt cache capability is disabled"));
-        }
         if input.cache.retention.is_some() {
             return Err(unsupported(
                 "prompt_cache_retention",
@@ -3027,12 +3021,6 @@ impl ResponsesRequest {
             return Err(unsupported(
                 "prompt_cache_retention",
                 "retention requires prompt cache to be enabled",
-            ));
-        }
-        if input.cache.enabled && !binding.capabilities.prompt_cache {
-            return Err(unsupported(
-                "prompt_cache",
-                "prompt cache capability is disabled",
             ));
         }
 
@@ -4554,7 +4542,6 @@ mod tests {
                 reasoning: true,
                 input_images: true,
                 tool_result_images: true,
-                prompt_cache: true,
                 priority_service: true,
             },
             GenerationSupport {
