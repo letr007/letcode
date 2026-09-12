@@ -8,6 +8,20 @@ use crate::tui::i18n::Language;
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
 
+/// Whether a persisted value has the shape of a UUID: five groups of hex digits
+/// separated by dashes, `8-4-4-4-12`.
+fn is_uuid_shaped(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 fn default_theme_id() -> String {
     ThemeName::default().as_str().to_string()
 }
@@ -62,11 +76,14 @@ impl TuiPreferences {
     /// fake pipeline needs it.
     pub fn ensure_fake_installation_id(&mut self) -> String {
         if let Some(id) = self.fake_installation_id.as_deref()
-            && !id.trim().is_empty()
+            && is_uuid_shaped(id)
         {
             return id.to_string();
         }
-        let id = crate::fake::CodexIdentity::new("letcode").installation_id;
+        // An installation id is a version 4 UUID. A persisted value that is not
+        // one cannot have come from a real client, so it is replaced rather than
+        // sent as this client's identity.
+        let id = crate::fake::synthetic_installation_id();
         self.fake_installation_id = Some(id.clone());
         id
     }
@@ -196,6 +213,26 @@ mod tests {
         let second = prefs.ensure_fake_installation_id();
         assert_eq!(first, second);
         assert_eq!(prefs.fake_installation_id, Some(first));
+    }
+
+    #[test]
+    fn non_uuid_installation_ids_are_replaced() {
+        let mut prefs = TuiPreferences {
+            fake_installation_id: Some("letcode".to_string()),
+            ..TuiPreferences::default()
+        };
+        let generated = prefs.ensure_fake_installation_id();
+        assert!(is_uuid_shaped(&generated), "{generated}");
+        assert_eq!(generated.as_bytes()[14], b'4', "version 4");
+        assert_eq!(prefs.fake_installation_id, Some(generated));
+
+        // An existing UUID is kept verbatim.
+        let kept = "00000000-0000-4000-8000-000000000000";
+        let mut existing = TuiPreferences {
+            fake_installation_id: Some(kept.to_string()),
+            ..TuiPreferences::default()
+        };
+        assert_eq!(existing.ensure_fake_installation_id(), kept);
     }
 
     #[test]

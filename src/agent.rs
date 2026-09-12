@@ -1459,7 +1459,7 @@ impl Agent {
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
             fake_client: None,
-            fake_installation_id: crate::fake::CodexIdentity::new("letcode").installation_id,
+            fake_installation_id: crate::fake::synthetic_installation_id(),
             fake_config: crate::config::FakeConfig::default(),
             fake_identity: None,
             fake_context_cache: std::sync::Mutex::new(None),

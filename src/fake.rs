@@ -117,7 +117,7 @@ pub struct CodexRequestContext {
     /// date belonging to another zone is never reported as this one.
     pub current_date: Option<String>,
     // Agent identity reported in turn metadata.
-    pub agent_name: String,
+    pub agent_name: Option<String>,
     // Environment.
     pub sandbox: String,
     pub sandbox_mode: String,
@@ -147,7 +147,6 @@ mod defaults {
     pub(super) const SANDBOX_MODE: &str = "danger-full-access";
     /// Mirrors the upstream fallback when the host zone cannot be named.
     pub(super) const TIMEZONE_FALLBACK: &str = "Etc/UTC";
-    pub(super) const AGENT_NAME: &str = "/root";
     pub(super) const SHELL_FALLBACK: &str = "zsh";
 }
 
@@ -213,11 +212,7 @@ impl CodexRequestContext {
             }),
             timezone,
             current_date,
-            agent_name: config
-                .identity
-                .agent_name
-                .clone()
-                .unwrap_or_else(|| defaults::AGENT_NAME.to_string()),
+            agent_name: config.identity.agent_name.clone(),
             sandbox: config
                 .environment
                 .sandbox
@@ -297,7 +292,11 @@ impl CodexRequestContext {
         metadata.insert("turn_id".into(), Value::String(self.turn_id.clone()));
         metadata.insert("window_id".into(), Value::String(self.window_id()));
         metadata.insert("request_kind".into(), Value::String("turn".into()));
-        metadata.insert("agent_name".into(), Value::String(self.agent_name.clone()));
+        // The imitated client only names an agent that reserved a nickname, so a
+        // plain top-level turn carries no `agent_name` at all.
+        if let Some(agent_name) = &self.agent_name {
+            metadata.insert("agent_name".into(), Value::String(agent_name.clone()));
+        }
         metadata.insert(
             "root_turn_id".into(),
             Value::String(self.root_turn_id.clone()),
@@ -670,38 +669,52 @@ fn unix_timestamp_ms() -> u128 {
         .as_millis()
 }
 
-fn synthetic_uuid() -> String {
+/// A 64-bit word from the OS-seeded hasher `RandomState` keeps. The keys differ
+/// per call and `salt` separates the callers, so the bits are spread over the
+/// whole range instead of collapsing into the visible pattern a counter or a
+/// process id produces.
+fn random_word(salt: u64) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    let counter = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let process = u128::from(std::process::id());
-    let mixed = nanos ^ (process << 64) ^ (u128::from(counter).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    static NEXT_CALL: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(salt);
+    hasher.write_u64(NEXT_CALL.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
 
-    let bytes = mixed.to_be_bytes();
+fn format_uuid(hi: u64, lo: u64) -> String {
     format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-8{:01x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6] & 0x0f,
-        bytes[7],
-        bytes[8] & 0x0f,
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15]
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hi >> 32) as u32,
+        (hi >> 16) as u16,
+        hi as u16,
+        (lo >> 48) as u16,
+        lo & 0xffff_ffff_ffff
     )
+}
+
+/// Session, thread and turn ids are version 7 in the client this profile
+/// imitates: 48 bits of the current millisecond, then random bits. Keeping the
+/// timestamp prefix matches that shape without pinning the high bytes.
+fn synthetic_uuid() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let hi = ((millis & 0x0000_ffff_ffff_ffff) << 16) | 0x7000 | (random_word(0) & 0x0fff);
+    let lo = 0x8000_0000_0000_0000 | (random_word(1) & 0x3fff_ffff_ffff_ffff);
+    format_uuid(hi, lo)
+}
+
+/// Installation ids are version 4 in the client this profile imitates, so they
+/// carry no timestamp.
+pub(crate) fn synthetic_installation_id() -> String {
+    let hi = (random_word(2) & 0xffff_ffff_ffff_0fff) | 0x4000;
+    let lo = 0x8000_0000_0000_0000 | (random_word(3) & 0x3fff_ffff_ffff_ffff);
+    format_uuid(hi, lo)
 }
 
 #[cfg(test)]
@@ -738,6 +751,48 @@ mod tests {
         assert!(FakeClient::Auto.supports_protocol_id(&responses));
         assert!(FakeClient::Auto.supports_protocol_id(&anthropic));
         assert!(!FakeClient::Auto.supports_protocol_id(&completions));
+    }
+
+    #[test]
+    fn synthetic_ids_match_the_shape_the_imitated_client_sends() {
+        let session = synthetic_uuid();
+        assert_eq!(session.as_bytes()[14], b'7', "session ids are version 7");
+        let variant = session.as_bytes()[19] as char;
+        assert!(
+            ('8'..='b').contains(&variant),
+            "variant bits are 10, got {variant}"
+        );
+        // The prefix is the current millisecond, so it must not read as zeros.
+        assert!(!session.starts_with("0000"), "{session}");
+        assert_ne!(session, synthetic_uuid());
+
+        let installation = synthetic_installation_id();
+        assert_eq!(
+            installation.as_bytes()[14],
+            b'4',
+            "installation ids are version 4"
+        );
+        let variant = installation.as_bytes()[19] as char;
+        assert!(('8'..='b').contains(&variant), "got {variant}");
+        // Random, not a fixed value: two calls must differ.
+        assert_ne!(installation, synthetic_installation_id());
+    }
+
+    #[test]
+    fn top_level_turns_carry_no_agent_name_unless_declared() {
+        let identity = CodexIdentity::new(synthetic_installation_id());
+        let derived = identity.turn_context(&crate::config::FakeConfig::default(), None);
+        assert!(
+            !derived
+                .turn_metadata_json()
+                .to_string()
+                .contains("agent_name")
+        );
+
+        let mut declared = crate::config::FakeConfig::default();
+        declared.identity.agent_name = Some("Hypatia".into());
+        let named = identity.turn_context(&declared, None);
+        assert_eq!(named.turn_metadata_json()["agent_name"], "Hypatia");
     }
 
     #[test]
