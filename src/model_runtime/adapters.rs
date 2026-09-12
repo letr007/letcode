@@ -2183,6 +2183,7 @@ impl CompletionsRequest {
             let mut calls = Vec::new();
             let mut tool_id = None;
             let mut reasoning = String::new();
+            let mut tool_result_images = Vec::new();
             for part in &message.content {
                 match part {
                     ContentPart::Text(text) => {
@@ -2224,19 +2225,32 @@ impl CompletionsRequest {
                         id,
                         content: result_content,
                     } => {
-                        if result_content
-                            .iter()
-                            .any(|part| matches!(part, ContentPart::Image { .. }))
-                        {
-                            return Err(unsupported(
-                                "tool_result_images",
-                                "tool result image capability is disabled",
-                            ));
-                        }
                         tool_id = Some(id.clone());
                         for part in result_content {
-                            if let ContentPart::Text(text) = part {
-                                content.push(CompletionsContent::Text { text: text.clone() });
+                            match part {
+                                ContentPart::Text(text) => {
+                                    content.push(CompletionsContent::Text { text: text.clone() });
+                                }
+                                ContentPart::Image { media_type, data } => {
+                                    if !binding.capabilities.tool_result_images {
+                                        return Err(unsupported(
+                                            "tool_result_images",
+                                            "tool result image capability is disabled",
+                                        ));
+                                    }
+                                    if !binding.capabilities.input_images {
+                                        return Err(unsupported(
+                                            "input_images",
+                                            "tool result image translation requires input image capability",
+                                        ));
+                                    }
+                                    tool_result_images.push(CompletionsContent::Image {
+                                        image_url: CompletionsImageUrl {
+                                            url: format!("data:{media_type};base64,{}", base64_encode(data)),
+                                        },
+                                    });
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -2295,6 +2309,16 @@ impl CompletionsRequest {
                     tool_call_id: tool_id,
                     reasoning_content: None,
                 });
+            }
+            if !tool_result_images.is_empty() {
+                messages.push(CompletionsMessage {
+                    role: "user",
+                    content: Some(CompletionsMessageContent::Parts(tool_result_images)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+                message_indices.push(index);
             }
         }
         if !input.tools.is_empty() && !binding.capabilities.tools {
@@ -5764,6 +5788,40 @@ anthropic_thinking = { mode = "adaptive" }"#,
         assert!(body["input"][1]["output"].is_array());
         assert_eq!(body["input"][1]["output"][0]["type"], "input_text");
         assert_eq!(body["input"][1]["output"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn completions_translates_tool_result_images_to_user_image_message() {
+        let binding = completions_binding("deepseek");
+        let request = ModelRequestInput {
+            control: super::super::RequestControl::new("deepseek-flash"),
+            segments: vec![],
+            segment_origins: vec![],
+            messages: vec![ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentPart::ToolResult {
+                    id: "call-image".into(),
+                    content: vec![
+                        ContentPart::Text("image metadata".into()),
+                        ContentPart::Image {
+                            media_type: "image/png".into(),
+                            data: vec![1, 2, 3],
+                        },
+                    ],
+                }],
+            }],
+            message_origins: vec!["tool-output".into()],
+            tools: vec![],
+            generation: GenerationSettings::default(),
+            cache: CacheIntent::default(),
+        };
+        let body: Value =
+            serde_json::from_slice(&binding.prepare_request(&request).unwrap().body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "tool");
+        assert_eq!(body["messages"][0]["content"], "image metadata");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "image_url");
+        assert_eq!(body["messages"][1]["content"][0]["image_url"]["url"], "data:image/png;base64,AQID");
     }
 
     #[test]

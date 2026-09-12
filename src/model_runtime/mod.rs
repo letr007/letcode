@@ -3152,6 +3152,7 @@ impl ResolvedProvider {
             let (endpoint, endpoint_query) = config
                 .endpoints
                 .endpoint_for(&protocol, adapter.default_endpoint_path())?;
+            let capabilities: RouteCapabilities = model.capabilities.clone().into();
             models.insert(
                 model_name.clone(),
                 ResolvedModelRoute {
@@ -3168,7 +3169,7 @@ impl ResolvedProvider {
                     auth: auth.clone(),
                     headers: config.headers.clone(),
                     query: merge_query(&config.query, &endpoint_query, name, model_name)?,
-                    capabilities: model.capabilities.clone().into(),
+                    capabilities: capabilities.clone(),
                     generation: model.capabilities.generation.clone().into(),
                     generation_defaults: model.generation.clone(),
                     async_tools: model.generation.async_tools.iter().cloned().collect(),
@@ -3203,7 +3204,7 @@ impl ResolvedProvider {
                                 model: Some(model_override),
                             },
                             model.protocol_settings.clone(),
-                            model.capabilities.clone().into(),
+                            capabilities,
                             model.capabilities.generation.clone().into(),
                         ))
                         .map_err(|error| RuntimeConfigError::InvalidValue {
@@ -4032,6 +4033,32 @@ base_url = "https://example.invalid/v1"
 {model_extra}
 "#
         )
+    }
+
+    #[test]
+    fn chat_completions_preserves_declared_tool_result_images() {
+        let catalog = RuntimeConfig::from_toml(
+            r#"
+active_provider = "cpa"
+[providers.cpa]
+protocol = "completions"
+default_model = "deepseek-flash"
+[providers.cpa.auth]
+type = "none"
+[providers.cpa.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.cpa.models."deepseek-flash"]
+[providers.cpa.models."deepseek-flash".capabilities]
+input_images = true
+tool_result_images = true
+"#,
+        )
+        .unwrap()
+        .resolve(&ProtocolRegistry::builtins())
+        .unwrap();
+        let route = catalog.route("cpa", "deepseek-flash").unwrap();
+        assert!(route.capabilities.input_images);
+        assert!(route.capabilities.tool_result_images);
     }
 
     #[test]
