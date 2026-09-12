@@ -21,11 +21,13 @@
 
 ### Changed
 
-- 请求兼容模式不再只改 transport metadata：Codex profile 下运行时上下文改写为与真实客户端同形的 `<environment_context>` user 块，消息条数保持不变。
-- 请求兼容模式在 Responses WebSocket 路径上附带 `OpenAI-Beta: responses_websockets=2026-02-06`；HTTP 路径不发送该头。
+- 请求兼容模式在 Codex profile 下把运行时上下文改为 `<environment_context>` user 块。
+- 请求兼容模式在 Responses WebSocket 路径上附带 `OpenAI-Beta: responses_websockets=2026-02-06`。
 - 项目记忆改为按工作区路径隔离的独立记忆库。
 - 历史回放校验复用已发布前缀的投影状态，仅在分支路径变化时重建。
 - 子代理运行状态改为只反映宿主事实。
+- 请求兼容模式的选择改为记录在会话中，恢复会话时还原。
+- TUI 常规偏好改为加锁的原子写入。
 
 ### Fixed
 
