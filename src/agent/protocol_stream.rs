@@ -2102,6 +2102,8 @@ pub(super) fn prepare_resolved_oneshot_request(
     model.supports_tools = false;
     model.parallel_tool_calls = false;
     model.fast_mode = false;
+    model.supports_input_images = route.capabilities.input_images;
+    model.supports_tool_result_images = route.capabilities.tool_result_images;
     let build = build_oneshot_request(&route.model_override, model.clone(), prelude, user_content)?;
     let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
@@ -2135,6 +2137,8 @@ where
     model.supports_tools = false;
     model.parallel_tool_calls = false;
     model.fast_mode = false;
+    model.supports_input_images = route.capabilities.input_images;
+    model.supports_tool_result_images = route.capabilities.tool_result_images;
     let build = build_oneshot_request(
         &route.model_override,
         model.clone(),

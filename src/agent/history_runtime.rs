@@ -839,12 +839,25 @@ max_output_tokens=128
                     None,
                 );
                 if !input_images {
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("unsupported_request_field")
+                    let (build, input) = result.unwrap();
+                    let placeholders = UserMessageContent::from_parts(
+                        content.parts().into_iter().map(|part| match part {
+                            crate::user_content::UserMessagePart::Image { attachment } => {
+                                crate::user_content::UserMessagePart::Text {
+                                    text: attachment.placeholder_summary(),
+                                }
+                            }
+                            part => part,
+                        }).collect(),
                     );
+                    let (text_build, _) = protocol_stream::prepare_resolved_oneshot_request(
+                        route, metadata, &prelude, &placeholders, None,
+                    ).unwrap();
+                    assert_eq!(build.budget.estimated_request_tokens, text_build.budget.estimated_request_tokens);
+                    assert!(input.messages.iter().all(|message| message.content.iter().all(|part| {
+                        !matches!(part, crate::model_runtime::ContentPart::Image { .. })
+                    })));
+                    route.binding.prepare_request(&input).unwrap();
                     continue;
                 }
                 let (build, input) = result.unwrap();

@@ -445,6 +445,101 @@ parallel_tool_calls = true
     }
 
     #[test]
+    fn image_budget_and_wire_content_follow_route_capabilities() {
+        use crate::request_builder::{TestRequestBuilderInput, build_test_request};
+        use crate::user_content::{UserImageAttachment, UserMessageContent};
+
+        let image = UserImageAttachment::from_bytes("frame.png", "image/png", b"png");
+        let history = vec![
+            HistoryItem::user_content(UserMessageContent::new("look", vec![image.clone()])),
+            HistoryItem::AssistantTurn {
+                text: None,
+                reasoning_content: None,
+                replay: None,
+                calls: vec![ProtocolToolCall {
+                    call_id: "read-1".into(), name: "read".into(), arguments_json: "{}".into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "read-1".into(), output_json: "image metadata".into(), images: vec![image.clone()],
+            },
+        ];
+        for protocol in ["responses", "completions", "anthropic"] {
+            for input_images in [false, true] {
+                // The Completions binding supports images in user messages,
+                // but its tool result representation is text-only.
+                let tool_image_modes: &[bool] = if protocol == "completions" { &[false] } else { &[false, true] };
+                for &tool_result_images in tool_image_modes {
+                    let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(r#"
+active_provider = "p"
+[providers.p]
+protocol = "{protocol}"
+default_model = "m"
+[providers.p.auth]
+type = "none"
+[providers.p.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.p.models.m.capabilities]
+tools = true
+parallel_tool_calls = true
+generation = {{ parallel_tool_calls = true }}
+input_images = {input_images}
+tool_result_images = {tool_result_images}
+"#)).unwrap().resolve(&crate::model_runtime::ProtocolRegistry::builtins()).unwrap();
+                    let route = catalog.route("p", "m").unwrap();
+                    let model = ModelRequestMetadata {
+                        context_window: Some(64_000),
+                        supports_tools: true,
+                        supports_input_images: route.capabilities.input_images,
+                        supports_tool_result_images: route.capabilities.tool_result_images,
+                        ..Default::default()
+                    };
+                    let build = build_test_request(TestRequestBuilderInput {
+                        model_id: "m", model: model.clone(), prelude: &[], history: &history,
+                        evidence: &[], tools: &[], protected_start_index: 0,
+                    }).unwrap();
+                    let request = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[]).unwrap();
+                    let user_parts = &request.messages[0].content;
+                    assert_eq!(user_parts.iter().any(|part| matches!(part, ContentPart::Image { .. })), input_images);
+                    assert_eq!(user_parts.iter().any(|part| matches!(part, ContentPart::Text(text) if text.contains("[Image: frame.png]"))), !input_images);
+                    let ContentPart::ToolResult { content, .. } = &request.messages[2].content[0] else { panic!("tool result") };
+                    assert_eq!(content.iter().any(|part| matches!(part, ContentPart::Image { .. })), tool_result_images);
+                    assert_eq!(content.iter().any(|part| matches!(part, ContentPart::Text(text) if text.contains("[Image: frame.png]"))), !tool_result_images);
+                    route.binding.prepare_request(&request).unwrap_or_else(|error| panic!("{protocol} input_images={input_images} tool_result_images={tool_result_images}: {error:?}"));
+                    let visual_tokens = (u64::from(input_images) + u64::from(tool_result_images)) * image.visual_token_charge();
+                    assert!(build.budget.estimated_request_tokens >= visual_tokens);
+                    if visual_tokens == 0 {
+                        assert!(build.budget.estimated_request_tokens < image.visual_token_charge());
+                    }
+
+                    // Estimation retains missing payloads for capable models; only
+                    // preparing a request decodes and rejects those attachments.
+                    for user_image in [false, true] {
+                        let mut missing = history.clone();
+                        if user_image {
+                            let mut invalid = image.clone();
+                            invalid.data_url.clear();
+                            missing[0] = HistoryItem::user_content(UserMessageContent::new("look", vec![invalid]));
+                        } else if let HistoryItem::ToolOutput { images, .. } = &mut missing[2] {
+                            images[0].data_url.clear();
+                        }
+                        let estimate = build_test_request(TestRequestBuilderInput {
+                            model_id: "m", model: model.clone(), prelude: &[], history: &missing,
+                            evidence: &[], tools: &[], protected_start_index: 0,
+                        }).unwrap();
+                        let result = model_request_from_prompt_plan(route, &model, &estimate.prompt_plan, &[]);
+                        if if user_image { input_images } else { tool_result_images } {
+                            assert!(result.unwrap_err().contains("data URL"));
+                        } else {
+                            route.binding.prepare_request(&result.unwrap()).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn projection_preserves_replay_tools_images_and_cache_boundary() {
         let replay = super::super::OpaqueReplayState::from_anthropic_thinking_blocks_json(
             r#"[{"type":"thinking","thinking":"plan","signature":"signed"}]"#,

@@ -37,6 +37,7 @@ use crate::transcript::transcript_projection::{
     project_session_restore_snapshot, restore_session_history_projection,
 };
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
+use crate::user_content::{UserImageAttachment, UserMessagePart};
 use serde_json::json;
 
 fn metadata(context_window: u64) -> ModelRequestMetadata {
@@ -49,6 +50,51 @@ fn metadata(context_window: u64) -> ModelRequestMetadata {
     }
 }
 
+fn image_attachment(label: &str, payload_len: usize) -> UserImageAttachment {
+    UserImageAttachment {
+        id: format!("image-{label}"),
+        label: label.to_string(),
+        mime: "image/png".into(),
+        data_url: format!("data:image/png;base64,{}", "x".repeat(payload_len)),
+    }
+}
+
+fn image_history(payload_len: usize) -> Vec<HistoryItem> {
+    let input_image = image_attachment("input.png", payload_len);
+    let tool_image = image_attachment("tool.png", payload_len);
+    vec![
+        HistoryItem::user_content(
+            UserMessageContent::from_parts(vec![
+                UserMessagePart::Text {
+                    text: "before".into(),
+                },
+                UserMessagePart::Image {
+                    attachment: input_image,
+                },
+                UserMessagePart::Text {
+                    text: "after".into(),
+                },
+            ])
+            .with_selected_skills(vec!["skill-a".into()]),
+        ),
+        HistoryItem::AssistantTurn {
+            text: None,
+            reasoning_content: None,
+            replay: None,
+            calls: vec![HistoryToolCall {
+                call_id: "call-image".into(),
+                name: "read".into(),
+                arguments_json: "{}".into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-image".into(),
+            output_json: "{\"ok\":true}".into(),
+            images: vec![tool_image],
+        },
+    ]
+}
+
 fn metadata_with_effective_input_limit(
     context_window: u64,
     effective_input_limit_tokens: u64,
@@ -57,6 +103,208 @@ fn metadata_with_effective_input_limit(
         effective_input_limit_tokens: Some(effective_input_limit_tokens),
         ..metadata(context_window)
     }
+}
+
+#[test]
+fn model_image_projection_covers_all_capability_combinations() {
+    let original = history_items_to_frames(&image_history(8));
+    let input_parts = vec![
+        UserMessagePart::Text {
+            text: "before".into(),
+        },
+        UserMessagePart::Image {
+            attachment: image_attachment("input.png", 8),
+        },
+        UserMessagePart::Text {
+            text: "after".into(),
+        },
+    ];
+    for (supports_input_images, supports_tool_result_images) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let mut projected = original.clone();
+        let model = ModelRequestMetadata {
+            supports_input_images,
+            supports_tool_result_images,
+            ..metadata(8_192)
+        };
+        project_model_images(&mut projected, &model);
+
+        let ProtocolFrameItem::UserMessage { content } = &projected[0].item else {
+            panic!("expected user frame");
+        };
+        assert_eq!(content.selected_skills, vec!["skill-a"]);
+        if supports_input_images {
+            assert_eq!(content.parts(), input_parts);
+        } else {
+            assert_eq!(
+                content.parts(),
+                vec![
+                    UserMessagePart::Text {
+                        text: "before".into(),
+                    },
+                    UserMessagePart::Text {
+                        text: "[Image: input.png]".into(),
+                    },
+                    UserMessagePart::Text {
+                        text: "after".into(),
+                    },
+                ]
+            );
+        }
+
+        let ProtocolFrameItem::ToolOutput {
+            output_json,
+            images,
+            ..
+        } = &projected[2].item
+        else {
+            panic!("expected tool output frame");
+        };
+        if supports_tool_result_images {
+            assert_eq!(output_json, "{\"ok\":true}");
+            assert_eq!(images, &vec![image_attachment("tool.png", 8)]);
+        } else {
+            assert_eq!(output_json, "{\"ok\":true}\n[Image: tool.png]");
+            assert!(images.is_empty());
+        }
+        assert_eq!(projected[0].history_index, original[0].history_index);
+        assert_eq!(projected[2].history_index, original[2].history_index);
+        assert_eq!(projected[0].runtime_frame_id, original[0].runtime_frame_id);
+        assert_eq!(
+            projected[2].source_provenance,
+            original[2].source_provenance
+        );
+    }
+}
+
+#[test]
+fn disabled_model_images_do_not_affect_plan_size_and_fit_tight_budget() {
+    let small = build_test_request(TestRequestBuilderInput {
+        model_id: "gpt-test",
+        model: metadata(1_024),
+        prelude: &[],
+        history: &image_history(8),
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+    })
+    .expect("placeholder projection should fit the tight budget");
+    let large = build_test_request(TestRequestBuilderInput {
+        model_id: "gpt-test",
+        model: metadata(1_024),
+        prelude: &[],
+        history: &image_history(80_000),
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+    })
+    .expect("large disabled images should fit the same tight budget");
+
+    assert_eq!(small.budget, large.budget);
+    assert_eq!(
+        small.prompt_plan.token_report(),
+        large.prompt_plan.token_report()
+    );
+    assert_eq!(
+        small
+            .prompt_plan
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    &segment.text,
+                    &segment.content,
+                    segment.tokens.estimated_input_tokens,
+                )
+            })
+            .collect::<Vec<_>>(),
+        large
+            .prompt_plan
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    &segment.text,
+                    &segment.content,
+                    segment.tokens.estimated_input_tokens,
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+
+    let enabled = build_test_request(TestRequestBuilderInput {
+        model_id: "gpt-test",
+        model: ModelRequestMetadata {
+            supports_input_images: true,
+            supports_tool_result_images: false,
+            ..metadata(8_192)
+        },
+        prelude: &[],
+        history: &image_history(8),
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+    })
+    .expect("enabled image request should build with visual budget");
+    let enabled_user = enabled
+        .prompt_plan
+        .segments
+        .iter()
+        .find(|segment| matches!(segment.content, PromptSegmentContent::UserContent { .. }))
+        .expect("enabled user image segment");
+    let disabled_user = small
+        .prompt_plan
+        .segments
+        .iter()
+        .find(|segment| matches!(segment.content, PromptSegmentContent::UserContent { .. }))
+        .expect("disabled user image segment");
+    assert!(matches!(
+        &enabled_user.content,
+        PromptSegmentContent::UserContent { content } if !content.attachments.is_empty()
+    ));
+    assert!(
+        enabled_user.tokens.estimated_input_tokens.unwrap()
+            > disabled_user.tokens.estimated_input_tokens.unwrap()
+    );
+}
+
+#[test]
+fn planner_image_projection_preserves_snapshot() {
+    let item = HistoryItem::user_content(
+        UserMessageContent::from_parts(vec![UserMessagePart::Image {
+            attachment: image_attachment("snapshot.png", 80_000),
+        }])
+        .with_selected_skills(vec!["skill-a".into()]),
+    );
+    let stable_key = ProtocolFrame::from_history_item(0, &item).stable_prompt_key();
+    let frame = RuntimeFrame::new(
+        RuntimeFrameKind::User,
+        FrameVisibility::Active,
+        RuntimeFrameProvenance::new(RuntimeSource::Derived),
+        RuntimeFrameIdSeed {
+            frame_kind: RuntimeFrameKind::User,
+            source: RuntimeSource::Derived,
+            ordinal: 0,
+            stable_key: &stable_key,
+            source_span: None,
+        },
+    )
+    .with_protocol(item);
+    let mut snapshot = RuntimeSnapshot::new("image-projection");
+    snapshot.push_frame(frame);
+    let before = snapshot.clone();
+    PromptPlanner::plan(PromptPlannerInput {
+        model: metadata(1_024),
+        model_id: "gpt-test",
+        prelude: &[],
+        snapshot: &snapshot,
+        tools: &[],
+        frozen_evidence: None,
+        protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
+    })
+    .expect("disabled image projection should fit");
+    assert_eq!(snapshot, before);
 }
 
 fn deepseek_metadata() -> ModelRequestMetadata {

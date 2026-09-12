@@ -542,6 +542,8 @@ mod tests {
             effective_input_limit_tokens: None,
             max_output_tokens: None,
             supports_tools: false,
+            supports_input_images: false,
+            supports_tool_result_images: false,
             supports_reasoning: false,
             reasoning_effort: None,
             reasoning_efforts: Vec::new(),

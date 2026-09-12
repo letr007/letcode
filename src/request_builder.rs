@@ -61,6 +61,8 @@ pub struct ModelRequestMetadata {
     pub effective_input_limit_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
+    pub supports_input_images: bool,
+    pub supports_tool_result_images: bool,
     pub supports_reasoning: bool,
     pub reasoning_effort: Option<ModelReasoningEffort>,
     pub reasoning_efforts: Vec<ModelReasoningEffort>,
@@ -784,6 +786,10 @@ pub(crate) fn build_request_from_selected_prompt(
 
 pub(crate) fn provider_visible_protocol_frames(snapshot: &RuntimeSnapshot) -> Vec<ProtocolFrame> {
     runtime_projection::provider_visible_protocol_frames(snapshot)
+}
+
+pub(crate) fn project_model_images(frames: &mut [ProtocolFrame], model: &ModelRequestMetadata) {
+    runtime_projection::project_model_images(frames, model);
 }
 
 fn protected_start_index_for_snapshot(

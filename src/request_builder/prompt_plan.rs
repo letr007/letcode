@@ -172,7 +172,8 @@ pub(crate) struct PlannedPrompt {
 impl PromptPlanner {
     pub(crate) fn plan(input: PromptPlannerInput<'_>) -> anyhow::Result<PlannedPrompt> {
         input.snapshot.validate_references()?;
-        let active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
+        let mut active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
+        super::project_model_images(&mut active_history_frames, &input.model);
         let active_protected_start_index =
             super::protected_start_index_for_snapshot(input.snapshot, &active_history_frames);
         let effective = effective_runtime_prompt(

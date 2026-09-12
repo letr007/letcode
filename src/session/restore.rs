@@ -670,6 +670,60 @@ reasoning_efforts = ["medium", "high"]
     }
 
     #[test]
+    fn routed_resume_preserves_image_history_without_decoding_payloads() {
+        use crate::agent::{ConfiguredPrimaryRouteFactory, PrimaryRouteFactory as _};
+        use crate::user_content::{UserImageAttachment, UserMessageContent};
+
+        for supports_images in [false, true] {
+            for missing_payload in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let config_path = dir.path().join("letcode.toml");
+                std::fs::write(&config_path, format!(r#"
+active_provider = "p"
+[providers.p]
+protocol = "responses"
+default_model = "current"
+[providers.p.auth]
+type = "none"
+[providers.p.endpoints]
+base_url = "https://example.invalid/v1"
+[providers.p.models.current.capabilities]
+input_images = {current_images}
+[providers.p.models.target.capabilities]
+input_images = {supports_images}
+"#, current_images = !supports_images)).unwrap();
+                let config = crate::config::AppConfig::load_from_path(&config_path).unwrap();
+                let factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(), config.global.retry.clone(), config.runtime_catalog.clone(),
+                ));
+                let mut agent = Agent::new("current", 1, 1);
+                agent.apply_prepared_route(factory.prepare_route(config.active_route()).unwrap());
+                agent.set_primary_route_factory(factory);
+                let mut target = TranscriptRecorder::create(dir.path()).unwrap();
+                target.record_session_started("p/target").unwrap();
+                let mut image = UserImageAttachment::from_bytes("clipboard", "image/png", b"image bytes");
+                if missing_payload {
+                    image.data_url.clear();
+                }
+                target.record_user_message_content(UserMessageContent::new("look", vec![image])).unwrap();
+                let id = target.session_id().to_owned();
+                drop(target);
+                let live = Arc::new(Mutex::new(TranscriptRecorder::create(dir.path()).unwrap()));
+                let prepared = prepare_resume_package(dir.path(), &id).unwrap();
+                let original_frames = prepared.snapshot.snapshot.active_protocol_frames();
+                let install = prepare_routed_resume_install(&agent, &live, prepared)
+                    .expect("restoring history does not decode image payloads");
+                let (_, usage) = install.commit(&mut agent, &live);
+                assert_eq!(live.lock().unwrap().session_id(), id);
+                assert_eq!(agent.route_display_name(), "p/target");
+                assert_eq!(agent.active_protocol_frames(), original_frames);
+                assert_eq!(agent.session_token_usage().unwrap().used_tokens, usage.used_tokens);
+                assert!(usage.used_tokens > 0);
+            }
+        }
+    }
+
+    #[test]
     fn routed_resume_switches_the_provider_route() {
         let sessions_dir = temp_dir();
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");

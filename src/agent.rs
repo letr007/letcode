@@ -1147,7 +1147,7 @@ impl Agent {
     /// that provider response. A stale frontier deliberately fails open.
     pub(super) fn projected_token_usage(&self) -> Option<TokenUsageEstimate> {
         let anchor = self.provider_usage_anchor.as_ref()?;
-        let frames = self.active_protocol_frames();
+        let mut frames = self.active_protocol_frames();
         if frames.len() < anchor.protocol_frontier_count
             || protocol_prefix_digest(&frames[..anchor.protocol_frontier_count])
                 != anchor.protocol_prefix_digest
@@ -1155,6 +1155,10 @@ impl Agent {
             return None;
         }
 
+        crate::request_builder::project_model_images(
+            &mut frames[anchor.protocol_frontier_count..],
+            &self.active_model_metadata(),
+        );
         let trailing_tokens = frames[anchor.protocol_frontier_count..]
             .iter()
             .map(|frame| estimate_trailing_history_item_tokens(&frame.to_history_item()))
@@ -1196,7 +1200,7 @@ impl Agent {
                 ColdRequiredReason::TruncatedOrReselected,
             ));
         }
-        let Some(suffix) = self.appended_protocol_frames(previous) else {
+        let Some(mut suffix) = self.appended_protocol_frames(previous) else {
             return Ok(ActiveEpochPreparation::ColdRequired(
                 ColdRequiredReason::ProtocolFrontierChanged,
             ));
@@ -1206,6 +1210,7 @@ impl Agent {
                 ColdRequiredReason::UnsupportedAppendShape,
             ));
         }
+        crate::request_builder::project_model_images(&mut suffix, &self.active_model_metadata());
         if crate::protocol_frames::validate_history_items_complete(
             &crate::protocol_frames::history_items_from_frames(&suffix),
             None,
@@ -1777,6 +1782,8 @@ impl Agent {
             metadata.reasoning_effort = Some(effort.clone());
         }
         if let Some(route) = self.resolved_model_route() {
+            metadata.supports_input_images = route.capabilities.input_images;
+            metadata.supports_tool_result_images = route.capabilities.tool_result_images;
             route.strategy.normalize_request_metadata(&mut metadata);
         }
         metadata.fast_mode = self.fast_mode_enabled();
@@ -1914,20 +1921,14 @@ impl Agent {
         self.candidate_session_token_usage(&self.model, &self.runtime_snapshot)
     }
 
+    /// Estimate selected content without decoding attachments or validating a
+    /// wire request. Those checks belong to actual request preparation.
     pub(crate) fn candidate_session_usage_with_composition(
         &self,
         model_id: &str,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
-        let (build, tools) = self.build_candidate_session_request(model_id, runtime_snapshot)?;
-        if let Some(route) = self.resolved_model_route.as_deref() {
-            self.validate_resolved_candidate_request(
-                route,
-                self.active_model_metadata(),
-                &tools,
-                &build,
-            )?;
-        }
+        let build = self.build_candidate_session_request(model_id, runtime_snapshot)?;
         let usage = TokenUsageEstimate {
             used_tokens: build.budget.estimated_request_tokens,
             context_window_tokens: build.budget.context_window_tokens,
@@ -1959,19 +1960,12 @@ impl Agent {
         runtime_route: Option<&ResolvedModelRoute>,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<(TokenUsageEstimate, Vec<PromptCompositionEntry>)> {
-        let (build, tools) = self.build_candidate_session_request_with_route(
+        let build = self.build_candidate_session_request_with_route(
             &route.model,
             model_catalog,
+            runtime_route,
             runtime_snapshot,
         )?;
-        if let Some(runtime_route) = runtime_route {
-            self.validate_resolved_candidate_request(
-                runtime_route,
-                model_catalog.get(&route.model).cloned().unwrap_or_default(),
-                &tools,
-                &build,
-            )?;
-        }
         let usage = TokenUsageEstimate {
             used_tokens: build.budget.estimated_request_tokens,
             context_window_tokens: build.budget.context_window_tokens,
@@ -1985,38 +1979,17 @@ impl Agent {
         Ok((usage, composition))
     }
 
-    fn validate_resolved_candidate_request(
-        &self,
-        route: &ResolvedModelRoute,
-        model: ModelRequestMetadata,
-        tools: &[crate::request_builder::ToolSpec],
-        build: &crate::request_builder::BuildResult,
-    ) -> Result<()> {
-        let input = crate::model_runtime::projection::model_request_from_prompt_plan(
-            route,
-            &model,
-            &build.prompt_plan,
-            tools,
-        )
-        .map_err(anyhow::Error::msg)?;
-        route
-            .binding
-            .prepare_request(&input)
-            .map_err(|failure| anyhow!(failure.to_string()))?;
-        Ok(())
-    }
-
     fn build_candidate_session_request(
         &self,
         model_id: &str,
         runtime_snapshot: &RuntimeSnapshot,
-    ) -> Result<(
-        crate::request_builder::BuildResult,
-        Vec<crate::request_builder::ToolSpec>,
-    )> {
+    ) -> Result<crate::request_builder::BuildResult> {
         self.build_candidate_session_request_with_route(
             model_id,
             &self.model_catalog,
+            self.resolved_model_route
+                .as_deref()
+                .filter(|route| route.model == model_id),
             runtime_snapshot,
         )
     }
@@ -2025,12 +1998,10 @@ impl Agent {
         &self,
         model_id: &str,
         model_catalog: &HashMap<String, ModelRequestMetadata>,
+        runtime_route: Option<&ResolvedModelRoute>,
         runtime_snapshot: &RuntimeSnapshot,
-    ) -> Result<(
-        crate::request_builder::BuildResult,
-        Vec<crate::request_builder::ToolSpec>,
-    )> {
-        let model = model_catalog
+    ) -> Result<crate::request_builder::BuildResult> {
+        let mut model = model_catalog
             .get(model_id)
             .cloned()
             .unwrap_or(ModelRequestMetadata {
@@ -2041,6 +2012,10 @@ impl Agent {
                 parallel_tool_calls: true,
                 ..Default::default()
             });
+        if let Some(route) = runtime_route {
+            model.supports_input_images = route.capabilities.input_images;
+            model.supports_tool_result_images = route.capabilities.tool_result_images;
+        }
         let mut tools = self.tools.specs();
         tools.retain(|spec| !is_subagent_tool_name(&spec.name));
         tools.extend(
@@ -2073,7 +2048,7 @@ impl Agent {
             None,
             Some(policy),
         )?;
-        Ok((build, tools))
+        Ok(build)
     }
 
     #[cfg(test)]
