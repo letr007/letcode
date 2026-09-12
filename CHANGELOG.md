@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-12
+
 ### Added
 
 - 新增 `[fake]` 配置段，为请求兼容模式声明可变信息。
@@ -334,7 +336,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/letr007/letcode/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/letr007/letcode/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/letr007/letcode/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/letr007/letcode/compare/v0.8.0...v0.9.0
