@@ -694,6 +694,18 @@ pub(crate) fn restore_latest_model_projection(records: &[TranscriptRecord]) -> O
     model
 }
 
+pub(crate) fn restore_latest_fake_client_projection(
+    records: &[TranscriptRecord],
+) -> Option<crate::fake::FakeClient> {
+    let mut client = None;
+    for record in records {
+        if let TranscriptEvent::FakeClientChanged { new_client, .. } = &record.event {
+            client = *new_client;
+        }
+    }
+    client
+}
+
 pub(crate) fn restore_latest_permission_mode_projection(
     records: &[TranscriptRecord],
 ) -> Option<String> {

@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use crate::agent::Agent;
 use crate::session::child_view::{
@@ -214,7 +214,24 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetFakeClient(client) => {
+                let previous_client = agent.fake_client();
                 if let Err(error) = agent.set_fake_client(client) {
+                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
+                        command: SessionCommand::SetFakeClient(client),
+                    });
+                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                        error.to_string(),
+                    )));
+                } else if let Err(error) = transcript
+                    .lock()
+                    .map_err(|_| anyhow!("transcript recorder poisoned"))
+                    .and_then(|mut recorder| {
+                        recorder.record_fake_client_changed(previous_client, client)
+                    })
+                {
+                    agent
+                        .set_fake_client(previous_client)
+                        .expect("restoring the previous fake mode must validate");
                     let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
                         command: SessionCommand::SetFakeClient(client),
                     });

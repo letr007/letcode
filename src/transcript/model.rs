@@ -431,6 +431,10 @@ pub enum TranscriptEvent {
         previous_mode: String,
         new_mode: String,
     },
+    FakeClientChanged {
+        previous_client: Option<crate::fake::FakeClient>,
+        new_client: Option<crate::fake::FakeClient>,
+    },
     TodoSnapshot {
         items: Vec<TodoItem>,
     },

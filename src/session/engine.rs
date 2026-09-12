@@ -2312,16 +2312,19 @@ async fn run_engine_loop(
                                 "Fast mode auto-disabled: current model is unavailable",
                             )));
                         }
-                        if agent
-                            .fake_client()
-                            .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
-                        {
-                            agent
-                                .set_fake_client(None)
-                                .expect("disabling fake mode is always supported");
-                            let _ = session_transport_tx.send(
-                                SessionTransportEvent::FakeClientChanged { client: None },
-                            );
+                        let recorded_fake_client =
+                            crate::transcript::restore_latest_fake_client(&resumed_event_records);
+                        let restored_fake_client = recorded_fake_client
+                            .filter(|client| client.supports_protocol(agent.active_protocol()));
+                        agent
+                            .set_fake_client(restored_fake_client)
+                            .expect("restoring fake mode must validate against the active protocol");
+                        let _ = session_transport_tx.send(
+                            SessionTransportEvent::FakeClientChanged {
+                                client: restored_fake_client,
+                            },
+                        );
+                        if restored_fake_client.is_none() && recorded_fake_client.is_some() {
                             let _ = session_transport_tx.send(SessionTransportEvent::Notice(
                                 NoticeEvent::info(
                                     "Fake mode disabled: unsupported by the resumed model protocol",
@@ -2462,22 +2465,12 @@ async fn run_engine_loop(
                             continue;
                         }
                         prepared_install.commit(&mut agent, &transcript);
-                        if agent
-                            .fake_client()
-                            .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
-                        {
-                            agent
-                                .set_fake_client(None)
-                                .expect("disabling fake mode is always supported");
-                            let _ = session_transport_tx.send(
-                                SessionTransportEvent::FakeClientChanged { client: None },
-                            );
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                NoticeEvent::info(
-                                    "Fake mode disabled: unsupported by the new session model protocol",
-                                ),
-                            ));
-                        }
+                        agent
+                            .set_fake_client(None)
+                            .expect("disabling fake mode is always supported");
+                        let _ = session_transport_tx.send(
+                            SessionTransportEvent::FakeClientChanged { client: None },
+                        );
                         let new_session_model_id = agent.route_display_name();
                         expert_model_routes = new_session_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));

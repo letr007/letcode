@@ -307,7 +307,7 @@ fn config_metadata_matches(expected: &fs::Metadata, current: &fs::Metadata) -> b
     }
 }
 
-pub(super) struct ConfigLock {
+pub(crate) struct ConfigLock {
     _file: fs::File,
 }
 
@@ -354,7 +354,7 @@ pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-pub(super) fn acquire_config_lock(config_target: &Path) -> Result<ConfigLock> {
+pub(crate) fn acquire_config_lock(config_target: &Path) -> Result<ConfigLock> {
     let lock_path = config_lock_path(config_target)?;
     let file = open_config_lock_file(&lock_path)?;
     lock_file(&file)?;

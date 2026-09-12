@@ -1301,6 +1301,17 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_fake_client_changed(
+        &mut self,
+        previous_client: Option<crate::fake::FakeClient>,
+        new_client: Option<crate::fake::FakeClient>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::FakeClientChanged {
+            previous_client,
+            new_client,
+        })
+    }
+
     pub fn record_todo_snapshot(&mut self, items: Vec<TodoItem>) -> Result<()> {
         self.append(TranscriptEvent::TodoSnapshot { items })
     }
@@ -1776,6 +1787,7 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::ToolCallCancelled { .. }
             | TranscriptEvent::PermissionDecision { .. }
             | TranscriptEvent::PermissionModeChanged { .. }
+            | TranscriptEvent::FakeClientChanged { .. }
             | TranscriptEvent::TodoSnapshot { .. }
             | TranscriptEvent::AutoContinueChanged { .. }
             | TranscriptEvent::AutoContinuationScheduled { .. }

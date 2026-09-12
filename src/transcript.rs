@@ -163,8 +163,9 @@ pub(crate) use restore::{
     restore_session_evidence, restore_session_history, restore_session_protocol_frames,
 };
 pub use restore::{
-    restore_latest_auto_continue_state, restore_latest_expert_models, restore_latest_model,
-    restore_latest_permission_mode, restore_latest_reasoning_effort, restore_latest_todo_snapshot,
+    restore_latest_auto_continue_state, restore_latest_expert_models, restore_latest_fake_client,
+    restore_latest_model, restore_latest_permission_mode, restore_latest_reasoning_effort,
+    restore_latest_todo_snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

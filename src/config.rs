@@ -103,7 +103,7 @@ const MAX_RECOVERY_ATTEMPTS: usize = 10;
 mod persistence;
 
 use persistence::acquire_config_read_lock;
-pub(crate) use persistence::replace_file;
+pub(crate) use persistence::{acquire_config_lock, replace_file};
 #[allow(unused_imports)]
 pub use persistence::{persist_expert_allowed_models, persist_mcp_server_enabled};
 

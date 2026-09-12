@@ -147,7 +147,6 @@ async fn main() -> Result<()> {
     agent.auto_disable_fast_mode_for_model(agent.model())?;
     let mut startup_preferences =
         tui::preferences::TuiPreferences::load_from_dir(&config.config_dir);
-    let startup_fake_client = startup_preferences.fake_client;
     let workspace_dir = env::current_dir()?;
     project_memory::configure(&config.config_dir.join("memory"), &workspace_dir)?;
     agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
@@ -191,31 +190,20 @@ async fn main() -> Result<()> {
     ));
     let prepared_active_route = primary_route_factory.prepare_route(active_route.clone())?;
     agent.apply_prepared_route(prepared_active_route);
-    if let Some(fake_client) = startup_fake_client {
-        if fake_client.supports_protocol(agent.active_protocol()) {
-            // `letcode.toml` is the authoritative source; the preferences file is
-            // only the persistence slot for a generated id.
-            let installation_id = match config.fake.identity.installation_id.clone() {
-                Some(declared) => declared,
-                None => {
-                    let generated = startup_preferences.ensure_fake_installation_id();
-                    startup_preferences
-                        .save_to_dir(&config.config_dir)
-                        .map_err(|error| {
-                            anyhow!("failed to persist fake installation id: {error}")
-                        })?;
-                    generated
-                }
-            };
-            agent.set_fake_installation_id(installation_id);
-            agent.set_fake_client(Some(fake_client))?;
-        } else {
-            startup_preferences.fake_client = None;
-            startup_preferences
-                .save_to_dir(&config.config_dir)
-                .map_err(|error| anyhow!("failed to disable unsupported fake mode: {error}"))?;
+    // The installation id is global; the selected fake client is session-owned
+    // and is restored from the active session transcript.
+    let installation_id = match config.fake.identity.installation_id.clone() {
+        Some(declared) => declared,
+        None => {
+            let generated = startup_preferences.ensure_fake_installation_id();
+            tui::preferences::TuiPreferences::update_in_dir(&config.config_dir, |prefs| {
+                prefs.fake_installation_id = Some(generated.clone());
+            })
+            .map_err(|error| anyhow!("failed to persist fake installation id: {error}"))?;
+            generated
         }
-    }
+    };
+    agent.set_fake_installation_id(installation_id);
     agent.set_primary_route_factory(primary_route_factory);
     install_expert_route_factory(&mut agent, &config)?;
     let skill_registry = Arc::new(SkillRegistry::load(&config.config_dir, &workspace_dir)?);

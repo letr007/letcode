@@ -1,12 +1,16 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::command::{ThemeName, ThoughtsDisplayMode, ToolsDisplayMode};
 use crate::tui::i18n::Language;
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
+static PREFERENCES_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a persisted value has the shape of a UUID: five groups of hex digits
 /// separated by dashes, `8-4-4-4-12`.
@@ -45,8 +49,6 @@ pub struct TuiPreferences {
     #[serde(default)]
     pub language: Option<String>,
     #[serde(default)]
-    pub fake_client: Option<crate::fake::FakeClient>,
-    #[serde(default)]
     pub fake_installation_id: Option<String>,
 }
 
@@ -61,7 +63,6 @@ impl Default for TuiPreferences {
             thoughts_display: ThoughtsDisplayMode::default(),
             tools_display: ToolsDisplayMode::default(),
             language: None,
-            fake_client: None,
             fake_installation_id: None,
         }
     }
@@ -112,12 +113,44 @@ impl TuiPreferences {
         }
     }
 
-    pub fn save_to_dir(&self, config_dir: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(config_dir)?;
+    pub fn update_in_dir(config_dir: &Path, update: impl FnOnce(&mut Self)) -> Result<()> {
         let path = preferences_path(config_dir);
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
-        Ok(())
+        fs::create_dir_all(config_dir)?;
+        let config_target = fs::canonicalize(config_dir)?.join(
+            path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("preferences path has no file name"))?,
+        );
+        let _lock = crate::config::acquire_config_lock(&config_target)?;
+        let mut current = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
+            .unwrap_or_default();
+        update(&mut current);
+        let json = serde_json::to_vec_pretty(&current)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("preferences path has no file name"))?;
+        let temp_path = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            PREFERENCES_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let write_result = (|| -> Result<()> {
+            let mut temp = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            temp.write_all(&json)?;
+            temp.sync_all()?;
+            drop(temp);
+            crate::config::replace_file(&temp_path, &path)
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result
     }
 }
 
@@ -158,10 +191,10 @@ mod tests {
             thoughts_display: ThoughtsDisplayMode::Titles,
             tools_display: ToolsDisplayMode::Compact,
             language: Some("zh-CN".into()),
-            fake_client: Some(crate::fake::FakeClient::Codex),
             fake_installation_id: Some("fake-installation".into()),
         };
-        prefs.save_to_dir(&base).expect("save preferences");
+        TuiPreferences::update_in_dir(&base, |current| *current = prefs.clone())
+            .expect("save preferences");
 
         let loaded = TuiPreferences::load_from_dir(&base);
         assert_eq!(loaded, prefs);
@@ -236,6 +269,35 @@ mod tests {
     }
 
     #[test]
+    fn field_updates_preserve_other_process_changes() {
+        let base = std::env::temp_dir().join(format!(
+            "letcode-tui-preferences-update-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                TuiPreferences::update_in_dir(&base, |prefs| {
+                    prefs.theme = "forest".into();
+                })
+                .expect("write theme");
+            });
+            scope.spawn(|| {
+                TuiPreferences::update_in_dir(&base, |prefs| {
+                    prefs.language = Some("zh-CN".into());
+                })
+                .expect("write language");
+            });
+        });
+
+        let loaded = TuiPreferences::load_from_dir(&base);
+        assert_eq!(loaded.theme, "forest");
+        assert_eq!(loaded.language.as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
     fn custom_theme_id_round_trips() {
         let prefs = TuiPreferences {
             tool_output_expanded: false,
@@ -246,7 +308,6 @@ mod tests {
             thoughts_display: ThoughtsDisplayMode::Compact,
             tools_display: ToolsDisplayMode::Detailed,
             language: None,
-            fake_client: None,
             fake_installation_id: None,
         };
         let json = serde_json::to_string(&prefs).expect("serialize");

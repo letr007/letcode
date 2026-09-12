@@ -1285,7 +1285,6 @@ impl TuiRuntime {
             }
             SessionTransportEvent::FakeClientChanged { client } => {
                 self.state.set_fake_client(*client);
-                self.persist_fake_selection(*client);
             }
             SessionTransportEvent::BackgroundSubagentCompleted {
                 parent_tool_call_id,
@@ -1635,6 +1634,7 @@ impl TuiRuntime {
                 self.state.clear_child_timeline_cache();
                 self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
+                self.state.set_fake_client(None);
                 self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear();
                 self.queued_prompts.clear();
@@ -2779,9 +2779,10 @@ impl TuiRuntime {
         };
         if let Some(language) = language {
             self.state.set_language(Some(language));
-            self.tui_preferences()
-                .save_to_dir(&self.preferences_dir)
-                .map_err(|error| anyhow!("failed to save language preference: {error}"))?;
+            TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+                prefs.language = Some(language.id().to_string());
+            })
+            .map_err(|error| anyhow!("failed to save language preference: {error}"))?;
         } else {
             let items = [
                 DialogItem::new("en", "English", None),
@@ -2809,8 +2810,9 @@ impl TuiRuntime {
 
     fn apply_tools_display(&mut self, mode: ToolsDisplayMode) {
         self.state.set_tools_display(mode);
-        let prefs = self.tui_preferences();
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(error) = TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+            prefs.tools_display = mode;
+        }) {
             tracing::warn!(%error, "failed to save tools display preference");
             self.state.show_toast(
                 self.state.t("runtime.preference_not_saved"),
@@ -2830,7 +2832,10 @@ impl TuiRuntime {
     }
 
     fn persist_sidebar_preference(&mut self) {
-        if let Err(error) = self.tui_preferences().save_to_dir(&self.preferences_dir) {
+        if let Err(error) = TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+            prefs.sidebar_hidden = self.state.sidebar_hidden;
+            prefs.sidebar_forced_open = self.state.sidebar_forced_open;
+        }) {
             tracing::warn!(%error, "failed to save TUI preferences");
             self.state.show_toast(
                 self.state.t("runtime.preference_not_saved"),
@@ -2849,8 +2854,9 @@ impl TuiRuntime {
             TranscriptScrollbarMode::Hidden => false,
         };
         self.state.set_transcript_scrollbar_visible(visible);
-        let prefs = self.tui_preferences();
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(error) = TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+            prefs.transcript_scrollbar_visible = visible;
+        }) {
             tracing::warn!(%error, "failed to save transcript scrollbar preference");
             self.state.show_toast(
                 self.state.t("runtime.preference_not_saved"),
@@ -2858,24 +2864,6 @@ impl TuiRuntime {
             );
         }
         SubmittedCommand::LocalOnly
-    }
-
-    fn tui_preferences(&self) -> TuiPreferences {
-        TuiPreferences {
-            tool_output_expanded: self.state.tool_output_expanded,
-            transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
-            sidebar_hidden: self.state.sidebar_hidden,
-            sidebar_forced_open: self.state.sidebar_forced_open,
-            theme: self.state.theme_id.clone(),
-            thoughts_display: self.state.thoughts_display,
-            tools_display: self.state.tools_display,
-            language: self
-                .state
-                .language
-                .map(|language| language.id().to_string()),
-            fake_client: self.state.fake_client,
-            fake_installation_id: self.state.fake_installation_id.clone(),
-        }
     }
 
     fn handle_thoughts_command(
@@ -2888,8 +2876,9 @@ impl TuiRuntime {
 
     fn apply_thoughts_display(&mut self, mode: ThoughtsDisplayMode) {
         self.state.set_thoughts_display(mode);
-        let prefs = self.tui_preferences();
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(error) = TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+            prefs.thoughts_display = mode;
+        }) {
             tracing::warn!(%error, "failed to save TUI preferences");
             self.state.show_toast(
                 self.state.t("runtime.preference_not_saved"),
@@ -2965,20 +2954,6 @@ impl TuiRuntime {
         SubmittedCommand::Runtime(RuntimeCommand::SetFakeClient(client))
     }
 
-    fn persist_fake_selection(&mut self, client: Option<crate::fake::FakeClient>) {
-        let mut prefs = self.tui_preferences();
-        prefs.fake_client = client;
-        if client.is_some() {
-            let installation_id = prefs.ensure_fake_installation_id();
-            self.state.fake_installation_id = Some(installation_id);
-        }
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
-            tracing::warn!(%error, "failed to save fake client preference");
-            self.state
-                .show_toast(self.state.t("runtime.fake_not_saved"), ToastKind::Info);
-        }
-    }
-
     fn show_theme_dialog(&mut self) {
         self.theme_preview_original = Some((self.state.theme_id.clone(), self.state.custom_theme));
         ensure_bundled_themes(&self.preferences_dir);
@@ -3016,8 +2991,9 @@ impl TuiRuntime {
         if !self.activate_theme(theme_id) {
             return;
         }
-        let prefs = self.tui_preferences();
-        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+        if let Err(error) = TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+            prefs.theme = self.state.theme_id.clone();
+        }) {
             tracing::warn!(%error, "failed to save TUI preferences");
             self.state
                 .show_toast(self.state.t("runtime.theme_not_saved"), ToastKind::Info);
@@ -3768,7 +3744,9 @@ impl TuiRuntime {
                     _ => crate::tui::i18n::Language::En,
                 };
                 self.state.set_language(Some(language));
-                self.tui_preferences().save_to_dir(&self.preferences_dir)?;
+                TuiPreferences::update_in_dir(&self.preferences_dir, |prefs| {
+                    prefs.language = Some(language.id().to_string());
+                })?;
                 self.state.close_dialog();
                 Ok(None)
             }
@@ -4633,7 +4611,7 @@ pub async fn run_tui(
     state.set_thoughts_display(preferences.thoughts_display);
     state.set_tools_display(preferences.tools_display);
     apply_preferences_theme(&mut state, &preferences_dir, &preferences.theme);
-    state.set_fake_client(preferences.fake_client);
+    state.set_fake_client(None);
     state.fake_installation_id = preferences.fake_installation_id;
     state.set_provider_label(provider_label);
     state.set_fast_mode_enabled(projection.fast_mode_enabled);
