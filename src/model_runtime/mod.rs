@@ -2282,6 +2282,7 @@ impl RuntimeConfig {
                     model_name,
                     protocol,
                     &model.protocol_settings,
+                    &model.generation,
                 )?;
                 validate_generation_defaults(provider_name, model_name, protocol, strategy, model)?;
                 if endpoint_query
@@ -2447,6 +2448,7 @@ fn validate_protocol_settings(
     model: &str,
     protocol: &str,
     settings: &ProtocolSettings,
+    generation: &RuntimeGenerationDefaults,
 ) -> Result<(), RuntimeConfigError> {
     if protocol == "anthropic" {
         let parsed: AnthropicProtocolSettings =
@@ -2456,6 +2458,20 @@ fn validate_protocol_settings(
                     reason: error.to_string(),
                 }
             })?;
+        if parsed
+            .anthropic_thinking
+            .as_ref()
+            .is_none_or(|thinking| thinking.mode != "adaptive")
+            && (generation.reasoning_effort.is_some() || !generation.reasoning_efforts.is_empty())
+        {
+            return Err(RuntimeConfigError::InvalidValue {
+                field: format!(
+                    "providers.{provider}.models.{model}.protocol_settings.anthropic_thinking"
+                ),
+                reason: "must set mode = \"adaptive\" when generation.reasoning_effort or generation.reasoning_efforts is configured"
+                    .into(),
+            });
+        }
         if let Some(thinking) = parsed.anthropic_thinking {
             if !matches!(thinking.mode.as_str(), "disabled" | "adaptive" | "budget") {
                 return Err(RuntimeConfigError::InvalidValue {

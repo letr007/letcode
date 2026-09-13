@@ -221,7 +221,7 @@ enabled = false
 
 # 协议专属设置由选定的 protocol binding 按自身 schema 校验。
 # Anthropic 路由可配置，例如：
-# anthropic_thinking = { mode = "adaptive" }
+# anthropic_thinking = { mode = "adaptive" } # 配置 reasoning_effort 时必须为 adaptive
 # anthropic_betas = ["context-1m-2025-08-07"]
 [providers.openai.models."gpt-5.5".protocol_settings]
 

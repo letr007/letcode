@@ -221,7 +221,7 @@ enabled = false
 
 # Adapter-specific settings are validated by the selected protocol binding.
 # Anthropic routes may set, for example:
-# anthropic_thinking = { mode = "adaptive" }
+# anthropic_thinking = { mode = "adaptive" } # required whenever reasoning_effort is configured
 # anthropic_betas = ["context-1m-2025-08-07"]
 [providers.openai.models."gpt-5.5".protocol_settings]
 

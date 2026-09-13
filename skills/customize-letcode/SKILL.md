@@ -231,7 +231,7 @@ namespace = "my-cache"
 - Provider 和 model 都可配置 `protocol` / `flavor`。`protocol` 支持 `responses`、`completions`、`anthropic`；`flavor = "deepseek"` 是显式 DeepSeek profile，不根据 provider/model 名猜测。
 - capability 与 generation capability 省略时均为 false。`.generation` 中出现某个参数时，必须先在 `.capabilities.generation` 打开对应能力；reasoning 参数还要求 `.capabilities.reasoning = true`。
 - `.cache.enabled = true` 是缓存的唯一开关：它同时声明该路由支持 provider-native prompt cache hint 并发送它。`.cache.retention` 仅适用于 Responses，并要求 `enabled = true`。
-- `anthropic_betas` 和 `anthropic_thinking` 位于模型的 `.protocol_settings` table，仅适用于 `protocol = "anthropic"`。beta 会按配置顺序合并为 `anthropic-beta` header；thinking 支持 `disabled`、`adaptive`、`budget`，budget 模式至少 1024 token。
+- `anthropic_betas` 和 `anthropic_thinking` 位于模型的 `.protocol_settings` table，仅适用于 `protocol = "anthropic"`。beta 会按配置顺序合并为 `anthropic-beta` header；thinking 支持 `disabled`、`adaptive`、`budget`，budget 模式至少 1024 token；配置 `reasoning_effort` 或 `reasoning_efforts` 时必须为 `adaptive`。
 - `[tools.parallelism]` 只能**收窄**已声明 `Parallel` 的工具（例如强制
   `exclusive`）。把 exclusive 工具提成 `parallel` 会被拒绝。
 - 本地 MCP 的 `command` 必须是字符串数组，不能是单个字符串。`type` 必填。

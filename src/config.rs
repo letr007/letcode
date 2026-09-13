@@ -2476,6 +2476,34 @@ base_url = "https://example.invalid"
     }
 
     #[test]
+    fn anthropic_reasoning_defaults_require_adaptive_thinking() {
+        let route = |extra: &str| {
+            config(
+                "vendor",
+                "model",
+                &format!("protocol = \"anthropic\"\n{extra}"),
+            )
+        };
+
+        let error = AppConfig::load_from_path(write_temp_config(route(
+            "[capabilities]\nreasoning = true\ngeneration = { reasoning = true }\n[generation]\nreasoning_effort = \"high\"",
+        )))
+        .expect_err("reasoning without thinking settings should fail");
+        assert!(format!("{error:#}").contains("anthropic_thinking"));
+
+        let loaded = AppConfig::load_from_path(write_temp_config(route(
+            "[capabilities]\nreasoning = true\ngeneration = { reasoning = true }\n[generation]\nreasoning_effort = \"high\"\n[protocol_settings]\nanthropic_thinking = { mode = \"adaptive\" }",
+        )))
+        .expect("adaptive thinking should load");
+        assert!(
+            !loaded.providers["vendor"].models["model"]
+                .request_metadata()
+                .selectable_reasoning_efforts()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn rejects_out_of_range_sampling_parameters() {
         let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
