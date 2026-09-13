@@ -7,15 +7,17 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-13
+
 ### Breaking
 
-- 移除 `capabilities.prompt_cache`；`[cache] enabled = true` 成为 prompt cache 的唯一开关，它同时声明该路由支持 provider-native cache hint 并发送它。配置中的该能力行需删除。
+- 移除 `capabilities.prompt_cache`；`[cache] enabled = true` 成为 prompt cache 的唯一开关，配置中的该能力行需删除。
 
 ### Fixed
 
-- 修复未启用并行工具调用的路由仍携带 `parallel_tool_calls`（值为 `false`）导致 Completions 路由的带工具回合在预检阶段全部失败的问题：该字段现在只在路由确实启用并行工具调用时出现。
-- 修复 Anthropic 路由配置了 `reasoning_effort` / `reasoning_efforts` 却未声明 `anthropic_thinking` 时，配置能加载而每个回合都在预检阶段失败的问题：现在加载时即拒绝，并指出需要 `mode = "adaptive"`。
-- 修复无法表达 reasoning effort 的路由（Anthropic 未声明 thinking，或其它协议未打开 `capabilities.generation.reasoning`）仍列出可选档位、选择后该模型后续回合全部在预检阶段失败的问题。
+- 修复未启用并行工具调用的路由仍发送 `parallel_tool_calls`，导致 Completions 路由的带工具回合在预检阶段全部失败的问题。
+- 修复 Anthropic 路由配置 `reasoning_effort` / `reasoning_efforts` 却未声明 `anthropic_thinking` 时每个回合都在预检阶段失败的问题；加载配置时现在会拒绝该组合。
+- 修复无法表达 reasoning effort 的路由仍列出可选档位，选中后该路由后续回合全部在预检阶段失败的问题。
 
 ## [0.12.0] - 2026-09-12
 
@@ -346,7 +348,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/letr007/letcode/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/letr007/letcode/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/letr007/letcode/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/letr007/letcode/compare/v0.9.0...v0.10.0
