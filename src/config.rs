@@ -1028,6 +1028,15 @@ fn project_resolved_model_config(model: &ResolvedModelRoute) -> Result<ModelConf
         retention,
         namespace: model.cache.namespace.clone(),
     };
+    // Reasoning effort is only offered when the route can express it: Anthropic needs
+    // adaptive thinking, other protocols need the generation support flag, or selecting
+    // an effort would fail every later turn in prepare.
+    let reasoning_settable = match protocol {
+        ApiProtocol::Anthropic => {
+            anthropic_thinking.mode == crate::request_builder::AnthropicThinkingMode::Adaptive
+        }
+        _ => model.generation.reasoning,
+    };
     let mut config = ModelConfig {
         display_name: model.display.clone(),
         protocol,
@@ -1039,7 +1048,7 @@ fn project_resolved_model_config(model: &ResolvedModelRoute) -> Result<ModelConf
         supports_tools: model.capabilities.tools,
         supports_input_images: model.capabilities.input_images,
         supports_tool_result_images: model.capabilities.tool_result_images,
-        supports_reasoning: model.capabilities.reasoning,
+        supports_reasoning: model.capabilities.reasoning && reasoning_settable,
         reasoning_effort,
         reasoning_efforts,
         reasoning_summary,
@@ -2499,6 +2508,27 @@ base_url = "https://example.invalid"
             !loaded.providers["vendor"].models["model"]
                 .request_metadata()
                 .selectable_reasoning_efforts()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_is_not_offered_when_the_route_cannot_express_it() {
+        let efforts = |extra: &str| {
+            let loaded =
+                AppConfig::load_from_path(write_temp_config(config("vendor", "model", extra)))
+                    .expect("route should load");
+            loaded.providers["vendor"].models["model"]
+                .request_metadata()
+                .selectable_reasoning_efforts()
+        };
+
+        // Anthropic reasons only through thinking settings; without them no effort can be sent.
+        assert!(efforts("protocol = \"anthropic\"\n[capabilities]\nreasoning = true").is_empty());
+        // Other protocols need the generation support flag, not just the model capability.
+        assert!(efforts("[capabilities]\nreasoning = true").is_empty());
+        assert!(
+            !efforts("[capabilities]\nreasoning = true\ngeneration = { reasoning = true }")
                 .is_empty()
         );
     }
