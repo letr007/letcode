@@ -19,9 +19,6 @@ pub struct ValidationAdvisory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStartedEvent {
     pub turn_id: u64,
-    pub intent: String,
-    pub directive: String,
-    pub validation_reminder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

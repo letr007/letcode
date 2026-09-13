@@ -1144,12 +1144,6 @@ fn classify_prelude_message(message: &PromptMessage) -> PreludeClassification {
             PromptSegmentStability::Volatile,
             RuntimeSource::ContextView,
         ),
-        PromptMessageOrigin::WorkflowTurn => (
-            PromptContributorKind::CurrentTurn,
-            "workflow_turn",
-            PromptSegmentStability::Volatile,
-            RuntimeSource::ContextView,
-        ),
         PromptMessageOrigin::RuntimeContextView => (
             PromptContributorKind::RuntimeContext,
             "runtime_context_view",

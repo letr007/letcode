@@ -1444,12 +1444,7 @@ max_output_tokens=4096
         recorder
             .lock()
             .unwrap()
-            .record_turn_started(TurnStartedEvent {
-                turn_id: 1,
-                intent: "inspect".into(),
-                directive: String::new(),
-                validation_reminder: String::new(),
-            })
+            .record_turn_started(TurnStartedEvent { turn_id: 1 })
             .unwrap();
         agent.turn.current_turn_start_index = Some(0);
         agent

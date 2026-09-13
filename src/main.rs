@@ -753,12 +753,7 @@ mod tests {
             .record_user_message("target content")
             .expect("target content");
         target
-            .record_turn_started(agent::TurnStartedEvent {
-                turn_id: 2,
-                intent: "test".into(),
-                directive: "test".into(),
-                validation_reminder: "test".into(),
-            })
+            .record_turn_started(agent::TurnStartedEvent { turn_id: 2 })
             .expect("target turn start");
         drop(target);
 

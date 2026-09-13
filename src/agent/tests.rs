@@ -90,7 +90,7 @@ fn pressure_compaction_consumes_one_attempt_per_frontier_and_honors_suppression(
 fn summary_pressure_suppression_survives_turn_initialization() {
     let mut agent = test_agent();
     agent.pressure_compaction_suppressed = true;
-    agent.prepare_turn_prelude("summary request");
+    agent.prepare_turn_prelude();
 
     let error = agent
         .turn
@@ -103,7 +103,7 @@ fn summary_pressure_suppression_survives_turn_initialization() {
     assert!(error.to_string().contains("suppressed"));
 
     let mut normal_agent = test_agent();
-    normal_agent.prepare_turn_prelude("normal request");
+    normal_agent.prepare_turn_prelude();
     normal_agent
         .turn
         .pressure_compaction
@@ -287,7 +287,7 @@ fn fake_context_is_resolved_once_per_turn_and_has_no_provider_secret() {
 
     // The next turn resolves again and is its own turn.
     agent
-        .try_prepare_turn_prelude("another turn")
+        .try_prepare_turn_prelude()
         .expect("turn prelude can be prepared");
     let next = agent
         .fake_turn_context(crate::fake::FakeClient::Codex)
@@ -892,7 +892,7 @@ fn active_epoch_resets_at_lifecycle_boundaries() {
         .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
         .expect("cold preview");
     agent.commit_active_epoch(preview);
-    agent.prepare_turn_prelude("next turn");
+    agent.prepare_turn_prelude();
     assert!(agent.active_epoch.is_none());
     assert!(matches!(
         agent
@@ -1067,7 +1067,7 @@ fn phase2_pressure_agent(protocol: ApiProtocol) -> Agent {
 async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback() {
     let mut agent = phase2_pressure_agent(ApiProtocol::Responses);
     let protected_start = agent.history_for_test().len();
-    let prelude = agent.prepare_turn_prelude("current user");
+    let prelude = agent.prepare_turn_prelude();
     agent.turn.current_turn_start_index = Some(protected_start);
     agent
         .append_history_item(HistoryItem::user("current user"))
@@ -1154,7 +1154,6 @@ fn test_execution_record(tool_name: &str, output: ToolResult) -> ToolExecutionRe
         tool_name: tool_name.into(),
         arguments: Some(json!({})),
         permission_class: crate::permission::ToolPermissionClass::Read,
-        directive: ExecutionDirective::None,
         status: ToolExecutionStatus::Executed,
         rejection: None,
         output,
@@ -2257,7 +2256,6 @@ fn remembered_subagent_evidence_carries_parent_turn_provenance() {
         tool_name: "agent__explore".into(),
         arguments: Some(json!({"task": "inspect"})),
         permission_class: crate::permission::ToolPermissionClass::Preview,
-        directive: crate::permission::ExecutionDirective::None,
         status: ToolExecutionStatus::Executed,
         rejection: None,
         output: ToolResult::ok(
@@ -2407,7 +2405,7 @@ async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() 
 #[tokio::test]
 async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
     let mut agent = test_agent();
-    agent.prepare_turn_prelude("Delegate implementation work");
+    agent.prepare_turn_prelude();
     agent.set_subagent_delegate(static_delegate(ToolResult::ok(
         "agent__fixer",
         json!({
@@ -2463,7 +2461,7 @@ async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
 #[tokio::test]
 async fn wait_and_background_delivery_apply_subagent_effects_once_per_turn() {
     let mut agent = test_agent();
-    agent.prepare_turn_prelude("Reconcile one background result");
+    agent.prepare_turn_prelude();
     let result = json!({
         "run_id": "run-dedupe-1",
         "child_session_id": "child-dedupe-1",
@@ -2490,7 +2488,6 @@ async fn wait_and_background_delivery_apply_subagent_effects_once_per_turn() {
         tool_name: tool_names::TOOL_AGENT_WAIT.into(),
         arguments: Some(json!({"run_id": "run-dedupe-1"})),
         permission_class: crate::permission::ToolPermissionClass::Preview,
-        directive: ExecutionDirective::None,
         status: ToolExecutionStatus::Executed,
         rejection: None,
         output: ToolResult::ok("agent__wait", result.clone()),
@@ -2783,13 +2780,8 @@ fn session_state_consistency_journal_resume_three_way() {
     let session_id = rec.session_id().to_string();
     let path = rec.path().to_path_buf();
     rec.record_user_message("hello").expect("user message");
-    rec.record_turn_started(TurnStartedEvent {
-        turn_id: 1,
-        intent: "engineering".into(),
-        directive: "none".into(),
-        validation_reminder: "none".into(),
-    })
-    .expect("turn started");
+    rec.record_turn_started(TurnStartedEvent { turn_id: 1 })
+        .expect("turn started");
     rec.record_assistant_tool_call_batch(
         Some("working".into()),
         None,
@@ -2876,7 +2868,7 @@ fn restore_session_context_seeds_next_turn_id() {
     agent
         .restore_session_context(Vec::new(), Vec::new(), 7)
         .expect("restore session context");
-    agent.prepare_turn_prelude("resumed turn");
+    agent.prepare_turn_prelude();
 
     assert_eq!(agent.current_turn_id(), 8);
 }
@@ -2887,7 +2879,7 @@ fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
     agent
         .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
         .expect("restore old session");
-    agent.prepare_turn_prelude("active turn");
+    agent.prepare_turn_prelude();
     let invalid_metadata = ModelRequestMetadata {
         effective_input_limit_tokens: Some(0),
         ..Default::default()
@@ -2984,7 +2976,7 @@ fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
     );
     assert_eq!(agent.runtime_snapshot_for_test(), &snapshot);
     assert_eq!(agent.evidence(), snapshot.evidence.as_slice());
-    agent.prepare_turn_prelude("continued turn");
+    agent.prepare_turn_prelude();
     assert_eq!(agent.current_turn_id(), 8);
 }
 
@@ -3011,7 +3003,7 @@ fn new_session_reset_discards_restored_runtime_metadata() {
         agent.runtime_snapshot_for_test(),
         &RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_latest_model("m1")
     );
-    agent.prepare_turn_prelude("fresh turn");
+    agent.prepare_turn_prelude();
     assert_eq!(agent.current_turn_id(), 1);
 }
 
@@ -3592,75 +3584,43 @@ async fn writable_inside_to_outside_rebind_is_a_post_started_security_failure() 
 
 #[cfg(unix)]
 #[tokio::test]
-async fn writable_tools_cover_user_and_directive_denials_without_starting() {
+async fn writable_tools_cover_user_denials_without_starting() {
     let fixture = UnixWritableFixture::new("denial-events");
     for tool in ["fs__write", "fs__append"] {
-        for (denial, modes) in [
-            ("user", &[PermissionMode::Default, PermissionMode::Safe][..]),
-            ("directive", &[PermissionMode::Default][..]),
-        ] {
-            for mode in modes {
-                let path = fixture.external.join(format!("{denial}-{tool}"));
-                let call = writable_call(&format!("{denial}-{tool}"), tool, &path, "denied");
-                let mut agent = test_agent();
-                agent.set_permission_mode(*mode);
-                if denial == "directive" {
-                    agent.turn = TurnRuntimeState::new(
-                        1,
-                        WorkflowTurnState::from_user_input("Read-only: inspect and report only."),
-                    );
-                }
-                let mut approvals = 0;
-                let mut events = Vec::new();
-                let record = agent
-                    .execute_tool_call(
-                        &call,
-                        &mut |event| {
-                            events.push(event);
-                            std::future::ready(Ok(()))
-                        },
-                        &mut |_| {
-                            approvals += 1;
-                            std::future::ready(Ok(PermissionApproval::Deny))
-                        },
-                    )
-                    .await
-                    .expect("denial is recorded");
-                assert_eq!(
-                    writable_event_phases(&events),
-                    vec![false],
-                    "{tool} {denial} {mode:?}"
-                );
-                assert!(
-                    !events
-                        .iter()
-                        .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. })),
-                    "{tool} {denial} {mode:?} must not start"
-                );
-                assert!(
-                    events.iter().any(|event| matches!(
-                        event,
-                        AgentEvent::ToolCallFinished { ok: false, .. }
-                    )),
-                    "{tool} {denial} {mode:?} must finish unsuccessfully"
-                );
-                assert_eq!(record.status, ToolExecutionStatus::Rejected);
-                assert_eq!(
-                    record.rejection,
-                    Some(if denial == "user" {
-                        ToolExecutionRejection::PermissionDeniedByUser
-                    } else {
-                        ToolExecutionRejection::DirectiveBlocked
-                    }),
-                    "{tool} {denial} {mode:?} rejection"
-                );
-                assert_eq!(
-                    approvals,
-                    usize::from(denial == "user"),
-                    "{tool} {denial} {mode:?}"
-                );
-                assert!(!path.exists(), "{tool} {denial} {mode:?} must not write");
-            }
+        for mode in [PermissionMode::Default, PermissionMode::Safe] {
+            let path = fixture.external.join(format!("user-{tool}"));
+            let call = writable_call(&format!("user-{tool}"), tool, &path, "denied");
+            let mut agent = test_agent();
+            agent.set_permission_mode(mode);
+            let mut approvals = 0;
+            let mut events = Vec::new();
+            let record = agent
+                .execute_tool_call(
+                    &call,
+                    &mut |event| {
+                        events.push(event);
+                        std::future::ready(Ok(()))
+                    },
+                    &mut |_| {
+                        approvals += 1;
+                        std::future::ready(Ok(PermissionApproval::Deny))
+                    },
+                )
+                .await
+                .expect("denial is recorded");
+            assert_eq!(writable_event_phases(&events), vec![false]);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            );
+            assert_eq!(record.status, ToolExecutionStatus::Rejected);
+            assert_eq!(
+                record.rejection,
+                Some(ToolExecutionRejection::PermissionDeniedByUser)
+            );
+            assert_eq!(approvals, 1);
+            assert!(!path.exists(), "{tool} {mode:?} must not write");
         }
     }
 }
@@ -4347,13 +4307,9 @@ async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
 }
 
 #[tokio::test]
-async fn auto_mode_reviewer_decides_calls_that_conflict_with_execution_directive() {
+async fn auto_mode_reviewer_approves_write_calls() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
-    agent.turn = TurnRuntimeState::new(
-        1,
-        WorkflowTurnState::from_user_input("Read only. Analyze and report."),
-    );
     let service = Arc::new(CapturingAutoReviewService {
         approval: PermissionApproval::AllowOnce,
         calls: AtomicUsize::new(0),
@@ -4362,14 +4318,14 @@ async fn auto_mode_reviewer_decides_calls_that_conflict_with_execution_directive
     agent.set_auto_review_service(Some(service.clone()));
 
     let path = std::env::temp_dir().join(format!(
-        "letcode-auto-review-directive-{}.txt",
+        "letcode-auto-review-write-{}.txt",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos()
     ));
     let call = HistoryToolCall {
-        call_id: "call-auto-directive".into(),
+        call_id: "call-auto-write".into(),
         name: "fs__write".into(),
         arguments_json: json!({"path": path, "content": "approved"}).to_string(),
     };
@@ -4380,7 +4336,7 @@ async fn auto_mode_reviewer_decides_calls_that_conflict_with_execution_directive
             std::future::ready(Ok(PermissionApproval::Deny))
         })
         .await
-        .expect("reviewer approval overrides static directive denial");
+        .expect("reviewer approval executes the write");
 
     assert_eq!(human_approvals, 0);
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
@@ -4390,7 +4346,6 @@ async fn auto_mode_reviewer_decides_calls_that_conflict_with_execution_directive
         .expect("request lock")
         .clone()
         .expect("review request");
-    assert_eq!(request.directive, ExecutionDirective::ReadOnly);
     assert!(!request.can_allow_always);
     assert!(request.grant_summary.is_none());
     assert_eq!(record.status, ToolExecutionStatus::Executed);
@@ -4974,7 +4929,7 @@ fn new_turn_preserves_todos_and_resets_auto_continue() {
     }];
     agent.runtime_snapshot.workflow.auto_continue.enabled = true;
 
-    agent.prepare_turn_prelude("start a new turn");
+    agent.prepare_turn_prelude();
 
     assert_eq!(agent.runtime_snapshot.workflow.todos.len(), 1);
     assert_eq!(agent.runtime_snapshot.workflow.todos[0].id, "stale");
@@ -5038,7 +4993,7 @@ fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
         .load_workspace_instructions(&workspace_root, &current_dir)
         .expect("workspace instructions load");
 
-    let prelude = agent.prepare_turn_prelude("Summarize the change.");
+    let prelude = agent.prepare_turn_prelude();
     let instructions = prelude
         .iter()
         .filter(|message| message.text.starts_with("来自 "))
@@ -5120,8 +5075,8 @@ base_url = "https://example.invalid/v1"
     agent.set_resolved_runtime_catalog(Some(catalog));
     agent.set_model_route_authority(route, Arc::clone(&resolved));
 
-    let first_prelude = agent.prepare_turn_prelude("Inspect the repository.");
-    let second_prelude = agent.prepare_turn_prelude("Now implement the change.");
+    let first_prelude = agent.prepare_turn_prelude();
+    let second_prelude = agent.prepare_turn_prelude();
     for prelude in [&first_prelude, &second_prelude] {
         let harness = prelude
             .iter()
@@ -5186,7 +5141,7 @@ fn selected_skill_injects_exact_turn_scoped_material() {
         .expect("register skills");
 
     let prelude = agent
-        .try_prepare_turn_prelude_with_skills("Please inspect this module.", &["rust-audit".into()])
+        .try_prepare_turn_prelude_with_skills(&["rust-audit".into()])
         .expect("selected skill resolves");
     let material = prelude
         .iter()
@@ -5198,104 +5153,12 @@ fn selected_skill_injects_exact_turn_scoped_material() {
     );
 
     let error = agent
-        .try_prepare_turn_prelude_with_skills("Use the selected skill.", &["missing".into()])
+        .try_prepare_turn_prelude_with_skills(&["missing".into()])
         .expect_err("unknown selected skill fails");
     assert!(
         error
             .to_string()
             .contains("unknown selected skill: missing")
-    );
-}
-
-#[tokio::test]
-async fn execute_tool_call_blocks_write_tools_under_read_only_directive() {
-    let mut agent = Agent::new("m1", 1, 1);
-    agent.turn = TurnRuntimeState::new(
-        1,
-        WorkflowTurnState::from_user_input("Read-only: inspect and report only."),
-    );
-
-    let call = HistoryToolCall {
-        call_id: "call-1".into(),
-        name: "fs__write".into(),
-        arguments_json: r#"{"path":"a.txt","content":"x"}"#.into(),
-    };
-    let mut events = Vec::new();
-
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("tool call should complete with visible error");
-
-    assert!(!record.output.ok);
-    assert!(
-        record
-            .output
-            .error
-            .as_ref()
-            .expect("error payload")
-            .message
-            .contains("read_only directive")
-    );
-    assert!(matches!(
-        events.as_slice(),
-        [
-            AgentEvent::ToolCallFinished { .. },
-            AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
-                status,
-                rejection: Some(rejection),
-                effect_kind,
-                ..
-            })
-        ] if status == "rejected"
-                && rejection == "directive_blocked"
-                && effect_kind == "diagnostic"
-    ));
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        record.rejection,
-        Some(ToolExecutionRejection::DirectiveBlocked)
-    );
-    assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
-}
-
-#[tokio::test]
-async fn execute_tool_call_blocks_non_read_only_commands_under_read_only_directive() {
-    let mut agent = Agent::new("m1", 1, 1);
-    agent.turn = TurnRuntimeState::new(
-        1,
-        WorkflowTurnState::from_user_input("Read only. Analyze and report."),
-    );
-
-    let call = HistoryToolCall {
-        call_id: "call-2".into(),
-        name: "shell__exec".into(),
-        arguments_json: r#"{"command":"cargo test permission::tests"}"#.into(),
-    };
-
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            std::future::ready(Ok(PermissionApproval::AllowOnce))
-        })
-        .await
-        .expect("tool call should complete with visible error");
-
-    assert!(!record.output.ok);
-    assert!(
-        record
-            .output
-            .error
-            .as_ref()
-            .expect("error payload")
-            .message
-            .contains("not read-only compatible")
     );
 }
 

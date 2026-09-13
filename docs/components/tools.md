@@ -24,7 +24,7 @@ scope 包括 `FullAccess` 和 `ReadOnlyExplorer`。scope 同时影响目录和�
 
 权限类别为 `Read`、`Preview`、`Write`、`Command` 和 `Unknown`。默认 handler 为 exclusive；只有显式声明支持重叠调用的 handler 才能成为 parallel。Agent 负责并行 batch 的 permission preflight、执行和结果 reconcile，registry 单次调用不会自动并行所有工具。
 
-permission decision 综合工具、参数、permission class、execution directive、permission mode、外部 workspace access 和 internal-tool 标记，产生 Allow/Ask/Deny。`AllowAlways` 只有在 session grant 条件和 generation 仍有效时才写入 permission session。
+permission decision 综合工具、参数、permission class、permission mode、外部 workspace access 和 internal-tool 标记，产生 Allow/Ask/Deny。`AllowAlways` 只有在 session grant 条件和 generation 仍有效时才写入 permission session。
 
 subagent tools 额外受 normalized task、path scope、owned-path lock、expert policy、background capability 和 takeover route gate 约束。`agent__wait`、`agent__status`、`agent__jobs`、`agent__cancel` 只操作已存在的 Pool run，不会隐式创建 child。
 
@@ -46,11 +46,11 @@ subagent tools 额外受 normalized task、path scope、owned-path lock、expert
 
 MCP discovery 对 enabled server 调用 `tools/list`：stdio server 使用子进程，remote server 使用 HTTP。多个 server 可并发 discovery，并按配置顺序汇总；单个 server offline 不阻塞其它 server。
 
-MCP tool 名称规范化为 `<server>__<tool>`，schema 作为 parameters，调用前建立/复用 transport session，发送 initialize、initialized notification 和 tools/call。MCP handler 在 letcode 中默认属于 Read/Exclusive，仍经过 Agent 的 scope、directive、permission、timeout、event 和 result 链路。
+MCP tool 名称规范化为 `<server>__<tool>`，schema 作为 parameters，调用前建立/复用 transport session，发送 initialize、initialized notification 和 tools/call。MCP handler 在 letcode 中默认属于 Read/Exclusive，仍经过 Agent 的 scope、permission、timeout、event 和 result 链路。
 
 ## 事件与结果
 
-一次工具调用会产生 started、output delta、cancelled 和 finished 事件，并记录 `Executed`、`Rejected` 或 `TimedOut`。拒绝原因包括 invalid JSON、directive blocked、scope denied、delegation scope denied、permission policy denied 和 user denied。
+一次工具调用会产生 started、output delta、cancelled 和 finished 事件，并记录 `Executed`、`Rejected` 或 `TimedOut`。拒绝原因包括 invalid JSON、scope denied、delegation scope denied、permission policy denied 和 user denied。
 
 `ToolResult::ok` 返回 `ok: true` 与可选 data；handler/registry failure 返回 `ok: false` 与 `ToolError`。工具 execution summary 会保留 tool identity、effects、status、拒绝原因和必要的 primary path/command，供 Agent、Session、Transcript、TUI 和 audit 使用。
 

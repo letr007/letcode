@@ -4162,12 +4162,7 @@ fn planned_interrupt(
 }
 
 fn turn_started(turn_id: u64) -> TurnStartedEvent {
-    TurnStartedEvent {
-        turn_id,
-        intent: "test".into(),
-        directive: "test turn lifecycle".into(),
-        validation_reminder: String::new(),
-    }
+    TurnStartedEvent { turn_id }
 }
 
 #[tokio::test]

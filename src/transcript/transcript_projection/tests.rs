@@ -709,12 +709,7 @@ fn max_turn_id_is_global_across_restored_leaf_cuts() {
     let records = vec![
         record_at(
             1,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 1,
-                intent: "task".into(),
-                directive: "do it".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
         ),
         record_at(
             2,
@@ -741,12 +736,7 @@ fn max_turn_id_is_global_across_restored_leaf_cuts() {
         branch_record_at(
             4,
             "later",
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "future".into(),
-                directive: "later".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
         branch_record_at(
             5,
@@ -1402,12 +1392,7 @@ fn runtime_snapshot_projects_workflow_state_from_resolved_turn() {
     let records = vec![
         record_at(
             1,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "engineering".into(),
-                directive: "execute".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
         record_at(
             2,
@@ -1531,12 +1516,7 @@ fn runtime_snapshot_workflow_persists_at_next_turn() {
         ),
         record_at(
             3,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 8,
-                intent: "engineering".into(),
-                directive: "execute".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 8 }),
         ),
     ];
 
@@ -1561,12 +1541,7 @@ fn runtime_snapshot_marks_entire_current_turn_as_protected() {
     let records = vec![
         record_at(
             1,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "chat".into(),
-                directive: "answer".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
         record_at(
             2,
@@ -1858,12 +1833,7 @@ fn checkpoint_candidate_fixture() -> (Vec<TranscriptRecord>, LogicalCheckpointEv
         ),
         record_at(
             2,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "test".into(),
-                directive: "retain the request".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
     ];
     let event = LogicalCheckpointEventV1 {
@@ -1926,12 +1896,7 @@ fn non_root_checkpoint_journal() -> Vec<TranscriptRecord> {
         branch_record_at(
             5,
             "child",
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "test".into(),
-                directive: "retain the child request".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
     ];
     let checkpoint = prepare_logical_checkpoint_candidate("s", &records, "child".into(), 5)
@@ -2625,12 +2590,7 @@ fn split_checkpoint_records() -> Vec<TranscriptRecord> {
         ),
         record_at(
             2,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "continue".into(),
-                directive: "keep current requirement".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
         record_at(
             3,
@@ -2750,12 +2710,7 @@ fn modern_active_turn_compaction_retires_current_user_with_prefix() {
         ),
         record_at(
             4,
-            TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 7,
-                intent: "continue".into(),
-                directive: "keep the current requirement".into(),
-                validation_reminder: String::new(),
-            }),
+            TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 7 }),
         ),
         record_at(
             5,

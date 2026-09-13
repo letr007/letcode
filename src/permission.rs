@@ -69,42 +69,6 @@ impl PermissionApproval {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ExecutionDirective {
-    #[default]
-    None,
-    ReadOnly,
-    PlanOnly,
-    AnalyzeOnly,
-    DoNotEdit,
-}
-
-impl ExecutionDirective {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::ReadOnly => "read_only",
-            Self::PlanOnly => "plan_only",
-            Self::AnalyzeOnly => "analyze_only",
-            Self::DoNotEdit => "do_not_edit",
-        }
-    }
-
-    pub fn restricts_writes(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    pub fn restricts_commands_to_read_only(self) -> bool {
-        !matches!(self, Self::None)
-    }
-}
-
-impl std::fmt::Display for ExecutionDirective {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPermissionClass {
     Read,
@@ -199,7 +163,6 @@ pub struct PermissionRequest {
     pub tool: String,
     pub args: Value,
     pub class: ToolPermissionClass,
-    pub directive: ExecutionDirective,
     pub summary: String,
     pub preview: Option<String>,
     pub can_allow_always: bool,
@@ -326,10 +289,8 @@ impl PermissionSessionState {
         tool: &str,
         args: &Value,
         class: ToolPermissionClass,
-        directive: ExecutionDirective,
     ) -> PermissionDecision {
-        self.policy
-            .check_class_with_directive(tool, args, class, directive)
+        self.policy.check_class(tool, args, class)
     }
     pub fn allows_grant(&self, resource: &PermissionResource) -> bool {
         self.grants.allows(resource)
@@ -343,11 +304,10 @@ impl PermissionSessionState {
         tool: &str,
         args: &Value,
         class: ToolPermissionClass,
-        directive: ExecutionDirective,
         external_workspace_access: bool,
         internal_tool: bool,
     ) -> (PermissionMode, u64, PermissionDecision, bool) {
-        let base_decision = self.decision(tool, args, class, directive);
+        let base_decision = self.decision(tool, args, class);
         let decision = if base_decision == PermissionDecision::Deny {
             PermissionDecision::Deny
         } else if internal_tool {
@@ -418,36 +378,16 @@ impl PermissionPolicy {
 
     #[cfg(test)]
     pub fn check(&self, tool: &str, args: &Value) -> PermissionDecision {
-        self.check_with_directive(tool, args, ExecutionDirective::None)
-    }
-
-    #[cfg(test)]
-    pub fn check_with_directive(
-        &self,
-        tool: &str,
-        args: &Value,
-        directive: ExecutionDirective,
-    ) -> PermissionDecision {
         let class = classify_tool(tool);
-
-        self.check_class_with_directive(tool, args, class, directive)
+        self.check_class(tool, args, class)
     }
 
-    pub fn check_class_with_directive(
+    pub fn check_class(
         &self,
         tool: &str,
         args: &Value,
         class: ToolPermissionClass,
-        directive: ExecutionDirective,
     ) -> PermissionDecision {
-        if restricted_by_directive_with_class(tool, args, class, directive).is_some() {
-            return if self.mode == PermissionMode::Auto {
-                PermissionDecision::Ask
-            } else {
-                PermissionDecision::Deny
-            };
-        }
-
         match self.mode {
             PermissionMode::Safe => PermissionDecision::Ask,
             PermissionMode::Default | PermissionMode::Auto
@@ -488,44 +428,6 @@ pub fn is_internal_tool(tool: &str) -> bool {
             | tool_names::TOOL_AGENT_WAIT
             | tool_names::TOOL_AGENT_CANCEL
     )
-}
-
-#[cfg(test)]
-pub fn restricted_by_directive(
-    tool: &str,
-    args: &Value,
-    directive: ExecutionDirective,
-) -> Option<String> {
-    restricted_by_directive_with_class(tool, args, classify_tool(tool), directive)
-}
-
-pub fn restricted_by_directive_with_class(
-    tool: &str,
-    args: &Value,
-    class: ToolPermissionClass,
-    directive: ExecutionDirective,
-) -> Option<String> {
-    if matches!(directive, ExecutionDirective::None) {
-        return None;
-    }
-
-    match class {
-        ToolPermissionClass::Write if directive.restricts_writes() => Some(format!(
-            "blocked by {directive} directive: tool '{tool}' modifies the workspace"
-        )),
-        ToolPermissionClass::Command if directive.restricts_commands_to_read_only() => {
-            match classify_command_risk(args) {
-                CommandRisk::ReadOnly => None,
-                _ => Some(format!(
-                    "blocked by {directive} directive: command tool '{tool}' is not read-only compatible"
-                )),
-            }
-        }
-        ToolPermissionClass::Unknown => Some(format!(
-            "blocked by {directive} directive: tool '{tool}' is not classified as read-only"
-        )),
-        _ => None,
-    }
 }
 
 pub fn classify_tool(tool: &str) -> ToolPermissionClass {
@@ -749,55 +651,36 @@ mod tests {
         ] {
             assert_eq!(
                 state
-                    .approval_snapshot(
-                        None,
-                        tool,
-                        &args,
-                        class,
-                        ExecutionDirective::None,
-                        false,
-                        internal,
-                    )
+                    .approval_snapshot(None, tool, &args, class, false, internal)
                     .2,
                 PermissionDecision::Allow,
                 "{tool} should not require Auto review"
             );
         }
 
-        for (tool, args, class, directive, external_workspace_access) in [
+        for (tool, args, class, external_workspace_access) in [
             (
                 "fs__write",
                 json!({"path": "out.txt", "content": "ok"}),
                 ToolPermissionClass::Write,
-                ExecutionDirective::PlanOnly,
                 false,
             ),
             (
                 "shell__exec",
                 json!({"command": "rm -rf target/tmp"}),
                 ToolPermissionClass::Command,
-                ExecutionDirective::None,
                 false,
             ),
             (
                 "fs__read",
                 json!({"path": "/tmp/outside.txt"}),
                 ToolPermissionClass::Read,
-                ExecutionDirective::None,
                 true,
             ),
         ] {
             assert_eq!(
                 state
-                    .approval_snapshot(
-                        None,
-                        tool,
-                        &args,
-                        class,
-                        directive,
-                        external_workspace_access,
-                        false,
-                    )
+                    .approval_snapshot(None, tool, &args, class, external_workspace_access, false)
                     .2,
                 PermissionDecision::Ask,
                 "{tool} should be reviewed in Auto mode"
@@ -818,7 +701,6 @@ mod tests {
                     "fs__read",
                     &json!({"path": "/tmp/letcode-command/x.out"}),
                     ToolPermissionClass::Read,
-                    ExecutionDirective::None,
                     false,
                     false,
                 )
@@ -833,7 +715,6 @@ mod tests {
                     "fs__read",
                     &json!({"path": "/tmp/other.txt"}),
                     ToolPermissionClass::Read,
-                    ExecutionDirective::None,
                     true,
                     false,
                 )
@@ -858,7 +739,6 @@ mod tests {
             "shell__exec",
             &args,
             ToolPermissionClass::Command,
-            ExecutionDirective::None,
             false,
             false,
         );
@@ -871,82 +751,6 @@ mod tests {
             !state.grant_if_current_session(generation, resource),
             "Auto mode must not create reusable session grants"
         );
-    }
-
-    #[test]
-    fn restricted_directive_overrides_otherwise_allowed_command() {
-        let policy = PermissionPolicy::default();
-
-        assert_eq!(
-            policy.check_with_directive(
-                "shell__exec",
-                &json!({"command": "cargo test permission::tests"}),
-                ExecutionDirective::ReadOnly,
-            ),
-            PermissionDecision::Deny
-        );
-        assert_eq!(
-            policy.check_with_directive(
-                "shell__exec",
-                &json!({"command": "git diff -- src/permission.rs"}),
-                ExecutionDirective::ReadOnly,
-            ),
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            policy.check_with_directive(
-                "shell__exec",
-                &json!({"command": "git diff -- src/permission.rs > out.txt"}),
-                ExecutionDirective::ReadOnly,
-            ),
-            PermissionDecision::Deny
-        );
-        assert_eq!(
-            policy.check_with_directive(
-                "shell__exec",
-                &json!({"command": "git status & touch out.txt"}),
-                ExecutionDirective::ReadOnly,
-            ),
-            PermissionDecision::Deny
-        );
-        assert_eq!(
-            policy.check_with_directive(
-                "shell__exec",
-                &json!({"command": "git diff --output=out.patch"}),
-                ExecutionDirective::ReadOnly,
-            ),
-            PermissionDecision::Deny
-        );
-        assert_eq!(
-            policy.check_with_directive(
-                "workflow__todos",
-                &json!({"items": []}),
-                ExecutionDirective::ReadOnly,
-            ),
-            PermissionDecision::Allow
-        );
-    }
-
-    #[test]
-    fn restricted_directive_blocks_edit_tools() {
-        let message = restricted_by_directive(
-            "fs__write",
-            &json!({"path": "a.txt", "content": "x"}),
-            ExecutionDirective::PlanOnly,
-        )
-        .expect("write tool should be blocked");
-
-        assert!(message.contains("plan_only"));
-        assert!(message.contains("fs__write"));
-
-        let unknown = restricted_by_directive(
-            "future__maybe_write",
-            &json!({"path": "a.txt"}),
-            ExecutionDirective::ReadOnly,
-        )
-        .expect("unknown tools should fail closed under restrictive directives");
-
-        assert!(unknown.contains("not classified as read-only"));
     }
 
     #[test]
@@ -995,7 +799,6 @@ mod tests {
             "shell__exec",
             &args,
             ToolPermissionClass::Command,
-            ExecutionDirective::None,
             false,
             false,
         );
@@ -1004,19 +807,6 @@ mod tests {
             grant_allowed,
             "session grant should satisfy Ask for formerly blacklisted commands"
         );
-
-        // Directive hard-deny still cannot be overridden by a grant.
-        let (_, _, directed, directed_grant) = state.approval_snapshot(
-            Some(&resource),
-            "shell__exec",
-            &args,
-            ToolPermissionClass::Command,
-            ExecutionDirective::ReadOnly,
-            false,
-            false,
-        );
-        assert_eq!(directed, PermissionDecision::Deny);
-        assert!(!directed_grant, "a grant must never override policy denial");
 
         state.clear_grants();
         assert!(
@@ -1033,7 +823,6 @@ mod tests {
             "fs__write",
             &json!({}),
             ToolPermissionClass::Write,
-            ExecutionDirective::None,
             false,
             false,
         );
@@ -1043,7 +832,6 @@ mod tests {
             "fs__write",
             &json!({}),
             ToolPermissionClass::Write,
-            ExecutionDirective::None,
             false,
             false,
         );
@@ -1054,7 +842,6 @@ mod tests {
             "fs__write",
             &json!({}),
             ToolPermissionClass::Write,
-            ExecutionDirective::None,
             false,
             false,
         );

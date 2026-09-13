@@ -159,7 +159,6 @@ fn failure_error_class(failure: &ModelFailure) -> LlmRequestErrorClass {
 pub(super) async fn run_resolved_turn_async<F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent,
     user_content: UserMessageContent,
-    user_input: &str,
     mut on_delta: F,
     mut on_event: E,
     mut approve: A,
@@ -177,8 +176,7 @@ where
         .cloned()
         .ok_or_else(|| anyhow!("normal Agent turn requires an installed resolved model route"))?;
     let protocol = resolved_protocol(&route)?;
-    let turn_prelude =
-        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
+    let turn_prelude = agent.try_prepare_turn_prelude_with_skills(&user_content.selected_skills)?;
     let protected_start_index = agent.active_history_items().len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);

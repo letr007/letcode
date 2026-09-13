@@ -870,12 +870,7 @@ input_images = {supports_images}
             .record_user_message("still running")
             .expect("record active user message");
         recorder
-            .record_turn_started(crate::agent::TurnStartedEvent {
-                turn_id: 1,
-                intent: "active".into(),
-                directive: "do not interrupt from another writer".into(),
-                validation_reminder: String::new(),
-            })
+            .record_turn_started(crate::agent::TurnStartedEvent { turn_id: 1 })
             .expect("record active turn");
         let session_id = recorder.session_id().to_string();
         let path = recorder.path().to_path_buf();
@@ -908,12 +903,7 @@ input_images = {supports_images}
             .record_user_message("continue")
             .expect("record user message");
         recorder
-            .record_turn_started(crate::agent::TurnStartedEvent {
-                turn_id: 7,
-                intent: "engineering".into(),
-                directive: "none".into(),
-                validation_reminder: "focused".into(),
-            })
+            .record_turn_started(crate::agent::TurnStartedEvent { turn_id: 7 })
             .expect("record turn start");
         recorder
             .record_assistant_tool_call_batch(
@@ -1030,12 +1020,7 @@ input_images = {supports_images}
             .adopt_legacy_linear_branch("history-1")
             .expect("adopt selected branch");
         recorder
-            .record_turn_started(crate::agent::TurnStartedEvent {
-                turn_id: 8,
-                intent: "engineering".into(),
-                directive: "none".into(),
-                validation_reminder: "focused".into(),
-            })
+            .record_turn_started(crate::agent::TurnStartedEvent { turn_id: 8 })
             .expect("record turn start");
         recorder
             .record_assistant_tool_call_batch(

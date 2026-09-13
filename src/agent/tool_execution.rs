@@ -61,7 +61,6 @@ pub(super) struct ParallelToolCall {
     call: HistoryToolCall,
     args: Value,
     permission_class: crate::permission::ToolPermissionClass,
-    directive: ExecutionDirective,
     turn_id: u64,
     task: Option<tokio::task::JoinHandle<ParallelBatchRecord>>,
 }
@@ -96,7 +95,6 @@ impl ParallelToolCall {
                         &self.call,
                         Some(self.args.clone()),
                         self.permission_class,
-                        self.directive,
                         ToolExecutionStatus::Executed,
                         None,
                         output,
@@ -124,13 +122,6 @@ fn prepare_parallel_tool_call(
     if agent.tools.parallelism(&call.name) != ToolParallelism::Parallel
         || !is_executable_tool(agent, &call.name)
         || !agent.tools.scope().allows_tool(&call.name)
-        || restricted_by_directive_with_class(
-            &call.name,
-            &args,
-            permission_class,
-            agent.turn.policy.directive,
-        )
-        .is_some()
         || external_workspace_access_for_tool(&call.name, &args).is_some()
     {
         return Err(anyhow::anyhow!(
@@ -148,7 +139,6 @@ fn prepare_parallel_tool_call(
         &call.name,
         &args,
         permission_class,
-        agent.turn.policy.directive,
         false,
         crate::permission::is_internal_tool(&call.name),
     );
@@ -201,7 +191,6 @@ fn parallel_tool_call_permission_is_current(
         &prepared.call.name,
         &prepared.args,
         prepared.permission_class,
-        agent.turn.policy.directive,
         false,
         crate::permission::is_internal_tool(&prepared.call.name),
     );
@@ -219,7 +208,6 @@ fn spawn_prepared_parallel_tool_call(
 ) -> ParallelToolCall {
     let tools = agent.tools.clone();
     let timeout_secs = agent.tool_timeout_secs;
-    let directive = agent.turn.policy.directive;
     let turn_id = agent.turn.turn_id;
     let call = prepared.call.clone();
     let args = prepared.args.clone();
@@ -268,7 +256,6 @@ fn spawn_prepared_parallel_tool_call(
                     &task_call,
                     Some(task_args),
                     permission_class,
-                    directive,
                     status,
                     None,
                     output,
@@ -282,7 +269,6 @@ fn spawn_prepared_parallel_tool_call(
         call,
         args,
         permission_class,
-        directive,
         turn_id,
         task: Some(task),
     }
@@ -372,7 +358,6 @@ where
                 &call.call.name,
                 &call.args,
                 call.permission_class,
-                agent.turn.policy.directive,
                 false,
                 crate::permission::is_internal_tool(&call.call.name),
             );
@@ -593,7 +578,6 @@ where
                         call,
                         None,
                         permission_class_for_tool_call(&agent.tools, &call.name),
-                        agent.turn.policy.directive,
                         ToolExecutionStatus::Rejected,
                         None,
                         ToolResult::err(&call.name, error.to_string()),
@@ -659,7 +643,6 @@ where
                     call,
                     Some(args),
                     permission_class_for_tool_call(&agent.tools, &call.name),
-                    agent.turn.policy.directive,
                     ToolExecutionStatus::Executed,
                     None,
                     output,
@@ -727,21 +710,18 @@ where
                 call,
                 None,
                 permission_class_for_tool_call(&agent.tools, &call.name),
-                agent.turn.policy.directive,
                 ToolExecutionStatus::Rejected,
                 Some(ToolExecutionRejection::InvalidJsonArguments),
                 output,
             )));
         }
     };
-    let directive = agent.turn.policy.directive;
     let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
     if !is_executable_tool(agent, &call.name) {
         let record = ToolExecutionRecord::new(
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Rejected,
             None,
             ToolResult::err(
@@ -756,28 +736,12 @@ where
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Rejected,
             Some(ToolExecutionRejection::ToolScopeDenied),
             ToolResult::err(
                 &call.name,
                 agent.tools.scope().rejection_message(&call.name),
             ),
-        );
-        return Ok(SubagentPreflight::Rejected(record));
-    }
-    if agent.permission_mode() != PermissionMode::Auto
-        && let Some(message) =
-            restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
-    {
-        let record = ToolExecutionRecord::new(
-            call,
-            Some(args),
-            permission_class,
-            directive,
-            ToolExecutionStatus::Rejected,
-            Some(ToolExecutionRejection::DirectiveBlocked),
-            ToolResult::err(&call.name, message),
         );
         return Ok(SubagentPreflight::Rejected(record));
     }
@@ -791,7 +755,6 @@ where
             &call.name,
             &args,
             permission_class,
-            directive,
             false,
             crate::permission::is_internal_tool(&call.name),
         )
@@ -810,7 +773,6 @@ where
                 tool: call.name.clone(),
                 args: args.clone(),
                 class: permission_class,
-                directive,
                 summary: format_tool_call(&call.name, &args),
                 preview: None,
                 can_allow_always: false,
@@ -841,7 +803,6 @@ where
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Rejected,
             Some(if matches!(decision, PermissionDecision::Deny) {
                 ToolExecutionRejection::PermissionDeniedByPolicy
@@ -868,7 +829,6 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    let directive = agent.turn.policy.directive;
     let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
 
     if !is_executable_tool(agent, &call.name) {
@@ -880,7 +840,6 @@ where
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Rejected,
             None,
             output,
@@ -898,27 +857,8 @@ where
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Rejected,
             Some(ToolExecutionRejection::ToolScopeDenied),
-            output,
-        );
-        emit_finished(on_event, call, &record).await?;
-        return Ok(record);
-    }
-
-    if agent.permission_mode() != PermissionMode::Auto
-        && let Some(message) =
-            restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
-    {
-        let output = ToolResult::err(&call.name, message);
-        let record = ToolExecutionRecord::new(
-            call,
-            Some(args),
-            permission_class,
-            directive,
-            ToolExecutionStatus::Rejected,
-            Some(ToolExecutionRejection::DirectiveBlocked),
             output,
         );
         emit_finished(on_event, call, &record).await?;
@@ -939,7 +879,6 @@ where
                     call,
                     Some(args),
                     permission_class,
-                    directive,
                     ToolExecutionStatus::Rejected,
                     None,
                     ToolResult::err(&call.name, error.to_string()),
@@ -964,7 +903,6 @@ where
                     call,
                     Some(args),
                     permission_class,
-                    directive,
                     ToolExecutionStatus::Rejected,
                     None,
                     ToolResult::err(&call.name, error.to_string()),
@@ -990,7 +928,6 @@ where
                 call,
                 Some(args),
                 permission_class,
-                directive,
                 ToolExecutionStatus::Rejected,
                 Some(ToolExecutionRejection::DelegationScopeDenied),
                 ToolResult::err(&call.name, message),
@@ -1045,7 +982,6 @@ where
             &call.name,
             &args,
             permission_class,
-            directive,
             needs_external_approval,
             crate::permission::is_internal_tool(&call.name),
         )
@@ -1071,7 +1007,6 @@ where
                 tool: call.name.clone(),
                 args: args.clone(),
                 class: permission_class,
-                directive,
                 summary: format_tool_call(&call.name, &args),
                 preview: external_workspace_access
                     .as_ref()
@@ -1129,7 +1064,6 @@ where
                             call,
                             Some(args),
                             permission_class,
-                            directive,
                             ToolExecutionStatus::Rejected,
                             None,
                             output,
@@ -1222,7 +1156,6 @@ where
                             call,
                             Some(args),
                             permission_class,
-                            directive,
                             ToolExecutionStatus::TimedOut,
                             None,
                             output,
@@ -1258,7 +1191,6 @@ where
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Executed,
             None,
             output,
@@ -1283,7 +1215,6 @@ where
             call,
             Some(args),
             permission_class,
-            directive,
             ToolExecutionStatus::Rejected,
             Some(rejection),
             output,
@@ -1348,7 +1279,6 @@ where
         call,
         None,
         permission_class_for_tool_call(&agent.tools, &call.name),
-        agent.turn.policy.directive,
         ToolExecutionStatus::Rejected,
         Some(ToolExecutionRejection::InvalidJsonArguments),
         output,
@@ -1389,7 +1319,6 @@ mod tests {
                 tool_name: call.name.clone(),
                 arguments: Some(serde_json::json!({})),
                 permission_class: crate::permission::ToolPermissionClass::Read,
-                directive: ExecutionDirective::None,
                 status: ToolExecutionStatus::Executed,
                 rejection: None,
                 output: ToolResult::ok(&call.name, serde_json::json!({})),
@@ -1428,7 +1357,6 @@ mod tests {
             call,
             args: serde_json::json!({}),
             permission_class: crate::permission::ToolPermissionClass::Read,
-            directive: ExecutionDirective::None,
             turn_id: 0,
             task: Some(task),
         };

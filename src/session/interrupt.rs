@@ -119,12 +119,7 @@ mod tests {
     use serde_json::json;
 
     fn turn_started(turn_id: u64) -> TranscriptEvent {
-        TranscriptEvent::TurnStarted(TurnStartedEvent {
-            turn_id,
-            intent: "test".into(),
-            directive: "test active turn".into(),
-            validation_reminder: String::new(),
-        })
+        TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id })
     }
 
     fn record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {

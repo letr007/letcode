@@ -1539,7 +1539,7 @@ max_output_tokens=128
             let directory = tempfile::tempdir().unwrap();
             let mut recorder = TranscriptRecorder::create(directory.path()).unwrap();
             recorder.record_session_started("test/m").unwrap();
-            recorder.record_turn_started(crate::agent::TurnStartedEvent { turn_id:1, intent:"read sources".into(), directive:String::new(), validation_reminder:String::new() }).unwrap();
+            recorder.record_turn_started(crate::agent::TurnStartedEvent { turn_id: 1 }).unwrap();
             recorder.record_user_message_content(crate::user_content::UserMessageContent::new("Read the source files", vec![
                 crate::user_content::UserImageAttachment {
                     id: "source-image".into(), label: "source image".into(), mime: "image/png".into(),

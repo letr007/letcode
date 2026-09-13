@@ -122,7 +122,6 @@ pub fn tool_span(turn_id: u64, tool_name: &str, call_id: &str, args_json_len: us
         "langfuse.observation.metadata.call_id" = %call_id,
         "langfuse.observation.metadata.args_json_bytes" = as_u64(args_json_len),
         "langfuse.observation.metadata.permission_class" = field::Empty,
-        "langfuse.observation.metadata.directive" = field::Empty,
         "langfuse.observation.metadata.execution_status" = field::Empty,
         "langfuse.observation.metadata.execution_rejection" = field::Empty,
         "langfuse.observation.metadata.effect_kind" = field::Empty,
@@ -135,7 +134,6 @@ pub fn tool_span(turn_id: u64, tool_name: &str, call_id: &str, args_json_len: us
         "tool.call_id" = %call_id,
         "tool.args_json.bytes" = as_u64(args_json_len),
         "tool.permission_class" = field::Empty,
-        "tool.directive" = field::Empty,
         "tool.execution.status" = field::Empty,
         "tool.execution.rejection" = field::Empty,
         "tool.effect.kind" = field::Empty,
@@ -162,16 +160,11 @@ pub fn finish_tool_span(span: &Span, result: &Result<ToolExecutionRecord>) {
                 .unwrap_or(0);
 
             span.record("tool.permission_class", record.permission_class.as_str());
-            span.record("tool.directive", record.directive.as_str());
             span.record("tool.execution.status", record.status.as_str());
             span.record("tool.effect.kind", effect_kind);
             span.record(
                 "langfuse.observation.metadata.permission_class",
                 record.permission_class.as_str(),
-            );
-            span.record(
-                "langfuse.observation.metadata.directive",
-                record.directive.as_str(),
             );
             span.record(
                 "langfuse.observation.metadata.execution_status",

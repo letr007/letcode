@@ -825,7 +825,7 @@ mod tests {
         ToolEffectKind, ToolEffects, ToolExecutionRecord, ToolExecutionRejection,
         ToolExecutionStatus,
     };
-    use crate::permission::{ExecutionDirective, ToolPermissionClass};
+    use crate::permission::ToolPermissionClass;
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
 
@@ -858,7 +858,6 @@ mod tests {
             tool_name: tool_name.into(),
             arguments,
             permission_class: ToolPermissionClass::Unknown,
-            directive: ExecutionDirective::None,
             status: if output.ok {
                 ToolExecutionStatus::Executed
             } else {

@@ -205,7 +205,7 @@ impl AgentTemplate {
             timeout_secs: Some(30),
             max_tool_calls: Some(2),
             input_expectations:
-                "需要工具权限请求：tool、args、class、directive、summary、用户目标摘要。"
+                "需要工具权限请求：tool、args、class、summary、用户目标摘要。"
                     .into(),
             expected_result_shape: concat!(
                 "JSON 对象：decision 为 allow_once|deny；",

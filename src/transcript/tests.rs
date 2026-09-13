@@ -775,12 +775,7 @@ fn interrupt_transaction_failure_leaves_sequence_events_and_tracker_unchanged() 
     let base_dir = journal_test_dir("interrupt-transaction-atomicity");
     let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 1,
-            intent: "interrupt".into(),
-            directive: "cancel active work".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 1 })
         .expect("start turn");
     recorder
         .record_tool_call_started("call-1", "shell__exec", json!({"command": "sleep 1"}))
@@ -843,12 +838,7 @@ fn restore_conversation_messages_ignores_provenance_events() {
             sequence: 2,
             timestamp_ms: 1,
             context_branch_id: None,
-            event: TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 1,
-                intent: "engineering".into(),
-                directive: "none".into(),
-                validation_reminder: "focused".into(),
-            }),
+            event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
         },
         TranscriptRecord {
             session_id: "s".into(),
@@ -1143,12 +1133,7 @@ fn checkout_to_root_reconstructs_root_tracker_after_reopen() {
     let base_dir = journal_test_dir("checkout-root-tracker");
     let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 1,
-            intent: "root".into(),
-            directive: "root turn".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 1 })
         .expect("start root turn");
     recorder
         .record_turn_finalized(TurnFinalizedEvent {
@@ -1171,24 +1156,14 @@ fn checkout_to_root_reconstructs_root_tracker_after_reopen() {
         .expect("checkout branch");
     recorder.set_current_context_branch_id(Some("branch-a".into()));
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 2,
-            intent: "branch".into(),
-            directive: "branch turn".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 2 })
         .expect("start branch turn");
     recorder
         .record_context_checkout(ROOT_CONTEXT_BRANCH_ID, root_base)
         .expect("checkout root");
     recorder.set_current_context_branch_id(None);
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 3,
-            intent: "root again".into(),
-            directive: "root turn after checkout".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 3 })
         .expect("start root turn after checkout");
     recorder
         .record_tool_call_started("root-call", "fs__read", json!({}))
@@ -1212,12 +1187,7 @@ fn open_reconstructs_metadata_only_branch_tracker_from_parent_projection() {
     let base_dir = journal_test_dir("metadata-only-branch-tracker");
     let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 1,
-            intent: "root".into(),
-            directive: "parent active turn".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 1 })
         .expect("start parent turn");
     recorder
         .record_tool_call_started("parent-call", "fs__read", json!({}))
@@ -2427,12 +2397,7 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
             sequence: 1,
             timestamp_ms: 0,
             context_branch_id: None,
-            event: TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 1,
-                intent: "inspect".into(),
-                directive: "read both files".into(),
-                validation_reminder: String::new(),
-            }),
+            event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
         },
         TranscriptRecord {
             session_id: "live".into(),
@@ -2580,12 +2545,7 @@ fn restore_max_turn_id_uses_all_turn_audit_events() {
             sequence: 1,
             timestamp_ms: 0,
             context_branch_id: None,
-            event: TranscriptEvent::TurnStarted(TurnStartedEvent {
-                turn_id: 3,
-                intent: "engineering".into(),
-                directive: "none".into(),
-                validation_reminder: "targeted".into(),
-            }),
+            event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 3 }),
         },
         TranscriptRecord {
             session_id: "s".into(),
@@ -2821,12 +2781,7 @@ fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
         .record_user_message("keep this requirement")
         .expect("user");
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 9,
-            intent: "test".into(),
-            directive: "verify preparation".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 9 })
         .expect("turn");
     recorder
         .record_assistant_message("working")
@@ -2871,12 +2826,7 @@ fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
     assert!(recorder.prepare_logical_checkpoint().is_err());
     recorder.record_user_message("goal").expect("user");
     recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 1,
-            intent: "test".into(),
-            directive: "reject incomplete tools".into(),
-            validation_reminder: String::new(),
-        })
+        .record_turn_started(TurnStartedEvent { turn_id: 1 })
         .expect("turn");
     recorder
         .record_assistant_tool_call_batch(

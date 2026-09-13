@@ -327,12 +327,7 @@ mod tests {
         assert_boundary_clears("reasoning-turn-start-clear", |recorder| {
             persist_agent_event(
                 recorder,
-                &AgentEvent::TurnStarted(crate::agent::TurnStartedEvent {
-                    turn_id: 2,
-                    intent: "continue".into(),
-                    directive: "continue".into(),
-                    validation_reminder: String::new(),
-                }),
+                &AgentEvent::TurnStarted(crate::agent::TurnStartedEvent { turn_id: 2 }),
             )
             .expect("start next turn");
         });
@@ -417,12 +412,7 @@ mod tests {
             });
             persist_agent_event(
                 &mut recorder,
-                &AgentEvent::TurnStarted(crate::agent::TurnStartedEvent {
-                    turn_id: 1,
-                    intent: "engineering".into(),
-                    directive: "inspect".into(),
-                    validation_reminder: String::new(),
-                }),
+                &AgentEvent::TurnStarted(crate::agent::TurnStartedEvent { turn_id: 1 }),
             )
             .unwrap();
             let calls = ["early-1", "early-2"].map(|id| crate::request_builder::HistoryToolCall {

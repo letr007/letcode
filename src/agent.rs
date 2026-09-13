@@ -16,8 +16,8 @@ use crate::model_runtime::{ResolvedModelRoute, ResolvedRuntimeCatalog};
 #[cfg(test)]
 use crate::permission::ToolScope;
 use crate::permission::{
-    ExecutionDirective, PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
-    PermissionSessionState, restricted_by_directive_with_class,
+    PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
+    PermissionSessionState,
 };
 use crate::request_builder::{
     HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata, PromptMessage,
@@ -96,7 +96,6 @@ pub(crate) enum ToolExecutionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExecutionRejection {
     InvalidJsonArguments,
-    DirectiveBlocked,
     ToolScopeDenied,
     DelegationScopeDenied,
     PermissionDeniedByPolicy,
@@ -129,8 +128,6 @@ pub(crate) struct ToolExecutionRecord {
     pub arguments: Option<Value>,
     #[allow(dead_code)]
     pub permission_class: crate::permission::ToolPermissionClass,
-    #[allow(dead_code)]
-    pub directive: ExecutionDirective,
     #[allow(dead_code)]
     pub status: ToolExecutionStatus,
     #[allow(dead_code)]
@@ -1812,10 +1809,6 @@ impl Agent {
     }
 
     #[cfg(test)]
-    fn current_turn(&self) -> &WorkflowTurnState {
-        &self.turn.policy
-    }
-
     #[cfg(test)]
     fn current_turn_id(&self) -> u64 {
         self.turn.turn_id
@@ -3171,8 +3164,6 @@ impl Agent {
         let mut question_handler_guard =
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
 
-        let user_input = user_content.text.clone();
-
         if question_handler_guard
             .agent()
             .resolved_model_route()
@@ -3181,7 +3172,6 @@ impl Agent {
             return protocol_stream::run_resolved_turn_async(
                 question_handler_guard.agent(),
                 user_content,
-                &user_input,
                 on_delta,
                 on_event,
                 approve,
@@ -3384,16 +3374,7 @@ impl Agent {
             return false;
         };
         let permission_class = permission_class_for_tool_call(&self.tools, &call.name);
-        if (self.permission_mode() != PermissionMode::Auto
-            && restricted_by_directive_with_class(
-                &call.name,
-                &args,
-                permission_class,
-                self.turn.policy.directive,
-            )
-            .is_some())
-            || external_workspace_access_for_tool(&call.name, &args).is_some()
-        {
+        if external_workspace_access_for_tool(&call.name, &args).is_some() {
             return false;
         }
         let Ok(state) = self.permission_session.lock() else {
@@ -3404,7 +3385,6 @@ impl Agent {
             &call.name,
             &args,
             permission_class,
-            self.turn.policy.directive,
             false,
             crate::permission::is_internal_tool(&call.name),
         );
@@ -3729,26 +3709,24 @@ impl Agent {
     }
 
     #[cfg(test)]
-    fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
-        self.try_prepare_turn_prelude(user_input)
+    fn prepare_turn_prelude(&mut self) -> Vec<PromptMessage> {
+        self.try_prepare_turn_prelude()
             .expect("test/internal turn prelude should resolve selected skills")
     }
 
     #[cfg(test)]
-    fn try_prepare_turn_prelude(&mut self, user_input: &str) -> Result<Vec<PromptMessage>> {
-        self.try_prepare_turn_prelude_with_skills(user_input, &[])
+    fn try_prepare_turn_prelude(&mut self) -> Result<Vec<PromptMessage>> {
+        self.try_prepare_turn_prelude_with_skills(&[])
     }
 
     fn try_prepare_turn_prelude_with_skills(
         &mut self,
-        user_input: &str,
         selected_skills: &[String],
     ) -> Result<Vec<PromptMessage>> {
         let manual_skill_material = self.manual_skill_material_messages(selected_skills)?;
         self.invalidate_request_projection();
-        let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
-        self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
+        self.turn = TurnRuntimeState::new(self.next_turn_id);
         self.runtime_snapshot.workflow.auto_continue = AutoContinueState::default();
         if self.pressure_compaction_suppressed {
             self.turn.pressure_compaction.suppress();
@@ -3762,9 +3740,6 @@ impl Agent {
             turn_prelude.push(message);
         }
         turn_prelude.extend(manual_skill_material);
-        if let Some(message) = turn.developer_context_message() {
-            turn_prelude.push(message);
-        }
         Ok(turn_prelude)
     }
 
@@ -3976,9 +3951,6 @@ impl Agent {
     fn turn_started_event(&self) -> TurnStartedEvent {
         TurnStartedEvent {
             turn_id: self.turn.turn_id,
-            intent: self.turn.policy.intent.as_str().to_string(),
-            directive: self.turn.policy.directive.as_str().to_string(),
-            validation_reminder: self.turn.policy.validation.as_str().to_string(),
         }
     }
 
@@ -4113,8 +4085,8 @@ impl Agent {
         self.append_history_item(HistoryItem::internal_continuation(text))
     }
 
-    pub(crate) fn begin_internal_continuation_turn(&mut self, text: &str) -> Result<()> {
-        let _ = self.try_prepare_turn_prelude_with_skills(text, &[])?;
+    pub(crate) fn begin_internal_continuation_turn(&mut self) -> Result<()> {
+        let _ = self.try_prepare_turn_prelude_with_skills(&[])?;
         Ok(())
     }
 
@@ -4146,7 +4118,6 @@ impl Agent {
             tool_name: parent_tool.clone(),
             arguments: Some(serde_json::json!({ "background": true })),
             permission_class: crate::permission::ToolPermissionClass::Preview,
-            directive: self.turn.policy.directive,
             status: ToolExecutionStatus::Executed,
             rejection: None,
             output: ToolResult::ok(
@@ -4422,7 +4393,6 @@ impl ToolExecutionRecord {
         call: &HistoryToolCall,
         arguments: Option<Value>,
         permission_class: crate::permission::ToolPermissionClass,
-        directive: ExecutionDirective,
         status: ToolExecutionStatus,
         rejection: Option<ToolExecutionRejection>,
         output: ToolResult,
@@ -4433,7 +4403,6 @@ impl ToolExecutionRecord {
             tool_name: call.name.clone(),
             arguments,
             permission_class,
-            directive,
             status,
             rejection,
             output,
@@ -4908,7 +4877,6 @@ pub(super) fn rebind_active_protocol_from_history(
 struct TurnRuntimeState {
     turn_id: u64,
     current_turn_start_index: Option<usize>,
-    policy: WorkflowTurnState,
     counters: TurnCounters,
     // Once enabled, auto-continue owns the rest of this turn so the LLM can
     // explicitly disable it and still receive one final response. This is
@@ -4925,11 +4893,10 @@ struct FrozenTurnEvidence {
 }
 
 impl TurnRuntimeState {
-    fn new(turn_id: u64, policy: WorkflowTurnState) -> Self {
+    fn new(turn_id: u64) -> Self {
         Self {
             turn_id,
             current_turn_start_index: None,
-            policy,
             counters: TurnCounters::default(),
             auto_continue_active: false,
             frozen_evidence: None,
@@ -4979,7 +4946,7 @@ impl PressureCompactionState {
 
 impl Default for TurnRuntimeState {
     fn default() -> Self {
-        Self::new(0, WorkflowTurnState::default())
+        Self::new(0)
     }
 }
 
@@ -5008,257 +4975,6 @@ struct WorkflowTodosPayload {
 #[derive(Debug, Clone, Deserialize)]
 struct WorkflowAutoContinuePayload {
     enabled: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnIntent {
-    Lightweight,
-    Engineering,
-}
-
-impl TurnIntent {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Lightweight => "lightweight",
-            Self::Engineering => "engineering",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValidationReminder {
-    None,
-    Focused,
-    Targeted,
-}
-
-impl ValidationReminder {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Focused => "focused",
-            Self::Targeted => "targeted",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkflowTurnState {
-    intent: TurnIntent,
-    validation: ValidationReminder,
-    directive: ExecutionDirective,
-}
-
-impl Default for WorkflowTurnState {
-    fn default() -> Self {
-        Self {
-            intent: TurnIntent::Lightweight,
-            validation: ValidationReminder::None,
-            directive: ExecutionDirective::None,
-        }
-    }
-}
-
-impl WorkflowTurnState {
-    fn from_user_input(user_input: &str) -> Self {
-        let intent = classify_turn_intent(user_input);
-        let validation = detect_validation_reminder(user_input, intent);
-        let directive = detect_execution_directive(user_input);
-        Self {
-            intent,
-            validation,
-            directive,
-        }
-    }
-
-    fn developer_context_message(&self) -> Option<PromptMessage> {
-        let text = match self.directive {
-            ExecutionDirective::None => return None,
-            ExecutionDirective::ReadOnly => {
-                "本回合为只读。不要修改文件，也不要运行非只读命令。".to_string()
-            }
-            ExecutionDirective::PlanOnly => {
-                "本回合仅做规划。只产出分析与计划。不要修改文件，也不要运行非只读命令。".to_string()
-            }
-            ExecutionDirective::AnalyzeOnly => {
-                "本回合仅做分析。只检查与解释。不要修改文件，也不要运行非只读命令。".to_string()
-            }
-            ExecutionDirective::DoNotEdit => {
-                "本回合有明确的禁止编辑指令。不要修改文件，也不要运行非只读命令。".to_string()
-            }
-        };
-
-        Some(PromptMessage::developer_with_origin(
-            text,
-            PromptMessageOrigin::WorkflowTurn,
-        ))
-    }
-}
-
-fn detect_execution_directive(user_input: &str) -> ExecutionDirective {
-    let normalized = normalize_for_intent(user_input);
-
-    if contains_any(&normalized, &["read-only", "read only", "readonly", "只读"]) {
-        ExecutionDirective::ReadOnly
-    } else if contains_any(
-        &normalized,
-        &[
-            "plan-only",
-            "plan only",
-            "planning only",
-            "only plan",
-            "just plan",
-            "只做计划",
-        ],
-    ) {
-        ExecutionDirective::PlanOnly
-    } else if contains_any(
-        &normalized,
-        &[
-            "analyze-only",
-            "analyze only",
-            "analysis only",
-            "only analyze",
-            "only analyse",
-            "只分析",
-        ],
-    ) {
-        ExecutionDirective::AnalyzeOnly
-    } else if contains_any(
-        &normalized,
-        &[
-            "do not edit",
-            "don't edit",
-            "dont edit",
-            "no edits",
-            "不要修改",
-        ],
-    ) {
-        ExecutionDirective::DoNotEdit
-    } else {
-        ExecutionDirective::None
-    }
-}
-
-fn classify_turn_intent(user_input: &str) -> TurnIntent {
-    let normalized = normalize_for_intent(user_input);
-
-    if contains_engineering_signal(&normalized) {
-        TurnIntent::Engineering
-    } else {
-        TurnIntent::Lightweight
-    }
-}
-
-fn detect_validation_reminder(user_input: &str, intent: TurnIntent) -> ValidationReminder {
-    if intent == TurnIntent::Lightweight {
-        return ValidationReminder::None;
-    }
-
-    let normalized = normalize_for_intent(user_input);
-    if contains_any(
-        &normalized,
-        &[
-            "cargo test",
-            "cargo check",
-            "cargo clippy",
-            "test ",
-            "tests ",
-            "build ",
-            "compile",
-            "lint",
-        ],
-    ) {
-        ValidationReminder::Targeted
-    } else if contains_any(
-        &normalized,
-        &[
-            "fix",
-            "implement",
-            "add",
-            "update",
-            "modify",
-            "refactor",
-            "rename",
-            "remove",
-            "create",
-            "write",
-            "edit",
-            "patch",
-            "bug",
-            "failing",
-            "regression",
-        ],
-    ) {
-        ValidationReminder::Focused
-    } else {
-        ValidationReminder::None
-    }
-}
-
-fn contains_engineering_signal(normalized: &str) -> bool {
-    contains_any(
-        normalized,
-        &[
-            "fix",
-            "implement",
-            "add",
-            "update",
-            "modify",
-            "refactor",
-            "rename",
-            "remove",
-            "create",
-            "write",
-            "edit",
-            "patch",
-            "debug",
-            "investigate",
-            "trace",
-            "root cause",
-            "complex analysis",
-            "full analysis",
-            "workflow",
-            "codebase",
-            "repository",
-            "repo",
-            "project",
-            "module",
-            "crate",
-            "src/",
-            "cargo ",
-            "test ",
-            "tests ",
-            "build ",
-            "compile",
-            "lint",
-            "multi-step",
-            "step by step",
-            "plan",
-            "pipeline",
-            "across",
-            "multiple files",
-            "复杂任务",
-            "复杂分析",
-            "工程",
-            "实现",
-            "修改",
-            "修复",
-            "重构",
-            "调试",
-            "排查",
-            "计划",
-            "当前项目",
-        ],
-    )
-}
-
-fn normalize_for_intent(user_input: &str) -> String {
-    user_input.to_ascii_lowercase()
-}
-
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
 }
 
 fn estimate_trailing_history_item_tokens(item: &HistoryItem) -> u64 {
@@ -5320,7 +5036,6 @@ impl ToolExecutionRejection {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::InvalidJsonArguments => "invalid_json_arguments",
-            Self::DirectiveBlocked => "directive_blocked",
             Self::ToolScopeDenied => "tool_scope_denied",
             Self::DelegationScopeDenied => "delegation_scope_denied",
             Self::PermissionDeniedByPolicy => "permission_denied_by_policy",

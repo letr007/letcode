@@ -20,7 +20,6 @@ use super::composer::one_line_snippet;
 pub(crate) struct ReviewRequestCard {
     pub tool: String,
     pub class: Option<String>,
-    pub directive: Option<String>,
     pub summary: String,
     pub goal: Option<String>,
     pub can_allow_always: bool,
@@ -46,8 +45,6 @@ pub(crate) fn parse_review_request(text: &str) -> Option<ReviewRequestCard> {
     }
     let tool = field_after(text, "Tool: ")?;
     let class = field_after(text, "Class: ");
-    let directive = field_after(text, "Execution directive: ")
-        .filter(|value| !value.eq_ignore_ascii_case("none"));
     let summary = field_after(text, "Summary: ").unwrap_or_else(|| tool.clone());
     let preview = field_after(text, "Preview: ").filter(|value| value != "(none)");
     let can_allow_always = field_after(text, "can_allow_always: ")
@@ -59,7 +56,6 @@ pub(crate) fn parse_review_request(text: &str) -> Option<ReviewRequestCard> {
     Some(ReviewRequestCard {
         tool,
         class,
-        directive,
         summary,
         goal,
         can_allow_always,
@@ -132,9 +128,6 @@ pub(crate) fn render_review_request_card_document(
         meta.push("always ok".to_string());
     } else {
         meta.push("once only".to_string());
-    }
-    if let Some(directive) = card.directive.as_deref() {
-        meta.push(directive.to_string());
     }
     if let Some(preview) = card.preview.as_deref() {
         meta.push(one_line_snippet(preview, 40));
@@ -311,7 +304,6 @@ mod tests {
          \n\
          Tool: shell__exec\n\
          Class: command\n\
-         Execution directive: read-only\n\
          Summary: shell__exec python3 -c \"...\"\n\
          Preview: (none)\n\
          can_allow_always: false\n\
@@ -325,7 +317,6 @@ mod tests {
         let card = parse_review_request(SAMPLE_REQUEST).expect("request");
         assert_eq!(card.tool, "shell__exec");
         assert_eq!(card.class.as_deref(), Some("command"));
-        assert_eq!(card.directive.as_deref(), Some("read-only"));
         assert!(!card.can_allow_always);
         assert_eq!(
             card.goal.as_deref(),

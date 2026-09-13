@@ -227,7 +227,6 @@ pub enum PromptMessageOrigin {
     SkillCatalog,
     SkillMaterial,
     RuntimeClock,
-    WorkflowTurn,
     RuntimeContextView,
 }
 

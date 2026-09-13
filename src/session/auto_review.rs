@@ -421,7 +421,6 @@ fn build_review_prompt(request: &PermissionRequest, user_goal: Option<&str>) -> 
          \n\
          Tool: {}\n\
          Class: {}\n\
-         Execution directive: {}\n\
          Summary: {}\n\
          Preview: {preview}\n\
          can_allow_always: {}\n\
@@ -432,7 +431,6 @@ fn build_review_prompt(request: &PermissionRequest, user_goal: Option<&str>) -> 
          Respect the user's goal and the agent's autonomy. Deny only when the call clearly conflicts with the user's intent or has unacceptable risk.",
         request.tool,
         request.class.as_str(),
-        request.directive.as_str(),
         request.summary,
         request.can_allow_always,
     )
@@ -575,7 +573,6 @@ mod tests {
             tool: "shell__exec".into(),
             args: serde_json::json!({"command": "pwd"}),
             class: crate::permission::ToolPermissionClass::Command,
-            directive: crate::permission::ExecutionDirective::ReadOnly,
             summary: "Run a read-only command".into(),
             preview: Some("pwd".into()),
             can_allow_always: false,

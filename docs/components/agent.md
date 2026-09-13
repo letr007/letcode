@@ -77,7 +77,7 @@ request decorator（例如 fake client）只能修改已准备的 request metada
 
 ## 工具与历史副作用
 
-模型生成的 tool calls 进入 `execute_tool_calls_and_record`。Agent 先解析 alias、scope、directive 和 permission，再执行 handler；必要时并行执行已声明为 parallel 的调用，按模型顺序 reconcile，并将 `ToolOutput` 写回 runtime snapshot。工具输出中的图片可通过外部事件保留，但文本历史使用适合 history 的结果表示。
+模型生成的 tool calls 进入 `execute_tool_calls_and_record`。Agent 先解析 alias、scope 和 permission，再执行 handler；必要时并行执行已声明为 parallel 的调用，按模型顺序 reconcile，并将 `ToolOutput` 写回 runtime snapshot。工具输出中的图片可通过外部事件保留，但文本历史使用适合 history 的结果表示。
 
 `append_history_item` 将 protocol history item 转换为带 provenance 的 derived runtime frame。`RuntimeSnapshot` 是当前协议上下文的权威存储；request builder 只从其 provider-visible projection 构造下一次请求。
 

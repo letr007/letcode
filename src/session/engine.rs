@@ -1664,7 +1664,7 @@ async fn run_engine_loop(
                         ),
                     };
                     if let Err(error) = agent
-                        .begin_internal_continuation_turn(&prompt)
+                        .begin_internal_continuation_turn()
                         .and_then(|()| {
                             transcript
                                 .lock()
