@@ -68,6 +68,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.frame_hyperlink_cells.clear();
     state.last_sidebar_area = Rect::default();
+    state.last_sidebar_bounds = Rect::default();
     state.last_sidebar_context_header = Rect::default();
     state.last_sidebar_mcp_header = Rect::default();
     state.last_sidebar_todos_header = Rect::default();
@@ -1251,6 +1252,7 @@ mod tests {
     use crate::context_view::{
         ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
     };
+    use crate::tui::events::ToolPendingEvent;
     use crate::tui::surface;
     use crate::tui::{
         AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, SessionEvent, ToolFinishedEvent,
@@ -1340,6 +1342,91 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn forced_overlay_sidebar_hides_the_workspace_layer_behind_it() {
+        let mut state = TuiState::default();
+        state.reasoning_effort_label = Some("leak-probe-reasoning".into());
+        state.toggle_sidebar();
+
+        let (width, height) = (100u16, 30u16);
+        let rows = draw_rows(&mut state, width, height);
+        let sidebar = layout::split_sidebar_layout(Rect::new(0, 0, width, height), true)
+            .sidebar
+            .expect("forced sidebar is rendered");
+        assert!(
+            sidebar.right() == width,
+            "expected the overlay layout: {sidebar:?}"
+        );
+
+        for (index, row) in rows.iter().enumerate() {
+            let panel: String = row.chars().skip(sidebar.x as usize).collect();
+            assert!(
+                !panel.contains("leak-probe-reasoning"),
+                "row {index} leaked workspace content into the panel: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_is_not_rendered_below_the_minimum_terminal_width() {
+        let mut forced = TuiState::default();
+        forced.toggle_sidebar();
+        let mut hidden = TuiState::default();
+        hidden.sidebar_hidden = true;
+
+        let narrow = layout::SIDEBAR_WIDTH * 2 - 1;
+        assert_eq!(
+            draw_rows(&mut forced, narrow, 30),
+            draw_rows(&mut hidden, narrow, 30)
+        );
+        assert_ne!(
+            draw_rows(&mut forced, narrow + 1, 30),
+            draw_rows(&mut hidden, narrow + 1, 30)
+        );
+    }
+
+    #[test]
+    fn overlay_sidebar_blocks_transcript_hits_inside_its_columns() {
+        let mut state = TuiState::default();
+        state.toggle_sidebar();
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )));
+
+        let (width, height) = (100u16, 30u16);
+        draw_rows(&mut state, width, height);
+        let sidebar = layout::split_sidebar_layout(Rect::new(0, 0, width, height), true)
+            .sidebar
+            .expect("forced sidebar is rendered");
+        let transcript = state.last_transcript_area;
+        assert!(
+            transcript.width > 0 && sidebar.x > transcript.x && sidebar.right() == width,
+            "expected an overlay panel over a live transcript: {transcript:?} {sidebar:?}"
+        );
+
+        let mut visible_hits = 0usize;
+        for row in transcript.top()..transcript.bottom() {
+            for col in transcript.left()..sidebar.x {
+                visible_hits += usize::from(state.transcript_click_target(col, row).is_some());
+            }
+            for col in sidebar.left()..transcript.right() {
+                assert!(
+                    state.transcript_click_target(col, row).is_none(),
+                    "row {row} col {col} kept a transcript click target under the panel"
+                );
+                assert!(
+                    state.map_mouse_to_anchor(col, row).is_none(),
+                    "row {row} col {col} kept a selection anchor under the panel"
+                );
+            }
+        }
+        assert!(
+            visible_hits > 0,
+            "the probe needs a live transcript hit next to the panel"
+        );
     }
 
     #[test]

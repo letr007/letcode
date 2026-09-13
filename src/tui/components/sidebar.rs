@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 
 use crate::agent::TodoStatus;
@@ -16,8 +16,10 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     }
 
     let style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(style), area);
     render_panel_guide(frame, area, theme);
+    state.last_sidebar_bounds = area;
 
     let inner = Rect::new(
         area.x.saturating_add(3),

@@ -1,3 +1,4 @@
+use super::components::layout::SIDEBAR_MIN_TERMINAL_WIDTH;
 use super::components::transcript::TranscriptRenderCache;
 use super::events::{
     AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
@@ -1199,6 +1200,8 @@ pub struct TuiState {
     pub sidebar_mcp_expanded: bool,
     pub sidebar_todos_expanded: bool,
     pub last_sidebar_area: ratatui::layout::Rect,
+    /// 面板外框（绘制时记录）。覆盖布局下面板遮挡的终端区域，命中判定与之一致。
+    pub last_sidebar_bounds: ratatui::layout::Rect,
     pub last_sidebar_context_header: ratatui::layout::Rect,
     pub last_sidebar_mcp_header: ratatui::layout::Rect,
     pub last_sidebar_todos_header: ratatui::layout::Rect,
@@ -1297,6 +1300,7 @@ impl Default for TuiState {
             sidebar_mcp_expanded: true,
             sidebar_todos_expanded: true,
             last_sidebar_area: ratatui::layout::Rect::default(),
+            last_sidebar_bounds: ratatui::layout::Rect::default(),
             last_sidebar_context_header: ratatui::layout::Rect::default(),
             last_sidebar_mcp_header: ratatui::layout::Rect::default(),
             last_sidebar_todos_header: ratatui::layout::Rect::default(),
@@ -1557,7 +1561,8 @@ impl TuiState {
     }
 
     pub fn sidebar_visible(&self, terminal_width: u16) -> bool {
-        !self.is_read_only_child_view()
+        terminal_width >= SIDEBAR_MIN_TERMINAL_WIDTH
+            && !self.is_read_only_child_view()
             && !self.sidebar_hidden
             && (self.sidebar_forced_open || terminal_width > 120)
     }
@@ -3400,11 +3405,17 @@ impl TuiState {
     /// 使用渲染时存的 `last_transcript_area`（content_area，不含 scrollbar 列）
     /// 与 `last_transcript_scroll_top`（已解析为 top-relative 偏移）。这两者都来自
     /// 渲染阶段，保证点击坐标和高亮坐标系完全一致。
+    ///
+    /// 覆盖布局下面板绘在 workspace 上，其区域内的单元格不属于 transcript，先排除。
     pub fn transcript_click_target(
         &self,
         terminal_col: u16,
         terminal_row: u16,
     ) -> Option<TranscriptClickTarget> {
+        if self.sidebar_covers_cell(terminal_col, terminal_row) {
+            return None;
+        }
+
         let area = self.last_transcript_area;
         if terminal_col < area.left()
             || terminal_col >= area.right()
@@ -3453,11 +3464,20 @@ impl TuiState {
         }
     }
 
+    fn sidebar_covers_cell(&self, terminal_col: u16, terminal_row: u16) -> bool {
+        let panel = self.last_sidebar_bounds;
+        panel.width > 0 && panel.height > 0 && panel.contains((terminal_col, terminal_row).into())
+    }
+
     pub fn map_mouse_to_anchor(
         &self,
         terminal_col: u16,
         terminal_row: u16,
     ) -> Option<SelectionAnchor> {
+        if self.sidebar_covers_cell(terminal_col, terminal_row) {
+            return None;
+        }
+
         let area = self.last_transcript_area;
 
         // 1. 命中检测：必须在 content_area 内，否则不映射
@@ -3718,6 +3738,7 @@ mod tests {
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
     use crate::tool::{QuestionOption, QuestionRequest, QuestionSpec};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
+    use crate::tui::components::layout::SIDEBAR_WIDTH;
     use crate::tui::events::{
         AutoContinueChangedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
         NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent, RetryLifecycleEvent,
@@ -4065,6 +4086,17 @@ mod tests {
         assert!(state.sidebar_visible(100));
         state.toggle_sidebar();
         assert!(!state.sidebar_visible(160));
+    }
+
+    #[test]
+    fn sidebar_is_dropped_below_the_minimum_terminal_width_even_when_forced_open() {
+        let mut state = TuiState::default();
+        let narrow = SIDEBAR_WIDTH * 2 - 1;
+        state.last_terminal_width = narrow;
+        state.toggle_sidebar();
+
+        assert!(!state.sidebar_visible(narrow));
+        assert!(state.sidebar_visible(SIDEBAR_WIDTH * 2));
     }
 
     #[test]
