@@ -14,6 +14,8 @@
 ### Fixed
 
 - 修复未启用并行工具调用的路由仍携带 `parallel_tool_calls`（值为 `false`）导致 Completions 路由的带工具回合在预检阶段全部失败的问题：该字段现在只在路由确实启用并行工具调用时出现。
+- 修复 Anthropic 路由配置了 `reasoning_effort` / `reasoning_efforts` 却未声明 `anthropic_thinking` 时，配置能加载而每个回合都在预检阶段失败的问题：现在加载时即拒绝，并指出需要 `mode = "adaptive"`。
+- 修复无法表达 reasoning effort 的路由（Anthropic 未声明 thinking，或其它协议未打开 `capabilities.generation.reasoning`）仍列出可选档位、选择后该模型后续回合全部在预检阶段失败的问题。
 
 ## [0.12.0] - 2026-09-12
 
