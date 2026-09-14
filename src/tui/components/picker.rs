@@ -7,7 +7,8 @@ use ratatui::{
 };
 
 use crate::tui::{
-    measure::display_width,
+    components::tool_card::truncate_display_width,
+    measure::{display_width, wrap_text_to_width},
     state::{DialogItem, DialogKind, DialogState, TuiState},
     theme::Theme,
 };
@@ -16,6 +17,12 @@ const PICKER_MIN_WIDTH: u16 = 64;
 const PICKER_MAX_WIDTH: u16 = 96;
 const PICKER_MIN_HEIGHT: u16 = 18;
 const PICKER_MAX_HEIGHT: u16 = 28;
+// Right-aligned details (session timestamps, status labels) never squeeze the row's
+// label below this width; longer details are truncated instead.
+const MIN_LEFT_LABEL_WIDTH: u16 = 18;
+// Expert rows wrap their model list onto continuation rows instead of truncating it.
+const AGENT_MODEL_INDENT: u16 = 4;
+const MODEL_SEPARATOR: &str = " · ";
 
 pub fn render_picker(
     frame: &mut Frame<'_>,
@@ -219,10 +226,11 @@ fn render_picker_body(
     }
 
     let mut rendered_any = false;
-    for entry in visible_picker_entries(dialog, rows) {
+    for entry in visible_picker_entries(dialog, rows, area.width) {
         if y >= area.bottom() {
             break;
         }
+        let entry_rows = entry.rows();
         match entry {
             PickerEntry::Heading(section) => {
                 render_section_heading(
@@ -233,9 +241,14 @@ fn render_picker_body(
                     theme.accent,
                 );
             }
-            PickerEntry::Item(index, item) => {
+            PickerEntry::Item { index, item, .. } => {
                 rendered_any = true;
-                let row = Rect::new(area.x, y, area.width, 1);
+                let row = Rect::new(
+                    area.x,
+                    y,
+                    area.width,
+                    entry_rows.min(area.bottom().saturating_sub(y)),
+                );
                 let selected = index == dialog.selected;
                 match dialog.kind {
                     DialogKind::ModelPicker => render_model_row(
@@ -246,9 +259,7 @@ fn render_picker_body(
                         selected,
                         item.id == state.model_id,
                     ),
-                    DialogKind::AgentPicker => {
-                        render_session_row(frame, row, theme, item, selected, None)
-                    }
+                    DialogKind::AgentPicker => render_agent_row(frame, row, theme, item, selected),
                     DialogKind::ExpertModelPicker(_) => {
                         render_model_row(frame, row, theme, item, selected, item.checked)
                     }
@@ -336,7 +347,7 @@ fn render_picker_body(
                 }
             }
         }
-        y = y.saturating_add(1);
+        y = y.saturating_add(entry_rows);
     }
 
     if !rendered_any && y < area.bottom() {
@@ -584,29 +595,58 @@ fn render_context_picker_footer(
 
 enum PickerEntry<'a> {
     Heading(&'a str),
-    Item(usize, &'a DialogItem),
+    Item {
+        index: usize,
+        item: &'a DialogItem,
+        rows: u16,
+    },
 }
 
-fn visible_picker_entries<'a>(dialog: &'a DialogState, rows: usize) -> Vec<PickerEntry<'a>> {
+impl PickerEntry<'_> {
+    fn rows(&self) -> u16 {
+        match self {
+            Self::Heading(_) => 1,
+            Self::Item { rows, .. } => *rows,
+        }
+    }
+}
+
+fn visible_picker_entries<'a>(
+    dialog: &'a DialogState,
+    rows: usize,
+    body_width: u16,
+) -> Vec<PickerEntry<'a>> {
     if rows == 0 {
         return Vec::new();
     }
 
-    let entries = picker_entries(dialog);
-    if entries.len() <= rows {
+    let entries = picker_entries(dialog, body_width);
+    let total_rows: usize = entries.iter().map(|entry| entry.rows() as usize).sum();
+    if total_rows <= rows {
         return entries;
     }
 
     let selected_position = entries
         .iter()
-        .position(|entry| matches!(entry, PickerEntry::Item(index, _) if *index == dialog.selected))
+        .position(
+            |entry| matches!(entry, PickerEntry::Item { index, .. } if *index == dialog.selected),
+        )
         .unwrap_or(0);
-    let start = selected_position.saturating_sub(rows.saturating_sub(1));
+    let mut start = selected_position;
+    let mut used_rows = 0usize;
+    for position in (0..=selected_position).rev() {
+        let height = entries[position].rows() as usize;
+        if used_rows + height > rows {
+            break;
+        }
+        used_rows += height;
+        start = position;
+    }
 
-    entries.into_iter().skip(start).take(rows).collect()
+    entries.into_iter().skip(start).collect()
 }
 
-fn picker_entries<'a>(dialog: &'a DialogState) -> Vec<PickerEntry<'a>> {
+fn picker_entries<'a>(dialog: &'a DialogState, body_width: u16) -> Vec<PickerEntry<'a>> {
     let mut entries = Vec::new();
     let mut previous_section: Option<&str> = None;
 
@@ -642,10 +682,34 @@ fn picker_entries<'a>(dialog: &'a DialogState) -> Vec<PickerEntry<'a>> {
             }
         }
 
-        entries.push(PickerEntry::Item(index, item));
+        entries.push(PickerEntry::Item {
+            index,
+            item,
+            rows: picker_item_rows(dialog, item, body_width),
+        });
     }
 
     entries
+}
+
+fn picker_item_rows(dialog: &DialogState, item: &DialogItem, body_width: u16) -> u16 {
+    if dialog.kind != DialogKind::AgentPicker {
+        return 1;
+    }
+    let Some(models) = item.right_detail.as_deref() else {
+        return 1;
+    };
+    let text_width = agent_model_text_width(body_width) as usize;
+    if text_width == 0 {
+        return 1;
+    }
+    1 + wrap_model_list(models, text_width).len() as u16
+}
+
+fn agent_model_text_width(body_width: u16) -> u16 {
+    body_width
+        .saturating_sub(2)
+        .saturating_sub(AGENT_MODEL_INDENT)
 }
 
 fn render_section_heading(
@@ -743,6 +807,99 @@ fn reasoning_item_is_current(current: Option<&str>, item_id: &str) -> bool {
     }
 }
 
+fn render_agent_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    item: &DialogItem,
+    selected: bool,
+) {
+    let row_style = if selected {
+        selected_item_style(theme)
+    } else {
+        item_style(theme)
+    };
+    frame.render_widget(Block::default().style(row_style), area);
+
+    let content = area.inner(Margin::new(1, 0));
+    if content.is_empty() {
+        return;
+    }
+
+    let marker = if selected { "● " } else { "  " };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(marker, row_style),
+            Span::styled(item.label.clone(), row_style),
+        ]))
+        .style(row_style),
+        Rect::new(content.x, content.y, content.width, 1),
+    );
+
+    let Some(models) = item.right_detail.as_deref() else {
+        return;
+    };
+    let indent = AGENT_MODEL_INDENT.min(content.width);
+    let text_width = content.width.saturating_sub(indent);
+    if text_width == 0 {
+        return;
+    }
+
+    let detail_style = Style::default().fg(theme.muted_text).bg(if selected {
+        theme.element_bg
+    } else {
+        theme.elevated_bg
+    });
+    for (offset, line) in wrap_model_list(models, text_width as usize)
+        .into_iter()
+        .enumerate()
+    {
+        let y = content.y.saturating_add(1).saturating_add(offset as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(line, detail_style))).style(row_style),
+            Rect::new(content.x + indent, y, text_width, 1),
+        );
+    }
+}
+
+/// Packs an expert's model list into rows without splitting a route name; only a single
+/// route wider than the row falls back to a hard wrap.
+fn wrap_model_list(models: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for model in models.split(MODEL_SEPARATOR) {
+        let candidate_width = if current.is_empty() {
+            display_width(model)
+        } else {
+            display_width(&current) + display_width(MODEL_SEPARATOR) + display_width(model)
+        };
+        if !current.is_empty() && candidate_width > width {
+            rows.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str(MODEL_SEPARATOR);
+        }
+        current.push_str(model);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+
+    rows.into_iter()
+        .flat_map(|row| wrap_text_to_width(&row, width))
+        .collect()
+}
+
 fn render_session_row(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -768,7 +925,7 @@ fn render_session_row(
         .as_ref()
         .map(|detail| display_width(detail) as u16)
         .unwrap_or(0)
-        .min(content.width);
+        .min(content.width.saturating_sub(MIN_LEFT_LABEL_WIDTH));
     let left_width = content.width.saturating_sub(right_width.saturating_add(2));
     let left_area = Rect::new(content.x, content.y, left_width, content.height);
     let right_area = Rect::new(
@@ -788,10 +945,12 @@ fn render_session_row(
         left_area,
     );
 
-    if let Some(right_detail) = &item.right_detail {
+    if let Some(right_detail) = &item.right_detail
+        && right_width > 0
+    {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                right_detail.clone(),
+                truncate_display_width(right_detail, right_width as usize),
                 if let Some(color) = status_color {
                     Style::default().fg(color).bg(if selected {
                         theme.element_bg
@@ -906,6 +1065,63 @@ mod tests {
         assert!(!rendered.contains("private.example"));
         assert!(rendered.contains("No tools discovered for this server"));
         assert!(rendered.contains("Esc back"));
+    }
+
+    #[test]
+    fn visible_entries_keep_the_selected_expert_inside_a_height_limited_window() {
+        let items = (0..6)
+            .map(|index| {
+                DialogItem::new(format!("expert-{index}"), format!("expert-{index}"), None)
+                    .with_section("Experts")
+                    .with_right_detail("deepseek/deepseek-v4 · zhipu/glm-5")
+            })
+            .collect();
+        let mut dialog = DialogState::new(DialogKind::AgentPicker, "Experts", None, items);
+        dialog.selected = 5;
+
+        let entries = visible_picker_entries(&dialog, 6, 62);
+        let rows: u16 = entries.iter().map(PickerEntry::rows).sum();
+        assert!(rows <= 6, "{rows}");
+        assert!(entries.iter().any(|entry| {
+            matches!(entry, PickerEntry::Item { index, .. } if *index == dialog.selected)
+        }));
+    }
+
+    #[test]
+    fn agent_picker_wraps_long_model_lists_without_truncating() {
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, PICKER_MIN_WIDTH, 30);
+        let dialog = DialogState::new(
+            DialogKind::AgentPicker,
+            "Experts",
+            None,
+            vec![
+                DialogItem::new("explorer", "explorer", None)
+                    .with_section("Experts")
+                    .with_right_detail("deepseek/deepseek-v4 · zhipu/glm-5 · moonshot/kimi-k2"),
+            ],
+        );
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_picker(frame, &mut state, area, theme, &dialog))
+            .expect("draw");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("explorer"), "{rendered}");
+        assert!(rendered.contains("deepseek/deepseek-v4"), "{rendered}");
+        assert!(rendered.contains("zhipu/glm-5"), "{rendered}");
+        assert!(rendered.contains("moonshot/kimi-k2"), "{rendered}");
+        assert!(!rendered.contains('…'), "{rendered}");
     }
 
     #[test]

@@ -1251,6 +1251,7 @@ impl TuiRuntime {
                 {
                     expert.route_id = model_id.clone();
                 }
+                self.refresh_open_agent_picker();
             }
             SessionTransportEvent::ExpertAllowedModelsChanged {
                 agent_name,
@@ -1273,6 +1274,7 @@ impl TuiRuntime {
                         item.checked = model_ids.contains(&item.id);
                     }
                 }
+                self.refresh_open_agent_picker();
             }
             SessionTransportEvent::PermissionModeChanged { mode } => {
                 self.state.set_permission_mode_label(mode.clone());
@@ -3186,6 +3188,24 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    /// Rebuilds an open expert list so its route summaries track the experts' live routes.
+    fn refresh_open_agent_picker(&mut self) {
+        let Some((query, selected_agent)) = self
+            .state
+            .dialog()
+            .filter(|dialog| dialog.kind == DialogKind::AgentPicker)
+            .map(|dialog| {
+                (
+                    dialog.query.clone(),
+                    dialog.selected_item().map(|item| item.id.clone()),
+                )
+            })
+        else {
+            return;
+        };
+        self.show_agents_dialog_with_state(query, selected_agent);
+    }
+
     fn show_agents_dialog_with_state(&mut self, query: String, selected_agent: Option<String>) {
         let items = self
             .available_experts
@@ -3193,7 +3213,7 @@ impl TuiRuntime {
             .map(|expert| {
                 DialogItem::new(expert.agent_name.clone(), expert.agent_name.clone(), None)
                     .with_section(self.state.t("ui.experts"))
-                    .with_right_detail(expert.route_id.clone())
+                    .with_right_detail(expert.model_summary())
             })
             .collect();
         let mut dialog = DialogState::new(

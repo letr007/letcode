@@ -759,6 +759,67 @@ fn expert_allowlist_event_syncs_the_open_picker() {
 }
 
 #[test]
+fn agent_picker_shows_the_default_route_until_models_are_selected() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "deepseek/deepseek-v4".into(),
+        allowed_models: Vec::new(),
+    }]);
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+
+    let dialog = runtime.state().dialog().expect("dialog");
+    assert_eq!(dialog.kind, DialogKind::AgentPicker);
+    assert_eq!(
+        dialog.items[0].right_detail.as_deref(),
+        Some("deepseek/deepseek-v4")
+    );
+}
+
+#[test]
+fn agent_picker_lists_selected_models_instead_of_the_default_route() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "deepseek/deepseek-v4".into(),
+        allowed_models: vec!["zhipu/glm-5".into(), "moonshot/kimi-k2".into()],
+    }]);
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+
+    let dialog = runtime.state().dialog().expect("dialog");
+    assert_eq!(
+        dialog.items[0].right_detail.as_deref(),
+        Some("zhipu/glm-5 · moonshot/kimi-k2")
+    );
+}
+
+#[test]
+fn expert_allowlist_event_refreshes_the_open_agent_picker() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "gpt-5.5".into(),
+        allowed_models: Vec::new(),
+    }]);
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ExpertAllowedModelsChanged {
+        agent_name: "explorer".into(),
+        model_ids: vec!["zhipu/glm-5".into()],
+    });
+
+    let dialog = runtime.state().dialog().expect("dialog");
+    assert_eq!(dialog.kind, DialogKind::AgentPicker);
+    assert_eq!(dialog.items[0].right_detail.as_deref(), Some("zhipu/glm-5"));
+}
+
+#[test]
 fn clipboard_image_becomes_a_png_attachment_without_inserting_text() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 

@@ -113,3 +113,14 @@ pub(crate) struct AvailableExpert {
     pub(crate) route_id: String,
     pub(crate) allowed_models: Vec<String>,
 }
+
+impl AvailableExpert {
+    /// Routes this expert accepts. Explicitly allowed models replace the configured
+    /// default route, which only applies while nothing is selected.
+    pub(crate) fn model_summary(&self) -> String {
+        if self.allowed_models.is_empty() {
+            return self.route_id.clone();
+        }
+        self.allowed_models.join(" · ")
+    }
+}
