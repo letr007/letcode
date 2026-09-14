@@ -173,7 +173,7 @@ path = "responses"
 display = "GPT-5.5"
 # protocol = "completions" # overrides the provider protocol
 # flavor = "standard" # overrides the provider flavor; deepseek selects the explicit DeepSeek profile
-# strategy = "astra" # default | astra; inferred from the model name when omitted
+# strategy = "astra" # default | astra | deepseek; inferred from the model name when omitted
 # context_window = 400000
 # effective_input_limit_tokens = 256000
 

@@ -16,12 +16,21 @@ const ASTRA_INTERACTIVE_HARNESS: &str = r#"GPT-6 Astra 工作指引：
 
 可独立发起且互不依赖的工具调用应尽量在同一批次并行；只有存在真实的数据或执行依赖时才串行调用。"#;
 
+const DEEPSEEK_INTERACTIVE_HARNESS: &str = r#"DeepSeek 工作指引：
+
+注释只出现在代码本身无法表达的地方，用于记录算法意图、外部约束、不变量与取舍原因；命名和结构已经交代清楚的部分直接省略，不逐行复述实现。
+
+文档、说明与提交信息正面陈述已经完成的设计、行为和结论，保持专业、简练。反面情形有无数种，不需要逐一列出。
+
+优先使用系统已经提供的能力：专用工具、skill、专家子代理。不要用通用手段重复实现它们已有的功能；可以并行推进或能够独立界定的工作，派给子代理处理。调用工具前确认参数名称、取值与作用范围，参数错误会产生真实的副作用，不只是返回一次错误。"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelStrategyId {
     #[default]
     Default,
     Astra,
+    Deepseek,
 }
 
 impl ModelStrategyId {
@@ -33,6 +42,9 @@ impl ModelStrategyId {
         configured.unwrap_or_else(|| {
             if is_astra_model(model_name) || model_override.is_some_and(is_astra_model) {
                 Self::Astra
+            } else if is_deepseek_model(model_name) || model_override.is_some_and(is_deepseek_model)
+            {
+                Self::Deepseek
             } else {
                 Self::Default
             }
@@ -49,7 +61,7 @@ impl ModelStrategyId {
 
     pub fn validate_binding(self, protocol: &str, flavor: ProviderFlavor) -> Result<(), String> {
         match self {
-            Self::Default => Ok(()),
+            Self::Default | Self::Deepseek => Ok(()),
             Self::Astra
                 if protocol == self.default_protocol() && flavor == self.default_flavor() =>
             {
@@ -131,6 +143,7 @@ impl ModelStrategyId {
         match self {
             Self::Default => None,
             Self::Astra => Some(PromptMessage::system(ASTRA_INTERACTIVE_HARNESS)),
+            Self::Deepseek => Some(PromptMessage::system(DEEPSEEK_INTERACTIVE_HARNESS)),
         }
     }
 }
@@ -138,6 +151,10 @@ impl ModelStrategyId {
 fn is_astra_model(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     value.contains("gpt") && value.contains("astra")
+}
+
+fn is_deepseek_model(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("deepseek")
 }
 
 #[cfg(test)]
@@ -170,6 +187,35 @@ mod tests {
             ModelStrategyId::resolve(None, "gpt-5.6", None),
             ModelStrategyId::Default
         );
+    }
+
+    #[test]
+    fn deepseek_is_inferred_from_configured_or_wire_model_name() {
+        assert_eq!(
+            ModelStrategyId::resolve(None, "deepseek-flash", None),
+            ModelStrategyId::Deepseek
+        );
+        assert_eq!(
+            ModelStrategyId::resolve(None, "friendly-name", Some("DeepSeek-V4")),
+            ModelStrategyId::Deepseek
+        );
+        assert_eq!(
+            ModelStrategyId::resolve(Some(ModelStrategyId::Default), "deepseek-flash", None),
+            ModelStrategyId::Default
+        );
+        assert_eq!(
+            ModelStrategyId::resolve(None, "gpt-5.6", None),
+            ModelStrategyId::Default
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_is_interactive_only() {
+        let message = ModelStrategyId::Deepseek
+            .interactive_prelude_message()
+            .expect("deepseek harness");
+        assert_eq!(message.origin, PromptMessageOrigin::StaticPrelude);
+        assert!(message.text.contains("DeepSeek 工作指引"));
     }
 
     #[test]

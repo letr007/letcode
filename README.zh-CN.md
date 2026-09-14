@@ -174,7 +174,7 @@ path = "responses"
 display = "GPT-5.5"
 # protocol = "completions" # 可覆盖 provider protocol
 # flavor = "standard" # 可覆盖 provider flavor；deepseek 表示显式选择 DeepSeek profile
-# strategy = "astra" # default | astra；省略时按模型名自动识别
+# strategy = "astra" # default | astra | deepseek；省略时按模型名自动识别
 # context_window = 400000
 # effective_input_limit_tokens = 256000
 
