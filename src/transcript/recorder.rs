@@ -161,12 +161,12 @@ impl ActiveTurnTracker {
     }
 }
 
-struct TranscriptWriterLock {
+pub(crate) struct TranscriptWriterLock {
     _file: fs::File,
 }
 
 impl TranscriptWriterLock {
-    fn try_acquire(transcript_path: &Path) -> Result<Option<Self>> {
+    pub(crate) fn try_acquire(transcript_path: &Path) -> Result<Option<Self>> {
         use fs4::fs_std::FileExt as _;
 
         let mut lock_path = transcript_path.as_os_str().to_os_string();

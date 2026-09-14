@@ -110,6 +110,13 @@ initial_delay_secs = 1
 backoff_multiplier = 2.0
 jitter_secs = 1
 
+# 可选；以下为默认值。闲置超过 older_than_days 的会话会在后台压缩，
+# 归档后的会话与活动会话一样出现在会话列表中，并在 resume 时自动恢复
+# （首次恢复会稍慢）。
+[global.session_archive]
+enabled = true
+older_than_days = 7
+
 # 可选；默认 default。可选值：safe | default | auto | yolo。
 [permissions]
 mode = "default" # solo 是 yolo 的兼容别名

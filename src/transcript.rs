@@ -34,6 +34,7 @@ use std::fs::OpenOptions;
 #[cfg(test)]
 use std::io::{self, Write};
 
+pub(crate) mod archive_index;
 mod model;
 mod session_index;
 
@@ -147,6 +148,7 @@ pub use journal::{
     read_records, read_records_allow_partial_tail, read_resumable_records_with_fingerprint,
 };
 pub use recorder::TranscriptRecorder;
+pub(crate) use recorder::TranscriptWriterLock;
 #[cfg(test)]
 pub(crate) use recorder::{ActiveContextExperiment, RecorderHealth};
 pub(crate) use recorder::{
@@ -309,7 +311,16 @@ fn fold_session_summary(acc: &mut SessionSummaryAcc, record: &TranscriptRecord) 
 fn summarize_session_file(path: &Path, session_id: String) -> Result<Option<SessionSummary>> {
     let file = File::open(path)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
-    let reader = BufReader::new(file);
+    summarize_session_reader(BufReader::new(file), session_id, path)
+}
+
+/// Summarize a transcript from any reader, so an archived transcript can be
+/// summarized through its decompressor without materializing the file.
+pub(crate) fn summarize_session_reader(
+    reader: impl BufRead,
+    session_id: String,
+    path: &Path,
+) -> Result<Option<SessionSummary>> {
     let mut acc = SessionSummaryAcc::default();
     let mut pending: Option<Vec<TranscriptRecord>> = None;
 

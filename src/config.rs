@@ -8,6 +8,7 @@ use crate::permission::PermissionMode;
 use crate::request_builder::{
     ModelReasoningEffort, ModelReasoningSummary, ModelRequestMetadata, ModelTextVerbosity,
 };
+use crate::session::archive::SessionArchiveConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -212,6 +213,9 @@ impl AppConfig {
             ),
             compaction,
             retry: build_retry_config(raw_global.retry.unwrap_or_default(), "global.retry")?,
+            session_archive: build_session_archive_config(
+                raw_global.session_archive.unwrap_or_default(),
+            )?,
         };
 
         let providers = resolved_catalog
@@ -411,6 +415,7 @@ pub struct GlobalConfig {
     pub log_file: PathBuf,
     pub compaction: CompactionConfig,
     pub retry: RetryConfig,
+    pub session_archive: SessionArchiveConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -712,6 +717,15 @@ struct RawGlobalConfig {
     log_file: Option<String>,
     compaction: Option<RawCompactionConfig>,
     retry: Option<RawRetryConfig>,
+    session_archive: Option<RawSessionArchiveConfig>,
+}
+
+/// Idle session transcripts older than this are archived in the background.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSessionArchiveConfig {
+    enabled: Option<bool>,
+    older_than_days: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1457,6 +1471,18 @@ fn validate_f32_range(label: &str, value: f32, min: f32, max: f32) -> Result<()>
     Ok(())
 }
 
+fn build_session_archive_config(raw: RawSessionArchiveConfig) -> Result<SessionArchiveConfig> {
+    let defaults = SessionArchiveConfig::default();
+    Ok(SessionArchiveConfig {
+        enabled: raw.enabled.unwrap_or(defaults.enabled),
+        older_than_days: raw
+            .older_than_days
+            .map(|days| positive_u64("global.session_archive.older_than_days", days))
+            .transpose()?
+            .unwrap_or(defaults.older_than_days),
+    })
+}
+
 fn build_compaction_config(raw: RawCompactionConfig) -> Result<CompactionConfig> {
     Ok(CompactionConfig {
         preserve_recent_tokens: raw.preserve_recent_tokens,
@@ -2190,6 +2216,41 @@ custom_key = "custom value"
         )))
         .expect_err("config should be rejected");
         assert!(format!("{error:#}").contains("global.retry.max_attempts must be at most 9000"));
+    }
+
+    #[test]
+    fn session_archive_settings_default_and_override() {
+        let default =
+            AppConfig::load_from_path(write_temp_config(config("openai", "model", ""))).unwrap();
+        assert_eq!(
+            default.global.session_archive,
+            SessionArchiveConfig::default()
+        );
+        assert!(default.global.session_archive.enabled);
+        assert_eq!(default.global.session_archive.older_than_days, 7);
+
+        let overridden = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[global.session_archive]\nenabled = false\nolder_than_days = 30\n",
+        )))
+        .unwrap();
+        assert!(!overridden.global.session_archive.enabled);
+        assert_eq!(overridden.global.session_archive.older_than_days, 30);
+    }
+
+    #[test]
+    fn rejects_session_archive_window_of_zero_days() {
+        let error = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[global.session_archive]\nolder_than_days = 0\n",
+        )))
+        .expect_err("config should be rejected");
+        assert!(
+            format!("{error:#}")
+                .contains("global.session_archive.older_than_days must be greater than 0")
+        );
     }
 
     #[test]

@@ -14,8 +14,9 @@ use crate::command::{
 use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
+use crate::session::archive::{self, ArchiveBudget, ArchiveRunReport, merged_session_summaries};
 use crate::skills::SkillCard;
-use crate::transcript::{SessionSummary, list_sessions, read_records, transcript_projection};
+use crate::transcript::{SessionSummary, read_records, transcript_projection};
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
@@ -201,6 +202,9 @@ pub struct TuiRuntime {
     session_list_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<SessionSummary>>>>,
     /// One-shot background release check. Failures are logged and never interrupt the TUI.
     update_check_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Option<String>>>>,
+    /// One-shot background archive pass started at TUI startup. Its report only
+    /// reaches the UI for sessions that exhausted their archive attempts.
+    archive_pass_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<ArchiveRunReport>>>,
     current_turn_output_tokens: u64,
     output_rate_samples: Vec<OutputRateSample>,
     history_selection: Option<usize>,
@@ -241,6 +245,7 @@ impl TuiRuntime {
             session_resume_pending: false,
             session_list_rx: None,
             update_check_rx: None,
+            archive_pass_rx: None,
             current_turn_output_tokens: 0,
             output_rate_samples: Vec::new(),
             history_selection: None,
@@ -270,6 +275,34 @@ impl TuiRuntime {
             let result = crate::updater::available_update()
                 .map(|update| update.map(|update| update.latest_version));
             let _ = tx.send(result);
+        });
+    }
+
+    /// Archive idle session families once, off the frame loop. The pass is
+    /// silent while it succeeds, and never runs from one-shot or JSON CLI modes
+    /// because those never enter the TUI.
+    fn start_session_archive_pass(&mut self) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.archive_pass_rx = Some(rx);
+        let sessions_dir = self.sessions_dir.clone();
+        std::thread::spawn(move || {
+            // The pass reads the settings from the same config file the process
+            // started from, without holding a live AppConfig in the TUI.
+            let config = match crate::config::AppConfig::load() {
+                Ok(config) => config.global.session_archive,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "skipping the session archive pass; the config is unreadable"
+                    );
+                    return;
+                }
+            };
+            let _ = tx.send(archive::run_archive_pass(
+                &sessions_dir,
+                config,
+                ArchiveBudget::default(),
+            ));
         });
     }
 
@@ -650,6 +683,7 @@ impl TuiRuntime {
         self.advance_assistant_typewriter_with_budget(Instant::now(), &mut budget);
         self.poll_session_list();
         self.poll_update_check();
+        self.poll_session_archive_pass();
         self.poll_git_branch();
 
         let mut batch = VecDeque::new();
@@ -709,6 +743,36 @@ impl TuiRuntime {
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => self.update_check_rx = None,
+        }
+    }
+
+    fn poll_session_archive_pass(&mut self) {
+        let Some(rx) = self.archive_pass_rx.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(report)) => {
+                self.archive_pass_rx = None;
+                if let Some((first, rest)) = report.anomalies.split_first() {
+                    let message = if rest.is_empty() {
+                        self.state
+                            .t_fmt("runtime.session_archive_anomaly", &[("session", first)])
+                    } else {
+                        let count = rest.len().to_string();
+                        self.state.t_fmt(
+                            "runtime.session_archive_anomaly_more",
+                            &[("session", first), ("count", &count)],
+                        )
+                    };
+                    self.state.show_toast(message, ToastKind::Error);
+                }
+            }
+            Ok(Err(error)) => {
+                self.archive_pass_rx = None;
+                tracing::warn!(%error, "session archive pass failed");
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => self.archive_pass_rx = None,
         }
     }
 
@@ -3335,7 +3399,7 @@ impl TuiRuntime {
         // dedicated async worker type; swap to spawn_blocking if we already hold
         // a Handle in more places.
         std::thread::spawn(move || {
-            let _ = tx.send(list_sessions(sessions_dir));
+            let _ = tx.send(merged_session_summaries(&sessions_dir));
         });
         Ok(Some(SubmittedCommand::LocalOnly))
     }
@@ -4666,6 +4730,7 @@ pub async fn run_tui(
         );
         runtime.set_workspace_dir(workspace_dir);
         runtime.start_update_check();
+        runtime.start_session_archive_pass();
         runtime.session_title = projection.session_title;
         let mut terminal = OwnedTerminal::new()?;
         // Restore platform input modes before OwnedTerminal restores raw mode.
@@ -4895,6 +4960,124 @@ mod git_branch_tests {
         assert_eq!(read_git_branch(&path), None);
 
         let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(test)]
+mod session_archive_tests {
+    use super::TuiRuntime;
+    use crate::session::archive::ArchiveRunReport;
+    use crate::tui::TuiState;
+    use crate::tui::state::ToastKind;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "letcode-session-archive-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn runtime() -> TuiRuntime {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            Vec::new(),
+            Vec::new(),
+            temp_dir("sessions"),
+            temp_dir("preferences"),
+        )
+    }
+
+    fn deliver_report(runtime: &mut TuiRuntime, report: ArchiveRunReport) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        runtime.archive_pass_rx = Some(rx);
+        tx.send(Ok(report)).expect("archive report should send");
+    }
+
+    #[test]
+    fn archive_anomalies_surface_once_as_an_error_toast() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_language(Some(crate::tui::i18n::Language::En));
+        deliver_report(
+            &mut runtime,
+            ArchiveRunReport {
+                anomalies: vec!["broken".into()],
+                ..ArchiveRunReport::default()
+            },
+        );
+
+        runtime.poll_session_archive_pass();
+
+        let toast = runtime.state().toast().expect("anomaly toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(
+            toast.message,
+            "Session archiving keeps failing for broken; see the log for details"
+        );
+        assert!(runtime.archive_pass_rx.is_none());
+    }
+
+    #[test]
+    fn archive_anomalies_count_the_remaining_sessions() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_language(Some(crate::tui::i18n::Language::En));
+        deliver_report(
+            &mut runtime,
+            ArchiveRunReport {
+                anomalies: vec!["first".into(), "second".into(), "third".into()],
+                ..ArchiveRunReport::default()
+            },
+        );
+
+        runtime.poll_session_archive_pass();
+
+        let toast = runtime.state().toast().expect("anomaly toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(
+            toast.message,
+            "Session archiving keeps failing for first and 2 more sessions; see the log for details"
+        );
+    }
+
+    #[test]
+    fn a_successful_archive_pass_leaves_the_ui_unchanged() {
+        let mut runtime = runtime();
+        deliver_report(
+            &mut runtime,
+            ArchiveRunReport {
+                archived_sessions: vec!["idle".into()],
+                ..ArchiveRunReport::default()
+            },
+        );
+
+        runtime.poll_session_archive_pass();
+
+        assert!(runtime.state().toast().is_none());
+        assert!(runtime.archive_pass_rx.is_none());
+    }
+
+    #[test]
+    fn a_failed_archive_pass_stays_out_of_the_ui() {
+        let mut runtime = runtime();
+        let (tx, rx) = mpsc::unbounded_channel();
+        runtime.archive_pass_rx = Some(rx);
+        tx.send(Err(anyhow::anyhow!("unreadable sessions directory")))
+            .expect("archive failure should send");
+
+        runtime.poll_session_archive_pass();
+
+        assert!(runtime.state().toast().is_none());
+        assert!(runtime.archive_pass_rx.is_none());
     }
 }
 

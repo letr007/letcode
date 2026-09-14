@@ -8,12 +8,12 @@ use crate::command::{CommandIntent, command_metadata, parse_command};
 use crate::config::AppConfig;
 use crate::permission::{PermissionApproval, PermissionMode};
 use crate::request_builder::{ModelReasoningEffort, ModelRequestMetadata};
+use crate::session::archive::merged_session_summaries;
 use crate::session::{
     PermissionRequestEvent, SessionCommand, SessionEngine, SessionEngineIngress,
     SessionEngineProjection, SessionTransportEvent, ToolOutcome,
 };
 use crate::tool::{QuestionRequest, QuestionResponse};
-use crate::transcript::list_sessions;
 use crate::user_content::{UserMessageContent, UserMessageSubmission};
 use anyhow::{Result, anyhow, bail};
 use serde_json::json;
@@ -1023,7 +1023,7 @@ fn print_repl_help() {
 }
 
 fn print_sessions(base_dir: &Path) -> Result<()> {
-    let sessions = list_sessions(base_dir)?;
+    let sessions = merged_session_summaries(base_dir)?;
 
     if sessions.is_empty() {
         println!("no sessions");

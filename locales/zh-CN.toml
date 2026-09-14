@@ -205,6 +205,8 @@ startup_mcp_unavailable = "MCP 发现不可用"
 mcp_disabled = "已禁用 · 缓存工具不可调用"
 mcp_online = "在线 · 可用工具 {count} 个"
 mcp_offline = "离线"
+session_archive_anomaly = "会话归档一直失败：{session}；详情见日志"
+session_archive_anomaly_more = "会话归档一直失败：{session} 及其他 {count} 个会话；详情见日志"
 
 [question]
 select_all = "可多选"

@@ -26,6 +26,7 @@
 //!   CLI ──┘
 //! ```
 
+pub(crate) mod archive;
 pub mod auto_review;
 pub mod child_view;
 pub mod command;

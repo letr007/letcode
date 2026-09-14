@@ -206,6 +206,8 @@ startup_mcp_unavailable = "MCP discovery unavailable"
 mcp_disabled = "Disabled · cached tools are not callable"
 mcp_online = "Online · {count} tools available"
 mcp_offline = "Offline"
+session_archive_anomaly = "Session archiving keeps failing for {session}; see the log for details"
+session_archive_anomaly_more = "Session archiving keeps failing for {session} and {count} more sessions; see the log for details"
 
 [question]
 select_all = "select all that apply"

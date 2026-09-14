@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::agent::Agent;
 use crate::config::ModelRoute;
@@ -17,6 +17,63 @@ use crate::transcript::transcript_projection::{
     RuntimeRestoreSnapshot, SessionContextCursor, project_runtime_restore_snapshot,
 };
 use crate::transcript::{TranscriptRecord, TranscriptRecorder, list_child_sessions_for_parent};
+
+/// Attempts to load and open a transcript whose archive state may change while
+/// a background archive pass is running.
+const RESUME_ARCHIVE_RACE_ATTEMPTS: usize = 2;
+
+/// Load the transcript and open it for appending, resolving the archive state
+/// and retrying once when a background archive pass is in the way.
+fn load_and_open_for_resume(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<(Vec<TranscriptRecord>, TranscriptRecorder)> {
+    load_and_open_for_resume_with(sessions_dir, session_id, || {})
+}
+
+fn load_and_open_for_resume_with(
+    sessions_dir: &Path,
+    session_id: &str,
+    after_load: impl Fn(),
+) -> Result<(Vec<TranscriptRecord>, TranscriptRecorder)> {
+    use crate::session::lifecycle::{
+        load_session_records_with_fingerprint, open_resume_transcript_with_records_at_fingerprint,
+    };
+
+    let last_attempt = RESUME_ARCHIVE_RACE_ATTEMPTS - 1;
+    for attempt in 0..RESUME_ARCHIVE_RACE_ATTEMPTS {
+        let displaced = match load_session_records_with_fingerprint(sessions_dir, session_id) {
+            Ok((records, fingerprint)) => {
+                after_load();
+                match open_resume_transcript_with_records_at_fingerprint(
+                    sessions_dir,
+                    session_id,
+                    &records,
+                    &fingerprint,
+                ) {
+                    Ok(recorder) => return Ok((records, recorder)),
+                    Err(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+
+        if attempt == last_attempt {
+            return Err(displaced);
+        }
+        tracing::debug!(
+            session_id = %session_id,
+            error = %displaced,
+            "session transcript was not openable while resuming; resolving its archive state and retrying"
+        );
+        // The family may have moved into the archive since the load, or an
+        // archive pass may still hold its lock before the archive files are
+        // visible; resolving here waits that pass out and restores the family.
+        super::archive::restore_session_family_for_resume(sessions_dir, session_id)?;
+    }
+
+    bail!("failed to open session {session_id} for resume")
+}
 
 /// Default cursor for resume: active branch tip (no explicit leaf cut).
 pub fn default_resume_cursor() -> SessionContextCursor {
@@ -89,25 +146,26 @@ pub fn prepare_resume_package(
     sessions_dir: impl AsRef<Path>,
     session_id: impl Into<String>,
 ) -> Result<PreparedResume> {
-    use crate::session::lifecycle::{
-        load_session_records_with_fingerprint, open_resume_transcript_with_records_at_fingerprint,
-    };
-
     let sessions_dir = sessions_dir.as_ref();
     let session_id = session_id.into();
-    let (mut records, fingerprint) =
-        load_session_records_with_fingerprint(sessions_dir, &session_id)?;
+    // A resume of an archived session restores its whole family first, so the
+    // rest of this path only ever sees live transcripts.
+    if let Some(stats) =
+        super::archive::restore_session_family_for_resume(sessions_dir, &session_id)?
+    {
+        tracing::debug!(
+            session_id = %session_id,
+            transcripts = stats.transcripts,
+            original_bytes = stats.original_bytes,
+            "restored an archived session family for resume"
+        );
+    }
+    let (mut records, mut recorder) = load_and_open_for_resume(sessions_dir, &session_id)?;
     let mut snapshot = project_runtime_restore_snapshot_with_children(
         session_id.clone(),
         records.clone(),
         default_resume_cursor(),
         sessions_dir,
-    )?;
-    let mut recorder = open_resume_transcript_with_records_at_fingerprint(
-        sessions_dir,
-        &session_id,
-        &records,
-        &fingerprint,
     )?;
     recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
 
@@ -1229,5 +1287,89 @@ protocol = "responses"
             "the wrapped anyhow error must remain in the source chain"
         );
         assert!(!agent.fast_mode_enabled());
+    }
+
+    #[test]
+    fn resume_restores_an_archived_session_before_loading_it() {
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder.record_session_started("p/target").unwrap();
+        recorder.record_user_message("question").unwrap();
+        recorder.record_assistant_message("answer").unwrap();
+        let session_id = recorder.session_id().to_string();
+        let transcript_path = recorder.path().to_path_buf();
+        drop(recorder);
+
+        // A zero-day window makes every transcript idle, so the pass archives
+        // without waiting for an aged file.
+        let report = crate::session::archive::run_archive_pass(
+            &sessions_dir,
+            crate::session::archive::SessionArchiveConfig {
+                enabled: true,
+                older_than_days: 0,
+            },
+            crate::session::archive::ArchiveBudget::default(),
+        )
+        .expect("archive pass runs");
+        assert_eq!(report.archived_sessions, vec![session_id.clone()]);
+        assert!(!transcript_path.exists());
+
+        let prepared = prepare_resume_package(&sessions_dir, &session_id)
+            .expect("resume restores the archived family");
+
+        assert_eq!(prepared.session_id, session_id);
+        assert!(!prepared.records.is_empty());
+        assert!(transcript_path.is_file());
+        assert!(
+            !crate::transcript::archive_index::transcript_path(&sessions_dir, &prepared.session_id)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn resume_recovers_when_a_background_archive_moves_the_session() {
+        use std::cell::Cell;
+        use std::time::{Duration, SystemTime};
+
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder.record_session_started("p/target").unwrap();
+        recorder.record_user_message("question").unwrap();
+        recorder.record_assistant_message("answer").unwrap();
+        let session_id = recorder.session_id().to_string();
+        let transcript_path = recorder.path().to_path_buf();
+        drop(recorder);
+
+        // The archive pass wins the race between loading and opening: the hook
+        // ages the transcript and archives the family before the open happens.
+        let archived = Cell::new(false);
+        let (records, _recorder) =
+            load_and_open_for_resume_with(&sessions_dir, &session_id, || {
+                if archived.replace(true) {
+                    return;
+                }
+                let modified = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&transcript_path)
+                    .unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                crate::session::archive::run_archive_pass(
+                    &sessions_dir,
+                    crate::session::archive::SessionArchiveConfig::default(),
+                    crate::session::archive::ArchiveBudget::default(),
+                )
+                .expect("archive pass runs");
+            })
+            .expect("resume recovers after the transcript was archived");
+
+        assert!(!records.is_empty());
+        assert!(transcript_path.is_file(), "the transcript comes back");
+        assert!(
+            crate::transcript::archive_index::archived_ids(&sessions_dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

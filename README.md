@@ -110,6 +110,14 @@ initial_delay_secs = 1
 backoff_multiplier = 2.0
 jitter_secs = 1
 
+# Optional; values below are the defaults. Idle sessions older than
+# older_than_days are compressed in the background; archived sessions stay
+# listed alongside live ones and are restored automatically when resumed
+# (the first resume of an archived session takes a little longer).
+[global.session_archive]
+enabled = true
+older_than_days = 7
+
 # Optional; defaults to default. Values: safe | default | auto | yolo.
 [permissions]
 mode = "default" # solo remains accepted as a yolo alias
