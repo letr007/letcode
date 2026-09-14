@@ -19,6 +19,14 @@ struct ExpertRoutePolicy {
     allowed_models: Vec<ModelRoute>,
 }
 
+impl ExpertRoutePolicy {
+    /// Route used when a delegation does not request one. Selecting allowed models
+    /// replaces the configured default route; the first selection wins.
+    fn effective_default_route(&self) -> Option<&ModelRoute> {
+        self.allowed_models.first().or(self.default_route.as_ref())
+    }
+}
+
 impl ExpertRouteFactory {
     fn prepare_route(&self, route: ModelRoute) -> Result<crate::agent::PreparedPrimaryRoute> {
         self.prepare_route_with_runtime_route(route, None)
@@ -168,12 +176,14 @@ impl SubagentChildFactory for ExpertRouteFactory {
             if takeover && parent.prepare_primary_route(route.clone()).is_ok() {
                 return Ok(route.clone());
             }
-            let effective_default = policy
-                .default_route
-                .as_ref()
-                .or_else(|| parent.primary_route());
             let allowed = policy.allowed_models.iter().any(|allowed| allowed == route);
-            let default_takeover = takeover && effective_default == Some(route);
+            // Takeover restores a route the child may have been created with: the
+            // effective default (a selected model or the configured one), the
+            // configured default itself, or the parent route when no default is set.
+            let default_takeover = takeover
+                && (policy.effective_default_route() == Some(route)
+                    || policy.default_route.as_ref() == Some(route)
+                    || (policy.default_route.is_none() && parent.primary_route() == Some(route)));
             if !allowed && !default_takeover {
                 let action = if takeover { "historical" } else { "requested" };
                 bail!(
@@ -189,8 +199,8 @@ impl SubagentChildFactory for ExpertRouteFactory {
             bail!("takeover requires a recorded provider/model route");
         }
         policy
-            .default_route
-            .clone()
+            .effective_default_route()
+            .cloned()
             .or_else(|| parent.primary_route().cloned())
             .ok_or_else(|| {
                 anyhow!(

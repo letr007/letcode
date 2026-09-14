@@ -496,6 +496,72 @@ base_url = "https://test.example.invalid/v1"
     }
 
     #[test]
+    fn expert_policy_defaults_to_the_first_selected_model() {
+        let providers = indexmap::IndexMap::from([
+            (
+                "primary".into(),
+                test_provider(
+                    "http://127.0.0.1:9876/v1",
+                    "primary-key",
+                    ApiProtocol::Completions,
+                    &["shared"],
+                ),
+            ),
+            (
+                "expert".into(),
+                test_provider(
+                    "http://127.0.0.1:9877/v1",
+                    "expert-key",
+                    ApiProtocol::Completions,
+                    &["special", "alt"],
+                ),
+            ),
+        ]);
+        let configured_default = ModelRoute::new("primary", "shared");
+        let first_selected = ModelRoute::new("expert", "special");
+        let factory = Arc::new(
+            ExpertRouteFactory::new_with_policies(
+                [(
+                    "explorer".into(),
+                    Some(configured_default.clone()),
+                    vec![first_selected.clone(), ModelRoute::new("expert", "alt")],
+                )],
+                &providers,
+                &RetryConfig::default(),
+            )
+            .expect("factory should build")
+            .with_runtime_catalog(resolved_runtime_catalog()),
+        );
+        let mut parent = test_agent();
+        use_resolved_runtime_catalog(&mut parent);
+        parent.set_primary_route(configured_default.clone());
+        parent.set_primary_route_factory(factory.clone());
+
+        assert_eq!(
+            SubagentChildFactory::resolve_route(
+                factory.as_ref(),
+                &parent,
+                &AgentTemplate::explorer(),
+                None,
+                false,
+            )
+            .expect("first selected model becomes the default"),
+            first_selected
+        );
+        assert_eq!(
+            SubagentChildFactory::resolve_route(
+                factory.as_ref(),
+                &parent,
+                &AgentTemplate::explorer(),
+                Some(&configured_default),
+                true,
+            )
+            .expect("configured default stays restorable for takeover"),
+            configured_default
+        );
+    }
+
+    #[test]
     fn expert_route_factory_rejects_an_unconfigured_model_for_a_known_provider() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
