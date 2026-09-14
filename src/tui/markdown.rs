@@ -630,12 +630,21 @@ impl MarkdownRenderer {
             .max(1);
         let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
         let mut widths = vec![1; columns];
+        let mut minimums = vec![1; columns];
         for row in &table.rows {
             for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index].max(display_width(&render_span_text(cell)));
+                let text = render_span_text(cell);
+                widths[index] = widths[index].max(display_width(&text));
+                let widest = text
+                    .graphemes(true)
+                    .map(display_width)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                minimums[index] = minimums[index].max(widest);
             }
         }
-        fit_column_widths(&mut widths, pane_width);
+        fit_column_widths(&mut widths, &minimums, pane_width);
         for (row_index, row) in table.rows.into_iter().enumerate() {
             let prefix = if row_index == 0 {
                 &first_prefix
@@ -647,36 +656,54 @@ impl MarkdownRenderer {
             } else {
                 table_style(self.theme)
             };
-            let mut spans = Vec::new();
-            if !prefix.is_empty() {
-                spans.push(RenderSpan::decoration(prefix.clone(), self.prefix_style()));
-            }
+            let mut cells = Vec::with_capacity(widths.len());
+            let mut row_cells = row.into_iter();
             for (index, width) in widths.iter().copied().enumerate() {
-                if index > 0 {
-                    spans.push(RenderSpan::decoration(
-                        " │ ",
-                        table_border_style(self.theme),
-                    ));
+                let mut wrapped = wrap_cell_spans(row_cells.next().unwrap_or_default(), width);
+                for (line_index, cell) in wrapped.iter_mut().enumerate() {
+                    for span in cell.iter_mut() {
+                        span.style = style;
+                    }
+                    // Only the first visual row starts a new column; wrapped
+                    // continuation rows belong to the same cell and must copy
+                    // without an extra separator space.
+                    if index > 0
+                        && line_index == 0
+                        && let Some(span) = cell.iter_mut().find(|span| span.source.is_some())
+                    {
+                        span.copy_join = CopyJoin::Space;
+                    }
                 }
-                let mut cell =
-                    truncate_render_spans(row.get(index).map(Vec::as_slice).unwrap_or(&[]), width);
-                if index > 0
-                    && let Some(span) = cell.iter_mut().find(|span| span.source.is_some())
-                {
-                    span.copy_join = CopyJoin::Space;
-                }
-                for span in &mut cell {
-                    span.style = style;
-                }
-                let used = display_width(&render_span_text(&cell));
-                spans.extend(cell);
-                if width > used {
-                    spans.push(RenderSpan::decoration(" ".repeat(width - used), style));
-                }
+                cells.push(wrapped);
             }
-            pad_render_line(&mut spans, self.options.width, self.theme.app_style());
-            self.document
-                .push_line(RenderLine { spans }, Break::HardBreak);
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for line_index in 0..height {
+                let mut spans = Vec::new();
+                if !prefix.is_empty() {
+                    spans.push(RenderSpan::decoration(prefix.clone(), self.prefix_style()));
+                }
+                for (index, width) in widths.iter().copied().enumerate() {
+                    if index > 0 {
+                        spans.push(RenderSpan::decoration(
+                            " │ ",
+                            table_border_style(self.theme),
+                        ));
+                    }
+                    let mut cell = cells[index].get(line_index).cloned().unwrap_or_default();
+                    let used = display_width(&render_span_text(&cell));
+                    if width > used {
+                        cell.push(RenderSpan::decoration(" ".repeat(width - used), style));
+                    }
+                    spans.extend(cell);
+                }
+                pad_render_line(&mut spans, self.options.width, self.theme.app_style());
+                let boundary = if line_index + 1 == height {
+                    Break::HardBreak
+                } else {
+                    Break::SoftWrap
+                };
+                self.document.push_line(RenderLine { spans }, boundary);
+            }
             if table.header_rows > 0 && row_index + 1 == table.header_rows {
                 let mut separator = Vec::new();
                 if !next_prefix.is_empty() {
@@ -998,6 +1025,23 @@ fn truncate_render_spans(spans: &[RenderSpan<Style>], width: usize) -> Vec<Rende
         }
     }
     out
+}
+
+/// Wrap one table cell into visually separate lines, preserving source ranges so
+/// selection and copying keep working across the wrapped rows.
+fn wrap_cell_spans(spans: Vec<RenderSpan<Style>>, width: usize) -> Vec<Vec<RenderSpan<Style>>> {
+    let width = width.max(1);
+    wrap_render_spans_with_prefixes(
+        spans,
+        width,
+        width,
+        RenderSpan::decoration("", Style::default()),
+        RenderSpan::decoration("", Style::default()),
+        Style::default(),
+    )
+    .into_iter()
+    .map(|(line, _)| line.spans)
+    .collect()
 }
 
 fn pad_render_line(spans: &mut Vec<RenderSpan<Style>>, width: usize, style: Style) {
@@ -1403,7 +1447,7 @@ fn heading_number(level: HeadingLevel) -> u8 {
     }
 }
 
-fn fit_column_widths(widths: &mut [usize], total_width: usize) {
+fn fit_column_widths(widths: &mut [usize], minimums: &[usize], total_width: usize) {
     if widths.is_empty() {
         return;
     }
@@ -1414,14 +1458,17 @@ fn fit_column_widths(widths: &mut [usize], total_width: usize) {
         .max(widths.len());
 
     // Natural content widths are preferred. Only shrink (widest first) when the
-    // table would exceed the available markdown pane width.
+    // table would exceed the available markdown pane width, and never below the
+    // width needed to draw one grapheme of that column's content.
     while widths.iter().sum::<usize>() > available {
-        let Some((index, _)) = widths.iter().enumerate().max_by_key(|(_, width)| *width) else {
-            return;
-        };
-        if widths[index] <= 1 {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| **width > minimums.get(*index).copied().unwrap_or(1))
+            .max_by_key(|(_, width)| *width)
+        else {
             break;
-        }
+        };
         widths[index] = widths[index].saturating_sub(1);
     }
 }
@@ -2503,5 +2550,45 @@ mod tests {
             text.contains("12 passed (含 heal / replace_frames)"),
             "{text}"
         );
+    }
+
+    fn document_text(document: &Document<Style>) -> String {
+        document
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn table_cells_wrap_instead_of_dropping_overflow() {
+        let markdown = "| 名称 | 说明 |\n| --- | --- |\n| 组件 | 这是一个非常非常长的说明文字用来观察换行行为 |";
+        let document =
+            render_markdown_document(markdown, Theme::dark(), MarkdownRenderOptions::new(24));
+        assert!(document.validate(), "{document:?}");
+        let text = document_text(&document);
+        assert!(text.contains("这是一个非常非常"), "{text}");
+        assert!(text.contains("观察换行行为"), "{text}");
+    }
+
+    #[test]
+    fn squeezed_columns_still_keep_one_grapheme() {
+        let markdown = "| 一 | 二 | 三 | 四 | 五 | 六 | 七 | 八 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| 甲 | 乙 | 丙 | 丁 | 戊 | 己 | 庚 | 辛 |";
+        let document =
+            render_markdown_document(markdown, Theme::dark(), MarkdownRenderOptions::new(30));
+        assert!(document.validate(), "{document:?}");
+        let text = document_text(&document);
+        for glyph in [
+            "一", "二", "三", "四", "五", "六", "七", "八", "甲", "乙", "丙", "丁", "戊", "己",
+            "庚", "辛",
+        ] {
+            assert!(text.contains(glyph), "missing {glyph} in {text}");
+        }
     }
 }

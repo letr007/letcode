@@ -605,4 +605,44 @@ mod tests {
             assert_eq!(extract_selected_text(&state), expected);
         }
     }
+
+    #[test]
+    fn wrapped_table_cells_copy_without_extra_separator_spaces() {
+        use crate::tui::{
+            components::transcript::TranscriptRenderCacheEntry,
+            markdown::{MarkdownRenderOptions, render_markdown_document},
+        };
+
+        let document = render_markdown_document(
+            "| 名称 | 说明 |\n| --- | --- |\n| 组件 | 这是一个很长的说明文字 |",
+            crate::tui::theme::Theme::dark(),
+            MarkdownRenderOptions::new(16),
+        );
+        assert!(document.validate(), "{document:?}");
+        let last_line = document.lines.len() - 1;
+
+        let mut state = TuiState::default();
+        state
+            .transcript_render_cache
+            .set_entries_for_test(vec![TranscriptRenderCacheEntry {
+                revision: None,
+                document,
+            }]);
+        state.text_selection = Some(TextSelection {
+            start: SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: 0,
+                char_offset: 0,
+            },
+            end: SelectionAnchor {
+                item_index: 0,
+                rendered_line_offset: last_line,
+                char_offset: usize::MAX,
+            },
+        });
+
+        let copied = extract_selected_text(&state);
+        assert!(copied.contains("这是一个很长的说明文字"), "{copied}");
+        assert!(!copied.contains("  "), "{copied}");
+    }
 }
