@@ -10,6 +10,7 @@
 ### Added
 
 - 新增 DeepSeek 工作指引策略，按模型名自动识别。
+- 新增会话归档：超过 `[global.session_archive] older_than_days`（默认 7 天）未活动的会话族（含子会话与产物）会在后台静默压缩为 zstd 并移出磁盘；归档会话仍照常出现在会话列表，恢复时自动还原，首次会先解压。
 
 ### Changed
 
