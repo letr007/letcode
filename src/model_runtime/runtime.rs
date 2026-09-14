@@ -415,7 +415,9 @@ pub struct ModelAttemptResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelAttemptFailure {
     pub failure: ModelFailure,
-    pub partial: ModelAttemptSnapshot,
+    /// Boxed so `Result<_, ModelAttemptFailure>` stays small on every call path;
+    /// only the failure path pays for the allocation.
+    pub partial: Box<ModelAttemptSnapshot>,
 }
 
 #[derive(Clone)]
@@ -562,7 +564,7 @@ impl ModelRuntime {
                 .prepare_request(input)
                 .map_err(|failure| ModelAttemptFailure {
                     failure,
-                    partial: ModelAttemptSnapshot::default(),
+                    partial: Box::new(ModelAttemptSnapshot::default()),
                 })?;
         self.execute_prepared_attempt(route, request, observer)
             .await
@@ -582,7 +584,7 @@ impl ModelRuntime {
                 .await
                 .map_err(|failure| ModelAttemptFailure {
                     failure,
-                    partial: ModelAttemptSnapshot::default(),
+                    partial: Box::new(ModelAttemptSnapshot::default()),
                 })?;
         if !(200..300).contains(&response.status) {
             let status = response.status;
@@ -597,7 +599,7 @@ impl ModelRuntime {
             }
             return Err(ModelAttemptFailure {
                 failure,
-                partial: ModelAttemptSnapshot::default(),
+                partial: Box::new(ModelAttemptSnapshot::default()),
             });
         }
         let mut decoder = if self.responses_websocket
@@ -920,7 +922,7 @@ impl AttemptAccumulator {
     fn failed(&self, failure: ModelFailure) -> ModelAttemptFailure {
         ModelAttemptFailure {
             failure,
-            partial: self.snapshot(),
+            partial: Box::new(self.snapshot()),
         }
     }
 
@@ -935,7 +937,7 @@ impl AttemptAccumulator {
         if !snapshot.pending_tools.is_empty() {
             return Err(ModelAttemptFailure {
                 failure: runtime_invalid("terminal contains incomplete tools"),
-                partial: snapshot,
+                partial: Box::new(snapshot),
             });
         }
         let terminal = match terminal {
@@ -945,7 +947,7 @@ impl AttemptAccumulator {
             TerminalStatus::ToolUse if snapshot.completed_tools.is_empty() => {
                 return Err(ModelAttemptFailure {
                     failure: runtime_invalid("tool terminal contains no tools"),
-                    partial: snapshot,
+                    partial: Box::new(snapshot),
                 });
             }
             TerminalStatus::Length
@@ -957,7 +959,7 @@ impl AttemptAccumulator {
                     failure: ModelFailure::new(FailurePhase::Finish, FailureKind::InvalidRequest)
                         .with_code("non_success_terminal")
                         .with_detail(format!("terminal status: {terminal:?}")),
-                    partial: snapshot,
+                    partial: Box::new(snapshot),
                 });
             }
             TerminalStatus::Completed | TerminalStatus::ToolUse => terminal,
@@ -1249,7 +1251,7 @@ impl TurnOrchestrator {
             if let Err(failure) = driver.attempt_started(iteration, attempt).await {
                 return Err(ModelAttemptFailure {
                     failure,
-                    partial: ModelAttemptSnapshot::default(),
+                    partial: Box::new(ModelAttemptSnapshot::default()),
                 });
             }
             if attempt == 1
@@ -1257,7 +1259,7 @@ impl TurnOrchestrator {
             {
                 return Err(ModelAttemptFailure {
                     failure,
-                    partial: ModelAttemptSnapshot::default(),
+                    partial: Box::new(ModelAttemptSnapshot::default()),
                 });
             }
             let mut observer = DriverObserver { driver };
@@ -1278,10 +1280,12 @@ impl TurnOrchestrator {
             if let Err(failure) = driver.attempt_finished(iteration, attempt, &outcome).await {
                 return Err(ModelAttemptFailure {
                     failure,
-                    partial: result
-                        .as_ref()
-                        .map(|result| result.snapshot.clone())
-                        .unwrap_or_else(|error| error.partial.clone()),
+                    partial: Box::new(
+                        result
+                            .as_ref()
+                            .map(|result| result.snapshot.clone())
+                            .unwrap_or_else(|error| error.partial.as_ref().clone()),
+                    ),
                 });
             }
             match result {
