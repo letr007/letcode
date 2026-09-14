@@ -2357,25 +2357,49 @@ async fn run_engine_loop(
                     }
                     SessionEngineCommand::NewSession => {
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                        let prepared_route = match agent
-                            .prepare_primary_route(new_session_default_route.clone())
-                        {
-                            Ok(route) => route,
+                        let prepared_new_route = if let Some(current_route) = agent.primary_route().cloned() {
+                            match agent.prepare_primary_route(current_route.clone()) {
+                                Ok(route) => Ok((current_route, route)),
+                                Err(current_error) => match agent
+                                    .prepare_primary_route(new_session_default_route.clone())
+                                {
+                                    Ok(route) => Ok((new_session_default_route.clone(), route)),
+                                    Err(default_error) => Err(anyhow!(
+                                        "failed to prepare the current model ({current_error}); fallback default model also failed ({default_error})"
+                                    )),
+                                },
+                            }
+                        } else {
+                            agent
+                                .prepare_primary_route(new_session_default_route.clone())
+                                .map(|route| (new_session_default_route.clone(), route))
+                        };
+                        let (new_session_route, prepared_route) = match prepared_new_route {
+                            Ok(prepared) => prepared,
                             Err(error) => {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     ErrorEvent::new(format!(
-                                        "failed to prepare the default model for a new session: {error}"
+                                        "failed to prepare a model for a new session: {error}"
                                     )),
                                 ));
                                 continue;
                             }
                         };
-                        let new_session_expert_model_routes =
+                        let mut new_session_expert_model_routes =
                             config_default_expert_routes_for_primary(
                                 &new_session_default_expert_routes,
                                 &legacy_expert_models,
-                                &new_session_default_route,
+                                &new_session_route,
                             );
+                        for (agent_name, route) in &expert_model_routes {
+                            if providers
+                                .get(&route.provider)
+                                .is_some_and(|provider| provider.has_model(&route.model))
+                            {
+                                new_session_expert_model_routes
+                                    .insert(agent_name.clone(), route.clone());
+                            }
+                        }
                         let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
                             crate::delegation::supported_agent_names().map(|name| {
                                 (
@@ -2402,7 +2426,7 @@ async fn run_engine_loop(
                         };
                         let prepared = match crate::session::prepare_new_session_package(
                             &sessions_dir,
-                            new_session_default_route.display_name(),
+                            new_session_route.display_name(),
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -2464,12 +2488,38 @@ async fn run_engine_loop(
                             let _ = remove_empty_session_file(prepared_install.new_path());
                             continue;
                         }
+                        let inherited_fake_client = agent.fake_client();
                         prepared_install.commit(&mut agent, &transcript);
+                        let new_session_fake_client = inherited_fake_client
+                            .filter(|client| client.supports_protocol(agent.active_protocol()));
                         agent
-                            .set_fake_client(None)
-                            .expect("disabling fake mode is always supported");
+                            .set_fake_client(new_session_fake_client)
+                            .expect("inheriting fake mode must validate against the new model protocol");
+                        let inherited_reasoning_effort = agent.reasoning_effort();
+                        if let Err(error) = transcript
+                            .lock()
+                            .map_err(|_| anyhow!("transcript recorder poisoned"))
+                            .and_then(|mut recorder| {
+                                recorder.record_fake_client_changed(None, new_session_fake_client)?;
+                                if let Some(effort) = inherited_reasoning_effort.clone() {
+                                    recorder.record_reasoning_effort_changed(
+                                        agent.route_display_name(),
+                                        effort,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!(
+                                    "failed to record inherited session settings: {error}"
+                                )),
+                            ));
+                        }
                         let _ = session_transport_tx.send(
-                            SessionTransportEvent::FakeClientChanged { client: None },
+                            SessionTransportEvent::FakeClientChanged {
+                                client: new_session_fake_client,
+                            },
                         );
                         let new_session_model_id = agent.route_display_name();
                         expert_model_routes = new_session_expert_model_routes;
@@ -2488,6 +2538,10 @@ async fn run_engine_loop(
                         let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                             model_id: new_session_model_id,
                         });
+                        if let Some(effort) = inherited_reasoning_effort {
+                            let _ = session_transport_tx
+                                .send(SessionTransportEvent::ReasoningEffortChanged { effort });
+                        }
                         continue;
                     }
                 };
@@ -2995,6 +3049,7 @@ pub(crate) fn format_background_subagent_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PrimaryRouteFactory;
     use crate::request_builder::ModelReasoningEffort;
     use std::fs;
     use std::sync::Arc;
@@ -3014,6 +3069,145 @@ mod tests {
         Arc::new(StdMutex::new(
             TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
         ))
+    }
+
+    #[tokio::test]
+    async fn new_session_inherits_current_model_expert_fake_and_reasoning_settings() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            fs::write(
+                &config_path,
+                r#"
+active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "default"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.test.models.current]
+[providers.test.models.current.capabilities]
+reasoning = true
+generation = { reasoning = true }
+[providers.test.models.current.generation]
+reasoning_efforts = ["high"]
+[providers.test.models.default]
+[providers.test.models.expert]
+"#,
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).unwrap();
+            let current_route = ModelRoute::new("test", "current");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("current", 1, 1);
+            agent.apply_prepared_route(
+                primary_factory
+                    .prepare_route(current_route.clone())
+                    .unwrap(),
+            );
+            agent.set_primary_route_factory(primary_factory);
+            agent
+                .set_fake_client(Some(crate::fake::FakeClient::Codex))
+                .unwrap();
+            agent
+                .set_reasoning_effort(ModelReasoningEffort::High)
+                .unwrap();
+            let transcript = parent_transcript(&config.global.sessions_dir);
+            transcript
+                .lock()
+                .unwrap()
+                .record_session_started(current_route.display_name())
+                .unwrap();
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let (mut engine, _) = SessionEngine::start(
+                agent,
+                transcript.clone(),
+                "Current".into(),
+                SessionEngineConfig {
+                    sessions_dir: config.global.sessions_dir.clone(),
+                    model_routes: indexmap::IndexMap::from([
+                        ("test/current".into(), current_route.clone()),
+                        ("test/default".into(), ModelRoute::new("test", "default")),
+                    ]),
+                    route_api_key_configured: indexmap::IndexMap::from([
+                        ("test/current".into(), true),
+                        ("test/default".into(), true),
+                        ("test/expert".into(), true),
+                    ]),
+                    new_session_default_route: ModelRoute::new("test", "default"),
+                    new_session_default_expert_routes: indexmap::IndexMap::from([
+                        ("explorer".into(), ModelRoute::new("test", "default")),
+                        ("reviewer".into(), ModelRoute::new("test", "default")),
+                    ]),
+                    expert_model_routes: indexmap::IndexMap::from([
+                        ("explorer".into(), ModelRoute::new("test", "expert")),
+                        ("reviewer".into(), ModelRoute::new("test", "missing")),
+                    ]),
+                    expert_allowed_models: indexmap::IndexMap::new(),
+                    legacy_expert_models: indexmap::IndexMap::new(),
+                    providers: config.providers.clone(),
+                    global_retry: config.global.retry.clone(),
+                    provider_api_key_hints: indexmap::IndexMap::new(),
+                    api_key_hint: String::new(),
+                    mcp_config_path: config.config_path.clone(),
+                    mcp_config: config.mcp.clone(),
+                    runtime_catalog: config.runtime_catalog.clone(),
+                },
+            )
+            .unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+            ingress.submit(SessionCommand::NewSession).unwrap();
+
+            let mut started = None;
+            let mut fake = None;
+            let mut effort = None;
+            while started.is_none() || fake.is_none() || effort.is_none() {
+                match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    SessionTransportEvent::SessionStarted { expert_models, .. } => {
+                        started = Some(expert_models)
+                    }
+                    SessionTransportEvent::FakeClientChanged { client } => fake = Some(client),
+                    SessionTransportEvent::ReasoningEffortChanged { effort: value } => {
+                        effort = Some(value)
+                    }
+                    _ => {}
+                }
+            }
+            let started = started.unwrap();
+            assert_eq!(started.get("explorer").unwrap(), "test/expert");
+            assert_eq!(started.get("reviewer").unwrap(), "test/default");
+            assert_eq!(fake, Some(Some(crate::fake::FakeClient::Codex)));
+            assert_eq!(effort, Some(ModelReasoningEffort::High));
+
+            let records =
+                crate::transcript::read_records(transcript.lock().unwrap().path()).unwrap();
+            assert_eq!(
+                crate::transcript::restore_latest_fake_client(&records),
+                Some(crate::fake::FakeClient::Codex)
+            );
+            assert_eq!(
+                crate::transcript::restore_latest_reasoning_effort(&records, "test/current",),
+                Some(ModelReasoningEffort::High)
+            );
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+        })
+        .await
+        .expect("new-session inheritance timed out");
     }
 
     #[tokio::test]

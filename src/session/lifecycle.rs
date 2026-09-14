@@ -184,7 +184,6 @@ impl PreparedNewSessionInstall {
         let old_path_at_commit = replace_live_transcript(live, prepared.recorder)
             .expect("live transcript lock must remain healthy after preparation");
         debug_assert_eq!(old_path_at_commit, old_path);
-        agent.clear_session_reasoning_efforts();
         agent.install_new_session_runtime_snapshot(runtime_snapshot, prepared.snapshot.max_turn_id);
         apply_prepared_context_scope(agent, prepared_scope);
         if let Some(prepared_route) = prepared_route {

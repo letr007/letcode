@@ -1634,7 +1634,6 @@ impl TuiRuntime {
                 self.state.clear_child_timeline_cache();
                 self.state.clear_pending_composer_settings();
                 self.state.session_id = Some(session_id.clone());
-                self.state.set_fake_client(None);
                 self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear();
                 self.queued_prompts.clear();

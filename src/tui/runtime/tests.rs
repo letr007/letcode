@@ -3695,6 +3695,30 @@ fn session_started_event_uses_complete_expert_snapshot() {
 }
 
 #[test]
+fn session_started_event_preserves_fake_state_until_fake_event_arrives() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_fake_client(Some(crate::fake::FakeClient::Codex));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::SessionStarted {
+        session_id: "new-session".into(),
+        records: Vec::new(),
+        runtime_context: event_context("new-session", 1),
+        expert_models: indexmap::IndexMap::new(),
+    });
+
+    assert_eq!(
+        runtime.state().fake_client,
+        Some(crate::fake::FakeClient::Codex)
+    );
+
+    runtime
+        .apply_session_transport_event(SessionTransportEvent::FakeClientChanged { client: None });
+    assert_eq!(runtime.state().fake_client, None);
+}
+
+#[test]
 fn session_started_event_clears_timeline_for_new_session() {
     let mut runtime = runtime();
     runtime
