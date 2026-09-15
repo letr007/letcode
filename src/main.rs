@@ -10,6 +10,7 @@
     clippy::type_complexity
 )]
 
+mod acp;
 mod agent;
 mod agent_event_journal;
 mod cli;
@@ -245,6 +246,31 @@ async fn main() -> Result<()> {
                 .await?;
             }
         },
+        EntryMode::Acp => {
+            let settings = acp::SessionSettings::new(
+                available_models
+                    .iter()
+                    .map(|model| {
+                        acp::ModelSummary::new(
+                            model.id.clone(),
+                            model.label.clone(),
+                            model.reasoning_efforts.clone(),
+                        )
+                    })
+                    .collect(),
+                initial_reasoning,
+            );
+            acp::run(
+                engine,
+                projection,
+                settings,
+                acp::SessionLocations {
+                    sessions_dir: config.global.sessions_dir.clone(),
+                    workspace_dir: workspace_dir.clone(),
+                },
+            )
+            .await?
+        }
         mode @ (EntryMode::Tui | EntryMode::Resume { .. }) => {
             let resume_session_id = match mode {
                 EntryMode::Resume { session_id } => Some(session_id),
@@ -364,6 +390,7 @@ fn session_engine_config(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntryMode {
+    Acp,
     Cli { prompt: Option<String>, json: bool },
     Tui,
     Resume { session_id: String },
@@ -433,6 +460,14 @@ impl CliOptions {
                         }
                         other => bail!("unknown config subcommand: {other}"),
                     }
+                }
+                "acp" => {
+                    if args.next().is_some() {
+                        bail!("acp accepts no arguments");
+                    }
+                    return Ok(Self {
+                        entry_mode: EntryMode::Acp,
+                    });
                 }
                 "--version" | "-V" | "version" => {
                     if args.next().is_some() {
