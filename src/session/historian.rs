@@ -2,6 +2,7 @@
 //! execution boundary as reviewer; only the host publishes validated artifacts.
 use crate::agent::{Agent, SubagentInvocation};
 use crate::context_history::HistoryPublication;
+use crate::historian::FailureClass;
 use crate::model_runtime::ModelFailure;
 use crate::session::runner::{
     SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
@@ -13,6 +14,7 @@ use crate::transcript::{HistorianExchangeEvent, TranscriptEvent, TranscriptRecor
 use anyhow::{Result, anyhow, ensure};
 use futures_util::FutureExt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 #[derive(Clone)]
@@ -28,7 +30,7 @@ pub(crate) struct HistoryWork {
 }
 struct Pending {
     run_id: String,
-    work_id: String,
+    first_source_id: Option<String>,
     source_len: usize,
     session_id: String,
     branch_id: String,
@@ -39,14 +41,32 @@ struct Pending {
 
 /// Terminal outcome of the most recent Historian attempt. The host keeps this so
 /// an identical source prefix is not re-dispatched at every later request
-/// boundary, and so an oversized prefix can shrink instead of failing forever.
+/// boundary, and so a prefix the provider refused can shrink instead of failing
+/// forever.
 #[derive(Clone)]
 pub(crate) struct HistorianFailure {
-    pub work_id: String,
+    /// Source identity the failing attempt started at. New messages move the end
+    /// of the uncovered region but not its start, so attempts are counted per
+    /// start: a region that keeps failing stops being re-issued, while a
+    /// publication that retires part of it reopens the count.
+    pub first_source_id: Option<String>,
     pub source_len: usize,
+    pub class: FailureClass,
+    /// Attempts spent on this region since the last publication.
+    pub attempts: u8,
+    /// When this attempt ended. A region that spent its attempts is parked for
+    /// the cooldown instead of for the rest of the session, so a provider that
+    /// recovers does not leave the session unable to compact.
+    pub failed_at: Instant,
     pub message: String,
-    pub oversized: bool,
 }
+
+/// Attempts the host spends on one uncovered region within one cooldown window.
+/// Re-sending the same failing request at every request boundary is what turns
+/// one failure into a storm; parking it for the cooldown bounds the retries
+/// without stranding a session whose provider recovers.
+const MAX_HISTORIAN_ATTEMPTS: u8 = 3;
+const HISTORIAN_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub(crate) struct HistorianRuntime {
     pool: SubagentPool,
@@ -86,16 +106,33 @@ impl HistorianRuntime {
         self.pass_limit.lock().ok().and_then(|limit| *limit)
     }
 
-    pub(crate) fn failed_for(&self, work_id: &str) -> bool {
+    /// Whether the uncovered region starting at `first_source_id` has spent all
+    /// of its attempts inside the current cooldown window.
+    pub(crate) fn exhausted(&self, first_source_id: Option<&str>) -> bool {
         self.failure
             .lock()
             .ok()
-            .and_then(|failure| failure.as_ref().map(|failure| failure.work_id == work_id))
+            .and_then(|failure| {
+                failure.as_ref().map(|failure| {
+                    failure.attempts >= MAX_HISTORIAN_ATTEMPTS
+                        && failure.failed_at.elapsed() < HISTORIAN_RETRY_COOLDOWN
+                        && failure.first_source_id.as_deref() == first_source_id
+                })
+            })
             .unwrap_or(false)
     }
 
-    fn record_failure(&self, failure: HistorianFailure) {
+    fn record_failure(&self, mut failure: HistorianFailure) {
         if let Ok(mut slot) = self.failure.lock() {
+            failure.attempts = match slot.as_ref() {
+                Some(previous)
+                    if previous.first_source_id == failure.first_source_id
+                        && previous.failed_at.elapsed() < HISTORIAN_RETRY_COOLDOWN =>
+                {
+                    previous.attempts.saturating_add(1)
+                }
+                _ => 1,
+            };
             *slot = Some(failure);
         }
     }
@@ -185,7 +222,7 @@ impl HistorianRuntime {
         let cancelled = Arc::new(Mutex::new(false));
         *pending = Some(Pending {
             run_id,
-            work_id: work.id.clone(),
+            first_source_id: work.source_ids.first().cloned(),
             source_len: work.source_ids.len(),
             session_id: work.session_id.clone(),
             branch_id: work.branch_id.clone(),
@@ -217,7 +254,7 @@ impl HistorianRuntime {
                     // child view treats it as a separate message.
                     let delta_sender = delta_tx.clone();
                     let delta_child = child_session_id.clone();
-                    let on_delta = move |delta: &str| {
+                    let mut on_delta = move |delta: &str| {
                         let _ = delta_sender.send(SessionTransportEvent::ChildSessionEvent {
                             child_session_id: delta_child.clone(),
                             agent_name: Some("historian".to_string()),
@@ -226,24 +263,33 @@ impl HistorianRuntime {
                         });
                         std::future::ready(Ok::<(), ModelFailure>(()))
                     };
-                    let payload_bytes = serde_json::to_string(&input)
-                        .map(|payload| payload.len() as u64)
-                        .unwrap_or_default();
                     let outcome = async {
-                        let (raw, usage) = match agent.run_historian(&input, on_delta).await {
-                            Ok(exchange) => exchange,
-                            Err(error) => {
-                                record_exchange(&child, &exchange_run_id, source_ids.len(), payload_bytes, &[], Exchange::Failed(error.to_string()));
-                                return Err(error);
-                            }
+                        let on_attempt = |attempt: crate::historian::HistorianAttempt<'_>| {
+                            record_exchange(
+                                &child,
+                                &exchange_run_id,
+                                source_ids.len(),
+                                attempt.payload_bytes,
+                                attempt.usage,
+                                match attempt.response {
+                                    Some(response) => Exchange::Rejected { error: attempt.error, response },
+                                    None => Exchange::Failed(attempt.error),
+                                },
+                            );
                         };
-                        let mut publication = match crate::historian::parse_publication(&publication_id, &source_ids, &raw) {
-                            Ok(publication) => publication,
-                            Err(error) => {
-                                record_exchange(&child, &exchange_run_id, source_ids.len(), payload_bytes, &usage, Exchange::Rejected { error: error.to_string(), response: &raw });
-                                return Err(error);
-                            }
-                        };
+                        let crate::historian::HistorianRun {
+                            mut publication,
+                            usage,
+                            payload_bytes,
+                        } = crate::historian::run_historian_with_repair(
+                            &agent,
+                            &publication_id,
+                            &source_ids,
+                            &input,
+                            &mut on_delta,
+                            on_attempt,
+                        )
+                        .await?;
                         record_exchange(&child, &exchange_run_id, source_ids.len(), payload_bytes, &usage, Exchange::Prepared);
                         publication.project_path = Some(project_path);
                         publication.external_fact_ids = external_fact_ids;
@@ -369,7 +415,7 @@ impl HistorianRuntime {
         }
         match job.receiver.try_recv() {
             Ok(result) => {
-                let work_id = job.work_id.clone();
+                let first_source_id = job.first_source_id.clone();
                 let source_len = job.source_len;
                 *guard = None;
                 match result {
@@ -380,9 +426,11 @@ impl HistorianRuntime {
                     Err(error) => {
                         let message = format!("{error:#}");
                         self.record_failure(HistorianFailure {
-                            work_id,
+                            first_source_id,
                             source_len,
-                            oversized: crate::historian::is_context_overflow(&message),
+                            class: crate::historian::classify_failure(&message),
+                            attempts: 0,
+                            failed_at: Instant::now(),
                             message,
                         });
                         Err(error)
@@ -503,23 +551,66 @@ mod tests {
     }
 
     #[test]
-    fn failure_tracking_is_scoped_to_the_failed_work_identity() {
+    fn failure_tracking_is_scoped_to_the_failing_region() {
         let dir = tempfile::tempdir().expect("temp dir");
         let runtime = runtime(dir.path());
-        assert!(!runtime.failed_for("work-1"));
-        runtime.record_failure(HistorianFailure {
-            work_id: "work-1".into(),
-            source_len: 600,
-            message: "cancelled".into(),
-            oversized: false,
-        });
-        assert!(runtime.failed_for("work-1"));
-        assert!(!runtime.failed_for("work-2"));
+        assert!(!runtime.exhausted(Some("raw:1")));
+        for _ in 0..MAX_HISTORIAN_ATTEMPTS {
+            runtime.record_failure(HistorianFailure {
+                first_source_id: Some("raw:1".into()),
+                source_len: 600,
+                class: FailureClass::Contract,
+                attempts: 0,
+                failed_at: Instant::now(),
+                message: "cancelled".into(),
+            });
+        }
+        assert_eq!(
+            runtime.failure().map(|failure| failure.attempts),
+            Some(MAX_HISTORIAN_ATTEMPTS)
+        );
         assert_eq!(
             runtime.failure().map(|failure| failure.source_len),
             Some(600)
         );
+        // The region that keeps failing stops being re-issued; a later region is
+        // still worth an attempt.
+        assert!(runtime.exhausted(Some("raw:1")));
+        assert!(!runtime.exhausted(Some("raw:9")));
+        assert!(!runtime.exhausted(None));
         runtime.clear_failure();
         assert!(runtime.failure().is_none());
+        assert!(!runtime.exhausted(Some("raw:1")));
+    }
+
+    #[test]
+    fn a_parked_region_is_offered_again_after_the_cooldown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime = runtime(dir.path());
+        let failure = |at: Instant| HistorianFailure {
+            first_source_id: Some("raw:1".into()),
+            source_len: 600,
+            class: FailureClass::Transport,
+            attempts: 0,
+            failed_at: at,
+            message: "cancelled".into(),
+        };
+        // A stale series does not carry over: this attempt starts a new one.
+        runtime.record_failure(failure(Instant::now() - HISTORIAN_RETRY_COOLDOWN));
+        assert_eq!(runtime.failure().map(|failure| failure.attempts), Some(1));
+        assert!(!runtime.exhausted(Some("raw:1")));
+        runtime.record_failure(failure(Instant::now()));
+        runtime.record_failure(failure(Instant::now()));
+        assert_eq!(
+            runtime.failure().map(|failure| failure.attempts),
+            Some(2),
+            "the region is offered again instead of staying parked for the session"
+        );
+        runtime.record_failure(failure(Instant::now()));
+        assert_eq!(
+            runtime.failure().map(|failure| failure.attempts),
+            Some(MAX_HISTORIAN_ATTEMPTS)
+        );
+        assert!(runtime.exhausted(Some("raw:1")));
     }
 }

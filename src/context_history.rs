@@ -32,7 +32,7 @@ impl HistoryCompartment {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             !self.id.trim().is_empty(),
             "history compartment id is empty"

@@ -5,6 +5,25 @@ use crate::context_history::{
 };
 use crate::session::historian::HistoryWork;
 
+const HISTORIAN_CHUNK_MIN_TOKENS: u64 = 20_000;
+const HISTORIAN_CHUNK_MAX_TOKENS: u64 = 50_000;
+
+/// Tokens one historian call may read. A summarizer call has to stay small
+/// enough that one response covers the whole chunk, so the budget comes from the
+/// historian route's own window: the producer's window says what the route
+/// accepts, not what the model can answer in one pass.
+///
+/// The floor keeps a region that one response can already cover from being split
+/// into several calls: a source image alone is charged several thousand tokens,
+/// so a small chunk is a handful of messages and pays a model round trip each.
+/// The ceiling keeps the derived share from growing without bound on a route
+/// whose window is far larger than any single response needs to be.
+fn historian_chunk_tokens(helper: &Agent) -> u64 {
+    let budget =
+        effective_input_budget_tokens(helper.active_model_metadata(), &helper.tool_definitions());
+    (budget / 4).clamp(HISTORIAN_CHUNK_MIN_TOKENS, HISTORIAN_CHUNK_MAX_TOKENS)
+}
+
 // Live appends retain process-local frame identities for request replay, but
 // their provisional spans are not journal coordinates. History work and retained
 // boundaries must come from the recorder's selected projection, without replacing
@@ -101,12 +120,32 @@ pub(super) fn work(
             fact_tokens += cost;
         }
     }
+    let mut end = cut.cut_end;
+    let chunk_tokens = historian_chunk_tokens(&helper);
+    let mut tokens = 0u64;
+    let mut requested = start;
+    for (offset, item) in history[start..cut.cut_end].iter().enumerate() {
+        tokens = tokens.saturating_add(crate::request_builder::estimate_history_item_tokens(item));
+        // A single message that exceeds the budget is still sent whole: the host
+        // cannot cut inside a message.
+        if tokens > chunk_tokens && offset > 0 {
+            break;
+        }
+        requested = start + offset + 1;
+    }
+    if requested > start {
+        let capped = crate::protocol_frames::canonical_compaction_boundary_with_transcript(
+            &analysis, requested,
+        )?;
+        if capped > start && capped < end {
+            end = capped;
+        }
+    }
     // A provider rejection for an oversized request is authoritative: no later
     // local preflight can prove the window is large enough, so bound the prefix
     // by the last length this session has not yet seen rejected.
-    let mut end = cut.cut_end;
     if let Some(limit) = pass_limit {
-        let requested = start.saturating_add(limit).min(cut.cut_end);
+        let requested = start.saturating_add(limit).min(end);
         let capped = crate::protocol_frames::canonical_compaction_boundary_with_transcript(
             &analysis, requested,
         )?;
@@ -132,7 +171,7 @@ pub(super) fn work(
             helper.active_model_metadata(),
             &helper.prelude,
             &input,
-            crate::historian::structured_output(route.generation.structured_output).as_ref(),
+            None,
         ) {
             Ok(_) => {
                 let identity = format!(
@@ -405,7 +444,7 @@ where
     if let Some(runtime) = &runtime {
         if !blocking {
             if let Some(failure) = runtime.failure()
-                && failure.oversized
+                && failure.class.shrinks()
             {
                 runtime.reduce_pass_limit(failure.source_len);
             }
@@ -413,8 +452,9 @@ where
                 let Some(work) = work(agent, manual, runtime.pass_limit())? else {
                     return Ok(false);
                 };
+                let first_source_id = work.source_ids.first().map(String::as_str);
                 if agent.last_historian_work.as_ref() == Some(&work.id)
-                    || runtime.failed_for(&work.id)
+                    || runtime.exhausted(first_source_id)
                 {
                     return Ok(false);
                 }
@@ -436,14 +476,14 @@ where
         loop {
             if !runtime.is_running() {
                 if let Some(failure) = runtime.failure()
-                    && failure.oversized
+                    && failure.class.shrinks()
                 {
                     runtime.reduce_pass_limit(failure.source_len);
                 }
                 let Some(work) = work(agent, manual, runtime.pass_limit())? else {
                     return Ok(false);
                 };
-                if runtime.failed_for(&work.id) {
+                if runtime.exhausted(work.source_ids.first().map(String::as_str)) {
                     let detail = runtime
                         .failure()
                         .map(|failure| failure.message)
@@ -471,8 +511,10 @@ where
                     break;
                 }
                 Err(error) => {
-                    let oversized = runtime.failure().is_some_and(|failure| failure.oversized);
-                    if oversized && shrink_rounds < 6 {
+                    let shrinkable = runtime
+                        .failure()
+                        .is_some_and(|failure| failure.class.shrinks());
+                    if shrinkable && shrink_rounds < 6 {
                         if let Some(failure) = runtime.failure() {
                             runtime.reduce_pass_limit(failure.source_len);
                         }
@@ -497,13 +539,17 @@ where
             false,
             Some(0),
         )?;
-        let (raw, _) = helper
-            .run_historian(&work.input, |_: &str| {
-                std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(()))
-            })
-            .await?;
-        let mut publication =
-            crate::historian::parse_publication(&work.id, &work.source_ids, &raw)?;
+        let crate::historian::HistorianRun {
+            mut publication, ..
+        } = crate::historian::run_historian_with_repair(
+            &helper,
+            &work.id,
+            &work.source_ids,
+            &work.input,
+            |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
+            |_| {},
+        )
+        .await?;
         publication.project_path = Some(work.project_path.clone());
         publication.external_fact_ids = work.external_fact_ids.clone();
         let publication_id = publication.id.clone();
@@ -583,7 +629,7 @@ mod tests {
                 }
                 if attempt==1 { accepted.notify_one(); release.notified().await; }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let output=serde_json::json!({"compartments":[{"end":if attempt==0 {4} else {1},"title":"Parser fix","importance":70,"detailed":"Fixed UTF-8 parser offsets","compact":"Parser offset fix","anchor":"UTF-8 parser"}],"facts":[]}).to_string();
+                let output=serde_json::json!({"end":if attempt==0 {4} else {1},"title":"Parser fix","importance":70,"detailed":"Fixed UTF-8 parser offsets","compact":"Parser offset fix","anchor":"UTF-8 parser"}).to_string();
                 let delta=serde_json::json!({"type":"response.output_text.delta","delta":output});
                 let terminal=serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":200,"output_tokens":60,"total_tokens":260}}});
                 let body=format!("data: {delta}\n\ndata: {terminal}\n\n");
@@ -1205,13 +1251,16 @@ max_output_tokens=128
     }
 
     #[tokio::test]
-    async fn rejected_publication_records_the_historian_exchange() {
+    async fn a_rejected_publication_is_repaired_and_both_attempts_are_recorded() {
         // Driven to its terminal state by polling, so the test never waits on
         // wall-clock time.
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
+                // The first response is rejected and the repair is accepted, so
+                // the exchange log carries both outcomes.
+                for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -1236,18 +1285,29 @@ max_output_tokens=128
                     let n = stream.read(&mut buffer).await.unwrap();
                     bytes.extend_from_slice(&buffer[..n]);
                 }
-                let publication = serde_json::json!({
-                    "compartments": [{
+                let publication = if attempt == 0 {
+                    serde_json::json!({
                         "end": 0,
                         "title": "Rejected",
                         "importance": 95,
                         "detailed": "not covered",
                         "compact": "not covered",
                         "anchor": "rejected"
-                    }],
-                    "facts": []
-                })
-                .to_string();
+                    })
+                    .to_string()
+                } else {
+                    // Any chunk has at least one source, so a one-episode repair
+                    // is accepted whatever this session holds.
+                    serde_json::json!({
+                        "end": 1,
+                        "title": "Repaired",
+                        "importance": 95,
+                        "detailed": "covered",
+                        "compact": "covered",
+                        "anchor": "repaired"
+                    })
+                    .to_string()
+                };
                 let delta = serde_json::json!({
                     "type": "response.output_text.delta",
                     "delta": publication
@@ -1270,6 +1330,7 @@ max_output_tokens=128
                     )
                     .await
                     .unwrap();
+                }
             });
             let config = crate::model_runtime::RuntimeConfig::from_toml(&format!(
                 r#"active_provider="test"
@@ -1375,16 +1436,21 @@ max_output_tokens=4096
             let branch = agent.runtime_snapshot.active_context.branch_id.clone();
             let revision = agent.runtime_snapshot.context_scope_revision;
             let mut rounds = 0;
-            loop {
+            let published = loop {
                 match runtime.poll(&session, &branch, revision) {
                     Ok(None) => {}
-                    Ok(Some(_)) => panic!("a rejected publication must not reach the host"),
-                    Err(_) => break,
+                    Ok(Some(publication)) => break publication,
+                    Err(error) => panic!("the repaired attempt must publish: {error:#}"),
                 }
                 rounds += 1;
                 assert!(rounds < 100_000, "historian run did not finish");
                 tokio::task::yield_now().await;
-            }
+            };
+            assert_eq!(
+                published.source_ids.len(),
+                1,
+                "the repaired response publishes the prefix it covers"
+            );
             let records = crate::transcript::read_records(recorder.lock().unwrap().path()).unwrap();
             let child_id = records
                 .iter()
@@ -1399,14 +1465,22 @@ max_output_tokens=4096
                 .unwrap();
             let child_records =
                 crate::transcript::read_child_session_records(directory.path(), &child_id).unwrap();
-            let exchange = child_records
+            let exchanges: Vec<_> = child_records
                 .iter()
-                .find_map(|record| match &record.event {
+                .filter_map(|record| match &record.event {
                     TranscriptEvent::HistorianExchange(exchange) => Some(exchange.clone()),
                     _ => None,
                 })
-                .expect("a rejected publication records the exchange");
-            assert_eq!(exchange.outcome, "rejected");
+                .collect();
+            assert_eq!(
+                exchanges
+                    .iter()
+                    .map(|exchange| exchange.outcome.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rejected", "prepared"],
+                "the rejected attempt and the accepted repair are both recorded"
+            );
+            let exchange = exchanges.first().expect("the rejection is recorded").clone();
             assert_eq!(exchange.source_count, source_count);
             assert!(exchange.payload_bytes > 0);
             assert_eq!(exchange.input_tokens, Some(321));
@@ -1416,7 +1490,7 @@ max_output_tokens=4096
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("episode cut is invalid"),
+                    .contains("expected a cut after"),
                 "unexpected rejection reason: {:?}",
                 exchange.error
             );
@@ -1430,6 +1504,69 @@ max_output_tokens=4096
         })
         .await
         .unwrap();
+    }
+
+    /// One historian call reads one chunk of the uncovered region. The region
+    /// here is far larger than any single call may read, so the prepared work
+    /// must cover a prefix of it rather than all of it.
+    #[tokio::test]
+    async fn one_historian_work_covers_a_bounded_chunk_of_the_uncovered_region() {
+        use crate::request_builder::HistoryToolCall;
+        let root = tempfile::tempdir().unwrap();
+        let (mut agent, recorder) = agent_with_recorder(root.path());
+        {
+            let mut recorder = recorder.lock().unwrap();
+            recorder
+                .record_turn_started(crate::agent::TurnStartedEvent { turn_id: 1 })
+                .unwrap();
+            recorder.record_user_message("Read every source").unwrap();
+            for index in 0..40 {
+                let call_id = format!("read-{index}");
+                recorder
+                    .record_assistant_tool_call_batch(
+                        None,
+                        None,
+                        None,
+                        vec![HistoryToolCall {
+                            call_id: call_id.clone(),
+                            name: "fs__read".into(),
+                            arguments_json: r#"{"path":"source.rs"}"#.into(),
+                        }],
+                    )
+                    .unwrap();
+                recorder
+                    .record_tool_call_finished(
+                        &call_id,
+                        "fs__read",
+                        true,
+                        crate::tool::ToolResult::ok(
+                            "fs__read",
+                            serde_json::json!({"content": "source detail ".repeat(3_000)}),
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        agent.turn.current_turn_start_index = Some(0);
+        agent.reload_runtime_snapshot_from_provider().unwrap();
+        let region = persisted_history_snapshot(&agent)
+            .unwrap()
+            .active_protocol_frames()
+            .len();
+        let prepared = work(&agent, true, None).unwrap().unwrap();
+        assert!(!prepared.source_ids.is_empty());
+        assert!(
+            prepared.source_ids.len() < region,
+            "one call must not read the whole region: {} of {region}",
+            prepared.source_ids.len()
+        );
+        let oldest = persisted_history_snapshot(&agent)
+            .unwrap()
+            .active_protocol_frames()[0]
+            .source_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.source_id.clone());
+        assert_eq!(Some(prepared.source_ids[0].clone()), oldest);
     }
 
     #[tokio::test]
@@ -1486,8 +1623,7 @@ max_output_tokens=4096
         assert_eq!(prepared.source_ids.len(), 10);
         assert!(prepared.input.text.contains("unique body first-7"));
         let mut publication = crate::historian::parse_publication(&prepared.id,&prepared.source_ids,&serde_json::json!({
-            "compartments":[{"end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"}],
-            "facts":[],"unprocessed_from":null
+            "end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"
         }).to_string()).unwrap();
         publication.project_path = Some(prepared.project_path);
         recorder
@@ -1521,7 +1657,7 @@ max_output_tokens=4096
         );
         let second = work(&agent, true, None).unwrap().unwrap();
         let publication = crate::historian::parse_publication(&second.id, &second.source_ids,
-            &serde_json::json!({"compartments":[{"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}],"facts":[]}).to_string()).unwrap();
+            &serde_json::json!({"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}).to_string()).unwrap();
         recorder
             .lock()
             .unwrap()

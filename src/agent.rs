@@ -2986,6 +2986,10 @@ impl Agent {
         }
     }
 
+    /// One non-tool model call for the historian. The episode contract lives in
+    /// the prompt and the host parser, so the route is not asked to enforce a
+    /// schema: a route that declares no structured-output support is still able
+    /// to do the work.
     pub(crate) async fn run_historian<F, Fut>(
         &self,
         user_input: &UserMessageContent,
@@ -2995,8 +2999,12 @@ impl Agent {
         F: FnMut(&str) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
     {
-        self.run_structured_oneshot(user_input, crate::historian::structured_output, on_delta)
-            .await
+        self.run_structured_oneshot(
+            user_input,
+            |_: Option<crate::model_runtime::StructuredOutputSupport>| None,
+            on_delta,
+        )
+        .await
     }
 
     /// One non-tool model call whose structured-output contract is chosen by the
