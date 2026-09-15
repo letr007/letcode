@@ -1688,6 +1688,61 @@ base_url = "https://test.example.invalid/v1"
         }
     }
 
+    #[tokio::test]
+    async fn large_structured_result_records_parent_evidence_in_full() {
+        let runtime = SubagentPool::new();
+        let agent = test_agent();
+        let sessions_dir = temp_sessions_dir();
+        let parent_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&parent_dir).expect("create parent recorder"),
+        ));
+        let parent_session_id = parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .session_id()
+            .to_string();
+
+        let long_summary = "s".repeat(9_000);
+        let report = serde_json::json!({
+            "status": "completed",
+            "summary": long_summary,
+            "findings": ["inspection complete"],
+        })
+        .to_string();
+
+        let run_summary = runtime
+            .run_with_executor(
+                &agent,
+                AgentTemplate::explorer(),
+                "inspect src/subagent.rs".into(),
+                test_governance(),
+                sessions_dir,
+                parent_session_id.clone(),
+                "turn-1".into(),
+                Some(Arc::clone(&parent_recorder)),
+                no_event_sender(),
+                None,
+                move |_agent, _task, _transcript, _tx, _child, _name| {
+                    async move { Ok(report) }.boxed()
+                },
+            )
+            .await
+            .expect("run succeeds");
+
+        assert_eq!(run_summary.status, SubagentStatus::Completed);
+        let parent_records = read_records(parent_dir.join(format!("{parent_session_id}.jsonl")))
+            .expect("read parent records");
+        let evidence_detail = parent_records
+            .iter()
+            .find_map(|record| match &record.event {
+                crate::transcript::TranscriptEvent::Evidence { detail, .. } => detail.clone(),
+                _ => None,
+            })
+            .expect("parent evidence carries the structured result");
+        assert!(evidence_detail.contains(&long_summary));
+    }
+
     struct PartialFailParentSink {
         file: std::fs::File,
     }

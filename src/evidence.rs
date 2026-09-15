@@ -7,9 +7,7 @@ use crate::agent::{ToolEffectKind, ToolExecutionRecord, is_subagent_tool_name};
 use crate::tool::ToolResult;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
-const MAX_EVIDENCE_DETAIL_BYTES: usize = 8 * 1024;
 const MAX_EVIDENCE_SUMMARY_CHARS: usize = 500;
-const MAX_EVIDENCE_TAGS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,8 +113,7 @@ impl EvidenceDraft {
             &evidence_summary(&record.tool_name, &record.output, &args),
             MAX_EVIDENCE_SUMMARY_CHARS,
         );
-        let detail = evidence_detail(&record.output)
-            .map(|detail| truncate_bytes(&detail, MAX_EVIDENCE_DETAIL_BYTES));
+        let detail = evidence_detail(&record.output);
         let tags = evidence_tags_for_record(record, &args);
 
         Self {
@@ -136,14 +133,6 @@ impl EvidenceDraft {
         }
         if self.summary.trim().is_empty() {
             bail!("evidence summary cannot be empty");
-        }
-        if let Some(detail) = &self.detail
-            && detail.len() > MAX_EVIDENCE_DETAIL_BYTES
-        {
-            bail!("evidence detail exceeds {MAX_EVIDENCE_DETAIL_BYTES} bytes");
-        }
-        if self.tags.len() > MAX_EVIDENCE_TAGS {
-            bail!("evidence has too many tags");
         }
         validate_source(&self.source)
     }
@@ -614,7 +603,6 @@ fn evidence_tags_for_record(record: &ToolExecutionRecord, args: &Value) -> Vec<S
     tags.extend(record.effects.edited_paths.clone());
     tags.sort();
     tags.dedup();
-    tags.truncate(MAX_EVIDENCE_TAGS);
     tags
 }
 
@@ -786,21 +774,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
-}
-
-fn truncate_bytes(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let ellipsis = "…";
-    let limit = max_bytes.saturating_sub(ellipsis.len());
-    let end = value
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= limit)
-        .last()
-        .unwrap_or(0);
-    format!("{}{}", &value[..end], ellipsis)
 }
 
 pub fn estimate_evidence_tokens(text: &str) -> u64 {
