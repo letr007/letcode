@@ -613,6 +613,7 @@ impl SessionCoordinator {
                         "Fake mode disabled: unsupported by the restored model protocol",
                     )));
                 }
+                let restored_permission_mode = snapshot.latest_permission_mode.is_some();
                 apply_restored_permission_mode(agent, snapshot.latest_permission_mode.as_deref());
                 let reasoning_notice = apply_restored_reasoning_effort(agent, &snapshot.records);
                 agent.install_validated_runtime_snapshot(runtime_snapshot);
@@ -626,6 +627,17 @@ impl SessionCoordinator {
                 }
                 let expert_models =
                     crate::transcript::restore_latest_expert_models(&snapshot.records);
+                // Navigating can install a recorded permission mode, and that mode
+                // may differ from the one this process runs with. Frontends build
+                // their navigation report from `SessionResumed`, so the mode is
+                // announced before it, exactly as resuming a session does —
+                // otherwise a client would show the pre-navigation mode until the
+                // next edit. A session that recorded no mode keeps the live one.
+                if restored_permission_mode {
+                    let _ = event_tx.send(SessionTransportEvent::PermissionModeChanged {
+                        mode: agent.permission_mode().to_string(),
+                    });
+                }
                 let _ = event_tx.send(SessionTransportEvent::SessionResumed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
@@ -1073,6 +1085,65 @@ protocol = "responses"
         assert_eq!(
             agent.runtime_snapshot_for_test().active_context.branch_id,
             "history-2"
+        );
+    }
+
+    #[test]
+    fn history_navigation_announces_the_permission_mode_it_restored() {
+        let transcript = temp_transcript();
+        {
+            let mut recorder = transcript.lock().expect("recorder");
+            recorder
+                .record_session_started("gpt-test")
+                .expect("started");
+            recorder
+                .record_permission_mode_changed("default", "yolo")
+                .expect("mode change");
+            recorder.record_user_message("first").expect("first user");
+            recorder
+                .record_assistant_message("first answer")
+                .expect("first answer");
+            recorder.record_user_message("second").expect("second user");
+            recorder
+                .record_assistant_message("second answer")
+                .expect("second answer");
+        }
+        let mut agent = test_agent();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            SessionCoordinator::dispatch_idle_command(
+                SessionCommand::Undo,
+                &mut agent,
+                &transcript,
+                &tx,
+                None,
+            )
+            .expect("dispatch"),
+            IdleDispatch::HistoryNavigated
+        );
+
+        assert_eq!(agent.permission_mode().to_string(), "yolo");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let mode_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionTransportEvent::PermissionModeChanged { mode } if mode == "yolo"
+                )
+            })
+            .expect("the restored mode is announced");
+        let resumed_index = events
+            .iter()
+            .position(|event| matches!(event, SessionTransportEvent::SessionResumed { .. }))
+            .expect("navigation reports the session it installed");
+        assert!(
+            mode_index < resumed_index,
+            "the restored mode is announced before the session report: mode at {mode_index}, session at {resumed_index}"
         );
     }
 

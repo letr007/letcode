@@ -2296,6 +2296,11 @@ async fn run_engine_loop(
                         let resumed_event_evidence_count =
                             prepared_install.session().snapshot.snapshot.evidence.len();
                         let fast_mode_auto_disabled = prepared_install.fast_mode_auto_disabled();
+                        let resumed_permission_mode = prepared_install
+                            .session()
+                            .snapshot
+                            .latest_permission_mode
+                            .is_some();
                         let token_usage = {
                             subagent_runtime.cancel_active_run_ids();
                             if !subagent_runtime.wait_until_idle().await {
@@ -2335,6 +2340,18 @@ async fn run_engine_loop(
                         agent.set_subagent_child_factory(Arc::new(expert_factory));
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         sticky_auto_reviewer.clear_sticky_session();
+                        // Resuming can install a recorded permission mode, and that mode may
+                        // differ from the one this process runs with. Frontends build their
+                        // resume report from `SessionResumed`, so the mode is announced before
+                        // it — otherwise a client would show the pre-resume mode until the
+                        // next edit. A session that recorded no mode keeps the live one.
+                        if resumed_permission_mode {
+                            let _ = session_transport_tx.send(
+                                SessionTransportEvent::PermissionModeChanged {
+                                    mode: agent.permission_mode().to_string(),
+                                },
+                            );
+                        }
                         let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
                             session_id: resumed_event_session_id,
                             branch_id: resumed_event_branch_id,
@@ -3266,6 +3283,103 @@ base_url = "http://127.0.0.1:1"
         })
         .await
         .expect("new-session history preparation timed out");
+    }
+
+    #[tokio::test]
+    async fn resume_reports_the_recorded_permission_mode_before_session_resumed() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            fs::write(
+                &config_path,
+                r#"
+active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.test.models.model]
+"#,
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).unwrap();
+            let sessions_dir = config.global.sessions_dir.clone();
+
+            let mut resumed = TranscriptRecorder::create(&sessions_dir).unwrap();
+            resumed.record_session_started("test/model").unwrap();
+            resumed
+                .record_permission_mode_changed("default", "yolo")
+                .unwrap();
+            let resumed_session_id = resumed.session_id().to_string();
+            drop(resumed);
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            let transcript = Arc::new(StdMutex::new(recorder));
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", 1, 1);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            // The live process runs in a different mode than the resumed session
+            // recorded, so the announced mode can only come from the transcript.
+            assert_eq!(agent.permission_mode().to_string(), "default");
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript, "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+
+            ingress
+                .submit_transitional(SessionEngineCommand::ResumeSession(
+                    resumed_session_id.clone(),
+                ))
+                .unwrap();
+
+            let mut mode_index = None;
+            let mut resumed_index = None;
+            let mut index = 0;
+            while resumed_index.is_none() {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("resume must report the resumed session")
+                    .expect("engine event stream");
+                match event {
+                    SessionTransportEvent::PermissionModeChanged { mode } => {
+                        assert_eq!(mode, "yolo", "restored mode is announced as-is");
+                        mode_index = Some(index);
+                    }
+                    SessionTransportEvent::SessionResumed { session_id, .. } => {
+                        assert_eq!(session_id, resumed_session_id);
+                        resumed_index = Some(index);
+                    }
+                    SessionTransportEvent::Error(error) => panic!("resume failed: {error:?}"),
+                    _ => {}
+                }
+                index += 1;
+            }
+            let mode_index = mode_index.expect("the recorded permission mode is reported");
+            let resumed_index = resumed_index.expect("SessionResumed was reported");
+            assert!(
+                mode_index < resumed_index,
+                "the restored mode must precede SessionResumed: mode at {mode_index}, resumed at {resumed_index}"
+            );
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+        })
+        .await
+        .expect("resume of a recorded permission mode timed out");
     }
 
     fn add_child(
