@@ -42,7 +42,7 @@ mod config_reload;
 mod control;
 
 use crate::transcript::{
-    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, any_record_where, read_records,
+    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, read_records,
     read_records_allow_partial_tail, remove_empty_session_file, sync_recorder_branch,
     transcript_projection,
 };
@@ -985,9 +985,9 @@ pub(crate) struct VisibleChildViewState {
 /// Size and modification time of a journal file, read without opening it.
 ///
 /// Journals only grow apart from tail repair, which moves either field anyway,
-/// so an unchanged fingerprint means there is nothing new to read. This is the
-/// cheap check; `TranscriptFileFingerprint` is the content digest to pin when
-/// the bytes have to be identified rather than compared.
+/// so an unchanged fingerprint means there is nothing new to read.
+/// `TranscriptFileFingerprint` is the content digest of the same file, computed
+/// from its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JournalFingerprint {
     len: u64,
@@ -1011,15 +1011,15 @@ struct VisibleChildViewResolution {
     child: ChildSessionSummary,
 }
 
-/// What the poll keeps from the last pass that reached a resolution, so it does
-/// not read the parent journal on every 250 ms tick. An unchanged parent journal
-/// lists the same children in the same order: a child's transcript file is
-/// created before its parent records the start, and a live parent holds the
-/// writer lock that archiving a session family needs. A parent journal that did
-/// move is still read in full, so this only removes the repeats.
+/// What the poll keeps from the last pass that reached a resolution. It stays
+/// valid while both journals keep the same size and modification time, because
+/// an unchanged parent journal lists the same children in the same order: a
+/// child's transcript file is created before its parent records the start, and a
+/// live parent holds the writer lock that archiving a session family needs.
 ///
-/// It is written before the runtime context is projected, so a projection that
-/// fails is not retried until one of the two journals moves.
+/// It is written before the runtime context is projected, so once a view has
+/// been sent, a projection that fails is not retried until one of the two
+/// journals moves.
 #[derive(Debug, Clone)]
 struct VisibleChildViewCache {
     child_journal: Option<JournalFingerprint>,
@@ -2851,26 +2851,24 @@ async fn run_engine_loop(
                                     }
                                     let (text, continuation) = match result {
                                         Ok(result) => {
-                                            let already_recorded = transcript
+                                            // Written with the subagent result, inside
+                                            // its transaction.
+                                            let parent_records = transcript
                                                 .lock()
-                                                .ok()
-                                                .map(|recorder| recorder.path().to_path_buf())
-                                                .is_some_and(|path| {
-                                                    any_record_where(&path, |record| {
-                                                        matches!(
-                                                            &record.event,
-                                                            crate::transcript::TranscriptEvent::Evidence {
-                                                                source: crate::evidence::EvidenceSource::Subagent {
-                                                                    run_id,
-                                                                    ..
-                                                                },
-                                                                ..
-                                                            } if run_id == &result.run_id
-                                                        )
-                                                    })
-                                                    .unwrap_or(false)
-                                                });
-                                            if already_recorded {
+                                                .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                                .and_then(|recorder| read_records(recorder.path()));
+                                            if parent_records.is_ok_and(|records| {
+                                                records.iter().any(|record| matches!(
+                                                    &record.event,
+                                                    crate::transcript::TranscriptEvent::Evidence {
+                                                        source: crate::evidence::EvidenceSource::Subagent {
+                                                            run_id,
+                                                            ..
+                                                        },
+                                                        ..
+                                                    } if run_id == &result.run_id
+                                                ))
+                                            }) {
                                                 continue;
                                             }
                                             let _ = session_transport_tx.send(

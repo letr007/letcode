@@ -116,7 +116,6 @@ pub(crate) fn journal_payload_digest(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-#[allow(dead_code)]
 pub fn read_records(path: impl AsRef<Path>) -> Result<Vec<TranscriptRecord>> {
     read_records_inner(path, false)
 }

@@ -143,6 +143,7 @@ pub struct TranscriptAssistantTurn {
 ## 源码索引
 
 - `src/transcript/journal.rs` — envelope、transaction、读取、schema gate 和 fingerprint。
+- `src/transcript/read.rs` — 读取形状：从文件回答窄问题，不缓存已解码记录。
 - `src/transcript/model.rs` — `TranscriptRecord`、`TranscriptAssistantTurn` 和事件 payload。
 - `src/transcript/recorder.rs` — append、transaction、assistant normalization 和 durability。
 - `src/transcript/transcript_projection.rs` — branch-aware runtime/history/session projections。

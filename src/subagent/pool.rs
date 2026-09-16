@@ -778,7 +778,6 @@ impl SubagentPool {
             bail!("model override cannot be used when taking over a child session");
         }
 
-        // The children come from the lifecycle records, so the scan reads only those.
         let existing_children = parent_transcript
             .as_ref()
             .and_then(|recorder| recorder.lock().ok())
