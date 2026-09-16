@@ -85,8 +85,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::transcript::{
-        TranscriptEvent, TranscriptRecorder, record_is_session_content, record_is_session_title,
-        record_is_user_message,
+        TranscriptEvent, TranscriptRecorder, read_records_allow_partial_tail,
+        record_is_session_content, record_is_session_title, record_is_user_message,
     };
 
     fn temp_dir() -> PathBuf {
@@ -264,5 +264,52 @@ mod tests {
                 full / stats.max(f64::MIN_POSITIVE)
             );
         }
+    }
+
+    /// Measurement harness for the project memory pass, which used to read every
+    /// source it tracks on each idle tick. Takes a file listing journal paths, one
+    /// per line, in LETCODE_BENCH_SOURCES.
+    #[test]
+    #[ignore = "measurement harness: set LETCODE_BENCH_SOURCES to a list of journal paths"]
+    fn worker_tick_measure() {
+        use std::time::Instant;
+
+        let list = std::env::var("LETCODE_BENCH_SOURCES").expect("LETCODE_BENCH_SOURCES");
+        let paths: Vec<PathBuf> = fs::read_to_string(&list)
+            .expect("read the source list")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .collect();
+
+        let start = Instant::now();
+        let mut records = 0usize;
+        let mut bytes = 0u64;
+        for path in &paths {
+            bytes += fs::metadata(path).expect("stat the journal").len();
+            records += read_records_allow_partial_tail(path)
+                .expect("read the source")
+                .len();
+        }
+        let full = start.elapsed();
+
+        let start = Instant::now();
+        for path in &paths {
+            let _ = path.is_file();
+        }
+        let gated = start.elapsed();
+
+        println!(
+            "\n### project memory pass — {} sources, {:.1} MB, {records} records",
+            paths.len(),
+            bytes as f64 / 1048576.0
+        );
+        println!("  full read  {full:?}");
+        println!(
+            "  gate only  {gated:?}   {:>8.0}x",
+            full.as_secs_f64() / gated.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
     }
 }

@@ -126,6 +126,14 @@ async fn process_pending(store: MemoryStore, helper: Agent) -> Result<()> {
         if batches >= 8 {
             break;
         }
+        // A batch covers the turns between the cursor and the observed frontier, so
+        // a source that has reached the frontier has nothing to extract and its
+        // records would be filtered away. The file is still checked for existence
+        // first: a source whose transcript is gone is reported like any other
+        // source that cannot be read, and skipping it here must not silence that.
+        if source.cursor >= source.observed_sequence && source.path.is_file() {
+            continue;
+        }
         let input_store = store.clone();
         let input_source = source.clone();
         let prepared = blocking(move || {
