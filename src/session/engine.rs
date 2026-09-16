@@ -42,8 +42,9 @@ mod config_reload;
 mod control;
 
 use crate::transcript::{
-    TranscriptEvent, TranscriptRecorder, read_records, read_records_allow_partial_tail,
-    remove_empty_session_file, sync_recorder_branch, transcript_projection,
+    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, read_records,
+    read_records_allow_partial_tail, remove_empty_session_file, sync_recorder_branch,
+    transcript_projection,
 };
 pub(crate) use config_reload::*;
 pub(crate) use control::*;
@@ -981,16 +982,104 @@ pub(crate) struct VisibleChildViewState {
     total: usize,
 }
 
+/// Size and modification time of a journal file, read without opening it.
+///
+/// Journals only grow, apart from tail repair (`repair_partial_tail`, reached
+/// through `TranscriptRecorder::open_after_partial_tail_repair`), which moves
+/// the length or the modification time either way. A fingerprint that has not
+/// moved therefore means there is nothing new to read. This is the cheap
+/// check; `TranscriptFileFingerprint` is the content digest to pin instead
+/// when the bytes themselves have to be identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JournalFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn journal_fingerprint(path: &std::path::Path) -> Option<JournalFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(JournalFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// Where the visible child sits among its parent's children.
+#[derive(Debug, Clone)]
+struct VisibleChildViewResolution {
+    parent_session_id: String,
+    index: usize,
+    total: usize,
+    child: ChildSessionSummary,
+}
+
+/// What the poll keeps from the last pass that reached a resolution, so it does
+/// not read the parent journal again on every 250 ms tick. A child's transcript
+/// file is created before its parent records the start, and a live parent holds
+/// the writer lock that archiving a session family needs, so an unchanged parent
+/// journal still lists the same children in the same order and no child file has
+/// gone away underneath it. A parent journal that did move is still read in
+/// full, so this only removes the repeats.
+///
+/// This is written as soon as a resolution exists, before the runtime context is
+/// projected from it. A projection that then fails is not retried until one of
+/// the two journals moves: both fingerprints are inputs to that projection, so
+/// an unchanged pair can only reproduce the same failure.
+#[derive(Debug, Clone)]
+struct VisibleChildViewCache {
+    child_journal: Option<JournalFingerprint>,
+    parent_journal: Option<JournalFingerprint>,
+    resolution: VisibleChildViewResolution,
+}
+
+fn resolve_visible_child_view(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    sessions_dir: &std::path::Path,
+    child_session_id: &str,
+) -> Result<Option<VisibleChildViewResolution>> {
+    let (parent_session_id, parent_records) = crate::session::current_session_records(transcript)?;
+    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
+    Ok(children
+        .iter()
+        .enumerate()
+        .find(|(_, child)| child.child_session_id == child_session_id)
+        .map(|(index, child)| VisibleChildViewResolution {
+            parent_session_id,
+            index,
+            total: children.len(),
+            child: child.clone(),
+        }))
+}
+
 async fn refresh_visible_child_session_view(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     sessions_dir: &std::path::Path,
     visible_child_session_id: &mut Option<String>,
     visible_child_view_state: &mut Option<VisibleChildViewState>,
+    visible_child_view_cache: &mut Option<VisibleChildViewCache>,
 ) {
     let Some(child_session_id) = visible_child_session_id.as_deref() else {
         return;
     };
+    let child_journal = journal_fingerprint(&crate::transcript::child_session_path(
+        sessions_dir,
+        child_session_id,
+    ));
+    let parent_journal = transcript
+        .lock()
+        .ok()
+        .and_then(|recorder| journal_fingerprint(recorder.path()));
+    let settled = visible_child_view_cache.as_ref().is_some_and(|cache| {
+        cache.resolution.child.child_session_id == child_session_id
+            && cache.child_journal == child_journal
+            && cache.parent_journal == parent_journal
+    });
+    // A cleared view state means the frontend is still owed a full pass, so
+    // only a completed one is skipped.
+    if settled && visible_child_view_state.is_some() {
+        return;
+    }
     let records = match crate::transcript::read_child_session_records_allow_partial_tail(
         sessions_dir,
         child_session_id,
@@ -1004,29 +1093,34 @@ async fn refresh_visible_child_session_view(
         }
     };
 
-    let (parent_session_id, parent_records) =
-        match crate::session::current_session_records(transcript) {
-            Ok(current) => current,
+    let resolution = match visible_child_view_cache.as_ref().filter(|cache| {
+        cache.resolution.child.child_session_id == child_session_id
+            && cache.parent_journal == parent_journal
+    }) {
+        Some(cache) => Some(cache.resolution.clone()),
+        None => match resolve_visible_child_view(transcript, sessions_dir, child_session_id) {
+            Ok(resolution) => resolution,
             Err(error) => {
                 let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
                     format!("failed to refresh child transcript: {error}"),
                 )));
                 return;
             }
-        };
-    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
-    let Some((index, child)) = children
-        .iter()
-        .enumerate()
-        .find(|(_, child)| child.child_session_id == child_session_id)
-    else {
+        },
+    };
+    let Some(resolution) = resolution else {
         return;
     };
     let view_state = VisibleChildViewState {
         record_count: records.len(),
-        index,
-        total: children.len(),
+        index: resolution.index,
+        total: resolution.total,
     };
+    *visible_child_view_cache = Some(VisibleChildViewCache {
+        child_journal,
+        parent_journal,
+        resolution: resolution.clone(),
+    });
     if visible_child_view_state.is_some_and(|state| state == view_state) {
         return;
     }
@@ -1042,12 +1136,12 @@ async fn refresh_visible_child_session_view(
     };
     *visible_child_view_state = Some(view_state);
     let _ = session_transport_tx.send(SessionTransportEvent::ChildSessionViewed {
-        parent_session_id,
-        child_session_id: child.child_session_id.clone(),
-        agent_name: child.agent_name.clone(),
-        index,
-        total: children.len(),
-        pool_ordinal: child.pool_ordinal,
+        parent_session_id: resolution.parent_session_id,
+        child_session_id: resolution.child.child_session_id,
+        agent_name: resolution.child.agent_name,
+        index: resolution.index,
+        total: resolution.total,
+        pool_ordinal: resolution.child.pool_ordinal,
         records,
         runtime_context,
     });
@@ -1126,6 +1220,7 @@ async fn run_engine_loop(
     let mut parked_commands = VecDeque::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
+    let mut visible_child_view_cache = None;
     let mut child_refresh = tokio::time::interval(std::time::Duration::from_millis(250));
     child_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2973,6 +3068,7 @@ async fn run_engine_loop(
                     &sessions_dir,
                     &mut visible_child_session_id,
                     &mut visible_child_view_state,
+                    &mut visible_child_view_cache,
                 ).await;
             }
             discovery = async {
@@ -3422,6 +3518,112 @@ base_url = "http://127.0.0.1:1"
             } => (child_session_id, index, total),
             other => panic!("expected child session view, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn child_view_refresh_skips_unchanged_journals_and_follows_the_moving_ones() {
+        let sessions_dir = temp_sessions_dir();
+        let parent = parent_transcript(&sessions_dir);
+        add_child(&parent, &sessions_dir, "run-1", 1);
+        let visible_child = add_child(&parent, &sessions_dir, "run-2", 2);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut visible_child_session_id = Some(visible_child.clone());
+        let mut view_state = None;
+        let mut cache = None;
+
+        refresh_visible_child_session_view(
+            &parent,
+            &tx,
+            &sessions_dir,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(
+            child_view_event(rx.try_recv().expect("the first pass reports the view")),
+            (visible_child.clone(), 1, 2)
+        );
+        assert!(
+            cache.is_some(),
+            "a completed pass is kept for the next tick"
+        );
+
+        refresh_visible_child_session_view(
+            &parent,
+            &tx,
+            &sessions_dir,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &mut cache,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "journals that have not moved must not be reported again"
+        );
+
+        let mut child = TranscriptRecorder::open(
+            crate::transcript::child_sessions_dir(&sessions_dir),
+            visible_child.clone(),
+        )
+        .expect("open the visible child transcript");
+        child
+            .record_user_message("more child work")
+            .expect("record the new child message");
+        drop(child);
+
+        refresh_visible_child_session_view(
+            &parent,
+            &tx,
+            &sessions_dir,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &mut cache,
+        )
+        .await;
+        let (_, index, total) =
+            child_view_event(rx.try_recv().expect("a grown child journal is reported"));
+        assert_eq!((index, total), (1, 2), "the sibling count has not changed");
+
+        add_child(&parent, &sessions_dir, "run-3", 3);
+        refresh_visible_child_session_view(
+            &parent,
+            &tx,
+            &sessions_dir,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &mut cache,
+        )
+        .await;
+        let (child_session_id, index, total) = child_view_event(
+            rx.try_recv()
+                .expect("a moved parent journal is re-resolved"),
+        );
+        assert_eq!(
+            (child_session_id.as_str(), index, total),
+            (visible_child.as_str(), 1, 3)
+        );
+
+        view_state = None;
+        refresh_visible_child_session_view(
+            &parent,
+            &tx,
+            &sessions_dir,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(
+            child_view_event(
+                rx.try_recv()
+                    .expect("a cleared view state is answered with a full pass")
+            )
+            .2,
+            3
+        );
     }
 
     #[tokio::test]

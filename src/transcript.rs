@@ -381,24 +381,23 @@ pub fn list_child_sessions_for_parent(
     )
 }
 
+/// Path of a child session's journal inside `base_dir`.
+pub(crate) fn child_session_path(base_dir: impl AsRef<Path>, child_session_id: &str) -> PathBuf {
+    session_path(&child_sessions_dir(base_dir), child_session_id)
+}
+
 pub fn read_child_session_records(
     base_dir: impl AsRef<Path>,
     child_session_id: &str,
 ) -> Result<Vec<TranscriptRecord>> {
-    read_records(session_path(
-        &child_sessions_dir(base_dir),
-        child_session_id,
-    ))
+    read_records(child_session_path(base_dir, child_session_id))
 }
 
 pub(crate) fn read_child_session_records_allow_partial_tail(
     base_dir: impl AsRef<Path>,
     child_session_id: &str,
 ) -> Result<Vec<TranscriptRecord>> {
-    read_records_allow_partial_tail(session_path(
-        &child_sessions_dir(base_dir),
-        child_session_id,
-    ))
+    read_records_allow_partial_tail(child_session_path(base_dir, child_session_id))
 }
 
 pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
