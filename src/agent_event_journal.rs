@@ -208,8 +208,8 @@ mod tests {
     use crate::evidence::EvidenceDraft;
     use crate::tool::ToolResult;
     use crate::transcript::{
-        TranscriptEvent, TranscriptRecorder, has_session_content, read_records,
-        restore_runtime_snapshot, restore_session_evidence, restore_session_history,
+        TranscriptEvent, TranscriptRecorder, read_records, restore_runtime_snapshot,
+        restore_session_evidence, restore_session_history,
     };
     use serde_json::json;
 

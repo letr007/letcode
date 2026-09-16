@@ -128,6 +128,7 @@ pub struct LogicalCheckpointEventV1 {
 pub(crate) mod transcript_projection;
 
 mod journal;
+mod read;
 mod recorder;
 mod restore;
 
@@ -147,6 +148,7 @@ pub(crate) use journal::{ParsedJournalLine, parse_journal_line, transaction_fiel
 pub use journal::{
     read_records, read_records_allow_partial_tail, read_resumable_records_with_fingerprint,
 };
+pub(crate) use read::any_record_where;
 pub use recorder::TranscriptRecorder;
 pub(crate) use recorder::TranscriptWriterLock;
 #[cfg(test)]
@@ -400,22 +402,19 @@ pub(crate) fn read_child_session_records_allow_partial_tail(
     read_records_allow_partial_tail(child_session_path(base_dir, child_session_id))
 }
 
-pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
-    records
-        .iter()
-        .any(|record| record.event.is_session_content())
+/// Whether one record is session content rather than journal bookkeeping.
+pub(crate) fn record_is_session_content(record: &TranscriptRecord) -> bool {
+    record.event.is_session_content()
 }
 
-pub fn transcript_has_user_message(records: &[TranscriptRecord]) -> bool {
-    records
-        .iter()
-        .any(|record| matches!(record.event, TranscriptEvent::UserMessage { .. }))
+/// Whether one record carries a user prompt.
+pub(crate) fn record_is_user_message(record: &TranscriptRecord) -> bool {
+    matches!(record.event, TranscriptEvent::UserMessage { .. })
 }
 
-pub fn transcript_has_session_title(records: &[TranscriptRecord]) -> bool {
-    records
-        .iter()
-        .any(|record| matches!(record.event, TranscriptEvent::SessionTitle { .. }))
+/// Whether one record carries a session title.
+pub(crate) fn record_is_session_title(record: &TranscriptRecord) -> bool {
+    matches!(record.event, TranscriptEvent::SessionTitle { .. })
 }
 
 impl TranscriptEvent {
@@ -479,8 +478,7 @@ impl TranscriptEvent {
 
 pub fn remove_empty_session_file(path: impl AsRef<Path>) -> Result<bool> {
     let path = path.as_ref();
-    let records = read_records(path)?;
-    if has_session_content(&records) {
+    if any_record_where(path, record_is_session_content)? {
         return Ok(false);
     }
 

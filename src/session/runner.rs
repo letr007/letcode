@@ -11,7 +11,8 @@ use crate::permission::PermissionApproval;
 use crate::subagent::SubagentPool;
 use crate::subagent_events::SubagentEventSender;
 use crate::transcript::{
-    TranscriptRecorder, read_records, transcript_has_session_title, transcript_has_user_message,
+    TranscriptRecorder, any_record_where, read_records, record_is_session_title,
+    record_is_user_message,
 };
 use crate::user_content::{UserMessageContent, UserMessageSubmission};
 
@@ -1371,8 +1372,10 @@ where {
                 recorder.path().to_path_buf(),
             )
         };
-        let records = read_records(&path)?;
-        if transcript_has_user_message(&records) || transcript_has_session_title(&records) {
+        let already_asked = any_record_where(&path, |record| {
+            record_is_user_message(record) || record_is_session_title(record)
+        })?;
+        if already_asked {
             return Ok(None);
         }
 
