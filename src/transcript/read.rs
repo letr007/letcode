@@ -6,6 +6,7 @@
 //! decode the whole journal to answer a question about part of it.
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -16,31 +17,48 @@ use super::{TranscriptRecord, read_records};
 /// Whether any record in the journal satisfies `predicate`, stopping at the
 /// first one that does.
 ///
-/// Records are released in journal order and the answer is decided from the
-/// records read so far, so the lines after a match are neither parsed nor
-/// validated. When nothing matches, the answer comes from [`read_records`]: only
-/// a full read settles that a journal has no matching record, and it is also
-/// what reports a journal that does not validate.
+/// The journal is read line by line and the scan stops at the first match, so
+/// neither the rest of the file nor the records in it are touched. When nothing
+/// matches, the answer comes from [`read_records`]: only a full read settles
+/// that a journal has no matching record, and it is also what reports a journal
+/// that does not validate.
 ///
-/// A journal that batches records into a transaction is read whole as well. Its
-/// records are released at the commit line, so answering from one of them before
-/// that would decide on a record the full read may never release.
+/// Two kinds of line end the scan without an answer, because neither can be
+/// judged on its own:
+///
+/// - A record that belongs to a transaction. Its records are released at the
+///   commit line, so answering from one of them would decide on a record the
+///   full read may never release.
+/// - A commit. Reaching one means a transaction came first.
 pub(crate) fn any_record_where(
     path: impl AsRef<Path>,
     mut predicate: impl FnMut(&TranscriptRecord) -> bool,
 ) -> Result<bool> {
     let path = path.as_ref();
-    let content = fs::read_to_string(path)
+    let file = fs::File::open(path)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut number = 0usize;
 
-    for (index, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .with_context(|| format!("failed to read transcript {}", path.display()))?
+            == 0
+        {
+            break;
+        }
+        number += 1;
+        let record_line = line.trim_end_matches(['\n', '\r']);
+        if record_line.trim().is_empty() {
             continue;
         }
-        let parsed = parse_journal_line(line).with_context(|| {
+        let parsed = parse_journal_line(record_line).with_context(|| {
             format!(
                 "failed to parse line {} from transcript {}",
-                index + 1,
+                number,
                 path.display()
             )
         })?;
@@ -66,7 +84,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::transcript::{TranscriptEvent, TranscriptRecorder};
+    use crate::transcript::{
+        TranscriptEvent, TranscriptRecorder, record_is_session_content, record_is_session_title,
+        record_is_user_message,
+    };
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -156,5 +177,95 @@ mod tests {
             "a full read reports the torn tail"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Measurement harness, not part of the suite: it reads journals named in the
+    /// environment, compares both reads for agreement, and reports their cost.
+    #[test]
+    #[ignore = "measurement harness: set LETCODE_BENCH_JOURNALS to colon-separated paths"]
+    fn ab_measure() {
+        use std::time::Instant;
+
+        let list = std::env::var("LETCODE_BENCH_JOURNALS").expect("LETCODE_BENCH_JOURNALS");
+        let subjects: Vec<(&str, Box<dyn Fn(&TranscriptRecord) -> bool>)> = vec![
+            ("session content", Box::new(record_is_session_content)),
+            (
+                "prompt or title",
+                Box::new(|record: &TranscriptRecord| {
+                    record_is_user_message(record) || record_is_session_title(record)
+                }),
+            ),
+        ];
+        let median = |mut times: Vec<std::time::Duration>| {
+            times.sort();
+            times[times.len() / 2].as_secs_f64() * 1000.0
+        };
+
+        for raw in list.split(':') {
+            let path = PathBuf::from(raw);
+            if !path.is_file() {
+                println!("skip {raw}: not a file");
+                continue;
+            }
+            let size = fs::metadata(&path).expect("stat the journal").len();
+            let warm = read_records(&path).expect("warm read");
+            println!(
+                "\n### {} — {:.1} MB, {} records",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                size as f64 / 1048576.0,
+                warm.len()
+            );
+            drop(warm);
+
+            for (name, predicate) in &subjects {
+                let mut full = Vec::new();
+                let mut shaped = Vec::new();
+                let mut answers = (false, false);
+                for round in 0..3 {
+                    for shaped_first in [round % 2 == 0, round % 2 != 0] {
+                        if shaped_first {
+                            let start = Instant::now();
+                            answers.1 = any_record_where(&path, |record| predicate(record))
+                                .expect("shaped");
+                            shaped.push(start.elapsed());
+                        } else {
+                            let start = Instant::now();
+                            answers.0 = read_records(&path)
+                                .expect("full")
+                                .iter()
+                                .any(predicate);
+                            full.push(start.elapsed());
+                        }
+                    }
+                }
+                assert_eq!(answers.0, answers.1, "{name}: the two reads disagree");
+                let (full, shaped) = (median(full), median(shaped));
+                println!(
+                    "  {name:<16} full {full:8.1} ms   shaped {shaped:8.2} ms   {:>8.0}x",
+                    full / shaped.max(f64::MIN_POSITIVE)
+                );
+            }
+
+            // What the child view poll no longer pays on each tick: the full
+            // parent read against the two stats that replaced it.
+            let (mut full, mut stats) = (Vec::new(), Vec::new());
+            for _ in 0..3 {
+                let start = Instant::now();
+                let _ = read_records(&path).expect("full read");
+                full.push(start.elapsed());
+                let start = Instant::now();
+                for _ in 0..2 {
+                    let metadata = fs::metadata(&path).expect("stat the journal");
+                    let _ = (metadata.len(), metadata.modified());
+                }
+                stats.push(start.elapsed());
+            }
+            let (full, stats) = (median(full), median(stats));
+            println!(
+                "  {:<16} full {full:8.1} ms   stats  {stats:8.3} ms   {:>8.0}x",
+                "poll gate",
+                full / stats.max(f64::MIN_POSITIVE)
+            );
+        }
     }
 }
