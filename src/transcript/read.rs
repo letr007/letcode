@@ -230,10 +230,7 @@ mod tests {
                             shaped.push(start.elapsed());
                         } else {
                             let start = Instant::now();
-                            answers.0 = read_records(&path)
-                                .expect("full")
-                                .iter()
-                                .any(predicate);
+                            answers.0 = read_records(&path).expect("full").iter().any(predicate);
                             full.push(start.elapsed());
                         }
                     }
