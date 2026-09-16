@@ -126,11 +126,9 @@ async fn process_pending(store: MemoryStore, helper: Agent) -> Result<()> {
         if batches >= 8 {
             break;
         }
-        // A batch covers the turns between the cursor and the observed frontier, so
-        // a source that has reached the frontier has nothing to extract and its
-        // records would be filtered away. The file is still checked for existence
-        // first: a source whose transcript is gone is reported like any other
-        // source that cannot be read, and skipping it here must not silence that.
+        // A source at its observed frontier has nothing between the two: the batch
+        // filter would drop every record it read. The existence check keeps a source
+        // whose transcript is gone reported as unreadable rather than skipped.
         if source.cursor >= source.observed_sequence && source.path.is_file() {
             continue;
         }

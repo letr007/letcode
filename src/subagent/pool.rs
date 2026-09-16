@@ -778,8 +778,7 @@ impl SubagentPool {
             bail!("model override cannot be used when taking over a child session");
         }
 
-        // Only the child lifecycle records of the parent journal describe the
-        // children, so the scan reads those rather than the journal they sit in.
+        // The children come from the lifecycle records, so the scan reads only those.
         let existing_children = parent_transcript
             .as_ref()
             .and_then(|recorder| recorder.lock().ok())

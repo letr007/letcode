@@ -1,9 +1,8 @@
 //! Shapes for reading a session journal.
 //!
-//! The journal file is the only source of transcript records: nothing here keeps
-//! decoded records, and every shape reads the file it is asked about. Call sites
-//! pick the narrowest shape that answers their question, so a reader does not
-//! decode the whole journal to answer a question about part of it.
+//! The journal file is the only source of transcript records: no shape keeps
+//! decoded records, and each one reads the file it is asked about. Callers pick
+//! the narrowest shape that answers their question.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -14,22 +13,16 @@ use anyhow::{Context, Result};
 use super::journal::{ParsedJournalLine, parse_journal_line, transaction_fields};
 use super::{TranscriptRecord, read_records};
 
-/// Whether any record in the journal satisfies `predicate`, stopping at the
-/// first one that does.
+/// Whether any record satisfies `predicate`, stopping at the first match.
 ///
-/// The journal is read line by line and the scan stops at the first match, so
-/// neither the rest of the file nor the records in it are touched. When nothing
-/// matches, the answer comes from [`read_records`]: only a full read settles
-/// that a journal has no matching record, and it is also what reports a journal
-/// that does not validate.
+/// A match is decided from the records read so far, so nothing after it is read
+/// or validated. A journal with no match is read in full instead: only that
+/// settles the answer, and it is also what reports a journal that does not
+/// validate.
 ///
-/// Two kinds of line end the scan without an answer, because neither can be
-/// judged on its own:
-///
-/// - A record that belongs to a transaction. Its records are released at the
-///   commit line, so answering from one of them would decide on a record the
-///   full read may never release.
-/// - A commit. Reaching one means a transaction came first.
+/// A transaction ends the scan without an answer: its records are released at
+/// the commit line, so deciding on one of them would use a record the full read
+/// may never release.
 pub(crate) fn any_record_where(
     path: impl AsRef<Path>,
     mut predicate: impl FnMut(&TranscriptRecord) -> bool,
@@ -99,8 +92,7 @@ mod tests {
         ))
     }
 
-    /// A journal whose matching record is not its last record, so the scan can
-    /// answer before the end.
+    /// A journal whose match is not its last record, so the scan can answer early.
     fn journal_with_two_prompts() -> (PathBuf, PathBuf) {
         let dir = temp_dir();
         let mut recorder = TranscriptRecorder::create(&dir).expect("create transcript");
@@ -179,8 +171,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Measurement harness, not part of the suite: it reads journals named in the
-    /// environment, compares both reads for agreement, and reports their cost.
+    /// Times the shaped read against the full read, and asserts they agree.
     #[test]
     #[ignore = "measurement harness: set LETCODE_BENCH_JOURNALS to colon-separated paths"]
     fn ab_measure() {
@@ -243,8 +234,8 @@ mod tests {
                 );
             }
 
-            // What the child view poll no longer pays on each tick: the full
-            // parent read against the two stats that replaced it.
+            // The parent read the poll no longer pays for, against the stats that
+            // replaced it.
             let (mut full, mut stats) = (Vec::new(), Vec::new());
             for _ in 0..3 {
                 let start = Instant::now();
@@ -266,9 +257,7 @@ mod tests {
         }
     }
 
-    /// Measurement harness for the project memory pass, which used to read every
-    /// source it tracks on each idle tick. Takes a file listing journal paths, one
-    /// per line, in LETCODE_BENCH_SOURCES.
+    /// Times reading every source in the list against the check that skips it.
     #[test]
     #[ignore = "measurement harness: set LETCODE_BENCH_SOURCES to a list of journal paths"]
     fn worker_tick_measure() {

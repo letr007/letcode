@@ -196,8 +196,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// The two projections must agree, because callers that only read the file
-    /// replaced callers that held the decoded parent records.
+    /// The file scan and the projection over records must agree.
     #[test]
     fn the_file_scan_agrees_with_the_projection_over_records() {
         let temp = tempdir().unwrap();
@@ -274,8 +273,7 @@ mod tests {
         assert_eq!(from_records, from_file);
     }
 
-    /// Measurement harness for the parent scan that replaced reading the parent
-    /// journal in full. Set LETCODE_BENCH_PARENT and LETCODE_BENCH_CHILD_DIR.
+    /// Times the file scan against reading the parent journal in full.
     #[test]
     #[ignore = "measurement harness: set LETCODE_BENCH_PARENT and LETCODE_BENCH_CHILD_DIR"]
     fn parent_scan_measure() {

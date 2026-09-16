@@ -383,7 +383,6 @@ pub fn list_child_sessions_for_parent(
     )
 }
 
-/// Path of a child session's journal inside `base_dir`.
 pub(crate) fn child_session_path(base_dir: impl AsRef<Path>, child_session_id: &str) -> PathBuf {
     session_path(&child_sessions_dir(base_dir), child_session_id)
 }
@@ -402,17 +401,14 @@ pub(crate) fn read_child_session_records_allow_partial_tail(
     read_records_allow_partial_tail(child_session_path(base_dir, child_session_id))
 }
 
-/// Whether one record is session content rather than journal bookkeeping.
 pub(crate) fn record_is_session_content(record: &TranscriptRecord) -> bool {
     record.event.is_session_content()
 }
 
-/// Whether one record carries a user prompt.
 pub(crate) fn record_is_user_message(record: &TranscriptRecord) -> bool {
     matches!(record.event, TranscriptEvent::UserMessage { .. })
 }
 
-/// Whether one record carries a session title.
 pub(crate) fn record_is_session_title(record: &TranscriptRecord) -> bool {
     matches!(record.event, TranscriptEvent::SessionTitle { .. })
 }

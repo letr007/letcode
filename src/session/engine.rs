@@ -984,12 +984,10 @@ pub(crate) struct VisibleChildViewState {
 
 /// Size and modification time of a journal file, read without opening it.
 ///
-/// Journals only grow, apart from tail repair (`repair_partial_tail`, reached
-/// through `TranscriptRecorder::open_after_partial_tail_repair`), which moves
-/// the length or the modification time either way. A fingerprint that has not
-/// moved therefore means there is nothing new to read. This is the cheap
-/// check; `TranscriptFileFingerprint` is the content digest to pin instead
-/// when the bytes themselves have to be identified.
+/// Journals only grow apart from tail repair, which moves either field anyway,
+/// so an unchanged fingerprint means there is nothing new to read. This is the
+/// cheap check; `TranscriptFileFingerprint` is the content digest to pin when
+/// the bytes have to be identified rather than compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JournalFingerprint {
     len: u64,
@@ -1014,17 +1012,14 @@ struct VisibleChildViewResolution {
 }
 
 /// What the poll keeps from the last pass that reached a resolution, so it does
-/// not read the parent journal again on every 250 ms tick. A child's transcript
-/// file is created before its parent records the start, and a live parent holds
-/// the writer lock that archiving a session family needs, so an unchanged parent
-/// journal still lists the same children in the same order and no child file has
-/// gone away underneath it. A parent journal that did move is still read in
-/// full, so this only removes the repeats.
+/// not read the parent journal on every 250 ms tick. An unchanged parent journal
+/// lists the same children in the same order: a child's transcript file is
+/// created before its parent records the start, and a live parent holds the
+/// writer lock that archiving a session family needs. A parent journal that did
+/// move is still read in full, so this only removes the repeats.
 ///
-/// This is written as soon as a resolution exists, before the runtime context is
-/// projected from it. A projection that then fails is not retried until one of
-/// the two journals moves: both fingerprints are inputs to that projection, so
-/// an unchanged pair can only reproduce the same failure.
+/// It is written before the runtime context is projected, so a projection that
+/// fails is not retried until one of the two journals moves.
 #[derive(Debug, Clone)]
 struct VisibleChildViewCache {
     child_journal: Option<JournalFingerprint>,
@@ -1075,8 +1070,7 @@ async fn refresh_visible_child_session_view(
             && cache.child_journal == child_journal
             && cache.parent_journal == parent_journal
     });
-    // A cleared view state means the frontend is still owed a full pass, so
-    // only a completed one is skipped.
+    // A cleared view state is still owed a full pass.
     if settled && visible_child_view_state.is_some() {
         return;
     }
@@ -2857,10 +2851,6 @@ async fn run_engine_loop(
                                     }
                                     let (text, continuation) = match result {
                                         Ok(result) => {
-                                            // Whether this completion is already in the
-                                            // journal is a question about one record, so
-                                            // the scan answers it without reading the
-                                            // journal to its end.
                                             let already_recorded = transcript
                                                 .lock()
                                                 .ok()
