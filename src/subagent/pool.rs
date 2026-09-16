@@ -778,14 +778,21 @@ impl SubagentPool {
             bail!("model override cannot be used when taking over a child session");
         }
 
-        let existing_children = {
-            let parent_records = parent_transcript
-                .as_ref()
-                .and_then(|recorder| recorder.lock().ok())
-                .and_then(|recorder| read_records_allow_partial_tail(recorder.path()).ok())
-                .unwrap_or_default();
-            Self::child_sessions(&sessions_dir, &parent_records)
-        };
+        // Only the child lifecycle records of the parent journal describe the
+        // children, so the scan reads those rather than the journal they sit in.
+        let existing_children = parent_transcript
+            .as_ref()
+            .and_then(|recorder| recorder.lock().ok())
+            .map(|recorder| recorder.path().to_path_buf())
+            .and_then(|parent_path| {
+                transcript_projection::project_child_session_summaries_from_file(
+                    &child_sessions_dir(&sessions_dir),
+                    &parent_path,
+                )
+                .ok()
+            })
+            .map(SubagentPool::child_sessions_from_summaries)
+            .unwrap_or_default();
 
         let setup = (|| -> Result<(String, String, u32, Arc<Mutex<TranscriptRecorder>>, Agent)> {
             let run_id = reservation.run_id.clone();

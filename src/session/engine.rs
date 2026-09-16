@@ -42,7 +42,7 @@ mod config_reload;
 mod control;
 
 use crate::transcript::{
-    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, read_records,
+    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, any_record_where, read_records,
     read_records_allow_partial_tail, remove_empty_session_file, sync_recorder_branch,
     transcript_projection,
 };
@@ -2857,22 +2857,30 @@ async fn run_engine_loop(
                                     }
                                     let (text, continuation) = match result {
                                         Ok(result) => {
-                                            let parent_records = transcript
+                                            // Whether this completion is already in the
+                                            // journal is a question about one record, so
+                                            // the scan answers it without reading the
+                                            // journal to its end.
+                                            let already_recorded = transcript
                                                 .lock()
-                                                .map_err(|_| anyhow!("transcript recorder poisoned"))
-                                                .and_then(|recorder| read_records(recorder.path()));
-                                            if parent_records.is_ok_and(|records| {
-                                                records.iter().any(|record| matches!(
-                                                    &record.event,
-                                                    crate::transcript::TranscriptEvent::Evidence {
-                                                        source: crate::evidence::EvidenceSource::Subagent {
-                                                            run_id,
-                                                            ..
-                                                        },
-                                                        ..
-                                                    } if run_id == &result.run_id
-                                                ))
-                                            }) {
+                                                .ok()
+                                                .map(|recorder| recorder.path().to_path_buf())
+                                                .is_some_and(|path| {
+                                                    any_record_where(&path, |record| {
+                                                        matches!(
+                                                            &record.event,
+                                                            crate::transcript::TranscriptEvent::Evidence {
+                                                                source: crate::evidence::EvidenceSource::Subagent {
+                                                                    run_id,
+                                                                    ..
+                                                                },
+                                                                ..
+                                                            } if run_id == &result.run_id
+                                                        )
+                                                    })
+                                                    .unwrap_or(false)
+                                                });
+                                            if already_recorded {
                                                 continue;
                                             }
                                             let _ = session_transport_tx.send(
