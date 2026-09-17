@@ -681,6 +681,7 @@ where
         agent.active_model_metadata(),
         &prelude,
         &prompt,
+        None,
         move |delta| {
             std::future::ready(
                 delta_tx

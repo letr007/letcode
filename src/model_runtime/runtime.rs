@@ -473,6 +473,46 @@ impl ModelRuntime {
         &self,
         route: &ResolvedModelRoute,
         input: &ModelRequestInput,
+        on_delta: F,
+        on_retry: R,
+    ) -> Result<(String, Vec<ModelEvent>), ModelFailure>
+    where
+        F: FnMut(&str) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+        R: FnMut() -> Rfut + Send,
+        Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+    {
+        let request = route.binding.prepare_request(input)?;
+        self.execute_prepared_text_oneshot_with_usage(route, request, on_delta, on_retry)
+            .await
+    }
+
+    /// Runs a request the caller prepared, and possibly decorated, itself.
+    pub async fn execute_prepared_text_oneshot<F, Fut, R, Rfut>(
+        &self,
+        route: &ResolvedModelRoute,
+        request: PreparedHttpRequest,
+        on_delta: F,
+        on_retry: R,
+    ) -> Result<String, ModelFailure>
+    where
+        F: FnMut(&str) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+        R: FnMut() -> Rfut + Send,
+        Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
+    {
+        self.execute_prepared_text_oneshot_with_usage(route, request, on_delta, on_retry)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    /// Runs a request the caller prepared, and possibly decorated, itself.
+    /// Accounting, retry classification and terminal validation are identical
+    /// to [`Self::execute_text_oneshot_with_usage`].
+    pub async fn execute_prepared_text_oneshot_with_usage<F, Fut, R, Rfut>(
+        &self,
+        route: &ResolvedModelRoute,
+        request: PreparedHttpRequest,
         mut on_delta: F,
         mut on_retry: R,
     ) -> Result<(String, Vec<ModelEvent>), ModelFailure>
@@ -484,7 +524,6 @@ impl ModelRuntime {
     {
         let mut usage_events = Vec::new();
         let retry = route.retry.clone().unwrap_or_else(default_retry_config);
-        let request = route.binding.prepare_request(input)?;
         let mut attempt = 1;
         loop {
             let mut observer = TextOneshotObserver {

@@ -2975,10 +2975,10 @@ impl Agent {
             request_projection_generation: 0,
             pressure_compaction_suppressed: false,
             fast_mode: None,
-            fake_client: None,
+            fake_client: self.fake_client,
             fake_installation_id: self.fake_installation_id.clone(),
             fake_config: self.fake_config.clone(),
-            fake_identity: None,
+            fake_identity: self.fake_identity.clone(),
             fake_context_cache: std::sync::Mutex::new(None),
             resolved_model_route: self.resolved_model_route.clone(),
             resolved_runtime_catalog: self.resolved_runtime_catalog.clone(),
@@ -3060,6 +3060,7 @@ impl Agent {
             self.active_model_metadata(),
             &self.prelude,
             user_input,
+            None,
         )
         .await
     }
@@ -3068,11 +3069,15 @@ impl Agent {
         let route = self
             .resolved_model_route()
             .ok_or_else(|| anyhow!("helper requires an installed resolved model route"))?;
+        // The title helper shares the session's route, so it shares its
+        // disguise while the fake is on.
+        let fake_decorator = protocol_stream::fake_request_decorator(self, route, false);
         let raw = protocol_stream::execute_resolved_text_oneshot(
             route,
             self.active_model_metadata(),
             &self.prelude,
             user_input,
+            fake_decorator.as_ref(),
         )
         .await
         .map_err(|error| anyhow!("session title generation failed: {error:#}"))?;

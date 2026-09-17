@@ -319,6 +319,72 @@ fn declaring_a_fake_value_refreshes_the_cached_turn_context() {
     assert_eq!(refreshed.current_date.as_deref(), Some("2001-02-03"));
 }
 
+#[test]
+fn session_title_request_is_disguised_while_the_fake_is_on() {
+    let mut agent = test_agent();
+    install_active_epoch_route(&mut agent, ApiProtocol::Responses);
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Codex))
+        .expect("responses protocol supports codex fake");
+
+    let title_agent = agent.session_title_agent();
+    let route = title_agent
+        .resolved_model_route()
+        .expect("the title helper shares the session route");
+    let decorator = super::protocol_stream::fake_request_decorator(&title_agent, route, false)
+        .expect("the title request carries the active fake");
+    let request = super::protocol_stream::prepare_oneshot_http_request(
+        route,
+        title_agent.active_model_metadata(),
+        &title_agent.prelude,
+        "rename this session",
+        Some(&decorator),
+    )
+    .expect("the title request is prepared");
+
+    let headers = &request.protocol_headers;
+    assert!(headers.contains_key("originator"));
+    assert!(headers.contains_key("user-agent"));
+    assert!(headers.contains_key("x-codex-turn-metadata"));
+    let session_id = headers.get("session-id").expect("session id is disguised");
+    assert_eq!(headers.get("thread-id"), Some(session_id));
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("the prepared body is JSON");
+    assert_eq!(
+        body.get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str),
+        Some(session_id.as_str()),
+        "the title request is scoped to the disguised session"
+    );
+    assert!(body.get("client_metadata").is_some());
+}
+
+#[test]
+fn session_title_request_stays_undisguised_while_the_fake_is_off() {
+    let mut agent = test_agent();
+    install_active_epoch_route(&mut agent, ApiProtocol::Responses);
+
+    let title_agent = agent.session_title_agent();
+    let route = title_agent
+        .resolved_model_route()
+        .expect("the title helper shares the session route");
+    assert!(super::protocol_stream::fake_request_decorator(&title_agent, route, false).is_none());
+    let request = super::protocol_stream::prepare_oneshot_http_request(
+        route,
+        title_agent.active_model_metadata(),
+        &title_agent.prelude,
+        "rename this session",
+        None,
+    )
+    .expect("the title request is prepared");
+
+    assert!(!request.protocol_headers.contains_key("originator"));
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("the prepared body is JSON");
+    assert!(body.get("client_metadata").is_none());
+}
+
 fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
     TokenUsageEstimate {
         used_tokens,

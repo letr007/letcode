@@ -119,6 +119,32 @@ fn should_use_responses_websocket(route: &crate::model_runtime::ResolvedModelRou
     route.protocol_id.as_str() == "responses" && route.websocket
 }
 
+/// Builds the decorator for one request on this route, so every request the
+/// agent sends while the fake is on carries the same disguise. Only the
+/// transport decides `responses_websocket`; protocols the fake does not cover
+/// have no decorator.
+pub(super) fn fake_request_decorator(
+    agent: &Agent,
+    route: &crate::model_runtime::ResolvedModelRoute,
+    responses_websocket: bool,
+) -> Option<crate::model_runtime::decorator::FakeRequestDecorator> {
+    let profile = match route.protocol_id.as_str() {
+        "responses" => crate::fake::FakeClient::Codex,
+        "anthropic" => crate::fake::FakeClient::Anthropic,
+        _ => return None,
+    };
+    let client = agent.fake_client()?;
+    agent.fake_turn_context(profile).and_then(|context| {
+        crate::model_runtime::decorator::FakeRequestDecorator::new(
+            client,
+            &route.protocol_id,
+            context,
+            responses_websocket,
+        )
+        .ok()
+    })
+}
+
 fn runtime_failure(
     phase: crate::model_runtime::FailurePhase,
     error: impl std::fmt::Display,
@@ -198,22 +224,7 @@ where
         max_tool_calls: agent.max_tool_calls,
     };
     let responses_websocket = should_use_responses_websocket(&route);
-    let fake_decorator = agent.fake_client().and_then(|client| {
-        let profile = match route.protocol_id.as_str() {
-            "responses" => crate::fake::FakeClient::Codex,
-            "anthropic" => crate::fake::FakeClient::Anthropic,
-            _ => return None,
-        };
-        agent.fake_turn_context(profile).and_then(|context| {
-            crate::model_runtime::decorator::FakeRequestDecorator::new(
-                client,
-                &route.protocol_id,
-                context,
-                responses_websocket,
-            )
-            .ok()
-        })
-    });
+    let fake_decorator = fake_request_decorator(agent, &route, responses_websocket);
     let ws_transport = if responses_websocket {
         let transport =
             std::sync::Arc::new(crate::model_runtime::runtime::TurnLocalResponsesTransport::new());
@@ -2117,9 +2128,10 @@ pub(super) fn prepare_resolved_oneshot_request(
 
 pub(super) async fn stream_resolved_oneshot_text_async<F, Fut, R, Rfut>(
     route: &crate::model_runtime::ResolvedModelRoute,
-    mut model: ModelRequestMetadata,
+    model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
+    decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
     mut on_delta: F,
     mut on_retry: R,
 ) -> Result<String>
@@ -2129,26 +2141,11 @@ where
     R: FnMut() -> Rfut + Send,
     Rfut: Future<Output = Result<()>> + Send,
 {
-    model.supports_reasoning = false;
-    model.reasoning_effort = None;
-    model.reasoning_summary = None;
-    model.supports_tools = false;
-    model.parallel_tool_calls = false;
-    model.fast_mode = false;
-    model.supports_input_images = route.capabilities.input_images;
-    model.supports_tool_result_images = route.capabilities.tool_result_images;
-    let build = build_oneshot_request(
-        &route.model_override,
-        model.clone(),
-        prelude,
-        &crate::user_content::UserMessageContent::new(user_text, vec![]),
-    )?;
-    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
-        .map_err(anyhow::Error::msg)?;
+    let request = prepare_oneshot_http_request(route, model, prelude, user_text, decorator)?;
     ModelRuntime::default()
-        .execute_text_oneshot(
+        .execute_prepared_text_oneshot(
             route,
-            &input,
+            request,
             move |delta| {
                 let future = on_delta(delta);
                 async move {
@@ -2175,16 +2172,56 @@ pub(super) async fn execute_resolved_text_oneshot(
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
+    decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
 ) -> Result<String> {
     stream_resolved_oneshot_text_async(
         route,
         model,
         prelude,
         user_text,
+        decorator,
         |_| std::future::ready(Ok(())),
         || std::future::ready(Ok(())),
     )
     .await
+}
+
+/// Builds the request a helper oneshot sends, including the fake disguise when
+/// the caller passes one. Prompt shaping and decoration stay together so every
+/// retry replays the same request.
+pub(super) fn prepare_oneshot_http_request(
+    route: &crate::model_runtime::ResolvedModelRoute,
+    mut model: ModelRequestMetadata,
+    prelude: &[PromptMessage],
+    user_text: &str,
+    decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
+) -> Result<crate::model_runtime::PreparedHttpRequest> {
+    model.supports_reasoning = false;
+    model.reasoning_effort = None;
+    model.reasoning_summary = None;
+    model.supports_tools = false;
+    model.parallel_tool_calls = false;
+    model.fast_mode = false;
+    model.supports_input_images = route.capabilities.input_images;
+    model.supports_tool_result_images = route.capabilities.tool_result_images;
+    let build = build_oneshot_request(
+        &route.model_override,
+        model.clone(),
+        prelude,
+        &crate::user_content::UserMessageContent::new(user_text, vec![]),
+    )?;
+    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+        .map_err(anyhow::Error::msg)?;
+    let request = route
+        .binding
+        .prepare_request(&input)
+        .map_err(anyhow::Error::new)?;
+    match decorator {
+        Some(decorator) => decorator
+            .decorate(&route.protocol_id, request)
+            .map_err(anyhow::Error::new),
+        None => Ok(request),
+    }
 }
 
 fn build_stream_interrupt_continuation(
