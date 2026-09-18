@@ -6630,3 +6630,82 @@ fn historian_child_report_keys_refresh_layout_without_changing_history() {
         InputAction::Insert('2')
     );
 }
+
+/// TEMPORARY measurement: times a child-view switch and the frame it costs.
+#[test]
+#[ignore = "measurement harness: set LETCODE_BENCH_SESSIONS, LETCODE_BENCH_PARENT_SESSION, LETCODE_BENCH_CHILD_SESSION"]
+fn switch_cost_measure() {
+    use std::time::Instant;
+
+    let dir = std::path::PathBuf::from(
+        std::env::var("LETCODE_BENCH_SESSIONS").expect("LETCODE_BENCH_SESSIONS"),
+    );
+    let parent_session =
+        std::env::var("LETCODE_BENCH_PARENT_SESSION").expect("LETCODE_BENCH_PARENT_SESSION");
+    let child_session =
+        std::env::var("LETCODE_BENCH_CHILD_SESSION").expect("LETCODE_BENCH_CHILD_SESSION");
+    let parent_records =
+        crate::transcript::read_records(&dir.join(format!("{parent_session}.jsonl")))
+            .expect("read the parent journal");
+    let child_records = crate::transcript::read_records(
+        &crate::transcript::child_sessions_dir(&dir).join(format!("{child_session}.jsonl")),
+    )
+    .expect("read the child journal");
+    println!(
+        "\n### parent {parent_session} {} records · child {child_session} {} records",
+        parent_records.len(),
+        child_records.len()
+    );
+
+    let mut runtime = runtime_with_experts(Vec::new());
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let draw = |terminal: &mut Terminal<TestBackend>, runtime: &mut TuiRuntime| {
+        terminal
+            .draw(|frame| crate::tui::render::render(frame, &mut runtime.state))
+            .unwrap();
+    };
+
+    for agent_name in ["explorer", "historian"] {
+        for round in 0..3 {
+            let start = Instant::now();
+            runtime.state.replace_child_timeline_from_records(
+                &child_records,
+                "parent",
+                "child",
+                agent_name,
+                1,
+                1,
+                1,
+            );
+            let apply = start.elapsed();
+            let start = Instant::now();
+            draw(&mut terminal, &mut runtime);
+            let first_frame = start.elapsed();
+            let start = Instant::now();
+            draw(&mut terminal, &mut runtime);
+            let steady_frame = start.elapsed();
+            println!(
+                "  child view ({agent_name}) round {round}: apply {:>9.1?} · first frame {:>9.1?} · steady frame {:>9.1?}",
+                apply, first_frame, steady_frame
+            );
+        }
+    }
+
+    for round in 0..2 {
+        let start = Instant::now();
+        runtime
+            .state
+            .replace_session_timeline_from_records(&parent_records);
+        let apply = start.elapsed();
+        let start = Instant::now();
+        draw(&mut terminal, &mut runtime);
+        let first_frame = start.elapsed();
+        let start = Instant::now();
+        draw(&mut terminal, &mut runtime);
+        let steady_frame = start.elapsed();
+        println!(
+            "  parent view round {round}: apply {:>9.1?} · first frame {:>9.1?} · steady frame {:>9.1?}",
+            apply, first_frame, steady_frame
+        );
+    }
+}

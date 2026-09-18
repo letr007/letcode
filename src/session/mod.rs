@@ -42,7 +42,6 @@ pub mod restore;
 pub mod runner;
 pub mod settings;
 
-pub use child_view::current_session_records;
 #[cfg(test)]
 pub(crate) use child_view::project_parent_session_view;
 pub(crate) use command::ActiveTurnCommandDisposition;

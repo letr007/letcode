@@ -1032,8 +1032,24 @@ fn resolve_visible_child_view(
     sessions_dir: &std::path::Path,
     child_session_id: &str,
 ) -> Result<Option<VisibleChildViewResolution>> {
-    let (parent_session_id, parent_records) = crate::session::current_session_records(transcript)?;
-    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
+    let (parent_session_id, parent_path) = {
+        let recorder = transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        (
+            recorder.session_id().to_string(),
+            recorder.path().to_path_buf(),
+        )
+    };
+    // Same shaped scan the navigation path uses: the poll only needs the child
+    // list, and decoding every parent record costs several times more (measured
+    // 70 ms against 12 ms on a 21 MB journal).
+    let children = SubagentPool::child_sessions_from_summaries(
+        transcript_projection::project_child_session_summaries_from_file(
+            &crate::transcript::child_sessions_dir(sessions_dir),
+            &parent_path,
+        )?,
+    );
     Ok(children
         .iter()
         .enumerate()

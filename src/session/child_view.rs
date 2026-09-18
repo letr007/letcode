@@ -86,19 +86,6 @@ pub fn sessions_dir_from_transcript(
         .ok_or_else(|| anyhow!("transcript path has no parent directory"))
 }
 
-/// Read the live session id and records under the transcript lock.
-pub fn current_session_records(
-    transcript: &Arc<Mutex<TranscriptRecorder>>,
-) -> Result<(String, Vec<TranscriptRecord>)> {
-    let recorder = transcript
-        .lock()
-        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-    Ok((
-        recorder.session_id().to_string(),
-        read_records(recorder.path())?,
-    ))
-}
-
 /// Project the current live transcript as a parent/root view restore package.
 pub fn project_parent_session_view(
     transcript: &Arc<Mutex<TranscriptRecorder>>,
@@ -202,6 +189,77 @@ mod tests {
             summary: String::new(),
             timestamp_ms: 0,
             pool_ordinal: 1,
+        }
+    }
+
+    /// TEMPORARY measurement: times the child-view switch projection on real journals.
+    #[test]
+    #[ignore = "measurement harness: set LETCODE_BENCH_SESSIONS and LETCODE_BENCH_PARENT_SESSION"]
+    fn switch_measure() {
+        use std::time::Instant;
+
+        let dir = std::path::PathBuf::from(
+            std::env::var("LETCODE_BENCH_SESSIONS").expect("LETCODE_BENCH_SESSIONS"),
+        );
+        let parent_session_id =
+            std::env::var("LETCODE_BENCH_PARENT_SESSION").expect("LETCODE_BENCH_PARENT_SESSION");
+        let parent_path = dir.join(format!("{parent_session_id}.jsonl"));
+        let parent_size = std::fs::metadata(&parent_path).expect("stat parent").len();
+        println!(
+            "\n### parent {parent_session_id} — {:.1} MB",
+            parent_size as f64 / 1048576.0
+        );
+
+        let mut navigation = crate::command::ChildNavigation::First;
+        let mut anchor: Option<String> = None;
+        for round in 0..4 {
+            let start = Instant::now();
+            let view = project_child_session_view_from_file(
+                &dir,
+                parent_session_id.clone(),
+                navigation,
+                anchor.as_deref(),
+            )
+            .expect("project the child view")
+            .expect("a child to view");
+            let elapsed = start.elapsed();
+            let child_size = std::fs::metadata(
+                crate::transcript::child_sessions_dir(&dir)
+                    .join(format!("{}.jsonl", view.child_session_id)),
+            )
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+            let _ = &view.runtime_context;
+            println!(
+                "  round {round}: {:>8.1?}  child {} {:.1} MB  {} records",
+                elapsed,
+                view.child_session_id,
+                child_size as f64 / 1048576.0,
+                view.records.len(),
+            );
+            anchor = Some(view.child_session_id.clone());
+            navigation = crate::command::ChildNavigation::Next;
+        }
+
+        let target = anchor.expect("a child was viewed");
+        for round in 0..3 {
+            let start = Instant::now();
+            let records = crate::transcript::read_records(&parent_path).expect("read the parent");
+            let children = SubagentPool::child_sessions(&dir, &records);
+            let parent_ms = start.elapsed();
+            let start = Instant::now();
+            let child_records =
+                crate::transcript::read_child_session_records_allow_partial_tail(&dir, &target)
+                    .expect("read the child");
+            let child_ms = start.elapsed();
+            println!(
+                "  poll pass {round}: parent full read + children {:>8.1?} ({} records, {} children) · child read {:>8.1?} ({} records)",
+                parent_ms,
+                records.len(),
+                children.len(),
+                child_ms,
+                child_records.len()
+            );
         }
     }
 }
