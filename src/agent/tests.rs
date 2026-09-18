@@ -3863,12 +3863,12 @@ async fn default_and_safe_allow_once_authorize_external_writes() {
 }
 
 struct MockAutoReviewService {
-    approval: Mutex<PermissionApproval>,
+    outcome: Mutex<AutoReviewOutcome>,
     calls: AtomicUsize,
 }
 
 struct CapturingAutoReviewService {
-    approval: PermissionApproval,
+    outcome: AutoReviewOutcome,
     calls: AtomicUsize,
     last_request: Mutex<Option<PermissionRequest>>,
 }
@@ -3886,7 +3886,7 @@ impl AutoReviewService for CapturingAutoReviewService {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_request.lock().expect("request lock") = Some(request);
             Ok(AutoReviewResolution {
-                approval: self.approval,
+                outcome: self.outcome,
                 reason: "captured".into(),
             })
         })
@@ -3906,14 +3906,15 @@ impl AutoReviewService for MockAutoReviewService {
     > {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let approval = *self.approval.lock().expect("approval lock");
-            let reason = match approval {
-                PermissionApproval::AllowOnce => "mock-once",
-                PermissionApproval::AllowAlways => "mock-always",
-                PermissionApproval::Deny => "mock-deny",
+            let outcome = *self.outcome.lock().expect("outcome lock");
+            let reason = match outcome {
+                AutoReviewOutcome::AllowOnce => "mock-once",
+                AutoReviewOutcome::AllowAlways => "mock-always",
+                AutoReviewOutcome::Ask => "mock-ask",
+                AutoReviewOutcome::Deny => "mock-deny",
             };
             Ok(AutoReviewResolution {
-                approval,
+                outcome,
                 reason: reason.into(),
             })
         })
@@ -3927,7 +3928,7 @@ async fn auto_mode_child_inherits_reviewer_service() {
     let mut parent = test_agent();
     parent.set_permission_mode(PermissionMode::Auto);
     let service = Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::AllowOnce),
+        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
         calls: AtomicUsize::new(0),
     });
     parent.set_auto_review_service(Some(service.clone()));
@@ -3966,7 +3967,7 @@ fn reviewer_child_does_not_inherit_auto_review_service() {
     let mut parent = test_agent();
     parent.set_permission_mode(PermissionMode::Auto);
     parent.set_auto_review_service(Some(Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::AllowOnce),
+        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
         calls: AtomicUsize::new(0),
     })));
 
@@ -4339,7 +4340,7 @@ async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
     let service = Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::AllowOnce),
+        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
         calls: AtomicUsize::new(0),
     });
     agent.set_auto_review_service(Some(service.clone()));
@@ -4377,7 +4378,7 @@ async fn auto_mode_reviewer_approves_write_calls() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
     let service = Arc::new(CapturingAutoReviewService {
-        approval: PermissionApproval::AllowOnce,
+        outcome: AutoReviewOutcome::AllowOnce,
         calls: AtomicUsize::new(0),
         last_request: Mutex::new(None),
     });
@@ -4420,6 +4421,77 @@ async fn auto_mode_reviewer_approves_write_calls() {
     let _ = fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn auto_reviewer_ask_returns_the_first_call_and_escalates_the_repeat() {
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        outcome: Mutex::new(AutoReviewOutcome::Ask),
+        calls: AtomicUsize::new(0),
+    });
+    agent.set_auto_review_service(Some(service.clone()));
+
+    let path = std::env::temp_dir().join(format!(
+        "letcode-auto-review-ask-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    let args = json!({"path": path, "content": "explained"});
+    let call = |call_id: &str| HistoryToolCall {
+        call_id: call_id.into(),
+        name: "fs__write".into(),
+        arguments_json: args.to_string(),
+    };
+    let mut human_approvals = 0usize;
+
+    let returned = agent
+        .execute_tool_call(
+            &call("call-auto-ask-1"),
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
+            },
+        )
+        .await
+        .expect("the first ask returns the call to the requester");
+
+    assert_eq!(
+        human_approvals, 0,
+        "the requester's round must not reach the user"
+    );
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(returned.status, ToolExecutionStatus::Rejected);
+
+    let escalated = agent
+        .execute_tool_call(
+            &call("call-auto-ask-2"),
+            &mut |_| std::future::ready(Ok(())),
+            &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
+            },
+        )
+        .await
+        .expect("the repeat goes to the user");
+
+    assert_eq!(
+        human_approvals, 1,
+        "the same call asked twice goes to the user"
+    );
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        2,
+        "the second ask is reviewed again before it reaches the user"
+    );
+    assert_eq!(escalated.status, ToolExecutionStatus::Executed);
+    assert!(escalated.output.ok, "{:?}", escalated.output.error);
+    assert_eq!(fs::read_to_string(&path).expect("read output"), "explained");
+    let _ = fs::remove_file(path);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
@@ -4449,7 +4521,7 @@ async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
     child.set_permission_mode(PermissionMode::Auto);
     child.set_subagent_path_scope(Some(Arc::new(scope)));
     let service = Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::Deny),
+        outcome: Mutex::new(AutoReviewOutcome::Deny),
         calls: AtomicUsize::new(0),
     });
     child.set_auto_review_service(Some(service.clone()));
@@ -4495,7 +4567,7 @@ async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
     let service = Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::AllowOnce),
+        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
         calls: AtomicUsize::new(0),
     });
     agent.set_auto_review_service(Some(service.clone()));
@@ -4542,7 +4614,7 @@ async fn auto_mode_deny_includes_reviewer_rationale() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
     let service = Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::Deny),
+        outcome: Mutex::new(AutoReviewOutcome::Deny),
         calls: AtomicUsize::new(0),
     });
     agent.set_auto_review_service(Some(service));
@@ -4571,6 +4643,53 @@ async fn auto_mode_deny_includes_reviewer_rationale() {
     }));
 }
 
+#[tokio::test]
+async fn auto_mode_ask_outcome_returns_the_call_to_the_requester() {
+    let mut agent = test_agent();
+    agent.set_permission_mode(PermissionMode::Auto);
+    let service = Arc::new(MockAutoReviewService {
+        outcome: Mutex::new(AutoReviewOutcome::Ask),
+        calls: AtomicUsize::new(0),
+    });
+    agent.set_auto_review_service(Some(service.clone()));
+
+    let path = std::env::temp_dir().join(format!(
+        "letcode-auto-ask-return-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    let call = HistoryToolCall {
+        call_id: "call-auto-ask".into(),
+        name: "fs__write".into(),
+        arguments_json: json!({"path": path, "content": "x"}).to_string(),
+    };
+    let mut human_requests = 0;
+    let record = agent
+        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+            human_requests += 1;
+            std::future::ready(Ok(PermissionApproval::Deny))
+        })
+        .await
+        .expect("returned call is a tool record");
+
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        human_requests, 0,
+        "the requester's round must not reach the user"
+    );
+    assert_eq!(record.status, ToolExecutionStatus::Rejected);
+    assert_eq!(
+        record.rejection,
+        Some(ToolExecutionRejection::ReturnedToRequester)
+    );
+    assert!(!path.exists(), "a returned call must not run");
+    let error = record.output.error.expect("returned reason").message;
+    assert!(error.contains("mock-ask"), "{error}");
+    assert!(error.contains("goes to the user"), "{error}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn auto_mode_does_not_reuse_allow_always_between_reviews() {
@@ -4581,7 +4700,7 @@ async fn auto_mode_does_not_reuse_allow_always_between_reviews() {
     let mut agent = test_agent();
     agent.set_permission_mode(PermissionMode::Auto);
     let service = Arc::new(MockAutoReviewService {
-        approval: Mutex::new(PermissionApproval::AllowAlways),
+        outcome: Mutex::new(AutoReviewOutcome::AllowAlways),
         calls: AtomicUsize::new(0),
     });
     agent.set_auto_review_service(Some(service.clone()));

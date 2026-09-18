@@ -765,6 +765,7 @@ where
         decision
     };
     let mut auto_deny_reason = None;
+    let mut auto_return_reason = None;
     let allowed = match decision {
         PermissionDecision::Allow => true,
         PermissionDecision::Ask => {
@@ -779,11 +780,26 @@ where
                 grant_summary: None,
             };
             let approval = if mode == PermissionMode::Auto {
-                let resolution = agent.resolve_auto_permission(request, None).await?;
-                if !resolution.approval.allowed() {
-                    auto_deny_reason = Some(resolution.reason);
+                let resolution = agent.resolve_auto_permission(request.clone(), None).await?;
+                match resolution.outcome.approval() {
+                    Some(approval) => {
+                        if !approval.allowed() {
+                            auto_deny_reason = Some(resolution.reason);
+                        }
+                        approval
+                    }
+                    // The reviewer asked the requester to explain the call. The
+                    // requester's round hands it back, so that explanation is in
+                    // its narration before the next review; the ask that survives
+                    // that round is the user's to answer, as in `default` mode.
+                    None => match agent.auto_review_round(&call.name, &args)? {
+                        AutoReviewRound::Requester => {
+                            auto_return_reason = Some(resolution.reason);
+                            PermissionApproval::Deny
+                        }
+                        AutoReviewRound::User => approve(request).await?,
+                    },
                 }
-                resolution.approval
             } else {
                 approve(request).await?
             };
@@ -792,8 +808,11 @@ where
         PermissionDecision::Deny => false,
     };
     if !allowed {
+        let returned_to_the_requester = auto_return_reason.is_some();
         let message = if matches!(decision, PermissionDecision::Deny) {
             "permission denied by current mode".to_string()
+        } else if let Some(reason) = auto_return_reason {
+            auto_review_return_message(&reason)
         } else if let Some(reason) = auto_deny_reason {
             format!("auto-review denied permission: {reason}")
         } else {
@@ -806,6 +825,8 @@ where
             ToolExecutionStatus::Rejected,
             Some(if matches!(decision, PermissionDecision::Deny) {
                 ToolExecutionRejection::PermissionDeniedByPolicy
+            } else if returned_to_the_requester {
+                ToolExecutionRejection::ReturnedToRequester
             } else {
                 ToolExecutionRejection::PermissionDeniedByUser
             }),
@@ -998,6 +1019,7 @@ where
     };
     let mut approval = None;
     let mut auto_deny_reason = None;
+    let mut auto_return_reason = None;
     let should_execute = match permission_decision {
         PermissionDecision::Allow => true,
         PermissionDecision::Ask => {
@@ -1016,11 +1038,26 @@ where
                     .then(|| resource.as_ref().expect("resource checked").summary()),
             };
             let result = if mode == PermissionMode::Auto {
-                let resolution = agent.resolve_auto_permission(request, None).await?;
-                if !resolution.approval.allowed() {
-                    auto_deny_reason = Some(resolution.reason);
+                let resolution = agent.resolve_auto_permission(request.clone(), None).await?;
+                match resolution.outcome.approval() {
+                    Some(approval) => {
+                        if !approval.allowed() {
+                            auto_deny_reason = Some(resolution.reason);
+                        }
+                        approval
+                    }
+                    // The reviewer asked the requester to explain the call. The
+                    // requester's round hands it back, so that explanation is in
+                    // its narration before the next review; the ask that survives
+                    // that round is the user's to answer, as in `default` mode.
+                    None => match agent.auto_review_round(&call.name, &args)? {
+                        AutoReviewRound::Requester => {
+                            auto_return_reason = Some(resolution.reason);
+                            PermissionApproval::Deny
+                        }
+                        AutoReviewRound::User => approve(request).await?,
+                    },
                 }
-                resolution.approval
             } else {
                 approve(request).await?
             };
@@ -1196,8 +1233,11 @@ where
             output,
         ))
     } else {
+        let returned_to_the_requester = auto_return_reason.is_some();
         let output = if matches!(permission_decision, PermissionDecision::Deny) {
             ToolResult::err(&call.name, "permission denied by current mode")
+        } else if let Some(reason) = auto_return_reason {
+            ToolResult::err(&call.name, auto_review_return_message(&reason))
         } else if let Some(reason) = auto_deny_reason {
             ToolResult::err(
                 &call.name,
@@ -1208,6 +1248,8 @@ where
         };
         let rejection = if matches!(permission_decision, PermissionDecision::Deny) {
             ToolExecutionRejection::PermissionDeniedByPolicy
+        } else if returned_to_the_requester {
+            ToolExecutionRejection::ReturnedToRequester
         } else {
             ToolExecutionRejection::PermissionDeniedByUser
         };
@@ -1222,6 +1264,15 @@ where
         emit_finished(on_event, call, &record).await?;
         Ok(record)
     }
+}
+
+/// The output handed to the requester when an auto-reviewer's `ask_user` returns
+/// the call instead of deciding it.
+fn auto_review_return_message(reason: &str) -> String {
+    format!(
+        "auto-review returned this call to you instead of deciding it: {reason}\n\
+         Explain how it serves the current goal, or change the call; an ask that survives this round goes to the user."
+    )
 }
 
 fn non_shell_tool_timeout_secs(tool_timeout_secs: Option<u64>, tool_name: &str) -> Option<u64> {

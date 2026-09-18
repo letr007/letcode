@@ -16,7 +16,7 @@ use crate::model_runtime::{ResolvedModelRoute, ResolvedRuntimeCatalog};
 #[cfg(test)]
 use crate::permission::ToolScope;
 use crate::permission::{
-    PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
+    AutoReviewRound, PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
     PermissionSessionState,
 };
 use crate::request_builder::{
@@ -62,7 +62,10 @@ mod history_runtime;
 mod protocol_stream;
 #[path = "agent/tool_execution.rs"]
 mod tool_execution;
-pub(crate) use auto_review::{AutoReviewResolution, AutoReviewService};
+pub(crate) use auto_review::{
+    AutoReviewOutcome, AutoReviewResolution, AutoReviewService, REVIEW_DECISION_VOCABULARY,
+    REVIEW_INSTRUCTIONS, REVIEW_OUTCOME_CRITERIA,
+};
 
 pub use crate::workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
@@ -98,6 +101,9 @@ pub(crate) enum ToolExecutionRejection {
     InvalidJsonArguments,
     ToolScopeDenied,
     DelegationScopeDenied,
+    /// The auto-reviewer asked the requester to explain the call, so it was
+    /// handed back instead of being decided.
+    ReturnedToRequester,
     PermissionDeniedByPolicy,
     PermissionDeniedByUser,
 }
@@ -2393,6 +2399,21 @@ impl Agent {
         self.active_history_items()
     }
 
+    /// The assistant's most recent narration, which is what the requester last
+    /// made visible. Reasoning is not narration and stays out of it.
+    pub fn last_visible_assistant_text(&self) -> Option<String> {
+        self.active_history_items()
+            .into_iter()
+            .rev()
+            .find_map(|item| match item {
+                HistoryItem::AssistantTurn { text, .. } => {
+                    let text = text?;
+                    (!text.trim().is_empty()).then_some(text)
+                }
+                _ => None,
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn protocol_frames_for_test(&self) -> Vec<crate::protocol_frames::ProtocolFrame> {
         self.active_protocol_frames()
@@ -2468,6 +2489,16 @@ impl Agent {
             bail!("auto permission mode requires a reviewer service");
         };
         service.review(self, request, user_goal).await
+    }
+
+    /// Accounts for one auto-reviewer `ask_user` on this call and reports the
+    /// ladder round it lands on.
+    pub(crate) fn auto_review_round(&self, tool: &str, args: &Value) -> Result<AutoReviewRound> {
+        Ok(self
+            .permission_session
+            .lock()
+            .map_err(|_| anyhow!("permission session poisoned"))?
+            .auto_review_round(tool, args))
     }
 
     pub fn set_subagent_child_factory(&mut self, factory: Arc<dyn SubagentChildFactory>) {
@@ -5051,6 +5082,7 @@ impl ToolExecutionRejection {
             Self::InvalidJsonArguments => "invalid_json_arguments",
             Self::ToolScopeDenied => "tool_scope_denied",
             Self::DelegationScopeDenied => "delegation_scope_denied",
+            Self::ReturnedToRequester => "returned_to_requester",
             Self::PermissionDeniedByPolicy => "permission_denied_by_policy",
             Self::PermissionDeniedByUser => "permission_denied_by_user",
         }

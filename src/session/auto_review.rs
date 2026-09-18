@@ -9,11 +9,14 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::agent::{Agent, AgentTemplate, AutoReviewResolution, AutoReviewService};
+use crate::agent::{
+    Agent, AgentTemplate, AutoReviewOutcome, AutoReviewResolution, AutoReviewService,
+    REVIEW_DECISION_VOCABULARY,
+};
 use crate::permission::PermissionRequest;
 use crate::session::event::PermissionResolutionEvent;
 use crate::session::runner::{
-    PermissionResponse, SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
+    SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
 };
 #[cfg(test)]
 use crate::subagent::SubagentStatus;
@@ -64,10 +67,6 @@ impl StickyAutoReviewer {
             provider_api_key_hints,
             api_key_hint,
         }
-    }
-
-    pub fn clear_sticky_session(&self) {
-        self.clear_sticky();
     }
 
     fn resolve_route(
@@ -135,12 +134,6 @@ impl StickyAutoReviewer {
         )
     }
 
-    fn emit(&self, event: SessionTransportEvent) {
-        if let Some(tx) = &self.event_tx {
-            let _ = tx.send(event);
-        }
-    }
-
     fn sticky_child_id(&self) -> String {
         self.inner
             .lock()
@@ -167,25 +160,17 @@ impl StickyAutoReviewer {
     fn record_decision(
         &self,
         request: &PermissionRequest,
-        outcome: &ParsedReview,
+        parsed: &ParsedReview,
         child_session_id: &str,
     ) -> Result<()> {
-        let mut recorder = self
-            .parent_transcript
-            .lock()
-            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-        recorder.record_permission_decision_full(
-            request.call_id.clone(),
-            request.tool.clone(),
-            request.args.clone(),
-            outcome.response.allowed(),
-            Some(outcome.rationale.clone()),
-            Some("auto".into()),
-            Some(outcome.approval_label().into()),
-            outcome.risk.clone(),
-            (!child_session_id.is_empty()).then(|| child_session_id.to_string()),
-        )?;
-        Ok(())
+        record_auto_decision(
+            &self.parent_transcript,
+            request,
+            parsed.outcome,
+            &parsed.rationale,
+            parsed.risk.as_deref(),
+            (!child_session_id.is_empty()).then_some(child_session_id),
+        )
     }
 }
 
@@ -212,7 +197,7 @@ impl AutoReviewService for StickyAutoReviewer {
             if !self.route_has_api_key(parent, &route)? {
                 let rationale = self.missing_api_key_rationale(&route);
                 let denied = ParsedReview {
-                    response: PermissionResponse::Deny,
+                    outcome: AutoReviewOutcome::Deny,
                     risk: Some("high".into()),
                     rationale,
                 };
@@ -222,7 +207,7 @@ impl AutoReviewService for StickyAutoReviewer {
             }
 
             let goal = user_goal.or_else(|| self.latest_user_goal());
-            let prompt = build_review_prompt(&request, goal.as_deref());
+            let prompt = expert_review_prompt(parent, &request, goal.as_deref());
 
             let parent_session_id = self
                 .parent_transcript
@@ -309,7 +294,7 @@ impl AutoReviewService for StickyAutoReviewer {
                 Ok(summary) => summary,
                 Err(error) => {
                     let parsed = ParsedReview {
-                        response: PermissionResponse::Deny,
+                        outcome: AutoReviewOutcome::Deny,
                         rationale: format!("auto-review failed: {error:#}"),
                         risk: Some("high".into()),
                     };
@@ -334,6 +319,17 @@ impl AutoReviewService for StickyAutoReviewer {
                 .map_err(|_| anyhow!("auto-review output capture poisoned"))?;
             let parsed =
                 parse_reviewer_output(&summary, full_output.as_deref(), request.can_allow_always);
+            if parsed.outcome == AutoReviewOutcome::Ask {
+                // Not a decision: the call goes to the user through the same prompt
+                // `default` mode uses, and that path records the answer. The reviewer's
+                // reasoning stays in its own child transcript.
+                tracing::debug!(
+                    call_id = request.call_id.as_deref().unwrap_or_default(),
+                    rationale = %parsed.rationale,
+                    "auto-review left the call to the user"
+                );
+                return Ok(parsed.into_resolution());
+            }
 
             self.record_decision(&request, &parsed, &child_session_id)?;
             self.emit_resolution(&request, &parsed, &child_session_id);
@@ -356,70 +352,130 @@ impl StickyAutoReviewer {
         parsed: &ParsedReview,
         child_session_id: &str,
     ) {
-        let call_id = request
-            .call_id
-            .clone()
-            .unwrap_or_else(|| request.tool.clone());
-        let decision = match parsed.response {
-            PermissionResponse::Deny => crate::session::PermissionDecision::Denied,
-            _ => crate::session::PermissionDecision::Approved,
-        };
-        self.emit(SessionTransportEvent::PermissionResolved(
-            PermissionResolutionEvent {
-                call_id,
-                decision,
-                reason: Some(parsed.rationale.clone()),
-                tool_name: Some(request.tool.clone()),
-                summary: Some(request.summary.clone()),
-                origin_label: Some(REVIEWER_AGENT_NAME.into()),
-                approval: Some(parsed.approval_label().into()),
-                risk: parsed.risk.clone(),
-                reviewer_child_session_id: (!child_session_id.is_empty())
-                    .then(|| child_session_id.to_string()),
-            },
-        ));
+        emit_auto_resolution(
+            self.event_tx.as_ref(),
+            request,
+            parsed.outcome,
+            &parsed.rationale,
+            parsed.risk.as_deref(),
+            (!child_session_id.is_empty()).then_some(child_session_id),
+        );
     }
 }
 
+/// Records a decided outcome in the parent transcript.
+///
+/// `ask` never reaches here: it is handed back to the requester for one round of
+/// explanation, and to the user when that round settles nothing.
+pub(crate) fn record_auto_decision(
+    parent_transcript: &Mutex<TranscriptRecorder>,
+    request: &PermissionRequest,
+    outcome: AutoReviewOutcome,
+    rationale: &str,
+    risk: Option<&str>,
+    reviewer_child_session_id: Option<&str>,
+) -> Result<()> {
+    let mut recorder = parent_transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+    recorder.record_permission_decision_full(
+        request.call_id.clone(),
+        request.tool.clone(),
+        request.args.clone(),
+        outcome
+            .approval()
+            .is_some_and(|approval| approval.allowed()),
+        Some(rationale.to_string()),
+        Some("auto".into()),
+        Some(outcome.label().into()),
+        risk.map(str::to_string),
+        reviewer_child_session_id.map(str::to_string),
+    )?;
+    Ok(())
+}
+
+/// Announces a decided outcome to the session transport.
+pub(crate) fn emit_auto_resolution(
+    event_tx: Option<&SessionTransportEventSender>,
+    request: &PermissionRequest,
+    outcome: AutoReviewOutcome,
+    rationale: &str,
+    risk: Option<&str>,
+    reviewer_child_session_id: Option<&str>,
+) {
+    let Some(event_tx) = event_tx else {
+        return;
+    };
+    let call_id = request
+        .call_id
+        .clone()
+        .unwrap_or_else(|| request.tool.clone());
+    let decision = match outcome {
+        AutoReviewOutcome::Deny => crate::session::PermissionDecision::Denied,
+        _ => crate::session::PermissionDecision::Approved,
+    };
+    let _ = event_tx.send(SessionTransportEvent::PermissionResolved(
+        PermissionResolutionEvent {
+            call_id,
+            decision,
+            reason: Some(rationale.to_string()),
+            tool_name: Some(request.tool.clone()),
+            summary: Some(request.summary.clone()),
+            origin_label: Some(REVIEWER_AGENT_NAME.into()),
+            approval: Some(outcome.label().into()),
+            risk: risk.map(str::to_string),
+            reviewer_child_session_id: reviewer_child_session_id.map(str::to_string),
+        },
+    ));
+}
+
 struct ParsedReview {
-    response: PermissionResponse,
+    outcome: AutoReviewOutcome,
     rationale: String,
     risk: Option<String>,
 }
 
 impl ParsedReview {
-    fn approval_label(&self) -> &'static str {
-        match self.response {
-            PermissionResponse::AllowOnce => "once",
-            PermissionResponse::AllowAlways => "always",
-            PermissionResponse::Deny => "deny",
-        }
-    }
-
     fn into_resolution(self) -> AutoReviewResolution {
         AutoReviewResolution {
-            approval: match self.response {
-                PermissionResponse::AllowOnce => crate::permission::PermissionApproval::AllowOnce,
-                PermissionResponse::AllowAlways => {
-                    crate::permission::PermissionApproval::AllowAlways
-                }
-                PermissionResponse::Deny => crate::permission::PermissionApproval::Deny,
-            },
+            outcome: self.outcome,
             reason: self.rationale,
         }
     }
 }
 
-fn build_review_prompt(request: &PermissionRequest, user_goal: Option<&str>) -> String {
+/// The reviewer expert's prompt, carrying the requesting agent's own most
+/// recent visible narration next to the goal it is judged against.
+fn expert_review_prompt(
+    parent: &Agent,
+    request: &PermissionRequest,
+    user_goal: Option<&str>,
+) -> String {
+    let executor_context = parent.last_visible_assistant_text();
+    build_review_prompt(request, user_goal, executor_context.as_deref())
+}
+
+pub(crate) fn build_review_prompt(
+    request: &PermissionRequest,
+    user_goal: Option<&str>,
+    executor_context: Option<&str>,
+) -> String {
     let args = serde_json::to_string_pretty(&request.args).unwrap_or_else(|_| "{}".into());
     let goal = user_goal.unwrap_or("(not provided)");
     let preview = request.preview.as_deref().unwrap_or("(none)");
+    // Absent narration leaves the prompt as it was before the requester said
+    // anything visible.
+    let executor_context = executor_context
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("Requester's most recent visible message:\n{text}\n\n"))
+        .unwrap_or_default();
     format!(
         "Approve or deny this tool permission request.\n\
          \n\
          User goal:\n{goal}\n\
          \n\
-         Tool: {}\n\
+         {executor_context}Tool: {}\n\
          Class: {}\n\
          Summary: {}\n\
          Preview: {preview}\n\
@@ -427,8 +483,8 @@ fn build_review_prompt(request: &PermissionRequest, user_goal: Option<&str>) -> 
          Arguments:\n{args}\n\
          \n\
          Reply with ONLY JSON:\n\
-         {{\"decision\":\"allow_once|deny\",\"risk\":\"low|medium|high\",\"rationale\":\"...\"}}\n\
-         Respect the user's goal and the agent's autonomy. Deny only when the call clearly conflicts with the user's intent or has unacceptable risk.",
+         {{\"decision\":\"{REVIEW_DECISION_VOCABULARY}\",\"risk\":\"low|medium|high\",\"rationale\":\"...\"}}\n\
+         Respect the user's goal and the agent's autonomy. Refuse only when the call clearly conflicts with the user's intent or has unacceptable risk; choose ask_user whenever the state does not settle it.",
         request.tool,
         request.class.as_str(),
         request.summary,
@@ -466,7 +522,7 @@ fn parse_reviewer_output(
         }
     }
     ParsedReview {
-        response: PermissionResponse::Deny,
+        outcome: AutoReviewOutcome::Deny,
         rationale: format!(
             "auto-review returned unparseable output: {}",
             one_line(&summary.summary, 160)
@@ -483,15 +539,16 @@ fn try_parse_reviewer_json(raw: &str, can_allow_always: bool) -> Option<ParsedRe
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| "no rationale provided".into());
     let decision = parsed.decision.trim().to_ascii_lowercase();
-    let response = match decision.as_str() {
-        "allow_once" | "allow" | "once" => PermissionResponse::AllowOnce,
-        "allow_always" | "always" if can_allow_always => PermissionResponse::AllowAlways,
-        "allow_always" | "always" => PermissionResponse::AllowOnce,
-        "deny" | "reject" => PermissionResponse::Deny,
+    let outcome = match decision.as_str() {
+        "execute" | "run" | "allow_once" | "allow" | "once" => AutoReviewOutcome::AllowOnce,
+        "allow_always" | "always" if can_allow_always => AutoReviewOutcome::AllowAlways,
+        "allow_always" | "always" => AutoReviewOutcome::AllowOnce,
+        "ask_user" | "ask" => AutoReviewOutcome::Ask,
+        "refuse" | "deny" | "reject" => AutoReviewOutcome::Deny,
         _ => return None,
     };
     Some(ParsedReview {
-        response,
+        outcome,
         rationale,
         risk: parsed.risk,
     })
@@ -563,6 +620,7 @@ mod tests {
             protocol,
             default_model: model.into(),
             retry: None,
+            reviewer: None,
             models: indexmap::IndexMap::from([(model.into(), test_model_config(protocol))]),
         }
     }
@@ -607,9 +665,37 @@ mod tests {
     }
 
     #[test]
+    fn expert_review_prompt_carries_the_requesters_last_visible_message() {
+        let mut parent = Agent::new("parent-model", 1, 1);
+        parent.set_history_for_test(vec![
+            crate::protocol_frames::ProtocolItem::user("run the test suite"),
+            crate::protocol_frames::ProtocolItem::assistant("I will run the test suite next"),
+        ]);
+
+        let prompt =
+            expert_review_prompt(&parent, &permission_request(), Some("run the test suite"));
+
+        assert!(
+            prompt.contains(
+                "Requester's most recent visible message:\nI will run the test suite next"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn expert_review_prompt_omits_narration_when_the_requester_has_none() {
+        let parent = Agent::new("parent-model", 1, 1);
+
+        let prompt = expert_review_prompt(&parent, &permission_request(), None);
+
+        assert!(!prompt.contains("most recent visible message"), "{prompt}");
+    }
+
+    #[test]
     fn unparseable_output_denies() {
         let denied = parse_reviewer_output(&completed_summary("I allow this"), None, true);
-        assert!(matches!(denied.response, PermissionResponse::Deny));
+        assert_eq!(denied.outcome, AutoReviewOutcome::Deny);
         assert!(
             denied
                 .rationale
@@ -624,7 +710,29 @@ mod tests {
             None,
             false,
         );
-        assert!(matches!(parsed.response, PermissionResponse::AllowOnce));
+        assert_eq!(parsed.outcome, AutoReviewOutcome::AllowOnce);
+    }
+
+    #[test]
+    fn reviewer_decisions_map_to_the_three_outcomes() {
+        let cases = [
+            (
+                r#"{"decision":"execute","risk":"low","rationale":"read only"}"#,
+                AutoReviewOutcome::AllowOnce,
+            ),
+            (
+                r#"{"decision":"ask_user","risk":"medium","rationale":"deletes files"}"#,
+                AutoReviewOutcome::Ask,
+            ),
+            (
+                r#"{"decision":"refuse","risk":"high","rationale":"contradicts the goal"}"#,
+                AutoReviewOutcome::Deny,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let parsed = parse_reviewer_output(&completed_summary(raw), None, false);
+            assert_eq!(parsed.outcome, expected, "{raw}");
+        }
     }
 
     #[test]
@@ -640,7 +748,7 @@ mod tests {
             true,
         );
 
-        assert!(matches!(parsed.response, PermissionResponse::AllowOnce));
+        assert_eq!(parsed.outcome, AutoReviewOutcome::AllowOnce);
         assert_eq!(parsed.rationale, rationale);
     }
 
@@ -692,10 +800,7 @@ mod tests {
             .await
             .expect("credential failure should become a denial");
 
-        assert!(matches!(
-            resolution.approval,
-            crate::permission::PermissionApproval::Deny
-        ));
+        assert_eq!(resolution.outcome, AutoReviewOutcome::Deny);
         assert!(
             resolution
                 .reason
@@ -774,7 +879,7 @@ mod tests {
                 .contains("historical model route 'old-provider/reviewer-model' is not allowed")
         );
 
-        reviewer.clear_sticky_session();
+        reviewer.clear_sticky();
         assert_eq!(
             reviewer
                 .resolve_route(&parent, &AgentTemplate::reviewer(), None)

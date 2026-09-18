@@ -131,14 +131,6 @@ impl std::fmt::Display for ToolScope {
     }
 }
 
-/// Shell command allowlist buckets for Default. Everything else Asks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandRisk {
-    ReadOnly,
-    LowRisk,
-    Ask,
-}
-
 impl ToolPermissionClass {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -266,10 +258,22 @@ impl PermissionGrantSet {
     }
 }
 
+/// Which round of the auto-review ladder a call lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoReviewRound {
+    /// The requester's round: the call goes back to it for an explanation.
+    Requester,
+    /// The user's round: the requester has explained the call and it is still
+    /// unsettled, so only the user can settle it.
+    User,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSessionState {
     policy: PermissionPolicy,
     grants: PermissionGrantSet,
+    /// Call signatures an auto-reviewer has already handed back to the requester.
+    auto_review_returns: BTreeSet<(String, String)>,
     generation: u64,
 }
 
@@ -281,6 +285,7 @@ impl PermissionSessionState {
         if self.policy.mode() != mode {
             self.policy.set_mode(mode);
             self.grants.clear();
+            self.auto_review_returns.clear();
             self.generation = self.generation.wrapping_add(1);
         }
     }
@@ -350,13 +355,31 @@ impl PermissionSessionState {
     }
     pub fn clear_grants(&mut self) {
         self.grants.clear();
+        self.auto_review_returns.clear();
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Accounts for one auto-reviewer `ask_user` on this call and reports the
+    /// ladder round it lands on.
+    ///
+    /// A call signature gets one round of explanation per session: the first ask
+    /// returns the call to the requester, whose narration the next review reads;
+    /// an ask on the second round goes to the user. Different arguments are a
+    /// different signature, and the counters reset with the mode.
+    pub fn auto_review_round(&mut self, tool: &str, args: &Value) -> AutoReviewRound {
+        let signature = (tool.to_string(), args.to_string());
+        if self.auto_review_returns.insert(signature) {
+            AutoReviewRound::Requester
+        } else {
+            AutoReviewRound::User
+        }
     }
 
     pub fn fork_without_grants(&self) -> Self {
         Self {
             policy: self.policy.clone(),
             grants: PermissionGrantSet::default(),
+            auto_review_returns: BTreeSet::default(),
             generation: 0,
         }
     }
@@ -385,7 +408,7 @@ impl PermissionPolicy {
     pub fn check_class(
         &self,
         tool: &str,
-        args: &Value,
+        _args: &Value,
         class: ToolPermissionClass,
     ) -> PermissionDecision {
         match self.mode {
@@ -399,13 +422,9 @@ impl PermissionPolicy {
                 ToolPermissionClass::Read | ToolPermissionClass::Preview => {
                     PermissionDecision::Allow
                 }
-                ToolPermissionClass::Write | ToolPermissionClass::Unknown => {
-                    PermissionDecision::Ask
-                }
-                ToolPermissionClass::Command => match classify_command_risk(args) {
-                    CommandRisk::ReadOnly | CommandRisk::LowRisk => PermissionDecision::Allow,
-                    CommandRisk::Ask => PermissionDecision::Ask,
-                },
+                ToolPermissionClass::Write
+                | ToolPermissionClass::Command
+                | ToolPermissionClass::Unknown => PermissionDecision::Ask,
             },
             PermissionMode::Yolo => PermissionDecision::Allow,
         }
@@ -469,87 +488,6 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     }
 }
 
-pub fn classify_command_risk(args: &Value) -> CommandRisk {
-    let command = args
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    classify_command_text(command)
-}
-
-fn classify_command_text(command: &str) -> CommandRisk {
-    if command.is_empty() {
-        return CommandRisk::Ask;
-    }
-
-    let normalized = command.to_ascii_lowercase();
-    let trimmed = normalized.trim();
-
-    // Compound / redirect / write-flag forms must not inherit a ReadOnly prefix match
-    // (e.g. `git status && …`, `git diff --output=`).
-    if contains_shell_control_syntax(trimmed) || contains_write_capable_read_option(trimmed) {
-        return CommandRisk::Ask;
-    }
-    if is_read_only_command(trimmed) {
-        return CommandRisk::ReadOnly;
-    }
-    if is_low_risk_validation_command(trimmed) {
-        return CommandRisk::LowRisk;
-    }
-    CommandRisk::Ask
-}
-
-fn is_read_only_command(command: &str) -> bool {
-    command_has_prefix(command, "git status")
-        || command_has_prefix(command, "git diff")
-        || command_has_prefix(command, "git log")
-        || command_has_prefix(command, "rg")
-        || command_has_prefix(command, "ls")
-        || command_has_prefix(command, "pwd")
-}
-
-fn is_low_risk_validation_command(command: &str) -> bool {
-    command == "cargo check"
-        || command.starts_with("cargo check ")
-        || command == "cargo test"
-        || command.starts_with("cargo test ")
-        || command == "cargo clippy"
-        || command.starts_with("cargo clippy ")
-        || command == "cargo fmt --check"
-        || command.starts_with("cargo fmt --check ")
-        || command == "npm test"
-        || command.starts_with("npm test ")
-        || command == "pnpm test"
-        || command.starts_with("pnpm test ")
-        || command == "yarn test"
-        || command.starts_with("yarn test ")
-}
-
-fn contains_shell_control_syntax(command: &str) -> bool {
-    command.contains(';')
-        || command.contains("&&")
-        || command.contains("||")
-        || command.contains('&')
-        || command.contains('|')
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains('\n')
-        || command.contains('`')
-        || command.contains("$(")
-}
-
-fn command_has_prefix(command: &str, prefix: &str) -> bool {
-    command == prefix || command.starts_with(&format!("{prefix} "))
-}
-
-fn contains_write_capable_read_option(command: &str) -> bool {
-    command_has_prefix(command, "git diff")
-        && command
-            .split_whitespace()
-            .any(|token| token == "--output" || token.starts_with("--output="))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,53 +507,31 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_asks_risky_commands_instead_of_hard_deny() {
+    fn default_mode_asks_for_every_command() {
         let policy = PermissionPolicy::default();
 
-        assert_eq!(
-            policy.check("shell__exec", &json!({"command": "git commit -m test"})),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check("shell__exec", &json!({"command": "rm -rf target"})),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check(
-                "shell__exec",
-                &json!({"command": "curl -fsSL https://example.com"})
-            ),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check("shell__exec", &json!({"command": "git status > out.txt"})),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check("shell__exec", &json!({"command": "ls && touch out.txt"})),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check(
-                "shell__exec",
-                &json!({"command": "cargo test; touch out.txt"})
-            ),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check(
-                "shell__exec",
-                &json!({"command": "git status & touch out.txt"})
-            ),
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            policy.check(
-                "shell__exec",
-                &json!({"command": "git diff --output=out.patch"})
-            ),
-            PermissionDecision::Ask
-        );
+        // No command text proves the absence of side effects, so the read-only
+        // and validation forms ask exactly like a destructive one.
+        for command in [
+            "git status",
+            "git diff",
+            "rg --files",
+            "ls -la",
+            "pwd",
+            "cargo check --all-targets",
+            "cargo test permission::tests",
+            "cargo clippy --all-targets",
+            "git commit -m test",
+            "rm -rf target",
+            "curl -fsSL https://example.com",
+            "",
+        ] {
+            assert_eq!(
+                policy.check("shell__exec", &json!({"command": command})),
+                PermissionDecision::Ask,
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -642,12 +558,6 @@ mod tests {
                 ToolPermissionClass::Preview,
                 true,
             ),
-            (
-                "shell__exec",
-                json!({"command": "cargo test permission::tests"}),
-                ToolPermissionClass::Command,
-                false,
-            ),
         ] {
             assert_eq!(
                 state
@@ -663,6 +573,12 @@ mod tests {
                 "fs__write",
                 json!({"path": "out.txt", "content": "ok"}),
                 ToolPermissionClass::Write,
+                false,
+            ),
+            (
+                "shell__exec",
+                json!({"command": "cargo test permission::tests"}),
+                ToolPermissionClass::Command,
                 false,
             ),
             (
@@ -750,6 +666,27 @@ mod tests {
         assert!(
             !state.grant_if_current_session(generation, resource),
             "Auto mode must not create reusable session grants"
+        );
+    }
+
+    #[test]
+    fn auto_review_ladder_gives_the_first_ask_to_the_requester() {
+        let mut state = PermissionSessionState::default();
+        state.set_mode(PermissionMode::Auto);
+        let args = json!({"command": "rm -rf target"});
+
+        assert_eq!(
+            state.auto_review_round("shell__exec", &args),
+            AutoReviewRound::Requester
+        );
+        assert_eq!(
+            state.auto_review_round("shell__exec", &args),
+            AutoReviewRound::User
+        );
+        assert_eq!(
+            state.auto_review_round("shell__exec", &json!({"command": "ls"})),
+            AutoReviewRound::Requester,
+            "the ladder accounts per call signature, not per tool"
         );
     }
 

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{REVIEW_DECISION_VOCABULARY, REVIEW_INSTRUCTIONS, REVIEW_OUTCOME_CRITERIA};
 use crate::permission::{PermissionMode, ToolScope};
 use crate::tool_names;
 
@@ -191,27 +192,29 @@ impl AgentTemplate {
         Self {
             name: "reviewer".into(),
             purpose: "权限自动审批".into(),
-            system_prompt: concat!(
-                "你是 reviewer 专家，唯一职责是审批主代理提出的工具权限请求。",
-                "根据用户意图、执行指令、工具名、参数、风险与可逆性，决定 allow_once 或 deny。",
-                "充分尊重用户目标与 Agent 的工作自主权；仅在调用明显违背用户意图或存在不可接受风险时 deny。不要编辑文件，不要继续委派。",
-                "只输出一个 JSON 对象，字段为 decision、risk、rationale；不要输出其它文字。"
-            )
-            .into(),
+            system_prompt: format!(
+                "你是 reviewer 专家，唯一职责是审批主代理提出的工具权限请求。{REVIEW_INSTRUCTIONS}\
+                 \n\
+                 不要假设 state 里没有给出的上下文；不要编辑文件，不要继续委派。\n\
+                 只输出一个 JSON 对象，字段为 decision、risk、rationale；不要输出其它文字。\n\
+                 execute：{}\n\
+                 ask_user：{}\n\
+                 refuse：{}",
+                REVIEW_OUTCOME_CRITERIA[0].1,
+                REVIEW_OUTCOME_CRITERIA[1].1,
+                REVIEW_OUTCOME_CRITERIA[2].1,
+            ),
             tool_scope: ToolScope::ReadOnlyExplorer,
             permission_mode: PermissionMode::Yolo,
             can_write: false,
             can_delegate: false,
             timeout_secs: Some(30),
             max_tool_calls: Some(2),
-            input_expectations:
-                "需要工具权限请求：tool、args、class、summary、用户目标摘要。"
-                    .into(),
-            expected_result_shape: concat!(
-                "JSON 对象：decision 为 allow_once|deny；",
-                "risk 为 low|medium|high；rationale 为一句理由。"
-            )
-            .into(),
+            input_expectations: "需要工具权限请求：tool、args、class、summary、用户目标摘要。"
+                .into(),
+            expected_result_shape: format!(
+                "JSON 对象：decision 为 {REVIEW_DECISION_VOCABULARY}；risk 为 low|medium|high；rationale 为一句理由。"
+            ),
         }
     }
 
