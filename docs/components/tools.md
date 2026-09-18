@@ -50,7 +50,7 @@ MCP tool 名称规范化为 `<server>__<tool>`，schema 作为 parameters，调�
 
 ## 事件与结果
 
-一次工具调用会产生 started、output delta、cancelled 和 finished 事件，并记录 `Executed`、`Rejected` 或 `TimedOut`。拒绝原因包括 invalid JSON、scope denied、delegation scope denied、permission policy denied 和 user denied。
+一次工具调用会产生 started、output delta、cancelled 和 finished 事件，并记录 `Executed`、`Rejected` 或 `TimedOut`。拒绝原因包括 invalid JSON、scope denied、delegation scope denied、permission policy denied、returned_to_requester（auto 审查把调用退回请求方补充说明）和 user denied。
 
 `ToolResult::ok` 返回 `ok: true` 与可选 data；handler/registry failure 返回 `ok: false` 与 `ToolError`。工具 execution summary 会保留 tool identity、effects、status、拒绝原因和必要的 primary path/command，供 Agent、Session、Transcript、TUI 和 audit 使用。
 

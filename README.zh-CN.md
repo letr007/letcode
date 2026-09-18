@@ -121,6 +121,26 @@ older_than_days = 7
 [permissions]
 mode = "default" # solo 是 yolo 的兼容别名
 
+# 实验性：[agents.reviewer] 指向带 reviewer = "jev" 标记的 provider 时，
+# auto 模式改由 Typesafe Jev 判定。每次审查用该 provider 的 base_url 与凭据、
+# 以及路由里的模型发一个 choice 问题，返回概率而不是文本。
+# [providers.typesafe]
+# protocol = "responses"
+# flavor = "standard"
+# default_model = "jev-latest"
+# reviewer = "jev"
+# [providers.typesafe.auth]
+# type = "bearer"
+# credential_env = "TYPESAFE_API_KEY"
+# [providers.typesafe.endpoints]
+# base_url = "https://api.typesafe.ai"
+# [providers.typesafe.models."jev-latest"]
+# display = "Jev"
+#
+# [agents.reviewer]
+# provider = "typesafe"
+# model = "jev-latest"
+
 # 可选；为内置专家指定默认路由或单次委派可选路由。
 # [agents.explorer]
 # provider = "openai"

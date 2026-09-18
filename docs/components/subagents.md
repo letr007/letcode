@@ -13,7 +13,7 @@ Subagent 委派通过 Agent 的 delegation tools 进入 `SubagentPool`。当前�
 | `librarian` | `agent__librarian` | 资料、证据和上下文整理 | 否 |
 | `general` | `agent__general` | 边界明确的只读通用辅助 | 否 |
 
-`reviewer` 是 permission review 专家，`historian` 是内部历史整理专家；两者可配置独立模型，但不属于六个可委派 subagent tool 的目录。child agent 不暴露任何 `agent__*` delegation tool，因此不能递归委派。Historian 使用自定义 one-shot executor 和同一子会话导航，详情见[历史整理与证据恢复](context-history.md)。
+`reviewer` 是 permission review 专家，`historian` 是内部历史整理专家；两者可配置独立模型，但不属于六个可委派 subagent tool 的目录。`reviewer` 按 `execute` / `ask_user` / `refuse` 三档输出 JSON 判定：`ask_user` 表示该次调用先退回请求方补充说明，仍不明确时才弹出与 `default` 模式相同的人工审批；运行失败、凭据缺失或输出无法解析都按拒绝处理。无交互前端（如 one-shot `--print`）无法回答升级后的人工审批，这种情形下该次调用以失败结束，而不是挂起。child agent 不暴露任何 `agent__*` delegation tool，因此不能递归委派。Historian 使用自定义 one-shot executor 和同一子会话导航，详情见[历史整理与证据恢复](context-history.md)。
 
 Pool 控制入口为：
 

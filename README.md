@@ -122,6 +122,27 @@ older_than_days = 7
 [permissions]
 mode = "default" # solo remains accepted as a yolo alias
 
+# Experimental: auto mode asks Typesafe Jev instead of the chat reviewer when
+# [agents.reviewer] routes to a provider marked reviewer = "jev". One review
+# posts a single choice question to that provider's base URL with its credential
+# and the route's model, and returns probabilities instead of prose.
+# [providers.typesafe]
+# protocol = "responses"
+# flavor = "standard"
+# default_model = "jev-latest"
+# reviewer = "jev"
+# [providers.typesafe.auth]
+# type = "bearer"
+# credential_env = "TYPESAFE_API_KEY"
+# [providers.typesafe.endpoints]
+# base_url = "https://api.typesafe.ai"
+# [providers.typesafe.models."jev-latest"]
+# display = "Jev"
+#
+# [agents.reviewer]
+# provider = "typesafe"
+# model = "jev-latest"
+
 # Optional; choose a default route and per-invocation allowed routes for an expert.
 # [agents.explorer]
 # provider = "openai"
