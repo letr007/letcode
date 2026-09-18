@@ -580,6 +580,7 @@ mod expert_route_switch_tests {
             protocol: crate::config::ApiProtocol::Completions,
             default_model: models.first().copied().unwrap_or_default().into(),
             retry: None,
+            reviewer: None,
             models: models
                 .iter()
                 .map(|model| {

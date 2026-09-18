@@ -1552,6 +1552,16 @@ impl ProviderFlavor {
     }
 }
 
+/// Approval reviewer backend a provider serves instead of chat turns. The
+/// reviewer route selects it; the provider supplies the endpoint, credential
+/// and model it is reached with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderReviewerBackend {
+    /// Typesafe Jev: one `choice` question per review at `/v1/systemone`.
+    Jev,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthScheme {
@@ -1932,6 +1942,8 @@ pub struct RuntimeProviderConfig {
     pub retry: Option<RuntimeRetryConfig>,
     #[serde(default)]
     pub flavor: Option<ProviderFlavor>,
+    #[serde(default)]
+    pub reviewer: Option<ProviderReviewerBackend>,
     pub auth: RuntimeAuthConfig,
     pub endpoints: RuntimeEndpoints,
     #[serde(default)]
@@ -2099,6 +2111,17 @@ impl RuntimeConfig {
                 }
             })?;
             validate_auth(provider_name, &provider.auth)?;
+            if provider.reviewer == Some(ProviderReviewerBackend::Jev)
+                && !matches!(provider.auth.scheme, AuthScheme::Bearer)
+            {
+                // The Jev request builder sends a Bearer token, so any other
+                // scheme would reach the endpoint with a credential the
+                // provider did not declare.
+                return Err(RuntimeConfigError::InvalidValue {
+                    field: format!("providers.{provider_name}.auth"),
+                    reason: "the jev reviewer authenticates with a Bearer token; set auth.type = \"bearer\"".into(),
+                });
+            }
             if matches!(provider.auth.scheme, AuthScheme::Header) {
                 let name = provider.auth.name.as_deref().unwrap_or_default();
                 if provider
@@ -3116,6 +3139,7 @@ fn is_reserved_header(value: &str) -> bool {
 pub struct ResolvedProvider {
     pub name: String,
     pub flavor: ProviderFlavor,
+    pub reviewer: Option<ProviderReviewerBackend>,
     pub default_model: String,
     pub retry: Option<RuntimeRetryConfig>,
     pub auth: RuntimeAuthConfig,
@@ -3229,6 +3253,7 @@ impl ResolvedProvider {
         Ok(Self {
             name: name.to_owned(),
             flavor: config.flavor.unwrap_or_default(),
+            reviewer: config.reviewer,
             default_model: config.default_model.clone().unwrap_or_default(),
             retry: config.retry.clone(),
             auth: auth.clone(),
@@ -4279,6 +4304,30 @@ protocol = "completions"
                 .1,
             "global"
         );
+    }
+
+    #[test]
+    fn jev_reviewer_configuration_requires_bearer_auth() {
+        let rejected = runtime_config(
+            "typesafe",
+            "type = \"header\"\nname = \"x-api-key\"\ncredential = \"secret\"",
+            "reviewer = \"jev\"",
+            "",
+        );
+        let error = RuntimeConfig::from_toml(&rejected).unwrap_err();
+        assert!(
+            error.to_string().contains("providers.typesafe.auth"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("bearer"), "{error}");
+
+        let accepted = runtime_config(
+            "typesafe",
+            "type = \"bearer\"\ncredential = \"secret\"",
+            "reviewer = \"jev\"",
+            "",
+        );
+        assert!(RuntimeConfig::from_toml(&accepted).is_ok());
     }
 
     #[test]

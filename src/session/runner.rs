@@ -1546,6 +1546,7 @@ mod tests {
             protocol: crate::config::ApiProtocol::Completions,
             default_model: "shared".into(),
             retry: None,
+            reviewer: None,
             models: indexmap::IndexMap::from([(
                 "shared".into(),
                 crate::config::ModelConfig {

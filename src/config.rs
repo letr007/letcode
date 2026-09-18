@@ -1,8 +1,8 @@
 use crate::model_runtime::{
     AuthScheme, CacheRetention, ProtocolRegistry, ProtocolSettings, ProviderFlavor,
-    ResolvedModelRoute, ResolvedProvider, RuntimeAuthConfig, RuntimeConfig,
-    RuntimeEndpointOverride, RuntimeEndpoints, RuntimeModelConfig, RuntimeProviderConfig,
-    RuntimeRetryConfig, RuntimeTransportConfig,
+    ProviderReviewerBackend, ResolvedModelRoute, ResolvedProvider, RuntimeAuthConfig,
+    RuntimeConfig, RuntimeEndpointOverride, RuntimeEndpoints, RuntimeModelConfig,
+    RuntimeProviderConfig, RuntimeRetryConfig, RuntimeTransportConfig,
 };
 use crate::permission::PermissionMode;
 use crate::request_builder::{
@@ -231,9 +231,7 @@ impl AppConfig {
             );
         }
 
-        let permissions = PermissionsConfig {
-            mode: raw.permissions.unwrap_or_default().mode.unwrap_or_default(),
-        };
+        let permissions = build_permissions_config(raw.permissions.unwrap_or_default())?;
         let tools = build_tools_config(raw.tools.unwrap_or_default())?;
         let fake = build_fake_config(raw.fake.unwrap_or_default())?;
         let agents =
@@ -455,6 +453,32 @@ pub struct PermissionsConfig {
     pub mode: PermissionMode,
 }
 
+/// Typesafe Jev reviewer: `POST {base_url}/v1/systemone` with a `state` object
+/// and one `choice` question, answered with probabilities instead of prose.
+///
+/// Resolved from the provider the reviewer route names, so the recorded route
+/// and the backend that answered it are the same provider/model pair.
+#[derive(Clone)]
+pub struct JevReviewConfig {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub credential: String,
+    pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for JevReviewConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JevReviewConfig")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("credential", &"<redacted>")
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
 /// Declarative values used when the session-level `/fake` switch is on.
 ///
 /// Every field is optional. Absent values resolve in [`crate::fake`] rather
@@ -552,6 +576,7 @@ pub struct ProviderConfig {
     pub protocol: ApiProtocol,
     pub default_model: String,
     pub retry: Option<RetryConfig>,
+    pub reviewer: Option<ProviderReviewerBackend>,
     pub models: IndexMap<String, ModelConfig>,
 }
 
@@ -564,6 +589,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("protocol", &self.protocol)
             .field("default_model", &self.default_model)
             .field("retry", &self.retry)
+            .field("reviewer", &self.reviewer)
             .field("models", &self.models)
             .finish()
     }
@@ -774,6 +800,10 @@ struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
 }
 
+/// Bounds one whole Jev review call, which sits on the permission path of the
+/// turn that waits for it.
+const DEFAULT_JEV_REVIEW_TIMEOUT_SECS: u64 = 10;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawToolsConfig {
@@ -816,6 +846,8 @@ struct RawProviderConfig {
     retry: Option<RawRetryConfig>,
     #[serde(default)]
     flavor: Option<ProviderFlavor>,
+    #[serde(default)]
+    reviewer: Option<ProviderReviewerBackend>,
     auth: Option<RuntimeAuthConfig>,
     endpoints: Option<RawRuntimeEndpoints>,
     #[serde(default)]
@@ -908,6 +940,7 @@ fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
                         &format!("providers.{name}.retry"),
                     )?),
                     flavor: provider.flavor,
+                    reviewer: provider.reviewer,
                     auth,
                     endpoints,
                     transport: provider.transport,
@@ -1122,7 +1155,34 @@ fn project_provider_config(provider: &ResolvedProvider) -> Result<ProviderConfig
         protocol,
         default_model,
         retry,
+        reviewer: provider.reviewer,
         models,
+    })
+}
+
+fn build_permissions_config(raw: RawPermissionsConfig) -> Result<PermissionsConfig> {
+    Ok(PermissionsConfig {
+        mode: raw.mode.unwrap_or_default(),
+    })
+}
+
+/// Typesafe Jev settings when `route` names a provider that declares
+/// `reviewer = "jev"`. The provider supplies the endpoint and credential it is
+/// reached with; the route supplies the model id.
+pub(crate) fn jev_review_for_route(
+    providers: &IndexMap<String, ProviderConfig>,
+    route: &ModelRoute,
+) -> Option<JevReviewConfig> {
+    let provider = providers.get(&route.provider)?;
+    if provider.reviewer != Some(ProviderReviewerBackend::Jev) {
+        return None;
+    }
+    Some(JevReviewConfig {
+        provider: route.provider.clone(),
+        base_url: provider.base_url.clone(),
+        model: route.model.clone(),
+        credential: provider.api_key.clone(),
+        timeout_secs: DEFAULT_JEV_REVIEW_TIMEOUT_SECS,
     })
 }
 
@@ -1656,6 +1716,61 @@ base_url = "https://example.invalid/v1"
             "[protocol_settings]",
             &format!("[providers.{provider}.models.\"{model}\".protocol_settings]"),
         )
+    }
+
+    #[test]
+    fn permissions_jev_section_is_rejected_as_unknown() {
+        let text = format!(
+            "{}\n[permissions]\nmode = \"auto\"\n\n[permissions.jev]\nbase_url = \"https://api.typesafe.ai\"\nmodel = \"jev-latest\"\n",
+            config("primary", "model-a", "")
+        );
+        let error = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+            .expect_err("removed section must be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `jev`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn reviewer_provider_marker_selects_the_jev_backend() {
+        let text = format!(
+            "{}\n[providers.typesafe]\nprotocol = \"responses\"\ndefault_model = \"jev-latest\"\nreviewer = \"jev\"\n\n[providers.typesafe.auth]\ntype = \"bearer\"\ncredential = \"typesafe-key\"\n\n[providers.typesafe.endpoints]\nbase_url = \"https://api.typesafe.ai\"\n\n[providers.typesafe.models.\"jev-latest\"]\n\n[agents.reviewer]\nprovider = \"typesafe\"\nmodel = \"jev-latest\"\n",
+            config("primary", "model-a", "")
+        );
+        let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+            .expect("config should load");
+        let route = loaded
+            .agents
+            .reviewer
+            .route
+            .clone()
+            .expect("reviewer route");
+        let jev = jev_review_for_route(&loaded.providers, &route).expect("jev backend");
+
+        assert_eq!(jev.provider, "typesafe");
+        assert_eq!(jev.base_url, "https://api.typesafe.ai");
+        assert_eq!(jev.model, "jev-latest");
+        assert_eq!(jev.credential, "typesafe-key");
+        assert_eq!(jev.timeout_secs, DEFAULT_JEV_REVIEW_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn unmarked_reviewer_provider_keeps_the_chat_backend() {
+        let text = format!(
+            "{}\n[agents.reviewer]\nprovider = \"primary\"\nmodel = \"model-a\"\n",
+            config("primary", "model-a", "")
+        );
+        let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+            .expect("config should load");
+        let route = loaded
+            .agents
+            .reviewer
+            .route
+            .clone()
+            .expect("reviewer route");
+
+        assert!(jev_review_for_route(&loaded.providers, &route).is_none());
     }
 
     #[test]

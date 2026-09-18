@@ -312,6 +312,7 @@ mod tests {
             protocol,
             default_model: models.first().copied().unwrap_or_default().into(),
             retry: None,
+            reviewer: None,
             models: models
                 .iter()
                 .map(|model| ((*model).to_string(), test_model_config(protocol)))
@@ -570,6 +571,7 @@ base_url = "https://test.example.invalid/v1"
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
             retry: None,
+            reviewer: None,
             models: indexmap::IndexMap::from([(
                 "shared".into(),
                 crate::config::ModelConfig {
@@ -617,6 +619,7 @@ base_url = "https://test.example.invalid/v1"
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
             retry: None,
+            reviewer: None,
             models: indexmap::IndexMap::from([(
                 "shared".into(),
                 crate::config::ModelConfig {
@@ -684,6 +687,7 @@ base_url = "https://test.example.invalid/v1"
                 backoff_multiplier: 1.0,
                 jitter_secs: 0,
             }),
+            reviewer: None,
             models: indexmap::IndexMap::from([(
                 "shared".into(),
                 crate::config::ModelConfig {
@@ -1090,6 +1094,7 @@ base_url = "https://test.example.invalid/v1"
             protocol: ApiProtocol::Completions,
             default_model: "shared".into(),
             retry: None,
+            reviewer: None,
             models: indexmap::IndexMap::from([(
                 "shared".into(),
                 crate::config::ModelConfig {

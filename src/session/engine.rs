@@ -248,6 +248,25 @@ impl SessionEngine {
             let _ = mcp_tools_tx.send(result);
         });
         let subagent_runtime = SubagentPool::new();
+        // The Jev backend records its reviews in a `reviewer` child session through
+        // the same pool the expert backend uses. It is resolved here, where the
+        // reviewer route is known and a client failure still reaches the caller
+        // that reports it.
+        let jev_reviewer = reviewer_jev_config(&agent, &config.providers)
+            .map(|jev| {
+                crate::session::jev_review::JevReviewer::new(
+                    jev,
+                    Arc::clone(&transcript),
+                    Some(event_tx.clone()),
+                    subagent_runtime.clone(),
+                    config.sessions_dir.clone(),
+                )
+                .map(|reviewer| {
+                    std::sync::Arc::new(reviewer)
+                        as std::sync::Arc<dyn crate::agent::AutoReviewService>
+                })
+            })
+            .transpose()?;
         let task = tokio::spawn(run_engine_loop(
             agent,
             Arc::clone(&transcript),
@@ -266,6 +285,7 @@ impl SessionEngine {
             config.mcp_config_path,
             config.mcp_config,
             config.runtime_catalog,
+            jev_reviewer,
             mcp_tools_rx,
             reload_rx,
             control_rx,
@@ -1157,6 +1177,24 @@ async fn refresh_visible_child_session_view(
     });
 }
 
+/// Typesafe Jev settings when the route the reviewer resolves to names a
+/// provider that declares `reviewer = "jev"`.
+fn reviewer_jev_config(
+    agent: &Agent,
+    providers: &indexmap::IndexMap<String, ProviderConfig>,
+) -> Option<crate::config::JevReviewConfig> {
+    // A route that cannot be resolved here is left to the chat backend, which
+    // reports its own resolution failure as the denial reason.
+    let route = crate::agent::AgentFactory::resolve_subagent_route(
+        agent,
+        &crate::agent::AgentTemplate::reviewer(),
+        None,
+        false,
+    )
+    .ok()?;
+    crate::config::jev_review_for_route(providers, &route)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine_loop(
     agent: Agent,
@@ -1176,6 +1214,7 @@ async fn run_engine_loop(
     mcp_config_path: PathBuf,
     mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
     mut runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
+    jev_reviewer: Option<std::sync::Arc<dyn crate::agent::AutoReviewService>>,
     mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
     mut reload_rx: mpsc::UnboundedReceiver<()>,
     mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
@@ -1200,19 +1239,20 @@ async fn run_engine_loop(
     let provider_api_key_hints = Arc::new(StdMutex::new(provider_api_key_hints));
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
-    let sticky_auto_reviewer =
-        std::sync::Arc::new(crate::session::auto_review::StickyAutoReviewer::new(
-            subagent_runtime.clone(),
-            sessions_dir.clone(),
-            Arc::clone(&transcript),
-            Some(session_transport_tx.clone()),
-            Arc::clone(&route_api_key_configured),
-            Arc::clone(&provider_api_key_hints),
-            api_key_hint.clone(),
-        ));
-    agent.set_auto_review_service(Some(
-        sticky_auto_reviewer.clone() as std::sync::Arc<dyn crate::agent::AutoReviewService>
-    ));
+    let auto_review_service: std::sync::Arc<dyn crate::agent::AutoReviewService> =
+        match jev_reviewer {
+            Some(service) => service,
+            None => std::sync::Arc::new(crate::session::auto_review::StickyAutoReviewer::new(
+                subagent_runtime.clone(),
+                sessions_dir.clone(),
+                Arc::clone(&transcript),
+                Some(session_transport_tx.clone()),
+                Arc::clone(&route_api_key_configured),
+                Arc::clone(&provider_api_key_hints),
+                api_key_hint.clone(),
+            )),
+        };
+    agent.set_auto_review_service(Some(std::sync::Arc::clone(&auto_review_service)));
     agent.historian_runtime = Some(Arc::new(crate::session::historian::HistorianRuntime::new(
         subagent_runtime.clone(),
         sessions_dir.clone(),
@@ -1277,7 +1317,7 @@ async fn run_engine_loop(
                     &previous_expert_allowed_models,
                     &expert_allowed_models,
                 ) {
-                    sticky_auto_reviewer.clear_sticky_session();
+                    auto_review_service.clear_sticky();
                 }
             }
             command = next_idle_session_command(&mut control_rx, &mut deferred_commands) => {
@@ -1372,7 +1412,7 @@ async fn run_engine_loop(
                     if agent_name == "historian"
                         && let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                     if agent_name == "reviewer" {
-                        sticky_auto_reviewer.clear_sticky_session();
+                        auto_review_service.clear_sticky();
                     }
                     let _ = session_transport_tx.send(SessionTransportEvent::ExpertAllowedModelsChanged {
                         agent_name: agent_name.clone(),
@@ -1442,7 +1482,7 @@ async fn run_engine_loop(
                     if agent_name == "historian"
                         && let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                     if agent_name == "reviewer" {
-                        sticky_auto_reviewer.clear_sticky_session();
+                        auto_review_service.clear_sticky();
                     }
                     let _ = session_transport_tx.send(SessionTransportEvent::ExpertModelChanged {
                         agent_name: agent_name.clone(),
@@ -1566,7 +1606,7 @@ async fn run_engine_loop(
                             // A sticky reviewer session records its actual route. Drop it after a
                             // primary-route change so the next review starts with the new policy.
                             if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                        sticky_auto_reviewer.clear_sticky_session();
+                        auto_review_service.clear_sticky();
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                                 model_id: model_id.clone(),
                             });
@@ -1714,7 +1754,7 @@ async fn run_engine_loop(
                                 expert_model_routes = routes;
                                 agent.set_subagent_child_factory(Arc::new(factory));
                                 if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                        sticky_auto_reviewer.clear_sticky_session();
+                        auto_review_service.clear_sticky();
                             }
                         if matches!(command, SessionEngineCommand::ViewParent) {
                             visible_child_session_id = None;
@@ -2444,7 +2484,7 @@ async fn run_engine_loop(
                         expert_model_routes = resumed_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                        sticky_auto_reviewer.clear_sticky_session();
+                        auto_review_service.clear_sticky();
                         // Resuming can install a recorded permission mode, and that mode may
                         // differ from the one this process runs with. Frontends build their
                         // resume report from `SessionResumed`, so the mode is announced before
@@ -2647,7 +2687,7 @@ async fn run_engine_loop(
                         expert_model_routes = new_session_expert_model_routes;
                         agent.set_subagent_child_factory(Arc::new(expert_factory));
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                        sticky_auto_reviewer.clear_sticky_session();
+                        auto_review_service.clear_sticky();
                         for (agent_name, route) in &expert_model_routes {
                             let _ = session_transport_tx.send(
                                 SessionTransportEvent::ExpertModelChanged {
@@ -3194,6 +3234,64 @@ mod tests {
         Arc::new(StdMutex::new(
             TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
         ))
+    }
+
+    /// Agent whose reviewer policy is the given route.
+    fn reviewer_route_agent(config: &AppConfig, route: ModelRoute) -> Agent {
+        let mut agent = Agent::new("current", 1, 1);
+        agent.set_subagent_child_factory(Arc::new(
+            crate::subagent::ExpertRouteFactory::new_with_policies(
+                [("reviewer".to_string(), Some(route), Vec::new())],
+                &config.providers,
+                &config.global.retry,
+            )
+            .expect("reviewer route factory"),
+        ));
+        agent
+    }
+
+    #[test]
+    fn reviewer_route_selects_the_backend_from_its_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("letcode.toml");
+        fs::write(
+            &config_path,
+            r#"
+active_provider = "chat"
+[providers.chat]
+protocol = "responses"
+default_model = "current"
+[providers.chat.auth]
+type = "bearer"
+credential = "chat-key"
+[providers.chat.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.chat.models.current]
+
+[providers.typesafe]
+protocol = "responses"
+default_model = "jev-latest"
+reviewer = "jev"
+[providers.typesafe.auth]
+type = "bearer"
+credential = "typesafe-key"
+[providers.typesafe.endpoints]
+base_url = "https://api.typesafe.ai"
+[providers.typesafe.models."jev-latest"]
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::load_from_path(&config_path).expect("config");
+
+        let marked = reviewer_route_agent(&config, ModelRoute::new("typesafe", "jev-latest"));
+        let jev = reviewer_jev_config(&marked, &config.providers).expect("jev backend");
+        assert_eq!(jev.provider, "typesafe");
+        assert_eq!(jev.base_url, "https://api.typesafe.ai");
+        assert_eq!(jev.model, "jev-latest");
+        assert_eq!(jev.credential, "typesafe-key");
+
+        let unmarked = reviewer_route_agent(&config, ModelRoute::new("chat", "current"));
+        assert!(reviewer_jev_config(&unmarked, &config.providers).is_none());
     }
 
     #[tokio::test]

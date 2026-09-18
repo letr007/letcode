@@ -669,6 +669,7 @@ mod tests {
                 backoff_multiplier: 1.0,
                 jitter_secs: 0,
             }),
+            reviewer: None,
             models: IndexMap::from([(
                 "shared".into(),
                 config::ModelConfig {
@@ -755,6 +756,7 @@ mod tests {
             protocol: config::ApiProtocol::Responses,
             default_model: "available".into(),
             retry: None,
+            reviewer: None,
             models: IndexMap::new(),
         };
         let factory = ConfiguredPrimaryRouteFactory::new(

@@ -36,6 +36,7 @@ pub mod engine;
 pub mod event;
 pub(crate) mod historian;
 pub mod interrupt;
+pub(crate) mod jev_review;
 pub mod lifecycle;
 pub mod ports;
 pub mod restore;
