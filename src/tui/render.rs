@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::{
-    components::{composer, dialog, footer, layout, sidebar, slash_panel, transcript},
+    components::{choice, composer, dialog, footer, layout, sidebar, slash_panel, transcript},
     measure::{display_width, wrap_text_to_width, wrapped_row_count},
     state::{ToastKind, TuiState},
     surface,
@@ -268,7 +268,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
 
             for index in 0..current.options.len() {
                 let option = &current.options[index];
-                let active = question.active_row == index;
+                let active = question.active_row.index() == index;
                 let selected = current.option_selected(&option.label);
                 let check = if current.multiple {
                     if selected { "[✓] " } else { "[ ] " }
@@ -280,7 +280,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
                 } else {
                     ""
                 };
-                let marker = if active { "›" } else { " " };
+                let marker = choice::choice_marker(active);
                 let option_style = if active {
                     Style::default().fg(theme.notice).bg(theme.element_bg)
                 } else if selected {
@@ -304,7 +304,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
             }
 
             let custom_active = question.active_custom_row();
-            let custom_marker = if custom_active { "›" } else { " " };
+            let custom_marker = choice::choice_marker(custom_active);
             let custom_selected = current.custom_selected();
             let custom_prefix = if current.multiple {
                 if custom_selected { "[✓] " } else { "[ ] " }
@@ -475,10 +475,7 @@ fn question_tab_lines(
             .get(index)
             .is_some_and(|item| item.is_answered());
         let style = if index == question.active_tab {
-            Style::default()
-                .fg(theme.root_bg)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD)
+            choice::highlighted_choice_style(theme, theme.accent)
         } else if answered {
             Style::default().fg(theme.text).bg(theme.element_bg)
         } else {
@@ -688,7 +685,7 @@ fn question_full_row_count(
     };
     total += rows(&title) + 1;
     for (index, option) in current.options.iter().enumerate() {
-        let active = question.active_row == index;
+        let active = question.active_row.index() == index;
         let selected = current.option_selected(&option.label);
         let check = if current.multiple {
             if selected { "[✓] " } else { "[ ] " }
@@ -700,7 +697,7 @@ fn question_full_row_count(
         } else {
             ""
         };
-        let marker = if active { "›" } else { " " };
+        let marker = choice::choice_marker(active);
         total += rows(&format!(
             "{marker} {}. {check}{}{trailing}",
             index + 1,
@@ -725,7 +722,7 @@ fn question_full_row_count(
     };
     total += rows(&format!(
         "{} {}. {custom_prefix}Type your own answer{custom_trailing}",
-        if custom_active { "›" } else { " " },
+        choice::choice_marker(custom_active),
         current.options.len() + 1,
     ));
     if question.editing_custom {
@@ -776,7 +773,7 @@ fn compact_question_lines(
     };
     let custom_label = format!(
         "{} {}. {custom_prefix}Type your own answer",
-        if custom_active { "›" } else { " " },
+        choice::choice_marker(custom_active),
         current.options.len() + 1
     );
     let custom_style = if custom_active {
@@ -832,10 +829,16 @@ fn compact_question_lines(
             Style::default().fg(theme.muted_text),
         );
     }
-    if question.active_row < current.options.len() {
-        let option = &current.options[question.active_row];
+    if question.active_row.index() < current.options.len() {
+        let active_row = question.active_row.index();
+        let option = &current.options[active_row];
         push(
-            format!("› {}. {}", question.active_row + 1, option.label),
+            format!(
+                "{} {}. {}",
+                choice::choice_marker(true),
+                active_row + 1,
+                option.label
+            ),
             Style::default().fg(theme.notice).bg(theme.element_bg),
         );
     }
@@ -1808,7 +1811,7 @@ mod tests {
             },
             Some("Child question".into()),
         );
-        question.active_row = 6;
+        question.active_row.focus(6);
         question.begin_custom_edit();
         question.questions[0].custom_edit_text = "custom answer kept visible".into();
         question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
@@ -1850,7 +1853,7 @@ mod tests {
             },
             None,
         );
-        question.active_row = 2;
+        question.active_row.focus(2);
         question.begin_custom_edit();
         question.questions[0].custom_edit_text = "Tailored plan".into();
         question.questions[0].custom_edit_cursor = "Tailored plan".len();
@@ -1891,7 +1894,7 @@ mod tests {
             },
             Some("Child question".into()),
         );
-        question.active_row = 2;
+        question.active_row.focus(2);
         question.begin_custom_edit();
         question.questions[0].custom_edit_text = "Own answer".into();
         question.questions[0].custom_edit_cursor = "Own answer".len();
@@ -1922,7 +1925,7 @@ mod tests {
             },
             None,
         );
-        question.active_row = 1;
+        question.active_row.focus(1);
         question.begin_custom_edit();
         question.questions[0].custom_edit_text = "answer".into();
         question.questions[0].custom_edit_cursor = "answer".len();
@@ -1959,7 +1962,7 @@ mod tests {
         let mut question =
             crate::tui::state::PendingQuestionState::new(request, Some("Child".into()));
         question.active_tab = 1;
-        question.active_row = 1;
+        question.active_row.focus(1);
         question.begin_custom_edit();
         question.questions[1].custom_edit_text = "custom".into();
         question.questions[1].custom_edit_cursor = "custom".len();
@@ -2004,7 +2007,7 @@ mod tests {
             },
             None,
         );
-        question.active_row = 2;
+        question.active_row.focus(2);
         question.begin_custom_edit();
         question.questions[0].custom_edit_text = "A tailored staged rollout".into();
         question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
@@ -2049,7 +2052,7 @@ mod tests {
             },
             Some("Child question from a nested session".into()),
         );
-        question.active_row = 1;
+        question.active_row.focus(1);
         question.begin_custom_edit();
         question.questions[0].custom_edit_text = "narrow custom answer".into();
         question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
@@ -2095,20 +2098,20 @@ mod tests {
 
         let mut empty_custom =
             crate::tui::state::PendingQuestionState::new(request(1, false), None);
-        empty_custom.active_row = 1;
+        empty_custom.active_row.focus(1);
         empty_custom.begin_custom_edit();
         cases.push((empty_custom, "close edit"));
 
         let mut single_custom =
             crate::tui::state::PendingQuestionState::new(request(1, false), None);
-        single_custom.active_row = 1;
+        single_custom.active_row.focus(1);
         single_custom.begin_custom_edit();
         single_custom.questions[0].custom_edit_text = "answer".into();
         cases.push((single_custom, "submit answer"));
 
         let mut multi_question_custom =
             crate::tui::state::PendingQuestionState::new(request(2, false), None);
-        multi_question_custom.active_row = 1;
+        multi_question_custom.active_row.focus(1);
         multi_question_custom.begin_custom_edit();
         multi_question_custom.questions[0].custom_edit_text = "answer".into();
         cases.push((multi_question_custom, "next question"));
@@ -2116,14 +2119,14 @@ mod tests {
         let mut final_multi_question_custom =
             crate::tui::state::PendingQuestionState::new(request(2, false), None);
         final_multi_question_custom.active_tab = 1;
-        final_multi_question_custom.active_row = 1;
+        final_multi_question_custom.active_row.focus(1);
         final_multi_question_custom.begin_custom_edit();
         final_multi_question_custom.questions[1].custom_edit_text = "answer".into();
         cases.push((final_multi_question_custom, "review answers"));
 
         let mut active_custom =
             crate::tui::state::PendingQuestionState::new(request(1, false), None);
-        active_custom.active_row = 1;
+        active_custom.active_row.focus(1);
         cases.push((active_custom, "type answer"));
 
         cases.push((
@@ -2161,19 +2164,19 @@ mod tests {
                 .collect(),
         };
         let mut single_multi = crate::tui::state::PendingQuestionState::new(request(1, true), None);
-        single_multi.active_row = 1;
+        single_multi.active_row.focus(1);
         single_multi.begin_custom_edit();
         single_multi.questions[0].custom_edit_text = "answer".into();
 
         let mut next_question =
             crate::tui::state::PendingQuestionState::new(request(2, false), None);
-        next_question.active_row = 1;
+        next_question.active_row.focus(1);
         next_question.begin_custom_edit();
         next_question.questions[0].custom_edit_text = "answer".into();
 
         let mut review = crate::tui::state::PendingQuestionState::new(request(2, false), None);
         review.active_tab = 1;
-        review.active_row = 1;
+        review.active_row.focus(1);
         review.begin_custom_edit();
         review.questions[1].custom_edit_text = "answer".into();
 

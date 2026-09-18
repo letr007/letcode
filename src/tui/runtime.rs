@@ -29,7 +29,7 @@ use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
     ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
-    QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
+    PermissionChoice, QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
@@ -321,16 +321,22 @@ impl TuiRuntime {
     }
 
     fn terminal_title(&self) -> String {
-        let question_pending = self.state.pending_question.is_some();
+        // 等待用户回答的提示占住 spinner 位并用标记字符替代：提问是 `?`，审批是 `!`。
+        let pending_marker = if self.state.pending_question.is_some() {
+            Some('?')
+        } else if self.state.pending_permission.is_some() {
+            Some('!')
+        } else {
+            None
+        };
         let title = format_terminal_title(
             self.session_title.as_deref(),
-            (!question_pending && self.has_active_or_pending_session_turn())
+            (pending_marker.is_none() && self.has_active_or_pending_session_turn())
                 .then_some(self.spinner_frame / TERMINAL_TITLE_TICKS_PER_FRAME),
         );
-        if question_pending {
-            format!("? {title}")
-        } else {
-            title
+        match pending_marker {
+            Some(marker) => format!("{marker} {title}"),
+            None => title,
         }
     }
 
@@ -1800,6 +1806,33 @@ impl TuiRuntime {
             .set_pending_permission_projection(self.permission_lifecycle.projection());
     }
 
+    fn approve_pending_permission(&mut self) -> Result<()> {
+        if let Some(handle) = self.permission_lifecycle.take_handle() {
+            handle.approve()?;
+        }
+        Ok(())
+    }
+
+    fn allow_always_pending_permission(&mut self) -> Result<()> {
+        if self
+            .state
+            .pending_permission
+            .as_ref()
+            .is_some_and(|permission| permission.can_allow_always)
+            && let Some(handle) = self.permission_lifecycle.take_handle()
+        {
+            handle.allow_always()?;
+        }
+        Ok(())
+    }
+
+    fn deny_pending_permission(&mut self) -> Result<()> {
+        if let Some(handle) = self.permission_lifecycle.take_handle() {
+            handle.deny()?;
+        }
+        Ok(())
+    }
+
     fn pending_permission_matches_call(
         &self,
         call_id: &str,
@@ -2044,7 +2077,7 @@ impl TuiRuntime {
                             QuestionAdvance::None => Action::None,
                         }
                     } else {
-                        match question.pick_row(question.active_row) {
+                        match question.pick_row(question.active_row.index()) {
                             QuestionAdvance::Submit => Action::Submit,
                             QuestionAdvance::Advanced => Action::Advanced,
                             QuestionAdvance::Editing => Action::BeginEdit,
@@ -2234,28 +2267,35 @@ impl TuiRuntime {
                 self.navigate_history_next();
                 Ok(None)
             }
-            InputAction::ApprovePermission => {
-                if let Some(handle) = self.permission_lifecycle.take_handle() {
-                    handle.approve()?;
+            InputAction::PermissionPrevOption => {
+                self.state.move_permission_choice_prev();
+                Ok(None)
+            }
+            InputAction::PermissionNextOption => {
+                self.state.move_permission_choice_next();
+                Ok(None)
+            }
+            InputAction::PermissionActivate => {
+                match self.state.highlighted_permission_choice() {
+                    Some(PermissionChoice::AllowOnce) => self.approve_pending_permission()?,
+                    Some(PermissionChoice::AllowAlways) => {
+                        self.allow_always_pending_permission()?
+                    }
+                    Some(PermissionChoice::Reject) => self.deny_pending_permission()?,
+                    None => {}
                 }
+                Ok(None)
+            }
+            InputAction::ApprovePermission => {
+                self.approve_pending_permission()?;
                 Ok(None)
             }
             InputAction::ApprovePermissionAlways => {
-                if self
-                    .state
-                    .pending_permission
-                    .as_ref()
-                    .is_some_and(|permission| permission.can_allow_always)
-                    && let Some(handle) = self.permission_lifecycle.take_handle()
-                {
-                    handle.allow_always()?;
-                }
+                self.allow_always_pending_permission()?;
                 Ok(None)
             }
             InputAction::DenyPermission => {
-                if let Some(handle) = self.permission_lifecycle.take_handle() {
-                    handle.deny()?;
-                }
+                self.deny_pending_permission()?;
                 Ok(None)
             }
             InputAction::Interrupt => self.handle_interrupt(),

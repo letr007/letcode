@@ -494,7 +494,7 @@ fn sidebar_scroll_actions_update_independent_offset() {
 }
 
 #[test]
-fn permission_prompt_keeps_the_active_terminal_spinner() {
+fn pending_approval_terminal_title_marks_attention_before_session_title() {
     let mut runtime = runtime();
     runtime.session_title = Some("Review plan".into());
     runtime.session_turn_active = true;
@@ -503,9 +503,7 @@ fn permission_prompt_keeps_the_active_terminal_spinner() {
         PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
     ));
 
-    let title = runtime.terminal_title();
-    assert!(title.ends_with("LetCode | Review plan"), "{title}");
-    assert!(!title.starts_with('?'), "{title}");
+    assert_eq!(runtime.terminal_title(), "! LetCode | Review plan");
 }
 
 #[test]
@@ -3945,6 +3943,85 @@ async fn approve_and_deny_actions_respond_through_pending_handle() {
         PermissionResponse::Deny
     );
     assert!(deny_runtime.pending_permission_handle().is_none());
+}
+
+#[tokio::test]
+async fn permission_horizontal_keys_move_highlight_and_enter_confirms_it() {
+    let mut runtime = runtime();
+    let (tx, rx) = oneshot::channel();
+    let mut request = PermissionRequestEvent::new("call-a", "shell__exec", "cargo test");
+    request.can_allow_always = true;
+    runtime
+        .permission_lifecycle
+        .begin_parent(request, RunnerPermissionRequest::new(tx))
+        .expect("seed pending parent permission");
+    runtime.reproject_pending_permission();
+
+    let right = map_key_event(
+        runtime.state(),
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(right, InputAction::PermissionNextOption);
+    runtime
+        .handle_input_action(right)
+        .expect("move highlight right");
+    assert_eq!(
+        runtime.state().highlighted_permission_choice(),
+        Some(crate::tui::state::PermissionChoice::AllowAlways)
+    );
+
+    let enter = map_key_event(
+        runtime.state(),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(enter, InputAction::PermissionActivate);
+    runtime
+        .handle_input_action(enter)
+        .expect("confirm highlighted choice");
+
+    assert_eq!(
+        rx.await.expect("approval received"),
+        PermissionResponse::AllowAlways
+    );
+}
+
+#[tokio::test]
+async fn permission_highlight_reaches_reject_when_allow_always_is_unavailable() {
+    let mut runtime = runtime();
+    let (tx, rx) = oneshot::channel();
+    runtime
+        .permission_lifecycle
+        .begin_parent(
+            PermissionRequestEvent::new("call-b", "shell__exec", "cargo test"),
+            RunnerPermissionRequest::new(tx),
+        )
+        .expect("seed pending parent permission");
+    runtime.reproject_pending_permission();
+
+    let right = map_key_event(
+        runtime.state(),
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    runtime
+        .handle_input_action(right)
+        .expect("move highlight right");
+    assert_eq!(
+        runtime.state().highlighted_permission_choice(),
+        Some(crate::tui::state::PermissionChoice::Reject)
+    );
+
+    let enter = map_key_event(
+        runtime.state(),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    runtime
+        .handle_input_action(enter)
+        .expect("confirm highlighted choice");
+
+    assert_eq!(
+        rx.await.expect("approval received"),
+        PermissionResponse::Deny
+    );
 }
 
 #[tokio::test]

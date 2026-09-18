@@ -583,11 +583,80 @@ impl PendingQuestionItem {
     }
 }
 
+/// 单列选项的高亮行：question prompt 与审批 prompt 共用同一套移动语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChoiceRow {
+    index: usize,
+}
+
+impl ChoiceRow {
+    pub fn index(self) -> usize {
+        self.index
+    }
+
+    pub fn focus(&mut self, index: usize) {
+        self.index = index;
+    }
+
+    pub fn reset(&mut self) {
+        self.focus(0);
+    }
+
+    /// 在 `[0, len)` 内循环移动；没有可选项时保持当前行。
+    pub fn move_next(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.index = (self.index + 1) % len;
+    }
+
+    pub fn move_prev(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.index = if self.index == 0 {
+            len - 1
+        } else {
+            self.index - 1
+        };
+    }
+
+    pub fn clamp(&mut self, len: usize) {
+        self.index = if len == 0 { 0 } else { self.index.min(len - 1) };
+    }
+}
+
+/// 审批 prompt 的可选项；枚举顺序即高亮移动与渲染顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChoice {
+    AllowOnce,
+    AllowAlways,
+    Reject,
+}
+
+impl PermissionChoice {
+    /// 请求未授予会话级授权（`can_allow_always` 为 false）时不提供“总是允许”。
+    pub fn options(can_allow_always: bool) -> &'static [PermissionChoice] {
+        const WITH_ALWAYS: [PermissionChoice; 3] = [
+            PermissionChoice::AllowOnce,
+            PermissionChoice::AllowAlways,
+            PermissionChoice::Reject,
+        ];
+        const WITHOUT_ALWAYS: [PermissionChoice; 2] =
+            [PermissionChoice::AllowOnce, PermissionChoice::Reject];
+        if can_allow_always {
+            &WITH_ALWAYS
+        } else {
+            &WITHOUT_ALWAYS
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingQuestionState {
     pub questions: Vec<PendingQuestionItem>,
     pub active_tab: usize,
-    pub active_row: usize,
+    pub active_row: ChoiceRow,
     pub editing_custom: bool,
     pub origin_label: Option<String>,
     pub confirm_scroll: usize,
@@ -603,7 +672,7 @@ impl PendingQuestionState {
                 .map(PendingQuestionItem::from_spec)
                 .collect(),
             active_tab: 0,
-            active_row: 0,
+            active_row: ChoiceRow::default(),
             editing_custom: false,
             origin_label,
             confirm_scroll: 0,
@@ -662,7 +731,7 @@ impl PendingQuestionState {
 
     pub fn active_custom_row(&self) -> bool {
         self.custom_row_index()
-            .is_some_and(|custom_row| custom_row == self.active_row)
+            .is_some_and(|custom_row| custom_row == self.active_row.index())
     }
 
     pub fn move_next_row(&mut self) {
@@ -670,10 +739,7 @@ impl PendingQuestionState {
             self.scroll_confirm_down(1);
             return;
         }
-        let row_count = self.current_row_count();
-        if row_count > 0 {
-            self.active_row = (self.active_row + 1) % row_count;
-        }
+        self.active_row.move_next(self.current_row_count());
     }
 
     pub fn move_prev_row(&mut self) {
@@ -681,14 +747,7 @@ impl PendingQuestionState {
             self.scroll_confirm_up(1);
             return;
         }
-        let row_count = self.current_row_count();
-        if row_count > 0 {
-            self.active_row = if self.active_row == 0 {
-                row_count - 1
-            } else {
-                self.active_row - 1
-            };
-        }
+        self.active_row.move_prev(self.current_row_count());
     }
 
     pub fn scroll_confirm_up(&mut self, amount: usize) {
@@ -892,12 +951,12 @@ impl PendingQuestionState {
             QuestionAdvance::Submit
         } else if active_tab + 1 < questions_len {
             self.active_tab += 1;
-            self.active_row = 0;
+            self.active_row.reset();
             self.reset_confirm_scroll();
             QuestionAdvance::Advanced
         } else if show_confirm {
             self.active_tab = questions_len;
-            self.active_row = 0;
+            self.active_row.reset();
             self.reset_confirm_scroll();
             QuestionAdvance::Advanced
         } else {
@@ -907,15 +966,10 @@ impl PendingQuestionState {
 
     fn clamp_active_row(&mut self) {
         if self.is_confirm_tab() {
-            self.active_row = 0;
+            self.active_row.reset();
             return;
         }
-        let row_count = self.current_row_count();
-        if row_count == 0 {
-            self.active_row = 0;
-        } else {
-            self.active_row = self.active_row.min(row_count - 1);
-        }
+        self.active_row.clamp(self.current_row_count());
     }
 }
 
@@ -1149,6 +1203,8 @@ pub struct TuiState {
     child_session_summaries: HashMap<String, ChildSessionCacheSummary>,
     pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
+    /// 审批 prompt 的高亮选项；与 question prompt 共用 `ChoiceRow` 的移动语义。
+    pub pending_permission_choice: ChoiceRow,
     pub pending_question: Option<PendingQuestionState>,
     pub slash_panel_selected: usize,
     pub slash_panel_dismissed: bool,
@@ -1251,6 +1307,7 @@ impl Default for TuiState {
             child_session_summaries: HashMap::new(),
             active_session: false,
             pending_permission: None,
+            pending_permission_choice: ChoiceRow::default(),
             pending_question: None,
             slash_panel_selected: 0,
             slash_panel_dismissed: false,
@@ -2780,8 +2837,45 @@ impl TuiState {
     }
 
     pub fn set_pending_permission_projection(&mut self, permission: Option<PermissionView>) {
+        // A new request starts from the first option again; the pending view itself is
+        // reprojected on every transport event, so the highlight lives beside it.
+        if self
+            .pending_permission
+            .as_ref()
+            .map(|pending| pending.call_id.as_str())
+            != permission.as_ref().map(|pending| pending.call_id.as_str())
+        {
+            self.pending_permission_choice.reset();
+        }
         self.pending_permission = permission;
         self.reproject_pending_permission();
+    }
+
+    /// 审批 prompt 当前展示的可选项。
+    pub fn permission_choices(&self) -> &'static [PermissionChoice] {
+        match self.pending_permission.as_ref() {
+            Some(permission) => PermissionChoice::options(permission.can_allow_always),
+            None => &[],
+        }
+    }
+
+    /// 审批 prompt 当前高亮的选项。
+    pub fn highlighted_permission_choice(&self) -> Option<PermissionChoice> {
+        self.permission_choices()
+            .get(self.pending_permission_choice.index())
+            .copied()
+    }
+
+    pub fn move_permission_choice_next(&mut self) {
+        let len = self.permission_choices().len();
+        self.pending_permission_choice.move_next(len);
+        self.pending_permission_choice.clamp(len);
+    }
+
+    pub fn move_permission_choice_prev(&mut self) {
+        let len = self.permission_choices().len();
+        self.pending_permission_choice.move_prev(len);
+        self.pending_permission_choice.clamp(len);
     }
 
     fn reproject_pending_permission(&mut self) {
@@ -3987,7 +4081,7 @@ mod tests {
                 multiple: false,
             },
         ]);
-        state.active_row = 1;
+        state.active_row.focus(1);
         state.begin_custom_edit();
         state.questions[0].custom_edit_text = "Gamma".into();
 
@@ -4202,6 +4296,47 @@ mod tests {
         assert_eq!(
             permission.status,
             crate::tui::timeline::PermissionPromptStatus::Approved
+        );
+    }
+
+    #[test]
+    fn permission_choice_wraps_and_restarts_with_each_request() {
+        let mut state = TuiState::default();
+        let mut request = PermissionRequestEvent::new("call-1", "shell__exec", "run tests");
+        request.can_allow_always = true;
+        state.set_pending_permission_projection(Some(PermissionView::from_request(request)));
+
+        assert_eq!(
+            state.highlighted_permission_choice(),
+            Some(PermissionChoice::AllowOnce)
+        );
+        state.move_permission_choice_next();
+        assert_eq!(
+            state.highlighted_permission_choice(),
+            Some(PermissionChoice::AllowAlways)
+        );
+        state.move_permission_choice_prev();
+        assert_eq!(
+            state.highlighted_permission_choice(),
+            Some(PermissionChoice::AllowOnce)
+        );
+        state.move_permission_choice_prev();
+        assert_eq!(
+            state.highlighted_permission_choice(),
+            Some(PermissionChoice::Reject)
+        );
+
+        state.set_pending_permission_projection(Some(PermissionView::from_request(
+            PermissionRequestEvent::new("call-2", "shell__exec", "run ls"),
+        )));
+        assert_eq!(
+            state.highlighted_permission_choice(),
+            Some(PermissionChoice::AllowOnce)
+        );
+        state.move_permission_choice_next();
+        assert_eq!(
+            state.highlighted_permission_choice(),
+            Some(PermissionChoice::Reject)
         );
     }
 

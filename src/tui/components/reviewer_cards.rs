@@ -67,7 +67,9 @@ pub(crate) fn parse_review_decision(text: &str) -> Option<ReviewDecisionCard> {
     let candidate = extract_json_object(text)?;
     let parsed: ReviewerJson = serde_json::from_str(candidate).ok()?;
     let decision = match parsed.decision.trim().to_ascii_lowercase().as_str() {
-        "allow_always" | "always" => "allow_once".to_string(),
+        "allow_always" | "always" | "execute" | "run" => "allow_once".to_string(),
+        "ask_user" | "ask" => "ask_user".to_string(),
+        "refuse" => "deny".to_string(),
         "allow_once" | "allow" | "once" | "deny" | "reject" => {
             parsed.decision.trim().to_ascii_lowercase()
         }
@@ -171,6 +173,7 @@ pub(crate) fn render_review_decision_card_document(
         "allow_once" | "allow" | "once" | "allow_always" | "always" => {
             ("allow once", theme.success)
         }
+        "ask_user" => ("ask user", theme.notice),
         "deny" | "reject" => ("deny", theme.error),
         other => (other, theme.notice),
     };
@@ -310,7 +313,7 @@ mod tests {
          Arguments:\n{\n  \"command\": \"python3\"\n}\n\
          \n\
          Reply with ONLY JSON:\n\
-         {\"decision\":\"allow_once|deny\",\"risk\":\"low|medium|high\",\"rationale\":\"...\"}\n";
+         {\"decision\":\"execute|ask_user|refuse\",\"risk\":\"low|medium|high\",\"rationale\":\"...\"}\n";
 
     #[test]
     fn parses_review_request_fields() {
@@ -322,6 +325,16 @@ mod tests {
             card.goal.as_deref(),
             Some("Execute commands to test auto-approval")
         );
+    }
+
+    #[test]
+    fn ask_user_decision_is_kept_as_its_own_card() {
+        let card = parse_review_decision(
+            r#"{"decision":"ask_user","risk":"medium","rationale":"needs the user"}"#,
+        )
+        .expect("decision");
+        assert_eq!(card.decision, "ask_user");
+        assert_eq!(card.risk.as_deref(), Some("medium"));
     }
 
     #[test]

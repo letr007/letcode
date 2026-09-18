@@ -1,3 +1,4 @@
+pub mod choice;
 pub mod composer;
 pub mod dialog;
 pub mod diff_render;

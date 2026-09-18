@@ -82,6 +82,9 @@ pub enum InputAction {
     QuestionMoveCursorRight,
     QuestionMoveCursorHome,
     QuestionMoveCursorEnd,
+    PermissionPrevOption,
+    PermissionNextOption,
+    PermissionActivate,
     ApprovePermission,
     ApprovePermissionAlways,
     DenyPermission,
@@ -159,12 +162,20 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     if state.pending_permission.is_some() {
+        // 审批选项横排：水平键移动高亮，Enter 确认；上下键留给 transcript 滚动。
         return match key.code {
-            KeyCode::Up => InputAction::ScrollUp,
-            KeyCode::Down => InputAction::ScrollDown,
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                InputAction::PermissionPrevOption
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                InputAction::PermissionNextOption
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => InputAction::ScrollUp,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => InputAction::ScrollDown,
             KeyCode::PageUp => InputAction::ScrollPageUp,
             KeyCode::PageDown => InputAction::ScrollPageDown,
             KeyCode::End => InputAction::ScrollToBottom,
+            KeyCode::Enter => InputAction::PermissionActivate,
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('o') | KeyCode::Char('O') => {
                 InputAction::ApprovePermission
             }
@@ -1035,10 +1046,6 @@ mod tests {
             InputAction::ApprovePermission
         );
         assert_eq!(
-            map_key_event(&state, key(KeyCode::Enter)),
-            InputAction::NoOp
-        );
-        assert_eq!(
             map_key_event(&state, key(KeyCode::Char('n'))),
             InputAction::DenyPermission
         );
@@ -1057,6 +1064,72 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('x'))),
             InputAction::NoOp
+        );
+    }
+
+    #[test]
+    fn permission_prompt_maps_horizontal_keys_to_highlight_movement() {
+        let mut state = TuiState::default();
+        state.pending_permission = Some(crate::tui::PermissionView::from_request(
+            PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::PermissionPrevOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('h'))),
+            InputAction::PermissionPrevOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::PermissionNextOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('l'))),
+            InputAction::PermissionNextOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::PermissionActivate
+        );
+    }
+
+    #[test]
+    fn permission_prompt_keeps_vertical_keys_scrolling_the_transcript() {
+        let mut state = TuiState::default();
+        state.pending_permission = Some(crate::tui::PermissionView::from_request(
+            PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::ScrollUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('k'))),
+            InputAction::ScrollUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ScrollDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('j'))),
+            InputAction::ScrollDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::PageUp)),
+            InputAction::ScrollPageUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::PageDown)),
+            InputAction::ScrollPageDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::End)),
+            InputAction::ScrollToBottom
         );
     }
 
@@ -1212,7 +1285,7 @@ mod tests {
             },
             None,
         );
-        question.active_row = 1;
+        question.active_row.focus(1);
         question.begin_custom_edit();
         state.pending_question = Some(question);
 
@@ -1248,7 +1321,7 @@ mod tests {
             },
             None,
         );
-        question.active_row = 1;
+        question.active_row.focus(1);
         question.begin_custom_edit();
         state.pending_question = Some(question);
 
@@ -1333,14 +1406,6 @@ mod tests {
         ));
 
         assert_eq!(
-            map_key_event(&state, key(KeyCode::Up)),
-            InputAction::ScrollUp
-        );
-        assert_eq!(
-            map_key_event(&state, key(KeyCode::Down)),
-            InputAction::ScrollDown
-        );
-        assert_eq!(
             map_key_event(&state, key(KeyCode::PageUp)),
             InputAction::ScrollPageUp
         );
@@ -1371,9 +1436,12 @@ mod tests {
         ));
         state.child_navigation_prefix = true;
 
-        assert_eq!(map_key_event(&state, key(KeyCode::Left)), InputAction::NoOp);
         assert_eq!(
-            map_key_event(&state, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::PermissionPrevOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('m'))),
             InputAction::NoOp
         );
         assert_eq!(

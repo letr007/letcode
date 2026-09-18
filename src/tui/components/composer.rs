@@ -7,7 +7,8 @@ use ratatui::{
 };
 use serde_json::Value;
 
-use super::super::state::TuiState;
+use super::super::state::{PermissionChoice, TuiState};
+use super::choice;
 use crate::tui::{
     measure::{display_width, wrap_text_to_width},
     surface,
@@ -159,10 +160,11 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, 
 
     if let Some(permission) = &state.pending_permission {
         let translator = state.translator();
+        let highlighted = state.pending_permission_choice.index();
         if area.height < 3 || area.width < 16 {
             render_pending_approval_tiny(frame, permission, area, theme, &translator);
         } else {
-            render_pending_approval_panel(frame, permission, area, theme, &translator);
+            render_pending_approval_panel(frame, permission, highlighted, area, theme, &translator);
         }
         return;
     }
@@ -372,6 +374,7 @@ fn render_pending_approval_tiny(
 fn render_pending_approval_panel(
     frame: &mut Frame<'_>,
     permission: &PermissionView,
+    highlighted: usize,
     area: Rect,
     theme: Theme,
     translator: &crate::tui::i18n::Translator,
@@ -414,7 +417,8 @@ fn render_pending_approval_panel(
         render_pending_approval_footer(
             frame,
             footer_area,
-            permission.can_allow_always,
+            permission,
+            highlighted,
             theme,
             translator,
         );
@@ -1084,13 +1088,15 @@ fn section_value(value: String, theme: Theme) -> Line<'static> {
 fn render_pending_approval_footer(
     frame: &mut Frame<'_>,
     area: Rect,
-    can_allow_always: bool,
+    permission: &PermissionView,
+    highlighted: usize,
     theme: Theme,
     translator: &crate::tui::i18n::Translator,
 ) {
     if area.is_empty() {
         return;
     }
+    let can_allow_always = permission.can_allow_always;
 
     let (left_area, right_area) = if area.width >= 56 {
         let right_width = area.width.min(34);
@@ -1108,25 +1114,38 @@ fn render_pending_approval_footer(
         (area, Rect::new(area.x, area.y, 0, 0))
     };
 
-    let selected = Style::default()
-        .fg(theme.root_bg)
-        .bg(theme.approval)
-        .add_modifier(Modifier::BOLD);
-    let chip = |label: &str, active: bool| {
-        if active {
-            Span::styled(format!(" {label} "), selected)
-        } else {
-            Span::styled(format!(" {label} "), muted_pending(theme))
+    let choices = PermissionChoice::options(can_allow_always);
+    let active = highlighted.min(choices.len().saturating_sub(1));
+    let mut left_spans = Vec::new();
+    for (index, choice) in choices.iter().enumerate() {
+        if index > 0 {
+            left_spans.push(Span::styled(" ", inline_pending(theme)));
         }
-    };
-
-    let mut left_spans = vec![chip(&translator.t("permission.allow_once"), true)];
-    if can_allow_always {
-        left_spans.push(Span::styled(" ", inline_pending(theme)));
-        left_spans.push(chip(&translator.t("permission.allow_always"), false));
+        let label = translator.t(approval_choice_label(*choice));
+        let chip_style = if index == active {
+            choice::highlighted_choice_style(theme, theme.approval)
+        } else {
+            muted_pending(theme)
+        };
+        left_spans.push(Span::styled(
+            format!(" {} {label} ", choice::choice_marker(index == active)),
+            chip_style,
+        ));
     }
-    left_spans.push(Span::styled(" ", inline_pending(theme)));
-    left_spans.push(chip(&translator.t("permission.reject"), false));
+    // The options never truncate; the navigation hint only joins them when the
+    // remaining width can hold it without spilling into the shortcut hints.
+    let nav_spans = [
+        Span::styled("  ", inline_pending(theme)),
+        Span::styled("←→", muted_pending(theme).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {}  ", translator.t("ui.select")),
+            muted_pending(theme),
+        ),
+        Span::styled("enter", muted_pending(theme).add_modifier(Modifier::BOLD)),
+    ];
+    if spans_width(&left_spans) + spans_width(&nav_spans) <= left_area.width as usize {
+        left_spans.extend(nav_spans);
+    }
     let left = Line::from(left_spans);
     frame.render_widget(Paragraph::new(left).style(inline_pending(theme)), left_area);
 
@@ -1167,6 +1186,21 @@ fn render_pending_approval_footer(
                 .alignment(ratatui::layout::Alignment::Right),
             right_area,
         );
+    }
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+fn approval_choice_label(choice: PermissionChoice) -> &'static str {
+    match choice {
+        PermissionChoice::AllowOnce => "permission.allow_once",
+        PermissionChoice::AllowAlways => "permission.allow_always",
+        PermissionChoice::Reject => "permission.reject",
     }
 }
 
@@ -1530,6 +1564,24 @@ mod tests {
         assert!(rendered.contains("n/d"), "{rendered}");
         assert!(rendered.contains("esc"), "{rendered}");
         assert!(!rendered.contains("fullscreen"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_permission_highlight_follows_the_selected_choice() {
+        let mut state = TuiState::default();
+        let mut request =
+            PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
+        request.arguments = Some(r#"{"command":"cargo test --workspace"}"#.into());
+        request.can_allow_always = true;
+        state.apply_event(SessionEvent::PermissionRequested(request));
+        state.move_permission_choice_next();
+
+        let rendered = draw_to_string(&mut state, 100, 10);
+
+        assert!(rendered.contains("› Allow always"), "{rendered}");
+        assert!(!rendered.contains("› Allow once"), "{rendered}");
+        assert!(rendered.contains("←→"), "{rendered}");
+        assert!(rendered.contains("enter"), "{rendered}");
     }
 
     #[test]
