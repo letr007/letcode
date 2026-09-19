@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-19
+
 ### Added
 
 - 新增实验性 Jev 审批后端，`[agents.reviewer]` 指向带 `reviewer = "jev"` 标记的 provider 时，`auto` 模式改由 Typesafe Jev 判定，端点、凭据和模型都取自该 provider。
@@ -395,7 +397,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/letr007/letcode/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/letr007/letcode/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/letr007/letcode/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/letr007/letcode/compare/v0.11.0...v0.12.0
