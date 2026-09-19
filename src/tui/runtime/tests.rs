@@ -6722,10 +6722,10 @@ fn switch_cost_measure() {
     let child_session =
         std::env::var("LETCODE_BENCH_CHILD_SESSION").expect("LETCODE_BENCH_CHILD_SESSION");
     let parent_records =
-        crate::transcript::read_records(&dir.join(format!("{parent_session}.jsonl")))
+        crate::transcript::read_records(dir.join(format!("{parent_session}.jsonl")))
             .expect("read the parent journal");
     let child_records = crate::transcript::read_records(
-        &crate::transcript::child_sessions_dir(&dir).join(format!("{child_session}.jsonl")),
+        crate::transcript::child_sessions_dir(&dir).join(format!("{child_session}.jsonl")),
     )
     .expect("read the child journal");
     println!(
