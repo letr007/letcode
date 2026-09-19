@@ -316,25 +316,25 @@ impl MemoryStore {
                         })
                     }))
         });
-        let terms = query
-            .query
-            .as_deref()
-            .unwrap_or_default()
-            .split_whitespace()
-            .filter(|term| !term.is_empty())
-            .take(24)
-            .map(|term| term.to_lowercase())
+        let grams = query_grams(query.query.as_deref().unwrap_or_default());
+        let candidates = candidates
+            .into_iter()
+            .map(|memory| {
+                let fields = SearchFields::new(&memory);
+                (memory, fields)
+            })
             .collect::<Vec<_>>();
+        let weights = gram_weights(&candidates, &grams);
         let mut ranked = candidates
             .into_iter()
-            .filter_map(|memory| {
-                let score = memory_score(&memory, &terms);
-                (terms.is_empty() || score > 0).then_some((score, memory))
+            .filter_map(|(memory, fields)| {
+                let score = memory_score(&fields, &grams, &weights);
+                (grams.is_empty() || score > 0.0).then_some((score, memory))
             })
             .collect::<Vec<_>>();
         ranked.sort_by(|(left_score, left), (right_score, right)| {
             right_score
-                .cmp(left_score)
+                .total_cmp(left_score)
                 .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
                 .then_with(|| left.id.cmp(&right.id))
         });
@@ -496,16 +496,100 @@ fn status_name(status: crate::memory::MemoryStatus) -> &'static str {
     }
 }
 
-fn memory_score(memory: &MemoryRecord, terms: &[String]) -> u64 {
-    let title = memory.title.to_lowercase();
-    let summary = memory.summary.to_lowercase();
-    let paths = memory.paths.join(" ").to_lowercase();
-    terms
+const MAX_QUERY_TERMS: usize = 24;
+
+/// 连续汉字按二字组展开（`记忆系统` → `记忆`/`忆系`/`系统`），其余词保持原样。
+/// 中文没有词边界，整句当成一个词时只剩逐字子串命中，长句必然查不到任何记忆。
+fn query_grams(text: &str) -> Vec<String> {
+    let mut grams = Vec::new();
+    for term in text
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .take(MAX_QUERY_TERMS)
+    {
+        let term = term.to_lowercase();
+        let mut run = String::new();
+        let mut run_is_han = None;
+        for character in term.chars() {
+            let is_han = is_han(character);
+            if run_is_han != Some(is_han) {
+                push_grams(&mut grams, &run, run_is_han == Some(true));
+                run.clear();
+                run_is_han = Some(is_han);
+            }
+            run.push(character);
+        }
+        push_grams(&mut grams, &run, run_is_han == Some(true));
+    }
+    let mut seen = std::collections::HashSet::new();
+    grams.retain(|gram| seen.insert(gram.clone()));
+    grams
+}
+
+fn is_han(character: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&character)
+}
+
+fn push_grams(grams: &mut Vec<String>, run: &str, is_han: bool) {
+    if run.is_empty() {
+        return;
+    }
+    let characters = run.chars().collect::<Vec<_>>();
+    if !is_han || characters.len() <= 2 {
+        grams.push(run.to_string());
+        return;
+    }
+    for pair in characters.windows(2) {
+        grams.push(pair.iter().collect());
+    }
+}
+
+/// 小写化后的可检索字段；文档频率与打分共用同一份，避免重复变换。
+struct SearchFields {
+    title: String,
+    summary: String,
+    paths: String,
+}
+
+impl SearchFields {
+    fn new(memory: &MemoryRecord) -> Self {
+        Self {
+            title: memory.title.to_lowercase(),
+            summary: memory.summary.to_lowercase(),
+            paths: memory.paths.join(" ").to_lowercase(),
+        }
+    }
+
+    fn contains(&self, gram: &str) -> bool {
+        self.title.contains(gram) || self.summary.contains(gram) || self.paths.contains(gram)
+    }
+}
+
+/// 文档频率取自本次候选集：中文长句会产生大量虚词二字组，不压低高频组时
+/// 「命中很多常见组」会压过「命中稀有组」。
+fn gram_weights(candidates: &[(MemoryRecord, SearchFields)], grams: &[String]) -> Vec<f64> {
+    let total = candidates.len().max(1) as f64;
+    grams
         .iter()
-        .map(|term| {
-            u64::from(title.contains(term)) * 6
-                + u64::from(summary.contains(term)) * 2
-                + u64::from(paths.contains(term)) * 8
+        .map(|gram| {
+            let matching = candidates
+                .iter()
+                .filter(|(_, fields)| fields.contains(gram))
+                .count() as f64;
+            (1.0 + total / (1.0 + matching)).ln()
+        })
+        .collect()
+}
+
+fn memory_score(fields: &SearchFields, grams: &[String], weights: &[f64]) -> f64 {
+    grams
+        .iter()
+        .zip(weights)
+        .map(|(gram, weight)| {
+            let hits = u64::from(fields.title.contains(gram)) * 6
+                + u64::from(fields.summary.contains(gram)) * 2
+                + u64::from(fields.paths.contains(gram)) * 8;
+            weight * hits as f64
         })
         .sum()
 }
@@ -528,6 +612,18 @@ mod tests {
 
     fn query(text: &str) -> crate::memory::MemoryRecallQuery {
         crate::memory::validate_memory_recall_query(&serde_json::json!({"query":text})).unwrap()
+    }
+
+    fn memory_with(title: &str, summary: &str, paths: &[&str]) -> MemoryDraft {
+        MemoryDraft {
+            kind: "diagnostic".into(),
+            title: title.into(),
+            summary: summary.into(),
+            status: "useful".into(),
+            source_ids: vec!["raw:2".into()],
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+            supersedes: vec![],
+        }
     }
 
     #[test]
@@ -577,6 +673,93 @@ mod tests {
         let other = MemoryStore::open(root.path(), project_b.path()).unwrap();
         assert!(other.known_memories(20).unwrap().is_empty());
         assert_eq!(other.status().unwrap().state, "missing");
+    }
+
+    #[test]
+    fn query_grams_expand_han_runs_and_keep_other_tokens() {
+        assert_eq!(
+            query_grams("记忆系统 store.rs"),
+            ["记忆", "忆系", "系统", "store.rs"]
+        );
+        assert_eq!(query_grams("cache other"), ["cache", "other"]);
+        assert_eq!(query_grams("记忆 记忆"), ["记忆"]);
+        assert!(query_grams(" \t\n").is_empty());
+    }
+
+    #[test]
+    fn chinese_sentences_recall_by_character_bigrams() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let store = MemoryStore::open(root.path(), root.path()).unwrap();
+        store.register_source("s", journal.path(), 1).unwrap();
+        store.register_source("s", journal.path(), 2).unwrap();
+        let source = store.sources().unwrap().remove(0);
+        store
+            .complete(
+                &source,
+                2,
+                "main",
+                &MemoryUpdate {
+                    memories: vec![memory_with(
+                        "记忆检索打分",
+                        "中文问句按二字组命中",
+                        &["src/project_memory/store.rs"],
+                    )],
+                    withdrawn_ids: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+        for text in ["记忆检索的打分是怎么做的", "打分是怎么算出来的"] {
+            let hits = store.query(&query(text)).unwrap();
+            assert_eq!(hits.len(), 1, "{text}");
+            assert_eq!(hits[0].title, "记忆检索打分");
+        }
+    }
+
+    #[test]
+    fn rare_grams_outrank_common_ones() {
+        // 「检索」出现在 4/5 条候选、「打分」只在 1 条：不计文档频率时 paths(8) 会压过 title(6)。
+        let root = tempfile::tempdir().unwrap();
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let store = MemoryStore::open(root.path(), root.path()).unwrap();
+        store.register_source("common", journal.path(), 1).unwrap();
+        store.register_source("common", journal.path(), 2).unwrap();
+        let common = store.sources().unwrap().remove(0);
+        store
+            .complete(
+                &common,
+                2,
+                "main",
+                &MemoryUpdate {
+                    memories: (0..4)
+                        .map(|ordinal| {
+                            memory_with(&format!("缓存策略 {ordinal}"), "无关内容", &["资料/检索"])
+                        })
+                        .collect(),
+                    withdrawn_ids: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+        store.register_source("rare", journal.path(), 1).unwrap();
+        store.register_source("rare", journal.path(), 2).unwrap();
+        let rare = store.sources().unwrap().remove(0);
+        store
+            .complete(
+                &rare,
+                2,
+                "main",
+                &MemoryUpdate {
+                    memories: vec![memory_with("打分标准", "无关内容", &[])],
+                    withdrawn_ids: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+        let hits = store.query(&query("检索打分")).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_eq!(hits[0].title, "打分标准");
     }
 
     #[test]

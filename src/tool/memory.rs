@@ -20,7 +20,7 @@ impl ToolHandler for MemoryRecallTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search system-maintained project memory for the current workspace by keywords, code symbols or paths. Read-only; no session scan or automatic history import. Returns source session/branch/raw IDs for context__expand. Memories can be incomplete or outdated; verify against current code. Use short keywords (including Chinese), not a full question."
+        "Search system-maintained project memory for the current workspace by keywords, code symbols or paths. Read-only; no session scan or automatic history import. Returns source session/branch/raw IDs for context__expand. Memories can be incomplete or outdated; verify against current code."
     }
 
     fn parameters(&self) -> Value {
