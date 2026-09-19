@@ -59,7 +59,7 @@ impl ToolHandler for MemoryRecallTool {
         tokio::task::spawn_blocking(move || {
             let memories = store.query(&query)?;
             let status = store.status()?;
-            // 记账是 best-effort：统计失败不影响这次检索的结果。
+            // 记账失败不影响这次检索的结果。
             let ids = memories
                 .iter()
                 .map(|memory| memory.id.clone())

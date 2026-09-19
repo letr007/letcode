@@ -46,7 +46,7 @@ pub(crate) struct MemoryUpdate {
     pub withdrawn_ids: Vec<String>,
 }
 
-/// 巩固层对已有记忆的改动：把冗余项合并进幸存者，或改写幸存者的正文。
+/// 巩固层对已有记忆的改动，只允许把冗余项合并进幸存者，或改写幸存者的正文。
 /// 退休必须指名覆盖者（`into`），不允许无覆盖地删除。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct CurationUpdate {
@@ -334,7 +334,7 @@ impl MemoryStore {
         self.read_active(limit.min(10_000))
     }
 
-    /// 记账：这些记忆刚被 memory__recall 返回过。失败只影响统计，不影响检索结果。
+    /// 记录这些记忆刚被 memory__recall 返回过。失败只影响统计，不影响检索结果。
     pub(crate) fn record_recall(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -354,7 +354,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// 应用一次巩固结果。整批在一个事务里：任一目标已不再是 active 就整体失败，
+    /// 应用一次巩固结果。整批在一个事务里，任一目标已不再是 active 就整体失败，
     /// 避免按已经过期的视图改动记忆。
     pub(crate) fn apply_curation(&self, update: &CurationUpdate) -> Result<()> {
         if update.merges.is_empty() && update.rewrites.is_empty() {
@@ -668,7 +668,7 @@ impl SearchFields {
     }
 }
 
-/// 文档频率取自本次候选集：中文长句会产生大量虚词二字组，不压低高频组时
+/// 文档频率取自本次候选集。中文长句会产生大量虚词二字组，不压低高频组时
 /// 「命中很多常见组」会压过「命中稀有组」。
 fn gram_weights(candidates: &[(MemoryRecord, SearchFields)], grams: &[String]) -> Vec<f64> {
     let total = candidates.len().max(1) as f64;
@@ -870,7 +870,7 @@ mod tests {
         assert_eq!(active[0].summary, "合并后的正文");
         assert!(active[0].curated_at_ms.is_some());
 
-        // 同一批再应用一次必须整体失败：目标已经不是 active。
+        // 同一批再应用一次必须整体失败，因为目标已经不是 active。
         assert!(store.apply_curation(&update).is_err());
         assert_eq!(store.known_memories(10).unwrap().len(), 1);
     }
@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn rare_grams_outrank_common_ones() {
-        // 「检索」出现在 4/5 条候选、「打分」只在 1 条：不计文档频率时 paths(8) 会压过 title(6)。
+        // 「检索」出现在 4/5 条候选，「打分」只在 1 条。不计文档频率时 paths(8) 命中会压过 title(6)。
         let root = tempfile::tempdir().unwrap();
         let journal = tempfile::NamedTempFile::new().unwrap();
         let store = MemoryStore::open(root.path(), root.path()).unwrap();

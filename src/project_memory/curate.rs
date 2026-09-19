@@ -1,7 +1,7 @@
-//! 巩固层：让 historian 复查已有记忆——退休冗余项、改写幸存者，不新增事实。
+//! 巩固层让 historian 复查已有记忆，退休冗余项、改写幸存者，不新增事实。
 //!
-//! 与 extract 的分工：extract 从会话记录新增记忆，curate 只在已有记忆之间做维护，
-//! 且只处理能证明彼此冗余的批次（归一后的标题相同，或一方包含另一方）。
+//! 与 extract 的分工在于 curate 不新增事实，只在已有记忆之间做维护，且只处理
+//! 能证明彼此冗余的批次（归一后的标题相同，或一方包含另一方）。
 
 use anyhow::{Result, ensure};
 use serde_json::json;
@@ -11,7 +11,7 @@ use crate::user_content::UserMessageContent;
 
 use super::store::{CurationUpdate, MemoryRecord};
 
-/// 单批送检与单次改动的上限：维护应当小步、可解释。
+/// 单批送检与单次改动的上限。维护应当小步、可解释。
 const MAX_CURATION_MEMORIES: usize = 24;
 const MAX_CURATION_CLUSTERS: usize = 6;
 const MAX_CURATION_CHARS: usize = 64 * 1024;
@@ -125,7 +125,7 @@ pub(crate) fn duplicate_groups(memories: &[MemoryRecord]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// 去掉空白与常见标点后小写化：标题的差异通常只是分隔符和全半角。
+/// 去掉空白与常见标点后小写化。标题的差异通常只是分隔符和全半角。
 fn normalize_title(title: &str) -> String {
     title
         .chars()
@@ -165,7 +165,7 @@ fn same_topic(left: &str, right: &str) -> bool {
         || (right.chars().count() >= MIN_DUPLICATE_TITLE_CHARS && left.contains(right))
 }
 
-/// 选出一次巩固的输入：只取重复组，装不下就少做几组，宁可不做也不截断单条记忆。
+/// 选出一次巩固的输入。只取重复组，装不下就少做几组，宁可不做也不截断单条记忆。
 pub(crate) fn prepare_batch(memories: &[MemoryRecord]) -> Option<CurationBatch> {
     let groups = duplicate_groups(memories);
     if groups.is_empty() {
@@ -253,7 +253,7 @@ pub(crate) fn parse_curation(text: &str, batch: &CurationBatch) -> Result<Curati
         );
         retired.insert(merge.retire.clone());
     }
-    // 幸存者不能被同时退休：不允许链式合并，保证每条保留的记忆直接覆盖它。
+    // 不允许链式合并，保证每条保留的记忆直接覆盖被退休项。
     for merge in &update.merges {
         ensure!(
             !retired.contains(&merge.into),
@@ -388,7 +388,7 @@ mod tests {
             memory("c", "缓存失效策略与回源细节"),
         ];
         let batch = batch(&memories);
-        // b 既要被退休、又要当覆盖者：链式合并必须拒绝。
+        // b 既要被退休、又要当覆盖者，链式合并必须拒绝。
         assert!(
             parse_curation(
                 r#"{"merges":[{"retire":"a","into":"b"},{"retire":"b","into":"c"}],"rewrites":[]}"#,
@@ -396,7 +396,7 @@ mod tests {
             )
             .is_err()
         );
-        // 同一目标被退休两次：拒绝。
+        // 同一目标被退休两次必须拒绝。
         assert!(
             parse_curation(
                 r#"{"merges":[{"retire":"a","into":"c"},{"retire":"a","into":"c"}],"rewrites":[]}"#,

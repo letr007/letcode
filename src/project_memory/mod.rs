@@ -36,7 +36,7 @@ pub(crate) fn enroll(recorder: &crate::transcript::TranscriptRecorder) -> Result
     Ok(())
 }
 
-/// 巩固是维护而非追赶：两次巩固之间留出间隔，且只在没有抽取欠账时执行。
+/// 巩固只在没有抽取欠账时执行，两次之间留出间隔。
 const CURATION_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Default)]
@@ -203,7 +203,7 @@ async fn process_pending(store: MemoryStore, helper: Agent, curation: Option<Age
     Ok(())
 }
 
-/// 巩固没有来源游标，也不推进任何前沿：失败只记日志，下一次 tick 再试。
+/// 巩固没有来源游标可推进，失败只记日志，下一次 tick 再试。
 async fn curate_pending(store: &MemoryStore, helper: Agent) {
     let candidate_store = store.clone();
     let batch = match blocking(move || {
