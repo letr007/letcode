@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone)]
 pub(crate) struct MemoryStore {
@@ -46,6 +46,29 @@ pub(crate) struct MemoryUpdate {
     pub withdrawn_ids: Vec<String>,
 }
 
+/// 巩固层对已有记忆的改动：把冗余项合并进幸存者，或改写幸存者的正文。
+/// 退休必须指名覆盖者（`into`），不允许无覆盖地删除。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct CurationUpdate {
+    #[serde(default)]
+    pub merges: Vec<CurationMerge>,
+    #[serde(default)]
+    pub rewrites: Vec<CurationRewrite>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CurationMerge {
+    pub retire: String,
+    pub into: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CurationRewrite {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MemoryRecord {
     pub id: String,
@@ -59,6 +82,14 @@ pub(crate) struct MemoryRecord {
     pub paths: Vec<String>,
     pub created_at_ms: u64,
     pub state: String,
+    /// 被 memory__recall 返回过的次数与最近一次时间；读取路径记账，供巩固层判断哪些记忆真被用到。
+    #[serde(default)]
+    pub recall_count: u64,
+    #[serde(default)]
+    pub last_recalled_at: Option<u64>,
+    /// 最近一次被巩固层改写的时刻；未被改写过则为 None。
+    #[serde(default)]
+    pub curated_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -125,17 +156,29 @@ impl MemoryStore {
                     source_ids_json TEXT NOT NULL,
                     paths_json TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL,
-                    state TEXT NOT NULL
+                    state TEXT NOT NULL,
+                    recall_count INTEGER NOT NULL DEFAULT 0,
+                    last_recalled_at INTEGER,
+                    curated_at_ms INTEGER
                 );
                 CREATE INDEX memories_active_created
                     ON memories(state, created_at_ms DESC);",
             )?;
-        } else if version == 1 {
-            transaction.execute_batch(
-                "ALTER TABLE sources
-                    ADD COLUMN observed_sequence INTEGER NOT NULL DEFAULT 0;
-                 UPDATE sources SET observed_sequence=cursor;",
-            )?;
+        } else {
+            if version < 2 {
+                transaction.execute_batch(
+                    "ALTER TABLE sources
+                        ADD COLUMN observed_sequence INTEGER NOT NULL DEFAULT 0;
+                     UPDATE sources SET observed_sequence=cursor;",
+                )?;
+            }
+            if version < 3 {
+                transaction.execute_batch(
+                    "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE memories ADD COLUMN last_recalled_at INTEGER;
+                     ALTER TABLE memories ADD COLUMN curated_at_ms INTEGER;",
+                )?;
+            }
         }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -291,6 +334,56 @@ impl MemoryStore {
         self.read_active(limit.min(10_000))
     }
 
+    /// 记账：这些记忆刚被 memory__recall 返回过。失败只影响统计，不影响检索结果。
+    pub(crate) fn record_recall(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connect()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        for id in ids {
+            transaction.execute(
+                "UPDATE memories SET recall_count=recall_count+1, last_recalled_at=?2
+                 WHERE id=?1 AND state='active'",
+                params![id, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 应用一次巩固结果。整批在一个事务里：任一目标已不再是 active 就整体失败，
+    /// 避免按已经过期的视图改动记忆。
+    pub(crate) fn apply_curation(&self, update: &CurationUpdate) -> Result<()> {
+        if update.merges.is_empty() && update.rewrites.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connect()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        for merge in &update.merges {
+            let changed = transaction.execute(
+                "UPDATE memories SET state='retired', curated_at_ms=?2
+                 WHERE id=?1 AND state='active'",
+                params![merge.retire, now],
+            )?;
+            ensure!(changed == 1, "memory curation target is no longer active");
+        }
+        for rewrite in &update.rewrites {
+            let changed = transaction.execute(
+                "UPDATE memories SET title=?2, summary=?3, curated_at_ms=?4
+                 WHERE id=?1 AND state='active'",
+                params![rewrite.id, rewrite.title, rewrite.summary, now],
+            )?;
+            ensure!(changed == 1, "memory curation target is no longer active");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn query(
         &self,
         query: &crate::memory::MemoryRecallQuery,
@@ -391,7 +484,8 @@ impl MemoryStore {
         let connection = self.connect()?;
         let mut statement = connection.prepare(
             "SELECT id,kind,title,summary,status,session_id,branch_id,
-                    source_ids_json,paths_json,created_at_ms,state
+                    source_ids_json,paths_json,created_at_ms,state,
+                    recall_count,last_recalled_at,curated_at_ms
              FROM memories WHERE state='active'
              ORDER BY created_at_ms DESC,id LIMIT ?1",
         )?;
@@ -408,6 +502,9 @@ impl MemoryStore {
                 row.get::<_, String>(8)?,
                 row.get::<_, u64>(9)?,
                 row.get::<_, String>(10)?,
+                row.get::<_, u64>(11)?,
+                row.get::<_, Option<u64>>(12)?,
+                row.get::<_, Option<u64>>(13)?,
             ))
         })?;
         rows.map(|row| {
@@ -423,6 +520,9 @@ impl MemoryStore {
                 paths_json,
                 created_at_ms,
                 state,
+                recall_count,
+                last_recalled_at,
+                curated_at_ms,
             ) = row?;
             Ok(MemoryRecord {
                 id,
@@ -436,6 +536,9 @@ impl MemoryStore {
                 paths: serde_json::from_str(&paths_json)?,
                 created_at_ms,
                 state,
+                recall_count,
+                last_recalled_at,
+                curated_at_ms,
             })
         })
         .collect()
@@ -624,6 +727,152 @@ mod tests {
             paths: paths.iter().map(|path| (*path).into()).collect(),
             supersedes: vec![],
         }
+    }
+
+    #[test]
+    fn opens_version_two_store_and_backfills_recall_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let workspace = project.path().canonicalize().unwrap();
+        let project_key = format!(
+            "{:x}",
+            Sha256::digest(workspace.as_os_str().as_encoded_bytes())
+        );
+        let directory = root.path().join(project_key);
+        std::fs::create_dir_all(&directory).unwrap();
+        let connection = Connection::open(directory.join("memory.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sources (
+                    session_id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    cursor INTEGER NOT NULL,
+                    retry_at_ms INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    observed_sequence INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE memories (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    branch_id TEXT NOT NULL,
+                    source_ids_json TEXT NOT NULL,
+                    paths_json TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                );
+                INSERT INTO sources(session_id,path,cursor,observed_sequence)
+                    VALUES ('old','/tmp/old.jsonl',1,1);
+                INSERT INTO memories(id,kind,title,summary,status,session_id,branch_id,
+                    source_ids_json,paths_json,created_at_ms,state)
+                    VALUES ('memory:old:1:0','decision','旧记忆','正文','useful','old','main',
+                    '[\"raw:1\"]','[]',1,'active');
+                PRAGMA user_version=2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = MemoryStore::open(root.path(), project.path()).unwrap();
+        let memories = store.known_memories(10).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].title, "旧记忆");
+        assert_eq!(memories[0].recall_count, 0);
+        assert_eq!(memories[0].last_recalled_at, None);
+        assert_eq!(memories[0].curated_at_ms, None);
+        assert_eq!(store.status().unwrap().state, "ready");
+    }
+
+    #[test]
+    fn recall_accounting_counts_each_returned_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let store = MemoryStore::open(root.path(), root.path()).unwrap();
+        store.register_source("s", journal.path(), 1).unwrap();
+        store.register_source("s", journal.path(), 2).unwrap();
+        let source = store.sources().unwrap().remove(0);
+        store
+            .complete(
+                &source,
+                2,
+                "main",
+                &MemoryUpdate {
+                    memories: vec![draft()],
+                    withdrawn_ids: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+        let hits = store.query(&query("缓存")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].recall_count, 0);
+        let ids = hits
+            .iter()
+            .map(|memory| memory.id.clone())
+            .collect::<Vec<_>>();
+        store.record_recall(&ids).unwrap();
+        let memories = store.known_memories(10).unwrap();
+        assert_eq!(memories[0].recall_count, 1);
+        assert!(memories[0].last_recalled_at.is_some());
+        store.record_recall(&ids).unwrap();
+        assert_eq!(store.known_memories(10).unwrap()[0].recall_count, 2);
+    }
+
+    #[test]
+    fn curation_retires_and_rewrites_active_memories() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let store = MemoryStore::open(root.path(), root.path()).unwrap();
+        store.register_source("s", journal.path(), 1).unwrap();
+        store.register_source("s", journal.path(), 2).unwrap();
+        let source = store.sources().unwrap().remove(0);
+        store
+            .complete(
+                &source,
+                2,
+                "main",
+                &MemoryUpdate {
+                    memories: vec![
+                        memory_with("缓存失效策略", "短正文", &[]),
+                        memory_with("缓存失效策略与回源", "长正文", &[]),
+                    ],
+                    withdrawn_ids: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+        let active = store.known_memories(10).unwrap();
+        assert_eq!(active.len(), 2);
+        let survivor = active
+            .iter()
+            .find(|memory| memory.title == "缓存失效策略与回源")
+            .unwrap();
+        let duplicate = active
+            .iter()
+            .find(|memory| memory.title == "缓存失效策略")
+            .unwrap();
+        let update = CurationUpdate {
+            merges: vec![CurationMerge {
+                retire: duplicate.id.clone(),
+                into: survivor.id.clone(),
+            }],
+            rewrites: vec![CurationRewrite {
+                id: survivor.id.clone(),
+                title: survivor.title.clone(),
+                summary: "合并后的正文".into(),
+            }],
+        };
+        store.apply_curation(&update).unwrap();
+        let active = store.known_memories(10).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].summary, "合并后的正文");
+        assert!(active[0].curated_at_ms.is_some());
+
+        // 同一批再应用一次必须整体失败：目标已经不是 active。
+        assert!(store.apply_curation(&update).is_err());
+        assert_eq!(store.known_memories(10).unwrap().len(), 1);
     }
 
     #[test]

@@ -59,6 +59,14 @@ impl ToolHandler for MemoryRecallTool {
         tokio::task::spawn_blocking(move || {
             let memories = store.query(&query)?;
             let status = store.status()?;
+            // 记账是 best-effort：统计失败不影响这次检索的结果。
+            let ids = memories
+                .iter()
+                .map(|memory| memory.id.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = store.record_recall(&ids) {
+                tracing::warn!(error = %error, "project memory recall accounting failed");
+            }
             Ok(json!({"memories": memories, "status": status}))
         })
         .await?

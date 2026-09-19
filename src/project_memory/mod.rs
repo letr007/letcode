@@ -1,4 +1,5 @@
 //! Persistent, workspace-scoped knowledge, independent of session compaction.
+pub(crate) mod curate;
 pub(crate) mod extract;
 pub(crate) mod store;
 
@@ -35,9 +36,13 @@ pub(crate) fn enroll(recorder: &crate::transcript::TranscriptRecorder) -> Result
     Ok(())
 }
 
+/// 巩固是维护而非追赶：两次巩固之间留出间隔，且只在没有抽取欠账时执行。
+const CURATION_INTERVAL: Duration = Duration::from_secs(600);
+
 #[derive(Default)]
 pub(crate) struct MemoryWorker {
     task: Option<tokio::task::JoinHandle<Result<()>>>,
+    last_curation: Option<std::time::Instant>,
 }
 
 impl MemoryWorker {
@@ -51,19 +56,23 @@ impl MemoryWorker {
         let Some(store) = configured_store()? else {
             return Ok(());
         };
-        let mut template = AgentTemplate::historian();
-        template.system_prompt = extract::MEMORY_PROMPT.into();
-        template.purpose = "后台项目记忆整理".into();
-        let helper = AgentFactory::create_child_with_route_and_max_tool_calls(
-            parent,
-            &template,
-            None,
-            false,
-            Some(0),
-        )?;
-        self.task = Some(tokio::spawn(
-            async move { process_pending(store, helper).await },
-        ));
+        let helper = historian_child(parent, extract::MEMORY_PROMPT, "后台项目记忆整理")?;
+        let curation_due = self
+            .last_curation
+            .is_none_or(|last| last.elapsed() >= CURATION_INTERVAL);
+        let curation = if curation_due {
+            self.last_curation = Some(std::time::Instant::now());
+            Some(historian_child(
+                parent,
+                curate::CURATION_PROMPT,
+                "后台项目记忆巩固",
+            )?)
+        } else {
+            None
+        };
+        self.task = Some(tokio::spawn(async move {
+            process_pending(store, helper, curation).await
+        }));
         Ok(())
     }
 
@@ -92,13 +101,27 @@ impl Drop for MemoryWorker {
     }
 }
 
+/// 记忆整理与巩固共用 historian 模板与模型路由，只是 system prompt 与职责不同。
+fn historian_child(parent: &Agent, prompt: &str, purpose: &str) -> Result<Agent> {
+    let mut template = AgentTemplate::historian();
+    template.system_prompt = prompt.into();
+    template.purpose = purpose.into();
+    AgentFactory::create_child_with_route_and_max_tool_calls(
+        parent,
+        &template,
+        None,
+        false,
+        Some(0),
+    )
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
         .context("project memory worker join failed")?
 }
 
-async fn process_pending(store: MemoryStore, helper: Agent) -> Result<()> {
+async fn process_pending(store: MemoryStore, helper: Agent, curation: Option<Agent>) -> Result<()> {
     use fs4::fs_std::FileExt;
     let lock_path = store.worker_lock_path();
     let lock = blocking(move || {
@@ -172,5 +195,55 @@ async fn process_pending(store: MemoryStore, helper: Agent) -> Result<()> {
             .await?;
         }
     }
+    if let Some(helper) = curation
+        && batches == 0
+    {
+        curate_pending(&store, helper).await;
+    }
     Ok(())
+}
+
+/// 巩固没有来源游标，也不推进任何前沿：失败只记日志，下一次 tick 再试。
+async fn curate_pending(store: &MemoryStore, helper: Agent) {
+    let candidate_store = store.clone();
+    let batch = match blocking(move || {
+        let memories = candidate_store.known_memories(10_000)?;
+        Ok(curate::prepare_batch(&memories))
+    })
+    .await
+    {
+        Ok(batch) => batch,
+        Err(error) => {
+            tracing::warn!(error = %error, "project memory curation could not read candidates");
+            return;
+        }
+    };
+    let Some(batch) = batch else {
+        return;
+    };
+    let result = async {
+        let (text, usage) = tokio::time::timeout(
+            Duration::from_secs(180),
+            helper.run_structured_oneshot(&batch.input, curate::structured_output, |_: &str| {
+                std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(()))
+            }),
+        )
+        .await
+        .context("project memory curation timed out")??;
+        let update = curate::parse_curation(&text, &batch)?;
+        let apply_store = store.clone();
+        let changed = blocking(move || {
+            apply_store.apply_curation(&update)?;
+            Ok(update.merges.len() + update.rewrites.len())
+        })
+        .await?;
+        Ok::<_, anyhow::Error>((changed, usage))
+    }
+    .await;
+    match result {
+        Ok((changed, usage)) => {
+            tracing::info!(changed, usage = ?usage, "project memory curation completed");
+        }
+        Err(error) => tracing::warn!(error = %error, "project memory curation failed"),
+    }
 }

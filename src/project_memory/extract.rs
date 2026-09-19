@@ -472,6 +472,9 @@ mod tests {
             paths: vec!["src/example.rs".into()],
             created_at_ms: 0,
             state: "active".into(),
+            recall_count: 0,
+            last_recalled_at: None,
+            curated_at_ms: None,
         }
     }
 
