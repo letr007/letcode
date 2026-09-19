@@ -9,16 +9,26 @@
 
 ### Added
 
-- 新增实验性 Jev 审批后端：`[agents.reviewer]` 指向带 `reviewer = "jev"` 标记的 provider 时，`auto` 模式改由 Typesafe Jev 判定，端点、凭据和模型都取自该 provider。
+- 新增实验性 Jev 审批后端，`[agents.reviewer]` 指向带 `reviewer = "jev"` 标记的 provider 时，`auto` 模式改由 Typesafe Jev 判定，端点、凭据和模型都取自该 provider。
 - Jev 的每次判定记录在 reviewer 子会话里，可像 chat 审查专家一样在 TUI 中查看请求与决策。
+- 后台 Historian 新增项目记忆巩固，同一事实的重复项合并为一条。
+
+### Breaking
+
+- 旧版本 letcode 打开已升级的项目记忆库会启动失败，回退前需恢复记忆库备份。
 
 ### Changed
 
-- `auto` 模式下审查专家的判定从放行/拒绝两档扩展为三档：直接执行、交回请求方补充说明、或拒绝执行。
+- `auto` 模式下审查专家的判定从放行/拒绝两档扩展为直接执行、交回请求方补充说明、或拒绝执行三档。
 - 交回请求方的调用会在补充说明后重新判定，仍不明确才弹出与 `default` 模式相同的人工审批；同一调用在一个会话内只有一轮补充机会。
 - 升级到用户的人工审批需要交互式前端，one-shot 等无交互入口无法回答。
 - 所有命令都会进入审批，只读/低风险前缀不再直接放行。
 - 人工审批提示支持左右方向键在选项间切换高亮、Enter 确认；待审批时终端标题以 `!` 提醒，与提问的 `?` 一致。
+- `memory__recall` 返回项新增 `recall_count`、`last_recalled_at` 与 `curated_at_ms`。
+
+### Fixed
+
+- 修复项目记忆检索几乎召不回无空格中文长句的问题。
 
 ### Removed
 
