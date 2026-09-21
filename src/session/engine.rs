@@ -3001,16 +3001,29 @@ async fn run_engine_loop(
                     .lock()
                     .map(|queue| queue.preempted_by_user_prompt())
                     .unwrap_or(false)
-                    && let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript)
                 {
-                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                        ErrorEvent::new(format!(
-                            "failed to restore background completion before queued prompt: {error}"
-                        )),
-                    ));
-                    deferred_commands.clear();
-                    parked_commands.clear();
-                    break;
+                    if let Err(error) = derive_interrupt_request(&transcript, &subagent_runtime)
+                        .and_then(|interrupt| record_interrupt_transcript(&transcript, &interrupt))
+                    {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!(
+                                "failed to close the preempted turn before queued prompt: {error}"
+                            )),
+                        ));
+                        deferred_commands.clear();
+                        parked_commands.clear();
+                        break;
+                    }
+                    if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!(
+                                "failed to restore background completion before queued prompt: {error}"
+                            )),
+                        ));
+                        deferred_commands.clear();
+                        parked_commands.clear();
+                        break;
+                    }
                 }
                 if let Some(interrupt) = interrupted {
                     let persisted_interrupt = match record_interrupt_transcript(&transcript, &interrupt) {
@@ -4840,5 +4853,292 @@ base_url = "http://127.0.0.1:1"
         assert!(event_rx.try_recv().is_err());
 
         let _ = fs::remove_file(path);
+    }
+
+    const STUB_ANSWER: &str = "the session is still usable";
+
+    struct HoldingTool;
+
+    #[async_trait::async_trait]
+    impl ToolHandler for HoldingTool {
+        fn name(&self) -> &str {
+            "test__hold"
+        }
+
+        fn description(&self) -> &str {
+            "Holds an assistant tool call batch open"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        fn permission_class(&self) -> crate::permission::ToolPermissionClass {
+            crate::permission::ToolPermissionClass::Read
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            std::future::pending().await
+        }
+    }
+
+    async fn serve_responses_stub(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut served = 0usize;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+        {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut chunk).await.expect("stub request read");
+                assert!(read > 0, "stub request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = at + 4;
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .expect("responses request has content length");
+                break (header_end, content_length);
+            };
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).await.expect("stub body read");
+                assert!(read > 0, "stub request closed before body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let body = if served == 0 {
+                stub_tool_call_sse()
+            } else {
+                stub_text_sse()
+            };
+            served += 1;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("stub response write");
+        }
+    }
+
+    fn stub_tool_call_sse() -> String {
+        [
+            json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"test__hold"}}),
+            json!({"type":"response.function_call_arguments.done","item_id":"item-1","arguments":"{}"}),
+            json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"test__hold","arguments":"{}"}}),
+            json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+    }
+
+    fn stub_text_sse() -> String {
+        [
+            json!({"type":"response.output_text.delta","delta":STUB_ANSWER}),
+            json!({"type":"response.completed","response":{"id":"resp-2","status":"completed","usage":{"input_tokens":12,"output_tokens":6,"total_tokens":18}}}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+    }
+
+    fn open_tool_call_batch_recorded(
+        transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    ) -> Result<bool> {
+        let path = transcript
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?
+            .path()
+            .to_path_buf();
+        let records = read_records(&path)?;
+        Ok(records.iter().any(|record| {
+            matches!(
+                &record.event,
+                TranscriptEvent::AssistantTurn(turn) if !turn.calls.is_empty()
+            )
+        }))
+    }
+
+    fn observed_error(error: &ErrorEvent) -> String {
+        match error.details.as_deref().filter(|detail| !detail.is_empty()) {
+            Some(detail) => format!("{} ({detail})", error.message),
+            None => error.message.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_queued_behind_a_preempted_turn_keeps_the_session_usable() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let stub = tokio::spawn(serve_responses_stub(listener));
+
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            let sessions_dir = directory.path().join("sessions");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+active_provider = "test"
+
+[global]
+sessions_dir = "{}"
+
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model]
+# Retains the pre-recorded history, so historian work stays out of the turn.
+context_window = 128000
+effective_input_limit_tokens = 64000
+[providers.test.models.model.capabilities]
+tools = true
+[providers.test.models.model.capabilities.generation]
+max_output_tokens = true
+[providers.test.models.model.generation]
+max_output_tokens = 4096
+"#,
+                    sessions_dir.display()
+                ),
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).expect("config");
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            // A recorded user message skips title generation, so the stub only serves turns.
+            recorder.record_user_message("earlier prompt").unwrap();
+            recorder.record_assistant_message("earlier answer").unwrap();
+            let transcript = Arc::new(StdMutex::new(recorder));
+
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", None, None);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            agent
+                .try_register_tool(HoldingTool)
+                .expect("register the holding tool");
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+
+            let mut errors = Vec::new();
+            let mut answers = Vec::new();
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-1",
+                        crate::user_content::UserMessageContent::new("first prompt", Vec::new()),
+                    ),
+                ))
+                .unwrap();
+
+            let barrier = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut barrier_error = None;
+            loop {
+                match open_tool_call_batch_recorded(&transcript) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => barrier_error = Some(error.to_string()),
+                }
+                if tokio::time::Instant::now() >= barrier {
+                    panic!(
+                        "the stub tool call never reached the transcript: {barrier_error:?}; errors: {errors:?}"
+                    );
+                }
+                while let Ok(event) = events.try_recv() {
+                    if let SessionTransportEvent::Error(error) = event {
+                        errors.push(observed_error(&error));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-2",
+                        crate::user_content::UserMessageContent::new("second prompt", Vec::new()),
+                    ),
+                ))
+                .unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let Ok(Some(event)) = tokio::time::timeout(remaining, events.recv()).await else {
+                    break;
+                };
+                match event {
+                    SessionTransportEvent::Error(error) => {
+                        let locked = error
+                            .message
+                            .contains("assistant tool call group is incomplete");
+                        errors.push(observed_error(&error));
+                        if locked {
+                            break;
+                        }
+                    }
+                    SessionTransportEvent::AssistantDelta(delta) => {
+                        let answered = delta.delta.contains(STUB_ANSWER);
+                        answers.push(delta.delta);
+                        if answered {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            assert!(
+                !errors.iter().any(|message| message
+                    .contains("assistant tool call group is incomplete")),
+                "preempting a running turn must not leave the session locked; observed errors: {errors:?}"
+            );
+            assert!(
+                answers.iter().any(|answer| answer.contains(STUB_ANSWER)),
+                "the prompt queued behind the preempted turn must open its own turn; observed errors: {errors:?}"
+            );
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+            stub.abort();
+        })
+        .await
+        .expect("preemption of a running turn timed out");
     }
 }
