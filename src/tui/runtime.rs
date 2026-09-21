@@ -3065,22 +3065,22 @@ impl TuiRuntime {
         let mut items = vec![
             DialogItem::new(
                 "dark",
-                self.state.t("runtime.theme_dark"),
+                "Dark",
                 Some(self.state.t("runtime.theme_dark_desc")),
             ),
             DialogItem::new(
                 "plain",
-                self.state.t("runtime.theme_plain"),
+                "Plain",
                 Some(self.state.t("runtime.theme_plain_desc")),
             ),
             DialogItem::new(
                 "glass",
-                self.state.t("runtime.theme_glass"),
+                "Glass",
                 Some(self.state.t("runtime.theme_glass_desc")),
             ),
             DialogItem::new(
                 "rainbow",
-                self.state.t("runtime.theme_rainbow"),
+                "Rainbow",
                 Some(self.state.t("runtime.theme_rainbow_desc")),
             ),
         ];
