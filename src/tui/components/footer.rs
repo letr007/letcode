@@ -682,7 +682,7 @@ fn compaction_cell_style(theme: Theme, level: usize, reverse: bool, dimmed: bool
 }
 
 fn dimmed_compaction_color(theme: Theme) -> Color {
-    match (theme.accent, theme.canvas()) {
+    match (theme.accent, theme.root_bg) {
         (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => Color::Rgb(
             ((red as u16 * 2 + bg_red as u16) / 3) as u8,
             ((green as u16 * 2 + bg_green as u16) / 3) as u8,

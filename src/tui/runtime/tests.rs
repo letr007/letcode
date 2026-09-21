@@ -252,7 +252,7 @@ fn plain_theme_keeps_the_void_transparent_and_fills_panels() {
 }
 
 #[test]
-fn glass_theme_paints_no_cell_background() {
+fn glass_theme_paints_only_the_caret_background() {
     let mut runtime = runtime();
     runtime.state_mut().set_theme_name(ThemeName::Glass);
 
@@ -262,14 +262,15 @@ fn glass_theme_paints_no_cell_background() {
         .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
         .expect("render transcript");
 
-    let painted = terminal
+    let painted: Vec<_> = terminal
         .backend()
         .buffer()
         .content()
         .iter()
         .filter(|cell| cell.bg != ratatui::style::Color::Reset)
-        .count();
-    assert_eq!(painted, 0, "glass 不该绘制任何背景");
+        .collect();
+    // 光标块是光标本身，本来就该落底色；除此之外 glass 不填充任何东西。
+    assert_eq!(painted.len(), 1, "只该画出光标底色: {painted:?}");
 }
 
 #[test]

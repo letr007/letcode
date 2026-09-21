@@ -1218,23 +1218,24 @@ fn wordmark_shadow_style(theme: Theme) -> Style {
 
 /// Approximate a dim foreground without emitting SGR DIM, whose treatment of
 /// block glyphs differs between terminal emulators.
+///
+/// Anchored on the palette's dark tone: a transparent root leaves the background unknown.
 fn wordmark_shadow_color(theme: Theme) -> Color {
     const FOREGROUND_WEIGHT: u16 = 38;
-    match (theme.notice, theme.canvas()) {
-        (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => {
-            let blend = |foreground: u8, background: u8| {
-                ((foreground as u16 * FOREGROUND_WEIGHT
-                    + background as u16 * (100 - FOREGROUND_WEIGHT))
-                    / 100) as u8
-            };
-            Color::Rgb(
-                blend(red, bg_red),
-                blend(green, bg_green),
-                blend(blue, bg_blue),
-            )
-        }
-        _ => theme.dim_text,
-    }
+    const PALETTE_DARK: (u8, u8, u8) = (18, 18, 18);
+    let Color::Rgb(red, green, blue) = theme.notice else {
+        return theme.dim_text;
+    };
+    let blend = |foreground: u8, background: u8| {
+        ((u16::from(foreground) * FOREGROUND_WEIGHT
+            + u16::from(background) * (100 - FOREGROUND_WEIGHT))
+            / 100) as u8
+    };
+    Color::Rgb(
+        blend(red, PALETTE_DARK.0),
+        blend(green, PALETTE_DARK.1),
+        blend(blue, PALETTE_DARK.2),
+    )
 }
 
 fn dashboard_hint_style(theme: Theme) -> Style {
@@ -1250,6 +1251,16 @@ fn dashboard_hint_key_style(theme: Theme) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn wordmark_shadow_ignores_the_background() {
+        let expected = wordmark_shadow_color(Theme::dark());
+
+        assert_eq!(wordmark_shadow_color(Theme::plain_for(None)), expected);
+        assert_eq!(wordmark_shadow_color(Theme::glass()), expected);
+    }
+
     use super::*;
     use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
     use crate::context_view::{

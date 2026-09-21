@@ -38,8 +38,6 @@ pub struct ComposerMetrics {
 struct ComposerCursorPulse {
     bg: Color,
     fg: Color,
-    /// 主题不绘制面板时没有表面色可混，光标改用终端原生反相（`Modifier::REVERSED`）。
-    reversed: bool,
 }
 
 const CURSOR_FRAME_INTERVAL_MS: usize = 33;
@@ -766,12 +764,7 @@ fn render_composer_cursor_block(
 ) {
     let _ = theme;
     if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
-        let style = if pulse.reversed {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default().bg(pulse.bg).fg(pulse.fg)
-        };
-        cell.set_style(style);
+        cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
     }
     // Soft caret remains buffer-only so terminal cursor movement cannot disturb IME popups.
 }
@@ -783,21 +776,17 @@ fn composer_cursor_style(state: &TuiState, theme: Theme) -> ComposerCursorPulse 
 }
 
 fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursorPulse {
-    if !theme.paints_panels() {
-        // `mix_color_f32` 对 Reset 端点退化为 `to`：混不出脉动，光标只会变成近白实心块。
-        return ComposerCursorPulse {
-            bg: Color::Reset,
-            fg: Color::Reset,
-            reversed: true,
-        };
-    }
-
+    // 脉动从光标所立的面起跳：`Color::Reset` 混不出渐变，没有面板时用主题画布。
+    let backdrop = if theme.paints_panels() {
+        theme.element_bg
+    } else {
+        theme.canvas()
+    };
     let intensity = cursor_pulse_intensity(animation_frame);
     let cursor_bg = composer_cursor_target_color(theme);
     ComposerCursorPulse {
-        bg: mix_color_f32(theme.element_bg, cursor_bg, intensity),
-        fg: mix_color_f32(theme.text, theme.element_bg, intensity * 0.82),
-        reversed: false,
+        bg: mix_color_f32(backdrop, cursor_bg, intensity),
+        fg: mix_color_f32(theme.text, backdrop, intensity * 0.82),
     }
 }
 
@@ -1420,15 +1409,19 @@ mod tests {
     }
 
     #[test]
-    fn composer_cursor_pulses_on_painted_panels_and_reverses_without_them() {
-        let plain = composer_cursor_pulse(Theme::plain_for(None), 0);
-        assert!(!plain.reversed);
-        assert_ne!(plain.bg, Color::Reset);
+    fn composer_cursor_pulses_in_every_theme() {
+        for theme in [Theme::dark(), Theme::plain_for(None), Theme::glass()] {
+            let mut colors: Vec<Color> = Vec::new();
+            for frame in 0..64 {
+                let pulse = composer_cursor_pulse(theme, frame);
+                assert_ne!(pulse.bg, Color::Reset, "光标必须有可见底色");
+                if !colors.contains(&pulse.bg) {
+                    colors.push(pulse.bg);
+                }
+            }
 
-        let glass = composer_cursor_pulse(Theme::glass(), 0);
-        assert!(glass.reversed);
-        assert_eq!(glass.bg, Color::Reset);
-        assert_eq!(glass.fg, Color::Reset);
+            assert!(colors.len() > 2, "光标应该会脉动: {colors:?}");
+        }
     }
 
     #[test]
