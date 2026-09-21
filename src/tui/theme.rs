@@ -4,9 +4,12 @@ use super::terminal_bg::Rgb;
 
 pub use crate::command::ThemeName;
 
-const SURFACE_DEPTH: f32 = 0.45;
-const ELEMENT_DEPTH: f32 = 0.30;
-const ELEVATED_DEPTH: f32 = 0.10;
+const SURFACE_LIFT: f32 = 0.05;
+const ELEMENT_LIFT: f32 = 0.12;
+const ELEVATED_LIFT: f32 = 0.20;
+
+/// 终端不给回包（或给的是亮色背景）时假定一个常见的深色背景。
+const ASSUMED_BACKGROUND: Rgb = (24, 25, 34);
 
 /// Shared TUI color tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,34 +73,49 @@ impl Theme {
         self.element_bg
     }
 
+    /// Ink fades toward this: the root, or black when the root is left to the terminal, where
+    /// there is no painted background to blend into.
+    pub const fn canvas(self) -> Color {
+        match self.root_bg {
+            Color::Reset => Color::Rgb(0, 0, 0),
+            color => color,
+        }
+    }
+
     /// Dark palette with the screen left to the terminal: `root_bg` becomes `Color::Reset`, so
-    /// gaps and the empty transcript keep terminal transparency. Panels are shaded relative to a
-    /// detected dark background, or fall back to the fixed ladder when there is none.
+    /// gaps and the empty transcript keep terminal transparency. Panels lift above a detected
+    /// dark background, so the ladder stays readable as it does in [`Theme::dark`].
     pub fn plain_for(terminal_bg: Option<Rgb>) -> Self {
+        let background = usable_background(terminal_bg);
         let mut theme = Self::dark();
         theme.root_bg = Color::Reset;
-        let (surface_bg, element_bg, elevated_bg) = match terminal_bg.filter(|bg| is_dark(*bg)) {
-            Some(bg) => (
-                darkened(bg, SURFACE_DEPTH),
-                darkened(bg, ELEMENT_DEPTH),
-                darkened(bg, ELEVATED_DEPTH),
-            ),
-            None => (
-                Color::Rgb(12, 12, 13),
-                Color::Rgb(18, 18, 20),
-                Color::Rgb(32, 32, 35),
-            ),
-        };
-        theme.surface_bg = surface_bg;
-        theme.element_bg = element_bg;
-        theme.elevated_bg = elevated_bg;
+        theme.surface_bg = lifted(background, SURFACE_LIFT);
+        theme.element_bg = lifted(background, ELEMENT_LIFT);
+        theme.elevated_bg = lifted(background, ELEVATED_LIFT);
         theme
+    }
+
+    /// Every surface, panels included, left to the terminal: the app paints ink only.
+    pub const fn glass() -> Self {
+        let mut theme = Self::dark();
+        theme.root_bg = Color::Reset;
+        theme.surface_bg = Color::Reset;
+        theme.element_bg = Color::Reset;
+        theme.elevated_bg = Color::Reset;
+        theme
+    }
+
+    /// Marks drawn in the surface tone — gauge tracks, prompt box caps — and the composer caret
+    /// need a painted surface, which [`Theme::glass`] does not provide.
+    pub const fn paints_panels(self) -> bool {
+        !matches!(self.element_bg, Color::Reset)
     }
 
     pub fn for_name(name: ThemeName, frame: usize, terminal_bg: Option<Rgb>) -> Self {
         match name {
             ThemeName::Dark => Self::dark(),
             ThemeName::Plain => Self::plain_for(terminal_bg),
+            ThemeName::Glass => Self::glass(),
             ThemeName::Rainbow => Self::dark().with_rainbow_accent(frame),
         }
     }
@@ -148,16 +166,40 @@ impl Theme {
     }
 }
 
-/// Shading a light background yields mid-gray panels that the light panel text cannot sit on.
+/// Lifting needs a dark terminal: there is no room above a mid or light background for a panel
+/// that the palette's light text can still sit on.
+fn usable_background(terminal_bg: Option<Rgb>) -> Rgb {
+    terminal_bg
+        .filter(|bg| is_dark(*bg))
+        .unwrap_or(ASSUMED_BACKGROUND)
+}
+
 fn is_dark((red, green, blue): Rgb) -> bool {
     // Rec. 601 luma weights.
     let luma = 299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue);
-    luma < 128 * 1000
+    luma < 64 * 1000
 }
 
-fn darkened((red, green, blue): Rgb, depth: f32) -> Color {
-    let channel = |value: u8| (f32::from(value) * (1.0 - depth)).round() as u8;
-    Color::Rgb(channel(red), channel(green), channel(blue))
+/// Move each channel toward the background's own bright end, so panels keep its hue; a fixed white
+/// anchor would wash a dark background out to gray.
+fn lifted((red, green, blue): Rgb, lift: f32) -> Color {
+    let peak = red.max(green).max(blue);
+    let anchor = if peak == 0 {
+        // Black has no hue to keep.
+        [u8::MAX; 3]
+    } else {
+        let scale = 255.0 / f32::from(peak);
+        [red, green, blue].map(|channel| (f32::from(channel) * scale).round() as u8)
+    };
+    let channel = |value: u8, anchor: u8| {
+        let value = f32::from(value);
+        (value + (f32::from(anchor) - value) * lift).round() as u8
+    };
+    Color::Rgb(
+        channel(red, anchor[0]),
+        channel(green, anchor[1]),
+        channel(blue, anchor[2]),
+    )
 }
 
 impl Default for Theme {
@@ -185,10 +227,15 @@ mod tests {
         assert_eq!(Theme::for_name(ThemeName::Dark, 0, None), Theme::dark());
     }
 
-    fn channel_sum(color: Color) -> u32 {
+    fn channels(color: Color) -> Rgb {
         let Color::Rgb(red, green, blue) = color else {
             panic!("expected an rgb surface, got {color:?}");
         };
+        (red, green, blue)
+    }
+
+    fn channel_sum(color: Color) -> u32 {
+        let (red, green, blue) = channels(color);
         u32::from(red) + u32::from(green) + u32::from(blue)
     }
 
@@ -206,35 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn plain_theme_darkens_panels_into_a_monotonic_ladder() {
-        let plain = Theme::plain_for(None);
-        let dark = Theme::dark();
-
-        for (plain_surface, dark_surface) in [
-            (plain.surface_bg, dark.surface_bg),
-            (plain.element_bg, dark.element_bg),
-            (plain.elevated_bg, dark.elevated_bg),
-        ] {
-            assert!(
-                channel_sum(plain_surface) < channel_sum(dark_surface),
-                "{plain_surface:?} should sit below {dark_surface:?}"
-            );
-        }
-
-        assert!(channel_sum(plain.surface_bg) < channel_sum(plain.element_bg));
-        assert!(channel_sum(plain.element_bg) < channel_sum(plain.elevated_bg));
-    }
-
-    #[test]
-    fn plain_shades_the_ladder_below_a_detected_background() {
+    fn plain_theme_lifts_panels_above_a_detected_background() {
         let background: Rgb = (26, 27, 38);
         let plain = Theme::plain_for(Some(background));
         let background = channel_sum(Color::Rgb(background.0, background.1, background.2));
 
         for surface in [plain.surface_bg, plain.element_bg, plain.elevated_bg] {
             assert!(
-                channel_sum(surface) < background,
-                "{surface:?} should sit below the terminal background"
+                channel_sum(surface) > background,
+                "{surface:?} should sit above the terminal background"
             );
         }
         assert!(channel_sum(plain.surface_bg) < channel_sum(plain.element_bg));
@@ -242,10 +269,63 @@ mod tests {
     }
 
     #[test]
-    fn plain_keeps_the_fixed_ladder_for_light_backgrounds() {
-        let fixed = Theme::plain_for(None);
+    fn plain_assumes_a_dark_background_when_there_is_none_to_use() {
+        let assumed = Theme::plain_for(None);
 
-        assert_eq!(Theme::plain_for(Some((255, 255, 255))), fixed);
-        assert_eq!(Theme::plain_for(Some((250, 250, 250))), fixed);
+        assert!(channel_sum(assumed.element_bg) > channel_sum(Color::Rgb(24, 25, 34)));
+        assert_eq!(Theme::plain_for(Some((255, 255, 255))), assumed);
+        assert_eq!(Theme::plain_for(Some((250, 250, 250))), assumed);
+        assert_eq!(Theme::plain_for(Some((120, 120, 120))), assumed);
+    }
+
+    #[test]
+    fn plain_keeps_the_background_hue_in_its_panels() {
+        let background: Rgb = (26, 27, 38);
+        let plain = Theme::plain_for(Some(background));
+
+        let cast = background.2 - background.0;
+
+        for surface in [plain.surface_bg, plain.element_bg, plain.elevated_bg] {
+            let channels = channels(surface);
+            assert!(
+                channels.2 - channels.0 >= cast,
+                "{channels:?} should keep the background's blue cast"
+            );
+        }
+    }
+
+    #[test]
+    fn glass_theme_leaves_every_surface_to_the_terminal() {
+        let glass = Theme::for_name(ThemeName::Glass, 0, Some((26, 27, 38)));
+
+        for surface in [
+            glass.root_bg,
+            glass.surface_bg,
+            glass.element_bg,
+            glass.elevated_bg,
+        ] {
+            assert_eq!(surface, Color::Reset);
+        }
+        assert!(!glass.paints_panels());
+        assert!(Theme::plain_for(None).paints_panels());
+    }
+
+    #[test]
+    fn canvas_stays_concrete_without_a_painted_root() {
+        assert_eq!(Theme::dark().canvas(), Theme::dark().root_bg);
+        assert_eq!(Theme::plain_for(None).canvas(), Color::Rgb(0, 0, 0));
+        assert_eq!(Theme::glass().canvas(), Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn plain_lifts_panels_off_a_black_background() {
+        let plain = Theme::plain_for(Some((0, 0, 0)));
+
+        for surface in [plain.surface_bg, plain.element_bg, plain.elevated_bg] {
+            assert!(
+                channel_sum(surface) > 0,
+                "{surface:?} should not stay black"
+            );
+        }
     }
 }

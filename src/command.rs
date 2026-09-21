@@ -94,8 +94,10 @@ impl ThoughtsDisplayMode {
 pub enum ThemeName {
     #[default]
     Dark,
-    /// Dark palette without surface fills, leaving the terminal background in place.
+    /// Dark palette with panels lifted above the terminal background.
     Plain,
+    /// Dark palette with every surface, panels included, left to the terminal.
+    Glass,
     Rainbow,
 }
 
@@ -104,6 +106,7 @@ impl ThemeName {
         match self {
             Self::Dark => "dark",
             Self::Plain => "plain",
+            Self::Glass => "glass",
             Self::Rainbow => "rainbow",
         }
     }
@@ -111,7 +114,8 @@ impl ThemeName {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "dark" | "default" => Some(Self::Dark),
-            "plain" | "transparent" => Some(Self::Plain),
+            "plain" => Some(Self::Plain),
+            "glass" | "transparent" => Some(Self::Glass),
             "rainbow" => Some(Self::Rainbow),
             _ => None,
         }
@@ -758,7 +762,7 @@ fn parse_theme(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
             None => Err(CommandParseError::with_args("parse.unknown_theme", [])),
         },
         ["/theme", ..] => Err(CommandParseError::new(
-            "Usage: /theme <dark|plain|rainbow|<themes/*.toml>>",
+            "Usage: /theme <dark|plain|glass|rainbow|<themes/*.toml>>",
         )),
         _ => unreachable!(),
     }

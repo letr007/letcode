@@ -3071,7 +3071,12 @@ impl TuiRuntime {
             DialogItem::new(
                 "plain",
                 "Plain",
-                Some("No surface fill — keeps the terminal background".into()),
+                Some("Panels lifted above the terminal background".into()),
+            ),
+            DialogItem::new(
+                "glass",
+                "Glass",
+                Some("Ink only — every surface left to the terminal".into()),
             ),
             DialogItem::new(
                 "rainbow",

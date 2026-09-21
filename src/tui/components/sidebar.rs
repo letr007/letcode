@@ -420,10 +420,7 @@ fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
     if cell.iter().all(|color| *color == cell[0]) {
         return match cell[0] {
             Some(color) => Span::styled("█", Style::default().fg(color).bg(theme.element_bg)),
-            None => Span::styled(
-                "█",
-                Style::default().fg(theme.elevated_bg).bg(theme.element_bg),
-            ),
+            None => context_bar_empty_cell(theme),
         };
     }
 
@@ -449,10 +446,7 @@ fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
             .unwrap_or((None, cell.len()));
         return match color {
             Some(color) => Span::styled("█", Style::default().fg(color).bg(theme.element_bg)),
-            None => Span::styled(
-                "█",
-                Style::default().fg(theme.elevated_bg).bg(theme.element_bg),
-            ),
+            None => context_bar_empty_cell(theme),
         };
     }
 
@@ -475,6 +469,19 @@ fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
     Span::styled(
         partial_context_block(split),
         Style::default().fg(foreground).bg(background),
+    )
+}
+
+/// 空槽墨色是表面色调；主题不绘制面板时它无处可比，落墨只会以终端默认前景变成亮块，
+/// 把剩余容量读成已占用，所以那种主题下空槽交还给终端底色。
+fn context_bar_empty_cell(theme: Theme) -> Span<'static> {
+    if !theme.paints_panels() {
+        return Span::raw(" ");
+    }
+
+    Span::styled(
+        "█",
+        Style::default().fg(theme.elevated_bg).bg(theme.element_bg),
     )
 }
 
@@ -1592,17 +1599,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_context_bar_uses_visible_track_cells() {
-        let theme = Theme::dark();
-        let line = context_bar_spans(4, 0, &[], theme);
+    fn empty_context_bar_keeps_its_track_only_on_painted_panels() {
+        for theme in [Theme::dark(), Theme::plain_for(None)] {
+            let line = context_bar_spans(4, 0, &[], theme);
 
-        assert_eq!(line.width(), 4);
-        assert!(line.spans.iter().all(|span| span.content.as_ref() == "█"));
-        assert!(
-            line.spans
-                .iter()
-                .all(|span| span.style.fg == Some(theme.elevated_bg))
-        );
+            assert_eq!(line.width(), 4);
+            assert!(line.spans.iter().all(|span| span.content.as_ref() == "█"));
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(theme.elevated_bg))
+            );
+        }
+
+        let glass = context_bar_spans(4, 0, &[], Theme::glass());
+        assert_eq!(glass.width(), 4);
+        assert!(glass.spans.iter().all(|span| span.content.as_ref() == " "));
+        assert!(glass.spans.iter().all(|span| span.style.fg.is_none()));
     }
 
     #[test]

@@ -252,6 +252,27 @@ fn plain_theme_keeps_the_void_transparent_and_fills_panels() {
 }
 
 #[test]
+fn glass_theme_paints_no_cell_background() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_theme_name(ThemeName::Glass);
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .expect("render transcript");
+
+    let painted = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .filter(|cell| cell.bg != ratatui::style::Color::Reset)
+        .count();
+    assert_eq!(painted, 0, "glass 不该绘制任何背景");
+}
+
+#[test]
 fn plain_theme_shades_panels_with_the_detected_terminal_background() {
     let background = (26_u8, 27_u8, 38_u8);
     let mut runtime = runtime();

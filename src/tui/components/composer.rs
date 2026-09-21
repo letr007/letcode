@@ -38,6 +38,8 @@ pub struct ComposerMetrics {
 struct ComposerCursorPulse {
     bg: Color,
     fg: Color,
+    /// 主题不绘制面板时没有表面色可混，光标改用终端原生反相（`Modifier::REVERSED`）。
+    reversed: bool,
 }
 
 const CURSOR_FRAME_INTERVAL_MS: usize = 33;
@@ -534,7 +536,9 @@ fn render_child_prompt_top_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    if cap_width > 0 {
+    // 这排半块字形只能用表面色描出盒子边缘；主题不绘制面板时它会在透明背景上
+    // 变成一条横贯整行的亮带。
+    if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 surface::PROMPT_TOP_CAP_GLYPH.repeat(cap_width as usize),
@@ -763,7 +767,12 @@ fn render_composer_cursor_block(
 ) {
     let _ = theme;
     if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
-        cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
+        let style = if pulse.reversed {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().bg(pulse.bg).fg(pulse.fg)
+        };
+        cell.set_style(style);
     }
     // Soft caret remains buffer-only so terminal cursor movement cannot disturb IME popups.
 }
@@ -775,11 +784,22 @@ fn composer_cursor_style(state: &TuiState, theme: Theme) -> ComposerCursorPulse 
 }
 
 fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursorPulse {
+    if !theme.paints_panels() {
+        // `mix_color_f32` 会把 `Color::Reset` 端点当成回退：bg 恒为近白、fg 恒为终端
+        // 默认前景，光标变成近白实心块。没有面板可混时改用终端自身的底色反白。
+        return ComposerCursorPulse {
+            bg: Color::Reset,
+            fg: Color::Reset,
+            reversed: true,
+        };
+    }
+
     let intensity = cursor_pulse_intensity(animation_frame);
     let cursor_bg = composer_cursor_target_color(theme);
     ComposerCursorPulse {
         bg: mix_color_f32(theme.element_bg, cursor_bg, intensity),
         fg: mix_color_f32(theme.text, theme.element_bg, intensity * 0.82),
+        reversed: false,
     }
 }
 
@@ -950,7 +970,8 @@ pub(crate) fn render_prompt_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    if cap_width > 0 {
+    // 见 `render_child_prompt_top_cap`：半块字形是面板边缘，不是仪表轨道。
+    if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 surface::PROMPT_BOTTOM_CAP_GLYPH.repeat(cap_width as usize),
@@ -1401,6 +1422,18 @@ mod tests {
     }
 
     #[test]
+    fn composer_cursor_pulses_on_painted_panels_and_reverses_without_them() {
+        let plain = composer_cursor_pulse(Theme::plain_for(None), 0);
+        assert!(!plain.reversed);
+        assert_ne!(plain.bg, Color::Reset);
+
+        let glass = composer_cursor_pulse(Theme::glass(), 0);
+        assert!(glass.reversed);
+        assert_eq!(glass.bg, Color::Reset);
+        assert_eq!(glass.fg, Color::Reset);
+    }
+
+    #[test]
     fn long_single_line_cjk_wraps_into_multiple_rows() {
         // Each CJK char is width 2.
         // width 6 => 3 chars per row.
@@ -1648,6 +1681,37 @@ mod tests {
             !rendered.contains("hidden input should not render"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn prompt_cap_bands_need_painted_panels() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.set_language(Some(crate::tui::i18n::Language::En));
+
+        let cap_glyphs = |state: &mut TuiState, theme: Theme| {
+            let backend = TestBackend::new(60, 5);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| render_composer(frame, state, Rect::new(0, 0, 60, 5), theme))
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        assert!(
+            cap_glyphs(&mut state, Theme::plain_for(None))
+                .contains(surface::PROMPT_BOTTOM_CAP_GLYPH),
+            "有面板填充的主题继续用半块字形描盒子边缘"
+        );
+
+        let glass = cap_glyphs(&mut state, Theme::glass());
+        assert!(!glass.contains(surface::PROMPT_BOTTOM_CAP_GLYPH), "{glass}");
+        assert!(glass.contains(surface::PROMPT_BOTTOM_LEFT_GLYPH), "{glass}");
     }
 
     #[test]

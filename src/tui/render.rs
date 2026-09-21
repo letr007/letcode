@@ -1220,7 +1220,7 @@ fn wordmark_shadow_style(theme: Theme) -> Style {
 /// block glyphs differs between terminal emulators.
 fn wordmark_shadow_color(theme: Theme) -> Color {
     const FOREGROUND_WEIGHT: u16 = 38;
-    match (theme.notice, theme.root_bg) {
+    match (theme.notice, theme.canvas()) {
         (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => {
             let blend = |foreground: u8, background: u8| {
                 ((foreground as u16 * FOREGROUND_WEIGHT

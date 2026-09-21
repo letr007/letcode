@@ -448,7 +448,7 @@ fn token_budget_bar_spans(
 
     let mut spans = Vec::with_capacity(width);
     for cell in cells.chunks(8) {
-        let (glyph, foreground, background) = token_budget_cell(cell);
+        let (glyph, foreground, background) = token_budget_cell(cell, theme);
         spans.push(Span::styled(
             glyph.to_string(),
             token_budget_bar_cell_style(foreground, background, theme),
@@ -458,13 +458,22 @@ fn token_budget_bar_spans(
     spans
 }
 
+/// 空预算格整格都是表面色；主题不绘制面板时它只能以终端默认前景画成亮块，
+/// 把剩余预算读成已占用，所以那种主题下的空格不落墨。
 fn token_budget_cell(
     cell: &[TokenBudgetSegment],
+    theme: Theme,
 ) -> (char, TokenBudgetSegment, TokenBudgetSegment) {
     debug_assert_eq!(cell.len(), 8);
+    let empty_glyph = if theme.paints_panels() { '█' } else { ' ' };
 
     if cell.iter().all(|segment| *segment == cell[0]) {
-        return ('█', cell[0], TokenBudgetSegment::Empty);
+        let glyph = if cell[0] == TokenBudgetSegment::Empty {
+            empty_glyph
+        } else {
+            '█'
+        };
+        return (glyph, cell[0], TokenBudgetSegment::Empty);
     }
 
     if cell.contains(&TokenBudgetSegment::Empty) {
@@ -473,7 +482,11 @@ fn token_budget_cell(
             .position(|segment| *segment == TokenBudgetSegment::Empty)
             .unwrap_or(cell.len());
         if used_units == 0 {
-            return ('█', TokenBudgetSegment::Empty, TokenBudgetSegment::Empty);
+            return (
+                empty_glyph,
+                TokenBudgetSegment::Empty,
+                TokenBudgetSegment::Empty,
+            );
         }
 
         let foreground = dominant_used_segment(&cell[..used_units]);
@@ -670,7 +683,7 @@ fn compaction_cell_style(theme: Theme, level: usize, reverse: bool, dimmed: bool
 }
 
 fn dimmed_compaction_color(theme: Theme) -> Color {
-    match (theme.accent, theme.root_bg) {
+    match (theme.accent, theme.canvas()) {
         (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => Color::Rgb(
             ((red as u16 * 2 + bg_red as u16) / 3) as u8,
             ((green as u16 * 2 + bg_green as u16) / 3) as u8,
@@ -703,7 +716,7 @@ fn scanner_cells(frame: usize, theme: Theme) -> Vec<(char, Color)> {
     };
 
     let head_color = phase_style(AppPhase::Idle, theme).fg.unwrap_or(theme.user);
-    let background = theme.root_bg;
+    let background = theme.canvas();
     let gradient = [
         blend_toward_background(head_color, background, 0.00),
         blend_toward_background(head_color, background, 0.20),
@@ -821,9 +834,9 @@ fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_status_spans,
-        output_token_rate_style, render_footer, token_budget_cache_hit_percent, token_budget_cell,
-        token_budget_segment_units, token_budget_spans,
+        TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_scanner_cells,
+        footer_status_spans, output_token_rate_style, render_footer, token_budget_bar_spans,
+        token_budget_cache_hit_percent, token_budget_segment_units, token_budget_spans,
     };
     use crate::{
         session::RetryLifecycleEvent,
@@ -1189,6 +1202,77 @@ mod tests {
             token_budget_segment_units(1_000_000, 10, [0, 200_000, 28_000]),
             [0, 16, 2]
         );
+    }
+
+    #[test]
+    fn empty_token_budget_cells_keep_ink_only_on_painted_panels() {
+        let empty_bar = |theme: crate::tui::Theme| {
+            token_budget_bar_spans(
+                3,
+                [
+                    (0, TokenBudgetSegment::Cache),
+                    (0, TokenBudgetSegment::Input),
+                    (0, TokenBudgetSegment::Output),
+                ],
+                theme,
+            )
+        };
+
+        let plain = empty_bar(crate::tui::Theme::plain_for(None));
+        assert!(plain.iter().all(|span| span.content.as_ref() == "█"));
+
+        let glass = empty_bar(crate::tui::Theme::glass());
+        assert!(
+            glass.iter().all(|span| span.content.as_ref() == " "),
+            "{glass:?}"
+        );
+
+        // 有用量时两种主题都照常画分块字形。
+        let used_bar = |theme: crate::tui::Theme| {
+            token_budget_bar_spans(
+                3,
+                [
+                    (3, TokenBudgetSegment::Cache),
+                    (0, TokenBudgetSegment::Input),
+                    (0, TokenBudgetSegment::Output),
+                ],
+                theme,
+            )
+        };
+        assert_eq!(
+            used_bar(crate::tui::Theme::plain_for(None))[0]
+                .content
+                .as_ref(),
+            "▍"
+        );
+
+        let glass_used = used_bar(crate::tui::Theme::glass());
+        assert_eq!(glass_used[0].content.as_ref(), "▍");
+        assert!(
+            glass_used[1..]
+                .iter()
+                .all(|span| span.content.as_ref() == " ")
+        );
+    }
+
+    #[test]
+    fn scanner_trail_fades_without_a_painted_panel() {
+        for theme in [
+            crate::tui::Theme::dark(),
+            crate::tui::Theme::plain_for(None),
+            crate::tui::Theme::glass(),
+        ] {
+            let mut colors: Vec<ratatui::style::Color> = Vec::new();
+            for frame in 0..8 {
+                for (_, color) in footer_scanner_cells(frame, theme) {
+                    if !colors.contains(&color) {
+                        colors.push(color);
+                    }
+                }
+            }
+
+            assert!(colors.len() > 2, "拖尾应该保留渐变: {colors:?}");
+        }
     }
 
     #[test]
