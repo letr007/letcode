@@ -472,8 +472,7 @@ fn context_bar_cell(cell: &[Option<Color>], theme: Theme) -> Span<'static> {
     )
 }
 
-/// 空槽墨色是表面色调；主题不绘制面板时它无处可比，落墨只会以终端默认前景变成亮块，
-/// 把剩余容量读成已占用，所以那种主题下空槽交还给终端底色。
+/// 空槽墨色取自表面色：没有面板时它只能画成终端默认前景的亮块，把剩余容量读成已占用。
 fn context_bar_empty_cell(theme: Theme) -> Span<'static> {
     if !theme.paints_panels() {
         return Span::raw(" ");

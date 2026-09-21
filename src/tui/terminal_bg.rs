@@ -81,7 +81,6 @@ fn parse_reply(bytes: &[u8]) -> Option<Rgb> {
     parse_color_spec(std::str::from_utf8(&payload[..end]).ok()?)
 }
 
-/// OSC 载荷以 BEL 或 ST 结束；两者都没出现说明回包还没到齐。
 #[cfg(any(unix, test))]
 fn osc_payload_end(bytes: &[u8]) -> Option<usize> {
     let mut index = 0;

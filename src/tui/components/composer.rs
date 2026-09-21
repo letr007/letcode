@@ -536,8 +536,7 @@ fn render_child_prompt_top_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    // 这排半块字形只能用表面色描出盒子边缘；主题不绘制面板时它会在透明背景上
-    // 变成一条横贯整行的亮带。
+    // 半块字形是面板边缘；没有面板时它会在透明背景上变成一条亮带。
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -785,8 +784,7 @@ fn composer_cursor_style(state: &TuiState, theme: Theme) -> ComposerCursorPulse 
 
 fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursorPulse {
     if !theme.paints_panels() {
-        // `mix_color_f32` 会把 `Color::Reset` 端点当成回退：bg 恒为近白、fg 恒为终端
-        // 默认前景，光标变成近白实心块。没有面板可混时改用终端自身的底色反白。
+        // `mix_color_f32` 对 Reset 端点退化为 `to`：混不出脉动，光标只会变成近白实心块。
         return ComposerCursorPulse {
             bg: Color::Reset,
             fg: Color::Reset,
@@ -970,7 +968,7 @@ pub(crate) fn render_prompt_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    // 见 `render_child_prompt_top_cap`：半块字形是面板边缘，不是仪表轨道。
+    // 见 `render_child_prompt_top_cap`。
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

@@ -73,8 +73,7 @@ impl Theme {
         self.element_bg
     }
 
-    /// Ink fades toward this: the root, or black when the root is left to the terminal, where
-    /// there is no painted background to blend into.
+    /// Ink fades toward this: the root, or black when the root is left to the terminal.
     pub const fn canvas(self) -> Color {
         match self.root_bg {
             Color::Reset => Color::Rgb(0, 0, 0),

@@ -458,8 +458,7 @@ fn token_budget_bar_spans(
     spans
 }
 
-/// 空预算格整格都是表面色；主题不绘制面板时它只能以终端默认前景画成亮块，
-/// 把剩余预算读成已占用，所以那种主题下的空格不落墨。
+/// 整空格整格都是表面色：没有面板时它只能画成终端默认前景的亮块，把空预算读成已占满。
 fn token_budget_cell(
     cell: &[TokenBudgetSegment],
     theme: Theme,
@@ -1227,7 +1226,6 @@ mod tests {
             "{glass:?}"
         );
 
-        // 有用量时两种主题都照常画分块字形。
         let used_bar = |theme: crate::tui::Theme| {
             token_budget_bar_spans(
                 3,
