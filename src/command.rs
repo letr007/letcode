@@ -94,9 +94,7 @@ impl ThoughtsDisplayMode {
 pub enum ThemeName {
     #[default]
     Dark,
-    /// Dark palette with panels lifted above the terminal background.
     Plain,
-    /// Dark palette with every surface, panels included, left to the terminal.
     Glass,
     Rainbow,
 }

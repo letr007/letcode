@@ -71,7 +71,6 @@ impl Theme {
         self.element_bg
     }
 
-    /// The background the theme draws on.
     pub const fn canvas(self) -> Color {
         match self.root_bg {
             Color::Reset => Color::Rgb(0, 0, 0),
@@ -79,8 +78,6 @@ impl Theme {
         }
     }
 
-    /// Dark palette with the screen left to the terminal: `root_bg` becomes `Color::Reset`, so gaps
-    /// and the empty transcript stay transparent, and panels lift above a detected background.
     pub fn plain_for(terminal_bg: Option<Rgb>) -> Self {
         let background = usable_background(terminal_bg);
         let mut theme = Self::dark();
@@ -91,7 +88,6 @@ impl Theme {
         theme
     }
 
-    /// Every surface, panels included, left to the terminal: the app paints ink only.
     pub const fn glass() -> Self {
         let mut theme = Self::dark();
         theme.root_bg = Color::Reset;
@@ -101,7 +97,6 @@ impl Theme {
         theme
     }
 
-    /// Whether panels are filled; marks drawn in the surface tone need one.
     pub const fn paints_panels(self) -> bool {
         !matches!(self.element_bg, Color::Reset)
     }
@@ -167,14 +162,13 @@ fn usable_background(terminal_bg: Option<Rgb>) -> Rgb {
         .unwrap_or(ASSUMED_BACKGROUND)
 }
 
-/// Lifting needs a dark terminal: a lighter background cannot host a panel under light text.
+/// Kept low: a brighter background cannot host lifted panels under the palette's light text.
 fn is_dark((red, green, blue): Rgb) -> bool {
     // Rec. 601 luma weights.
     let luma = 299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue);
     luma < 64 * 1000
 }
 
-/// Move each channel toward the background's own bright end, so panels keep the background's hue.
 fn lifted((red, green, blue): Rgb, lift: f32) -> Color {
     let peak = red.max(green).max(blue);
     let anchor = if peak == 0 {

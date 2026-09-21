@@ -458,7 +458,7 @@ fn token_budget_bar_spans(
     spans
 }
 
-/// 整空格整格都是表面色：没有面板时它只能画成终端默认前景的亮块，把空预算读成已占满。
+/// 没有面板时用空格：`█` 会画成终端默认前景的亮块，把空预算读成已占满。
 fn token_budget_cell(
     cell: &[TokenBudgetSegment],
     theme: Theme,
