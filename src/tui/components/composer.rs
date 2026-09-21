@@ -674,7 +674,7 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
 
 fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind) -> Style {
     Style::default()
-        .fg(theme.root_bg)
+        .fg(theme.on_accent)
         .bg(mix_color(surface::surface_bg(theme, kind), theme.user, 70))
         .add_modifier(Modifier::BOLD)
 }

@@ -661,7 +661,7 @@ fn compaction_cell_style(theme: Theme, level: usize, reverse: bool, dimmed: bool
         theme.accent
     };
     if reverse {
-        Style::default().fg(theme.root_bg).bg(accent)
+        Style::default().fg(theme.on_accent).bg(accent)
     } else if level == 0 {
         Style::default().fg(theme.element_bg).bg(theme.root_bg)
     } else {

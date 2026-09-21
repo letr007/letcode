@@ -6,6 +6,7 @@ use super::events::{
 };
 use super::measure;
 use super::slash;
+use super::terminal_bg::Rgb;
 use super::theme::{Theme, ThemeName};
 use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TimelineItem, TodoView};
 use super::transcript_render::Interaction;
@@ -1268,6 +1269,7 @@ pub struct TuiState {
     pub tool_output_overrides: HashMap<String, bool>,
     pub theme_id: String,
     pub custom_theme: Option<Theme>,
+    terminal_bg: Option<Rgb>,
     pub fake_client: Option<crate::fake::FakeClient>,
     pub fake_installation_id: Option<String>,
     pub transcript_render_cache: TranscriptRenderCache,
@@ -1368,6 +1370,7 @@ impl Default for TuiState {
             tool_output_overrides: HashMap::new(),
             theme_id: ThemeName::default().as_str().to_string(),
             custom_theme: None,
+            terminal_bg: None,
             fake_client: None,
             fake_installation_id: None,
             transcript_render_cache: TranscriptRenderCache::default(),
@@ -1535,7 +1538,7 @@ impl TuiState {
 
     pub fn theme(&self) -> Theme {
         if let Some(builtin) = ThemeName::parse(&self.theme_id) {
-            Theme::for_name(builtin, self.status_spinner_frame)
+            Theme::for_name(builtin, self.status_spinner_frame, self.terminal_bg)
         } else {
             self.custom_theme.unwrap_or_else(Theme::dark)
         }
@@ -1543,7 +1546,7 @@ impl TuiState {
 
     pub fn transcript_theme(&self) -> Theme {
         if let Some(builtin) = ThemeName::parse(&self.theme_id) {
-            Theme::for_name(builtin, 0)
+            Theme::for_name(builtin, 0, self.terminal_bg)
         } else {
             self.custom_theme.unwrap_or_else(Theme::dark)
         }
@@ -1555,6 +1558,14 @@ impl TuiState {
 
     pub fn set_fake_client(&mut self, client: Option<crate::fake::FakeClient>) {
         self.fake_client = client;
+    }
+
+    pub fn set_terminal_bg(&mut self, terminal_bg: Option<Rgb>) {
+        if self.terminal_bg != terminal_bg {
+            self.terminal_bg = terminal_bg;
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+        }
     }
 
     pub fn set_active_theme(&mut self, theme_id: String, custom_theme: Option<Theme>) {

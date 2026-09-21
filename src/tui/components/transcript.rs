@@ -2114,7 +2114,7 @@ fn user_prompt_padding_style(theme: Theme) -> ratatui::style::Style {
 
 fn queued_badge_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
-        .fg(theme.root_bg)
+        .fg(theme.on_accent)
         .bg(theme.user)
         .add_modifier(Modifier::BOLD)
 }
@@ -2181,7 +2181,7 @@ fn apply_selection_highlight(
     // 注意不要叠加 `Modifier::REVERSED`——它会在终端层面互换 fg/bg 显示，
     // 使本应做背景的 accent 反相到文字上、背景反而变成 root_bg（与正常背景同色），
     // 视觉上表现为"背景没变、文字变蓝"。
-    let selection_style = Style::default().bg(theme.accent).fg(theme.root_bg);
+    let selection_style = Style::default().bg(theme.accent).fg(theme.on_accent);
 
     // 遍历可见行，应用高亮
     for (idx, line) in lines.iter_mut().enumerate() {

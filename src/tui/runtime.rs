@@ -3069,6 +3069,11 @@ impl TuiRuntime {
                 Some("Neutral charcoal — calm default".into()),
             ),
             DialogItem::new(
+                "plain",
+                "Plain",
+                Some("No surface fill — keeps the terminal background".into()),
+            ),
+            DialogItem::new(
                 "rainbow",
                 "Rainbow",
                 Some("Animated accents — party mode".into()),
@@ -4773,6 +4778,10 @@ pub async fn run_tui(
         runtime.start_session_archive_pass();
         runtime.session_title = projection.session_title;
         let mut terminal = OwnedTerminal::new()?;
+        // 必须在输入读取开始前：探针窗口里读到的按键无法归还事件流。
+        runtime
+            .state
+            .set_terminal_bg(super::terminal_bg::query_background());
         // Restore platform input modes before OwnedTerminal restores raw mode.
         let mut input = super::terminal_input::TerminalInput::new()?;
         runtime.update_terminal_title(&mut terminal)?;

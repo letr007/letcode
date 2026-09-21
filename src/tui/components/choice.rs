@@ -16,7 +16,7 @@ pub(crate) fn choice_marker(active: bool) -> &'static str {
 /// 高亮项的反白样式；`accent` 为调用方 prompt 的强调色。
 pub(crate) fn highlighted_choice_style(theme: Theme, accent: Color) -> Style {
     Style::default()
-        .fg(theme.root_bg)
+        .fg(theme.on_accent)
         .bg(accent)
         .add_modifier(Modifier::BOLD)
 }

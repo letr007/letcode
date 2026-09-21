@@ -47,6 +47,8 @@ struct ThemeFile {
     #[serde(default)]
     dim_text: Option<String>,
     #[serde(default)]
+    on_accent: Option<String>,
+    #[serde(default)]
     accent: Option<String>,
     #[serde(default)]
     assistant: Option<String>,
@@ -214,6 +216,8 @@ impl ThemeFile {
                 .unwrap_or(base.muted_text),
             dim_text: parse_optional_color(self.dim_text.as_deref(), "dim_text")?
                 .unwrap_or(base.dim_text),
+            on_accent: parse_optional_color(self.on_accent.as_deref(), "on_accent")?
+                .unwrap_or(base.on_accent),
             accent: parse_optional_color(self.accent.as_deref(), "accent")?.unwrap_or(base.accent),
             assistant: parse_optional_color(self.assistant.as_deref(), "assistant")?
                 .unwrap_or(base.assistant),

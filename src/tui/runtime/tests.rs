@@ -226,6 +226,54 @@ fn render_runtime_transcript(runtime: &mut TuiRuntime) {
 }
 
 #[test]
+fn plain_theme_keeps_the_void_transparent_and_fills_panels() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_theme_name(ThemeName::Plain);
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .expect("render transcript");
+
+    let cells = terminal.backend().buffer().content();
+    let transparent = cells
+        .iter()
+        .filter(|cell| cell.bg == ratatui::style::Color::Reset)
+        .count();
+
+    assert!(transparent > 0, "空白区必须保留终端背景");
+    assert!(
+        cells
+            .iter()
+            .any(|cell| cell.bg == crate::tui::Theme::plain_for(None).element_bg),
+        "卡片需要有近黑填充才能从终端背景里区分出来"
+    );
+}
+
+#[test]
+fn plain_theme_shades_panels_with_the_detected_terminal_background() {
+    let background = (26_u8, 27_u8, 38_u8);
+    let mut runtime = runtime();
+    runtime.state_mut().set_theme_name(ThemeName::Plain);
+    runtime.state_mut().set_terminal_bg(Some(background));
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .expect("render transcript");
+
+    let shaded = crate::tui::Theme::plain_for(Some(background)).element_bg;
+    let cells = terminal.backend().buffer().content();
+
+    assert!(
+        cells.iter().any(|cell| cell.bg == shaded),
+        "面板填充应该落在探测到的终端背景之下"
+    );
+}
+
+#[test]
 fn draw_starts_reasoning_transition_at_first_presentation() {
     let mut runtime = runtime();
     runtime
