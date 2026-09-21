@@ -3226,6 +3226,25 @@ mod tests {
         ))
     }
 
+    /// Windows 路径里的反斜杠在 TOML 基本字符串中会被当成转义序列，先转义再插值。
+    fn toml_path(path: &std::path::Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
+    #[test]
+    fn config_templates_keep_windows_paths_parseable() {
+        let path =
+            std::path::Path::new("C:\\Users\\runneradmin\\AppData\\Local\\Temp\\letcode\\sessions");
+        let rendered = format!("sessions_dir = \"{}\"\n", toml_path(path));
+
+        let parsed: toml::Value =
+            toml::from_str(&rendered).expect("windows paths must stay parseable");
+        assert_eq!(
+            parsed["sessions_dir"].as_str(),
+            Some(path.to_string_lossy().as_ref())
+        );
+    }
+
     fn parent_transcript(sessions_dir: &std::path::Path) -> Arc<StdMutex<TranscriptRecorder>> {
         Arc::new(StdMutex::new(
             TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
@@ -4996,7 +5015,7 @@ max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
-                    sessions_dir.display()
+                    toml_path(&sessions_dir)
                 ),
             )
             .unwrap();
@@ -5166,7 +5185,7 @@ max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
-                    sessions_dir.display()
+                    toml_path(&sessions_dir)
                 ),
             )
             .unwrap();
@@ -5369,7 +5388,7 @@ max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
-                    sessions_dir.display()
+                    toml_path(&sessions_dir)
                 ),
             )
             .unwrap();
