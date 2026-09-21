@@ -3019,23 +3019,23 @@ impl TuiRuntime {
         let items = vec![
             DialogItem::new(
                 "off",
-                "Off",
-                Some("Use letcode's native request shape".into()),
+                self.state.t("runtime.fake_mode_off"),
+                Some(self.state.t("runtime.fake_mode_off_desc")),
             ),
             DialogItem::new(
                 "auto",
-                "Auto",
-                Some("Use Codex for Responses and Anthropic for Messages".into()),
+                self.state.t("runtime.fake_mode_auto"),
+                Some(self.state.t("runtime.fake_mode_auto_desc")),
             ),
             DialogItem::new(
                 "codex",
                 "Codex",
-                Some("Use the Codex Responses wire profile".into()),
+                Some(self.state.t("runtime.fake_mode_codex_desc")),
             ),
             DialogItem::new(
                 "anthropic",
                 "Anthropic",
-                Some("Use the Anthropic Messages transport profile".into()),
+                Some(self.state.t("runtime.fake_mode_anthropic_desc")),
             ),
         ];
         let mut dialog = DialogState::new(
@@ -3478,18 +3478,18 @@ impl TuiRuntime {
             vec![
                 DialogItem::new(
                     ThoughtsDisplayMode::Compact.as_str(),
-                    "Level 1 · Compact",
-                    Some("Current cycle and latest title".into()),
+                    self.state.t("runtime.thinking_level_compact"),
+                    Some(self.state.t("runtime.thinking_level_compact_desc")),
                 ),
                 DialogItem::new(
                     ThoughtsDisplayMode::Titles.as_str(),
-                    "Level 2 · Titles",
-                    Some("All titles with elapsed time".into()),
+                    self.state.t("runtime.thinking_level_titles"),
+                    Some(self.state.t("runtime.thinking_level_titles_desc")),
                 ),
                 DialogItem::new(
                     ThoughtsDisplayMode::Full.as_str(),
-                    "Level 3 · Full",
-                    Some("Titles, elapsed time, and full content".into()),
+                    self.state.t("runtime.thinking_level_full"),
+                    Some(self.state.t("runtime.thinking_level_full_desc")),
                 ),
             ],
         );
@@ -3510,13 +3510,13 @@ impl TuiRuntime {
             vec![
                 DialogItem::new(
                     ToolsDisplayMode::Compact.as_str(),
-                    "Level 1 · Compact",
-                    Some("One updating line with the total tool-call count".into()),
+                    self.state.t("runtime.tools_level_compact"),
+                    Some(self.state.t("runtime.tools_level_compact_desc")),
                 ),
                 DialogItem::new(
                     ToolsDisplayMode::Detailed.as_str(),
-                    "Level 2 · Detailed",
-                    Some("Show each tool call and its details".into()),
+                    self.state.t("runtime.tools_level_detailed"),
+                    Some(self.state.t("runtime.tools_level_detailed_desc")),
                 ),
             ],
         );
@@ -3536,7 +3536,7 @@ impl TuiRuntime {
         }
         let mut dialog = DialogState::new(
             DialogKind::ReasoningPicker,
-            "Reasoning effort",
+            self.state.t("runtime.reasoning_title"),
             Some(self.state.t("runtime.reasoning_description")),
             reasoning_dialog_items(&efforts),
         );
