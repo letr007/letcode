@@ -189,6 +189,14 @@ pub fn load_custom_theme(preferences_dir: &Path, id: &str) -> Result<Theme> {
     Ok(theme)
 }
 
+pub fn bundled_theme_description(id: &str) -> Option<String> {
+    let (_, contents) = BUNDLED_THEMES
+        .iter()
+        .find(|(bundle_id, _)| *bundle_id == id)?;
+    let file: ThemeFile = toml::from_str(contents).ok()?;
+    file.description
+}
+
 fn load_theme_file(path: &Path) -> Result<(ThemeFile, Theme)> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read theme file {}", path.display()))?;
@@ -298,6 +306,15 @@ mod tests {
         ));
         fs::create_dir_all(themes_dir(&base)).expect("create themes dir");
         base
+    }
+
+    #[test]
+    fn bundled_descriptions_come_from_the_shipped_files() {
+        assert_eq!(
+            bundled_theme_description("ocean").as_deref(),
+            Some("Deep teal water with bright cyan accents")
+        );
+        assert_eq!(bundled_theme_description("mine"), None);
     }
 
     #[test]

@@ -534,7 +534,6 @@ fn render_child_prompt_top_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    // These half blocks are the panel edge; without a panel they read as a bright band.
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

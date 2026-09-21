@@ -34,7 +34,8 @@ use super::state::{
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
 use super::theme_file::{
-    discover_custom_themes, ensure_bundled_themes, load_custom_theme, normalize_theme_id,
+    CustomThemeInfo, bundled_theme_description, discover_custom_themes, ensure_bundled_themes,
+    load_custom_theme, normalize_theme_id,
 };
 #[cfg(test)]
 use crate::session::RunnerPermissionRequest;
@@ -3085,7 +3086,8 @@ impl TuiRuntime {
             ),
         ];
         for custom in discover_custom_themes(&self.preferences_dir) {
-            items.push(DialogItem::new(custom.id, custom.label, custom.description));
+            let description = custom_theme_description(self.state(), &custom);
+            items.push(DialogItem::new(custom.id, custom.label, description));
         }
         let mut dialog = DialogState::new(
             DialogKind::ThemePicker,
@@ -4403,6 +4405,22 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/theme"
             | "/context"
     )
+}
+
+fn custom_theme_description(state: &TuiState, custom: &CustomThemeInfo) -> Option<String> {
+    let key = match custom.id.as_str() {
+        "ocean" => "runtime.theme_ocean_desc",
+        "forest" => "runtime.theme_forest_desc",
+        "rose" => "runtime.theme_rose_desc",
+        "tokyonight" => "runtime.theme_tokyonight_desc",
+        _ => return custom.description.clone(),
+    };
+    match bundled_theme_description(&custom.id) {
+        Some(default) if custom.description.as_deref() == Some(default.as_str()) => {
+            Some(state.t(key))
+        }
+        _ => custom.description.clone(),
+    }
 }
 
 #[cfg(test)]

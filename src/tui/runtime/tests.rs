@@ -252,6 +252,34 @@ fn plain_theme_keeps_the_void_transparent_and_fills_panels() {
 }
 
 #[test]
+fn bundled_theme_descriptions_follow_the_language() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::ZhCn));
+
+    let bundled = CustomThemeInfo {
+        id: "ocean".into(),
+        path: PathBuf::from("ocean.toml"),
+        label: "Ocean".into(),
+        description: crate::tui::theme_file::bundled_theme_description("ocean"),
+    };
+    assert_eq!(
+        custom_theme_description(runtime.state(), &bundled).as_deref(),
+        Some("深青水色，亮青强调")
+    );
+
+    let edited = CustomThemeInfo {
+        description: Some("my own palette".into()),
+        ..bundled
+    };
+    assert_eq!(
+        custom_theme_description(runtime.state(), &edited).as_deref(),
+        Some("my own palette")
+    );
+}
+
+#[test]
 fn glass_theme_paints_only_the_caret_background() {
     let mut runtime = runtime();
     runtime.state_mut().set_theme_name(ThemeName::Glass);
