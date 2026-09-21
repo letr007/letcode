@@ -3065,23 +3065,23 @@ impl TuiRuntime {
         let mut items = vec![
             DialogItem::new(
                 "dark",
-                "Dark",
-                Some("Neutral charcoal — calm default".into()),
+                self.state.t("runtime.theme_dark"),
+                Some(self.state.t("runtime.theme_dark_desc")),
             ),
             DialogItem::new(
                 "plain",
-                "Plain",
-                Some("Panels lifted above the terminal background".into()),
+                self.state.t("runtime.theme_plain"),
+                Some(self.state.t("runtime.theme_plain_desc")),
             ),
             DialogItem::new(
                 "glass",
-                "Glass",
-                Some("Ink only — every surface left to the terminal".into()),
+                self.state.t("runtime.theme_glass"),
+                Some(self.state.t("runtime.theme_glass_desc")),
             ),
             DialogItem::new(
                 "rainbow",
-                "Rainbow",
-                Some("Animated accents — party mode".into()),
+                self.state.t("runtime.theme_rainbow"),
+                Some(self.state.t("runtime.theme_rainbow_desc")),
             ),
         ];
         for custom in discover_custom_themes(&self.preferences_dir) {
