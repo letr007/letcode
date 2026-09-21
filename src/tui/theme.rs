@@ -82,8 +82,8 @@ impl Theme {
     }
 
     /// Dark palette with the screen left to the terminal: `root_bg` becomes `Color::Reset`, so
-    /// gaps and the empty transcript keep terminal transparency. Panels lift above a detected
-    /// dark background, so the ladder stays readable as it does in [`Theme::dark`].
+    /// gaps and the empty transcript keep terminal transparency. Panels lift above a detected dark
+    /// background, keeping the ladder ordered as [`Theme::dark`] does.
     pub fn plain_for(terminal_bg: Option<Rgb>) -> Self {
         let background = usable_background(terminal_bg);
         let mut theme = Self::dark();
@@ -104,8 +104,8 @@ impl Theme {
         theme
     }
 
-    /// Marks drawn in the surface tone — gauge tracks, prompt box caps — and the composer caret
-    /// need a painted surface, which [`Theme::glass`] does not provide.
+    /// Marks drawn in the surface tone — gauge tracks, box caps, the composer caret — need a
+    /// painted surface, which [`Theme::glass`] does not provide.
     pub const fn paints_panels(self) -> bool {
         !matches!(self.element_bg, Color::Reset)
     }
@@ -165,22 +165,22 @@ impl Theme {
     }
 }
 
-/// Lifting needs a dark terminal: there is no room above a mid or light background for a panel
-/// that the palette's light text can still sit on.
 fn usable_background(terminal_bg: Option<Rgb>) -> Rgb {
     terminal_bg
         .filter(|bg| is_dark(*bg))
         .unwrap_or(ASSUMED_BACKGROUND)
 }
 
+/// Lifting needs a dark terminal: a lighter background leaves no room for a panel the palette's
+/// light text can sit on.
 fn is_dark((red, green, blue): Rgb) -> bool {
     // Rec. 601 luma weights.
     let luma = 299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue);
     luma < 64 * 1000
 }
 
-/// Move each channel toward the background's own bright end, so panels keep its hue; a fixed white
-/// anchor would wash a dark background out to gray.
+/// Move each channel toward the background's own bright end, so panels keep its hue instead of
+/// washing out to gray.
 fn lifted((red, green, blue): Rgb, lift: f32) -> Color {
     let peak = red.max(green).max(blue);
     let anchor = if peak == 0 {
