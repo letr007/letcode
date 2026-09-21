@@ -269,7 +269,7 @@ fn glass_theme_paints_only_the_caret_background() {
         .iter()
         .filter(|cell| cell.bg != ratatui::style::Color::Reset)
         .collect();
-    // 光标只在亮拍画一格底色，空拍交给终端；除此之外 glass 不填充任何东西。
+    // 只有光标亮拍会落底色，其余交给终端。
     assert!(painted.len() <= 1, "只该画出光标底色: {painted:?}");
 }
 

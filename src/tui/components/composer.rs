@@ -781,8 +781,7 @@ fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursor
     let intensity = cursor_pulse_intensity(animation_frame);
     let cursor_bg = composer_cursor_target_color(theme);
     if !theme.paints_panels() {
-        // `Color::Reset` cannot be interpolated, so without a panel the caret can only blink:
-        // lit, or nothing at all.
+        // `Color::Reset` cannot be interpolated, so a caret without a panel can only blink.
         return if intensity >= LIT {
             ComposerCursorPulse {
                 bg: cursor_bg,
@@ -969,7 +968,6 @@ pub(crate) fn render_prompt_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    // See `render_child_prompt_top_cap`.
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

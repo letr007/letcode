@@ -8,7 +8,6 @@ const SURFACE_LIFT: f32 = 0.05;
 const ELEMENT_LIFT: f32 = 0.12;
 const ELEVATED_LIFT: f32 = 0.20;
 
-/// Assumed when the terminal reports no usable dark background.
 const ASSUMED_BACKGROUND: Rgb = (24, 25, 34);
 
 /// Shared TUI color tokens.
@@ -22,7 +21,6 @@ pub struct Theme {
     pub text: Color,
     pub muted_text: Color,
     pub dim_text: Color,
-    /// Ink for text placed on an accent-filled block such as a chip or a selection.
     pub on_accent: Color,
     pub accent: Color,
     pub assistant: Color,
@@ -73,7 +71,7 @@ impl Theme {
         self.element_bg
     }
 
-    /// The background the theme draws on: the root, or black when the root is left to the terminal.
+    /// The background the theme draws on.
     pub const fn canvas(self) -> Color {
         match self.root_bg {
             Color::Reset => Color::Rgb(0, 0, 0),
@@ -81,9 +79,8 @@ impl Theme {
         }
     }
 
-    /// Dark palette with the screen left to the terminal: `root_bg` becomes `Color::Reset`, so
-    /// gaps and the empty transcript keep terminal transparency. Panels lift above a detected dark
-    /// background, keeping the ladder ordered as [`Theme::dark`] does.
+    /// Dark palette with the screen left to the terminal: `root_bg` becomes `Color::Reset`, so gaps
+    /// and the empty transcript stay transparent, and panels lift above a detected background.
     pub fn plain_for(terminal_bg: Option<Rgb>) -> Self {
         let background = usable_background(terminal_bg);
         let mut theme = Self::dark();
@@ -104,8 +101,7 @@ impl Theme {
         theme
     }
 
-    /// Marks drawn in the surface tone — gauge tracks, box caps, the composer caret — need a
-    /// painted surface, which [`Theme::glass`] does not provide.
+    /// Whether panels are filled; marks drawn in the surface tone need one.
     pub const fn paints_panels(self) -> bool {
         !matches!(self.element_bg, Color::Reset)
     }
@@ -171,16 +167,14 @@ fn usable_background(terminal_bg: Option<Rgb>) -> Rgb {
         .unwrap_or(ASSUMED_BACKGROUND)
 }
 
-/// Lifting needs a dark terminal: a lighter background leaves no room for a panel the palette's
-/// light text can sit on.
+/// Lifting needs a dark terminal: a lighter background cannot host a panel under light text.
 fn is_dark((red, green, blue): Rgb) -> bool {
     // Rec. 601 luma weights.
     let luma = 299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue);
     luma < 64 * 1000
 }
 
-/// Move each channel toward the background's own bright end, so panels keep its hue instead of
-/// washing out to gray.
+/// Move each channel toward the background's own bright end, so panels keep the background's hue.
 fn lifted((red, green, blue): Rgb, lift: f32) -> Color {
     let peak = red.max(green).max(blue);
     let anchor = if peak == 0 {
