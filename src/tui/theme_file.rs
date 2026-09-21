@@ -241,20 +241,31 @@ impl ThemeFile {
     }
 }
 
+const COLOR_SYNTAX: &str = "expected #RRGGBB, #RGB, or \"default\"";
+
 fn parse_optional_color(value: Option<&str>, field: &str) -> Result<Option<Color>> {
     match value {
         None => Ok(None),
-        Some(raw) => parse_hex_color(raw)
+        Some(raw) => parse_color(raw)
             .with_context(|| format!("invalid color for {field}: {raw}"))
             .map(Some),
     }
+}
+
+/// `"default"` 把这一槽位交给终端：文字后面是 SGR 49，文字本身是 SGR 39。
+fn parse_color(value: &str) -> Result<Color> {
+    let raw = value.trim();
+    if raw.eq_ignore_ascii_case("default") {
+        return Ok(Color::Reset);
+    }
+    parse_hex_color(raw)
 }
 
 fn parse_hex_color(value: &str) -> Result<Color> {
     let raw = value.trim();
     let hex = raw
         .strip_prefix('#')
-        .ok_or_else(|| anyhow::anyhow!("expected #RRGGBB or #RGB"))?;
+        .ok_or_else(|| anyhow::anyhow!(COLOR_SYNTAX))?;
     let (r, g, b) = match hex.len() {
         3 => {
             let r = u8::from_str_radix(&hex[0..1], 16)? * 17;
@@ -268,7 +279,7 @@ fn parse_hex_color(value: &str) -> Result<Color> {
             let b = u8::from_str_radix(&hex[4..6], 16)?;
             (r, g, b)
         }
-        _ => bail!("expected #RRGGBB or #RGB"),
+        _ => bail!(COLOR_SYNTAX),
     };
     Ok(Color::Rgb(r, g, b))
 }
@@ -287,6 +298,41 @@ mod tests {
         ));
         fs::create_dir_all(themes_dir(&base)).expect("create themes dir");
         base
+    }
+
+    #[test]
+    fn default_leaves_a_slot_to_the_terminal() {
+        let prefs = temp_prefs_dir("default-color");
+        fs::write(
+            theme_file_path(&prefs, "translucent"),
+            r##"
+                root_bg = "default"
+                element_bg = "Default"
+                accent = "#010203"
+            "##,
+        )
+        .expect("write theme");
+
+        let theme = load_custom_theme(&prefs, "translucent").expect("load theme");
+
+        assert_eq!(theme.root_bg, Color::Reset);
+        assert_eq!(theme.element_bg, Color::Reset);
+        assert_eq!(theme.accent, Color::Rgb(0x01, 0x02, 0x03));
+        assert!(!theme.paints_panels());
+    }
+
+    #[test]
+    fn unknown_color_values_name_their_field() {
+        let prefs = temp_prefs_dir("bad-color");
+        fs::write(
+            theme_file_path(&prefs, "translucent"),
+            r##"muted_text = "defaults""##,
+        )
+        .expect("write theme");
+
+        let error = load_custom_theme(&prefs, "translucent").expect_err("reject unknown value");
+
+        assert!(format!("{error:#}").contains("muted_text"), "{error:#}");
     }
 
     #[test]
