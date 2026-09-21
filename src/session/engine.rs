@@ -1268,6 +1268,7 @@ async fn run_engine_loop(
     memory_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
+    let mut delivered_background_runs = std::collections::HashSet::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
     let mut visible_child_view_cache = None;
@@ -1783,9 +1784,10 @@ async fn run_engine_loop(
                     }) {
                         continue;
                     }
+                    let delivered_run = result.as_ref().ok().map(|result| result.run_id.clone());
                     let prompt = match result {
                         Ok(result) => {
-                            if background_subagent_result_already_delivered(&agent, &result.run_id) {
+                            if delivered_background_runs.contains(&result.run_id) {
                                 continue;
                             }
                             if let Err(error) = agent.install_background_subagent_result(&result) {
@@ -1831,6 +1833,9 @@ async fn run_engine_loop(
                         continue;
                     }
                     deferred_commands.push_front(SessionEngineCommand::ContinueSession);
+                    if let Some(run_id) = delivered_run {
+                        delivered_background_runs.insert(run_id);
+                    }
                     continue;
                 }
 
@@ -2905,26 +2910,10 @@ async fn run_engine_loop(
                                     }) {
                                         continue;
                                     }
+                                    let delivered_run = result.as_ref().ok().map(|result| result.run_id.clone());
                                     let (text, continuation) = match result {
                                         Ok(result) => {
-                                            // Written with the subagent result, inside
-                                            // its transaction.
-                                            let parent_records = transcript
-                                                .lock()
-                                                .map_err(|_| anyhow!("transcript recorder poisoned"))
-                                                .and_then(|recorder| read_records(recorder.path()));
-                                            if parent_records.is_ok_and(|records| {
-                                                records.iter().any(|record| matches!(
-                                                    &record.event,
-                                                    crate::transcript::TranscriptEvent::Evidence {
-                                                        source: crate::evidence::EvidenceSource::Subagent {
-                                                            run_id,
-                                                            ..
-                                                        },
-                                                        ..
-                                                    } if run_id == &result.run_id
-                                                ))
-                                            }) {
+                                            if delivered_background_runs.contains(&result.run_id) {
                                                 continue;
                                             }
                                             let _ = session_transport_tx.send(
@@ -2947,7 +2936,7 @@ async fn run_engine_loop(
                                             crate::agent::PendingTurnContinuation { result: None },
                                         ),
                                     };
-                                    if let Err(error) = transcript
+                                    match transcript
                                         .lock()
                                         .map_err(|_| anyhow!("transcript recorder poisoned"))
                                         .and_then(|mut recorder| {
@@ -2961,13 +2950,19 @@ async fn run_engine_loop(
                                                 .lock()
                                                 .map_err(|_| anyhow!("turn continuation queue poisoned"))
                                                 .map(|mut queue| queue.push(continuation))
-                                        })
-                                    {
-                                        let _ = session_transport_tx.send(
-                                            SessionTransportEvent::Error(ErrorEvent::new(format!(
-                                                "failed to queue background subagent completion: {error}"
-                                            ))),
-                                        );
+                                        }) {
+                                        Ok(()) => {
+                                            if let Some(run_id) = delivered_run {
+                                                delivered_background_runs.insert(run_id);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = session_transport_tx.send(
+                                                SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                                    "failed to queue background subagent completion: {error}"
+                                                ))),
+                                            );
+                                        }
                                     }
                                 }
                                 Some(SessionEngineCommand::ShowHistoryTree)
@@ -3191,18 +3186,6 @@ async fn run_engine_loop(
     if let Err(error) = memory_worker.shutdown().await {
         tracing::warn!(error = %error, "project memory worker shutdown failed");
     }
-}
-
-fn background_subagent_result_already_delivered(agent: &Agent, run_id: &str) -> bool {
-    agent.evidence().iter().any(|evidence| {
-        matches!(
-            &evidence.source,
-            crate::evidence::EvidenceSource::Subagent {
-                run_id: recorded,
-                ..
-            } if recorded == run_id
-        )
-    })
 }
 
 pub(crate) fn format_background_subagent_completion(
@@ -4977,6 +4960,373 @@ base_url = "http://127.0.0.1:1"
             Some(detail) => format!("{} ({detail})", error.message),
             None => error.message.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_recorded_background_result_is_delivered_once_and_continues_the_session() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            let sessions_dir = directory.path().join("sessions");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+active_provider = "test"
+
+[global]
+sessions_dir = "{}"
+
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.test.models.model]
+# Retains the pre-recorded history, so historian work stays out of the turn.
+context_window = 128000
+effective_input_limit_tokens = 64000
+[providers.test.models.model.capabilities]
+tools = true
+[providers.test.models.model.capabilities.generation]
+max_output_tokens = true
+[providers.test.models.model.generation]
+max_output_tokens = 4096
+"#,
+                    sessions_dir.display()
+                ),
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).expect("config");
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            recorder.record_user_message("earlier prompt").unwrap();
+            recorder.record_assistant_message("earlier answer").unwrap();
+            let session_id = recorder.session_id().to_string();
+            let transcript = Arc::new(StdMutex::new(recorder));
+
+            // The subagent pool records the result before it sends the command.
+            transcript
+                .lock()
+                .unwrap()
+                .record_subagent_result_structured(
+                    "run-1",
+                    &session_id,
+                    "run-1",
+                    "child-1",
+                    "explorer",
+                    "completed",
+                    "the child finished",
+                    None,
+                )
+                .unwrap();
+
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", None, None);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+
+            let completion = || SessionEngineCommand::BackgroundSubagentCompleted {
+                parent_session_id: session_id.clone(),
+                parent_tool_call_id: Some("call-1".into()),
+                result: Ok(crate::subagent::SubagentRunSummary {
+                    run_id: "run-1".into(),
+                    child_session_id: "child-1".into(),
+                    agent_name: "explorer".into(),
+                    status: crate::subagent::SubagentStatus::Completed,
+                    failure_kind: None,
+                    summary: "the child finished".into(),
+                    structured_result: crate::subagent::StructuredSubagentResult {
+                        status: "completed".into(),
+                        summary: "the child finished".into(),
+                        malformed: false,
+                        findings: Vec::new(),
+                        files_read: Vec::new(),
+                        files_changed: Vec::new(),
+                        commands_run: Vec::new(),
+                        validation: Vec::new(),
+                        blockers: Vec::new(),
+                        next_steps: Vec::new(),
+                        run_id: "run-1".into(),
+                        child_session_id: "child-1".into(),
+                        raw_excerpt: None,
+                    },
+                }),
+            };
+
+            ingress.submit_transitional(completion()).unwrap();
+            let delivery = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(SessionTransportEvent::BackgroundSubagentCompleted { .. }) => {
+                            return true;
+                        }
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            })
+            .await
+            .expect("the delivered event arrives");
+            assert!(delivery, "a recorded result must still be delivered");
+
+            let mut continued = false;
+            for _ in 0..100 {
+                let records = read_records(transcript.lock().unwrap().path()).unwrap();
+                continued = records.iter().any(|record| {
+                    matches!(
+                        &record.event,
+                        TranscriptEvent::InternalContinuation {
+                            source:
+                                crate::transcript::InternalContinuationSource::SubagentCompletion,
+                            ..
+                        }
+                    )
+                });
+                if continued {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(continued, "the completion must queue a continuation turn");
+
+            ingress.submit_transitional(completion()).unwrap();
+            let duplicate = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
+            assert!(
+                !matches!(
+                    duplicate,
+                    Ok(Some(
+                        SessionTransportEvent::BackgroundSubagentCompleted { .. }
+                    ))
+                ),
+                "the same run must not be delivered twice"
+            );
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+        })
+        .await
+        .expect("background completion flow timed out");
+    }
+
+    #[tokio::test]
+    async fn a_background_result_arriving_during_an_active_turn_is_delivered_and_continues() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let stub = tokio::spawn(serve_responses_stub(listener));
+
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            let sessions_dir = directory.path().join("sessions");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+active_provider = "test"
+
+[global]
+sessions_dir = "{}"
+
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model]
+# Retains the pre-recorded history, so historian work stays out of the turn.
+context_window = 128000
+effective_input_limit_tokens = 64000
+[providers.test.models.model.capabilities]
+tools = true
+[providers.test.models.model.capabilities.generation]
+max_output_tokens = true
+[providers.test.models.model.generation]
+max_output_tokens = 4096
+"#,
+                    sessions_dir.display()
+                ),
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).expect("config");
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            // A recorded user message skips title generation, so the stub only serves turns.
+            recorder.record_user_message("earlier prompt").unwrap();
+            recorder.record_assistant_message("earlier answer").unwrap();
+            let session_id = recorder.session_id().to_string();
+            let transcript = Arc::new(StdMutex::new(recorder));
+
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", None, None);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            agent
+                .try_register_tool(HoldingTool)
+                .expect("register the holding tool");
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+
+            let mut errors = Vec::new();
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-1",
+                        crate::user_content::UserMessageContent::new("first prompt", Vec::new()),
+                    ),
+                ))
+                .unwrap();
+
+            // The held tool call keeps the turn running for the rest of the test.
+            let barrier = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut barrier_error = None;
+            loop {
+                match open_tool_call_batch_recorded(&transcript) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => barrier_error = Some(error.to_string()),
+                }
+                if tokio::time::Instant::now() >= barrier {
+                    panic!(
+                        "the stub tool call never reached the transcript: {barrier_error:?}; errors: {errors:?}"
+                    );
+                }
+                while let Ok(event) = events.try_recv() {
+                    if let SessionTransportEvent::Error(error) = event {
+                        errors.push(observed_error(&error));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let structured_result = crate::subagent::StructuredSubagentResult {
+                status: "completed".into(),
+                summary: "the child finished".into(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-1".into(),
+                child_session_id: "child-1".into(),
+                raw_excerpt: None,
+            };
+
+            // The subagent pool records the result before it sends the command.
+            transcript
+                .lock()
+                .unwrap()
+                .record_subagent_result_structured(
+                    "run-1",
+                    &session_id,
+                    "run-1",
+                    "child-1",
+                    "explorer",
+                    "completed",
+                    "the child finished",
+                    Some(structured_result.clone()),
+                )
+                .unwrap();
+
+            ingress
+                .submit_transitional(SessionEngineCommand::BackgroundSubagentCompleted {
+                    parent_session_id: session_id.clone(),
+                    parent_tool_call_id: Some("call-1".into()),
+                    result: Ok(crate::subagent::SubagentRunSummary {
+                        run_id: "run-1".into(),
+                        child_session_id: "child-1".into(),
+                        agent_name: "explorer".into(),
+                        status: crate::subagent::SubagentStatus::Completed,
+                        failure_kind: None,
+                        summary: "the child finished".into(),
+                        structured_result,
+                    }),
+                })
+                .unwrap();
+
+            let delivery = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(SessionTransportEvent::BackgroundSubagentCompleted { .. }) => {
+                            return true;
+                        }
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            })
+            .await
+            .expect("the delivered event arrives while the turn is active");
+            assert!(
+                delivery,
+                "a result recorded while the turn is active must still be delivered"
+            );
+
+            let mut continued = false;
+            for _ in 0..100 {
+                let records = read_records(transcript.lock().unwrap().path()).unwrap();
+                continued = records.iter().any(|record| {
+                    matches!(
+                        &record.event,
+                        TranscriptEvent::InternalContinuation {
+                            source: crate::transcript::InternalContinuationSource::SubagentCompletion,
+                            ..
+                        }
+                    )
+                });
+                if continued {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                continued,
+                "the completion must queue a continuation turn while the turn is active"
+            );
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+            stub.abort();
+        })
+        .await
+        .expect("background completion during an active turn timed out");
     }
 
     #[tokio::test]
