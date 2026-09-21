@@ -2817,6 +2817,15 @@ fn validate_reserved_query(
     Ok(())
 }
 
+pub fn user_agent() -> String {
+    format!(
+        "letcode ({} {}; {})",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderTransport {
     client: reqwest::Client,
@@ -2840,6 +2849,7 @@ impl ProviderTransport {
             );
         }
         let mut builder = reqwest::Client::builder()
+            .user_agent(user_agent())
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs));
         if config.no_proxy_loopback
             && endpoint.is_some_and(|value| {
@@ -4187,6 +4197,73 @@ protocol = "completions"
             assert_eq!(route.transport.connect_timeout().as_secs(), 17);
             assert!(!route.transport.no_proxy_loopback());
         }
+    }
+
+    #[tokio::test]
+    async fn provider_requests_identify_letcode_unless_a_header_overrides_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/v1/responses");
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0u8; 4096];
+                let read = stream.read(&mut buffer).await.unwrap();
+                seen.push(String::from_utf8_lossy(&buffer[..read]).to_lowercase());
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            seen
+        });
+
+        let transport =
+            ProviderTransport::new_for_endpoint(&RuntimeTransportConfig::default(), Some(&url))
+                .unwrap();
+        let auth = RuntimeAuthConfig {
+            scheme: AuthScheme::None,
+            name: None,
+            credential: None,
+            credential_env: None,
+        };
+        let sent = [
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "user-agent".to_string(),
+                "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1".to_string(),
+            )]),
+        ];
+        for headers in &sent {
+            let request = transport
+                .request(
+                    reqwest::Method::POST,
+                    &url,
+                    "vendor",
+                    &auth,
+                    headers,
+                    &BTreeMap::new(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let _ = transport.client().execute(request).await;
+        }
+
+        let seen = server.await.unwrap();
+        assert!(
+            seen[0].contains(&format!("user-agent: {}", user_agent().to_lowercase())),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains("user-agent: codex_cli_rs/9.9.9 (plan9; vax) vt100/1"),
+            "{}",
+            seen[1]
+        );
     }
 
     #[test]
