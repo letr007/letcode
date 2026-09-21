@@ -776,17 +776,28 @@ fn composer_cursor_style(state: &TuiState, theme: Theme) -> ComposerCursorPulse 
 }
 
 fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursorPulse {
-    // 脉动从光标所立的面起跳：`Color::Reset` 混不出渐变，没有面板时用主题画布。
-    let backdrop = if theme.paints_panels() {
-        theme.element_bg
-    } else {
-        theme.canvas()
-    };
+    const LIT: f32 = 0.5;
+
     let intensity = cursor_pulse_intensity(animation_frame);
     let cursor_bg = composer_cursor_target_color(theme);
+    if !theme.paints_panels() {
+        // `Color::Reset` 不参与插值，所以没有面板时只能二态闪烁：亮块，或者什么都不画。
+        return if intensity >= LIT {
+            ComposerCursorPulse {
+                bg: cursor_bg,
+                fg: mix_color_f32(theme.text, theme.canvas(), 0.82),
+            }
+        } else {
+            ComposerCursorPulse {
+                bg: Color::Reset,
+                fg: theme.text,
+            }
+        };
+    }
+
     ComposerCursorPulse {
-        bg: mix_color_f32(backdrop, cursor_bg, intensity),
-        fg: mix_color_f32(theme.text, backdrop, intensity * 0.82),
+        bg: mix_color_f32(theme.element_bg, cursor_bg, intensity),
+        fg: mix_color_f32(theme.text, theme.element_bg, intensity * 0.82),
     }
 }
 
@@ -1410,18 +1421,34 @@ mod tests {
 
     #[test]
     fn composer_cursor_pulses_in_every_theme() {
-        for theme in [Theme::dark(), Theme::plain_for(None), Theme::glass()] {
-            let mut colors: Vec<Color> = Vec::new();
-            for frame in 0..64 {
-                let pulse = composer_cursor_pulse(theme, frame);
-                assert_ne!(pulse.bg, Color::Reset, "光标必须有可见底色");
-                if !colors.contains(&pulse.bg) {
-                    colors.push(pulse.bg);
-                }
-            }
+        for theme in [Theme::dark(), Theme::plain_for(None)] {
+            let colors = cursor_backgrounds(theme);
 
             assert!(colors.len() > 2, "光标应该会脉动: {colors:?}");
+            assert!(!colors.contains(&Color::Reset), "有面板时光标始终有底色");
         }
+
+        let colors = cursor_backgrounds(Theme::glass());
+
+        assert!(
+            colors.contains(&Color::Reset),
+            "空拍要交给终端背景: {colors:?}"
+        );
+        assert!(
+            colors.iter().any(|color| *color != Color::Reset),
+            "亮拍要画出来: {colors:?}"
+        );
+    }
+
+    fn cursor_backgrounds(theme: Theme) -> Vec<Color> {
+        let mut colors = Vec::new();
+        for frame in 0..64 {
+            let bg = composer_cursor_pulse(theme, frame).bg;
+            if !colors.contains(&bg) {
+                colors.push(bg);
+            }
+        }
+        colors
     }
 
     #[test]
