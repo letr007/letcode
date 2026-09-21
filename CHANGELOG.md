@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-22
+
 ### Added
 
 - 新增 `plain` 与 `glass` 主题。
@@ -412,7 +414,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/letr007/letcode/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/letr007/letcode/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/letr007/letcode/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/letr007/letcode/compare/v0.12.0...v0.13.0
