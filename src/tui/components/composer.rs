@@ -534,7 +534,7 @@ fn render_child_prompt_top_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    // 半块字形是面板边缘；没有面板时它会在透明背景上变成一条亮带。
+    // These half blocks are the panel edge; without a panel they read as a bright band.
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -781,7 +781,8 @@ fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursor
     let intensity = cursor_pulse_intensity(animation_frame);
     let cursor_bg = composer_cursor_target_color(theme);
     if !theme.paints_panels() {
-        // `Color::Reset` 不参与插值，所以没有面板时只能二态闪烁：亮块，或者什么都不画。
+        // `Color::Reset` cannot be interpolated, so without a panel the caret can only blink:
+        // lit, or nothing at all.
         return if intensity >= LIT {
             ComposerCursorPulse {
                 bg: cursor_bg,
@@ -968,7 +969,7 @@ pub(crate) fn render_prompt_cap(
     );
 
     let cap_width = area.width.saturating_sub(1);
-    // 见 `render_child_prompt_top_cap`。
+    // See `render_child_prompt_top_cap`.
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

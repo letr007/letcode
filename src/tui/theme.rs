@@ -8,7 +8,7 @@ const SURFACE_LIFT: f32 = 0.05;
 const ELEMENT_LIFT: f32 = 0.12;
 const ELEVATED_LIFT: f32 = 0.20;
 
-/// 终端不给回包（或给的是亮色背景）时假定一个常见的深色背景。
+/// Assumed when the terminal reports no usable dark background.
 const ASSUMED_BACKGROUND: Rgb = (24, 25, 34);
 
 /// Shared TUI color tokens.
@@ -73,7 +73,7 @@ impl Theme {
         self.element_bg
     }
 
-    /// Ink fades toward this: the root, or black when the root is left to the terminal.
+    /// The background the theme draws on: the root, or black when the root is left to the terminal.
     pub const fn canvas(self) -> Color {
         match self.root_bg {
             Color::Reset => Color::Rgb(0, 0, 0),
