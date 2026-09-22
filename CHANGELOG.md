@@ -7,9 +7,11 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-22
+
 ### Fixed
 
-- 修复等待子代理时收到另一个后台子代理的完成通知后，本回合可能中断、会话随后无法恢复的问题；已受影响的会话重新打开时按当前规则复原。
+- 修复等待子代理时收到另一个后台子代理的完成通知后，本回合可能中断、会话随后无法恢复的问题。
 
 ## [0.16.0] - 2026-09-22
 
@@ -418,7 +420,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/letr007/letcode/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/letr007/letcode/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/letr007/letcode/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/letr007/letcode/compare/v0.13.0...v0.14.0
