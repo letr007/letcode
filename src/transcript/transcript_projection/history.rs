@@ -173,6 +173,8 @@ impl HistoryProjectionState {
                 history = compacted;
             }
             TranscriptEvent::ContextCompaction(event) => {
+                // The boundary math below needs protocol-valid frames.
+                place_interleaved_entries_after_their_group(&mut history);
                 // Modern compactions carry a durable anchor from the exact
                 // pre-event projection. A missing anchor means no raw suffix.
                 // Legacy index records remain tolerant during replay.
@@ -321,6 +323,7 @@ impl HistoryProjectionState {
         Vec<HistoryProjectionEntry>,
     ) {
         let mut history = self.history.clone();
+        place_interleaved_entries_after_their_group(&mut history);
         let cancelled_call_ids = self
             .cancelled_call_ids
             .iter()
@@ -336,6 +339,7 @@ impl HistoryProjectionState {
 
     fn finish(self) -> Vec<HistoryProjectionEntry> {
         let mut history = self.history;
+        place_interleaved_entries_after_their_group(&mut history);
         let cancelled_call_ids = self
             .cancelled_call_ids
             .iter()
@@ -425,10 +429,61 @@ pub(super) fn checkpoint_spans_from_history(
     merged
 }
 
+/// A provider rejects a tool call answered after another item, so a frame the
+/// transcript recorded while the group was open moves behind the group.
+fn place_interleaved_entries_after_their_group(history: &mut Vec<HistoryProjectionEntry>) {
+    let mut pending: BTreeSet<String> = BTreeSet::new();
+    let mut deferred: Vec<HistoryProjectionEntry> = Vec::new();
+    let mut placed: Vec<HistoryProjectionEntry> = Vec::with_capacity(history.len());
+    for entry in history.drain(..) {
+        let declaration = match &entry.item {
+            HistoryItem::AssistantTurn { calls, .. } if !calls.is_empty() => Some(
+                calls
+                    .iter()
+                    .map(|call| call.call_id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        let closes_group = match &entry.item {
+            HistoryItem::ToolOutput { call_id, .. } => pending.remove(call_id.as_str()),
+            _ => false,
+        };
+        if let Some(calls) = declaration {
+            // The replaced group can no longer receive an output.
+            placed.append(&mut deferred);
+            pending.clear();
+            pending.extend(calls);
+            placed.push(entry);
+            continue;
+        }
+        if matches!(&entry.item, HistoryItem::ToolOutput { .. }) {
+            // An undeclared output stays put for the protocol analysis.
+            placed.push(entry);
+            if closes_group && pending.is_empty() {
+                if !deferred.is_empty() {
+                    tracing::warn!(
+                        frames = deferred.len(),
+                        "placed history frames recorded inside an open tool call group after it closed"
+                    );
+                }
+                placed.append(&mut deferred);
+            }
+            continue;
+        }
+        if pending.is_empty() {
+            placed.push(entry);
+        } else {
+            deferred.push(entry);
+        }
+    }
+    placed.append(&mut deferred);
+    *history = placed;
+}
+
 /// Historical tool calls cannot be resumed after a process restart. Remove an
 /// incomplete group from the *projection* (never from the append-only
 /// transcript), retaining any assistant text as a normal assistant message.
-/// This leaves subsequent user turns protocol-legal without reordering records.
 fn normalize_incomplete_tool_call_groups(
     history: &mut Vec<HistoryProjectionEntry>,
     active_turn_id: Option<u64>,

@@ -298,3 +298,62 @@ fn history_snapshot_normalization_preserves_pending_tool_state() {
     )
     .unwrap();
 }
+
+#[test]
+fn history_snapshot_places_a_completion_recorded_while_a_tool_call_was_open() {
+    let records = [
+        entry(
+            1,
+            TranscriptEvent::UserMessage {
+                content: "wait for the child".into(),
+            },
+        ),
+        entry(
+            2,
+            TranscriptEvent::AssistantToolCallBatch {
+                text: None,
+                reasoning_content: None,
+                reasoning_wire: None,
+                calls: vec![crate::request_builder::HistoryToolCall {
+                    call_id: "wait".into(),
+                    name: "agent__wait".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ),
+        entry(
+            3,
+            TranscriptEvent::InternalContinuation {
+                text: "A background subagent has completed.".into(),
+                source: crate::transcript::InternalContinuationSource::SubagentCompletion,
+            },
+        ),
+        entry(
+            4,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "wait".into(),
+                name: "agent__wait".into(),
+                ok: true,
+                output: ToolResult::ok("agent__wait", json!({"status": "completed"})),
+            },
+        ),
+    ];
+    let history = restore_history_projection(&records)
+        .into_iter()
+        .map(|projected| projected.item)
+        .collect::<Vec<_>>();
+
+    let output = history
+        .iter()
+        .position(
+            |item| matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == "wait"),
+        )
+        .expect("tool output");
+    let notice = history
+        .iter()
+        .position(|item| matches!(item, HistoryItem::InternalContinuation { .. }))
+        .expect("completion notice");
+    assert!(output < notice, "{history:?}");
+    crate::protocol_frames::validate_history_items_complete(&history, None)
+        .expect("a following turn is accepted");
+}

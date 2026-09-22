@@ -1059,6 +1059,75 @@ input_images = {supports_images}
     }
 
     #[test]
+    fn prepare_resume_reads_a_completion_recorded_while_a_tool_call_was_open() {
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("gpt-5.5")
+            .expect("record session start");
+        recorder
+            .record_user_message("wait for the child")
+            .expect("record user message");
+        recorder
+            .record_assistant_tool_call_batch(
+                None,
+                None,
+                None,
+                vec![crate::request_builder::HistoryToolCall {
+                    call_id: "call-wait".into(),
+                    name: "agent__wait".into(),
+                    arguments_json: "{}".into(),
+                }],
+            )
+            .expect("record tool batch");
+        recorder
+            .record_internal_continuation(
+                "A background subagent has completed.",
+                crate::transcript::InternalContinuationSource::SubagentCompletion,
+            )
+            .expect("record completion");
+        recorder
+            .record_tool_call_finished(
+                "call-wait",
+                "agent__wait",
+                true,
+                crate::tool::ToolResult::ok(
+                    "agent__wait",
+                    serde_json::json!({"status": "completed"}),
+                ),
+            )
+            .expect("record tool result");
+        let session_id = recorder.session_id().to_string();
+        drop(recorder);
+
+        let prepared = prepare_resume_package(&sessions_dir, &session_id).expect("prepare resume");
+        let history =
+            crate::protocol_frames::history_items_from_frames(&prepared.snapshot.protocol_frames);
+        crate::protocol_frames::validate_history_items_complete(&history, None)
+            .expect("resumed history is protocol-complete");
+        let output = history
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    crate::request_builder::HistoryItem::ToolOutput { call_id, .. }
+                        if call_id == "call-wait"
+                )
+            })
+            .expect("tool output");
+        let notice = history
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    crate::request_builder::HistoryItem::InternalContinuation { .. }
+                )
+            })
+            .expect("completion notice");
+        assert!(output < notice, "{history:?}");
+    }
+
+    #[test]
     fn prepare_resume_repairs_orphaned_turn_on_selected_branch() {
         let sessions_dir = temp_dir();
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");

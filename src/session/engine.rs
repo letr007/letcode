@@ -4859,7 +4859,9 @@ base_url = "http://127.0.0.1:1"
 
     const STUB_ANSWER: &str = "the session is still usable";
 
-    struct HoldingTool;
+    struct HoldingTool {
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
 
     #[async_trait::async_trait]
     impl ToolHandler for HoldingTool {
@@ -4880,7 +4882,11 @@ base_url = "http://127.0.0.1:1"
         }
 
         async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
-            std::future::pending().await
+            match &self.release {
+                Some(release) => release.notified().await,
+                None => std::future::pending().await,
+            }
+            Ok(json!({ "released": true }))
         }
     }
 
@@ -5209,8 +5215,11 @@ max_output_tokens = 4096
             let mut agent = Agent::new("model", None, None);
             agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
             agent.set_primary_route_factory(primary_factory);
+            let release = Arc::new(tokio::sync::Notify::new());
             agent
-                .try_register_tool(HoldingTool)
+                .try_register_tool(HoldingTool {
+                    release: Some(Arc::clone(&release)),
+                })
                 .expect("register the holding tool");
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
@@ -5340,6 +5349,68 @@ max_output_tokens = 4096
                 "the completion must queue a continuation turn while the turn is active"
             );
 
+            release.notify_one();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut records = Vec::new();
+            loop {
+                while let Ok(event) = events.try_recv() {
+                    if let SessionTransportEvent::Error(error) = event {
+                        errors.push(observed_error(&error));
+                    }
+                }
+                records = read_records(transcript.lock().unwrap().path()).unwrap();
+                let answered = records
+                    .iter()
+                    .any(|record| matches!(&record.event, TranscriptEvent::ToolCallFinished { .. }));
+                let continued_turn = records.iter().any(|record| {
+                    matches!(&record.event, TranscriptEvent::AssistantTurn(turn) if turn.text.as_deref() == Some(STUB_ANSWER))
+                });
+                if (answered && continued_turn)
+                    || errors
+                        .iter()
+                        .any(|error| error.contains("orphan tool output"))
+                {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("the released tool call never closed its batch: {errors:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| error.contains("orphan tool output")),
+                "{errors:?}"
+            );
+            let history =
+                crate::transcript::transcript_projection::restore_session_history_projection(
+                    &records,
+                );
+            crate::protocol_frames::validate_history_items_complete(&history, None)
+                .expect("the recorded turn stays projectable");
+            let output = history
+                .iter()
+                .position(|item| {
+                    matches!(
+                        item,
+                        crate::request_builder::HistoryItem::ToolOutput { call_id, .. }
+                            if call_id == "call-1"
+                    )
+                })
+                .expect("tool output");
+            let notice = history
+                .iter()
+                .position(|item| {
+                    matches!(
+                        item,
+                        crate::request_builder::HistoryItem::InternalContinuation { .. }
+                    )
+                })
+                .expect("completion notice");
+            assert!(output < notice, "{history:?}");
+
             ingress.shutdown().unwrap();
             engine.join().await.unwrap();
             stub.abort();
@@ -5412,7 +5483,7 @@ max_output_tokens = 4096
             agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
             agent.set_primary_route_factory(primary_factory);
             agent
-                .try_register_tool(HoldingTool)
+                .try_register_tool(HoldingTool { release: None })
                 .expect("register the holding tool");
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
