@@ -144,10 +144,16 @@ async fn process_pending(store: MemoryStore, helper: Agent, curation: Option<Age
     let source_store = store.clone();
     let sources = blocking(move || source_store.sources()).await?;
     // One pass is bounded; unfinished sources are resumed on subsequent idle ticks.
+    // A source that already failed keeps its place, but only one such retry is
+    // spent per pass so a stuck frontier cannot fill the pass by itself.
     let mut batches = 0usize;
+    let mut retried_failure = false;
     for source in sources {
-        if batches >= 8 {
+        if batches >= 8 || (retried_failure && source.failure_count > 0) {
             break;
+        }
+        if source.failure_count > 0 {
+            retried_failure = true;
         }
         let input_store = store.clone();
         let input_source = source.clone();

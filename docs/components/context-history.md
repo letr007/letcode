@@ -42,7 +42,7 @@ model = "your-model"
 
 工具观察、子代理结果和来源引用继续进入会话内的 EvidenceRecord。Evidence 参与当前会话的选择与审计，但不再兼任跨会话项目记忆库。旧日志中已经发布和应用的事实仍按原有投影恢复，session JSONL 不迁移、不改写。
 
-新的项目记忆由独立后台 worker 在完整 turn 持久化后增量提取，复用 Historian 的无工具 one-shot 路由，但使用独立任务 prompt。数据按规范化 workspace 路径隔离，保存在配置目录的 SQLite 读模型中；首次启用只登记当前 journal frontier，不扫描或重新提炼旧 session。session undo、checkout 或删除不会自动撤销已经记录的项目知识。
+新的项目记忆由独立后台 worker 在完整 turn 持久化后增量提取，复用 Historian 的无工具 one-shot 路由，但使用独立任务 prompt。数据按规范化 workspace 路径隔离，保存在配置目录的 SQLite 读模型中；首次启用只登记当前 journal frontier，不扫描或重新提炼旧 session。session undo、checkout 或删除不会自动撤销已经记录的项目知识。同一 frontier 连续抽取失败时按 1 分钟、5 分钟、30 分钟、2 小时、6 小时退避，每轮只重试一个已失败来源；连续 8 次后停止自动重试。journal frontier 前进后只抽取新增部分并重新计数。
 
 普通请求不自动注入整份项目记忆。模型仅在任务需要时调用 `memory__recall`，按关键词、代码路径、类型和状态检索；结果保留来源 session、branch 和 `raw:N` ID，以便通过 history 工具回查。记忆可能不完整或过时，不是执行授权，也不能覆盖当前代码、用户要求和高权威配置。
 

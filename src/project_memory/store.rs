@@ -5,7 +5,17 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
+
+/// Consecutive failures spent on one unchanged frontier. A later frontier starts a new series.
+const MAX_SOURCE_FAILURES: u32 = 8;
+const SOURCE_RETRY_DELAYS_MS: [u64; 5] = [
+    60_000,
+    5 * 60_000,
+    30 * 60_000,
+    2 * 60 * 60_000,
+    6 * 60 * 60_000,
+];
 
 #[derive(Clone)]
 pub(crate) struct MemoryStore {
@@ -18,6 +28,7 @@ pub(crate) struct Source {
     pub path: PathBuf,
     pub cursor: u64,
     pub observed_sequence: u64,
+    pub failure_count: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,7 +154,8 @@ impl MemoryStore {
                     cursor INTEGER NOT NULL,
                     observed_sequence INTEGER NOT NULL,
                     retry_at_ms INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT
+                    last_error TEXT,
+                    failure_count INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE memories (
                     id TEXT PRIMARY KEY,
@@ -177,6 +189,11 @@ impl MemoryStore {
                     "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;
                      ALTER TABLE memories ADD COLUMN last_recalled_at INTEGER;
                      ALTER TABLE memories ADD COLUMN curated_at_ms INTEGER;",
+                )?;
+            }
+            if version < 4 {
+                transaction.execute_batch(
+                    "ALTER TABLE sources ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;",
                 )?;
             }
         }
@@ -213,7 +230,19 @@ impl MemoryStore {
              VALUES (?1, ?2, ?3, ?3)
              ON CONFLICT(session_id) DO UPDATE SET
                 path=excluded.path,
-                observed_sequence=MAX(sources.observed_sequence, excluded.observed_sequence)",
+                observed_sequence=MAX(sources.observed_sequence, excluded.observed_sequence),
+                failure_count=CASE
+                    WHEN excluded.observed_sequence > sources.observed_sequence THEN 0
+                    ELSE sources.failure_count
+                END,
+                retry_at_ms=CASE
+                    WHEN excluded.observed_sequence > sources.observed_sequence THEN 0
+                    ELSE sources.retry_at_ms
+                END,
+                last_error=CASE
+                    WHEN excluded.observed_sequence > sources.observed_sequence THEN NULL
+                    ELSE sources.last_error
+                END",
             params![session_id, path.to_string_lossy(), start_sequence],
         )?;
         Ok(())
@@ -222,17 +251,20 @@ impl MemoryStore {
     pub(crate) fn sources(&self) -> Result<Vec<Source>> {
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "SELECT session_id, path, cursor, observed_sequence FROM sources
-             WHERE cursor < observed_sequence AND retry_at_ms <= ?1
-             ORDER BY retry_at_ms, session_id",
+            "SELECT session_id, path, cursor, observed_sequence, failure_count FROM sources
+             WHERE cursor < observed_sequence
+               AND failure_count < ?1
+               AND retry_at_ms <= ?2
+             ORDER BY failure_count, retry_at_ms, session_id",
         )?;
         Ok(statement
-            .query_map([now_ms()], |row| {
+            .query_map(params![MAX_SOURCE_FAILURES, now_ms()], |row| {
                 Ok(Source {
                     session_id: row.get(0)?,
                     path: PathBuf::from(row.get::<_, String>(1)?),
                     cursor: row.get(2)?,
                     observed_sequence: row.get(3)?,
+                    failure_count: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -311,7 +343,7 @@ impl MemoryStore {
         let changed = transaction.execute(
             "UPDATE sources SET cursor=?2,
                     observed_sequence=MAX(observed_sequence, ?2),
-                    retry_at_ms=0, last_error=NULL
+                    retry_at_ms=0, last_error=NULL, failure_count=0
              WHERE session_id=?1 AND cursor=?3",
             params![source.session_id, end_sequence, source.cursor],
         )?;
@@ -322,10 +354,20 @@ impl MemoryStore {
 
     pub(crate) fn fail_source(&self, source: &Source, error: &str) -> Result<()> {
         let error = error.chars().take(400).collect::<String>();
+        let delay = SOURCE_RETRY_DELAYS_MS
+            [usize::try_from(source.failure_count).unwrap_or(SOURCE_RETRY_DELAYS_MS.len() - 1)
+                .min(SOURCE_RETRY_DELAYS_MS.len() - 1)];
         self.connect()?.execute(
-            "UPDATE sources SET retry_at_ms=?2, last_error=?3
-             WHERE session_id=?1 AND cursor=?4",
-            params![source.session_id, now_ms() + 60_000, error, source.cursor],
+            "UPDATE sources
+             SET failure_count=failure_count+1, retry_at_ms=?2, last_error=?3
+             WHERE session_id=?1 AND cursor=?4 AND observed_sequence=?5",
+            params![
+                source.session_id,
+                now_ms().saturating_add(delay),
+                error,
+                source.cursor,
+                source.observed_sequence
+            ],
         )?;
         Ok(())
     }
@@ -1129,5 +1171,61 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.state, "failed");
         assert_eq!(status.last_error.as_deref(), Some("test error"));
+    }
+
+    #[test]
+    fn repeated_failures_back_off_then_stop_until_the_frontier_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let store = MemoryStore::open(root.path(), root.path()).unwrap();
+        store.register_source("s", journal.path(), 0).unwrap();
+        store.register_source("s", journal.path(), 2).unwrap();
+        let mut previous_retry = 0u64;
+        for _ in 0..MAX_SOURCE_FAILURES {
+            let source = store.sources().unwrap().remove(0);
+            let before = now_ms();
+            store.fail_source(&source, "provider failed").unwrap();
+            let (count, retry_at): (u32, u64) = store
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT failure_count, retry_at_ms FROM sources WHERE session_id='s'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, source.failure_count + 1);
+            assert!(retry_at >= before.saturating_add(60_000));
+            assert!(retry_at > previous_retry);
+            previous_retry = retry_at;
+            store
+                .connect()
+                .unwrap()
+                .execute("UPDATE sources SET retry_at_ms=0 WHERE session_id='s'", [])
+                .unwrap();
+        }
+        assert!(store.sources().unwrap().is_empty());
+        assert_eq!(store.status().unwrap().pending_sources, 1);
+
+        store.register_source("s", journal.path(), 2).unwrap();
+        assert!(store.sources().unwrap().is_empty());
+
+        store.register_source("s", journal.path(), 3).unwrap();
+        let row: (u64, u64, u32, u64, Option<String>) = store
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT cursor, observed_sequence, failure_count, retry_at_ms, last_error
+                 FROM sources WHERE session_id='s'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (0, 3, 0, 0, None), "frontier advance should reset retries");
+        let resumed = store.sources().unwrap().remove(0);
+        assert_eq!(resumed.cursor, 0);
+        assert_eq!(resumed.observed_sequence, 3);
+        assert_eq!(resumed.failure_count, 0);
+        assert_eq!(store.status().unwrap().state, "synchronizing");
     }
 }
