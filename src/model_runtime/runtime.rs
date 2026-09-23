@@ -562,7 +562,8 @@ impl ModelRuntime {
                             })
                             .cloned(),
                     );
-                    let delay = retry_delay(&retry, attempt, error.failure.retry_hint);
+                    let delay = overload_fixed_retry_delay(route, &retry, &error.failure)
+                        .unwrap_or_else(|| retry_delay(&retry, attempt, error.failure.retry_hint));
                     tracing::warn!(
                         provider = %route.provider,
                         model = %route.model,
@@ -1335,7 +1336,8 @@ impl TurnOrchestrator {
                         && retry.enabled
                         && attempt < retry.max_attempts =>
                 {
-                    let delay = retry_delay(retry, attempt, error.failure.retry_hint);
+                    let delay = overload_fixed_retry_delay(route, retry, &error.failure)
+                        .unwrap_or_else(|| retry_delay(retry, attempt, error.failure.retry_hint));
                     if let Err(failure) = driver
                         .retry_scheduled(iteration, attempt, attempt + 1, delay, &error.failure)
                         .await
@@ -1373,6 +1375,23 @@ impl ModelEventObserver for DriverObserver<'_> {
 
 fn retryable_failure(failure: &ModelFailure) -> bool {
     failure.retry_hint != RetryHint::Never
+}
+
+fn fixed_retry_delay(config: &RuntimeRetryConfig) -> Option<Duration> {
+    (config.initial_delay_secs > 0).then(|| Duration::from_secs(config.initial_delay_secs))
+}
+
+fn overload_fixed_retry_delay(
+    route: &ResolvedModelRoute,
+    config: &RuntimeRetryConfig,
+    failure: &ModelFailure,
+) -> Option<Duration> {
+    if failure.code.as_deref() != Some("server_is_overloaded")
+        || !crate::fast_mode::is_fast_capable_model(&route.model)
+    {
+        return None;
+    }
+    fixed_retry_delay(config)
 }
 
 pub(crate) fn failure_with_cleanup(failure: ModelFailure, cleanup: ModelFailure) -> ModelFailure {
@@ -2759,6 +2778,30 @@ reasoning = true
             retry_delay(&config, 1, RetryHint::RetryAfterSeconds(7)),
             Duration::from_secs(7)
         );
+    }
+
+    #[test]
+    fn gpt_overload_uses_fixed_interval_without_exponential_growth() {
+        let mut route = route("responses");
+        route.model = "gpt-5.5".into();
+        let config = RuntimeRetryConfig {
+            enabled: true,
+            max_attempts: 5,
+            max_recovery_attempts: 0,
+            initial_delay_secs: 2,
+            exponential_backoff: true,
+            backoff_multiplier: 2.0,
+            jitter_secs: 1,
+        };
+        let failure = ModelFailure::new(FailurePhase::Decode, FailureKind::Http)
+            .with_code("server_is_overloaded")
+            .with_retry_hint(RetryHint::Retryable);
+        assert_eq!(
+            overload_fixed_retry_delay(&route, &config, &failure),
+            Some(Duration::from_secs(2))
+        );
+        route.model = "claude-4".into();
+        assert_eq!(overload_fixed_retry_delay(&route, &config, &failure), None);
     }
 
     #[test]

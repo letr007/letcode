@@ -4415,6 +4415,7 @@ fn error_failure(phase: FailurePhase, error: Option<ResponsesError>) -> ModelFai
             | "service_unavailable"
             | "temporarily_unavailable"
             | "overloaded"
+            | "server_is_overloaded"
             | "bad_gateway"
             | "gateway_timeout"
             | "previous_response_not_found"
@@ -6162,6 +6163,15 @@ anthropic_thinking = { mode = "adaptive" }"#,
         let events = failed.push(&sse("response.failed", r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"nope"}}}"#)).unwrap();
         assert!(matches!(events.as_slice(), [ModelEvent::Failure(_)]));
         assert!(failed.finish().is_ok());
+
+        let mut overloaded = binding.new_decoder();
+        let events = overloaded.push(&sse("error", r#"{"type":"error","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}"#)).unwrap();
+        let ModelEvent::Failure(failure) = &events[0] else {
+            panic!("expected overload failure");
+        };
+        assert_eq!(failure.code.as_deref(), Some("server_is_overloaded"));
+        assert_eq!(failure.retry_hint, RetryHint::Retryable);
+        assert!(overloaded.finish().is_ok());
 
         let mut incomplete = binding.new_decoder();
         let events = incomplete
