@@ -1663,6 +1663,8 @@ pub struct RuntimeEndpoints {
     pub completions: RuntimeEndpointOverride,
     #[serde(default)]
     pub anthropic: RuntimeEndpointOverride,
+    #[serde(default, alias = "reviewer")]
+    pub jev: RuntimeEndpointOverride,
 }
 
 impl RuntimeEndpoints {
@@ -1693,6 +1695,7 @@ impl RuntimeEndpoints {
             "responses" => &self.responses,
             "completions" => &self.completions,
             "anthropic" => &self.anthropic,
+            "jev" => &self.jev,
             _ => {
                 return Err(RuntimeConfigError::UnknownProtocol(protocol.to_string()));
             }
@@ -1705,10 +1708,13 @@ impl RuntimeEndpoints {
             });
         }
         let base = self.base_url.trim_end_matches('/');
+        let trimmed_path = path.trim_start_matches('/');
         let value = if path.starts_with("http://") || path.starts_with("https://") {
             path.to_owned()
+        } else if base.ends_with("/v1") && trimmed_path.starts_with("v1/") {
+            format!("{base}/{}", &trimmed_path[3..])
         } else {
-            format!("{base}/{}", path.trim_start_matches('/'))
+            format!("{base}/{trimmed_path}")
         };
         if value.is_empty() {
             return Err(RuntimeConfigError::InvalidValue {
@@ -2111,16 +2117,22 @@ impl RuntimeConfig {
                 }
             })?;
             validate_auth(provider_name, &provider.auth)?;
-            if provider.reviewer == Some(ProviderReviewerBackend::Jev)
-                && !matches!(provider.auth.scheme, AuthScheme::Bearer)
-            {
-                // The Jev request builder sends a Bearer token, so any other
-                // scheme would reach the endpoint with a credential the
-                // provider did not declare.
-                return Err(RuntimeConfigError::InvalidValue {
-                    field: format!("providers.{provider_name}.auth"),
-                    reason: "the jev reviewer authenticates with a Bearer token; set auth.type = \"bearer\"".into(),
-                });
+            if provider.reviewer == Some(ProviderReviewerBackend::Jev) {
+                if !matches!(provider.auth.scheme, AuthScheme::Bearer) {
+                    // The Jev request builder sends a Bearer token, so any other
+                    // scheme would reach the endpoint with a credential the
+                    // provider did not declare.
+                    return Err(RuntimeConfigError::InvalidValue {
+                        field: format!("providers.{provider_name}.auth"),
+                        reason: "the jev reviewer authenticates with a Bearer token; set auth.type = \"bearer\"".into(),
+                    });
+                }
+                let protocol_id = ProtocolId::new("jev").expect("valid protocol identifier");
+                let adapter_path = adapters::default_endpoint_path(protocol_id.as_str())
+                    .ok_or_else(|| RuntimeConfigError::UnknownProtocol(protocol_id.to_string()))?;
+                provider
+                    .endpoints
+                    .endpoint_for(&protocol_id, adapter_path)?;
             }
             if matches!(provider.auth.scheme, AuthScheme::Header) {
                 let name = provider.auth.name.as_deref().unwrap_or_default();
@@ -3154,6 +3166,7 @@ pub struct ResolvedProvider {
     pub retry: Option<RuntimeRetryConfig>,
     pub auth: RuntimeAuthConfig,
     pub endpoint: String,
+    pub jev_endpoint: Option<String>,
     pub endpoint_query: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
     pub query: BTreeMap<String, String>,
@@ -3260,6 +3273,32 @@ impl ResolvedProvider {
                 },
             );
         }
+        let jev_endpoint = if config.reviewer == Some(ProviderReviewerBackend::Jev)
+            || config.endpoints.jev.path.is_some()
+        {
+            let protocol_id = ProtocolId::new("jev").expect("valid protocol identifier");
+            let adapter_path = adapters::default_endpoint_path(protocol_id.as_str())
+                .ok_or_else(|| RuntimeConfigError::UnknownProtocol(protocol_id.to_string()))?;
+            let (url, endpoint_query) =
+                config.endpoints.endpoint_for(&protocol_id, adapter_path)?;
+            if endpoint_query.is_empty() {
+                Some(url)
+            } else {
+                let mut parsed_url = reqwest::Url::parse(&url).map_err(|error| {
+                    RuntimeConfigError::InvalidValue {
+                        field: format!("providers.{name}.endpoints.jev"),
+                        reason: error.to_string(),
+                    }
+                })?;
+                for (k, v) in &endpoint_query {
+                    parsed_url.query_pairs_mut().append_pair(k, v);
+                }
+                Some(parsed_url.to_string())
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             name: name.to_owned(),
             flavor: config.flavor.unwrap_or_default(),
@@ -3268,6 +3307,7 @@ impl ResolvedProvider {
             retry: config.retry.clone(),
             auth: auth.clone(),
             endpoint: config.endpoints.base_url.clone(),
+            jev_endpoint,
             endpoint_query: BTreeMap::new(),
             headers: config.headers.clone(),
             query: config.query.clone(),

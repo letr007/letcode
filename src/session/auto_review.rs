@@ -615,6 +615,7 @@ mod tests {
         let protocol = crate::config::ApiProtocol::Completions;
         crate::config::ProviderConfig {
             base_url: "http://127.0.0.1:9/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "reviewer-key".into(),
             protocol,

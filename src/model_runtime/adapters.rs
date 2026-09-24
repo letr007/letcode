@@ -16,6 +16,7 @@ pub(crate) fn default_endpoint_path(protocol: &str) -> Option<&'static str> {
         "responses" => Some("/responses"),
         "completions" => Some("/chat/completions"),
         "anthropic" => Some("/messages"),
+        "jev" => Some("/v1/systemone"),
         _ => None,
     }
 }

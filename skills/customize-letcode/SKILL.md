@@ -120,6 +120,9 @@ base_url = "https://api.openai.com/v1"
 # [providers.openai.endpoints.responses]
 # path = "responses"
 # query = { api_version = "2026-01-01" }
+# Jev 审批后端端点缺省为 /v1/systemone，同样支持覆盖：
+# [providers.openai.endpoints.jev]
+# path = "decisions"
 
 # 可选 provider 连接设置：
 # [providers.openai.transport]

@@ -656,6 +656,7 @@ mod tests {
     fn active_provider_model_switch_reconfigures_complete_route() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: config::ApiProtocol::Completions,
@@ -751,6 +752,7 @@ mod tests {
 
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "test-key".into(),
             protocol: config::ApiProtocol::Responses,

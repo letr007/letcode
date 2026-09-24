@@ -307,6 +307,7 @@ mod tests {
     ) -> ProviderConfig {
         ProviderConfig {
             base_url: base_url.into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: api_key.into(),
             protocol,
@@ -566,6 +567,7 @@ base_url = "https://test.example.invalid/v1"
     fn expert_route_factory_rejects_an_unconfigured_model_for_a_known_provider() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
@@ -614,6 +616,7 @@ base_url = "https://test.example.invalid/v1"
     fn routed_child_retains_route_factory_for_takeover_restoration() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
@@ -674,6 +677,7 @@ base_url = "https://test.example.invalid/v1"
     fn expert_route_factory_creates_children_with_the_routed_provider_settings() {
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,
@@ -1089,6 +1093,7 @@ base_url = "https://test.example.invalid/v1"
             .to_string();
         let provider = ProviderConfig {
             base_url: "http://127.0.0.1:9876/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "expert-key".into(),
             protocol: ApiProtocol::Completions,

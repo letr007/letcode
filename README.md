@@ -136,6 +136,8 @@ mode = "default" # solo remains accepted as a yolo alias
 # credential_env = "TYPESAFE_API_KEY"
 # [providers.typesafe.endpoints]
 # base_url = "https://api.typesafe.ai"
+# [providers.typesafe.endpoints.jev] # Defaults to /v1/systemone; can be overridden
+# path = "decisions"
 # [providers.typesafe.models."jev-latest"]
 # display = "Jev"
 #

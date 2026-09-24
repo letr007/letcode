@@ -462,6 +462,7 @@ pub struct PermissionsConfig {
 pub struct JevReviewConfig {
     pub provider: String,
     pub base_url: String,
+    pub endpoint: String,
     pub model: String,
     pub credential: String,
     pub timeout_secs: u64,
@@ -472,6 +473,7 @@ impl std::fmt::Debug for JevReviewConfig {
         f.debug_struct("JevReviewConfig")
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
+            .field("endpoint", &self.endpoint)
             .field("model", &self.model)
             .field("credential", &"<redacted>")
             .field("timeout_secs", &self.timeout_secs)
@@ -571,6 +573,7 @@ pub struct McpRemoteServerConfig {
 #[derive(Clone, PartialEq)]
 pub struct ProviderConfig {
     pub base_url: String,
+    pub jev_endpoint: Option<String>,
     pub api_key: String,
     pub auth_mode: ProviderAuthMode,
     pub protocol: ApiProtocol,
@@ -584,6 +587,7 @@ impl std::fmt::Debug for ProviderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderConfig")
             .field("base_url", &self.base_url)
+            .field("jev_endpoint", &self.jev_endpoint)
             .field("api_key", &"<redacted>")
             .field("auth_mode", &self.auth_mode)
             .field("protocol", &self.protocol)
@@ -871,6 +875,8 @@ struct RawRuntimeEndpoints {
     completions: RuntimeEndpointOverride,
     #[serde(default)]
     anthropic: RuntimeEndpointOverride,
+    #[serde(default, alias = "reviewer")]
+    jev: RuntimeEndpointOverride,
 }
 
 fn runtime_retry(
@@ -928,6 +934,7 @@ fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
                 responses: endpoints.responses,
                 completions: endpoints.completions,
                 anthropic: endpoints.anthropic,
+                jev: endpoints.jev,
             };
             Ok((
                 name.clone(),
@@ -1150,6 +1157,7 @@ fn project_provider_config(provider: &ResolvedProvider) -> Result<ProviderConfig
     });
     Ok(ProviderConfig {
         base_url: provider.endpoint.clone(),
+        jev_endpoint: provider.jev_endpoint.clone(),
         api_key,
         auth_mode,
         protocol,
@@ -1177,9 +1185,14 @@ pub(crate) fn jev_review_for_route(
     if provider.reviewer != Some(ProviderReviewerBackend::Jev) {
         return None;
     }
+    let endpoint = provider
+        .jev_endpoint
+        .clone()
+        .unwrap_or_else(|| format!("{}/v1/systemone", provider.base_url.trim_end_matches('/')));
     Some(JevReviewConfig {
         provider: route.provider.clone(),
         base_url: provider.base_url.clone(),
+        endpoint,
         model: route.model.clone(),
         credential: provider.api_key.clone(),
         timeout_secs: DEFAULT_JEV_REVIEW_TIMEOUT_SECS,
@@ -1750,9 +1763,92 @@ base_url = "https://example.invalid/v1"
 
         assert_eq!(jev.provider, "typesafe");
         assert_eq!(jev.base_url, "https://api.typesafe.ai");
+        assert_eq!(jev.endpoint, "https://api.typesafe.ai/v1/systemone");
         assert_eq!(jev.model, "jev-latest");
         assert_eq!(jev.credential, "typesafe-key");
         assert_eq!(jev.timeout_secs, DEFAULT_JEV_REVIEW_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn reviewer_provider_supports_custom_endpoint_and_alias() {
+        let text = format!(
+            r#"{}
+[providers.newapi]
+protocol = "responses"
+default_model = "jev-latest"
+reviewer = "jev"
+
+[providers.newapi.auth]
+type = "bearer"
+credential = "newapi-key"
+
+[providers.newapi.endpoints]
+base_url = "https://fuck2.letr7.com/v1"
+
+[providers.newapi.endpoints.jev]
+path = "decisions"
+
+[providers.newapi.models."jev-latest"]
+
+[agents.reviewer]
+provider = "newapi"
+model = "jev-latest"
+"#,
+            config("primary", "model-a", "")
+        );
+        let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+            .expect("config should load");
+        let route = loaded
+            .agents
+            .reviewer
+            .route
+            .clone()
+            .expect("reviewer route");
+        let jev = jev_review_for_route(&loaded.providers, &route).expect("jev backend");
+
+        assert_eq!(jev.provider, "newapi");
+        assert_eq!(jev.base_url, "https://fuck2.letr7.com/v1");
+        assert_eq!(jev.endpoint, "https://fuck2.letr7.com/v1/decisions");
+        assert_eq!(jev.model, "jev-latest");
+        assert_eq!(jev.credential, "newapi-key");
+
+        // Alias `reviewer` and path with `/v1/decisions`
+        let text_alias = format!(
+            r#"{}
+[providers.newapi]
+protocol = "responses"
+default_model = "jev-latest"
+reviewer = "jev"
+
+[providers.newapi.auth]
+type = "bearer"
+credential = "newapi-key"
+
+[providers.newapi.endpoints]
+base_url = "https://fuck2.letr7.com/v1"
+
+[providers.newapi.endpoints.reviewer]
+path = "/v1/decisions"
+
+[providers.newapi.models."jev-latest"]
+
+[agents.reviewer]
+provider = "newapi"
+model = "jev-latest"
+"#,
+            config("primary", "model-a", "")
+        );
+        let loaded_alias = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text_alias)
+            .expect("config should load");
+        let route_alias = loaded_alias
+            .agents
+            .reviewer
+            .route
+            .clone()
+            .expect("reviewer route");
+        let jev_alias =
+            jev_review_for_route(&loaded_alias.providers, &route_alias).expect("jev backend");
+        assert_eq!(jev_alias.endpoint, "https://fuck2.letr7.com/v1/decisions");
     }
 
     #[test]

@@ -575,6 +575,7 @@ mod expert_route_switch_tests {
     fn provider(models: &[&str]) -> ProviderConfig {
         ProviderConfig {
             base_url: "http://127.0.0.1:9/v1".into(),
+            jev_endpoint: None,
             auth_mode: crate::config::ProviderAuthMode::ApiKey,
             api_key: "key".into(),
             protocol: crate::config::ApiProtocol::Completions,

@@ -71,7 +71,7 @@ impl JevReviewer {
     ) -> Result<Self> {
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_secs(config.timeout_secs));
-        if is_loopback_endpoint(&config.base_url) {
+        if is_loopback_endpoint(&config.endpoint) || is_loopback_endpoint(&config.base_url) {
             builder = builder.no_proxy();
         }
         let client = builder
@@ -347,7 +347,7 @@ async fn ask_jev(
     if credential.is_empty() {
         bail!("{}", missing_credential_rationale(config));
     }
-    let url = format!("{}/v1/systemone", config.base_url.trim_end_matches('/'));
+    let url = &config.endpoint;
     let body = json!({
         "model": config.model,
         "state": state,
@@ -360,7 +360,7 @@ async fn ask_jev(
         },
     });
     let response = client
-        .post(&url)
+        .post(url)
         .header("authorization", format!("Bearer {credential}"))
         .json(&body)
         .send()
@@ -685,9 +685,11 @@ mod tests {
     }
 
     fn review_config(base_url: String, credential: &str) -> JevReviewConfig {
+        let endpoint = format!("{}/v1/systemone", base_url.trim_end_matches('/'));
         JevReviewConfig {
             provider: "typesafe".into(),
             base_url,
+            endpoint,
             model: "jev-latest".into(),
             credential: credential.into(),
             timeout_secs: 5,

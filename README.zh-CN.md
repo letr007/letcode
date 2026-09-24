@@ -134,6 +134,8 @@ mode = "default" # solo 是 yolo 的兼容别名
 # credential_env = "TYPESAFE_API_KEY"
 # [providers.typesafe.endpoints]
 # base_url = "https://api.typesafe.ai"
+# [providers.typesafe.endpoints.jev] # 缺省为 /v1/systemone；可显式覆盖
+# path = "decisions"
 # [providers.typesafe.models."jev-latest"]
 # display = "Jev"
 #
