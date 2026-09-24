@@ -116,9 +116,6 @@ impl Theme {
         theme.approval = Color::Rgb(0xe9, 0xc2, 0x71);
         theme.notice = Color::Rgb(0x9a, 0xc9, 0xda);
         theme.fake = Color::Rgb(0xd8, 0xa1, 0xed);
-        theme.diff_add_bg = Color::Reset;
-        theme.diff_delete_bg = Color::Reset;
-        theme.diff_hunk_bg = Color::Reset;
         theme
     }
 
@@ -332,9 +329,9 @@ mod tests {
         assert_eq!(wireframe.root_bg, Color::Reset);
         assert_eq!(wireframe.element_bg, Color::Reset);
         assert_eq!(wireframe.border, Color::Rgb(0x70, 0x80, 0x9a));
-        assert_eq!(wireframe.diff_add_bg, Color::Reset);
-        assert_eq!(wireframe.diff_delete_bg, Color::Reset);
-        assert_eq!(wireframe.diff_hunk_bg, Color::Reset);
+        assert_eq!(wireframe.diff_add_bg, Theme::dark().diff_add_bg);
+        assert_eq!(wireframe.diff_delete_bg, Theme::dark().diff_delete_bg);
+        assert_eq!(wireframe.diff_hunk_bg, Theme::dark().diff_hunk_bg);
     }
 
     #[test]

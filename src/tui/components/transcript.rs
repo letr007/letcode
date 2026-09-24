@@ -1555,9 +1555,7 @@ fn build_user_message(
     push_user_card_line_into(out, "", None, width, theme, None);
     if theme.card_frame {
         push_user_card_line_into(out, "", None, width, theme, None);
-        push_user_card_line_into(out, "", None, width, theme, None);
     }
-
     // 内容行：每个 chunk 一行
     let mut pushed = false;
     for (index, chunk) in chunks.iter().enumerate() {
@@ -1650,7 +1648,6 @@ fn build_user_message(
     // 底部空 card 行（decoration）
     push_user_card_line_into(out, "", None, width, theme, None);
     if theme.card_frame {
-        push_user_card_line_into(out, "", None, width, theme, None);
         push_user_card_line_into(out, "", None, width, theme, None);
     }
     frame_user_card_lines(&mut out.document, card_start, width, theme);
@@ -4359,8 +4356,8 @@ mod tests {
             .position(|line| line.starts_with('└') && line.ends_with('┘'))
             .expect("bottom border");
 
-        assert_eq!(content - top, 3, "{lines:?}");
-        assert_eq!(bottom - content, 3, "{lines:?}");
+        assert_eq!(content - top, 2, "{lines:?}");
+        assert_eq!(bottom - content, 2, "{lines:?}");
         assert!(lines[content].starts_with('│') && lines[content].ends_with('│'));
     }
 
