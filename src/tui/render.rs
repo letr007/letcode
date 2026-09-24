@@ -121,7 +121,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         theme.card_frame,
     );
     if let Some(question) = state.pending_question.as_ref() {
-        metrics.composer_height = question_composer_height(question, workspace);
+        metrics.composer_height = question_composer_height(question, workspace, theme.card_frame);
         metrics.transcript_viewport_height = workspace
             .height
             .saturating_sub(metrics.composer_height)
@@ -572,21 +572,27 @@ fn confirm_body_row_count(
     rows
 }
 
-fn question_content_width(area_width: u16) -> usize {
+fn question_content_width(area_width: u16, card_frame: bool) -> usize {
     area_width
         .saturating_sub(surface::ACCENT_BAR_WIDTH)
         .saturating_sub(surface::PROMPT_INNER_PAD_X)
         .saturating_sub(surface::CARD_PAD_RIGHT)
+        .saturating_sub(u16::from(card_frame))
         .max(1) as usize
 }
 
 fn question_composer_height(
     question: &crate::tui::state::PendingQuestionState,
     workspace: Rect,
+    card_frame: bool,
 ) -> u16 {
     layout::question_composer_height_for_content(
         workspace.height,
-        question_full_row_count(question, question_content_width(workspace.width)),
+        question_full_row_count(
+            question,
+            question_content_width(workspace.width, card_frame),
+        ),
+        card_frame,
     )
 }
 
@@ -1799,10 +1805,14 @@ mod tests {
         );
         let workspace = Rect::new(2, 0, 96, 23);
         let content_rows =
-            question_full_row_count(&question, question_content_width(workspace.width));
-        let height = question_composer_height(&question, workspace);
+            question_full_row_count(&question, question_content_width(workspace.width, false));
+        let height = question_composer_height(&question, workspace, false);
 
         assert_eq!(height, content_rows as u16 + 4);
+        assert_eq!(
+            question_composer_height(&question, workspace, true),
+            height + 1
+        );
         assert!(height < workspace.height.saturating_sub(2));
     }
 
@@ -1830,8 +1840,10 @@ mod tests {
         question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
         let workspace = Rect::new(2, 0, 44, 13);
 
-        assert_eq!(question_composer_height(&question, workspace), 11);
-        assert!(question_full_row_count(&question, question_content_width(workspace.width)) > 7);
+        assert_eq!(question_composer_height(&question, workspace, false), 11);
+        assert!(
+            question_full_row_count(&question, question_content_width(workspace.width, false)) > 7
+        );
 
         let mut state = TuiState::default();
         state.mark_session_active();
