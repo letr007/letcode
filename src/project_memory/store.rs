@@ -354,9 +354,9 @@ impl MemoryStore {
 
     pub(crate) fn fail_source(&self, source: &Source, error: &str) -> Result<()> {
         let error = error.chars().take(400).collect::<String>();
-        let delay = SOURCE_RETRY_DELAYS_MS
-            [usize::try_from(source.failure_count).unwrap_or(SOURCE_RETRY_DELAYS_MS.len() - 1)
-                .min(SOURCE_RETRY_DELAYS_MS.len() - 1)];
+        let delay = SOURCE_RETRY_DELAYS_MS[usize::try_from(source.failure_count)
+            .unwrap_or(SOURCE_RETRY_DELAYS_MS.len() - 1)
+            .min(SOURCE_RETRY_DELAYS_MS.len() - 1)];
         self.connect()?.execute(
             "UPDATE sources
              SET failure_count=failure_count+1, retry_at_ms=?2, last_error=?3
@@ -1218,10 +1218,22 @@ mod tests {
                 "SELECT cursor, observed_sequence, failure_count, retry_at_ms, last_error
                  FROM sources WHERE session_id='s'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
-        assert_eq!(row, (0, 3, 0, 0, None), "frontier advance should reset retries");
+        assert_eq!(
+            row,
+            (0, 3, 0, 0, None),
+            "frontier advance should reset retries"
+        );
         let resumed = store.sources().unwrap().remove(0);
         assert_eq!(resumed.cursor, 0);
         assert_eq!(resumed.observed_sequence, 3);
