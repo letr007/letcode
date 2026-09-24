@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-24
+
 ### Added
 
 - 新增 `wireframe` 主题，采用透明卡片与矩形边框风格。
@@ -430,7 +432,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/letr007/letcode/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/letr007/letcode/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/letr007/letcode/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/letr007/letcode/compare/v0.14.0...v0.15.0
