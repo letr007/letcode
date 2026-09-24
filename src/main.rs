@@ -97,6 +97,17 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
+    let config_path = config::default_config_path()?;
+    if !config_path.exists() {
+        match options.entry_mode {
+            EntryMode::Tui | EntryMode::Resume { .. } => {
+                if !tui::setup::run(&config_path)? {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
     let config = AppConfig::load()?;
     let _tracing_guards = init_tracing(&config.global.log_file);
 

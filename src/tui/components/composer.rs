@@ -294,22 +294,50 @@ pub(crate) fn render_connected_prompt_shell(
     emphasis: surface::SurfaceEmphasis,
     footer_height: u16,
 ) -> Option<ConnectedPromptShell> {
+    render_connected_prompt_shell_with_bar(frame, area, theme, emphasis, footer_height, true)
+}
+
+pub(crate) fn render_connected_prompt_shell_without_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    emphasis: surface::SurfaceEmphasis,
+    footer_height: u16,
+) -> Option<ConnectedPromptShell> {
+    render_connected_prompt_shell_with_bar(frame, area, theme, emphasis, footer_height, false)
+}
+
+fn render_connected_prompt_shell_with_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    emphasis: surface::SurfaceEmphasis,
+    footer_height: u16,
+    show_accent_bar: bool,
+) -> Option<ConnectedPromptShell> {
     if area.is_empty() {
         return None;
     }
 
     let framed = theme.card_frame && area.width >= 3 && area.height >= 3;
     let top_pad = surface::PROMPT_INNER_PAD_TOP;
-    let bar_style = surface::accent_style(theme, emphasis, surface::SurfaceKind::Root)
-        .add_modifier(Modifier::BOLD);
-    render_accent_bar(frame, area, bar_style);
+    let bar_width = if show_accent_bar {
+        surface::ACCENT_BAR_WIDTH
+    } else {
+        0
+    };
+    if show_accent_bar {
+        let bar_style = surface::accent_style(theme, emphasis, surface::SurfaceKind::Root)
+            .add_modifier(Modifier::BOLD);
+        render_accent_bar(frame, area, bar_style);
+    }
 
     let panel_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let surface_area = Rect::new(
-        area.x + surface::ACCENT_BAR_WIDTH,
+        area.x + bar_width,
         area.y + u16::from(framed),
         area.width
-            .saturating_sub(surface::ACCENT_BAR_WIDTH)
+            .saturating_sub(bar_width)
             .saturating_sub(u16::from(framed)),
         area.height
             .saturating_sub(1)
@@ -317,14 +345,14 @@ pub(crate) fn render_connected_prompt_shell(
     );
     frame.render_widget(Block::new().style(panel_style), surface_area);
 
-    render_prompt_cap(frame, area, theme, emphasis);
+    render_prompt_cap_with_bar(frame, area, theme, emphasis, show_accent_bar);
     render_three_sided_frame(frame, area, theme);
 
-    let inner_x = area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X;
+    let inner_x = area.x + bar_width + surface::PROMPT_INNER_PAD_X;
     let inner_y = area.y + top_pad + u16::from(framed);
     let inner_width = area
         .width
-        .saturating_sub(surface::ACCENT_BAR_WIDTH)
+        .saturating_sub(bar_width)
         .saturating_sub(surface::PROMPT_INNER_PAD_X)
         .saturating_sub(surface::CARD_PAD_RIGHT)
         .saturating_sub(u16::from(framed))
@@ -965,6 +993,16 @@ pub(crate) fn render_prompt_cap(
     theme: Theme,
     emphasis: surface::SurfaceEmphasis,
 ) {
+    render_prompt_cap_with_bar(frame, area, theme, emphasis, true);
+}
+
+fn render_prompt_cap_with_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    emphasis: surface::SurfaceEmphasis,
+    show_accent_bar: bool,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -977,15 +1015,18 @@ pub(crate) fn render_prompt_cap(
         cap_area,
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            surface::PROMPT_BOTTOM_LEFT_GLYPH,
-            surface::accent_style(theme, emphasis, surface::SurfaceKind::Root),
-        ))),
-        Rect::new(area.x, cap_y, 1.min(area.width), 1),
-    );
-
-    let cap_width = area.width.saturating_sub(1);
+    let cap_width = if show_accent_bar {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                surface::PROMPT_BOTTOM_LEFT_GLYPH,
+                surface::accent_style(theme, emphasis, surface::SurfaceKind::Root),
+            ))),
+            Rect::new(area.x, cap_y, 1.min(area.width), 1),
+        );
+        area.width.saturating_sub(1)
+    } else {
+        area.width
+    };
     if cap_width > 0 && theme.paints_panels() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -994,7 +1035,7 @@ pub(crate) fn render_prompt_cap(
                     .fg(surface::surface_bg(theme, surface::SurfaceKind::Element))
                     .bg(surface::surface_bg(theme, surface::SurfaceKind::Root)),
             ))),
-            Rect::new(area.x + 1, cap_y, cap_width, 1),
+            Rect::new(area.x + u16::from(show_accent_bar), cap_y, cap_width, 1),
         );
     }
 }

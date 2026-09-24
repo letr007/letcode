@@ -14,6 +14,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -123,6 +126,84 @@ pub struct AppConfig {
     pub providers: IndexMap<String, ProviderConfig>,
     pub runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
     pub fake: FakeConfig,
+}
+
+pub(crate) fn initialize_config(
+    path: &Path,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<()> {
+    if base_url.trim().is_empty() {
+        bail!("Base URL cannot be empty");
+    }
+    if api_key.trim().is_empty() {
+        bail!("API key cannot be empty");
+    }
+    if model.trim().is_empty() {
+        bail!("Model cannot be empty");
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        bail!("configuration file already exists: {}", path.display());
+    }
+
+    let model = toml_string(model);
+    let config_text = format!(
+        "active_provider = \"default\"\n\n[providers.default]\nprotocol = \"responses\"\ndefault_model = {model}\n\n[providers.default.auth]\ntype = \"bearer\"\ncredential = {}\n\n[providers.default.endpoints]\nbase_url = {}\n\n[providers.default.models.{model}.capabilities]\ntools = true\n",
+        toml_string(api_key),
+        toml_string(base_url),
+    );
+    AppConfig::load_from_str_at_path(path, &config_text)
+        .context("generated setup configuration is invalid")?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    let _lock = acquire_config_lock(path)?;
+    if fs::symlink_metadata(path).is_ok() {
+        bail!(
+            "configuration file was created while setting up: {}",
+            path.display()
+        );
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.setup.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("letcode.toml"),
+        std::process::id(),
+        stamp
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!("failed to create temporary config {}", temp_path.display())
+        })?;
+        file.write_all(config_text.as_bytes())
+            .with_context(|| format!("failed to write temporary config {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temporary config {}", temp_path.display()))?;
+        drop(file);
+        replace_file(&temp_path, path)
+            .with_context(|| format!("failed to install config {}", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
 }
 
 impl AppConfig {
@@ -2933,6 +3014,36 @@ base_url = "https://example.invalid"
             "[cache]\nenabled = true\nlayout = \"v1\"",
         );
         assert!(AppConfig::load_from_path(write_temp_config(unknown)).is_err());
+    }
+
+    #[test]
+    fn initialize_config_writes_a_minimal_valid_config() {
+        let path = write_missing_config_path();
+        initialize_config(
+            &path,
+            "https://example.invalid/v1",
+            "secret-key",
+            "example-model",
+        )
+        .expect("initial config should be written");
+
+        let loaded = AppConfig::load_from_path(&path).expect("initial config should load");
+        assert_eq!(loaded.active_provider, "default");
+        assert_eq!(loaded.active_route().model, "example-model");
+        assert_eq!(loaded.providers["default"].api_key, "secret-key");
+        assert!(loaded.providers["default"].models["example-model"].supports_tools);
+    }
+
+    fn write_missing_config_path() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let base = env::temp_dir().join(format!("letcode-initialize-config-test-{timestamp}-{id}"));
+        fs::create_dir_all(&base).unwrap();
+        base.join("nested").join("letcode.toml")
     }
 
     fn loaded_config_for_allowlist(allowed_models: &str) -> String {
