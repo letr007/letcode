@@ -218,6 +218,7 @@ impl ThemeFile {
                 .unwrap_or(base.element_bg),
             elevated_bg: parse_optional_color(self.elevated_bg.as_deref(), "elevated_bg")?
                 .unwrap_or(base.elevated_bg),
+            card_frame: base.card_frame,
             border: parse_optional_color(self.border.as_deref(), "border")?.unwrap_or(base.border),
             text: parse_optional_color(self.text.as_deref(), "text")?.unwrap_or(base.text),
             muted_text: parse_optional_color(self.muted_text.as_deref(), "muted_text")?

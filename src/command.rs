@@ -96,6 +96,7 @@ pub enum ThemeName {
     Dark,
     Plain,
     Glass,
+    Wireframe,
     Rainbow,
 }
 
@@ -105,6 +106,7 @@ impl ThemeName {
             Self::Dark => "dark",
             Self::Plain => "plain",
             Self::Glass => "glass",
+            Self::Wireframe => "wireframe",
             Self::Rainbow => "rainbow",
         }
     }
@@ -114,6 +116,7 @@ impl ThemeName {
             "dark" | "default" => Some(Self::Dark),
             "plain" => Some(Self::Plain),
             "glass" | "transparent" => Some(Self::Glass),
+            "wireframe" => Some(Self::Wireframe),
             "rainbow" => Some(Self::Rainbow),
             _ => None,
         }
@@ -1007,6 +1010,10 @@ mod tests {
         assert_eq!(
             parse_command("/theme tokyonight"),
             Ok(CommandIntent::Theme(ThemeCommand::Set("tokyonight".into())))
+        );
+        assert_eq!(
+            parse_command("/theme wireframe"),
+            Ok(CommandIntent::Theme(ThemeCommand::Set("wireframe".into())))
         );
         assert_eq!(
             parse_command("/theme sunset"),

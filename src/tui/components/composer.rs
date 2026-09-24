@@ -218,6 +218,9 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect,
 }
 
 fn render_composer_panel(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+    let framed = theme.card_frame && area.width >= 3 && area.height >= 3;
+    let top_pad = surface::PROMPT_INNER_PAD_TOP;
+
     // Accent bar at the left edge.
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
@@ -231,22 +234,28 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let surface_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH,
-        area.y,
-        area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
-        area.height.saturating_sub(1),
+        area.y + u16::from(framed),
+        area.width
+            .saturating_sub(surface::ACCENT_BAR_WIDTH)
+            .saturating_sub(u16::from(framed)),
+        area.height
+            .saturating_sub(1)
+            .saturating_sub(u16::from(framed)),
     );
     frame.render_widget(Block::new().style(element_style), surface_area);
 
     // Textarea area inside the element surface.
     let textarea_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X,
-        area.y + surface::PROMPT_INNER_PAD_TOP,
+        area.y + top_pad + u16::from(framed),
         u16::try_from(composer_textarea_width(area.width))
             .unwrap_or(u16::MAX)
+            .saturating_sub(u16::from(framed))
             .max(1),
         area.height
             .saturating_sub(1)
-            .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
+            .saturating_sub(u16::from(framed))
+            .saturating_sub(top_pad)
             .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
             .max(1),
     );
@@ -275,6 +284,7 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         render_prompt_metadata(frame, state, area, theme);
     }
     render_prompt_cap(frame, area, theme, prompt_emphasis);
+    render_three_sided_frame(frame, area, theme);
 }
 
 pub(crate) fn render_connected_prompt_shell(
@@ -288,6 +298,8 @@ pub(crate) fn render_connected_prompt_shell(
         return None;
     }
 
+    let framed = theme.card_frame && area.width >= 3 && area.height >= 3;
+    let top_pad = surface::PROMPT_INNER_PAD_TOP;
     let bar_style = surface::accent_style(theme, emphasis, surface::SurfaceKind::Root)
         .add_modifier(Modifier::BOLD);
     render_accent_bar(frame, area, bar_style);
@@ -295,26 +307,33 @@ pub(crate) fn render_connected_prompt_shell(
     let panel_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let surface_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH,
-        area.y,
-        area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
-        area.height.saturating_sub(1),
+        area.y + u16::from(framed),
+        area.width
+            .saturating_sub(surface::ACCENT_BAR_WIDTH)
+            .saturating_sub(u16::from(framed)),
+        area.height
+            .saturating_sub(1)
+            .saturating_sub(u16::from(framed)),
     );
     frame.render_widget(Block::new().style(panel_style), surface_area);
 
     render_prompt_cap(frame, area, theme, emphasis);
+    render_three_sided_frame(frame, area, theme);
 
     let inner_x = area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X;
-    let inner_y = area.y + surface::PROMPT_INNER_PAD_TOP;
+    let inner_y = area.y + top_pad + u16::from(framed);
     let inner_width = area
         .width
         .saturating_sub(surface::ACCENT_BAR_WIDTH)
         .saturating_sub(surface::PROMPT_INNER_PAD_X)
         .saturating_sub(surface::CARD_PAD_RIGHT)
+        .saturating_sub(u16::from(framed))
         .max(1);
     let inner_height = area
         .height
         .saturating_sub(1)
-        .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
+        .saturating_sub(u16::from(framed))
+        .saturating_sub(top_pad)
         .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
         .max(1);
 
@@ -995,6 +1014,41 @@ pub(crate) fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style)
     let lines =
         vec![Line::from(Span::styled(surface::ACCENT_BAR_GLYPH, style)); area.height as usize];
     frame.render_widget(Paragraph::new(Text::from(lines)).style(style), bar_area);
+}
+
+fn render_three_sided_frame(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+    if !theme.card_frame || area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let style = Style::default().fg(theme.border).bg(theme.root_bg);
+    let horizontal = "─".repeat(area.width.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("┌{horizontal}┐"), style))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let side_lines = (0..area.height.saturating_sub(2))
+        .map(|_| Line::from(Span::styled("│", style)))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(Text::from(side_lines.clone())),
+        Rect::new(area.x, area.y + 1, 1, area.height.saturating_sub(2)),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(side_lines)),
+        Rect::new(
+            area.right().saturating_sub(1),
+            area.y + 1,
+            1,
+            area.height.saturating_sub(2),
+        ),
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("└{horizontal}┘"), style))),
+        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+    );
 }
 
 fn compact_permission_summary(
@@ -1696,6 +1750,50 @@ mod tests {
         assert!(
             !rendered.contains("hidden input should not render"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn wireframe_composer_uses_a_continuous_box() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_composer(
+                    frame,
+                    &mut state,
+                    Rect::new(0, 0, 60, 6),
+                    Theme::wireframe(),
+                );
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..6)
+            .map(|y| {
+                (0..60)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rows[0].starts_with("┌") && rows[0].ends_with("┐"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1].starts_with("│") && rows[1].ends_with("│") && !rows[1].contains("message"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[2].starts_with("│") && rows[2].ends_with("│") && rows[2].contains("message"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[5].starts_with("└") && rows[5].ends_with("┘"),
+            "{rows:?}"
         );
     }
 

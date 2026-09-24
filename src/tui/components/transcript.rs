@@ -895,10 +895,11 @@ impl Component<Style> for TimelineItemComponent<'_> {
                     &report,
                     options,
                     self.theme,
-                    card_content_width(self.width),
+                    card_content_width(self.width, self.theme),
                     self.translator,
                 ),
                 self.width,
+                self.theme,
             );
             return;
         }
@@ -1005,7 +1006,7 @@ fn try_render_reviewer_view_item(
             reviewer_cards::render_review_request_card_document(
                 &card,
                 theme,
-                card_content_width(width),
+                card_content_width(width, theme),
             )
         }
         TimelineItem::Assistant(message) => {
@@ -1013,12 +1014,12 @@ fn try_render_reviewer_view_item(
             reviewer_cards::render_review_decision_card_document(
                 &card,
                 theme,
-                card_content_width(width),
+                card_content_width(width, theme),
             )
         }
         _ => return None,
     };
-    Some(pad_card_document(document, width))
+    Some(pad_card_document(document, width, theme))
 }
 
 fn render_timeline_item_document(
@@ -1076,7 +1077,13 @@ fn build_compaction_block_lines(
 
     if !summary.is_empty() {
         let start = out.document.lines.len();
-        build_assistant_message_lines(out, summary, streaming, theme, card_content_width(width));
+        build_assistant_message_lines(
+            out,
+            summary,
+            streaming,
+            theme,
+            card_content_width(width, theme),
+        );
         pad_card_lines(&mut out.document, start, width);
     }
 
@@ -1085,12 +1092,18 @@ fn build_compaction_block_lines(
     }
 }
 
-fn card_content_width(width: usize) -> usize {
-    width.saturating_sub(surface::CARD_PAD_RIGHT as usize)
+fn card_content_width(width: usize, theme: Theme) -> usize {
+    width
+        .saturating_sub(surface::CARD_PAD_RIGHT as usize)
+        .saturating_sub(usize::from(theme.card_frame))
 }
 
-fn pad_card_document(mut document: Document<Style>, width: usize) -> Document<Style> {
-    pad_card_lines(&mut document, 0, width);
+fn pad_card_document(mut document: Document<Style>, width: usize, theme: Theme) -> Document<Style> {
+    if theme.card_frame {
+        frame_card_document(&mut document, width, theme);
+    } else {
+        pad_card_lines(&mut document, 0, width);
+    }
     document
 }
 
@@ -1107,6 +1120,94 @@ fn pad_card_lines(document: &mut Document<Style>, start: usize, width: usize) {
                 .push(RenderSpan::decoration(" ".repeat(width - used), style));
         }
     }
+}
+
+fn frame_card_document(document: &mut Document<Style>, width: usize, theme: Theme) {
+    if document.lines.is_empty() || width < 2 {
+        pad_card_lines(document, 0, width);
+        return;
+    }
+
+    let border_style = Style::default().fg(theme.border).bg(theme.root_bg);
+    let content_width = width.saturating_sub(1);
+    let line_count = document.lines.len();
+    for line in document.lines.iter_mut().take(line_count) {
+        if let Some(first) = line.spans.first_mut()
+            && first.text == surface::ACCENT_BAR_GLYPH
+        {
+            first.text = "│".into();
+            first.style = border_style;
+        } else {
+            line.spans
+                .insert(0, RenderSpan::decoration("│", border_style));
+        }
+
+        let used = line
+            .spans
+            .iter()
+            .map(|span| display_width(&span.text))
+            .sum::<usize>();
+        if content_width > used {
+            let style = line.spans.last().map(|span| span.style).unwrap_or_default();
+            line.spans.push(RenderSpan::decoration(
+                " ".repeat(content_width - used),
+                style,
+            ));
+        }
+        line.spans.push(RenderSpan::decoration("│", border_style));
+    }
+
+    let previous_final_break = document.breaks.last().copied().unwrap_or(Break::End);
+    if let Some(boundary) = document.breaks.last_mut() {
+        *boundary = Break::BlockBreak;
+    }
+    document.lines.insert(
+        0,
+        RenderLine {
+            spans: vec![RenderSpan::decoration(
+                format!("┌{}┐", "─".repeat(width.saturating_sub(2))),
+                border_style,
+            )],
+        },
+    );
+    document.breaks.insert(0, Break::HardBreak);
+    document.lines.push(RenderLine {
+        spans: vec![RenderSpan::decoration(
+            format!("└{}┘", "─".repeat(width.saturating_sub(2))),
+            border_style,
+        )],
+    });
+    document.breaks.push(previous_final_break);
+}
+
+fn frame_user_card_lines(document: &mut Document<Style>, start: usize, width: usize, theme: Theme) {
+    if !theme.card_frame || width < 3 {
+        return;
+    }
+
+    let Some(end) = document.lines.len().checked_sub(1) else {
+        return;
+    };
+    if start > end {
+        return;
+    }
+
+    let border_style = Style::default().fg(theme.border).bg(theme.root_bg);
+    let horizontal = "─".repeat(width.saturating_sub(2));
+    let top = RenderLine {
+        spans: vec![RenderSpan::decoration(
+            format!("┌{horizontal}┐"),
+            border_style,
+        )],
+    };
+    let bottom = RenderLine {
+        spans: vec![RenderSpan::decoration(
+            format!("└{horizontal}┘"),
+            border_style,
+        )],
+    };
+    document.lines[start] = top;
+    document.lines[end] = bottom;
 }
 
 /// Full-width drawn divider (box-drawing line), not a character label string.
@@ -1443,6 +1544,7 @@ fn build_user_message(
     width: usize,
 ) {
     let text = message_text(message);
+    let card_start = out.document.lines.len();
     let content_width = width.saturating_sub(5).max(1);
 
     // 整段 text 一次 wrap，得到每个视觉行对应原文的字符区间。
@@ -1451,6 +1553,10 @@ fn build_user_message(
 
     // 顶部空 card 行（decoration）
     push_user_card_line_into(out, "", None, width, theme, None);
+    if theme.card_frame {
+        push_user_card_line_into(out, "", None, width, theme, None);
+        push_user_card_line_into(out, "", None, width, theme, None);
+    }
 
     // 内容行：每个 chunk 一行
     let mut pushed = false;
@@ -1543,6 +1649,11 @@ fn build_user_message(
 
     // 底部空 card 行（decoration）
     push_user_card_line_into(out, "", None, width, theme, None);
+    if theme.card_frame {
+        push_user_card_line_into(out, "", None, width, theme, None);
+        push_user_card_line_into(out, "", None, width, theme, None);
+    }
+    frame_user_card_lines(&mut out.document, card_start, width, theme);
 }
 
 /// 与 `push_user_card_line` 等价的构造，并同时记录 Span 级来源。
@@ -1595,16 +1706,26 @@ fn push_user_card_content_line_into(
     theme: Theme,
     boundary: Break,
 ) {
-    let bar_style = surface::accent_style(
-        theme,
-        surface::SurfaceEmphasis::User,
-        surface::SurfaceKind::Root,
-    );
+    let framed = theme.card_frame && width >= 3;
+    let bar_style = if framed {
+        Style::default().fg(theme.border).bg(theme.root_bg)
+    } else {
+        surface::accent_style(
+            theme,
+            surface::SurfaceEmphasis::User,
+            surface::SurfaceKind::Root,
+        )
+    };
     let pad_style = user_prompt_padding_style(theme);
     let badge_style = queued_badge_style(theme);
+    let left_edge = if framed {
+        "│"
+    } else {
+        surface::ACCENT_BAR_GLYPH
+    };
 
     let mut spans = vec![
-        RenderSpan::decoration(surface::ACCENT_BAR_GLYPH, bar_style),
+        RenderSpan::decoration(left_edge, bar_style),
         RenderSpan::decoration("  ", pad_style),
     ];
 
@@ -1619,10 +1740,20 @@ fn push_user_card_content_line_into(
     spans.extend(content_spans.into_iter().map(|(span, _)| span));
 
     let used = spans.iter().map(|span| display_width(&span.text)).sum();
-    if width > used {
-        spans.push(RenderSpan::decoration(" ".repeat(width - used), pad_style));
-    } else {
+    let target_width = width.saturating_sub(usize::from(framed));
+    if target_width > used {
+        spans.push(RenderSpan::decoration(
+            " ".repeat(target_width - used),
+            pad_style,
+        ));
+    } else if !framed {
         spans.push(RenderSpan::decoration("  ", pad_style));
+    }
+    if framed {
+        spans.push(RenderSpan::decoration(
+            "│",
+            Style::default().fg(theme.border).bg(theme.root_bg),
+        ));
     }
 
     out.push_line(
@@ -1655,9 +1786,10 @@ fn build_assistant_message_lines(
             structured_subagent::render_structured_subagent_result_document(
                 &result,
                 theme,
-                card_content_width(width),
+                card_content_width(width, theme),
             ),
             width,
+            theme,
         ));
         return;
     }
@@ -1680,8 +1812,28 @@ fn build_assistant_message_lines(
     out.document.append(document);
 }
 
-fn append_card_document(out: &mut TimelineDocument, document: Document<Style>, width: usize) {
-    out.document.append(pad_card_document(document, width));
+fn append_card_document(
+    out: &mut TimelineDocument,
+    document: Document<Style>,
+    width: usize,
+    theme: Theme,
+) {
+    out.document
+        .append(pad_card_document(document, width, theme));
+}
+
+fn append_tool_document(
+    out: &mut TimelineDocument,
+    mut document: Document<Style>,
+    width: usize,
+    theme: Theme,
+) {
+    if theme.card_frame && document.lines.len() <= 1 {
+        pad_card_lines(&mut document, 0, width);
+        out.document.append(document);
+    } else {
+        append_card_document(out, document, width, theme);
+    }
 }
 
 fn build_tool_lines(
@@ -1693,17 +1845,18 @@ fn build_tool_lines(
     expanded_output: bool,
     translator: &Translator,
 ) {
-    append_card_document(
+    append_tool_document(
         out,
         tool_card::render_tool_card_document(
             tool,
             theme,
-            card_content_width(width),
+            card_content_width(width, theme),
             frame,
             expanded_output,
             translator,
         ),
         width,
+        theme,
     );
 }
 
@@ -1715,8 +1868,9 @@ fn build_todo_card(
 ) {
     append_card_document(
         out,
-        todo_card::render_todo_card_document(todo, theme, card_content_width(width)),
+        todo_card::render_todo_card_document(todo, theme, card_content_width(width, theme)),
         width,
+        theme,
     );
 }
 
@@ -1732,9 +1886,10 @@ fn build_permission_lines(
             tool_card::render_permission_card_document(
                 permission,
                 theme,
-                card_content_width(width),
+                card_content_width(width, theme),
             ),
             width,
+            theme,
         );
     }
 }
@@ -1749,7 +1904,7 @@ fn build_auto_review_lines(
     expanded: bool,
 ) {
     let card_width = width;
-    let width = card_content_width(width);
+    let width = card_content_width(width, theme);
     let content_width = width.saturating_sub(display_width(AUTO_REVIEW_INDENT));
     if content_width == 0 {
         return;
@@ -1837,7 +1992,7 @@ fn push_auto_review_text(
 
 fn build_error_lines(out: &mut TimelineDocument, error: &ErrorView, theme: Theme, width: usize) {
     let card_width = width;
-    let width = card_content_width(width);
+    let width = card_content_width(width, theme);
     if width == 0 {
         return;
     }
@@ -4182,6 +4337,34 @@ mod tests {
     }
 
     #[test]
+    fn wireframe_user_card_has_a_continuous_box() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("hello")));
+
+        let lines = transcript_lines(&state, Theme::wireframe(), 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let top = lines
+            .iter()
+            .position(|line| line.starts_with('┌') && line.ends_with('┐'))
+            .expect("top border");
+        let content = lines
+            .iter()
+            .position(|line| line.contains("hello"))
+            .expect("message content");
+        let bottom = lines
+            .iter()
+            .position(|line| line.starts_with('└') && line.ends_with('┘'))
+            .expect("bottom border");
+
+        assert_eq!(content - top, 3, "{lines:?}");
+        assert_eq!(bottom - content, 3, "{lines:?}");
+        assert!(lines[content].starts_with('│') && lines[content].ends_with('│'));
+    }
+
+    #[test]
     fn queued_user_message_renders_badge() {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::UserMessage(UserMessageEvent::queued(
@@ -4319,6 +4502,43 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("image 2") && line.contains("diagram.png")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn wireframe_todo_card_has_a_continuous_box() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+            TodoItem {
+                id: "t1".into(),
+                content: "Draw the card boundary".into(),
+                status: TodoStatus::InProgress,
+            },
+        ])));
+
+        let theme = Theme::for_name(ThemeName::Wireframe, 0, None);
+        let lines = transcript_lines(&state, theme, 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with('┌') && line.ends_with('┐')),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with('└') && line.ends_with('┘')),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("# Todos")
+                && line.starts_with('│')
+                && line.ends_with('│')),
             "{lines:?}"
         );
     }

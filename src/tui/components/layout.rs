@@ -243,6 +243,7 @@ pub fn workspace_metrics(
     has_question: bool,
     is_read_only_child_view: bool,
     slash_panel_height: u16,
+    card_frame: bool,
 ) -> WorkspaceLayoutMetrics {
     let slash_panel_height = if has_permission || has_question {
         0
@@ -258,6 +259,13 @@ pub fn workspace_metrics(
     } else {
         composer_height(area.height, input, tokens, area.width as usize)
             .min(area.height.saturating_sub(1))
+    };
+    let composer_height = if card_frame && composer_height > 0 {
+        composer_height
+            .saturating_add(1)
+            .min(area.height.saturating_sub(1))
+    } else {
+        composer_height
     };
     let gap_height = if area.height >= 7 {
         surface::CONTENT_GAP
@@ -316,7 +324,7 @@ mod tests {
     #[test]
     fn pending_permission_uses_composer_takeover_height() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "", &[], true, false, false, 0);
+        let metrics = workspace_metrics(area, "", &[], true, false, false, 0, false);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -332,7 +340,7 @@ mod tests {
     #[test]
     fn pending_question_uses_bottom_panel_height_and_hides_slash_panel() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "/per", &[], false, true, false, 4);
+        let metrics = workspace_metrics(area, "/per", &[], false, true, false, 4, false);
 
         let [_transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -347,7 +355,7 @@ mod tests {
     fn question_layout_never_overflows_short_workspaces() {
         for height in 7..=10 {
             let area = Rect::new(0, 0, 80, height);
-            let metrics = workspace_metrics(area, "", &[], false, true, false, 0);
+            let metrics = workspace_metrics(area, "", &[], false, true, false, 0, false);
             let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
             assert!(composer.height + gap.height + footer.height <= area.height);
@@ -375,7 +383,7 @@ mod tests {
     fn height_seven_terminal_keeps_question_composer_above_the_global_footer() {
         let terminal = Rect::new(0, 0, 80, 7);
         let workspace = workspace_area(terminal);
-        let metrics = workspace_metrics(workspace, "", &[], false, true, false, 0);
+        let metrics = workspace_metrics(workspace, "", &[], false, true, false, 0, false);
         let [_transcript, _gap, _slash, composer, footer] =
             split_workspace_layout(workspace, metrics);
 
@@ -385,9 +393,40 @@ mod tests {
     }
 
     #[test]
+    fn wireframe_composer_reserves_an_extra_row_for_card_spacing() {
+        let area = Rect::new(0, 0, 80, 12);
+        let plain = workspace_metrics(area, "", &[], false, false, false, 0, false);
+        let wireframe = workspace_metrics(area, "", &[], false, false, false, 0, true);
+
+        assert_eq!(wireframe.composer_height, plain.composer_height + 1);
+        assert_eq!(
+            wireframe.transcript_viewport_height,
+            plain.transcript_viewport_height - 1
+        );
+    }
+
+    #[test]
     fn child_read_only_composer_grows_only_when_a_transcript_row_remains() {
-        let compact = workspace_metrics(Rect::new(0, 0, 80, 7), "", &[], false, false, true, 0);
-        let centered = workspace_metrics(Rect::new(0, 0, 80, 8), "", &[], false, false, true, 0);
+        let compact = workspace_metrics(
+            Rect::new(0, 0, 80, 7),
+            "",
+            &[],
+            false,
+            false,
+            true,
+            0,
+            false,
+        );
+        let centered = workspace_metrics(
+            Rect::new(0, 0, 80, 8),
+            "",
+            &[],
+            false,
+            false,
+            true,
+            0,
+            false,
+        );
 
         assert_eq!(compact.composer_height, 4);
         assert_eq!(compact.transcript_viewport_height, 1);

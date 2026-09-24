@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 
@@ -35,7 +35,11 @@ pub fn render_picker(
     frame.render_widget(Clear, picker_area);
     frame.render_widget(Block::default().style(theme.elevated_style()), picker_area);
 
-    let inner = picker_area.inner(Margin::new(3, 2));
+    let inner = if theme.card_frame {
+        picker_area.inner(Margin::new(2, 1))
+    } else {
+        picker_area.inner(Margin::new(3, 2))
+    };
     if inner.is_empty() {
         return;
     }
@@ -127,6 +131,43 @@ pub fn render_picker(
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
     }
+
+    render_three_sided_frame(frame, picker_area, theme);
+}
+
+fn render_three_sided_frame(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+    if !theme.card_frame || area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let style = Style::default().fg(theme.border).bg(theme.root_bg);
+    let horizontal = "─".repeat(area.width.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("┌{horizontal}┐"), style))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let side_lines = (0..area.height.saturating_sub(2))
+        .map(|_| Line::from(Span::styled("│", style)))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(Text::from(side_lines.clone())),
+        Rect::new(area.x, area.y + 1, 1, area.height.saturating_sub(2)),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(side_lines)),
+        Rect::new(
+            area.right().saturating_sub(1),
+            area.y + 1,
+            1,
+            area.height.saturating_sub(2),
+        ),
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("└{horizontal}┘"), style))),
+        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+    );
 }
 
 fn mcp_tools_description(dialog: &DialogState) -> Option<&str> {

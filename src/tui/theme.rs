@@ -17,6 +17,7 @@ pub struct Theme {
     pub surface_bg: Color,
     pub element_bg: Color,
     pub elevated_bg: Color,
+    pub card_frame: bool,
     pub border: Color,
     pub text: Color,
     pub muted_text: Color,
@@ -43,6 +44,7 @@ impl Theme {
             surface_bg: Color::Rgb(24, 24, 26),
             element_bg: Color::Rgb(30, 30, 32),
             elevated_bg: Color::Rgb(38, 38, 40),
+            card_frame: false,
             border: Color::Rgb(50, 50, 54),
             text: Color::Rgb(220, 220, 220),
             muted_text: Color::Rgb(130, 130, 130),
@@ -97,6 +99,29 @@ impl Theme {
         theme
     }
 
+    pub const fn wireframe() -> Self {
+        let mut theme = Self::glass();
+        theme.card_frame = true;
+        theme.border = Color::Rgb(0x70, 0x80, 0x9a);
+        theme.text = Color::Rgb(0xde, 0xe7, 0xf2);
+        theme.muted_text = Color::Rgb(0x9b, 0xa8, 0xbb);
+        theme.dim_text = Color::Rgb(0x66, 0x73, 0x88);
+        theme.on_accent = Color::Rgb(0x11, 0x18, 0x21);
+        theme.accent = Color::Rgb(0x84, 0xc8, 0xff);
+        theme.assistant = Color::Rgb(0x8b, 0xd7, 0xaa);
+        theme.user = Color::Rgb(0x8c, 0xca, 0xff);
+        theme.success = Color::Rgb(0x8e, 0xd9, 0xa6);
+        theme.warning = Color::Rgb(0xe2, 0xc1, 0x77);
+        theme.error = Color::Rgb(0xf0, 0x8b, 0x92);
+        theme.approval = Color::Rgb(0xe9, 0xc2, 0x71);
+        theme.notice = Color::Rgb(0x9a, 0xc9, 0xda);
+        theme.fake = Color::Rgb(0xd8, 0xa1, 0xed);
+        theme.diff_add_bg = Color::Reset;
+        theme.diff_delete_bg = Color::Reset;
+        theme.diff_hunk_bg = Color::Reset;
+        theme
+    }
+
     pub const fn paints_panels(self) -> bool {
         !matches!(self.element_bg, Color::Reset)
     }
@@ -106,6 +131,7 @@ impl Theme {
             ThemeName::Dark => Self::dark(),
             ThemeName::Plain => Self::plain_for(terminal_bg),
             ThemeName::Glass => Self::glass(),
+            ThemeName::Wireframe => Self::wireframe(),
             ThemeName::Rainbow => Self::dark().with_rainbow_accent(frame),
         }
     }
@@ -293,8 +319,22 @@ mod tests {
         ] {
             assert_eq!(surface, Color::Reset);
         }
+        assert!(!glass.card_frame);
         assert!(!glass.paints_panels());
         assert!(Theme::plain_for(None).paints_panels());
+    }
+
+    #[test]
+    fn wireframe_theme_keeps_transparent_surfaces_and_enables_card_frames() {
+        let wireframe = Theme::for_name(ThemeName::Wireframe, 0, None);
+
+        assert!(wireframe.card_frame);
+        assert_eq!(wireframe.root_bg, Color::Reset);
+        assert_eq!(wireframe.element_bg, Color::Reset);
+        assert_eq!(wireframe.border, Color::Rgb(0x70, 0x80, 0x9a));
+        assert_eq!(wireframe.diff_add_bg, Color::Reset);
+        assert_eq!(wireframe.diff_delete_bg, Color::Reset);
+        assert_eq!(wireframe.diff_hunk_bg, Color::Reset);
     }
 
     #[test]

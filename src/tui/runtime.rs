@@ -3080,6 +3080,11 @@ impl TuiRuntime {
                 Some(self.state.t("runtime.theme_glass_desc")),
             ),
             DialogItem::new(
+                "wireframe",
+                "Wireframe",
+                Some(self.state.t("runtime.theme_wireframe_desc")),
+            ),
+            DialogItem::new(
                 "rainbow",
                 "Rainbow",
                 Some(self.state.t("runtime.theme_rainbow_desc")),

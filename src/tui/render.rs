@@ -118,6 +118,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         state.pending_question.is_some(),
         state.is_read_only_child_view(),
         layout::slash_panel_height(state),
+        theme.card_frame,
     );
     if let Some(question) = state.pending_question.as_ref() {
         metrics.composer_height = question_composer_height(question, workspace);
@@ -1075,6 +1076,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, the
         &state.composer_tokens,
         prompt_width as usize,
     )
+    .saturating_add(u16::from(theme.card_frame))
     .clamp(1, content_area.height);
     let slash_height =
         layout::slash_panel_height(state).min(content_area.height.saturating_sub(prompt_height));
@@ -1458,7 +1460,7 @@ mod tests {
 
         let rows = draw_rows(&mut state, 100, 24);
         let workspace = layout::workspace_area(Rect::new(0, 0, 100, 24));
-        let metrics = layout::workspace_metrics(workspace, "", &[], false, false, true, 0);
+        let metrics = layout::workspace_metrics(workspace, "", &[], false, false, true, 0, false);
         let [_transcript, _gap, _slash, composer, footer] =
             layout::split_workspace_layout(workspace, metrics);
         let surface_center = composer.y + composer.height.saturating_sub(1) / 2;
