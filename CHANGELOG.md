@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `wireframe` 主题，采用透明卡片与矩形边框风格。
+- Jev 审批后端支持在 `[providers.<name>.endpoints.jev]`（或别名 `[endpoints.reviewer]`）下配置自定义端点路径（缺省为 `/v1/systemone`），自动处理基础 URL 规范化。
+
+### Fixed
+
+- 修复后台项目记忆提取在未推进的记录节点上连续失败时无休止重试的问题，增加递增延迟退避并在连续失败 8 次后暂停，待会话产生新记录后再恢复。
+- 识别 `server_is_overloaded` 为可重试错误；GPT 模型遇到该错误时改为按配置的固定初始间隔重试，避免指数退避导致等待过久。
+
 ## [0.16.1] - 2026-09-22
 
 ### Fixed
