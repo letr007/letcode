@@ -906,8 +906,7 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         | CommandIntent::Redo
         | CommandIntent::Resume(_)
         | CommandIntent::NewSession
-        | CommandIntent::Child(_)
-        | CommandIntent::Parent => unreachable!(
+        | CommandIntent::Child(_) => unreachable!(
             "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
         ),
     }
@@ -946,11 +945,8 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
         SessionCommand::DelegateSubagent { .. } => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),
-        SessionCommand::ViewChild { .. } => ReplCommand::Unsupported(
-            "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
-        ),
-        SessionCommand::ViewParent => ReplCommand::Unsupported(
-            "CLI does not support /parent yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
+        SessionCommand::ViewChild { .. } | SessionCommand::ViewParent => ReplCommand::Unsupported(
+            "CLI does not support /child yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
         ),
         SessionCommand::ToggleMcpServer(_) | SessionCommand::Interrupt => ReplCommand::Unsupported(
             "CLI does not support this session command yet; use the TUI.".into(),

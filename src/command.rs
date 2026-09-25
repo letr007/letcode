@@ -16,6 +16,7 @@ pub struct CommandMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildNavigation {
+    Toggle,
     First,
     Next,
     Prev,
@@ -169,7 +170,6 @@ pub enum CommandIntent {
     McpBrowse,
     SkillBrowse,
     Child(ChildNavigation),
-    Parent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,25 +497,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/child",
         insert_text: "/child",
         description_key: "command.child",
-        usage: "/child <first|next|prev>",
-        visible_in_slash: true,
-        visible_in_help: true,
-        visible_in_summary: true,
-    },
-    CommandMetadata {
-        name: "/children",
-        insert_text: "/children",
-        description_key: "command.children",
-        usage: "/children <first|next|prev>",
-        visible_in_slash: true,
-        visible_in_help: true,
-        visible_in_summary: false,
-    },
-    CommandMetadata {
-        name: "/parent",
-        insert_text: "/parent",
-        description_key: "command.parent",
-        usage: "/parent",
+        usage: "/child [first|next|prev]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -552,7 +534,6 @@ pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
         "/mcp",
         "/skill",
         "/child",
-        "/parent",
     ]
     .join(", ");
     translator.t_fmt(
@@ -621,8 +602,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/context" => expect_no_extra_args(&parts, "/context", CommandIntent::ContextBrowse),
         "/mcp" => expect_no_extra_args(&parts, "/mcp", CommandIntent::McpBrowse),
         "/skill" => expect_no_extra_args(&parts, "/skill", CommandIntent::SkillBrowse),
-        "/child" | "/children" => parse_child_navigation(&parts),
-        "/parent" => expect_no_extra_args(&parts, "/parent", CommandIntent::Parent),
+        "/child" => parse_child_navigation(&parts),
         _ => Err(CommandParseError::unknown_command(parts[0])),
     }
 }
@@ -856,8 +836,8 @@ fn parse_delegate_command(input: &str) -> Result<CommandIntent, CommandParseErro
 
 fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     match parts {
-        ["/child"] | ["/children"] => Ok(CommandIntent::Child(ChildNavigation::First)),
-        ["/child", value] | ["/children", value] => match value.to_ascii_lowercase().as_str() {
+        ["/child"] => Ok(CommandIntent::Child(ChildNavigation::Toggle)),
+        ["/child", value] => match value.to_ascii_lowercase().as_str() {
             "first" => Ok(CommandIntent::Child(ChildNavigation::First)),
             "next" => Ok(CommandIntent::Child(ChildNavigation::Next)),
             "prev" | "previous" => Ok(CommandIntent::Child(ChildNavigation::Prev)),
@@ -866,8 +846,7 @@ fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseE
                 [("value", other)],
             )),
         },
-        ["/child", ..] => Err(CommandParseError::new("Usage: /child <first|next|prev>")),
-        ["/children", ..] => Err(CommandParseError::new("Usage: /children <first|next|prev>")),
+        ["/child", ..] => Err(CommandParseError::new("Usage: /child [first|next|prev]")),
         _ => unreachable!(),
     }
 }
@@ -1074,6 +1053,34 @@ mod tests {
             Err(CommandParseError::new(
                 "Unknown command: /fixer. Type /help for available local commands."
             ))
+        );
+        assert_eq!(
+            parse_command("/child"),
+            Ok(CommandIntent::Child(ChildNavigation::Toggle))
+        );
+        assert_eq!(
+            parse_command("/child first"),
+            Ok(CommandIntent::Child(ChildNavigation::First))
+        );
+        assert_eq!(
+            parse_command("/child next"),
+            Ok(CommandIntent::Child(ChildNavigation::Next))
+        );
+        assert_eq!(
+            parse_command("/child prev"),
+            Ok(CommandIntent::Child(ChildNavigation::Prev))
+        );
+        assert_eq!(
+            parse_command("/child previous"),
+            Ok(CommandIntent::Child(ChildNavigation::Prev))
+        );
+        assert_eq!(
+            parse_command("/children"),
+            Err(CommandParseError::unknown_command("/children"))
+        );
+        assert_eq!(
+            parse_command("/parent"),
+            Err(CommandParseError::unknown_command("/parent"))
         );
         assert_eq!(
             parse_command("/child sideways"),

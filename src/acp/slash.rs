@@ -274,8 +274,6 @@ mod tests {
             "/mcp",
             "/skill",
             "/child next",
-            "/children first",
-            "/parent",
         ] {
             assert!(
                 matches!(request(text), SlashRequest::Rejected(ref message) if message.ends_with("is not available over ACP")),

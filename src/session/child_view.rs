@@ -56,7 +56,7 @@ pub fn select_child_navigation_index(
             .position(|child| child.child_session_id == child_session_id)
     });
     Some(match navigation {
-        ChildNavigation::First => 0,
+        ChildNavigation::Toggle | ChildNavigation::First => 0,
         ChildNavigation::Next => current_index
             .map(|index| (index + 1) % children.len())
             .unwrap_or(0),

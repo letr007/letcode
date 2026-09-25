@@ -97,7 +97,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(commands.contains(&"/child"));
-        assert!(commands.contains(&"/children"));
-        assert!(commands.contains(&"/parent"));
+        assert!(!commands.contains(&"/children"));
+        assert!(!commands.contains(&"/parent"));
     }
 }

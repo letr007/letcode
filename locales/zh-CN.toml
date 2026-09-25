@@ -22,9 +22,7 @@ new = "开始新会话"
 context = "浏览上下文详情"
 mcp = "浏览 MCP 工具"
 skill = "浏览本地技能"
-child = "查看子代理 transcript"
-children = "查看子代理 transcripts"
-parent = "返回父级 transcript"
+child = "切换子代理视图"
 
 [expert]
 explorer = "委派只读探索任务"

@@ -6883,3 +6883,70 @@ fn switch_cost_measure() {
         );
     }
 }
+
+#[test]
+fn child_command_toggles_between_child_and_parent_views() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("/child");
+    let cmd = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("submit /child in parent view");
+    assert_eq!(
+        cmd,
+        Some(RuntimeCommand::ViewChild {
+            navigation: crate::command::ChildNavigation::First,
+            anchor_child_session_id: None,
+        })
+    );
+
+    // Switch to child view
+    runtime.state_mut().replace_child_timeline_from_records(
+        &[],
+        "parent-session",
+        "child-session",
+        "explorer",
+        0,
+        1,
+        1,
+    );
+    assert!(runtime.state().transcript_view.is_child());
+
+    // Submitting /child while in child view toggles back to parent view
+    runtime.state_mut().set_input("/child");
+    let cmd = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("submit /child in child view");
+    assert_eq!(cmd, Some(RuntimeCommand::ViewParent));
+    assert!(!runtime.state().transcript_view.is_child());
+
+    // Switch back to child view and test /child next
+    runtime.state_mut().replace_child_timeline_from_records(
+        &[],
+        "parent-session",
+        "child-session",
+        "explorer",
+        0,
+        1,
+        1,
+    );
+    assert!(runtime.state().transcript_view.is_child());
+    runtime.state_mut().set_input("/child next");
+    let cmd = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("submit /child next");
+    assert_eq!(
+        cmd,
+        Some(RuntimeCommand::ViewChild {
+            navigation: crate::command::ChildNavigation::Next,
+            anchor_child_session_id: None,
+        })
+    );
+
+    // Test /child toggles back to parent view again
+    runtime.state_mut().set_input("/child");
+    let cmd = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("submit /child toggle to parent");
+    assert_eq!(cmd, Some(RuntimeCommand::ViewParent));
+    assert!(!runtime.state().transcript_view.is_child());
+}

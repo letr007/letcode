@@ -2782,8 +2782,7 @@ impl TuiRuntime {
             | CommandIntent::Redo
             | CommandIntent::Resume(_)
             | CommandIntent::NewSession
-            | CommandIntent::Child(_)
-            | CommandIntent::Parent => unreachable!(
+            | CommandIntent::Child(_) => unreachable!(
                 "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
             ),
         }
@@ -2851,10 +2850,24 @@ impl TuiRuntime {
             SessionCommand::ViewChild {
                 navigation,
                 anchor_child_session_id,
-            } => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewChild {
-                navigation,
-                anchor_child_session_id,
-            }))),
+            } => {
+                if navigation == SharedChildNavigation::Toggle
+                    && self.state.transcript_view.is_child()
+                {
+                    self.state.restore_parent_timeline_view();
+                    Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
+                } else {
+                    let navigation = if navigation == SharedChildNavigation::Toggle {
+                        SharedChildNavigation::First
+                    } else {
+                        navigation
+                    };
+                    Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewChild {
+                        navigation,
+                        anchor_child_session_id,
+                    })))
+                }
+            }
             SessionCommand::ViewParent => {
                 if self.state.transcript_view.is_child() {
                     self.state.restore_parent_timeline_view();
@@ -4401,8 +4414,6 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/exit"
             | "/quit"
             | "/child"
-            | "/children"
-            | "/parent"
             | "/thoughts"
             | "/tools"
             | "/tool-output"

@@ -119,7 +119,6 @@ impl SessionCommand {
                 navigation: nav,
                 anchor_child_session_id: None,
             }),
-            CommandIntent::Parent => Some(Self::ViewParent),
             CommandIntent::PermissionSet(mode) => Some(Self::SetPermissionMode(mode)),
             CommandIntent::ModelSet(model) => Some(Self::SetModel(model)),
             CommandIntent::FastToggle => Some(Self::ToggleFastMode),

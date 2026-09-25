@@ -22,9 +22,7 @@ new = "Start a new session"
 context = "Browse context details"
 mcp = "Browse MCP tools"
 skill = "Browse local skills"
-child = "View child subagent transcript"
-children = "View child subagent transcripts"
-parent = "Return to parent transcript"
+child = "Toggle child subagent view"
 
 [expert]
 explorer = "Delegate a read-only exploration task"

@@ -841,15 +841,15 @@ where
                         navigation,
                         anchor_child_session_id,
                     } => {
-                        *visible_child_session_id =
-                            crate::session::SessionCoordinator::emit_view_child(
-                                &transcript,
-                                session_transport_tx,
-                                Some(sessions_dir),
-                                navigation,
-                                anchor_child_session_id.as_deref(),
-                            );
-                        *visible_child_view_state = None;
+                        apply_engine_view_child(
+                            &transcript,
+                            session_transport_tx,
+                            Some(sessions_dir),
+                            navigation,
+                            anchor_child_session_id.as_deref(),
+                            visible_child_session_id,
+                            visible_child_view_state,
+                        );
                     }
                     ManualCompactionNavigation::ViewParent => {
                         crate::session::SessionCoordinator::emit_view_parent(
@@ -1000,6 +1000,39 @@ pub(crate) struct VisibleChildViewState {
     record_count: usize,
     index: usize,
     total: usize,
+}
+
+fn apply_engine_view_child(
+    transcript: &std::sync::Arc<std::sync::Mutex<crate::transcript::TranscriptRecorder>>,
+    session_transport_tx: &tokio::sync::mpsc::UnboundedSender<crate::session::SessionTransportEvent>,
+    sessions_dir: Option<&std::path::Path>,
+    navigation: crate::command::ChildNavigation,
+    anchor_child_session_id: Option<&str>,
+    visible_child_session_id: &mut Option<String>,
+    visible_child_view_state: &mut Option<VisibleChildViewState>,
+) {
+    if navigation == crate::command::ChildNavigation::Toggle && visible_child_session_id.is_some() {
+        crate::session::SessionCoordinator::emit_view_parent(
+            transcript,
+            session_transport_tx,
+            sessions_dir,
+        );
+        *visible_child_session_id = None;
+        *visible_child_view_state = None;
+    } else {
+        let effective_nav = match navigation {
+            crate::command::ChildNavigation::Toggle => crate::command::ChildNavigation::First,
+            other => other,
+        };
+        *visible_child_session_id = crate::session::SessionCoordinator::emit_view_child(
+            transcript,
+            session_transport_tx,
+            sessions_dir,
+            effective_nav,
+            anchor_child_session_id,
+        );
+        *visible_child_view_state = None;
+    }
 }
 
 /// Size and modification time of a journal file, read without opening it.
@@ -1654,23 +1687,16 @@ async fn run_engine_loop(
                 }
 
                 if let Some(session_command) = session_engine_command_as_idle_session_command(&command) {
-                    if let SessionEngineCommand::ViewChild { .. } = &command {
-                        visible_child_session_id = crate::session::SessionCoordinator::emit_view_child(
+                    if let SessionEngineCommand::ViewChild { navigation, anchor_child_session_id } = &command {
+                        apply_engine_view_child(
                             &transcript,
                             &session_transport_tx,
                             Some(sessions_dir.as_path()),
-                            match &command {
-                                SessionEngineCommand::ViewChild { navigation, .. } => *navigation,
-                                _ => unreachable!("view-child command was matched above"),
-                            },
-                            match &command {
-                                SessionEngineCommand::ViewChild { anchor_child_session_id, .. } => {
-                                    anchor_child_session_id.as_deref()
-                                }
-                                _ => unreachable!("view-child command was matched above"),
-                            },
+                            *navigation,
+                            anchor_child_session_id.as_deref(),
+                            &mut visible_child_session_id,
+                            &mut visible_child_view_state,
                         );
-                        visible_child_view_state = None;
                     } else {
                         let history_navigation = matches!(
                             command,
@@ -2158,15 +2184,15 @@ async fn run_engine_loop(
                                             anchor_child_session_id,
                                         },
                                     )) => {
-                                        visible_child_session_id =
-                                            crate::session::SessionCoordinator::emit_view_child(
-                                                &transcript,
-                                                &session_transport_tx,
-                                                Some(sessions_dir.as_path()),
-                                                navigation,
-                                                anchor_child_session_id.as_deref(),
-                                            );
-                                        visible_child_view_state = None;
+                                        apply_engine_view_child(
+                                            &transcript,
+                                            &session_transport_tx,
+                                            Some(sessions_dir.as_path()),
+                                            navigation,
+                                            anchor_child_session_id.as_deref(),
+                                            &mut visible_child_session_id,
+                                            &mut visible_child_view_state,
+                                        );
                                     }
                                     ActiveSessionOperation::Command(Some(
                                         SessionEngineCommand::ViewParent,
@@ -2864,15 +2890,15 @@ async fn run_engine_loop(
                                     navigation,
                                     anchor_child_session_id,
                                 }) => {
-                                    visible_child_session_id =
-                                        crate::session::SessionCoordinator::emit_view_child(
-                                            &transcript,
-                                            &session_transport_tx,
-                                            Some(sessions_dir.as_path()),
-                                            navigation,
-                                            anchor_child_session_id.as_deref(),
-                                        );
-                                    visible_child_view_state = None;
+                                    apply_engine_view_child(
+                                        &transcript,
+                                        &session_transport_tx,
+                                        Some(sessions_dir.as_path()),
+                                        navigation,
+                                        anchor_child_session_id.as_deref(),
+                                        &mut visible_child_session_id,
+                                        &mut visible_child_view_state,
+                                    );
                                 }
                                 Some(SessionEngineCommand::ViewParent) => {
                                     crate::session::SessionCoordinator::emit_view_parent(

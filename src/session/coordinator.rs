@@ -264,6 +264,10 @@ impl SessionCoordinator {
                 navigation,
                 anchor_child_session_id,
             } => {
+                let navigation = match navigation {
+                    crate::command::ChildNavigation::Toggle => crate::command::ChildNavigation::First,
+                    other => other,
+                };
                 Self::emit_view_child(
                     transcript,
                     event_tx,
