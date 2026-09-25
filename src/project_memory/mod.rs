@@ -41,7 +41,7 @@ const CURATION_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Default)]
 pub(crate) struct MemoryWorker {
-    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    task: Option<tokio::task::JoinHandle<Result<bool>>>,
     last_curation: Option<std::time::Instant>,
 }
 
@@ -51,7 +51,9 @@ impl MemoryWorker {
             return Ok(());
         }
         if let Some(task) = self.task.take() {
-            task.await.context("project memory worker failed")??;
+            if task.await.context("project memory worker failed")?? {
+                self.last_curation = Some(std::time::Instant::now());
+            }
         }
         let Some(store) = configured_store()? else {
             return Ok(());
@@ -61,7 +63,6 @@ impl MemoryWorker {
             .last_curation
             .is_none_or(|last| last.elapsed() >= CURATION_INTERVAL);
         let curation = if curation_due {
-            self.last_curation = Some(std::time::Instant::now());
             Some(historian_child(
                 parent,
                 curate::CURATION_PROMPT,
@@ -121,7 +122,11 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
         .context("project memory worker join failed")?
 }
 
-async fn process_pending(store: MemoryStore, helper: Agent, curation: Option<Agent>) -> Result<()> {
+async fn process_pending(
+    store: MemoryStore,
+    helper: Agent,
+    curation: Option<Agent>,
+) -> Result<bool> {
     use fs4::fs_std::FileExt;
     let lock_path = store.worker_lock_path();
     let lock = blocking(move || {
@@ -139,7 +144,7 @@ async fn process_pending(store: MemoryStore, helper: Agent, curation: Option<Age
     })
     .await?;
     let Some(_lock) = lock else {
-        return Ok(());
+        return Ok(false);
     };
     let source_store = store.clone();
     let sources = blocking(move || source_store.sources()).await?;
@@ -204,13 +209,13 @@ async fn process_pending(store: MemoryStore, helper: Agent, curation: Option<Age
     if let Some(helper) = curation
         && batches == 0
     {
-        curate_pending(&store, helper).await;
+        return Ok(curate_pending(&store, helper).await);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// 巩固没有来源游标可推进，失败只记日志，下一次 tick 再试。
-async fn curate_pending(store: &MemoryStore, helper: Agent) {
+async fn curate_pending(store: &MemoryStore, helper: Agent) -> bool {
     let candidate_store = store.clone();
     let batch = match blocking(move || {
         let memories = candidate_store.known_memories(10_000)?;
@@ -221,11 +226,11 @@ async fn curate_pending(store: &MemoryStore, helper: Agent) {
         Ok(batch) => batch,
         Err(error) => {
             tracing::warn!(error = %error, "project memory curation could not read candidates");
-            return;
+            return false;
         }
     };
     let Some(batch) = batch else {
-        return;
+        return false;
     };
     let result = async {
         let (text, usage) = tokio::time::timeout(
@@ -249,7 +254,11 @@ async fn curate_pending(store: &MemoryStore, helper: Agent) {
     match result {
         Ok((changed, usage)) => {
             tracing::info!(changed, usage = ?usage, "project memory curation completed");
+            true
         }
-        Err(error) => tracing::warn!(error = %error, "project memory curation failed"),
+        Err(error) => {
+            tracing::warn!(error = %error, "project memory curation failed");
+            false
+        }
     }
 }
