@@ -1,12 +1,12 @@
 # Transcript
 
-Transcript 是按会话保存的 append-only JSON Lines journal。主会话文件为 `<session_id>.jsonl`，子代理会话位于 `children/<child_session_id>.jsonl`。`sessions-index.json` 是列表和发现用的派生索引，不是会话事实来源。
+Transcript 是按会话保存的只追加写入（append-only）JSON Lines 日志。主会话日志保存在 `<session_id>.jsonl`，子代理日志保存在 `children/<child_session_id>.jsonl`。`sessions-index.json` 是专供列表展示与快速发现的派生索引；会话的真实数据全部保存在各会话的 JSONL 日志中。
 
-当前写入使用 journal schema `2`。schema `1` envelope 可直接 resume：读取时会在内存中将 legacy assistant payload 规范化为 `AssistantTurn`，原文件不重写，后续追加使用 schema 2。无 envelope 的更早 legacy 记录仍只用于读取与发现。
+当前系统采用日志规范版本 schema 2 写入新记录。系统能够直接恢复采用 schema 1 封套的历史日志：在内存中将旧版助手输出规范化为 `AssistantTurn`，原有文件内容保持不变，后续追加写入自动升级为 schema 2。不带封套的更早版本日志仅用于离线读取与检索展示。
 
-## Record 结构
+## 记录结构与封套
 
-普通 journal 行由 `JournalRecordEnvelope`、`TranscriptRecord` 和 `TranscriptEvent` 扁平序列化为一个 JSON object：
+普通的日志记录行由封套结构 `JournalRecordEnvelope`、记录元数据 `TranscriptRecord` 与具体事件 `TranscriptEvent` 扁平化序列化为一个 JSON 对象：
 
 ```rust
 pub struct JournalRecordEnvelope {
@@ -30,7 +30,7 @@ pub struct TranscriptRecord {
 }
 ```
 
-`record` 和 `event` 都使用 `serde(flatten)`；事件使用 `kind` 作为 snake_case tag。因此实际 JSON 不包含嵌套的 `record` 或 `event` 字段：
+`record` 和 `event` 均通过 `serde(flatten)` 展开序列化，事件类型以 `kind` 字段作为标签。实际的 JSON 记录不包含嵌套的 `record` 或 `event` 外层键名：
 
 ```json
 {
@@ -49,13 +49,13 @@ pub struct TranscriptRecord {
 }
 ```
 
-`event_id` 固定为 `<session_id>:<sequence>`。`sequence` 在整个 session 内严格递增，`resulting_revision` 等于当前 sequence，`base_revision` 是前一个 revision。
+`event_id` 固定由 `<session_id>:<sequence>` 拼接生成。`sequence` 在单个会话内严格单调递增，`resulting_revision` 等同于当前序列号，`base_revision` 对应上一条记录的版本号。
 
-`scope` 只描述 journal envelope：record 带 `context_branch_id` 时为 `branch`，否则为 `global`。根 branch `main` 的普通内容不写 `context_branch_id`；branch topology、checkout 和其它全局 metadata 由事件 payload、关联 cursor 与 projection 规则解释，不能仅根据 `scope` 判断其内容归属。
+`scope` 字段标识封套层面的作用域：当记录包含 `context_branch_id` 时为 `branch`，否则为 `global`。默认主分支 `main` 的常规消息不单独标注分支 ID；分支拓扑、检出状态等元数据通过事件体、关联游标与投影规则解析。
 
-## AssistantTurn
+## 助手历史单元
 
-schema v2 使用统一的 assistant 历史单元：
+日志规范 schema 2 采用统一的数据结构保存助手回复：
 
 ```rust
 pub struct TranscriptAssistantTurn {
@@ -66,7 +66,7 @@ pub struct TranscriptAssistantTurn {
 }
 ```
 
-普通文本回复只写 `text`：
+常规纯文本回复仅写入 `text` 字段：
 
 ```json
 {
@@ -83,73 +83,75 @@ pub struct TranscriptAssistantTurn {
 }
 ```
 
-带工具调用的 turn 在 `calls` 中保存 `call_id`、工具名和 `arguments_json`。provider-native replay state 写入 `replay`，其中包含 namespace、payload version、producer identity 和 opaque payload；恢复时只有兼容的 protocol binding 可以使用该 replay。
+包含工具调用的回合会在 `calls` 数组中记录调用 ID、工具名称与 JSON 参数。服务商私有的重放状态保存在 `replay` 中，记录命名空间、格式版本和负载内容；只有兼容的协议绑定才能在恢复时使用该重放状态。
 
-`reasoning_message` 仍是当前事件，用于 timeline/audit 展示及可选的 `duration_ms`。`assistant_turn.reasoning_content` 和 `replay` 则属于可恢复的 assistant history。旧的 `assistant_message` 与 `assistant_tool_call_batch` 用于解码 schema 1；resume reader 和 v2 recorder 都会将它们规范化为 `assistant_turn`，而 schema 2 文件若直接包含旧 assistant payload 仍视为无效。
+`reasoning_message` 作为独立事件派发，用于时间线展示与耗时统计。`assistant_turn.reasoning_content` 和 `replay` 则作为助手历史的一部分持久化。旧版的 `assistant_message` 与 `assistant_tool_call_batch` 用于兼容解码旧日志；恢复读取器与 v2 记录器均会将它们转换为 `assistant_turn`。schema 2 格式的日志文件若包含旧版字段，会被判定为格式无效。
 
-## 事件模型
+## 事件分类
 
-`TranscriptEvent` 同时承载会话内容和运行状态：
+`TranscriptEvent` 同时承载会话内容与系统运行状态：
 
-- session/model：session start/title、model、reasoning effort 和 expert route 变化；
-- turn/history：user、assistant、continuation、turn lifecycle 和 reasoning；
-- tool/permission：tool lifecycle、tool execution summary 和 permission decision；
-- workflow：todo、auto continue 和 validation advisory；
-- context：compaction、logical checkpoint、branch、checkout、history navigation 和 context metadata；
-- subagent/evidence：child lifecycle、structured result 和 evidence；
-- observation：LLM request telemetry、usage、cache 和错误。
+- 会话与模型：会话启动与标题、模型变更、思考等级与专家路由调整；
+- 回合与历史：用户输入、助手回复、流程继续、生命周期变迁与思考过程；
+- 工具与权限：工具调用状态、执行摘要与权限审批结果；
+- 流程管理：待办事项更新、自动继续状态与验证建议；
+- 上下文演进：上下文压缩、逻辑检查点、分支创建、分支检出、历史导航与元数据更新；
+- 子代理与证据：子任务生命周期、结构化结果与审计证据；
+- 运行观测：LLM 请求遥测指标、Token 用量、缓存统计与系统异常。
 
-事件是否进入 provider history、runtime restore、session history tree、TUI timeline、session index 或 job board，由各自 projection 决定。journal 中存在的 metadata 和 telemetry 不一定显示为聊天消息。
+各消费方按需投影所需事件，并非所有日志事件都会在聊天界面中展示为消息。
 
-## Transaction 与持久化
+## 事务与落盘机制
 
-需要原子可见的一组事件使用 transaction。每个 payload record 携带相同的 `transaction_id`、连续的 `transaction_index` 和一致的 `transaction_count`；payload 后必须跟随 `journal_entry = "transaction_commit"`，其中记录 base/resulting revision、payload byte length 和 digest。
+需要原子写入的一组事件使用事务封装。每个记录行携带相同的 `transaction_id`、连续递增的 `transaction_index` 和一致的总数 `transaction_count`。数据写入完毕后，必须追加一条 `journal_entry = "transaction_commit"` 提交记录，记录基础版本、结束版本、数据总字节数与内容校验和。
 
-读取器只释放通过 commit 校验的 transaction。完整但未 commit 的 transaction tail 对 projection 不可见，也不能作为 append-safe resume 的已确认 frontier。
+读取器只解析已包含提交记录的完整事务。未完成提交的事务尾部对投影层不可见，也不能作为会话恢复的安全端点。
 
-单条写入执行 `write_all` 和 `flush`；影响恢复语义的事件还会执行 `sync_data`。transaction 一次写入全部 payload 和 commit 后执行 `flush`、`sync_data`。每个 `TranscriptRecorder` 在整个写入生命周期内持有 `<session_id>.jsonl.lock` 的非阻塞跨进程独占锁；同一主会话或子会话不能同时打开第二个 writer，只读 projection 不受影响。任一 I/O 失败都会将 recorder 标记为 poisoned、释放 writer lock，且不会推进 sequence 或 active-turn state，允许受控恢复路径修复尾部后重新取得写入所有权。
+单条常规记录写入后执行 `write_all` 与 `flush`；影响恢复状态的关键事件会追加调用 `sync_data` 确保落盘。事务则在写入全部数据与提交标记后统一执行 `flush` 和 `sync_data`。
 
-`logical_checkpoint` payload 自带独立的 `schema_version`。为避免扁平 JSON 出现重复 key，该事件的 journal envelope 使用 `journal_schema_version = 2`；payload 的 `schema_version` 当前为 `1`。
+每个 `TranscriptRecorder` 在写入期间持有 `<session_id>.jsonl.lock` 独占文件锁。单个会话文件禁止多进程同时写入，只读读取不受锁影响。若发生底层 I/O 错误，记录器会被标记为损坏状态并释放文件锁，序列号与活动状态停止推进，保护文件尾部可被受控恢复。
 
-## Branch 与投影
+`logical_checkpoint` 事件携带自身独立的版本号。为避免 JSON 展开后字段命名冲突，其封套字段声明为 `journal_schema_version = 2`，业务负载版本号声明为 `schema_version = 1`。
 
-根 branch ID 为 `main`。`ContextBranchCreated` 记录 parent 和 `base_sequence`；非根 branch 的内容 record 携带 `context_branch_id`。branch 的可见内容由父路径在 base sequence 的前缀，加上本 branch 不超过目标 leaf 的内容组成。
+## 分支管理与状态投影
 
-`ContextCheckout` 选择活动 branch scope，但不会永久冻结内容 leaf；显式 `SessionContextCursor.leaf_sequence` 才表示固定截面。Undo、Redo 和 Navigate 通过 `HistoryNavigation` 持久化目标 sequence 与 redo stack，不修改已有记录。
+主分支固定命名为 `main`。`ContextBranchCreated` 事件记录父分支与派生时的基础序列号 `base_sequence`；分支上的内容记录携带 `context_branch_id`。分支的可见内容由派生点之前的父分支前缀与当前分支的记录拼接而成。
 
-主要投影包括：
+`ContextCheckout` 切换当前活动分支，不冻结具体的内容节点；显式指定 `SessionContextCursor.leaf_sequence` 时固定选定截面。撤销、重做与分支跳转统一通过 `HistoryNavigation` 事件记录目标序列号与重做栈，不修改磁盘上已存在的历史数据。
 
-- runtime restore：恢复 model、permission、workflow、protocol frames、context tree、evidence 和 child summaries；
-- history projection：恢复 user、`AssistantTurn`、tool output、continuation、compaction 和 checkpoint；
-- session history tree：按 branch path 生成导航节点；
-- TUI timeline：恢复 message、reasoning、tool、permission、todo 和 subagent 状态；
-- session index/job board：生成会话摘要和子代理运行状态。
+日志通过不同的投影器提供多种运行视图：
 
-## 读取与 Resume
+- 运行时恢复投影：恢复模型、权限、工作流、协议帧、上下文树、审计证据与子代理摘要；
+- 对话历史投影：恢复用户消息、助手回复、工具输出、续接提示、压缩记录与检查点；
+- 分支历史树：根据分支路径生成界面导航树；
+- TUI 时间线：组装消息气泡、思考块、工具卡片、权限弹窗、待办列表与子代理状态；
+- 会话索引与看板：生成全局会话摘要与子任务监控列表。
 
-严格读取校验 session identity、sequence/revision 连续性、event ID、scope 和 transaction。live partial-tail 读取只允许忽略最后一个未完成 JSON 行；`repair_partial_tail` 只在完整前缀可严格解析时补换行或截断无效尾部。
+## 日志校验与会话恢复
 
-普通 resume 使用 `read_resumable_records_with_fingerprint`：
+系统执行严格的日志解析，校验会话一致性、序列号连续性、事件 ID 格式、作用域规则与事务完整性。读取遇到未完成的尾部时，只允许忽略最后一行未截断完整的 JSON；`repair_partial_tail` 仅在已有前缀完全合法时执行截断修复。
 
-1. 接受 schema 1 或 2 envelope，并拒绝无 envelope legacy；
-2. 校验 sequence/revision、transaction 和文件 fingerprint；
-3. 将 schema 1 的 `assistant_message` / `assistant_tool_call_batch` 在内存中规范化为 `AssistantTurn`；无效的 legacy replay state 直接报错；
-4. 投影选定 branch 的 runtime snapshot，并验证 restored route 和 context scope；
-5. 非阻塞取得 session writer lock，在锁内重新校验 fingerprint 和 transaction frontier；活动 session 已持锁时明确拒绝第二个 resume；
-6. 打开 append-safe recorder，并在提交点替换 live session。
+会话恢复通过 `read_resumable_records_with_fingerprint` 完成：
 
-兼容过程不改写既有 JSONL。resume 后的新记录使用 schema 2，因此文件可以包含合法的 v1 前缀和 v2 后缀；下次 resume 会重复相同的内存规范化。无 envelope 的更早 legacy transcript 仍可用于发现、列表、摘要和只读审计，但不能普通 resume 或 append。
+1. 验证日志包含合法的 schema 1 或 schema 2 封套，拒绝无封套的旧文件；
+2. 校验序列号、事务连续性与文件指纹；
+3. 将 schema 1 的旧版记录在内存中规范化为 `AssistantTurn`，重放状态损坏时报错；
+4. 构建指定分支的运行时快照，验证恢复路由与上下文作用域；
+5. 获取文件独占锁，重新核对指纹与事务边界，若文件被占用则拒绝恢复；
+6. 构造安全追加模式的记录器，并在原子提交点替换当前活动会话。
+
+恢复过程完全在内存中完成数据适配，不重写既有文件。恢复后的新记录使用 schema 2 追加写入，磁盘文件可由合法的旧版前缀与新版记录组合构成。无封套的更早日志仅供检索，不支持恢复追加。
 
 ## 源码索引
 
-- `src/transcript/journal.rs` — envelope、transaction、读取、schema gate 和 fingerprint。
-- `src/transcript/read.rs` — 读取形状：从文件回答窄问题，不缓存已解码记录。
-- `src/transcript/model.rs` — `TranscriptRecord`、`TranscriptAssistantTurn` 和事件 payload。
-- `src/transcript/recorder.rs` — append、transaction、assistant normalization 和 durability。
-- `src/transcript/transcript_projection.rs` — branch-aware runtime/history/session projections。
-- `src/transcript/transcript_projection/history.rs` — assistant/tool history normalization。
-- `src/transcript/transcript_projection/session_tree.rs` — session history tree。
-- `src/transcript/session_index.rs` — session discovery index。
-- `src/session/restore.rs` — resume package、route validation 和 recorder swap。
-- `src/protocol_frames.rs` — 可恢复的 protocol history item。
-- `src/model_runtime/mod.rs` — opaque replay state 和 compatibility scope。
+- `src/transcript/journal.rs`：实现封套定义、事务校验、读取门禁与文件指纹计算。
+- `src/transcript/read.rs`：提供轻量读取接口，按需解析目标记录。
+- `src/transcript/model.rs`：定义记录模型、助手单元与全部事件载荷。
+- `src/transcript/recorder.rs`：负责日志追加、事务管理、数据规范化与落盘保证。
+- `src/transcript/transcript_projection.rs`：实现支持分支的运行时投影与会话状态构建。
+- `src/transcript/transcript_projection/history.rs`：规范化对话历史与工具调用记录。
+- `src/transcript/transcript_projection/session_tree.rs`：生成会话分支历史导航树。
+- `src/transcript/session_index.rs`：维护磁盘会话发现索引。
+- `src/session/restore.rs`：校验恢复数据包、检查路由可用性并执行记录器切换。
+- `src/protocol_frames.rs`：定义可用于状态恢复的协议历史项。
+- `src/model_runtime/mod.rs`：声明不透明重放状态与协议兼容性作用域。

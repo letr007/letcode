@@ -44,6 +44,12 @@ cargo run -- --cli
 
 CLI mode can also be selected with `cli` or `repl`. TUI can be selected explicitly with `--tui` or `tui`.
 
+Run the ACP server (for Zed and other editors over stdio):
+
+```sh
+cargo run -- acp
+```
+
 Show the installed version and check for a newer GitHub release:
 
 ```sh

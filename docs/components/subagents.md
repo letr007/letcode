@@ -1,110 +1,110 @@
 # Subagents
 
-## 专家与运行入口
+## 专家目录与交互工具
 
-Subagent 委派通过 Agent 的 delegation tools 进入 `SubagentPool`。当前六个可委派专家是：
+子代理委派通过 Agent 的专用工具进入任务池 `SubagentPool`。系统内置了六个可供委派的专家角色：
 
-| 专家 | 工具 | 用途 | 写入 |
+| 专家名称 | 对应工具 | 核心用途 | 是否允许写入 |
 | --- | --- | --- | --- |
-| `explorer` | `agent__explore` | 聚焦只读仓库探索 | 否 |
-| `fixer` | `agent__fixer` | 限定范围的实现或修复 | 是 |
-| `oracle` | `agent__oracle` | 根因、风险和验证判断 | 否 |
-| `designer` | `agent__designer` | 设计、方案和接口梳理 | 否 |
-| `librarian` | `agent__librarian` | 资料、证据和上下文整理 | 否 |
-| `general` | `agent__general` | 边界明确的只读通用辅助 | 否 |
+| `explorer` | `agent__explore` | 聚焦只读代码库探索 | 否 |
+| `fixer` | `agent__fixer` | 限定范围的实现与代码修复 | 是 |
+| `oracle` | `agent__oracle` | 根因分析、风险审查与验证建议 | 否 |
+| `designer` | `agent__designer` | 方案设计、接口梳理与交互决策 | 否 |
+| `librarian` | `agent__librarian` | 资料整理、代码检索与上下文归档 | 否 |
+| `general` | `agent__general` | 边界明确的只读辅助任务 | 否 |
 
-`reviewer` 是 permission review 专家，`historian` 是内部历史整理专家；两者可配置独立模型，但不属于六个可委派 subagent tool 的目录。`reviewer` 按 `execute` / `ask_user` / `refuse` 三档输出 JSON 判定：`ask_user` 表示该次调用先退回请求方补充说明，仍不明确时才弹出与 `default` 模式相同的人工审批；运行失败、凭据缺失或输出无法解析都按拒绝处理。无交互前端（如 one-shot `--print`）无法回答升级后的人工审批，这种情形下该次调用以失败结束，而不是挂起。child agent 不暴露任何 `agent__*` delegation tool，因此不能递归委派。Historian 使用自定义 one-shot executor 和同一子会话导航，详情见[历史整理与证据恢复](context-history.md)。
+此外，`reviewer` 是权限审查专家，`historian` 是内部历史整理专家。它们可配置独立模型，属于系统内部专家，不对外提供委派工具。`reviewer` 按 `execute`、`ask_user` 和 `refuse` 三档输出 JSON 判定：`ask_user` 会先退回请求方补充说明；若仍不明确，系统弹出与 `default` 模式一致的人工审批。若审查运行失败、缺少凭据或输出无法解析，系统均按拒绝处理。无交互前端（如单次运行的 `--print` 模式）无法响应人工审批，遇到该情况直接返回失败，不保持挂起。子代理内部不挂载任何 `agent__*` 委派工具，禁止发生递归委派。Historian 的运行机制参见[历史整理与证据恢复](context-history.md)。
 
-Pool 控制入口为：
+任务池提供以下管理工具：
 
-- `agent__jobs`：列出 parent transcript projection 与 active pool 合并后的 jobs；
-- `agent__status`：查询单个 run 的 active/completed/transcript 状态；
-- `agent__wait`：claim 并等待 active run 的 terminal result；
-- `agent__cancel`：请求取消 active run，或返回当前 terminal job。
+- `agent__jobs`：列出主会话日志记录与活动任务池中的所有任务；
+- `agent__status`：查询指定任务的实时运行状态或归档记录；
+- `agent__wait`：等待指定的活动后台任务完成并获取最终结果；
+- `agent__cancel`：向运行中的任务发送取消请求。
 
-## 输入与治理
+## 输入校验与运行治理
 
-归一化输入至少包含非空 `task` 或 `objective`；`objective` 优先。还可以指定 `success_criteria`、`allowed_paths`、`forbidden_paths`、`owned_paths`、`model`、`target_child_session_id` 和 `background`。
+规范化的委派请求必须包含 `task` 或 `objective`，系统优先采纳 `objective`。请求还可指定成功标准 `success_criteria`、允许路径 `allowed_paths`、禁止路径 `forbidden_paths`、独占所有权路径 `owned_paths`、模型路由 `model`、目标子会话 ID `target_child_session_id` 和后台运行标志 `background`。
 
-`model` 与 `target_child_session_id` 互斥。`fixer` 必须提供非空 `owned_paths`，因为 Pool 需要为可写运行建立路径锁。模板的 timeout、tool budget、scope、permission mode、write/delegate capability 和结果 shape 由 expert template/runtime 应用，不由模型在 prompt 中自行扩大。
+`model` 与 `target_child_session_id` 互斥。委派 `fixer` 角色时必须提供非空的 `owned_paths`，以便任务池为写操作申请独占路径锁。超时时间、工具预算、作用域、权限模式、写入权限和返回结构均由专家模板严格约束，模型不能在 Prompt 中自行扩大权限。
 
-child prompt 包含任务、成功标准、路径范围、route/takeover 信息、执行边界以及固定的“不递归委派、保持给定范围、简洁报告结果”约定。读工具受 `allowed_paths`/`owned_paths` 限制，写工具只能落在 `owned_paths`；`forbidden_paths` 优先于其它范围。
+子代理的系统提示包含任务目标、验收条件、操作路径范围、路由信息与执行边界，明确约定禁止递归委派、限定在给定范围内行动，并简明扼要汇报结果。只读工具受允许路径与所有权路径约束；写入工具严格限制在所有权路径内；禁止路径的优先级最高，覆盖其他所有范围。
 
-Pool reservation 使用 canonicalized path roots：读-读可并行；读-写和写-写在路径重叠或祖先/后代关系下冲突。完成时 Pool 对比 child transcript 的实际变更路径和 owned-path lock；锁外变更会使运行结果成为 logical failure。
+任务池在规范化路径根节点上管理并发锁：只读任务之间支持并发；读写或写写任务在路径重叠、属于父子目录关系时会被判定为冲突并拒绝执行。任务结束时，任务池核对子代理日志中实际变更的文件列表；超出路径锁范围的修改会导致任务判定为逻辑失败。
 
-## Child route authority
+## 子代理路由权威
 
-每个 child run 都在创建前解析并准备自己的 model route。`ExpertRouteFactory` 根据 expert policy、parent route、requested model 和 runtime catalog 生成 `PreparedPrimaryRoute`，再创建带 resolved runtime route 的 child Agent。
+每个子代理任务在启动前均独立解析并准备专属的模型路由。`ExpertRouteFactory` 结合专家策略、父级路由、指定模型和运行时目录生成预备路由，再创建具备权威已解析路由的子 Agent 实例。
 
-route authority 的规则是：
+子代理路由解析遵循以下规则：
 
-- 普通 child 若提供 model override，必须通过 expert allowed-model policy 和 parent route preparation；
-- 未提供 override 时使用 expert default route，缺省再使用 parent primary route；
-- route 一旦准备并安装，child turn 直接使用其 `ResolvedModelRoute` 和 binding；执行期间不会按模型字符串重新猜测 provider、protocol 或 endpoint；
-- child 的 compaction one-shot 和其它纯文本 helper 使用同一 child resolved route，不另选 provider route；
-- 子代理工具、child runner 和 one-shot helper 的权限/事件边界可以不同，但 route identity 必须来自该 child 的 resolved authority。
+- 普通子代理若指定了覆盖模型，必须符合专家允许的模型列表，并能通过父级路由校验；
+- 未指定模型时优先使用该专家的默认路由，若未配置则回退到父级主路由；
+- 路由安装后，子代理直接使用已解析路由发起请求，后续执行不再依据字符串重新探测端点；
+- 子代理的上下文压缩及其他单次请求沿用当前子代理路由，不另选路由；
+- 子代理各工具的权限边界相互独立，但执行身份严格归属于该子代理的权威路由。
 
-## 新建运行
+## 新建子代理任务
 
-`SubagentPool::start_named_governed` 创建 reservation，`run_named_governed` 提供同步等待包装。流程为：
+通过 `SubagentPool::start_named_governed` 可以启动子代理任务，`run_named_governed` 则提供同步等待封装。处理流程如下：
 
-1. 查找 expert template；
-2. 归一化 input，计算 path access、timeout、tool budget 和 route；
-3. 申请 reservation，分配稳定 `run_id` 与单调 `pool_ordinal`；
-4. 普通运行创建 child transcript，写入 `SessionStarted`、running lifecycle 和 `SubagentStarted`；
-5. 创建 child Agent，安装 route、path scope 和 child transcript context scope；
-6. parent transcript 写入对应的 start event；
-7. 激活 slot 和 cancellation channel，运行 child prompt。
+1. 匹配目标专家模板；
+2. 规范化输入参数，计算路径访问范围、超时时间、工具配额与执行路由；
+3. 申请路径锁预约，分配稳定的 `run_id` 与单调递增的任务序号；
+4. 创建子会话日志文件，依次写入会话启动记录、运行状态和子代理启动事件；
+5. 创建子 Agent 实例，注入路由、路径作用域与子日志上下文；
+6. 在父会话日志中记录对应的启动事件；
+7. 激活执行槽位与取消通道，开始执行子代理提示词。
 
-active slot 同时覆盖 reservation/starting 和 running 状态，因此尚未完成 child 初始化的运行也能被 cancel。
+激活的槽位同时覆盖预约阶段和执行阶段，尚未完成初始化的任务同样可以被取消。
 
-## Exact retained route takeover
+## 接管既有子会话
 
-`target_child_session_id` 表示接管一个已经存在的 child session。takeover 只接受：
+指定 `target_child_session_id` 可以接管已终止的子会话继续工作。接管必须满足以下条件：
 
-- child 属于当前 parent；
-- child transcript 存在且能读取；
-- recorded agent name 与本次 expert template 完全一致；
-- child 状态为 terminal（completed、failed、budget_exhausted、cancelled 或 timed_out；兼容读取 errored）；
-- child transcript 中存在可解析的 provider/model route；
-- 没有另一个 active takeover 使用同一 child session。
+- 目标子会话归属于当前父会话；
+- 目标子会话日志完整可读；
+- 日志中记录的专家名称与本次调用的专家模板完全一致；
+- 子会话当前处于终止状态（完成、失败、配额耗尽、取消或超时）；
+- 日志中记录了可解析的服务商与模型路由；
+- 没有其他活跃任务正在接管同一个子会话。
 
-takeover 不接受 model override。child transcript 中记录的 provider/model route 是 exact retained authority；Pool 通过 `parent.prepare_primary_route` 恢复它。若 route 仍在当前 selectable catalog 中，则使用当前 factory；若 route 已被移除，则使用与该 route 同一 epoch 保存的 `RetainedRoutePreparation`（旧 factory + resolved route）。该 exact 分支只允许已有 takeover/resume 使用，不会把 removed route 放回 selectable catalog。
+接管模式不接受外部覆盖模型。日志中保存的路由信息代表历史权威，任务池通过父级路由工厂将其恢复。若该模型仍在当前配置中，使用当前工厂解析；若该模型已从配置中移除，则使用历史快照中保存的配置进行还原。该还原机制仅供会话恢复与接管使用，不会把已删除的模型重新加入可选目录。
 
-成功 takeover 会在原 child transcript 上 append 新的 running lifecycle 和 started event，恢复其 turn sequence/context branch，保留原 `pool_ordinal`，并生成新的 `run_id`。child session ID 和历史 transcript 不变。exact retained route 在 takeover 中可绕过当前 expert allowed-model 列表；非 takeover 的新委派仍受当前 policy。正在运行的 child、缺失或无效 route、缺少 exact preparation、agent/parent 关系不匹配都会直接失败。
+接管成功后，系统会在原日志末尾追加新的运行记录，继承原有的回合历史与上下文分支，沿用原任务序号并生成新的运行 ID。正在运行的子会话、损坏的日志文件或专家类型不匹配均会导致接管被直接拒绝。
 
-## 生命周期与状态
+## 生命周期与状态流转
 
-Pool 状态依次为 reservation、active execution、terminal reconciliation 和 completed lookup。terminal 状态包括 `completed`、`failed`、`budget_exhausted`、`cancelled` 和 `timed_out`。tool budget 超限映射为 `budget_exhausted`；executor error 映射为 `failed`；timeout/cancel 分别映射为对应状态。
+任务池依次经历资源预约、活跃执行、终态调和与归档查询四个阶段。终态状态包括已完成（`completed`）、执行失败（`failed`）、配额耗尽（`budget_exhausted`）、已取消（`cancelled`）与超时（`timed_out`）。工具调用超限映射为配额耗尽，执行异常映射为失败。
 
-terminal reconciliation 会检查实际写入范围、写 child completion 和 parent result，并将 active slot 移到 completed map。`ActiveRunGuard` 在未正常完成而被 drop 时生成 cancelled summary；正常完成由 `guard.complete()` 保存 completed result 并唤醒 waiter。
+终态调和阶段会核对实际文件修改范围，写入完成状态与汇总结果，并将执行槽位转移到已完成任务表中。若任务在异常中断时释放守卫，系统会自动生成取消总结；正常完成时由守卫持久化最终结果并唤醒等待任务。
 
-## Foreground、background 与 jobs
+## 前后台任务与监控
 
-foreground delegate 等待 `complete_started_run`，返回带 run/session identity、expert、status、failure kind、summary、structured result 和 `active: false` 的 `ToolResult`。
+前台委派调用会等待任务终态，并在工具结果中返回运行标识、专家名称、完成状态、摘要、结构化结果与活动标记（`active: false`）。
 
-background delegate 需要可用的 parent background control channel。它启动独立 task 后立即返回 `status: running`、`active: true` 和 `background: true`；完成时向 parent session control channel 发送 `BackgroundSubagentCompleted`。
+后台委派需要父级提供后台控制通道。任务派发后立即返回运行中状态（`status: running`）与后台标记（`background: true`）。子任务在后台独立运行，完成后向父会话发送 `BackgroundSubagentCompleted` 事件。
 
-`agent__wait` 只等待 active job，并且同一 run 只允许一个 foreground claim。`agent__status` 优先查询 completed、再查询 active、最后查询 child transcript projection。`agent__jobs` 以 pool ordinal/run ID 排序并覆盖实时 active status。`agent__cancel` 只对 active run 发 cancellation request；未知 run ID 直接报错。
+`agent__wait` 仅等待活跃任务，同一任务只允许单个前台工具认领。`agent__status` 优先查询已完成缓存，其次查询活动任务，最后回退读取子会话日志。`agent__jobs` 按序号汇总所有任务并覆盖当前状态。`agent__cancel` 向运行中任务发送取消信号，传入无效 ID 时直接报错。
 
-## Transcript、evidence 与结果
+## 日志、证据与结构化结果
 
-运行级 transcript 事件为：
+子代理在日志中记录以下关键事件：
 
-- `SubagentStarted`：run/parent/child identity、expert、summary 和 pool ordinal；
-- `SubagentLifecycle`：run identity、expert、status 和 detail；
-- `SubagentResult`：run/parent/child identity、expert、status 和 summary。
+- `SubagentStarted`：记录运行标识、父子会话关联、专家名称、任务摘要与序号；
+- `SubagentLifecycle`：记录状态变更与详细说明；
+- `SubagentResult`：记录最终状态与产出结果。
 
-完成的 structured result 还可作为 parent-side `Evidence`，来源包含 run、child session、parent tool、parent turn 和 parent session。parent transcript 保存 child relationship；child transcript 保存其自身 lifecycle 和 assistant/tool 内容。job board 可以从 parent start/result 与 child lifecycle 重建运行状态。
+完成的结构化数据可作为父会话的审计证据，完整保留执行来源。父日志记录任务调度关系，子日志保存具体的交互与工具调用。任务看板可通过两套日志完整还原执行轨迹。
 
-结果结构包含 `run_id`、`child_session_id`、`agent_name`、`status`、`failure_kind`、`summary`、`structured_result`。structured result 约定包含 `findings`、`files_read`、`files_changed`、`commands_run`、`validation`、`blockers` 和 `next_steps`。
+结构化产出统一包含执行发现、读取文件、修改文件、执行命令、验证结果、阻碍因素和后续建议，便于父级 Agent 理解和调和。
 
 ## 源码索引
 
-- `src/agent/catalog.rs` — 六个 expert template、subagent catalog 和 capability contract。
-- `src/tool/delegation.rs` — input normalization、path scope 和 delegation schema。
-- `src/subagent/route_factory.rs` — child route preparation、allowed models 和 takeover route validation。
-- `src/subagent/pool.rs` — reservation、path locks、takeover、lifecycle、wait/cancel 和 reconciliation。
-- `src/subagent/result.rs` — summary、structured result 和 terminal mapping。
-- `src/session/subagent_delegate.rs` — session-owned route display、background control 和 parent integration。
-- `src/transcript/recorder.rs` — subagent start/lifecycle/result persistence。
+- `src/agent/catalog.rs`：定义专家模板、子代理能力契约与目录信息。
+- `src/tool/delegation.rs`：实现委派输入规范化、路径作用域检查与工具模式。
+- `src/subagent/route_factory.rs`：负责子代理路由准备、模型白名单与接管校验。
+- `src/subagent/pool.rs`：管理任务池预约、并发路径锁、会话接管、生命周期与等待取消。
+- `src/subagent/result.rs`：处理任务摘要、结构化结果组装与终态映射。
+- `src/session/subagent_delegate.rs`：集成会话级路由展示、后台控制通道与父子交互。
+- `src/transcript/recorder.rs`：持久化子代理启动、状态变迁与执行结果。

@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-  letcode 是一个由 Rust 编写的终端 Agent。
+  letcode 是 Rust 编写的终端 Agent。
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
 
 ![letcode TUI](docs/letcode.png)
 
-提供基于 Ratatui 的仿 `opencode` 风格 TUI，也保留了 REPL CLI 模式。
+提供基于 Ratatui 的仿 `opencode` 风格 TUI，保留了 REPL CLI 模式。
 
 [技术文档](docs/index.md)
 
@@ -43,6 +43,12 @@ cargo run -- --cli
 ```
 
 CLI 模式也可以通过 `cli` 或 `repl` 选择。TUI 可以通过 `--tui` 或 `tui` 显式选择。
+
+运行 ACP 服务端（供 Zed 等外部编辑器通过 stdio 连接）：
+
+```sh
+cargo run -- acp
+```
 
 查看已安装版本并检查 GitHub Release 中的新版本：
 
@@ -122,8 +128,8 @@ older_than_days = 7
 mode = "default" # solo 是 yolo 的兼容别名
 
 # 实验性：[agents.reviewer] 指向带 reviewer = "jev" 标记的 provider 时，
-# auto 模式改由 Typesafe Jev 判定。每次审查用该 provider 的 base_url 与凭据、
-# 以及路由里的模型发一个 choice 问题，返回概率而不是文本。
+# auto 模式改由 Typesafe Jev 判定。审查时使用该 provider 的 base_url 与凭据，
+# 并用路由指定的模型发起 choice 问题，返回概率，不返回文本。
 # [providers.typesafe]
 # protocol = "responses"
 # flavor = "standard"
@@ -243,7 +249,7 @@ parallel_tool_calls = true
 # async_tools = ["web__fetch"] # 工具名；仅 Astra 策略 + responses 协议，且需 capabilities.tools = true
 
 [providers.openai.models."gpt-5.5".cache]
-# enabled = true 即声明并启用 provider-native prompt cache hint（唯一的开缓开关）
+# enabled = true 即声明并启用 provider-native prompt cache hint（唯一的缓存开关）
 enabled = false
 # retention = "in_memory" # in_memory | 24h；启用 cache 时设置
 # namespace = "openai"
