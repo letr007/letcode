@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- `[fake.claude]` 新增，声明 Claude Code 剖面的客户端版本、依赖包版本、超时与能力标记。
+- `[fake.identity]` 新增 `account_uuid`，声明 Claude Code 剖面上报的账号；省略时由安装 ID 派生。
+
+### Breaking
+
+- `[fake]` 配置段按剖面拆分，`[fake.client]` 与 `[fake.environment]` 合并为 `[fake.codex]`，`[fake.extra]` 移入 `[fake.codex.extra]`。包含旧键的配置会被拒绝。
+
+### Changed
+
+- `/fake anthropic` 改为伪装 Claude Code，发送 `claude-cli/<version> (external, cli)` User-Agent、`x-app`、`anthropic-beta` 等 Claude Code 标头，并在请求体写入 2.x 形态的 `metadata.user_id`。
+- Codex 与 Claude Code 剖面不再共用客户端特征，各自读取自己的参数与标头。
+
 ## [0.17.0] - 2026-09-24
 
 ### Added

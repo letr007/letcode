@@ -249,17 +249,20 @@ model = "gpt-5.5"
 timezone = "Asia/Shanghai"
 # date = "2026-09-12"
 
-[fake.client]
+[fake.codex]
 version = "0.153.4"
 originator = "Codex Desktop"
-
-[fake.environment]
 sandbox = "none"
 sandbox_mode = "danger-full-access"
 shell = "zsh"
+
+[fake.claude]
+version = "2.1.69"
+package_version = "0.74.0"
+timeout = "600"
 ```
 
-未显式指定的字段由系统在运行时自动检测当前主机的真实环境值补充。详情参见[客户端特征仿真](fake.md)。
+`[fake.codex]` 与 `[fake.claude]` 分别对应 Codex 与 Claude Code 两个剖面。未显式指定的字段由系统在运行时自动检测当前主机的真实环境值补充。详情参见[客户端特征仿真](fake.md)。
 
 ## 源码索引
 

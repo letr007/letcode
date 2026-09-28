@@ -15,12 +15,12 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 
 ## 传输剖面
 
-系统支持两种面向主流协议的传输剖面：
+系统支持两种面向主流协议的传输剖面，各自模仿一个真实的编码客户端。
 
 1. **Codex 剖面**：面向基于 Responses 协议的服务商，构造匹配的客户端版本标头与回合扩展元数据；
-2. **Anthropic 剖面**：面向 Anthropic Messages 协议，注入匹配的客户端上下文标识。
+2. **Claude Code 剖面**：面向 Anthropic Messages 协议，构造匹配的 Claude Code 客户端标头，并在请求体的 `metadata.user_id` 中报告当前会话。
 
-设置为 `auto` 模式时，系统根据当前激活的服务商协议自动匹配对应的剖面。
+两个剖面模仿的客户端不同，可配置项各成一段。Codex 剖面读取 `[fake.codex]`，Claude Code 剖面读取 `[fake.claude]`。`auto` 模式下，系统按当前激活的服务商协议选择剖面。
 
 ## 宿主环境探测机制
 
@@ -31,7 +31,7 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 - 工作区与版本库：读取当前工作区的绝对路径，并自动探测当前 Git 提交哈希（`git rev-parse HEAD`）与工作区变更状态；
 - 时区与日期：默认依据本机系统时钟与 IANA 本地时区换算。
 
-针对特定服务商专有的沙箱标记（如 `sandbox_mode` 与 `node_repl_disabled`），系统填充规范的默认值。用户也可以在配置文件的 `[fake.extra]` 中添加自定义键值对，最多允许配置 16 项。
+无法从本机确认的属性取自被模仿客户端的典型值，如客户端版本、依赖包版本和能力标记。这些值随被模仿客户端发版变化，需要同步更新。针对特定服务商专有的沙箱标记（如 `sandbox_mode` 与 `node_repl_disabled`），系统填充规范的默认值。用户也可以在配置文件的 `[fake.codex.extra]` 中添加自定义键值对，最多允许配置 16 项。
 
 ## 运行与动态切换
 
@@ -39,7 +39,7 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 
 启用仿真有两种方式：
 
-1. **配置文件声明**：在 `letcode.toml` 中配置 `[fake]` 块字段；
+1. **配置文件声明**：在 `letcode.toml` 中配置 `[fake.codex]`、`[fake.claude]` 等字段；
 2. **会话动态切换**：在 TUI 交互界面中输入 `/fake` 命令，即可在当前会话中即时切换开启或关闭状态。
 
 未启用仿真时，网络请求保持纯净的标准协议格式，不注入额外的客户端包装元数据。

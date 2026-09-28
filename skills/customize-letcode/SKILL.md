@@ -200,17 +200,17 @@ namespace = "my-cache"
 # [fake.identity]
 # installation_id = "00000000-0000-4000-8000-000000000000"  # 省略则生成并持久化
 # agent_name = "Hypatia"                 # 省略则不上报
+# account_uuid = "00000000-0000-4000-8000-000000000000"  # Claude Code 剖面上报的账号
 # [fake.clock]
 # timezone = "Asia/Shanghai"             # IANA 名
 # date = "2026-09-12"                    # 省略则按本机时钟在该时区换算
-# [fake.client]
+# [fake.codex]                           # Codex Responses 剖面
 # version = "0.153.4"
 # originator = "Codex Desktop"
 # os = "Mac OS 26.4.1"
 # arch = "aarch64"
 # terminal = "Apple_Terminal"
 # beta_features = ["remote_compaction_v2"]
-# [fake.environment]
 # sandbox = "none"
 # sandbox_mode = "danger-full-access"
 # auto_review_enabled = false
@@ -222,8 +222,16 @@ namespace = "my-cache"
 # git_commit_hash = "1f0c3a2"
 # git_remote_url = "git@github.com:owner/repo.git"
 # git_has_changes = false
-# [fake.extra]                          # 自由键值，上限 16 项
+# [fake.codex.extra]                     # 自由键值，上限 16 项
 # custom_flag = "1"
+# [fake.claude]                          # Claude Code Messages 剖面
+# version = "2.1.69"
+# package_version = "0.74.0"
+# runtime_version = "v22.16.0"
+# timeout = "600"
+# os = "MacOS"
+# arch = "arm64"
+# betas = ["claude-code-20250219"]
 ```
 
 形状说明：
@@ -249,8 +257,8 @@ namespace = "my-cache"
   `reviewer` expert 来回答审批。
 - `generation.async_tools` 列出异步工具名，需同时满足 Astra 策略、`protocol = "responses"` 与 `capabilities.tools = true`；Astra 只支持 `low` 及以上的 reasoning effort。
 - `capabilities.generation.structured_output` 声明该路由的强制能力（非布尔值）：`json_schema` 由上游在解码层约束 JSON 语法，`json_object` 只表达“输出 JSON”的意图。
-- `[fake]` 省略的字段按真实主机或所模拟客户端的典型值推导；`identity.installation_id` 必须是 UUID，否则会被替换；`clock.timezone` 需为 IANA 名。
-- `[fake.extra]` 的键不超过 64 字节且首字符为 ASCII 字母、只含字母数字与 `_` `.` `-`，值不超过 128 字节；不得使用 turn metadata 已占用的键（如 `session_id`、`thread_id`、`turn_id`、`agent_name`、`request_kind`）。
+- `[fake.codex]` 与 `[fake.claude]` 省略的字段按真实主机或所模拟客户端的典型值推导；`identity.installation_id` 必须是 UUID，否则会被替换；`clock.timezone` 需为 IANA 名。
+- `[fake.codex.extra]` 的键不超过 64 字节且首字符为 ASCII 字母、只含字母数字与 `_` `.` `-`，值不超过 128 字节；不得使用 turn metadata 已占用的键（如 `session_id`、`thread_id`、`turn_id`、`agent_name`、`request_kind`）。
 - `[providers.<name>.retry]` 从 `[global.retry]` 继承未填写字段。`enabled` 控制是否重试；`exponential_backoff = false` 时每次固定等待 `initial_delay_secs`（不叠加 jitter），`true` 时按 `backoff_multiplier` 指数增长并可叠加 `jitter_secs`。服务端有效的 `Retry-After` 仍优先。`max_attempts` 包含首次请求。
 
 ## Skills
