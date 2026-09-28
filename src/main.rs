@@ -100,10 +100,8 @@ async fn main() -> Result<()> {
     let config_path = config::default_config_path()?;
     if !config_path.exists() {
         match options.entry_mode {
-            EntryMode::Tui | EntryMode::Resume { .. } => {
-                if !tui::setup::run(&config_path)? {
-                    return Ok(());
-                }
+            EntryMode::Tui | EntryMode::Resume { .. } if !tui::setup::run(&config_path)? => {
+                return Ok(());
             }
             _ => {}
         }

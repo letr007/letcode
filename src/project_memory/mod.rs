@@ -50,10 +50,10 @@ impl MemoryWorker {
         if self.task.as_ref().is_some_and(|task| !task.is_finished()) {
             return Ok(());
         }
-        if let Some(task) = self.task.take() {
-            if task.await.context("project memory worker failed")?? {
-                self.last_curation = Some(std::time::Instant::now());
-            }
+        if let Some(task) = self.task.take()
+            && task.await.context("project memory worker failed")??
+        {
+            self.last_curation = Some(std::time::Instant::now());
         }
         let Some(store) = configured_store()? else {
             return Ok(());

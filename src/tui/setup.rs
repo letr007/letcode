@@ -185,21 +185,19 @@ pub(crate) fn run(config_path: &Path) -> Result<bool> {
         };
         match event {
             Event::Key(key) if is_cancel_key(key) => return Ok(false),
-            Event::Key(key) => {
-                if handle_key(&mut setup, key) {
-                    if setup.active_field == SetupField::Model {
-                        match crate::config::initialize_config(
-                            config_path,
-                            &setup.base_url,
-                            &setup.api_key,
-                            &setup.model,
-                        ) {
-                            Ok(()) => return Ok(true),
-                            Err(error) => setup.error = Some(format!("{error:#}")),
-                        }
-                    } else {
-                        setup.next_field();
+            Event::Key(key) if handle_key(&mut setup, key) => {
+                if setup.active_field == SetupField::Model {
+                    match crate::config::initialize_config(
+                        config_path,
+                        &setup.base_url,
+                        &setup.api_key,
+                        &setup.model,
+                    ) {
+                        Ok(()) => return Ok(true),
+                        Err(error) => setup.error = Some(format!("{error:#}")),
                     }
+                } else {
+                    setup.next_field();
                 }
             }
             Event::Paste(text) => setup.insert(&text),
