@@ -1004,7 +1004,9 @@ pub(crate) struct VisibleChildViewState {
 
 fn apply_engine_view_child(
     transcript: &std::sync::Arc<std::sync::Mutex<crate::transcript::TranscriptRecorder>>,
-    session_transport_tx: &tokio::sync::mpsc::UnboundedSender<crate::session::SessionTransportEvent>,
+    session_transport_tx: &tokio::sync::mpsc::UnboundedSender<
+        crate::session::SessionTransportEvent,
+    >,
     sessions_dir: Option<&std::path::Path>,
     navigation: crate::command::ChildNavigation,
     anchor_child_session_id: Option<&str>,
