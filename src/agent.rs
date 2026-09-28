@@ -1635,8 +1635,7 @@ impl Agent {
         &self.fake_config
     }
 
-    /// Returns this turn's resolved fake context for `profile`, computing it at
-    /// most once per turn. Callers pass a concrete profile, never `Auto`.
+    /// Resolves this turn's fake context for a concrete `profile`, once per turn.
     pub(crate) fn fake_turn_context(
         &self,
         profile: crate::fake::FakeClient,

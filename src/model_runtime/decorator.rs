@@ -20,8 +20,6 @@ impl FakeRequestDecorator {
         context: FakeRequestContext,
         responses_websocket: bool,
     ) -> Result<Self, ModelFailure> {
-        // The context is resolved for the route's protocol, so a mismatch means
-        // the caller paired a profile with the wrong transport.
         if !client.supports_protocol_id(protocol_id)
             || !context.profile().supports_protocol_id(protocol_id)
         {
@@ -81,9 +79,7 @@ impl FakeRequestDecorator {
         Ok(request)
     }
 
-    /// Installs headers the profile owns, replacing whatever the adapter set
-    /// under the same name: for those names the disguise *is* the transport
-    /// identity, so the declared profile wins over the adapter default.
+    /// Installs headers the profile owns, replacing the adapter's value for the same name.
     fn replace_headers(
         &self,
         request: &mut PreparedHttpRequest,
@@ -145,8 +141,6 @@ impl FakeRequestDecorator {
     }
 }
 
-/// Rewrites an adapter-prepared JSON body through `apply`, keeping the
-/// adapter's own error classification.
 fn rewrite_body(body: &[u8], apply: impl FnOnce(&mut Value)) -> Result<Vec<u8>, ModelFailure> {
     let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
         ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
@@ -272,8 +266,6 @@ mod tests {
             .decorate(&protocol, request("anthropic", original.clone()))
             .unwrap();
         let body: Value = serde_json::from_slice(&decorated.body).unwrap();
-        // The prompt and tools keep their native shape; only the client
-        // identity the body reports is added.
         assert_eq!(body["model"], original["model"]);
         assert_eq!(body["messages"], original["messages"]);
         assert_eq!(body["stream"], original["stream"]);
@@ -281,13 +273,10 @@ mod tests {
         assert!(user_id.contains("fake-installation"), "{user_id}");
         assert!(user_id.contains("session_id"), "{user_id}");
 
-        // The adapter's own transport defaults survive.
         assert_eq!(
             decorated.protocol_headers["anthropic-version"],
             "2023-06-01"
         );
-        // The profile owns `accept`: the client sends application/json rather
-        // than the adapter's text/event-stream.
         assert_eq!(decorated.protocol_headers["accept"], "application/json");
         assert_eq!(decorated.protocol_headers["x-app"], "cli");
         let user_agent = &decorated.protocol_headers["user-agent"];
@@ -319,7 +308,6 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         });
-        // One turn sends several requests through one decorator.
         let first = decorator
             .decorate(&protocol, request("anthropic", body.clone()))
             .unwrap();
@@ -361,8 +349,6 @@ mod tests {
             .insert("accept".into(), "text/event-stream".into());
 
         let decorated = decorator.decorate(&protocol, prepared).unwrap();
-        // The profile declares the client's capabilities, so its own values
-        // win over whatever the adapter negotiated.
         let beta = &decorated.protocol_headers["anthropic-beta"];
         assert!(!beta.contains("provider-beta"), "{beta}");
         assert!(beta.starts_with("claude-code-"), "{beta}");
@@ -376,7 +362,6 @@ mod tests {
             FakeRequestDecorator::new(FakeClient::Auto, &completions, codex_context(), false)
                 .is_err()
         );
-        // The conversation profile and the route protocol must agree.
         let responses = ProtocolId::new("responses").unwrap();
         assert!(
             FakeRequestDecorator::new(FakeClient::Codex, &responses, claude_context(), false)

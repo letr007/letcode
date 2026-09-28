@@ -569,9 +569,7 @@ impl std::fmt::Debug for JevReviewConfig {
 /// than here: outward-facing attributes (OS, architecture, terminal, working
 /// directory) come from the real host, identity values are generated, and
 /// attributes letcode has no equivalent for fall back to the imitated client's
-/// typical values. Identity and clock describe the session, so they are shared;
-/// the two imitated clients report different attributes and therefore each own
-/// a profile section.
+/// typical values.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeConfig {
     pub identity: FakeIdentityConfig,
@@ -584,9 +582,7 @@ pub struct FakeConfig {
 pub struct FakeIdentityConfig {
     pub installation_id: Option<String>,
     pub agent_name: Option<String>,
-    /// Account identifier the Claude profile reports in `metadata.user_id`.
-    /// Absent values are derived from the installation id, so a stable account
-    /// id needs no second persisted identifier.
+    /// Account id the Claude profile reports; derived when absent.
     pub account_uuid: Option<String>,
 }
 
@@ -600,7 +596,6 @@ pub struct FakeClockConfig {
     pub date: Option<String>,
 }
 
-/// Values the Codex Responses profile reports about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeCodexConfig {
     pub version: Option<String>,
@@ -623,7 +618,6 @@ pub struct FakeCodexConfig {
     pub extra: IndexMap<String, String>,
 }
 
-/// Values the Claude Code Messages profile reports about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeClaudeConfig {
     pub version: Option<String>,

@@ -4,14 +4,12 @@
 //! prompt and tools, and the environment block letcode reports about itself. It
 //! deliberately does not replace the agent persona or the tool catalog.
 //!
-//! Each protocol carries its own profile, because the imitated clients report
-//! different attributes: the Codex Responses profile and the Claude Code
-//! Messages profile. Declared values live in `[fake.codex]` and `[fake.claude]`
-//! in `letcode.toml`. Absent values are derived rather than hardcoded wherever
-//! the real host can answer: OS, architecture, terminal, working directory,
-//! shell and repository state come from the machine running letcode, because a
-//! real client reports its real host too. Attributes letcode has no equivalent
-//! for fall back to the imitated client's typical values.
+//! Declared values live in `[fake.codex]` and `[fake.claude]` in `letcode.toml`.
+//! Absent values are derived rather than hardcoded wherever the real host can
+//! answer: OS, architecture, terminal, working directory, shell and repository
+//! state come from the machine running letcode, because a real client reports
+//! its real host too. Attributes letcode has no equivalent for fall back to the
+//! imitated client's typical values.
 
 use crate::config::FakeConfig;
 use serde::{Deserialize, Serialize};
@@ -70,9 +68,6 @@ impl FakeClient {
 }
 
 /// Stable synthetic identity used for one fake-enabled agent session.
-///
-/// Both profiles report the session it names; the Codex profile also reports it
-/// as the installation id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeIdentity {
     pub installation_id: String,
@@ -98,7 +93,6 @@ impl FakeIdentity {
         CodexRequestContext::resolve(self, config, cwd)
     }
 
-    /// Resolves the per-turn Claude Code context.
     pub(crate) fn claude_turn_context(&self, config: &FakeConfig) -> ClaudeRequestContext {
         ClaudeRequestContext::resolve(self, config)
     }
@@ -388,7 +382,6 @@ impl CodexRequestContext {
 /// Per-turn values injected into a Claude Code shaped Messages request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeRequestContext {
-    /// Session identity, frozen when the fake was enabled.
     pub installation_id: String,
     pub session_id: String,
     pub version: String,
@@ -398,21 +391,16 @@ pub struct ClaudeRequestContext {
     pub os: String,
     pub arch: String,
     pub betas: Vec<String>,
-    /// Account the client reports in `metadata.user_id`.
     pub account_uuid: String,
 }
 
 /// Claude Code-typical values for attributes letcode has no equivalent for.
 mod claude_defaults {
-    /// Snapshot of the imitated release. The values it implies (user agent,
-    /// package and runtime versions, beta set) describe one published client,
-    /// so they must be kept in sync together.
+    /// These values describe one published client, so they move together.
     pub(super) const VERSION: &str = "2.1.69";
     pub(super) const PACKAGE_VERSION: &str = "0.74.0";
     pub(super) const RUNTIME_VERSION: &str = "v22.16.0";
     pub(super) const TIMEOUT: &str = "600";
-    /// The surface the client reports itself running on, verbatim after the
-    /// version.
     pub(super) const ENTRYPOINT: &str = "(external, cli)";
     pub(super) const APP: &str = "cli";
     pub(super) const LANG: &str = "js";
@@ -475,10 +463,7 @@ impl ClaudeRequestContext {
         )
     }
 
-    /// HTTP headers the client sends on Messages requests. `user-agent`,
-    /// `accept` and `anthropic-beta` belong to the disguise, so they replace
-    /// the adapter's transport values instead of merging with them.
-    /// The request id is minted per call; the session id stays stable.
+    /// HTTP headers the client sends on Messages requests.
     pub fn headers(&self) -> Vec<(String, String)> {
         let mut headers = vec![
             ("accept".into(), "application/json".into()),
@@ -517,9 +502,7 @@ impl ClaudeRequestContext {
         headers
     }
 
-    /// The `metadata.user_id` the client reports: a JSON blob over the device,
-    /// account and session ids, with the session id matching the session the
-    /// transport headers name.
+    /// The `metadata.user_id` the 2.x client reports, as a JSON blob string.
     pub fn metadata_user_id(&self) -> String {
         serde_json::json!({
             "device_id": self.installation_id,
@@ -530,7 +513,6 @@ impl ClaudeRequestContext {
     }
 }
 
-/// Per-turn values resolved for the profile the active protocol uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeRequestContext {
     Codex(CodexRequestContext),
@@ -538,7 +520,6 @@ pub enum FakeRequestContext {
 }
 
 impl FakeRequestContext {
-    /// The profile that produced this context.
     pub fn profile(&self) -> FakeClient {
         match self {
             Self::Codex(_) => FakeClient::Codex,
@@ -547,7 +528,6 @@ impl FakeRequestContext {
     }
 }
 
-/// Names the host OS the way the imitated client's HTTP layer reports it.
 fn stainless_os() -> String {
     match std::env::consts::OS {
         "macos" => "MacOS".to_string(),
@@ -557,8 +537,6 @@ fn stainless_os() -> String {
     }
 }
 
-/// Names the host architecture the way the imitated client's HTTP layer
-/// reports it.
 fn stainless_arch() -> String {
     match std::env::consts::ARCH {
         "x86_64" => "x64".to_string(),
@@ -569,10 +547,7 @@ fn stainless_arch() -> String {
     }
 }
 
-/// The account id the Claude profile reports is synthesized: letcode has no
-/// account to name. Deriving it from the installation id keeps it stable across
-/// sessions without persisting a second identifier, and it carries the
-/// version-4 shape the client's account ids share.
+/// Synthesized account id, derived from the installation id so it stays stable.
 fn account_uuid_from(installation_id: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -586,8 +561,7 @@ fn account_uuid_from(installation_id: &str) -> String {
     format_uuid(hi, lo)
 }
 
-/// Writes the client identity the Messages body reports into `metadata`. The
-/// prompt and tools keep their native shape.
+/// Writes the client identity the Messages body reports into `metadata`.
 pub fn apply_claude_body_shape(request: &mut Value, context: &ClaudeRequestContext) {
     let Some(object) = request.as_object_mut() else {
         return;
@@ -1221,7 +1195,6 @@ mod tests {
                 .expect("beta header")
                 .starts_with("claude-code-")
         );
-        // The Codex profile's transport identity does not appear here.
         assert!(value("originator").is_none());
         assert!(value("x-codex-turn-metadata").is_none());
     }
@@ -1242,7 +1215,6 @@ mod tests {
             value(&first, "x-client-request-id"),
             value(&second, "x-client-request-id")
         );
-        // The session identity underneath stays stable.
         assert_eq!(
             value(&first, "x-claude-code-session-id"),
             Some(context.session_id.clone())
@@ -1269,10 +1241,8 @@ mod tests {
         assert_eq!(decoded["device_id"], "installation");
         assert_eq!(decoded["session_id"], context.session_id.as_str());
         assert_eq!(decoded["account_uuid"], context.account_uuid.as_str());
-        // The prompt keeps its native shape.
         assert_eq!(request["messages"][0]["content"], "hi");
 
-        // Declared values win over the derived account id.
         let mut declared = FakeConfig::default();
         declared.identity.account_uuid = Some("declared-account".into());
         let declared = identity.claude_turn_context(&declared);
