@@ -70,8 +70,9 @@ const DEFAULT_LOG_FILE: &str = "logs/combined.log";
 const MAX_FAKE_EXTRA_ENTRIES: usize = 16;
 const MAX_FAKE_EXTRA_KEY_BYTES: usize = 64;
 const MAX_FAKE_EXTRA_VALUE_BYTES: usize = 128;
-/// Keys the turn metadata owns. A declared `[fake.extra]` entry may not shadow
-/// them, mirroring the reserved-key rule the upstream metadata shape applies.
+/// Keys the Codex turn metadata owns. A declared `[fake.codex.extra]` entry may
+/// not shadow them, mirroring the reserved-key rule the upstream metadata shape
+/// applies.
 const RESERVED_FAKE_EXTRA_KEYS: &[&str] = &[
     "installation_id",
     "x-codex-installation-id",
@@ -567,20 +568,26 @@ impl std::fmt::Debug for JevReviewConfig {
 /// Every field is optional. Absent values resolve in [`crate::fake`] rather
 /// than here: outward-facing attributes (OS, architecture, terminal, working
 /// directory) come from the real host, identity values are generated, and
-/// attributes letcode has no equivalent for fall back to Codex-typical values.
+/// attributes letcode has no equivalent for fall back to the imitated client's
+/// typical values. Identity and clock describe the session, so they are shared;
+/// the two imitated clients report different attributes and therefore each own
+/// a profile section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeConfig {
     pub identity: FakeIdentityConfig,
     pub clock: FakeClockConfig,
-    pub client: FakeClientProfileConfig,
-    pub environment: FakeEnvironmentConfig,
-    pub extra: IndexMap<String, String>,
+    pub codex: FakeCodexConfig,
+    pub claude: FakeClaudeConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeIdentityConfig {
     pub installation_id: Option<String>,
     pub agent_name: Option<String>,
+    /// Account identifier the Claude profile reports in `metadata.user_id`.
+    /// Absent values are derived from the installation id, so a stable account
+    /// id needs no second persisted identifier.
+    pub account_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -593,18 +600,15 @@ pub struct FakeClockConfig {
     pub date: Option<String>,
 }
 
+/// Values the Codex Responses profile reports about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FakeClientProfileConfig {
+pub struct FakeCodexConfig {
     pub version: Option<String>,
     pub originator: Option<String>,
     pub os: Option<String>,
     pub arch: Option<String>,
     pub terminal: Option<String>,
     pub beta_features: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FakeEnvironmentConfig {
     pub sandbox: Option<String>,
     pub sandbox_mode: Option<String>,
     pub auto_review_enabled: Option<bool>,
@@ -616,6 +620,19 @@ pub struct FakeEnvironmentConfig {
     pub git_commit_hash: Option<String>,
     pub git_remote_url: Option<String>,
     pub git_has_changes: Option<bool>,
+    pub extra: IndexMap<String, String>,
+}
+
+/// Values the Claude Code Messages profile reports about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeClaudeConfig {
+    pub version: Option<String>,
+    pub package_version: Option<String>,
+    pub runtime_version: Option<String>,
+    pub timeout: Option<String>,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub betas: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -771,10 +788,8 @@ struct RawAppConfig {
 struct RawFakeConfig {
     identity: Option<RawFakeIdentityConfig>,
     clock: Option<RawFakeClockConfig>,
-    client: Option<RawFakeClientConfig>,
-    environment: Option<RawFakeEnvironmentConfig>,
-    #[serde(default)]
-    extra: IndexMap<String, String>,
+    codex: Option<RawFakeCodexConfig>,
+    claude: Option<RawFakeClaudeConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -782,6 +797,7 @@ struct RawFakeConfig {
 struct RawFakeIdentityConfig {
     installation_id: Option<String>,
     agent_name: Option<String>,
+    account_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -793,18 +809,13 @@ struct RawFakeClockConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawFakeClientConfig {
+struct RawFakeCodexConfig {
     version: Option<String>,
     originator: Option<String>,
     os: Option<String>,
     arch: Option<String>,
     terminal: Option<String>,
     beta_features: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawFakeEnvironmentConfig {
     sandbox: Option<String>,
     sandbox_mode: Option<String>,
     auto_review_enabled: Option<bool>,
@@ -816,6 +827,20 @@ struct RawFakeEnvironmentConfig {
     git_commit_hash: Option<String>,
     git_remote_url: Option<String>,
     git_has_changes: Option<bool>,
+    #[serde(default)]
+    extra: IndexMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFakeClaudeConfig {
+    version: Option<String>,
+    package_version: Option<String>,
+    runtime_version: Option<String>,
+    timeout: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    betas: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1295,8 +1320,8 @@ fn build_tools_config(raw: RawToolsConfig) -> Result<ToolsConfig> {
 fn build_fake_config(raw: RawFakeConfig) -> Result<FakeConfig> {
     let identity = raw.identity.unwrap_or_default();
     let clock = raw.clock.unwrap_or_default();
-    let client = raw.client.unwrap_or_default();
-    let environment = raw.environment.unwrap_or_default();
+    let codex = raw.codex.unwrap_or_default();
+    let claude = raw.claude.unwrap_or_default();
 
     Ok(FakeConfig {
         identity: FakeIdentityConfig {
@@ -1305,60 +1330,68 @@ fn build_fake_config(raw: RawFakeConfig) -> Result<FakeConfig> {
                 identity.installation_id,
             )?,
             agent_name: optional_non_empty("fake.identity.agent_name", identity.agent_name)?,
+            account_uuid: optional_non_empty("fake.identity.account_uuid", identity.account_uuid)?,
         },
         clock: FakeClockConfig {
             timezone: optional_non_empty("fake.clock.timezone", clock.timezone)?,
             date: optional_non_empty("fake.clock.date", clock.date)?,
         },
-        client: FakeClientProfileConfig {
-            version: optional_non_empty("fake.client.version", client.version)?,
-            originator: optional_non_empty("fake.client.originator", client.originator)?,
-            os: optional_non_empty("fake.client.os", client.os)?,
-            arch: optional_non_empty("fake.client.arch", client.arch)?,
-            terminal: optional_non_empty("fake.client.terminal", client.terminal)?,
-            beta_features: client.beta_features,
-        },
-        environment: FakeEnvironmentConfig {
-            sandbox: optional_non_empty("fake.environment.sandbox", environment.sandbox)?,
-            sandbox_mode: optional_non_empty(
-                "fake.environment.sandbox_mode",
-                environment.sandbox_mode,
-            )?,
-            auto_review_enabled: environment.auto_review_enabled,
-            node_repl_auto_review_required: environment.node_repl_auto_review_required,
-            node_repl_disabled: environment.node_repl_disabled,
-            cwd: optional_non_empty("fake.environment.cwd", environment.cwd)?,
-            workspace: optional_non_empty("fake.environment.workspace", environment.workspace)?,
-            shell: optional_non_empty("fake.environment.shell", environment.shell)?,
+        codex: FakeCodexConfig {
+            version: optional_non_empty("fake.codex.version", codex.version)?,
+            originator: optional_non_empty("fake.codex.originator", codex.originator)?,
+            os: optional_non_empty("fake.codex.os", codex.os)?,
+            arch: optional_non_empty("fake.codex.arch", codex.arch)?,
+            terminal: optional_non_empty("fake.codex.terminal", codex.terminal)?,
+            beta_features: codex.beta_features,
+            sandbox: optional_non_empty("fake.codex.sandbox", codex.sandbox)?,
+            sandbox_mode: optional_non_empty("fake.codex.sandbox_mode", codex.sandbox_mode)?,
+            auto_review_enabled: codex.auto_review_enabled,
+            node_repl_auto_review_required: codex.node_repl_auto_review_required,
+            node_repl_disabled: codex.node_repl_disabled,
+            cwd: optional_non_empty("fake.codex.cwd", codex.cwd)?,
+            workspace: optional_non_empty("fake.codex.workspace", codex.workspace)?,
+            shell: optional_non_empty("fake.codex.shell", codex.shell)?,
             git_commit_hash: optional_non_empty(
-                "fake.environment.git_commit_hash",
-                environment.git_commit_hash,
+                "fake.codex.git_commit_hash",
+                codex.git_commit_hash,
             )?,
-            git_remote_url: optional_non_empty(
-                "fake.environment.git_remote_url",
-                environment.git_remote_url,
-            )?,
-            git_has_changes: environment.git_has_changes,
+            git_remote_url: optional_non_empty("fake.codex.git_remote_url", codex.git_remote_url)?,
+            git_has_changes: codex.git_has_changes,
+            extra: build_fake_extra(codex.extra)?,
         },
-        extra: build_fake_extra(raw.extra)?,
+        claude: FakeClaudeConfig {
+            version: optional_non_empty("fake.claude.version", claude.version)?,
+            package_version: optional_non_empty(
+                "fake.claude.package_version",
+                claude.package_version,
+            )?,
+            runtime_version: optional_non_empty(
+                "fake.claude.runtime_version",
+                claude.runtime_version,
+            )?,
+            timeout: optional_non_empty("fake.claude.timeout", claude.timeout)?,
+            os: optional_non_empty("fake.claude.os", claude.os)?,
+            arch: optional_non_empty("fake.claude.arch", claude.arch)?,
+            betas: claude.betas,
+        },
     })
 }
 
 fn build_fake_extra(extra: IndexMap<String, String>) -> Result<IndexMap<String, String>> {
     if extra.len() > MAX_FAKE_EXTRA_ENTRIES {
-        bail!("fake.extra may contain at most {MAX_FAKE_EXTRA_ENTRIES} entries");
+        bail!("fake.codex.extra may contain at most {MAX_FAKE_EXTRA_ENTRIES} entries");
     }
     for (key, value) in &extra {
         if key.len() > MAX_FAKE_EXTRA_KEY_BYTES || !valid_fake_extra_key(key) {
-            bail!("fake.extra keys must be short ASCII identifiers: '{key}'");
+            bail!("fake.codex.extra keys must be short ASCII identifiers: '{key}'");
         }
         if value.len() > MAX_FAKE_EXTRA_VALUE_BYTES {
             bail!(
-                "fake.extra values may contain at most {MAX_FAKE_EXTRA_VALUE_BYTES} bytes: '{key}'"
+                "fake.codex.extra values may contain at most {MAX_FAKE_EXTRA_VALUE_BYTES} bytes: '{key}'"
             );
         }
         if RESERVED_FAKE_EXTRA_KEYS.contains(&key.as_str()) {
-            bail!("fake.extra may not declare the reserved key '{key}'");
+            bail!("fake.codex.extra may not declare the reserved key '{key}'");
         }
     }
     Ok(extra)
@@ -2385,18 +2418,26 @@ model_override = "wire-model"
             r#"[fake.identity]
 installation_id = "declared-installation"
 agent_name = "declared-agent"
+account_uuid = "declared-account"
 [fake.clock]
 timezone = "Asia/Shanghai"
 date = "2026-01-02"
-[fake.client]
+[fake.codex]
 version = "1.2.3"
 originator = "codex_cli_rs"
 beta_features = ["one", "two"]
-[fake.environment]
 sandbox_mode = "read-only"
 auto_review_enabled = true
-[fake.extra]
+[fake.codex.extra]
 custom_key = "custom value"
+[fake.claude]
+version = "2.1.69"
+package_version = "0.74.0"
+runtime_version = "v22.16.0"
+timeout = "600"
+os = "MacOS"
+arch = "x64"
+betas = ["claude-code-20250219"]
 "#,
         )))
         .expect("config should load");
@@ -2409,21 +2450,43 @@ custom_key = "custom value"
             loaded.fake.identity.agent_name.as_deref(),
             Some("declared-agent")
         );
+        assert_eq!(
+            loaded.fake.identity.account_uuid.as_deref(),
+            Some("declared-account")
+        );
         assert_eq!(loaded.fake.clock.timezone.as_deref(), Some("Asia/Shanghai"));
         assert_eq!(loaded.fake.clock.date.as_deref(), Some("2026-01-02"));
-        assert_eq!(loaded.fake.client.version.as_deref(), Some("1.2.3"));
+        assert_eq!(loaded.fake.codex.version.as_deref(), Some("1.2.3"));
         assert_eq!(
-            loaded.fake.client.beta_features.as_deref(),
+            loaded.fake.codex.beta_features.as_deref(),
             Some(["one".to_string(), "two".to_string()].as_slice())
         );
+        assert_eq!(loaded.fake.codex.sandbox_mode.as_deref(), Some("read-only"));
+        assert_eq!(loaded.fake.codex.auto_review_enabled, Some(true));
         assert_eq!(
-            loaded.fake.environment.sandbox_mode.as_deref(),
-            Some("read-only")
-        );
-        assert_eq!(loaded.fake.environment.auto_review_enabled, Some(true));
-        assert_eq!(
-            loaded.fake.extra.get("custom_key").map(String::as_str),
+            loaded
+                .fake
+                .codex
+                .extra
+                .get("custom_key")
+                .map(String::as_str),
             Some("custom value")
+        );
+        assert_eq!(loaded.fake.claude.version.as_deref(), Some("2.1.69"));
+        assert_eq!(
+            loaded.fake.claude.package_version.as_deref(),
+            Some("0.74.0")
+        );
+        assert_eq!(
+            loaded.fake.claude.runtime_version.as_deref(),
+            Some("v22.16.0")
+        );
+        assert_eq!(loaded.fake.claude.timeout.as_deref(), Some("600"));
+        assert_eq!(loaded.fake.claude.os.as_deref(), Some("MacOS"));
+        assert_eq!(loaded.fake.claude.arch.as_deref(), Some("x64"));
+        assert_eq!(
+            loaded.fake.claude.betas.as_deref(),
+            Some(["claude-code-20250219".to_string()].as_slice())
         );
     }
 
@@ -2454,7 +2517,7 @@ custom_key = "custom value"
         let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
-            "[fake.extra]\nsession_id = \"other\"\n",
+            "[fake.codex.extra]\nsession_id = \"other\"\n",
         )))
         .expect_err("config should be rejected");
         assert!(format!("{error:#}").contains("reserved key 'session_id'"));
@@ -2462,7 +2525,7 @@ custom_key = "custom value"
         let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
-            "[fake.extra]\nworkspaces = \"text\"\n",
+            "[fake.codex.extra]\nworkspaces = \"text\"\n",
         )))
         .expect_err("config should be rejected");
         assert!(format!("{error:#}").contains("reserved key 'workspaces'"));
@@ -2476,7 +2539,7 @@ custom_key = "custom value"
         let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
-            &format!("[fake.extra]\n{too_many}"),
+            &format!("[fake.codex.extra]\n{too_many}"),
         )))
         .expect_err("config should be rejected");
         assert!(format!("{error:#}").contains("at most 16 entries"));
@@ -2484,7 +2547,7 @@ custom_key = "custom value"
         let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
-            "[fake.extra]\n\"1bad\" = \"value\"\n",
+            "[fake.codex.extra]\n\"1bad\" = \"value\"\n",
         )))
         .expect_err("config should be rejected");
         assert!(format!("{error:#}").contains("must be short ASCII identifiers"));
@@ -2493,7 +2556,7 @@ custom_key = "custom value"
         let error = AppConfig::load_from_path(write_temp_config(config(
             "openai",
             "model",
-            &format!("[fake.extra]\nkey = \"{long}\"\n"),
+            &format!("[fake.codex.extra]\nkey = \"{long}\"\n"),
         )))
         .expect_err("config should be rejected");
         assert!(format!("{error:#}").contains("at most 128 bytes"));

@@ -1,5 +1,5 @@
 use super::{FailureKind, FailurePhase, ModelFailure, PreparedHttpRequest, ProtocolId};
-use crate::fake::{CodexRequestContext, FakeClient};
+use crate::fake::{FakeClient, FakeRequestContext};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeRequestDecorator {
     client: FakeClient,
-    context: CodexRequestContext,
+    context: FakeRequestContext,
     /// The WebSocket transport negotiates its protocol version with a beta
     /// header the HTTP transport does not send.
     responses_websocket: bool,
@@ -17,10 +17,14 @@ impl FakeRequestDecorator {
     pub fn new(
         client: FakeClient,
         protocol_id: &ProtocolId,
-        context: CodexRequestContext,
+        context: FakeRequestContext,
         responses_websocket: bool,
     ) -> Result<Self, ModelFailure> {
-        if !client.supports_protocol_id(protocol_id) {
+        // The context is resolved for the route's protocol, so a mismatch means
+        // the caller paired a profile with the wrong transport.
+        if !client.supports_protocol_id(protocol_id)
+            || !context.profile().supports_protocol_id(protocol_id)
+        {
             return Err(
                 ModelFailure::new(FailurePhase::Prepare, FailureKind::UnsupportedProtocol)
                     .with_code("fake_protocol_mismatch"),
@@ -46,20 +50,12 @@ impl FakeRequestDecorator {
                     .with_code("fake_protocol_mismatch"),
             );
         }
-        match protocol_id.as_str() {
-            "responses" => {
-                let mut body = serde_json::from_slice::<Value>(&request.body).map_err(|error| {
-                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
-                        .with_code("fake_request_body")
-                        .with_detail(error.to_string())
+        match (protocol_id.as_str(), &self.context) {
+            ("responses", FakeRequestContext::Codex(context)) => {
+                request.body = rewrite_body(&request.body, |body| {
+                    crate::fake::apply_codex_response_shape(body, context);
                 })?;
-                crate::fake::apply_codex_response_shape(&mut body, &self.context);
-                request.body = serde_json::to_vec(&body).map_err(|error| {
-                    ModelFailure::new(FailurePhase::Prepare, FailureKind::Internal)
-                        .with_code("fake_request_serialization")
-                        .with_detail(error.to_string())
-                })?;
-                let mut headers = self.context.headers();
+                let mut headers = context.headers();
                 if self.responses_websocket {
                     headers.push((
                         "openai-beta".into(),
@@ -68,8 +64,11 @@ impl FakeRequestDecorator {
                 }
                 self.merge_headers(&mut request, headers)?;
             }
-            "anthropic" => {
-                self.merge_headers(&mut request, self.context.anthropic_headers())?;
+            ("anthropic", FakeRequestContext::Claude(context)) => {
+                request.body = rewrite_body(&request.body, |body| {
+                    crate::fake::apply_claude_body_shape(body, context);
+                })?;
+                self.replace_headers(&mut request, context.headers())?;
             }
             _ => {
                 return Err(ModelFailure::new(
@@ -80,6 +79,32 @@ impl FakeRequestDecorator {
             }
         }
         Ok(request)
+    }
+
+    /// Installs headers the profile owns, replacing whatever the adapter set
+    /// under the same name: for those names the disguise *is* the transport
+    /// identity, so the declared profile wins over the adapter default.
+    fn replace_headers(
+        &self,
+        request: &mut PreparedHttpRequest,
+        headers: Vec<(String, String)>,
+    ) -> Result<(), ModelFailure> {
+        for (name, value) in headers {
+            let normalized = name.to_ascii_lowercase();
+            let name =
+                reqwest::header::HeaderName::from_bytes(normalized.as_bytes()).map_err(|_| {
+                    ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                        .with_code("invalid_fake_header_name")
+                })?;
+            reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+                    .with_code("invalid_fake_header_value")
+            })?;
+            request
+                .protocol_headers
+                .insert(name.as_str().to_owned(), value);
+        }
+        Ok(())
     }
 
     fn merge_headers(
@@ -120,10 +145,26 @@ impl FakeRequestDecorator {
     }
 }
 
+/// Rewrites an adapter-prepared JSON body through `apply`, keeping the
+/// adapter's own error classification.
+fn rewrite_body(body: &[u8], apply: impl FnOnce(&mut Value)) -> Result<Vec<u8>, ModelFailure> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
+        ModelFailure::new(FailurePhase::Prepare, FailureKind::InvalidRequest)
+            .with_code("fake_request_body")
+            .with_detail(error.to_string())
+    })?;
+    apply(&mut value);
+    serde_json::to_vec(&value).map_err(|error| {
+        ModelFailure::new(FailurePhase::Prepare, FailureKind::Internal)
+            .with_code("fake_request_serialization")
+            .with_detail(error.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::CodexIdentity;
+    use crate::fake::{FakeIdentity, FakeRequestContext};
     use crate::model_runtime::{HttpMethod, ModelStreamDecoder, TerminalStatus};
     use std::collections::BTreeMap;
 
@@ -143,13 +184,26 @@ mod tests {
         }
     }
 
+    fn codex_context() -> FakeRequestContext {
+        FakeRequestContext::Codex(
+            FakeIdentity::new("fake-installation")
+                .turn_context(&crate::config::FakeConfig::default(), None),
+        )
+    }
+
+    fn claude_context() -> FakeRequestContext {
+        FakeRequestContext::Claude(
+            FakeIdentity::new("fake-installation")
+                .claude_turn_context(&crate::config::FakeConfig::default()),
+        )
+    }
+
     #[test]
     fn codex_decorator_carries_declared_metadata_without_credentials() {
         let protocol = ProtocolId::new("responses").unwrap();
-        let context = CodexIdentity::new("fake-installation")
-            .turn_context(&crate::config::FakeConfig::default(), None);
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Codex, &protocol, context, false).unwrap();
+            FakeRequestDecorator::new(FakeClient::Codex, &protocol, codex_context(), false)
+                .unwrap();
         let decorated = decorator
             .decorate(
                 &protocol,
@@ -204,12 +258,11 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_decorator_preserves_native_body_and_reserved_headers() {
+    fn anthropic_decorator_carries_the_claude_code_profile() {
         let protocol = ProtocolId::new("anthropic").unwrap();
-        let context = CodexIdentity::new("fake-installation")
-            .turn_context(&crate::config::FakeConfig::default(), None);
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, context, false).unwrap();
+            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
+                .unwrap();
         let original = serde_json::json!({
             "model":"claude",
             "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
@@ -218,31 +271,127 @@ mod tests {
         let decorated = decorator
             .decorate(&protocol, request("anthropic", original.clone()))
             .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&decorated.body).unwrap(),
-            original
-        );
+        let body: Value = serde_json::from_slice(&decorated.body).unwrap();
+        // The prompt and tools keep their native shape; only the client
+        // identity the body reports is added.
+        assert_eq!(body["model"], original["model"]);
+        assert_eq!(body["messages"], original["messages"]);
+        assert_eq!(body["stream"], original["stream"]);
+        let user_id = body["metadata"]["user_id"].as_str().expect("user id");
+        assert!(user_id.contains("fake-installation"), "{user_id}");
+        assert!(user_id.contains("session_id"), "{user_id}");
+
+        // The adapter's own transport defaults survive.
         assert_eq!(
             decorated.protocol_headers["anthropic-version"],
             "2023-06-01"
         );
-        assert_eq!(decorated.protocol_headers["accept"], "text/event-stream");
-        assert!(decorated.protocol_headers.contains_key("originator"));
+        // The profile owns `accept`: the client sends application/json rather
+        // than the adapter's text/event-stream.
+        assert_eq!(decorated.protocol_headers["accept"], "application/json");
+        assert_eq!(decorated.protocol_headers["x-app"], "cli");
+        let user_agent = &decorated.protocol_headers["user-agent"];
+        assert!(user_agent.starts_with("claude-cli/"), "{user_agent}");
+        assert!(user_agent.ends_with("(external, cli)"), "{user_agent}");
+        assert!(decorated.protocol_headers.contains_key("anthropic-beta"));
+        assert!(
+            decorated
+                .protocol_headers
+                .contains_key("x-claude-code-session-id")
+        );
+        // Codex-only transport identity must not leak into this profile.
+        assert!(!decorated.protocol_headers.contains_key("originator"));
+        assert!(
+            !decorated
+                .protocol_headers
+                .contains_key("x-codex-turn-metadata")
+        );
+    }
+
+    #[test]
+    fn claude_requests_share_the_session_but_not_the_request_id() {
+        let protocol = ProtocolId::new("anthropic").unwrap();
+        let decorator =
+            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
+                .unwrap();
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        // One turn sends several requests through one decorator.
+        let first = decorator
+            .decorate(&protocol, request("anthropic", body.clone()))
+            .unwrap();
+        let second = decorator
+            .decorate(&protocol, request("anthropic", body))
+            .unwrap();
+
+        assert_eq!(
+            first.protocol_headers["x-claude-code-session-id"],
+            second.protocol_headers["x-claude-code-session-id"]
+        );
+        assert_ne!(
+            first.protocol_headers["x-client-request-id"],
+            second.protocol_headers["x-client-request-id"]
+        );
+        let session = |decorated: &PreparedHttpRequest| {
+            let body: Value = serde_json::from_slice(&decorated.body).unwrap();
+            body["metadata"]["user_id"]
+                .as_str()
+                .expect("user id")
+                .to_string()
+        };
+        assert_eq!(session(&first), session(&second));
+        assert!(session(&first).contains(&first.protocol_headers["x-claude-code-session-id"]));
+    }
+
+    #[test]
+    fn claude_profile_replaces_the_adapter_transport_values() {
+        let protocol = ProtocolId::new("anthropic").unwrap();
+        let decorator =
+            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
+                .unwrap();
+        let mut prepared = request("anthropic", serde_json::json!({"model": "claude"}));
+        prepared
+            .protocol_headers
+            .insert("anthropic-beta".into(), "provider-beta".into());
+        prepared
+            .protocol_headers
+            .insert("accept".into(), "text/event-stream".into());
+
+        let decorated = decorator.decorate(&protocol, prepared).unwrap();
+        // The profile declares the client's capabilities, so its own values
+        // win over whatever the adapter negotiated.
+        let beta = &decorated.protocol_headers["anthropic-beta"];
+        assert!(!beta.contains("provider-beta"), "{beta}");
+        assert!(beta.starts_with("claude-code-"), "{beta}");
+        assert_eq!(decorated.protocol_headers["accept"], "application/json");
     }
 
     #[test]
     fn decorator_rejects_incompatible_protocols() {
-        let context = CodexIdentity::new("fake-installation")
-            .turn_context(&crate::config::FakeConfig::default(), None);
         let completions = ProtocolId::new("completions").unwrap();
-        assert!(FakeRequestDecorator::new(FakeClient::Auto, &completions, context, false).is_err());
+        assert!(
+            FakeRequestDecorator::new(FakeClient::Auto, &completions, codex_context(), false)
+                .is_err()
+        );
+        // The conversation profile and the route protocol must agree.
+        let responses = ProtocolId::new("responses").unwrap();
+        assert!(
+            FakeRequestDecorator::new(FakeClient::Codex, &responses, claude_context(), false)
+                .is_err()
+        );
+        let anthropic = ProtocolId::new("anthropic").unwrap();
+        assert!(
+            FakeRequestDecorator::new(FakeClient::Anthropic, &anthropic, codex_context(), false)
+                .is_err()
+        );
     }
 
     #[test]
     fn only_websocket_responses_requests_carry_the_beta_header() {
         let protocol = ProtocolId::new("responses").unwrap();
-        let context = CodexIdentity::new("fake-installation")
-            .turn_context(&crate::config::FakeConfig::default(), None);
         let body = serde_json::json!({
             "model": "gpt",
             "instructions": "system",
@@ -250,16 +399,17 @@ mod tests {
             "tools": []
         });
 
-        let http = FakeRequestDecorator::new(FakeClient::Codex, &protocol, context.clone(), false)
+        let http = FakeRequestDecorator::new(FakeClient::Codex, &protocol, codex_context(), false)
             .unwrap()
             .decorate(&protocol, request("responses", body.clone()))
             .unwrap();
         assert!(!http.protocol_headers.contains_key("openai-beta"));
 
-        let websocket = FakeRequestDecorator::new(FakeClient::Codex, &protocol, context, true)
-            .unwrap()
-            .decorate(&protocol, request("responses", body))
-            .unwrap();
+        let websocket =
+            FakeRequestDecorator::new(FakeClient::Codex, &protocol, codex_context(), true)
+                .unwrap()
+                .decorate(&protocol, request("responses", body))
+                .unwrap();
         assert_eq!(
             websocket.protocol_headers["openai-beta"],
             crate::fake::CODEX_RESPONSES_WEBSOCKET_BETA

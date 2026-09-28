@@ -166,6 +166,16 @@ fn test_agent() -> Agent {
     Agent::new("m1", 4, 4)
 }
 
+fn codex_context(agent: &Agent) -> crate::fake::CodexRequestContext {
+    match agent
+        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .expect("codex fake context is available")
+    {
+        crate::fake::FakeRequestContext::Codex(context) => context,
+        crate::fake::FakeRequestContext::Claude(_) => panic!("expected the codex profile"),
+    }
+}
+
 #[test]
 fn fake_modes_select_only_their_target_protocol() {
     let mut agent = test_agent();
@@ -227,7 +237,7 @@ fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
     let mut agent = test_agent();
     let mut declared = crate::config::FakeConfig::default();
     declared.identity.installation_id = Some("declared-installation".into());
-    declared.client.version = Some("9.9.9".into());
+    declared.codex.version = Some("9.9.9".into());
     declared.clock.timezone = Some("Asia/Shanghai".into());
     declared.clock.date = Some("2001-02-03".into());
     // Startup installs the declared values even with the fake switched off.
@@ -236,9 +246,7 @@ fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
     agent
         .set_fake_client(Some(crate::fake::FakeClient::Codex))
         .expect("responses protocol supports codex fake");
-    let context = agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
-        .expect("fake context is available");
+    let context = codex_context(&agent);
     assert_eq!(context.installation_id, "declared-installation");
     assert_eq!(context.current_date.as_deref(), Some("2001-02-03"));
     assert_eq!(context.timezone, "Asia/Shanghai");
@@ -260,10 +268,7 @@ fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
         .set_fake_client(Some(crate::fake::FakeClient::Codex))
         .expect("responses protocol supports codex fake");
     assert_eq!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Codex)
-            .expect("fake context is available")
-            .installation_id,
+        codex_context(&agent).installation_id,
         "reloaded-installation"
     );
 }
@@ -277,21 +282,15 @@ fn fake_context_is_resolved_once_per_turn_and_has_no_provider_secret() {
     // Both consumers in a turn (the prompt block and the request decorator)
     // read one resolution, so they share an identity and the host facts behind
     // it are read from the system once.
-    let first = agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
-        .expect("fake context is available");
-    let second = agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
-        .expect("fake context remains available");
+    let first = codex_context(&agent);
+    let second = codex_context(&agent);
     assert_eq!(first, second);
 
     // The next turn resolves again and is its own turn.
     agent
         .try_prepare_turn_prelude()
         .expect("turn prelude can be prepared");
-    let next = agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
-        .expect("fake context is available for the next turn");
+    let next = codex_context(&agent);
     assert_eq!(next.session_id, first.session_id);
     assert_ne!(next.turn_id, first.turn_id);
 
@@ -306,17 +305,41 @@ fn declaring_a_fake_value_refreshes_the_cached_turn_context() {
     agent
         .set_fake_client(Some(crate::fake::FakeClient::Codex))
         .expect("responses protocol supports codex fake");
-    let derived = agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
-        .expect("fake context is available");
+    let derived = codex_context(&agent);
     let mut declared = crate::config::FakeConfig::default();
     declared.clock.date = Some("2001-02-03".into());
     agent.set_fake_config(declared);
-    let refreshed = agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
-        .expect("fake context remains available");
+    let refreshed = codex_context(&agent);
     assert_ne!(derived.current_date, refreshed.current_date);
     assert_eq!(refreshed.current_date.as_deref(), Some("2001-02-03"));
+}
+
+#[test]
+fn the_anthropic_profile_resolves_the_claude_code_context() {
+    let mut agent = test_agent();
+    agent.set_default_protocol(ApiProtocol::Anthropic);
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
+        .expect("anthropic protocol supports the anthropic fake");
+    let context = agent
+        .fake_turn_context(crate::fake::FakeClient::Anthropic)
+        .expect("claude context is available");
+    let crate::fake::FakeRequestContext::Claude(context) = context else {
+        panic!("the anthropic profile must resolve the Claude context");
+    };
+    assert!(context.headers().iter().any(|(name, _)| name == "x-app"));
+    assert!(
+        !context
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "originator")
+    );
+    // The profile gate keeps the Codex context out of this agent.
+    assert!(
+        agent
+            .fake_turn_context(crate::fake::FakeClient::Codex)
+            .is_none()
+    );
 }
 
 #[test]
@@ -358,6 +381,46 @@ fn session_title_request_is_disguised_while_the_fake_is_on() {
         "the title request is scoped to the disguised session"
     );
     assert!(body.get("client_metadata").is_some());
+}
+
+#[test]
+fn anthropic_session_title_request_carries_the_claude_code_profile() {
+    let mut agent = test_agent();
+    agent.set_default_protocol(ApiProtocol::Anthropic);
+    install_active_epoch_route(&mut agent, ApiProtocol::Anthropic);
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
+        .expect("anthropic protocol supports the anthropic fake");
+
+    let title_agent = agent.session_title_agent();
+    let route = title_agent
+        .resolved_model_route()
+        .expect("the title helper shares the session route");
+    let decorator = super::protocol_stream::fake_request_decorator(&title_agent, route, false)
+        .expect("the title request carries the active fake");
+    let request = super::protocol_stream::prepare_oneshot_http_request(
+        route,
+        title_agent.active_model_metadata(),
+        &title_agent.prelude,
+        "rename this session",
+        Some(&decorator),
+    )
+    .expect("the title request is prepared");
+
+    let headers = &request.protocol_headers;
+    let user_agent = headers.get("user-agent").expect("client identity");
+    assert!(user_agent.starts_with("claude-cli/"), "{user_agent}");
+    assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
+    assert!(headers.contains_key("x-client-request-id"));
+    assert!(!headers.contains_key("originator"));
+    let session_id = headers
+        .get("x-claude-code-session-id")
+        .expect("session id is disguised");
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("the prepared body is JSON");
+    let user_id = body["metadata"]["user_id"].as_str().expect("user id");
+    assert!(user_id.contains(session_id.as_str()), "{user_id}");
 }
 
 #[test]

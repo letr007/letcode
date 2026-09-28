@@ -4,11 +4,14 @@
 //! prompt and tools, and the environment block letcode reports about itself. It
 //! deliberately does not replace the agent persona or the tool catalog.
 //!
-//! Declared values live in `[fake]` in `letcode.toml`. Absent values are derived
-//! rather than hardcoded wherever the real host can answer: OS, architecture,
-//! terminal, working directory, shell and repository state come from the machine
-//! running letcode, because a real client reports its real host too. Attributes
-//! letcode has no equivalent for fall back to Codex-typical values.
+//! Each protocol carries its own profile, because the imitated clients report
+//! different attributes: the Codex Responses profile and the Claude Code
+//! Messages profile. Declared values live in `[fake.codex]` and `[fake.claude]`
+//! in `letcode.toml`. Absent values are derived rather than hardcoded wherever
+//! the real host can answer: OS, architecture, terminal, working directory,
+//! shell and repository state come from the machine running letcode, because a
+//! real client reports its real host too. Attributes letcode has no equivalent
+//! for fall back to the imitated client's typical values.
 
 use crate::config::FakeConfig;
 use serde::{Deserialize, Serialize};
@@ -24,7 +27,7 @@ pub enum FakeClient {
     Auto,
     /// Apply the Codex Responses wire profile.
     Codex,
-    /// Apply the Anthropic Messages transport profile.
+    /// Apply the Claude Code Messages wire profile.
     Anthropic,
 }
 
@@ -67,13 +70,16 @@ impl FakeClient {
 }
 
 /// Stable synthetic identity used for one fake-enabled agent session.
+///
+/// Both profiles report the session it names; the Codex profile also reports it
+/// as the installation id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexIdentity {
+pub struct FakeIdentity {
     pub installation_id: String,
     pub session_id: String,
 }
 
-impl CodexIdentity {
+impl FakeIdentity {
     pub fn new(installation_id: impl Into<String>) -> Self {
         Self {
             installation_id: installation_id.into(),
@@ -81,15 +87,20 @@ impl CodexIdentity {
         }
     }
 
-    /// Resolves the per-turn context. Identity stays frozen for the session;
-    /// declared and host-derived values are re-resolved on every turn so a
-    /// configuration reload takes effect without rebuilding the session.
+    /// Resolves the per-turn Codex context. Identity stays frozen for the
+    /// session; declared and host-derived values are re-resolved on every turn
+    /// so a configuration reload takes effect without rebuilding the session.
     pub(crate) fn turn_context(
         &self,
         config: &FakeConfig,
         cwd: Option<&Path>,
     ) -> CodexRequestContext {
         CodexRequestContext::resolve(self, config, cwd)
+    }
+
+    /// Resolves the per-turn Claude Code context.
+    pub(crate) fn claude_turn_context(&self, config: &FakeConfig) -> ClaudeRequestContext {
+        ClaudeRequestContext::resolve(self, config)
     }
 }
 
@@ -151,14 +162,14 @@ mod defaults {
 }
 
 impl CodexRequestContext {
-    fn resolve(identity: &CodexIdentity, config: &FakeConfig, cwd: Option<&Path>) -> Self {
+    fn resolve(identity: &FakeIdentity, config: &FakeConfig, cwd: Option<&Path>) -> Self {
         let cwd = cwd
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("/"));
         let cwd_text = cwd.to_string_lossy().to_string();
         let workspace = config
-            .environment
+            .codex
             .workspace
             .clone()
             .unwrap_or_else(|| cwd_text.clone());
@@ -169,10 +180,10 @@ impl CodexRequestContext {
             None => date_in_timezone(&timezone),
         };
         // Only the git fields the configuration leaves open are read from the
-        // host, so a fully declared `[fake.environment]` spawns no subprocess.
-        let git = if config.environment.git_commit_hash.is_none()
-            || config.environment.git_remote_url.is_none()
-            || config.environment.git_has_changes.is_none()
+        // host, so a fully declared `[fake.codex]` spawns no subprocess.
+        let git = if config.codex.git_commit_hash.is_none()
+            || config.codex.git_remote_url.is_none()
+            || config.codex.git_has_changes.is_none()
         {
             probe_git(&cwd)
         } else {
@@ -187,24 +198,24 @@ impl CodexRequestContext {
             root_turn_id: synthetic_uuid(),
             started_at_unix_ms: unix_timestamp_ms(),
             version: config
-                .client
+                .codex
                 .version
                 .clone()
                 .unwrap_or_else(|| defaults::VERSION.to_string()),
             originator: config
-                .client
+                .codex
                 .originator
                 .clone()
                 .unwrap_or_else(|| defaults::ORIGINATOR.to_string()),
-            os: config.client.os.clone().unwrap_or_else(host_os),
-            arch: config.client.arch.clone().unwrap_or_else(host_arch),
+            os: config.codex.os.clone().unwrap_or_else(host_os),
+            arch: config.codex.arch.clone().unwrap_or_else(host_arch),
             terminal: config
-                .client
+                .codex
                 .terminal
                 .clone()
                 .or_else(host_terminal)
                 .unwrap_or_else(|| defaults::TERMINAL.to_string()),
-            beta_features: config.client.beta_features.clone().unwrap_or_else(|| {
+            beta_features: config.codex.beta_features.clone().unwrap_or_else(|| {
                 defaults::BETA_FEATURES
                     .iter()
                     .map(|value| (*value).to_string())
@@ -214,37 +225,33 @@ impl CodexRequestContext {
             current_date,
             agent_name: config.identity.agent_name.clone(),
             sandbox: config
-                .environment
+                .codex
                 .sandbox
                 .clone()
                 .unwrap_or_else(|| defaults::SANDBOX.to_string()),
             sandbox_mode: config
-                .environment
+                .codex
                 .sandbox_mode
                 .clone()
                 .unwrap_or_else(|| defaults::SANDBOX_MODE.to_string()),
-            auto_review_enabled: config.environment.auto_review_enabled.unwrap_or(false),
+            auto_review_enabled: config.codex.auto_review_enabled.unwrap_or(false),
             node_repl_auto_review_required: config
-                .environment
+                .codex
                 .node_repl_auto_review_required
                 .unwrap_or(false),
-            node_repl_disabled: config.environment.node_repl_disabled.unwrap_or(false),
-            cwd: config.environment.cwd.clone().unwrap_or(cwd_text),
+            node_repl_disabled: config.codex.node_repl_disabled.unwrap_or(false),
+            cwd: config.codex.cwd.clone().unwrap_or(cwd_text),
             workspace,
             shell: config
-                .environment
+                .codex
                 .shell
                 .clone()
                 .or_else(host_shell)
                 .unwrap_or_else(|| defaults::SHELL_FALLBACK.to_string()),
-            git_commit_hash: config
-                .environment
-                .git_commit_hash
-                .clone()
-                .or(git.commit_hash),
-            git_remote_url: config.environment.git_remote_url.clone().or(git.remote_url),
-            git_has_changes: config.environment.git_has_changes.or(git.has_changes),
-            extra: config.extra.clone(),
+            git_commit_hash: config.codex.git_commit_hash.clone().or(git.commit_hash),
+            git_remote_url: config.codex.git_remote_url.clone().or(git.remote_url),
+            git_has_changes: config.codex.git_has_changes.or(git.has_changes),
+            extra: config.codex.extra.clone(),
         }
     }
 
@@ -365,16 +372,6 @@ impl CodexRequestContext {
         body
     }
 
-    /// HTTP headers applied to Anthropic Messages requests when the fake is
-    /// active. The Messages body keeps its native shape; only transport
-    /// metadata is disguised.
-    pub fn anthropic_headers(&self) -> Vec<(String, String)> {
-        self.headers()
-            .into_iter()
-            .filter(|(name, _)| name != "accept")
-            .collect()
-    }
-
     pub fn client_metadata(&self) -> Value {
         serde_json::json!({
             "thread_id": self.thread_id,
@@ -386,6 +383,222 @@ impl CodexRequestContext {
             "root_turn_id": self.root_turn_id
         })
     }
+}
+
+/// Per-turn values injected into a Claude Code shaped Messages request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeRequestContext {
+    /// Session identity, frozen when the fake was enabled.
+    pub installation_id: String,
+    pub session_id: String,
+    pub version: String,
+    pub package_version: String,
+    pub runtime_version: String,
+    pub timeout: String,
+    pub os: String,
+    pub arch: String,
+    pub betas: Vec<String>,
+    /// Account the client reports in `metadata.user_id`.
+    pub account_uuid: String,
+}
+
+/// Claude Code-typical values for attributes letcode has no equivalent for.
+mod claude_defaults {
+    /// Snapshot of the imitated release. The values it implies (user agent,
+    /// package and runtime versions, beta set) describe one published client,
+    /// so they must be kept in sync together.
+    pub(super) const VERSION: &str = "2.1.69";
+    pub(super) const PACKAGE_VERSION: &str = "0.74.0";
+    pub(super) const RUNTIME_VERSION: &str = "v22.16.0";
+    pub(super) const TIMEOUT: &str = "600";
+    /// The surface the client reports itself running on, verbatim after the
+    /// version.
+    pub(super) const ENTRYPOINT: &str = "(external, cli)";
+    pub(super) const APP: &str = "cli";
+    pub(super) const LANG: &str = "js";
+    pub(super) const RUNTIME: &str = "node";
+    pub(super) const RETRY_COUNT: &str = "0";
+    pub(super) const BETAS: &[&str] = &[
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+        "adaptive-thinking-2026-01-28",
+        "context-management-2025-06-27",
+        "prompt-caching-scope-2026-01-05",
+        "advanced-tool-use-2025-11-20",
+        "effort-2025-11-24",
+    ];
+}
+
+impl ClaudeRequestContext {
+    fn resolve(identity: &FakeIdentity, config: &FakeConfig) -> Self {
+        let claude = &config.claude;
+        Self {
+            installation_id: identity.installation_id.clone(),
+            session_id: identity.session_id.clone(),
+            version: claude
+                .version
+                .clone()
+                .unwrap_or_else(|| claude_defaults::VERSION.to_string()),
+            package_version: claude
+                .package_version
+                .clone()
+                .unwrap_or_else(|| claude_defaults::PACKAGE_VERSION.to_string()),
+            runtime_version: claude
+                .runtime_version
+                .clone()
+                .unwrap_or_else(|| claude_defaults::RUNTIME_VERSION.to_string()),
+            timeout: claude
+                .timeout
+                .clone()
+                .unwrap_or_else(|| claude_defaults::TIMEOUT.to_string()),
+            os: claude.os.clone().unwrap_or_else(stainless_os),
+            arch: claude.arch.clone().unwrap_or_else(stainless_arch),
+            betas: claude.betas.clone().unwrap_or_else(|| {
+                claude_defaults::BETAS
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect()
+            }),
+            account_uuid: config
+                .identity
+                .account_uuid
+                .clone()
+                .unwrap_or_else(|| account_uuid_from(&identity.installation_id)),
+        }
+    }
+
+    pub fn user_agent(&self) -> String {
+        format!(
+            "claude-cli/{} {}",
+            self.version,
+            claude_defaults::ENTRYPOINT
+        )
+    }
+
+    /// HTTP headers the client sends on Messages requests. `user-agent`,
+    /// `accept` and `anthropic-beta` belong to the disguise, so they replace
+    /// the adapter's transport values instead of merging with them.
+    /// The request id is minted per call; the session id stays stable.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("accept".into(), "application/json".into()),
+            ("user-agent".into(), self.user_agent()),
+            ("x-app".into(), claude_defaults::APP.into()),
+            ("x-stainless-lang".into(), claude_defaults::LANG.into()),
+            (
+                "x-stainless-package-version".into(),
+                self.package_version.clone(),
+            ),
+            ("x-stainless-os".into(), self.os.clone()),
+            ("x-stainless-arch".into(), self.arch.clone()),
+            (
+                "x-stainless-runtime".into(),
+                claude_defaults::RUNTIME.into(),
+            ),
+            (
+                "x-stainless-runtime-version".into(),
+                self.runtime_version.clone(),
+            ),
+            (
+                "x-stainless-retry-count".into(),
+                claude_defaults::RETRY_COUNT.into(),
+            ),
+            ("x-stainless-timeout".into(), self.timeout.clone()),
+            (
+                "anthropic-dangerous-direct-browser-access".into(),
+                "true".into(),
+            ),
+            ("x-client-request-id".into(), synthetic_uuid()),
+            ("x-claude-code-session-id".into(), self.session_id.clone()),
+        ];
+        if !self.betas.is_empty() {
+            headers.push(("anthropic-beta".into(), self.betas.join(",")));
+        }
+        headers
+    }
+
+    /// The `metadata.user_id` the client reports: a JSON blob over the device,
+    /// account and session ids, with the session id matching the session the
+    /// transport headers name.
+    pub fn metadata_user_id(&self) -> String {
+        serde_json::json!({
+            "device_id": self.installation_id,
+            "account_uuid": self.account_uuid,
+            "session_id": self.session_id,
+        })
+        .to_string()
+    }
+}
+
+/// Per-turn values resolved for the profile the active protocol uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeRequestContext {
+    Codex(CodexRequestContext),
+    Claude(ClaudeRequestContext),
+}
+
+impl FakeRequestContext {
+    /// The profile that produced this context.
+    pub fn profile(&self) -> FakeClient {
+        match self {
+            Self::Codex(_) => FakeClient::Codex,
+            Self::Claude(_) => FakeClient::Anthropic,
+        }
+    }
+}
+
+/// Names the host OS the way the imitated client's HTTP layer reports it.
+fn stainless_os() -> String {
+    match std::env::consts::OS {
+        "macos" => "MacOS".to_string(),
+        "windows" => "Windows".to_string(),
+        "linux" => "Linux".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Names the host architecture the way the imitated client's HTTP layer
+/// reports it.
+fn stainless_arch() -> String {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        "x86" => "ia32".to_string(),
+        "arm" => "arm".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The account id the Claude profile reports is synthesized: letcode has no
+/// account to name. Deriving it from the installation id keeps it stable across
+/// sessions without persisting a second identifier, and it carries the
+/// version-4 shape the client's account ids share.
+fn account_uuid_from(installation_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(installation_id.as_bytes());
+    let mut hi_bytes = [0u8; 8];
+    let mut lo_bytes = [0u8; 8];
+    hi_bytes.copy_from_slice(&digest[..8]);
+    lo_bytes.copy_from_slice(&digest[8..16]);
+    let hi = (u64::from_be_bytes(hi_bytes) & 0xffff_ffff_ffff_0fff) | 0x4000;
+    let lo = (u64::from_be_bytes(lo_bytes) & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
+    format_uuid(hi, lo)
+}
+
+/// Writes the client identity the Messages body reports into `metadata`. The
+/// prompt and tools keep their native shape.
+pub fn apply_claude_body_shape(request: &mut Value, context: &ClaudeRequestContext) {
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    let metadata = object
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    metadata.insert("user_id".into(), Value::String(context.metadata_user_id()));
 }
 
 /// Rewrite a serialized OpenAI Responses request into the observed Codex
@@ -722,7 +935,7 @@ mod tests {
     use super::*;
 
     fn context() -> CodexRequestContext {
-        CodexIdentity::new("installation").turn_context(&FakeConfig::default(), None)
+        FakeIdentity::new("installation").turn_context(&FakeConfig::default(), None)
     }
 
     #[test]
@@ -780,7 +993,7 @@ mod tests {
 
     #[test]
     fn top_level_turns_carry_no_agent_name_unless_declared() {
-        let identity = CodexIdentity::new(synthetic_installation_id());
+        let identity = FakeIdentity::new(synthetic_installation_id());
         let derived = identity.turn_context(&crate::config::FakeConfig::default(), None);
         assert!(
             !derived
@@ -797,7 +1010,7 @@ mod tests {
 
     #[test]
     fn codex_identity_uses_stable_session_ids_within_a_context() {
-        let identity = CodexIdentity::new("installation");
+        let identity = FakeIdentity::new("installation");
         let context = identity.turn_context(&FakeConfig::default(), None);
 
         assert_eq!(context.session_id, context.thread_id);
@@ -808,28 +1021,31 @@ mod tests {
     #[test]
     fn declared_values_win_over_derived_defaults() {
         let mut config = FakeConfig::default();
-        config.client.version = Some("9.9.9".into());
-        config.client.originator = Some("codex_cli_rs".into());
-        config.client.os = Some("Plan9".into());
-        config.client.arch = Some("vax".into());
-        config.client.terminal = Some("vt100/1".into());
-        config.client.beta_features = Some(vec!["one".into(), "two".into()]);
+        config.codex.version = Some("9.9.9".into());
+        config.codex.originator = Some("codex_cli_rs".into());
+        config.codex.os = Some("Plan9".into());
+        config.codex.arch = Some("vax".into());
+        config.codex.terminal = Some("vt100/1".into());
+        config.codex.beta_features = Some(vec!["one".into(), "two".into()]);
         config.clock.timezone = Some("Asia/Shanghai".into());
         config.clock.date = Some("1999-01-01".into());
         config.identity.agent_name = Some("unit-test".into());
-        config.environment.sandbox = Some("seatbelt".into());
-        config.environment.sandbox_mode = Some("read-only".into());
-        config.environment.auto_review_enabled = Some(true);
-        config.environment.node_repl_disabled = Some(true);
-        config.environment.cwd = Some("/declared/cwd".into());
-        config.environment.workspace = Some("/declared/ws".into());
-        config.environment.shell = Some("fish".into());
-        config.environment.git_commit_hash = Some("deadbeef".into());
-        config.environment.git_remote_url = Some("https://example.test/repo.git".into());
-        config.environment.git_has_changes = Some(true);
-        config.extra.insert("custom_key".into(), "custom".into());
+        config.codex.sandbox = Some("seatbelt".into());
+        config.codex.sandbox_mode = Some("read-only".into());
+        config.codex.auto_review_enabled = Some(true);
+        config.codex.node_repl_disabled = Some(true);
+        config.codex.cwd = Some("/declared/cwd".into());
+        config.codex.workspace = Some("/declared/ws".into());
+        config.codex.shell = Some("fish".into());
+        config.codex.git_commit_hash = Some("deadbeef".into());
+        config.codex.git_remote_url = Some("https://example.test/repo.git".into());
+        config.codex.git_has_changes = Some(true);
+        config
+            .codex
+            .extra
+            .insert("custom_key".into(), "custom".into());
 
-        let context = CodexIdentity::new("installation").turn_context(&config, None);
+        let context = FakeIdentity::new("installation").turn_context(&config, None);
         let headers = context.headers();
         let user_agent = headers
             .iter()
@@ -867,8 +1083,8 @@ mod tests {
     #[test]
     fn environment_context_escapes_xml_text() {
         let mut config = FakeConfig::default();
-        config.environment.cwd = Some("/a<b>&\"c\"".into());
-        let context = CodexIdentity::new("installation").turn_context(&config, None);
+        config.codex.cwd = Some("/a<b>&\"c\"".into());
+        let context = FakeIdentity::new("installation").turn_context(&config, None);
         let block = context.environment_context_text();
 
         assert!(block.contains("/a&lt;b&gt;&amp;&quot;c&quot;"));
@@ -952,9 +1168,9 @@ mod tests {
     #[test]
     fn headers_expose_no_real_local_paths_unless_declared() {
         let mut config = FakeConfig::default();
-        config.environment.workspace = Some("/workspace".into());
-        config.environment.cwd = Some("/workspace".into());
-        let context = CodexIdentity::new("installation").turn_context(&config, None);
+        config.codex.workspace = Some("/workspace".into());
+        config.codex.cwd = Some("/workspace".into());
+        let context = FakeIdentity::new("installation").turn_context(&config, None);
         let headers = context.headers();
         let metadata = headers
             .iter()
@@ -967,23 +1183,118 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_headers_keep_identity_and_drop_duplicate_accept() {
-        let context = context();
-        let headers = context.anthropic_headers();
+    fn claude_headers_report_the_client_profile() {
+        let context = FakeIdentity::new("installation").claude_turn_context(&FakeConfig::default());
+        let headers = context.headers();
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.as_str())
+        };
 
-        assert!(
-            headers.iter().all(|(name, _)| name != "accept"),
-            "anthropic transport already sends its own Accept header"
+        assert_eq!(value("accept"), Some("application/json"));
+        assert_eq!(value("x-app"), Some("cli"));
+        assert_eq!(value("x-stainless-lang"), Some("js"));
+        assert_eq!(value("x-stainless-runtime"), Some("node"));
+        assert_eq!(value("x-stainless-retry-count"), Some("0"));
+        assert_eq!(
+            value("anthropic-dangerous-direct-browser-access"),
+            Some("true")
+        );
+        assert_eq!(
+            value("user-agent"),
+            Some(
+                format!(
+                    "claude-cli/{} (external, cli)",
+                    super::claude_defaults::VERSION
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            value("x-claude-code-session-id"),
+            Some(context.session_id.as_str())
         );
         assert!(
-            headers
-                .iter()
-                .any(|(name, value)| name == "originator" && !value.is_empty())
+            value("anthropic-beta")
+                .expect("beta header")
+                .starts_with("claude-code-")
         );
-        assert!(
+        // The Codex profile's transport identity does not appear here.
+        assert!(value("originator").is_none());
+        assert!(value("x-codex-turn-metadata").is_none());
+    }
+
+    #[test]
+    fn claude_request_id_is_minted_per_request() {
+        let context = FakeIdentity::new("installation").claude_turn_context(&FakeConfig::default());
+        let value = |headers: &[(String, String)], name: &str| {
             headers
                 .iter()
-                .any(|(name, _)| name == "x-codex-turn-metadata")
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        let first = context.headers();
+        let second = context.headers();
+        assert_ne!(
+            value(&first, "x-client-request-id"),
+            value(&second, "x-client-request-id")
+        );
+        // The session identity underneath stays stable.
+        assert_eq!(
+            value(&first, "x-claude-code-session-id"),
+            Some(context.session_id.clone())
+        );
+        assert_eq!(
+            value(&first, "x-claude-code-session-id"),
+            value(&second, "x-claude-code-session-id")
+        );
+    }
+
+    #[test]
+    fn claude_body_reports_the_session_as_metadata_user_id() {
+        let identity = FakeIdentity::new("installation");
+        let context = identity.claude_turn_context(&FakeConfig::default());
+        let mut request = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        apply_claude_body_shape(&mut request, &context);
+
+        let user_id = request["metadata"]["user_id"].as_str().expect("user id");
+        let decoded: Value = serde_json::from_str(user_id).expect("json blob");
+        assert_eq!(decoded["device_id"], "installation");
+        assert_eq!(decoded["session_id"], context.session_id.as_str());
+        assert_eq!(decoded["account_uuid"], context.account_uuid.as_str());
+        // The prompt keeps its native shape.
+        assert_eq!(request["messages"][0]["content"], "hi");
+
+        // Declared values win over the derived account id.
+        let mut declared = FakeConfig::default();
+        declared.identity.account_uuid = Some("declared-account".into());
+        let declared = identity.claude_turn_context(&declared);
+        assert_eq!(declared.account_uuid, "declared-account");
+    }
+
+    #[test]
+    fn claude_account_id_is_stable_per_installation() {
+        let identity = FakeIdentity::new("installation");
+        let first = identity
+            .claude_turn_context(&FakeConfig::default())
+            .account_uuid;
+        let second = identity
+            .claude_turn_context(&FakeConfig::default())
+            .account_uuid;
+        assert_eq!(first, second);
+        assert_eq!(first.as_bytes()[14], b'4', "account ids are version 4");
+        assert_ne!(
+            first,
+            FakeIdentity::new("other-installation")
+                .claude_turn_context(&FakeConfig::default())
+                .account_uuid
         );
     }
 }

@@ -727,13 +727,13 @@ pub struct Agent {
     fake_client: Option<crate::fake::FakeClient>,
     fake_installation_id: String,
     fake_config: crate::config::FakeConfig,
-    fake_identity: Option<crate::fake::CodexIdentity>,
+    fake_identity: Option<crate::fake::FakeIdentity>,
     /// Resolved once per turn: the prompt block and the request decorator are
     /// built at different points of the same turn, so resolving per call would
     /// read the clock and the repository twice and hand one turn two different
     /// identities. The guarded value is plain data, so a poisoned lock carries
     /// no broken invariant and is recovered from.
-    fake_context_cache: std::sync::Mutex<Option<(u64, crate::fake::CodexRequestContext)>>,
+    fake_context_cache: std::sync::Mutex<Option<(u64, crate::fake::FakeRequestContext)>>,
     resolved_model_route: Option<Arc<ResolvedModelRoute>>,
     resolved_runtime_catalog: Option<ResolvedRuntimeCatalog>,
     retained_route_preparations: HashMap<String, RetainedRoutePreparation>,
@@ -1614,7 +1614,7 @@ impl Agent {
             .installation_id
             .clone()
             .unwrap_or_else(|| self.fake_installation_id.clone());
-        self.fake_identity = client.map(|_| crate::fake::CodexIdentity::new(installation_id));
+        self.fake_identity = client.map(|_| crate::fake::FakeIdentity::new(installation_id));
         self.clear_fake_context_cache();
         Ok(())
     }
@@ -1635,11 +1635,12 @@ impl Agent {
         &self.fake_config
     }
 
-    /// Returns this turn's resolved fake context, computing it at most once.
+    /// Returns this turn's resolved fake context for `profile`, computing it at
+    /// most once per turn. Callers pass a concrete profile, never `Auto`.
     pub(crate) fn fake_turn_context(
         &self,
         profile: crate::fake::FakeClient,
-    ) -> Option<crate::fake::CodexRequestContext> {
+    ) -> Option<crate::fake::FakeRequestContext> {
         if self.fake_client != Some(crate::fake::FakeClient::Auto)
             && self.fake_client != Some(profile)
         {
@@ -1653,10 +1654,20 @@ impl Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((cached_turn_id, context)) = cache.as_ref()
             && *cached_turn_id == turn_id
+            && context.profile() == profile
         {
             return Some(context.clone());
         }
-        let context = identity.turn_context(&self.fake_config, None);
+        let context = match profile {
+            crate::fake::FakeClient::Anthropic => crate::fake::FakeRequestContext::Claude(
+                identity.claude_turn_context(&self.fake_config),
+            ),
+            crate::fake::FakeClient::Auto | crate::fake::FakeClient::Codex => {
+                crate::fake::FakeRequestContext::Codex(
+                    identity.turn_context(&self.fake_config, None),
+                )
+            }
+        };
         *cache = Some((turn_id, context.clone()));
         Some(context)
     }
@@ -5229,9 +5240,13 @@ fn default_agent_prelude() -> Vec<PromptMessage> {
 /// Resolves the Codex-shaped context when the Codex profile is active for the
 /// current protocol. The Anthropic profile keeps its native runtime context.
 fn fake_codex_context(agent: &Agent) -> Option<crate::fake::CodexRequestContext> {
-    (agent.active_protocol() == ApiProtocol::Responses)
-        .then(|| agent.fake_turn_context(crate::fake::FakeClient::Codex))
-        .flatten()
+    if agent.active_protocol() != ApiProtocol::Responses {
+        return None;
+    }
+    match agent.fake_turn_context(crate::fake::FakeClient::Codex)? {
+        crate::fake::FakeRequestContext::Codex(context) => Some(context),
+        crate::fake::FakeRequestContext::Claude(_) => None,
+    }
 }
 
 fn runtime_context_message(fake: Option<&crate::fake::CodexRequestContext>) -> PromptMessage {
