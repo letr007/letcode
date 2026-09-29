@@ -321,7 +321,6 @@ unreported = "Not reported"
 tokens = "Input {input} tokens · Output {output} tokens"
 cached = "Cached input: {tokens}"
 cache = "Cache event: read {read} tokens · written {write} tokens"
-usage_note = "Latest usage/cache updates shown separately, not summed. JSON retains all updates."
 
 [setup]
 title = "Set up letcode"

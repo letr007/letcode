@@ -282,7 +282,6 @@ pub(crate) fn render_report(
             width,
         );
     }
-    text(&mut doc, &tr.t("historian.usage_note"), muted, width);
     if options.sources {
         gap(&mut doc);
         text(
