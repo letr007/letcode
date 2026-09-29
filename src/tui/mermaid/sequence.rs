@@ -901,10 +901,9 @@ fn parse_note(
         (ir::MermaidNotePosition::Right, target)
     } else if let Some(target) = rest.strip_prefix("left of ") {
         (ir::MermaidNotePosition::Left, target)
-    } else if let Some(target) = rest.strip_prefix("over ") {
-        (ir::MermaidNotePosition::Over, target)
     } else {
-        return None;
+        let target = rest.strip_prefix("over ")?;
+        (ir::MermaidNotePosition::Over, target)
     };
     let colon = target.find(':')?;
     let raw_participants = target[..colon].trim();

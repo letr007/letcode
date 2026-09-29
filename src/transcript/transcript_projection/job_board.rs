@@ -366,7 +366,6 @@ pub(crate) fn project_job_board(
                 child_session_id,
                 agent_name,
                 summary,
-                pool_ordinal: _,
                 ..
             } if parent_session_id == &record.session_id
                 && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>

@@ -1090,7 +1090,7 @@ async fn secure_write_writable_leaf(
             .follow(FollowSymlinks::No);
         prepared
             .parent_dir
-            .open_with(&prepared.leaf_name(), &options)
+            .open_with(prepared.leaf_name(), &options)
             .map(cap_std::fs::File::into_std)
             .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?
     };

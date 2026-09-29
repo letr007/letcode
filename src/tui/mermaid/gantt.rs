@@ -341,7 +341,8 @@ fn resolve_task(
     let end_token = end_token.trim();
     let start = if let Some(date) = parse_date(start_token) {
         date
-    } else if let Some(id) = start_token.strip_prefix("after ") {
+    } else {
+        let id = start_token.strip_prefix("after ")?;
         let predecessor = *ids.get(id.trim())?;
         resolve_task(
             predecessor,
@@ -352,8 +353,6 @@ fn resolve_task(
             excludes_weekends,
         )?
         .1
-    } else {
-        return None;
     };
     let mut end = if let Some(date) = parse_date(end_token) {
         date
@@ -368,10 +367,9 @@ fn resolve_task(
             excludes_weekends,
         )?
         .0
-    } else if let Some(days) = duration_days(end_token) {
-        advance_duration(start, days, excludes_weekends)?
     } else {
-        return None;
+        let days = duration_days(end_token)?;
+        advance_duration(start, days, excludes_weekends)?
     };
     visiting.remove(&index);
     if end < start {

@@ -413,6 +413,7 @@ pub(super) fn open_config_lock_file(lock_path: &Path) -> Result<fs::File> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)
             .with_context(|| format!("failed to open config lock file {}", lock_path.display()))
     }

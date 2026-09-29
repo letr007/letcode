@@ -534,10 +534,7 @@ mod windows_native {
                         ));
                     }
                     _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "unexpected console wait result",
-                        ));
+                        return Err(io::Error::other("unexpected console wait result"));
                     }
                 }
 
@@ -927,6 +924,59 @@ mod windows_native {
         }
     }
 
+    fn native_key_code(virtual_key: u16) -> Option<KeyCode> {
+        let code = match virtual_key {
+            VK_BACK => KeyCode::Backspace,
+            VK_TAB => KeyCode::Tab,
+            VK_RETURN => KeyCode::Enter,
+            VK_ESCAPE => KeyCode::Esc,
+            VK_PRIOR => KeyCode::PageUp,
+            VK_NEXT => KeyCode::PageDown,
+            VK_END => KeyCode::End,
+            VK_HOME => KeyCode::Home,
+            VK_LEFT => KeyCode::Left,
+            VK_RIGHT => KeyCode::Right,
+            VK_UP => KeyCode::Up,
+            VK_DOWN => KeyCode::Down,
+            VK_INSERT => KeyCode::Insert,
+            VK_DELETE => KeyCode::Delete,
+            VK_CAPITAL => KeyCode::CapsLock,
+            VK_SCROLL => KeyCode::ScrollLock,
+            VK_NUMLOCK => KeyCode::NumLock,
+            VK_SNAPSHOT => KeyCode::PrintScreen,
+            VK_PAUSE => KeyCode::Pause,
+            VK_APPS => KeyCode::Menu,
+            VK_LSHIFT => KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            VK_RSHIFT => KeyCode::Modifier(ModifierKeyCode::RightShift),
+            VK_LCONTROL => KeyCode::Modifier(ModifierKeyCode::LeftControl),
+            VK_RCONTROL => KeyCode::Modifier(ModifierKeyCode::RightControl),
+            VK_LMENU => KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+            VK_RMENU => KeyCode::Modifier(ModifierKeyCode::RightAlt),
+            VK_LWIN => KeyCode::Modifier(ModifierKeyCode::LeftSuper),
+            VK_RWIN => KeyCode::Modifier(ModifierKeyCode::RightSuper),
+            VK_F1..=VK_F24 => KeyCode::F((virtual_key - VK_F1 + 1) as u8),
+            VK_NUMPAD0..=VK_NUMPAD9 => {
+                KeyCode::Char((b'0' + (virtual_key - VK_NUMPAD0) as u8) as char)
+            }
+            VK_MULTIPLY => KeyCode::Char('*'),
+            VK_ADD => KeyCode::Char('+'),
+            VK_SUBTRACT => KeyCode::Char('-'),
+            VK_DECIMAL => KeyCode::Char('.'),
+            VK_DIVIDE => KeyCode::Char('/'),
+            VK_BROWSER_BACK => KeyCode::Media(crossterm::event::MediaKeyCode::TrackPrevious),
+            VK_BROWSER_FORWARD => KeyCode::Media(crossterm::event::MediaKeyCode::TrackNext),
+            VK_VOLUME_MUTE => KeyCode::Media(crossterm::event::MediaKeyCode::MuteVolume),
+            VK_VOLUME_DOWN => KeyCode::Media(crossterm::event::MediaKeyCode::LowerVolume),
+            VK_VOLUME_UP => KeyCode::Media(crossterm::event::MediaKeyCode::RaiseVolume),
+            VK_MEDIA_NEXT_TRACK => KeyCode::Media(crossterm::event::MediaKeyCode::TrackNext),
+            VK_MEDIA_PREV_TRACK => KeyCode::Media(crossterm::event::MediaKeyCode::TrackPrevious),
+            VK_MEDIA_STOP => KeyCode::Media(crossterm::event::MediaKeyCode::Stop),
+            VK_MEDIA_PLAY_PAUSE => KeyCode::Media(crossterm::event::MediaKeyCode::PlayPause),
+            _ => return None,
+        };
+        Some(code)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1187,59 +1237,6 @@ mod windows_native {
             std::mem::forget(input);
         }
     }
-
-    fn native_key_code(virtual_key: u16) -> Option<KeyCode> {
-        let code = match virtual_key {
-            VK_BACK => KeyCode::Backspace,
-            VK_TAB => KeyCode::Tab,
-            VK_RETURN => KeyCode::Enter,
-            VK_ESCAPE => KeyCode::Esc,
-            VK_PRIOR => KeyCode::PageUp,
-            VK_NEXT => KeyCode::PageDown,
-            VK_END => KeyCode::End,
-            VK_HOME => KeyCode::Home,
-            VK_LEFT => KeyCode::Left,
-            VK_RIGHT => KeyCode::Right,
-            VK_UP => KeyCode::Up,
-            VK_DOWN => KeyCode::Down,
-            VK_INSERT => KeyCode::Insert,
-            VK_DELETE => KeyCode::Delete,
-            VK_CAPITAL => KeyCode::CapsLock,
-            VK_SCROLL => KeyCode::ScrollLock,
-            VK_NUMLOCK => KeyCode::NumLock,
-            VK_SNAPSHOT => KeyCode::PrintScreen,
-            VK_PAUSE => KeyCode::Pause,
-            VK_APPS => KeyCode::Menu,
-            VK_LSHIFT => KeyCode::Modifier(ModifierKeyCode::LeftShift),
-            VK_RSHIFT => KeyCode::Modifier(ModifierKeyCode::RightShift),
-            VK_LCONTROL => KeyCode::Modifier(ModifierKeyCode::LeftControl),
-            VK_RCONTROL => KeyCode::Modifier(ModifierKeyCode::RightControl),
-            VK_LMENU => KeyCode::Modifier(ModifierKeyCode::LeftAlt),
-            VK_RMENU => KeyCode::Modifier(ModifierKeyCode::RightAlt),
-            VK_LWIN => KeyCode::Modifier(ModifierKeyCode::LeftSuper),
-            VK_RWIN => KeyCode::Modifier(ModifierKeyCode::RightSuper),
-            VK_F1..=VK_F24 => KeyCode::F((virtual_key - VK_F1 + 1) as u8),
-            VK_NUMPAD0..=VK_NUMPAD9 => {
-                KeyCode::Char((b'0' + (virtual_key - VK_NUMPAD0) as u8) as char)
-            }
-            VK_MULTIPLY => KeyCode::Char('*'),
-            VK_ADD => KeyCode::Char('+'),
-            VK_SUBTRACT => KeyCode::Char('-'),
-            VK_DECIMAL => KeyCode::Char('.'),
-            VK_DIVIDE => KeyCode::Char('/'),
-            VK_BROWSER_BACK => KeyCode::Media(crossterm::event::MediaKeyCode::TrackPrevious),
-            VK_BROWSER_FORWARD => KeyCode::Media(crossterm::event::MediaKeyCode::TrackNext),
-            VK_VOLUME_MUTE => KeyCode::Media(crossterm::event::MediaKeyCode::MuteVolume),
-            VK_VOLUME_DOWN => KeyCode::Media(crossterm::event::MediaKeyCode::LowerVolume),
-            VK_VOLUME_UP => KeyCode::Media(crossterm::event::MediaKeyCode::RaiseVolume),
-            VK_MEDIA_NEXT_TRACK => KeyCode::Media(crossterm::event::MediaKeyCode::TrackNext),
-            VK_MEDIA_PREV_TRACK => KeyCode::Media(crossterm::event::MediaKeyCode::TrackPrevious),
-            VK_MEDIA_STOP => KeyCode::Media(crossterm::event::MediaKeyCode::Stop),
-            VK_MEDIA_PLAY_PAUSE => KeyCode::Media(crossterm::event::MediaKeyCode::PlayPause),
-            _ => return None,
-        };
-        Some(code)
-    }
 }
 
 pub struct TerminalInput {
@@ -1251,9 +1248,9 @@ impl TerminalInput {
     pub fn new() -> io::Result<Self> {
         #[cfg(windows)]
         {
-            return Ok(Self {
+            Ok(Self {
                 native: windows_native::NativeInput::new()?,
-            });
+            })
         }
 
         #[cfg(not(windows))]
@@ -1265,7 +1262,7 @@ impl TerminalInput {
     pub fn read(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
         #[cfg(windows)]
         {
-            return self.native.read(timeout);
+            self.native.read(timeout)
         }
 
         #[cfg(not(windows))]

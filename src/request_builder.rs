@@ -884,7 +884,7 @@ pub(crate) fn sha256_hex(input: &[u8]) -> String {
         0x1f83d9ab,
         0x5be0cd19,
     ];
-    for chunk in data.chunks_exact(64) {
+    for chunk in data.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());

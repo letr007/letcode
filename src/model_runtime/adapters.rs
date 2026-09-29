@@ -3603,7 +3603,7 @@ impl IncrementalSseFramer {
         }
         Some(SseEvent {
             event: self.event.take(),
-            data: self.data.drain(..).collect::<Vec<_>>().join("\n"),
+            data: std::mem::take(&mut self.data).join("\n"),
         })
     }
 }

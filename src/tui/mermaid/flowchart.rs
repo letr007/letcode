@@ -776,16 +776,13 @@ fn route_horizontal_edges(
         let label_end = target_channel;
         if let Some(label) = &edge.label {
             let label_width = mermaid_label_width(&label.text);
-            if let Some(col) = centered_mermaid_label_col(label_start, label_end, label_width) {
-                feedback_labels.push((
-                    label_row,
-                    col,
-                    label.text.as_str(),
-                    MermaidSourceSpan::new(label.start, label.end),
-                ));
-            } else {
-                return None;
-            }
+            let col = centered_mermaid_label_col(label_start, label_end, label_width)?;
+            feedback_labels.push((
+                label_row,
+                col,
+                label.text.as_str(),
+                MermaidSourceSpan::new(label.start, label.end),
+            ));
         }
     }
     let shared_node_ports = placements

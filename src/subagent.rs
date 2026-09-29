@@ -1658,7 +1658,6 @@ base_url = "https://test.example.invalid/v1"
                 run_id,
                 child_session_id,
                 summary,
-                pool_ordinal: _,
                 ..
             } => {
                 assert_eq!(run_id, &run_summary.run_id);
