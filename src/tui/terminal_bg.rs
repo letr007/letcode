@@ -3,13 +3,18 @@
 //! crossterm 0.28 没有把字节还回事件流的接口，探针期间读到的按键无法归还，所以只在启动的
 //! 那一小段窗口里查询。Windows 走原生控制台事件，没有可复用的字节窗口，因此不探测。
 
+#[cfg(unix)]
 use std::time::Duration;
 
 pub type Rgb = (u8, u8, u8);
 
+#[cfg(unix)]
 const QUERY: &[u8] = b"\x1b]11;?\x1b\\";
+#[cfg(any(unix, test))]
 const REPLY_PREFIX: &[u8] = b"\x1b]11;";
+#[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_millis(150);
+#[cfg(unix)]
 const MAX_BYTES: usize = 256;
 
 #[cfg(unix)]
