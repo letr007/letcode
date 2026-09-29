@@ -247,7 +247,6 @@ impl HistorianRuntime {
             let delta_tx = event_tx.clone();
             let result = pool.complete_started_run_with_executor(started, move |agent, _, child, _, child_session_id, _| {
                 async move {
-                    child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_user_message(format!("Historian · {} history items\n\nModel: {}", source_ids.len(), agent.model()))?;
                     let started_at = std::time::Instant::now();
                     // Provisional text is surfaced on the existing child-session
                     // channel. A retried attempt starts a new observation, so the

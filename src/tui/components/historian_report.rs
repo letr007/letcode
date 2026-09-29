@@ -65,7 +65,6 @@ pub(crate) fn render_report(
         title,
         width,
     );
-    text(&mut doc, &tr.t("historian.application_note"), muted, width);
     let p = &report.publication;
     text(
         &mut doc,
@@ -374,7 +373,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn historian_report_views_preserve_sources_and_distinguish_generation_from_application() {
+    fn historian_report_views_preserve_sources_and_usage() {
         let report = sample_report();
         let encoded = serde_json::to_string(&report).unwrap();
         assert_eq!(parse_report(&encoded), Some(report.clone()));
@@ -388,7 +387,7 @@ pub(crate) mod tests {
             100,
             &tr,
         ));
-        assert!(compact.contains("Report prepared") && compact.contains("tracked separately"));
+        assert!(compact.contains("Report prepared"));
         assert!(compact.contains("Compact-only result") && !compact.contains("Detailed-only"));
         assert!(!compact.contains("raw:12") && !compact.contains("old-fact"));
         assert!(compact.contains("Input 120 tokens") && !compact.contains("Input 220"));
