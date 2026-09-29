@@ -39,8 +39,8 @@ description: 描述该技能的具体应用场景与触发时机
 ```mermaid
 flowchart TD
     Builtin["内置技能（Built-in，5 个）"]
-      --> User["用户全局目录 (~/.config/.../skills)"]
-    User --> Workspace["工作区目录 (.letcode/skills 等)"]
+      --> User["用户全局目录（~/.config/.../skills）"]
+    User --> Workspace["工作区目录（.letcode/skills 等）"]
     Workspace --> Registry["最终技能注册表 SkillRegistry"]
 ```
 
@@ -56,12 +56,12 @@ flowchart TD
 
 为了节省模型的上下文 Token，系统不会在会话启动时将所有技能全文拼入系统提示。
 
-系统采用轻量级卡片机制注入前言：
+系统在前言中注入简短的技能卡片：
 
 1. 系统在回合前言（Prelude）中生成紧凑的技能清单，仅列出技能名称、用途说明与来源路径；
 2. 模型根据当前任务意图自行判断是否需要引入特定技能；
 3. 需要时，模型显式调用 `skill` 工具加载完整的 `SKILL.md` 正文；
-4. 若技能附带子目录资源，模型可通过 `skill__resource_list` 列举资源文件，并使用 `skill__resource_read` 按需读取。
+4. 技能附带子目录资源时，模型可通过 `skill__resource_list` 列举资源文件，并使用 `skill__resource_read` 按需读取。
 
 该机制确保未使用的技能不会占用输入预算，只有真正需要的专业知识才会载入上下文。
 

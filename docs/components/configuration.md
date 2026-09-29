@@ -6,7 +6,7 @@ letcode 从用户主目录下的 TOML 文件读取系统配置：
 ~/.config/letcode/letcode.toml
 ```
 
-配置文件支持使用环境变量，也可以使用命令进行脱机格式验证：
+配置文件支持使用环境变量，也可以用命令脱机验证格式：
 
 ```sh
 letcode config validate

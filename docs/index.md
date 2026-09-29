@@ -111,7 +111,7 @@ flowchart TD
 
 ### [Permission](components/permission.md)
 
-实现四种权限运行模式、工具安全分类、会话级授权机制、自动化智能审查以及子代理独占路径锁。
+实现四种权限运行模式、工具安全分类、会话级授权机制、自动审查以及子代理独占路径锁。
 
 ### [Subagents](components/subagents.md)
 
@@ -119,7 +119,7 @@ flowchart TD
 
 ### [Skills](components/skills.md)
 
-管理基于 `SKILL.md` 规范的技能系统，支持多级目录发现、前言轻量级卡片注入、动态按需加载与上下文压缩保护。
+管理基于 `SKILL.md` 规范的技能系统，支持多级目录发现、前言注入简短技能卡片、动态按需加载与上下文压缩保护。
 
 ### [ACP](components/acp.md)
 

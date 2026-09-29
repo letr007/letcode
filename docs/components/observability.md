@@ -1,6 +1,6 @@
 # 可观测性与调用追踪
 
-letcode 提供多层级的运行时可观测性与调用追踪支持。系统既支持在进程内部收集轻量级的逻辑请求观测与指标遥测，也支持通过 OpenTelemetry 与 Langfuse 导出结构化的分布式追踪数据。
+letcode 提供多层级的运行时可观测性与调用追踪支持。系统既支持在进程内部收集逻辑请求观测与指标遥测，也支持通过 OpenTelemetry 与 Langfuse 导出结构化的分布式追踪数据。
 
 ## 遥测分层模型
 
@@ -19,7 +19,7 @@ flowchart TD
 
 ## Langfuse 追踪体系
 
-系统通过 `tracing` 生态无缝对接 Langfuse。开启该功能需在环境中声明凭据：
+系统通过 `tracing` 把追踪数据发送到 Langfuse。开启该功能需在环境中声明凭据：
 
 ```sh
 export LETCODE_LANGFUSE_ENABLED=true
@@ -33,7 +33,7 @@ export LANGFUSE_HOST="https://cloud.langfuse.com"
 
 ### 1. 层次化 Span 拓扑
 
-Langfuse 导出数据遵循树状跨度（Span）结构：
+Langfuse 导出的数据按树状结构组织 Span：
 
 - **Trace 根节点**：绑定当前会话的 `session_id`，标签包含会话模型标识；
 - **Turn Span**：对应单个用户提示词触发的交互回合，记录开始时间与完成耗时；

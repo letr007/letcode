@@ -85,7 +85,7 @@ pub struct TranscriptAssistantTurn {
 
 包含工具调用的回合会在 `calls` 数组中记录调用 ID、工具名称与 JSON 参数。服务商私有的重放状态保存在 `replay` 中，记录命名空间、格式版本和负载内容；只有兼容的协议绑定才能在恢复时使用该重放状态。
 
-`reasoning_message` 作为独立事件派发，用于时间线展示与耗时统计。`assistant_turn.reasoning_content` 和 `replay` 则作为助手历史的一部分持久化。旧版的 `assistant_message` 与 `assistant_tool_call_batch` 用于兼容解码旧日志；恢复读取器与 v2 记录器均会将它们转换为 `assistant_turn`。schema 2 格式的日志文件若包含旧版字段，会被判定为格式无效。
+`reasoning_message` 作为独立事件派发，用于时间线展示与耗时统计。`assistant_turn.reasoning_content` 和 `replay` 则作为助手历史的一部分持久化。旧版的 `assistant_message` 与 `assistant_tool_call_batch` 用于兼容解码旧日志；恢复读取器与 v2 记录器均会将它们转换为 `assistant_turn`。schema 2 格式的日志文件包含旧版字段时，会被判定为格式无效。
 
 ## 事件分类
 
@@ -109,7 +109,7 @@ pub struct TranscriptAssistantTurn {
 
 单条常规记录写入后执行 `write_all` 与 `flush`；影响恢复状态的关键事件会追加调用 `sync_data` 确保落盘。事务则在写入全部数据与提交标记后统一执行 `flush` 和 `sync_data`。
 
-每个 `TranscriptRecorder` 在写入期间持有 `<session_id>.jsonl.lock` 独占文件锁。单个会话文件禁止多进程同时写入，只读读取不受锁影响。若发生底层 I/O 错误，记录器会被标记为损坏状态并释放文件锁，序列号与活动状态停止推进，保护文件尾部可被受控恢复。
+每个 `TranscriptRecorder` 在写入期间持有 `<session_id>.jsonl.lock` 独占文件锁。单个会话文件禁止多进程同时写入，只读读取不受锁影响。发生底层 I/O 错误时，记录器会被标记为损坏状态并释放文件锁，序列号与活动状态停止推进，保护文件尾部可被受控恢复。
 
 `logical_checkpoint` 事件携带自身独立的版本号。为避免 JSON 展开后字段命名冲突，其封套字段声明为 `journal_schema_version = 2`，业务负载版本号声明为 `schema_version = 1`。
 
@@ -137,7 +137,7 @@ pub struct TranscriptAssistantTurn {
 2. 校验序列号、事务连续性与文件指纹；
 3. 将 schema 1 的旧版记录在内存中规范化为 `AssistantTurn`，重放状态损坏时报错；
 4. 构建指定分支的运行时快照，验证恢复路由与上下文作用域；
-5. 获取文件独占锁，重新核对指纹与事务边界，若文件被占用则拒绝恢复；
+5. 获取文件独占锁，重新核对指纹与事务边界，文件被占用时拒绝恢复；
 6. 构造安全追加模式的记录器，并在原子提交点替换当前活动会话。
 
 恢复过程完全在内存中完成数据适配，不重写既有文件。恢复后的新记录使用 schema 2 追加写入，磁盘文件可由合法的旧版前缀与新版记录组合构成。无封套的更早日志仅供检索，不支持恢复追加。
