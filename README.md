@@ -50,6 +50,8 @@ cargo install --path .
 letcode loads its configuration from `~/.config/letcode/letcode.toml`. Create this file with minimal settings:
 
 ```toml
+#:schema https://raw.githubusercontent.com/letr007/letcode/main/letcode.schema.json
+
 active_provider = "openai"
 
 [providers.openai]

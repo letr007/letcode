@@ -46,12 +46,18 @@ provider/model 时会拒绝启动。下面这些是合法配置面。
 
 新建 skill 放在上面的 letcode skill 目录里。同名 skill：后发现的根覆盖先发现的。
 
+## 编辑器补全
+
+仓库根目录的 `letcode.schema.json` 用 JSON Schema 描述同一配置面，编辑器据此补全和校验用户配置。改动配置面时同步更新这个文件。
+
 ## letcode.toml
 
 未知顶层键会被拒绝。至少需要一个带至少一个 model 的 `[providers.<name>]`。
 `active_provider` 默认取第一个 provider 键。
 
 ```toml
+#:schema https://raw.githubusercontent.com/letr007/letcode/main/letcode.schema.json
+
 active_provider = "openai"
 fast_mode = false
 
@@ -348,7 +354,7 @@ user = "#ff8800"
 
 ## 提议修改时
 
-- 保留用户没要求改的 providers、models、MCP servers、agent routes。
+- 保留用户没要求改的 providers、models、MCP servers、agent routes，以及首行的 `#:schema` 注释。
 - 只用本 skill 里的键。未知顶层键，以及 `$schema`、`plugin`、自由形式
   `agent` map、`skills.urls`、`permission.bash` 模式映射这类形状会被拒绝。
 - 长说明放进 letcode skills 目录下的 skill 文件；`letcode.toml` 没有 skill

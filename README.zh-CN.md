@@ -50,6 +50,8 @@ cargo install --path .
 letcode 启动时读取 `~/.config/letcode/letcode.toml` 配置文件。创建该文件并填入最小配置：
 
 ```toml
+#:schema https://raw.githubusercontent.com/letr007/letcode/main/letcode.schema.json
+
 active_provider = "openai"
 
 [providers.openai]
