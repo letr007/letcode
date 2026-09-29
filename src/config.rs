@@ -65,6 +65,10 @@ const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
+/// Editor directive (Taplo, Even Better TOML, Zed) naming the published
+/// configuration schema. letcode itself ignores the comment.
+const CONFIG_SCHEMA_COMMENT: &str =
+    "#:schema https://raw.githubusercontent.com/letr007/letcode/main/letcode.schema.json";
 /// Mirrors the Codex turn-metadata extension limits so declared extra keys
 /// cannot exceed what a real client would send.
 const MAX_FAKE_EXTRA_ENTRIES: usize = 16;
@@ -150,7 +154,7 @@ pub(crate) fn initialize_config(
 
     let model = toml_string(model);
     let config_text = format!(
-        "active_provider = \"default\"\n\n[providers.default]\nprotocol = \"responses\"\ndefault_model = {model}\n\n[providers.default.auth]\ntype = \"bearer\"\ncredential = {}\n\n[providers.default.endpoints]\nbase_url = {}\n\n[providers.default.models.{model}.capabilities]\ntools = true\n",
+        "{CONFIG_SCHEMA_COMMENT}\n\nactive_provider = \"default\"\n\n[providers.default]\nprotocol = \"responses\"\ndefault_model = {model}\n\n[providers.default.auth]\ntype = \"bearer\"\ncredential = {}\n\n[providers.default.endpoints]\nbase_url = {}\n\n[providers.default.models.{model}.capabilities]\ntools = true\n",
         toml_string(api_key),
         toml_string(base_url),
     );
@@ -1775,7 +1779,7 @@ pub struct ConfigValidationReport {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[providers.openai]\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\nflavor = \"standard\"\n\n[providers.openai.auth]\ntype = \"bearer\"\ncredential = \"YOUR_API_KEY\"\n\n[providers.openai.endpoints]\nbase_url = \"https://api.openai.com/v1\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay = \"GPT-5.5\"\n\n[providers.openai.models.\"gpt-5.5\".capabilities]\ntools = true\nreasoning = true\n\n[providers.openai.models.\"gpt-5.5\".capabilities.generation]\nmax_output_tokens = true\n\n[providers.openai.models.\"gpt-5.5\".generation]\nmax_output_tokens = 4096\n",
+        "config file not found: {}\n\nCreate it with at least:\n\n{CONFIG_SCHEMA_COMMENT}\n\nactive_provider = \"openai\"\n\n[providers.openai]\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\nflavor = \"standard\"\n\n[providers.openai.auth]\ntype = \"bearer\"\ncredential = \"YOUR_API_KEY\"\n\n[providers.openai.endpoints]\nbase_url = \"https://api.openai.com/v1\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay = \"GPT-5.5\"\n\n[providers.openai.models.\"gpt-5.5\".capabilities]\ntools = true\nreasoning = true\n\n[providers.openai.models.\"gpt-5.5\".capabilities.generation]\nmax_output_tokens = true\n\n[providers.openai.models.\"gpt-5.5\".generation]\nmax_output_tokens = 4096\n",
         path.display()
     )
 }
@@ -3083,6 +3087,9 @@ base_url = "https://example.invalid"
             "example-model",
         )
         .expect("initial config should be written");
+
+        let written = fs::read_to_string(&path).expect("initial config should be readable");
+        assert!(written.starts_with(CONFIG_SCHEMA_COMMENT));
 
         let loaded = AppConfig::load_from_path(&path).expect("initial config should load");
         assert_eq!(loaded.active_provider, "default");
