@@ -61,7 +61,6 @@ pub(crate) struct ArchivedSession {
     pub(crate) last_user_summary: Option<String>,
     #[serde(default)]
     pub(crate) last_assistant_summary: Option<String>,
-    /// Workspace root the session was started in, when the transcript records one.
     #[serde(default)]
     pub(crate) workspace: Option<String>,
     #[serde(default)]

@@ -146,8 +146,6 @@ pub struct SessionEngine {
 #[derive(Debug, Clone)]
 pub struct SessionEngineConfig {
     pub sessions_dir: PathBuf,
-    /// Workspace root sessions started by this engine belong to. `None` records
-    /// no workspace, leaving those sessions unassigned in session listings.
     pub workspace_dir: Option<PathBuf>,
     /// Routes keyed by their provider-qualified display name (`provider/model`).
     pub model_routes: indexmap::IndexMap<String, ModelRoute>,

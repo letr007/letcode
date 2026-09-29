@@ -5,12 +5,6 @@ use super::DialogItem;
 use crate::transcript::SessionSummary;
 use crate::tui::state::SessionPickerScope;
 
-/// Builds the picker rows for one scope, preserving the listing order (most
-/// recently used first) the summaries already carry.
-///
-/// The current workspace lists its own sessions under date headings, exactly as
-/// the unfiltered listing did. Every workspace groups by project instead, with
-/// sessions that record no workspace last.
 pub(super) fn session_dialog_items(
     sessions: &[SessionSummary],
     current_workspace: Option<&str>,
@@ -19,8 +13,6 @@ pub(super) fn session_dialog_items(
 ) -> Vec<DialogItem> {
     match scope {
         SessionPickerScope::Workspace => {
-            // Sessions that record no workspace belong to no workspace, so they
-            // only ever appear in the every-workspace view.
             let Some(current) = current_workspace else {
                 return Vec::new();
             };
@@ -48,8 +40,6 @@ pub(super) fn session_dialog_items(
     }
 }
 
-/// Sessions by workspace root, most recently used project first and the
-/// workspace-less sessions last. `None` keys the transcripts that record none.
 fn project_groups<'a>(
     sessions: &'a [SessionSummary],
     current_workspace: Option<&str>,
@@ -69,8 +59,6 @@ fn project_groups<'a>(
         groups[position].1.push(session);
     }
 
-    // The workspace running this process leads, so its project stays the first
-    // block the user sees after switching away from the workspace view.
     groups.sort_by_key(|(root, members)| {
         let current = root.as_deref() == current_workspace;
         let recent = members
@@ -83,8 +71,6 @@ fn project_groups<'a>(
     groups
 }
 
-/// Display names for the project headings, keyed by workspace root. Roots that
-/// share a directory name are widened to their parent so the headings differ.
 fn project_labels(groups: &[(Option<String>, Vec<&SessionSummary>)]) -> HashMap<String, String> {
     let roots = groups
         .iter()
@@ -111,7 +97,6 @@ fn project_labels(groups: &[(Option<String>, Vec<&SessionSummary>)]) -> HashMap<
         .collect()
 }
 
-/// The last `depth` path segments, joined with `/`.
 fn trailing_components(root: &str, depth: usize) -> String {
     let mut parts = Path::new(root)
         .components()
@@ -145,7 +130,6 @@ fn session_item(session: &SessionSummary, section: String, right_detail: String)
     .with_right_detail(right_detail)
 }
 
-/// A row in the workspace view, sectioned by the day it last ran.
 fn date_section_item(session: &SessionSummary) -> DialogItem {
     let timestamp_ms = session.last_timestamp_ms.or(session.first_timestamp_ms);
     let section = timestamp_ms
@@ -158,8 +142,6 @@ fn date_section_item(session: &SessionSummary) -> DialogItem {
     session_item(session, section, right_detail)
 }
 
-/// A row in the every-workspace view, where the section names the project and
-/// the stamp carries the date instead of only the time.
 fn session_stamp_label(session: &SessionSummary) -> String {
     let Some(timestamp_ms) = session.last_timestamp_ms.or(session.first_timestamp_ms) else {
         return "--:--".into();

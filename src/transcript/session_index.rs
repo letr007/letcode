@@ -35,7 +35,6 @@ pub(super) struct IndexedSession {
     title: Option<String>,
     last_user_summary: Option<String>,
     last_assistant_summary: Option<String>,
-    /// Workspace root the session was started in, when the transcript records one.
     workspace: Option<String>,
     has_content: bool,
 }

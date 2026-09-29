@@ -215,11 +215,7 @@ pub struct TuiRuntime {
     available_experts: Vec<AvailableExpert>,
     branch_poller: BranchPoller,
     sessions_dir: PathBuf,
-    /// Canonical root of the workspace this process runs in, matching the root
-    /// recorded with every session it starts.
     workspace_key: Option<String>,
-    /// Last `/resume` listing. Kept so switching scopes regroups it without
-    /// scanning the sessions directory again.
     session_summaries: Vec<SessionSummary>,
     preferences_dir: PathBuf,
     assistant_typewriter: Option<AssistantTypewriter>,
@@ -3473,8 +3469,6 @@ impl TuiRuntime {
         ))))
     }
 
-    /// Picker rows for one session listing in `scope`, with this process's
-    /// workspace as the reference project.
     fn session_rows(
         &self,
         sessions: &[SessionSummary],
@@ -3488,7 +3482,6 @@ impl TuiRuntime {
         )
     }
 
-    /// Switches `/resume` between this workspace and every workspace.
     fn toggle_session_scope(&mut self) {
         let Some(scope) = self
             .state

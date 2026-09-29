@@ -435,7 +435,6 @@ fn render_session_picker_footer(
     state: &TuiState,
     dialog: &DialogState,
 ) {
-    // The hint names the scope the key switches to, not the current one.
     let target = match dialog.session_scope {
         SessionPickerScope::Workspace => state.t("ui.session_scope_all"),
         SessionPickerScope::All => state.t("ui.session_scope_this"),

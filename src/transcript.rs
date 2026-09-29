@@ -182,7 +182,6 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub last_user_summary: Option<String>,
     pub last_assistant_summary: Option<String>,
-    /// Workspace root this session was started in, when the transcript records one.
     pub workspace: Option<String>,
 }
 
@@ -259,9 +258,6 @@ pub(crate) fn project_subagent_jobs(
     )
 }
 
-/// Canonical form of a workspace root, used to match a session to the directory
-/// it was started in. A path that cannot be canonicalized (for example a deleted
-/// directory) keeps its original spelling.
 pub fn workspace_root(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())

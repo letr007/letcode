@@ -302,13 +302,10 @@ impl DialogItem {
     }
 }
 
-/// Which sessions the picker lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionPickerScope {
-    /// Sessions started in the workspace this process runs in.
     #[default]
     Workspace,
-    /// Sessions from every workspace, grouped by project.
     All,
 }
 
@@ -1133,8 +1130,6 @@ impl DialogState {
         self.reset_detail_focus();
     }
 
-    /// Replace the listed items, keeping the query and moving the cursor to the
-    /// first visible row.
     pub fn replace_items(&mut self, items: Vec<DialogItem>) {
         self.items = items;
         self.selected = 0;

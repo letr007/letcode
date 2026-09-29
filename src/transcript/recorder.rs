@@ -506,8 +506,6 @@ impl TranscriptRecorder {
         })
     }
 
-    /// Records the workspace root alongside the start record, so session
-    /// listings can group by the project a session belongs to.
     pub fn record_session_workspace(&mut self, root: impl Into<String>) -> Result<()> {
         self.append_metadata(TranscriptEvent::SessionWorkspace { root: root.into() })
     }

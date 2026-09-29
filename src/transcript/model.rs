@@ -118,8 +118,6 @@ pub enum TranscriptEvent {
     SessionStarted {
         model: String,
     },
-    /// The workspace root the session was started in. Transcripts written before
-    /// this record existed carry none, and stay listed as unassigned.
     SessionWorkspace {
         root: String,
     },
