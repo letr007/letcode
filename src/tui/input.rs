@@ -379,6 +379,8 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
     ((key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER))
         && matches!(key.code, KeyCode::Char('v' | 'V')))
+        || (key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('v' | 'V')))
         || (key.code == KeyCode::Insert && key.modifiers == KeyModifiers::SHIFT)
 }
 
@@ -685,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_shortcuts_accept_shift_insert_and_uppercase_v() {
+    fn clipboard_shortcuts_accept_shift_insert_uppercase_v_and_alt_v() {
         let state = TuiState::default();
         for key in [
             KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
@@ -697,11 +699,17 @@ mod tests {
                 KeyCode::Char('v'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::ALT),
         ] {
             assert_eq!(map_key_event(&state, key), InputAction::PasteFromClipboard);
         }
         assert_ne!(
             map_key_event(&state, KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE)),
+            InputAction::PasteFromClipboard
+        );
+        assert_ne!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
             InputAction::PasteFromClipboard
         );
     }

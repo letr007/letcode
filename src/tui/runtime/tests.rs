@@ -929,6 +929,7 @@ fn clipboard_image_becomes_a_png_attachment_without_inserting_text() {
                 height: 1,
                 bytes: pixels.clone().into(),
             }),
+            &[],
         )
         .unwrap();
     let content = runtime.state().composer_content();
@@ -953,7 +954,9 @@ fn clipboard_large_text_is_one_token_and_never_submits_commands() {
     let mut runtime = runtime();
     let paste = "中文😀\r\n/quit\r\n\r\n".repeat(20_000);
     let expected = paste.replace("\r\n", "\n");
-    runtime.apply_clipboard_content(Some(paste), None).unwrap();
+    runtime
+        .apply_clipboard_content(Some(paste), None, &[])
+        .unwrap();
     assert_eq!(runtime.state().composer_tokens.len(), 1);
     assert_eq!(runtime.state().input_buffer.chars().count(), 1);
     assert_eq!(runtime.state().composer_content().text, expected);
@@ -972,12 +975,91 @@ fn invalid_clipboard_image_does_not_change_the_composer() {
                     width: 2,
                     height: 2,
                     bytes: vec![0; 3].into(),
-                })
+                }),
+                &[],
             )
             .is_err()
     );
     assert_eq!(runtime.state().input_buffer, "keep draft");
     assert!(runtime.state().composer_content().attachments.is_empty());
+}
+
+fn temp_clipboard_dir() -> PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "letcode-clipboard-files-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time ok")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("temp dir");
+    directory
+}
+
+#[test]
+fn clipboard_image_files_become_attachments() {
+    let directory = temp_clipboard_dir();
+    let image_path = directory.join("shot.png");
+    image::RgbaImage::from_pixel(2, 1, image::Rgba([10, 20, 30, 255]))
+        .save(&image_path)
+        .expect("write png");
+    let notes_path = directory.join("notes.txt");
+    std::fs::write(&notes_path, "not an image").expect("write notes");
+
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("describe ");
+    runtime
+        .apply_clipboard_content(
+            None,
+            None,
+            &[
+                image_path.clone(),
+                notes_path,
+                directory.join("missing.png"),
+            ],
+        )
+        .unwrap();
+
+    let content = runtime.state().composer_content();
+    assert_eq!(content.text, "describe [Image 1]");
+    assert_eq!(content.attachments.len(), 1);
+    assert_eq!(content.attachments[0].label, "shot.png");
+    assert_eq!(content.attachments[0].mime, "image/png");
+    assert!(
+        content.attachments[0]
+            .data_url
+            .starts_with("data:image/png;base64,")
+    );
+
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn clipboard_image_files_take_precedence_over_their_paths_as_text() {
+    let directory = temp_clipboard_dir();
+    let image_path = directory.join("diagram.png");
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+        .save(&image_path)
+        .expect("write png");
+    let path_text = image_path.to_string_lossy().into_owned();
+
+    let mut runtime = runtime();
+    runtime
+        .apply_clipboard_content(
+            Some(path_text.clone()),
+            None,
+            std::slice::from_ref(&image_path),
+        )
+        .unwrap();
+
+    let content = runtime.state().composer_content();
+    assert_eq!(content.attachments.len(), 1);
+    assert_eq!(content.attachments[0].label, "diagram.png");
+    assert_eq!(content.text, "[Image 1]");
+    assert!(!content.text.contains(&path_text));
+
+    std::fs::remove_dir_all(&directory).ok();
 }
 
 #[test]

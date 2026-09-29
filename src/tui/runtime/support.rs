@@ -2,10 +2,12 @@
 //! orchestrator. These hold no `TuiRuntime` state, so they live apart from the
 //! God-file body.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 use crate::tui::state::McpDiscoveryState;
+use crate::user_content::UserImageAttachment;
 
 pub(crate) const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 3;
 const TERMINAL_TITLE_APP_NAME: &str = "LetCode";
@@ -64,6 +66,28 @@ pub(crate) fn choose_clipboard_paste(
     } else {
         ClipboardPasteChoice::None
     }
+}
+
+pub(crate) fn clipboard_image_attachments(paths: &[PathBuf]) -> Vec<UserImageAttachment> {
+    paths
+        .iter()
+        .filter_map(|path| clipboard_image_attachment(path))
+        .collect()
+}
+
+fn clipboard_image_attachment(path: &Path) -> Option<UserImageAttachment> {
+    let mime = crate::tool::supported_image_mime(path)?;
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > crate::tool::MAX_READ_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let label = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("clipboard")
+        .to_string();
+    Some(UserImageAttachment::from_bytes(label, mime, &bytes))
 }
 
 pub(crate) fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {

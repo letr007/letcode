@@ -57,8 +57,8 @@ pub(crate) use model_catalog::{AvailableExpert, AvailableModel};
 mod support;
 use support::{
     ClipboardPasteChoice, ClipboardPasteContext, TERMINAL_TITLE_TICKS_PER_FRAME,
-    choose_clipboard_paste, format_terminal_title, mcp_discovery_description, next_attachment_id,
-    next_submission_id, session_title_from_records,
+    choose_clipboard_paste, clipboard_image_attachments, format_terminal_title,
+    mcp_discovery_description, next_attachment_id, next_submission_id, session_title_from_records,
 };
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
@@ -4257,15 +4257,21 @@ impl TuiRuntime {
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
                 let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
-                let image = if matches!(
+                let composer = matches!(
                     self.clipboard_paste_context(),
                     ClipboardPasteContext::Composer
-                ) {
+                );
+                let image = if composer {
                     clipboard.get_image().ok()
                 } else {
                     None
                 };
-                if let Err(error) = self.apply_clipboard_content(text, image) {
+                let image_files = if composer && image.is_none() {
+                    clipboard.get().file_list().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if let Err(error) = self.apply_clipboard_content(text, image, &image_files) {
                     tracing::warn!(%error, "failed to paste clipboard content");
                     self.show_toast(self.state.t("runtime.paste_failed"), ToastKind::Error);
                 }
@@ -4285,9 +4291,29 @@ impl TuiRuntime {
         &mut self,
         text: Option<String>,
         image: Option<arboard::ImageData<'_>>,
+        image_files: &[PathBuf],
     ) -> Result<()> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
+
+        if image.is_none()
+            && matches!(
+                self.clipboard_paste_context(),
+                ClipboardPasteContext::Composer
+            )
+        {
+            let attachments = clipboard_image_attachments(image_files);
+            if !attachments.is_empty() {
+                if self.state.is_read_only_child_view() {
+                    return Ok(());
+                }
+                for attachment in attachments {
+                    self.state.add_composer_attachment(attachment);
+                }
+                self.reset_history_navigation();
+                return Ok(());
+            }
+        }
 
         match choose_clipboard_paste(
             self.clipboard_paste_context(),

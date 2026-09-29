@@ -1047,6 +1047,23 @@ mod windows_native {
         }
 
         #[test]
+        fn native_records_deliver_alt_v_for_clipboard_paste() {
+            let mut input = test_input();
+            input.process_records(&[
+                key_record(b'v' as u16, b'V' as u16, true, LEFT_ALT_PRESSED),
+                key_record(b'v' as u16, b'V' as u16, false, LEFT_ALT_PRESSED),
+            ]);
+            assert_eq!(
+                input.pending.pop_front(),
+                Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('v'),
+                    KeyModifiers::ALT
+                )))
+            );
+            assert!(input.pending.is_empty());
+        }
+
+        #[test]
         fn native_records_preserve_key_mouse_and_resize_events() {
             let mut input = NativeInput {
                 handle: std::ptr::null_mut(),
@@ -1339,6 +1356,20 @@ mod tests {
         assert!(
             matches!(events[4], Event::Mouse(mouse) if mouse.kind == MouseEventKind::Up(MouseButton::Left) && mouse.column == 4 && mouse.row == 5)
         );
+    }
+
+    #[test]
+    fn alt_v_escape_prefix_survives_split_chunks() {
+        for chunks in [
+            vec![&b"\x1bv"[..]],
+            vec![&b"\x1b"[..], &b"v"[..]],
+            vec![&b"\x1bV"[..]],
+        ] {
+            assert!(
+                matches!(vt::parse_vt_chunks(&chunks).as_slice(), [Event::Key(key)] if matches!(key.code, KeyCode::Char('v' | 'V')) && key.modifiers == KeyModifiers::ALT),
+                "{chunks:?}"
+            );
+        }
     }
 
     #[test]

@@ -397,7 +397,7 @@ async fn read_file(args: Value, context: ToolExecutionContext) -> Result<ToolRes
     ))
 }
 
-fn supported_image_mime(path: &Path) -> Option<&'static str> {
+pub(crate) fn supported_image_mime(path: &Path) -> Option<&'static str> {
     match path
         .extension()
         .and_then(|extension| extension.to_str())

@@ -93,12 +93,13 @@ pub(crate) fn canonical_subagent_observed_path(path: &str) -> Result<PathBuf> {
             .to_path_buf();
     }
 }
+pub(crate) use fs::supported_image_mime;
 pub use registry::ToolRegistry;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const MAX_READ_LINE_LIMIT: usize = 5_000;
 const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
-const MAX_READ_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+pub(crate) const MAX_READ_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 300;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
 const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
