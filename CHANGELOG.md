@@ -5,6 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Added
+
+- 新增配置 schema `letcode.schema.json`，编辑器据此为 `letcode.toml` 提供补全与结构校验。
+- 首次启动生成的配置和缺失配置提示默认带上 `#:schema` 注释行。
+
 ## [0.18.0] - 2026-09-28
 
 ### Added
