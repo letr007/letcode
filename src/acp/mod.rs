@@ -404,7 +404,8 @@ reasoning_efforts = ["low", "high"]
         crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
         let reasoning_effort = agent.reasoning_effort();
-        let engine_config = crate::session_engine_config(config, Default::default(), String::new());
+        let engine_config =
+            crate::session_engine_config(config, Default::default(), String::new(), None);
         let (engine, projection) = SessionEngine::start(
             agent,
             Arc::clone(&transcript),

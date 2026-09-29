@@ -146,6 +146,9 @@ pub struct SessionEngine {
 #[derive(Debug, Clone)]
 pub struct SessionEngineConfig {
     pub sessions_dir: PathBuf,
+    /// Workspace root sessions started by this engine belong to. `None` records
+    /// no workspace, leaving those sessions unassigned in session listings.
+    pub workspace_dir: Option<PathBuf>,
     /// Routes keyed by their provider-qualified display name (`provider/model`).
     pub model_routes: indexmap::IndexMap<String, ModelRoute>,
     /// Whether each route has a non-empty credential configured.
@@ -271,6 +274,7 @@ impl SessionEngine {
             agent,
             Arc::clone(&transcript),
             config.sessions_dir,
+            config.workspace_dir,
             config.model_routes,
             config.route_api_key_configured,
             config.new_session_default_route,
@@ -1235,6 +1239,7 @@ async fn run_engine_loop(
     agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
+    workspace_dir: Option<PathBuf>,
     model_routes: indexmap::IndexMap<String, ModelRoute>,
     route_api_key_configured: indexmap::IndexMap<String, bool>,
     new_session_default_route: ModelRoute,
@@ -2622,6 +2627,7 @@ async fn run_engine_loop(
                         let prepared = match crate::session::prepare_new_session_package(
                             &sessions_dir,
                             new_session_route.display_name(),
+                            workspace_dir.as_deref(),
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -3400,6 +3406,7 @@ reasoning_efforts = ["high"]
                 "Current".into(),
                 SessionEngineConfig {
                     sessions_dir: config.global.sessions_dir.clone(),
+                    workspace_dir: None,
                     model_routes: indexmap::IndexMap::from([
                         ("test/current".into(), current_route.clone()),
                         ("test/default".into(), ModelRoute::new("test", "default")),
@@ -3511,7 +3518,8 @@ base_url = "http://127.0.0.1:1"
                     .clone(),
             )));
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
             let (mut engine, _) =
                 SessionEngine::start(agent, transcript, "model".into(), settings).unwrap();
             let ingress = engine.take_ingress();
@@ -3583,7 +3591,8 @@ base_url = "http://127.0.0.1:1"
             // recorded, so the announced mode can only come from the transcript.
             assert_eq!(agent.permission_mode().to_string(), "default");
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
             let (mut engine, _) =
                 SessionEngine::start(agent, transcript, "model".into(), settings).unwrap();
             let ingress = engine.take_ingress();
@@ -5090,7 +5099,8 @@ max_output_tokens = 4096
             agent.set_primary_route_factory(primary_factory);
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
             let (mut engine, _) =
                 SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
             let ingress = engine.take_ingress();
@@ -5251,7 +5261,8 @@ max_output_tokens = 4096
                 .expect("register the holding tool");
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
             let (mut engine, _) =
                 SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
             let ingress = engine.take_ingress();
@@ -5515,7 +5526,8 @@ max_output_tokens = 4096
                 .expect("register the holding tool");
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
-            let settings = crate::session_engine_config(&config, Default::default(), String::new());
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
             let (mut engine, _) =
                 SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
             let ingress = engine.take_ingress();

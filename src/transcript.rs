@@ -182,6 +182,8 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub last_user_summary: Option<String>,
     pub last_assistant_summary: Option<String>,
+    /// Workspace root this session was started in, when the transcript records one.
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +259,16 @@ pub(crate) fn project_subagent_jobs(
     )
 }
 
+/// Canonical form of a workspace root, used to match a session to the directory
+/// it was started in. A path that cannot be canonicalized (for example a deleted
+/// directory) keeps its original spelling.
+pub fn workspace_root(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> {
     let base_dir = base_dir.as_ref();
 
@@ -276,6 +288,7 @@ struct SessionSummaryAcc {
     title: Option<String>,
     last_user_summary: Option<String>,
     last_assistant_summary: Option<String>,
+    workspace: Option<String>,
     has_content: bool,
 }
 
@@ -287,6 +300,7 @@ fn fold_session_summary(acc: &mut SessionSummaryAcc, record: &TranscriptRecord) 
     acc.last_timestamp_ms = Some(record.timestamp_ms);
     match &record.event {
         TranscriptEvent::SessionStarted { model } => acc.model = Some(model.clone()),
+        TranscriptEvent::SessionWorkspace { root } => acc.workspace = Some(root.clone()),
         TranscriptEvent::ModelChanged { new_model, .. } => acc.model = Some(new_model.clone()),
         TranscriptEvent::SessionTitle { title } => acc.title = Some(title.clone()),
         TranscriptEvent::UserMessage { content } => {
@@ -370,6 +384,7 @@ pub(crate) fn summarize_session_reader(
         title: acc.title,
         last_user_summary: acc.last_user_summary,
         last_assistant_summary: acc.last_assistant_summary,
+        workspace: acc.workspace,
     }))
 }
 

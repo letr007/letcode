@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::SessionSummary;
 
 const INDEX_FILE: &str = "sessions-index.json";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SessionsIndexFile {
@@ -35,6 +35,8 @@ pub(super) struct IndexedSession {
     title: Option<String>,
     last_user_summary: Option<String>,
     last_assistant_summary: Option<String>,
+    /// Workspace root the session was started in, when the transcript records one.
+    workspace: Option<String>,
     has_content: bool,
 }
 
@@ -49,6 +51,7 @@ impl IndexedSession {
             title: self.title.clone(),
             last_user_summary: self.last_user_summary.clone(),
             last_assistant_summary: self.last_assistant_summary.clone(),
+            workspace: self.workspace.clone(),
         }
     }
 
@@ -159,6 +162,7 @@ pub(super) fn list_sessions_with_index(
                         title: summary.title.clone(),
                         last_user_summary: summary.last_user_summary.clone(),
                         last_assistant_summary: summary.last_assistant_summary.clone(),
+                        workspace: summary.workspace.clone(),
                         has_content: true,
                     };
                     index.sessions.insert(session_id, indexed);

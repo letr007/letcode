@@ -26,9 +26,17 @@ use crate::transcript::{
 pub fn bootstrap_new_transcript(
     sessions_dir: impl AsRef<Path>,
     model: impl Into<String>,
+    workspace: Option<&Path>,
 ) -> Result<TranscriptRecorder> {
     let mut recorder = TranscriptRecorder::create(sessions_dir.as_ref())?;
-    if let Err(error) = recorder.record_session_started(model.into()) {
+    let recorded = (|| -> Result<()> {
+        recorder.record_session_started(model.into())?;
+        if let Some(workspace) = workspace {
+            recorder.record_session_workspace(crate::transcript::workspace_root(workspace))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = recorded {
         let _ = remove_empty_session_file(recorder.path());
         return Err(error);
     }
@@ -59,7 +67,7 @@ pub fn start_new_transcript_session(
     sessions_dir: impl AsRef<Path>,
     model: impl Into<String>,
 ) -> Result<PathBuf> {
-    let new_recorder = bootstrap_new_transcript(sessions_dir, model)?;
+    let new_recorder = bootstrap_new_transcript(sessions_dir, model, None)?;
     replace_live_transcript(live, new_recorder)
 }
 
@@ -84,9 +92,10 @@ pub struct PreparedNewSession {
 pub fn prepare_new_session_package(
     sessions_dir: impl AsRef<Path>,
     model: impl Into<String>,
+    workspace: Option<&Path>,
 ) -> Result<PreparedNewSession> {
     let sessions_dir = sessions_dir.as_ref();
-    let mut recorder = bootstrap_new_transcript(sessions_dir, model)?;
+    let mut recorder = bootstrap_new_transcript(sessions_dir, model, workspace)?;
     recorder.set_current_context_branch_id(None);
     let session_id = recorder.session_id().to_string();
     let new_path = recorder.path().to_path_buf();

@@ -218,6 +218,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::LlmRequestTelemetry { .. }
             | TranscriptEvent::SessionStarted { .. }
+            | TranscriptEvent::SessionWorkspace { .. }
             | TranscriptEvent::SessionTitle { .. }
             | TranscriptEvent::ContextBranchCreated { .. }
             | TranscriptEvent::ContextBranchSummary { .. }

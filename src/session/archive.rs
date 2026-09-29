@@ -281,6 +281,7 @@ pub(crate) fn archived_summaries(sessions_dir: &Path) -> Result<Vec<SessionSumma
                     title: None,
                     last_user_summary: None,
                     last_assistant_summary: None,
+                    workspace: None,
                 });
             }
         }
@@ -568,6 +569,7 @@ fn archive_family(
                 title: summary.title,
                 last_user_summary: summary.last_user_summary,
                 last_assistant_summary: summary.last_assistant_summary,
+                workspace: summary.workspace,
                 archived_at_ms: now_ms(),
             };
             archive_index::upsert(sessions_dir, parent_session_id, row)?;
@@ -1001,6 +1003,7 @@ fn reconcile_row(sessions_dir: &Path, session_id: &str) -> Result<Option<Archive
         title: summary.title,
         last_user_summary: summary.last_user_summary,
         last_assistant_summary: summary.last_assistant_summary,
+        workspace: summary.workspace,
         archived_at_ms: now_ms(),
         ..ArchivedSession::default()
     }))

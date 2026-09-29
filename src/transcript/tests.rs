@@ -2626,6 +2626,47 @@ fn non_checkpoint_tool_finished_does_not_switch_branch() {
 }
 
 #[test]
+fn session_summaries_carry_the_recorded_workspace() {
+    let base_dir = journal_test_dir("session-workspace");
+    let mut grouped = TranscriptRecorder::create(&base_dir).expect("create transcript");
+    grouped
+        .record_session_started("test/model")
+        .expect("record session start");
+    grouped
+        .record_session_workspace("/work/letcode")
+        .expect("record workspace");
+    grouped
+        .record_user_message("grouped by project")
+        .expect("record user message");
+
+    let mut unrecorded = TranscriptRecorder::create(&base_dir).expect("create transcript");
+    unrecorded
+        .record_session_started("test/model")
+        .expect("record session start");
+    unrecorded
+        .record_user_message("predates the workspace record")
+        .expect("record user message");
+
+    for summaries in [
+        list_sessions(&base_dir).expect("first list"),
+        list_sessions(&base_dir).expect("second list hits the sidecar index"),
+    ] {
+        let workspace = |session_id: &str| {
+            summaries
+                .iter()
+                .find(|summary| summary.session_id == session_id)
+                .and_then(|summary| summary.workspace.clone())
+        };
+
+        assert_eq!(
+            workspace(grouped.session_id()).as_deref(),
+            Some("/work/letcode")
+        );
+        assert_eq!(workspace(unrecorded.session_id()), None);
+    }
+}
+
+#[test]
 fn list_sessions_persists_and_reuses_sidecar_index() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-list-index-test-{}",

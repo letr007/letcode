@@ -232,11 +232,17 @@ async fn main() -> Result<()> {
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
         recorder.record_session_started(active_route.display_name())?;
+        recorder.record_session_workspace(transcript::workspace_root(&workspace_dir))?;
         sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
     }
 
     let model_label = active_provider.model_label(&active_route.model);
-    let engine_config = session_engine_config(&config, provider_api_key_hints, api_key_hint);
+    let engine_config = session_engine_config(
+        &config,
+        provider_api_key_hints,
+        api_key_hint,
+        Some(workspace_dir.clone()),
+    );
     let initial_reasoning = agent.reasoning_effort();
     let (engine, projection) =
         session::SessionEngine::start(agent, recorder, model_label, engine_config)?;
@@ -327,9 +333,11 @@ fn session_engine_config(
     config: &AppConfig,
     provider_api_key_hints: IndexMap<String, String>,
     api_key_hint: String,
+    workspace_dir: Option<std::path::PathBuf>,
 ) -> session::SessionEngineConfig {
     session::SessionEngineConfig {
         sessions_dir: config.global.sessions_dir.clone(),
+        workspace_dir,
         model_routes: config
             .providers
             .iter()
@@ -911,6 +919,7 @@ mod tests {
             let prepared = session::prepare_new_session_package(
                 &invalid_sessions_dir,
                 agent.route_display_name(),
+                None,
             )?;
             let prepared = session::lifecycle::prepare_new_session_install_with_route(
                 &agent, &recorder, prepared, None,

@@ -36,7 +36,7 @@ const ARTIFACTS_DIR: &str = "artifacts";
 
 const INDEX_FILE: &str = "index.json";
 const INDEX_LOCK_FILE: &str = "index.lock";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 const LOCK_RETRIES: usize = 10;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(200);
 
@@ -61,6 +61,9 @@ pub(crate) struct ArchivedSession {
     pub(crate) last_user_summary: Option<String>,
     #[serde(default)]
     pub(crate) last_assistant_summary: Option<String>,
+    /// Workspace root the session was started in, when the transcript records one.
+    #[serde(default)]
+    pub(crate) workspace: Option<String>,
     #[serde(default)]
     pub(crate) archived_at_ms: u128,
 }
@@ -76,6 +79,7 @@ impl ArchivedSession {
             title: self.title.clone(),
             last_user_summary: self.last_user_summary.clone(),
             last_assistant_summary: self.last_assistant_summary.clone(),
+            workspace: self.workspace.clone(),
         }
     }
 }
