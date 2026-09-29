@@ -1,0 +1,563 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/letr007/letcode/main/letcode.schema.json",
+  "title": "letcode configuration",
+  "description": "Schema for ~/.config/letcode/letcode.toml, picked up by editors that understand the `#:schema` directive. Every level rejects unknown keys, mirroring the runtime parser.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["providers"],
+  "properties": {
+    "active_provider": {
+      "type": "string",
+      "description": "Provider used by the current session. Defaults to the first key under [providers] and must name a configured provider."
+    },
+    "fast_mode": {
+      "type": "boolean",
+      "default": false,
+      "description": "Skip non-essential retries and reasoning waits. Also toggled inside a session with /fast."
+    },
+    "global": { "$ref": "#/definitions/global" },
+    "permissions": { "$ref": "#/definitions/permissions" },
+    "tools": { "$ref": "#/definitions/tools" },
+    "mcp": {
+      "type": "object",
+      "description": "Model Context Protocol servers, one table per server.",
+      "additionalProperties": { "$ref": "#/definitions/mcpServer" }
+    },
+    "agents": { "$ref": "#/definitions/agents" },
+    "providers": {
+      "type": "object",
+      "description": "Model providers, one table per provider.",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/definitions/provider" }
+    },
+    "fake": { "$ref": "#/definitions/fake" }
+  },
+  "definitions": {
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum iterations within one interactive turn. Unbounded when omitted."
+        },
+        "max_tool_calls": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum tool calls within one interactive turn. Unbounded when omitted."
+        },
+        "tool_timeout_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Default timeout for ordinary tools in seconds. shell__exec keeps its own 300 second default."
+        },
+        "sessions_dir": {
+          "type": "string",
+          "default": "sessions",
+          "description": "Session transcript directory, resolved relative to the configuration directory."
+        },
+        "log_file": {
+          "type": "string",
+          "default": "logs/combined.log",
+          "description": "Runtime log file, resolved relative to the configuration directory."
+        },
+        "compaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "preserve_recent_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Tokens retained at the end of history during compaction. Derived from the model input budget when omitted."
+            }
+          }
+        },
+        "retry": { "$ref": "#/definitions/retry" },
+        "session_archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Archive idle session transcripts in the background."
+            },
+            "older_than_days": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Idle days after which a transcript is archived. Archived sessions still resume."
+            }
+          }
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "description": "Physical retry policy. A provider level [providers.<name>.retry] inherits fields it does not declare from [global.retry].",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9000,
+          "default": 50,
+          "description": "Maximum attempts before an observable side effect; includes the first request."
+        },
+        "max_recovery_attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 3,
+          "description": "Maximum controlled recovery iterations after partial output."
+        },
+        "initial_delay_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1,
+          "description": "Delay before the first retry; the fixed delay when exponential_backoff = false."
+        },
+        "exponential_backoff": { "type": "boolean", "default": true },
+        "backoff_multiplier": { "type": "number", "default": 2.0 },
+        "jitter_secs": { "type": "integer", "minimum": 0, "default": 1 }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["safe", "default", "auto", "yolo", "solo"],
+          "default": "default",
+          "description": "safe asks for everything, default allows reads and asks for writes, auto answers approvals with the reviewer expert, yolo allows everything (solo is an alias)."
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "parallelism": {
+          "type": "object",
+          "description": "Per-tool concurrency override. Only narrows a tool that already declares Parallel; promoting an exclusive tool is rejected.",
+          "additionalProperties": { "enum": ["parallel", "exclusive"] }
+        }
+      }
+    },
+    "mcpServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["local", "remote"] },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also toggled inside a session with /mcp; the choice is written back here."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5000,
+          "description": "Response and method-call timeout in milliseconds."
+        },
+        "command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "description": "Executable and arguments of a local stdio server. Required for type = \"local\"."
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Environment variables passed to a local server. Aliased as `env`."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Alias of `environment`."
+        },
+        "url": {
+          "type": "string",
+          "description": "Endpoint of a remote server. Required for type = \"remote\"."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra request headers for a remote server."
+        },
+        "oauth": {
+          "enum": [false],
+          "default": false,
+          "description": "Remote MCP OAuth is not supported; leave it false and authenticate through headers."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "local" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["command"],
+            "not": {
+              "anyOf": [
+                { "required": ["url"] },
+                { "required": ["headers"] },
+                { "required": ["oauth"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "remote" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["url"],
+            "not": {
+              "anyOf": [
+                { "required": ["command"] },
+                { "required": ["environment"] },
+                { "required": ["env"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "agents": {
+      "type": "object",
+      "description": "Optional per-expert model routing. The key set is fixed; omitting provider makes the expert follow active_provider.",
+      "additionalProperties": false,
+      "properties": {
+        "explorer": { "$ref": "#/definitions/agentRoute" },
+        "fixer": { "$ref": "#/definitions/agentRoute" },
+        "oracle": { "$ref": "#/definitions/agentRoute" },
+        "designer": { "$ref": "#/definitions/agentRoute" },
+        "librarian": { "$ref": "#/definitions/agentRoute" },
+        "general": { "$ref": "#/definitions/agentRoute" },
+        "reviewer": { "$ref": "#/definitions/agentRoute" },
+        "historian": { "$ref": "#/definitions/agentRoute" }
+      }
+    },
+    "agentRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "allowed_models": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[^/]+/.+$" },
+          "description": "Routes offered to a single agent__* delegation, written as provider/model. Does not change the expert default route."
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_model", "auth", "endpoints"],
+      "properties": {
+        "protocol": { "$ref": "#/definitions/protocol" },
+        "default_model": {
+          "type": "string",
+          "description": "Model used when a route does not name one. Must be a key under this provider's [models]."
+        },
+        "retry": { "$ref": "#/definitions/retry" },
+        "flavor": { "$ref": "#/definitions/flavor" },
+        "reviewer": {
+          "enum": ["jev"],
+          "description": "Marks the provider as an approval reviewer backend. The Jev reviewer requires auth.type = \"bearer\"."
+        },
+        "auth": { "$ref": "#/definitions/auth" },
+        "endpoints": { "$ref": "#/definitions/endpoints" },
+        "transport": { "$ref": "#/definitions/providerTransport" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra request headers. Reserved and duplicate headers are rejected."
+        },
+        "query": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra query parameters. Reserved and duplicate keys are rejected."
+        },
+        "models": {
+          "type": "object",
+          "description": "Model routes under this provider, keyed by model id.",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/definitions/model" }
+        }
+      }
+    },
+    "protocol": {
+      "enum": ["responses", "completions", "anthropic"],
+      "description": "Wire protocol. Adapter defaults apply when omitted."
+    },
+    "flavor": {
+      "enum": ["standard", "deepseek"],
+      "description": "Explicit provider profile. Never inferred from the provider or model name."
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": ["bearer", "header", "query", "none"],
+          "description": "bearer sends Authorization: Bearer; header and query require `name`; none takes no credential."
+        },
+        "name": {
+          "type": "string",
+          "description": "Header or query parameter carrying the credential. Required by the header and query schemes."
+        },
+        "credential": {
+          "type": "string",
+          "description": "Literal credential. The environment variable named by credential_env takes precedence."
+        },
+        "credential_env": {
+          "type": "string",
+          "description": "Environment variable holding the credential. Defaults to <PROVIDER>_API_KEY."
+        }
+      }
+    },
+    "endpoints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "description": "Absolute http(s) URL without query parameters or fragments."
+        },
+        "responses": { "$ref": "#/definitions/endpointOverride" },
+        "completions": { "$ref": "#/definitions/endpointOverride" },
+        "anthropic": { "$ref": "#/definitions/endpointOverride" },
+        "jev": { "$ref": "#/definitions/endpointOverride" },
+        "reviewer": {
+          "$ref": "#/definitions/endpointOverride",
+          "description": "Alias of `jev`."
+        }
+      }
+    },
+    "endpointOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Protocol path overriding the adapter default. May be absolute."
+        },
+        "query": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Query parameters appended to the endpoint."
+        }
+      }
+    },
+    "providerTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connect_timeout_secs": { "type": "integer", "minimum": 1, "default": 10 },
+        "no_proxy_loopback": { "type": "boolean", "default": true }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "display": { "type": "string", "description": "Human readable model label." },
+        "strategy": { "$ref": "#/definitions/strategy" },
+        "context_window": { "type": "integer", "minimum": 1 },
+        "effective_input_limit_tokens": { "type": "integer", "minimum": 1 },
+        "protocol": { "$ref": "#/definitions/protocol" },
+        "model_override": {
+          "type": "string",
+          "description": "Wire model id sent upstream when it differs from the configuration key."
+        },
+        "flavor": { "$ref": "#/definitions/flavor" },
+        "transport": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "websocket": {
+              "type": "boolean",
+              "default": false,
+              "description": "Use WebSocket transport for Responses agent turns when the endpoint supports it. One-shot requests stay on HTTP/SSE."
+            }
+          }
+        },
+        "capabilities": { "$ref": "#/definitions/capabilities" },
+        "generation": { "$ref": "#/definitions/generation" },
+        "cache": { "$ref": "#/definitions/cache" },
+        "protocol_settings": {
+          "type": "object",
+          "description": "Adapter-owned settings, validated by the selected protocol binding. Anthropic reads anthropic_thinking = { mode = \"disabled\" | \"adaptive\" | \"budget\", budget_tokens = <integer> } and anthropic_betas = [<string>]; both require protocol = \"anthropic\"."
+        }
+      }
+    },
+    "strategy": {
+      "enum": ["default", "astra", "deepseek"],
+      "description": "Model request strategy. Inferred from the model name when omitted."
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Declared model capabilities. Every flag defaults to false, and only flags declared here may be used under [generation].",
+      "additionalProperties": false,
+      "properties": {
+        "tools": { "type": "boolean", "default": false },
+        "parallel_tool_calls": { "type": "boolean", "default": false },
+        "reasoning": { "type": "boolean", "default": false },
+        "input_images": { "type": "boolean", "default": false },
+        "tool_result_images": { "type": "boolean", "default": false },
+        "priority_service": { "type": "boolean", "default": false },
+        "generation": { "$ref": "#/definitions/generationCapabilities" }
+      }
+    },
+    "generationCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature": { "type": "boolean", "default": false },
+        "top_p": { "type": "boolean", "default": false },
+        "max_output_tokens": { "type": "boolean", "default": false },
+        "stop_sequences": { "type": "boolean", "default": false },
+        "reasoning": {
+          "type": "boolean",
+          "default": false,
+          "description": "Must also be true when reasoning_effort or reasoning_efforts is set."
+        },
+        "reasoning_summary": { "type": "boolean", "default": false },
+        "text_verbosity": { "type": "boolean", "default": false },
+        "parallel_tool_calls": { "type": "boolean", "default": false },
+        "priority_service": { "type": "boolean", "default": false },
+        "structured_output": {
+          "enum": ["json_object", "json_schema"],
+          "description": "json_schema constrains JSON syntax in the decoder; json_object only states the intent."
+        }
+      }
+    },
+    "generation": {
+      "type": "object",
+      "description": "Per-turn generation defaults. Each parameter must have its matching flag enabled under capabilities.generation first.",
+      "additionalProperties": false,
+      "properties": {
+        "async_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Tool names dispatched asynchronously. Requires the Astra strategy, protocol = \"responses\" and capabilities.tools = true."
+        },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "reasoning_effort": {
+          "type": "string",
+          "description": "none, minimal, low, medium, high, xhigh, max, or a provider specific value."
+        },
+        "reasoning_efforts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Reasoning efforts offered to the session."
+        },
+        "reasoning_summary": { "enum": ["auto", "concise", "detailed"] },
+        "text_verbosity": { "enum": ["low", "medium", "high"] },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "description": "Requires capabilities.parallel_tool_calls = true."
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sole switch for provider-native prompt caching on this route."
+        },
+        "retention": {
+          "enum": ["in_memory", "24h"],
+          "description": "Cache retention. 24h is Responses only and requires enabled = true."
+        },
+        "namespace": { "type": "string" }
+      }
+    },
+    "fake": {
+      "type": "object",
+      "description": "Request values used while the session level /fake switch is on. Every field is optional; absent values are derived from the real host or from the imitated client.",
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "installation_id": {
+              "type": "string",
+              "description": "UUID reported as the client installation id; generated and persisted when omitted."
+            },
+            "agent_name": { "type": "string" },
+            "account_uuid": { "type": "string" }
+          }
+        },
+        "clock": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "timezone": { "type": "string", "description": "IANA zone name, for example Asia/Shanghai." },
+            "date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+          }
+        },
+        "codex": { "$ref": "#/definitions/fakeCodex" },
+        "claude": { "$ref": "#/definitions/fakeClaude" }
+      }
+    },
+    "fakeCodex": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "string" },
+        "originator": { "type": "string" },
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "terminal": { "type": "string" },
+        "beta_features": { "type": "array", "items": { "type": "string" } },
+        "sandbox": { "type": "string" },
+        "sandbox_mode": { "type": "string" },
+        "auto_review_enabled": { "type": "boolean" },
+        "node_repl_auto_review_required": { "type": "boolean" },
+        "node_repl_disabled": { "type": "boolean" },
+        "cwd": { "type": "string" },
+        "workspace": { "type": "string" },
+        "shell": { "type": "string" },
+        "git_commit_hash": { "type": "string" },
+        "git_remote_url": { "type": "string" },
+        "git_has_changes": { "type": "boolean" },
+        "extra": {
+          "type": "object",
+          "description": "Free-form turn metadata keys, at most 16 entries. Keys are limited to 64 bytes starting with an ASCII letter; values are limited to 128 bytes. Keys already owned by the turn metadata (session_id, thread_id, turn_id, agent_name, request_kind, ...) are rejected.",
+          "maxProperties": 16,
+          "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$" },
+          "additionalProperties": { "type": "string", "maxLength": 128 }
+        }
+      }
+    },
+    "fakeClaude": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "string" },
+        "package_version": { "type": "string" },
+        "runtime_version": { "type": "string" },
+        "timeout": { "type": "string" },
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "betas": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
