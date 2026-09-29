@@ -22,7 +22,7 @@ letcode config validate
 
 Taplo、VS Code 的 Even Better TOML 和 Zed 都能识别这一行，也可改成本地路径，例如 `#:schema ./letcode.schema.json`。letcode 读取配置时忽略注释。首次启动生成的配置和缺失配置提示默认带上这一行。
 
-schema 检查键名、类型、枚举和必填字段，并禁止未声明的键。跨字段的语义仍由 `letcode config validate` 和启动校验负责，例如 `default_model` 必须指向已声明的模型，`generation` 参数必须先在 `capabilities.generation` 打开。改动配置结构后，同步更新这个文件。
+schema 检查键名、类型、枚举和必填字段，并禁止未声明的键。字段之间的约束由 `letcode config validate` 和启动校验负责。改动配置结构后，同步更新这个文件。
 
 ## 顶层配置
 
