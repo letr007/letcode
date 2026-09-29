@@ -29,7 +29,8 @@ use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
     ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
-    PermissionChoice, QuestionAdvance, ToastKind, TranscriptClickTarget, TuiState,
+    PermissionChoice, QuestionAdvance, SessionPickerScope, ToastKind, TranscriptClickTarget,
+    TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
@@ -80,7 +81,7 @@ use history_tree_dialog::history_tree_dialog_items;
 use lifecycle::{active_turn_state, has_active_or_pending_session_turn};
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
-use session_dialog::session_dialog_item;
+use session_dialog::session_dialog_items;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 
@@ -214,6 +215,12 @@ pub struct TuiRuntime {
     available_experts: Vec<AvailableExpert>,
     branch_poller: BranchPoller,
     sessions_dir: PathBuf,
+    /// Canonical root of the workspace this process runs in, matching the root
+    /// recorded with every session it starts.
+    workspace_key: Option<String>,
+    /// Last `/resume` listing. Kept so switching scopes regroups it without
+    /// scanning the sessions directory again.
+    session_summaries: Vec<SessionSummary>,
     preferences_dir: PathBuf,
     assistant_typewriter: Option<AssistantTypewriter>,
     deferred_session_events: VecDeque<SessionTransportEvent>,
@@ -255,6 +262,8 @@ impl TuiRuntime {
             available_experts,
             branch_poller: BranchPoller::new(),
             sessions_dir,
+            workspace_key: None,
+            session_summaries: Vec::new(),
             preferences_dir,
             assistant_typewriter: None,
             deferred_session_events: VecDeque::new(),
@@ -265,6 +274,7 @@ impl TuiRuntime {
     }
 
     pub fn set_workspace_dir(&mut self, workspace_dir: PathBuf) {
+        self.workspace_key = Some(crate::transcript::workspace_root(&workspace_dir));
         self.branch_poller.set_workspace_dir(workspace_dir);
         self.poll_git_branch();
     }
@@ -794,13 +804,15 @@ impl TuiRuntime {
                     self.push_command_notice(self.state.t("runtime.no_sessions_found"));
                     return;
                 }
-                let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
-                let dialog = DialogState::new(
+                let mut dialog = DialogState::new(
                     DialogKind::SessionPicker,
                     self.state.t("ui.sessions_section"),
                     None,
-                    items,
+                    Vec::new(),
                 );
+                let items = self.session_rows(&sessions, dialog.session_scope);
+                dialog.replace_items(items);
+                self.session_summaries = sessions;
                 self.state.open_dialog(dialog);
             }
             Ok(Err(error)) => {
@@ -2174,6 +2186,10 @@ impl TuiRuntime {
                 self.preview_selected_theme();
                 Ok(None)
             }
+            InputAction::DialogToggleSessionScope => {
+                self.toggle_session_scope();
+                Ok(None)
+            }
             InputAction::DialogAccept => self.handle_dialog_accept(),
             InputAction::DialogToggle => {
                 if self
@@ -3455,6 +3471,38 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
             model.id,
         ))))
+    }
+
+    /// Picker rows for one session listing in `scope`, with this process's
+    /// workspace as the reference project.
+    fn session_rows(
+        &self,
+        sessions: &[SessionSummary],
+        scope: SessionPickerScope,
+    ) -> Vec<DialogItem> {
+        session_dialog_items(
+            sessions,
+            self.workspace_key.as_deref(),
+            scope,
+            &self.state.t("dialog.session_unassigned"),
+        )
+    }
+
+    /// Switches `/resume` between this workspace and every workspace.
+    fn toggle_session_scope(&mut self) {
+        let Some(scope) = self
+            .state
+            .dialog()
+            .filter(|dialog| dialog.kind == DialogKind::SessionPicker)
+            .map(|dialog| dialog.session_scope.toggled())
+        else {
+            return;
+        };
+        let items = self.session_rows(&self.session_summaries, scope);
+        if let Some(dialog) = self.state.dialog_mut() {
+            dialog.session_scope = scope;
+            dialog.replace_items(items);
+        }
     }
 
     fn show_resume_dialog(&mut self) -> Result<Option<SubmittedCommand>> {

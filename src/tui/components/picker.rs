@@ -9,7 +9,7 @@ use ratatui::{
 use crate::tui::{
     components::tool_card::truncate_display_width,
     measure::{display_width, wrap_text_to_width},
-    state::{DialogItem, DialogKind, DialogState, TuiState},
+    state::{DialogItem, DialogKind, DialogState, SessionPickerScope, TuiState},
     theme::Theme,
 };
 
@@ -127,6 +127,8 @@ pub fn render_picker(
             render_mcp_picker_footer(frame, footer_area, theme, state, dialog.kind.clone());
         } else if matches!(dialog.kind, DialogKind::ExpertModelPicker(_)) {
             render_expert_model_picker_footer(frame, footer_area, theme, state);
+        } else if dialog.kind == DialogKind::SessionPicker {
+            render_session_picker_footer(frame, footer_area, theme, state, dialog);
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
@@ -394,7 +396,10 @@ fn render_picker_body(
     if !rendered_any && y < area.bottom() {
         let empty_label = match dialog.kind {
             DialogKind::LanguagePicker => state.t("language.no_match"),
-            DialogKind::SessionPicker => state.t("dialog.no_sessions"),
+            DialogKind::SessionPicker => match dialog.session_scope {
+                SessionPickerScope::Workspace => state.t("dialog.no_workspace_sessions"),
+                SessionPickerScope::All => state.t("dialog.no_sessions"),
+            },
             DialogKind::HistoryTree => state.t("dialog.no_history"),
             DialogKind::ContextPicker => state.t("dialog.no_context"),
             DialogKind::McpPicker => dialog
@@ -421,6 +426,34 @@ fn render_picker_body(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+fn render_session_picker_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+    dialog: &DialogState,
+) {
+    // The hint names the scope the key switches to, not the current one.
+    let target = match dialog.session_scope {
+        SessionPickerScope::Workspace => state.t("ui.session_scope_all"),
+        SessionPickerScope::All => state.t("ui.session_scope_this"),
+    };
+    let spans = vec![
+        Span::styled("←/→", accent_style(theme)),
+        Span::styled(format!(" {target}"), muted_style(theme)),
+        Span::styled("  ·  ", muted_style(theme)),
+        Span::styled("Enter", accent_style(theme)),
+        Span::styled(format!(" {}", state.t("ui.select")), muted_style(theme)),
+        Span::styled("  ·  ", muted_style(theme)),
+        Span::styled("Esc", accent_style(theme)),
+        Span::styled(format!(" {}", state.t("ui.close")), muted_style(theme)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
+        area,
+    );
 }
 
 fn render_expert_model_picker_footer(

@@ -302,6 +302,25 @@ impl DialogItem {
     }
 }
 
+/// Which sessions the picker lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionPickerScope {
+    /// Sessions started in the workspace this process runs in.
+    #[default]
+    Workspace,
+    /// Sessions from every workspace, grouped by project.
+    All,
+}
+
+impl SessionPickerScope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Workspace => Self::All,
+            Self::All => Self::Workspace,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogKind {
     ModelPicker,
@@ -493,6 +512,7 @@ pub struct DialogState {
     pub mcp_primary_selected_server: Option<String>,
     pub expert_primary_query: Option<String>,
     pub expert_primary_selected_agent: Option<String>,
+    pub session_scope: SessionPickerScope,
     pub detail_focused: bool,
     pub detail_scroll: u16,
     pub detail_scroll_max: u16,
@@ -1046,6 +1066,7 @@ impl DialogState {
             mcp_primary_selected_server: None,
             expert_primary_query: None,
             expert_primary_selected_agent: None,
+            session_scope: SessionPickerScope::default(),
             detail_focused: false,
             detail_scroll: 0,
             detail_scroll_max: u16::MAX,
@@ -1109,6 +1130,15 @@ impl DialogState {
         };
 
         self.selected = target.unwrap_or(0);
+        self.reset_detail_focus();
+    }
+
+    /// Replace the listed items, keeping the query and moving the cursor to the
+    /// first visible row.
+    pub fn replace_items(&mut self, items: Vec<DialogItem>) {
+        self.items = items;
+        self.selected = 0;
+        self.clamp_selection_to_visible();
         self.reset_detail_focus();
     }
 

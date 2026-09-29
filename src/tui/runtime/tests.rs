@@ -6950,3 +6950,65 @@ fn child_command_toggles_between_child_and_parent_views() {
     assert_eq!(cmd, Some(RuntimeCommand::ViewParent));
     assert!(!runtime.state().transcript_view.is_child());
 }
+
+#[test]
+fn session_scope_switch_regroups_the_resume_listing() {
+    fn summary(id: &str, last_timestamp_ms: u128, workspace: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            session_id: id.into(),
+            record_count: 1,
+            first_timestamp_ms: Some(last_timestamp_ms),
+            last_timestamp_ms: Some(last_timestamp_ms),
+            model: Some("test/model".into()),
+            title: Some(format!("title {id}")),
+            last_user_summary: None,
+            last_assistant_summary: None,
+            workspace: workspace.map(str::to_string),
+        }
+    }
+
+    fn listed(runtime: &TuiRuntime) -> Vec<&str> {
+        runtime
+            .state()
+            .dialog()
+            .expect("resume dialog is open")
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect()
+    }
+
+    let mut runtime = runtime();
+    runtime.workspace_key = Some("/work/letcode".into());
+    runtime.session_summaries = vec![
+        summary("current", 300, Some("/work/letcode")),
+        summary("other", 200, Some("/oss/letcode")),
+    ];
+    let items = runtime.session_rows(&runtime.session_summaries, SessionPickerScope::Workspace);
+    runtime.state_mut().open_dialog(DialogState::new(
+        DialogKind::SessionPicker,
+        "Sessions",
+        None,
+        items,
+    ));
+
+    assert_eq!(listed(&runtime), ["current"]);
+
+    runtime
+        .handle_input_action(InputAction::DialogToggleSessionScope)
+        .expect("switch to every workspace");
+    assert_eq!(
+        runtime.state().dialog().expect("dialog").session_scope,
+        SessionPickerScope::All
+    );
+    assert_eq!(listed(&runtime), ["current", "other"]);
+
+    runtime
+        .handle_input_action(InputAction::DialogToggleSessionScope)
+        .expect("switch back to this workspace");
+    assert_eq!(
+        runtime.state().dialog().expect("dialog").session_scope,
+        SessionPickerScope::Workspace
+    );
+    assert_eq!(listed(&runtime), ["current"]);
+}

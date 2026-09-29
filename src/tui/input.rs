@@ -22,6 +22,7 @@ pub enum InputAction {
     DialogBackspace,
     DialogNext,
     DialogPrev,
+    DialogToggleSessionScope,
     DialogAccept,
     DialogToggle,
     DialogCancel,
@@ -275,11 +276,17 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         let search_dialog = state
             .dialog()
             .is_some_and(|dialog| dialog.kind.is_searchable());
+        let session_picker = state
+            .dialog()
+            .is_some_and(|dialog| dialog.kind == DialogKind::SessionPicker);
 
         return if search_dialog {
             match key.code {
                 KeyCode::Up => InputAction::DialogPrev,
                 KeyCode::Down => InputAction::DialogNext,
+                KeyCode::Left | KeyCode::Right if session_picker => {
+                    InputAction::DialogToggleSessionScope
+                }
                 KeyCode::Enter => InputAction::DialogAccept,
                 KeyCode::Char(' ')
                     if state.dialog().is_some_and(|dialog| {
@@ -972,6 +979,58 @@ mod tests {
                 } else {
                     InputAction::Paste("x".into())
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn session_picker_horizontal_keys_switch_scope() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::SessionPicker,
+            "Sessions",
+            None,
+            vec![crate::tui::state::DialogItem::new(
+                "session-1",
+                "Work",
+                None,
+            )],
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::DialogToggleSessionScope
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::DialogToggleSessionScope
+        );
+    }
+
+    #[test]
+    fn other_searchable_pickers_leave_horizontal_keys_unbound() {
+        for kind in [
+            DialogKind::ModelPicker,
+            DialogKind::HistoryTree,
+            DialogKind::ContextPicker,
+        ] {
+            let mut state = TuiState::default();
+            state.open_dialog(crate::tui::state::DialogState::new(
+                kind.clone(),
+                "Dialog",
+                None,
+                vec![crate::tui::state::DialogItem::new("item", "Item", None)],
+            ));
+
+            assert_eq!(
+                map_key_event(&state, key(KeyCode::Left)),
+                InputAction::NoOp,
+                "{kind:?} must not swallow the horizontal keys"
+            );
+            assert_eq!(
+                map_key_event(&state, key(KeyCode::Right)),
+                InputAction::NoOp,
+                "{kind:?} must not swallow the horizontal keys"
             );
         }
     }

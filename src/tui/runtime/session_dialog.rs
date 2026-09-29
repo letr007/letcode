@@ -1,13 +1,152 @@
+use std::collections::HashMap;
+use std::path::{Component, Path};
+
 use super::DialogItem;
 use crate::transcript::SessionSummary;
+use crate::tui::state::SessionPickerScope;
 
-pub(super) fn session_dialog_item(session: &SessionSummary) -> DialogItem {
-    let label = session
+/// Builds the picker rows for one scope, preserving the listing order (most
+/// recently used first) the summaries already carry.
+///
+/// The current workspace lists its own sessions under date headings, exactly as
+/// the unfiltered listing did. Every workspace groups by project instead, with
+/// sessions that record no workspace last.
+pub(super) fn session_dialog_items(
+    sessions: &[SessionSummary],
+    current_workspace: Option<&str>,
+    scope: SessionPickerScope,
+    unassigned_label: &str,
+) -> Vec<DialogItem> {
+    match scope {
+        SessionPickerScope::Workspace => {
+            // Sessions that record no workspace belong to no workspace, so they
+            // only ever appear in the every-workspace view.
+            let Some(current) = current_workspace else {
+                return Vec::new();
+            };
+            sessions
+                .iter()
+                .filter(|session| session.workspace.as_deref() == Some(current))
+                .map(date_section_item)
+                .collect()
+        }
+        SessionPickerScope::All => {
+            let groups = project_groups(sessions, current_workspace);
+            let labels = project_labels(&groups);
+            let mut items = Vec::with_capacity(sessions.len());
+            for (root, members) in groups {
+                let label = match &root {
+                    Some(root) => labels.get(root).cloned().unwrap_or_else(|| root.clone()),
+                    None => unassigned_label.to_string(),
+                };
+                items.extend(members.into_iter().map(|session| {
+                    session_item(session, label.clone(), session_stamp_label(session))
+                }));
+            }
+            items
+        }
+    }
+}
+
+/// Sessions by workspace root, most recently used project first and the
+/// workspace-less sessions last. `None` keys the transcripts that record none.
+fn project_groups<'a>(
+    sessions: &'a [SessionSummary],
+    current_workspace: Option<&str>,
+) -> Vec<(Option<String>, Vec<&'a SessionSummary>)> {
+    let mut groups: Vec<(Option<String>, Vec<&'a SessionSummary>)> = Vec::new();
+    let mut index: HashMap<Option<&str>, usize> = HashMap::new();
+    for session in sessions {
+        let root = session.workspace.as_deref();
+        let position = match index.get(&root) {
+            Some(position) => *position,
+            None => {
+                groups.push((root.map(str::to_string), Vec::new()));
+                index.insert(root, groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        groups[position].1.push(session);
+    }
+
+    // The workspace running this process leads, so its project stays the first
+    // block the user sees after switching away from the workspace view.
+    groups.sort_by_key(|(root, members)| {
+        let current = root.as_deref() == current_workspace;
+        let recent = members
+            .iter()
+            .filter_map(|session| session.last_timestamp_ms)
+            .max()
+            .unwrap_or(0);
+        (root.is_none(), !current, std::cmp::Reverse(recent))
+    });
+    groups
+}
+
+/// Display names for the project headings, keyed by workspace root. Roots that
+/// share a directory name are widened to their parent so the headings differ.
+fn project_labels(groups: &[(Option<String>, Vec<&SessionSummary>)]) -> HashMap<String, String> {
+    let roots = groups
+        .iter()
+        .filter_map(|(root, _)| root.as_deref())
+        .collect::<Vec<_>>();
+    let mut short_counts: HashMap<String, usize> = HashMap::new();
+    for root in &roots {
+        *short_counts
+            .entry(trailing_components(root, 1))
+            .or_default() += 1;
+    }
+
+    roots
+        .into_iter()
+        .map(|root| {
+            let short = trailing_components(root, 1);
+            let label = if short_counts[&short] == 1 {
+                short
+            } else {
+                trailing_components(root, 2)
+            };
+            (root.to_string(), label)
+        })
+        .collect()
+}
+
+/// The last `depth` path segments, joined with `/`.
+fn trailing_components(root: &str, depth: usize) -> String {
+    let mut parts = Path::new(root)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if parts.len() > depth {
+        parts.drain(..parts.len() - depth);
+    }
+    parts.join("/")
+}
+
+fn session_label(session: &SessionSummary) -> String {
+    session
         .title
         .clone()
         .or_else(|| session.last_user_summary.clone())
         .or_else(|| session.last_assistant_summary.clone())
-        .unwrap_or_else(|| "empty session".into());
+        .unwrap_or_else(|| "empty session".into())
+}
+
+fn session_item(session: &SessionSummary, section: String, right_detail: String) -> DialogItem {
+    DialogItem::new(
+        session.session_id.clone(),
+        session_label(session),
+        Some(session.session_id.clone()),
+    )
+    .with_section(section)
+    .with_right_detail(right_detail)
+}
+
+/// A row in the workspace view, sectioned by the day it last ran.
+fn date_section_item(session: &SessionSummary) -> DialogItem {
     let timestamp_ms = session.last_timestamp_ms.or(session.first_timestamp_ms);
     let section = timestamp_ms
         .map(session_section_label)
@@ -16,13 +155,24 @@ pub(super) fn session_dialog_item(session: &SessionSummary) -> DialogItem {
         .map(session_time_label)
         .unwrap_or_else(|| "--:--".into());
 
-    DialogItem::new(
-        session.session_id.clone(),
-        label,
-        Some(session.session_id.clone()),
-    )
-    .with_section(section)
-    .with_right_detail(right_detail)
+    session_item(session, section, right_detail)
+}
+
+/// A row in the every-workspace view, where the section names the project and
+/// the stamp carries the date instead of only the time.
+fn session_stamp_label(session: &SessionSummary) -> String {
+    let Some(timestamp_ms) = session.last_timestamp_ms.or(session.first_timestamp_ms) else {
+        return "--:--".into();
+    };
+    let (year, month, day) = utc_date_parts(timestamp_ms);
+    let (current_year, current_month, current_day) = utc_date_parts(unix_timestamp_ms_for_tui());
+    if (year, month, day) == (current_year, current_month, current_day) {
+        return session_time_label(timestamp_ms);
+    }
+    if year == current_year {
+        return format!("{} {day:02}", month_name(month));
+    }
+    format!("{} {day:02} {year}", month_name(month))
 }
 
 fn session_section_label(timestamp_ms: u128) -> String {
@@ -112,4 +262,92 @@ fn unix_timestamp_ms_for_tui() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(id: &str, last_timestamp_ms: u128, workspace: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            session_id: id.into(),
+            record_count: 1,
+            first_timestamp_ms: Some(last_timestamp_ms),
+            last_timestamp_ms: Some(last_timestamp_ms),
+            model: Some("test/model".into()),
+            title: Some(format!("title {id}")),
+            last_user_summary: None,
+            last_assistant_summary: None,
+            workspace: workspace.map(str::to_string),
+        }
+    }
+
+    fn ids(items: &[DialogItem]) -> Vec<&str> {
+        items.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    fn sections(items: &[DialogItem]) -> Vec<&str> {
+        items
+            .iter()
+            .map(|item| item.section.as_deref().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn workspace_scope_lists_only_the_running_workspace() {
+        let sessions = vec![
+            summary("current", 300, Some("/work/letcode")),
+            summary("other", 200, Some("/work/other")),
+            summary("unrecorded", 100, None),
+        ];
+
+        let items = session_dialog_items(
+            &sessions,
+            Some("/work/letcode"),
+            SessionPickerScope::Workspace,
+            "Unknown project",
+        );
+
+        assert_eq!(ids(&items), ["current"]);
+    }
+
+    #[test]
+    fn every_workspace_scope_leads_with_the_running_project() {
+        let sessions = vec![
+            summary("newest", 400, Some("/work/other")),
+            summary("unrecorded", 300, None),
+            summary("current", 200, Some("/work/letcode")),
+            summary("older", 100, Some("/work/letcode")),
+        ];
+
+        let items = session_dialog_items(
+            &sessions,
+            Some("/work/letcode"),
+            SessionPickerScope::All,
+            "Unknown project",
+        );
+
+        assert_eq!(ids(&items), ["current", "older", "newest", "unrecorded"]);
+        assert_eq!(
+            sections(&items),
+            ["letcode", "letcode", "other", "Unknown project"]
+        );
+    }
+
+    #[test]
+    fn project_headings_widen_when_directory_names_collide() {
+        let sessions = vec![
+            summary("work", 200, Some("/work/api")),
+            summary("oss", 100, Some("/oss/api")),
+        ];
+
+        let items = session_dialog_items(
+            &sessions,
+            Some("/elsewhere"),
+            SessionPickerScope::All,
+            "Unknown project",
+        );
+
+        assert_eq!(sections(&items), ["work/api", "oss/api"]);
+    }
 }
