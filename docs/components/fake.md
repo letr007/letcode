@@ -32,7 +32,7 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 - 工作区与版本库：读取当前工作区的绝对路径，并自动探测当前 Git 提交哈希（`git rev-parse HEAD`）与工作区变更状态；
 - 时区与日期：默认依据本机系统时钟与 IANA 本地时区换算。
 
-部分服务商的网关只接受携带客户端自述块（归属行与 Agent 声明行）且附带 `metadata.user_id` 的请求，缺少任一项时以 `Service Unavailable` 类响应退回；这两项在仿真开启时始终发送。
+部分服务商的网关只接受携带客户端自述块（归属行与 Agent 声明行）且附带 `metadata.user_id` 的请求，缺少任一项时以 `Service Unavailable` 类响应退回；主轮次与 helper 请求在仿真开启时都发送这两项。
 
 无法从本机确认的属性取自被模仿客户端的典型值，如客户端版本、依赖包版本和能力标记。这些值描述同一个已发布客户端：标头的 `claude-cli/<version>`、归属行的 `cc_version=<version>.<build>`、`x-stainless-package-version`、`x-stainless-runtime-version` 与 `anthropic-beta` 列表随被模仿客户端发版整体变化，需要同步更新。针对特定服务商专有的沙箱标记（如 `sandbox_mode` 与 `node_repl_disabled`），系统填充规范的默认值。用户也可以在配置文件的 `[fake.codex.extra]` 中添加自定义键值对，最多允许配置 16 项。
 

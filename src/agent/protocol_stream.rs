@@ -2212,9 +2212,18 @@ pub(super) fn prepare_oneshot_http_request(
     )?;
     let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
+    decorate_oneshot_request(route, &input, decorator)
+}
+
+/// Builds the request a caller already shaped, then applies the fake disguise.
+pub(super) fn decorate_oneshot_request(
+    route: &crate::model_runtime::ResolvedModelRoute,
+    input: &crate::model_runtime::ModelRequestInput,
+    decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
+) -> Result<crate::model_runtime::PreparedHttpRequest> {
     let request = route
         .binding
-        .prepare_request(&input)
+        .prepare_request(input)
         .map_err(anyhow::Error::new)?;
     match decorator {
         Some(decorator) => decorator

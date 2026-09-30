@@ -454,6 +454,164 @@ fn anthropic_session_title_request_carries_the_claude_code_profile() {
     assert!(user_id.contains(session_id.as_str()), "{user_id}");
 }
 
+/// Reads one request from a test server connection.
+async fn read_test_http_request(stream: &mut tokio::net::TcpStream) -> (String, String) {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let (head_end, length) = loop {
+        let read = stream.read(&mut buffer).await.unwrap();
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(at) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head_end = at + 4;
+            let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            break (head_end, length);
+        }
+    };
+    while bytes.len() < head_end + length {
+        let read = stream.read(&mut buffer).await.unwrap();
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    (
+        String::from_utf8_lossy(&bytes[..head_end]).into_owned(),
+        String::from_utf8_lossy(&bytes[head_end..head_end + length]).into_owned(),
+    )
+}
+
+/// Serves one Anthropic text completion on the connection.
+async fn serve_anthropic_text_completion(stream: &mut tokio::net::TcpStream, text: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    let body = format!(
+        concat!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg-1\"}}}}\n\n",
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n",
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":3}}}}\n\n",
+            "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        text = text
+    );
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Asserts the request carries what the imitated client reports on every call.
+fn assert_claude_client_profile(head: &str, body: &str) {
+    let request: serde_json::Value = serde_json::from_str(body).expect("the body is JSON");
+    let system = request["system"].as_array().expect("system blocks");
+    assert!(
+        system[0]["text"]
+            .as_str()
+            .expect("the first block is text")
+            .starts_with("x-anthropic-billing-header: cc_version="),
+        "{system:?}"
+    );
+    assert_eq!(
+        system[1]["text"].as_str(),
+        Some("You are a Claude agent, built on Anthropic's Claude Agent SDK.")
+    );
+    // The client blocks precede the helper's own prompt instead of replacing it.
+    assert!(system.len() > 2, "{system:?}");
+    let user_id = request["metadata"]["user_id"].as_str().expect("user id");
+    let decoded: serde_json::Value = serde_json::from_str(user_id).expect("user id is a JSON blob");
+    assert_eq!(decoded["device_id"].as_str().map(str::len), Some(64));
+
+    let head = head.to_ascii_lowercase();
+    assert!(head.starts_with("post /v1/messages?beta=true "), "{head}");
+    assert!(head.contains("user-agent: claude-cli/"), "{head}");
+    assert!(head.contains("x-claude-code-session-id: "), "{head}");
+}
+
+#[tokio::test]
+async fn the_anthropic_title_oneshot_carries_the_client_profile() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_test_http_request(&mut stream).await;
+        serve_anthropic_text_completion(&mut stream, "Titled").await;
+        request
+    });
+
+    let mut agent = test_agent();
+    agent.set_default_protocol(ApiProtocol::Anthropic);
+    install_active_epoch_route_at(
+        &mut agent,
+        ApiProtocol::Anthropic,
+        false,
+        &format!("http://{address}/v1"),
+    );
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
+        .expect("anthropic protocol supports the anthropic fake");
+
+    let mut title_agent = agent.session_title_agent();
+    let title = title_agent
+        .generate_session_title("say ok")
+        .await
+        .expect("the title is generated");
+    assert_eq!(title, "Titled");
+
+    let (head, body) = server.await.unwrap();
+    assert_claude_client_profile(&head, &body);
+}
+
+#[tokio::test]
+async fn the_anthropic_structured_oneshot_carries_the_client_profile() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_test_http_request(&mut stream).await;
+        serve_anthropic_text_completion(&mut stream, "Summarized").await;
+        request
+    });
+
+    let mut agent = test_agent();
+    agent.set_default_protocol(ApiProtocol::Anthropic);
+    install_active_epoch_route_at(
+        &mut agent,
+        ApiProtocol::Anthropic,
+        false,
+        &format!("http://{address}/v1"),
+    );
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
+        .expect("anthropic protocol supports the anthropic fake");
+
+    let (text, _) = agent
+        .run_structured_oneshot(
+            &crate::user_content::UserMessageContent::new("say ok", vec![]),
+            |_| None,
+            |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
+        )
+        .await
+        .expect("the oneshot completes");
+    assert_eq!(text, "Summarized");
+
+    let (head, body) = server.await.unwrap();
+    assert_claude_client_profile(&head, &body);
+}
+
 #[test]
 fn session_title_request_stays_undisguised_while_the_fake_is_off() {
     let mut agent = test_agent();
@@ -506,6 +664,20 @@ fn install_active_epoch_image_route(
     protocol: ApiProtocol,
     supports_images: bool,
 ) {
+    install_active_epoch_route_at(
+        agent,
+        protocol,
+        supports_images,
+        "https://test.example.invalid/v1",
+    );
+}
+
+fn install_active_epoch_route_at(
+    agent: &mut Agent,
+    protocol: ApiProtocol,
+    supports_images: bool,
+    base_url: &str,
+) {
     let catalog = crate::model_runtime::RuntimeConfig::from_toml(&format!(
         r#"
 active_provider = "test"
@@ -515,7 +687,15 @@ default_model = "m1"
 [providers.test.auth]
 type = "none"
 [providers.test.endpoints]
-base_url = "https://test.example.invalid/v1"
+base_url = "{base_url}"
+[providers.test.retry]
+enabled = false
+max_attempts = 1
+max_recovery_attempts = 1
+initial_delay_secs = 1
+exponential_backoff = false
+backoff_multiplier = 1.0
+jitter_secs = 0
 [providers.test.models.m1]
 [providers.test.models.m1.capabilities]
 tools = true

@@ -3073,15 +3073,19 @@ impl Agent {
             .resolved_model_route()
             .ok_or_else(|| anyhow!("structured oneshot requires a resolved route"))?;
         let structured_output = contract(route.generation.structured_output);
+        let mut prelude = self.prelude.clone();
+        prepend_fake_claude_client_blocks(self, &mut prelude);
         let (_, input) = protocol_stream::prepare_resolved_oneshot_request(
             route,
             self.active_model_metadata(),
-            &self.prelude,
+            &prelude,
             user_input,
             structured_output.as_ref(),
         )?;
+        let decorator = protocol_stream::fake_request_decorator(self, route, false);
+        let request = protocol_stream::decorate_oneshot_request(route, &input, decorator.as_ref())?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
-            .execute_text_oneshot_with_usage(route, &input, on_delta, || async { Ok(()) })
+            .execute_prepared_text_oneshot_with_usage(route, request, on_delta, || async { Ok(()) })
             .await
             .map_err(anyhow::Error::new)?;
         Ok((
@@ -3097,12 +3101,15 @@ impl Agent {
         let route = self
             .resolved_model_route()
             .ok_or_else(|| anyhow!("helper requires an installed resolved model route"))?;
+        let mut prelude = self.prelude.clone();
+        prepend_fake_claude_client_blocks(self, &mut prelude);
+        let decorator = protocol_stream::fake_request_decorator(self, route, false);
         protocol_stream::execute_resolved_text_oneshot(
             route,
             self.active_model_metadata(),
-            &self.prelude,
+            &prelude,
             user_input,
-            None,
+            decorator.as_ref(),
         )
         .await
     }
@@ -3114,10 +3121,12 @@ impl Agent {
         // The title helper shares the session's route, so it shares its
         // disguise while the fake is on.
         let fake_decorator = protocol_stream::fake_request_decorator(self, route, false);
+        let mut prelude = self.prelude.clone();
+        prepend_fake_claude_client_blocks(self, &mut prelude);
         let raw = protocol_stream::execute_resolved_text_oneshot(
             route,
             self.active_model_metadata(),
-            &self.prelude,
+            &prelude,
             user_input,
             fake_decorator.as_ref(),
         )
