@@ -343,6 +343,37 @@ fn the_anthropic_profile_resolves_the_claude_code_context() {
 }
 
 #[test]
+fn the_anthropic_profile_prepends_the_client_blocks() {
+    let mut agent = test_agent();
+    agent.set_default_protocol(ApiProtocol::Anthropic);
+    agent
+        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
+        .expect("anthropic protocol supports the anthropic fake");
+
+    let prelude = agent
+        .try_prepare_turn_prelude_with_skills(&[])
+        .expect("the turn prelude is prepared");
+    let first = prelude.first().expect("the prelude has a first message");
+    assert!(
+        first
+            .text
+            .starts_with("x-anthropic-billing-header: cc_version="),
+        "{}",
+        first.text
+    );
+    let second = prelude.get(1).expect("the prelude has a second message");
+    assert_eq!(
+        second.text,
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    );
+    // The blocks precede the agent's own prompt instead of replacing it.
+    assert_eq!(
+        prelude.get(2).map(|message| message.text.as_str()),
+        agent.prelude.first().map(|message| message.text.as_str())
+    );
+}
+
+#[test]
 fn session_title_request_is_disguised_while_the_fake_is_on() {
     let mut agent = test_agent();
     install_active_epoch_route(&mut agent, ApiProtocol::Responses);
@@ -411,7 +442,7 @@ fn anthropic_session_title_request_carries_the_claude_code_profile() {
     let user_agent = headers.get("user-agent").expect("client identity");
     assert!(user_agent.starts_with("claude-cli/"), "{user_agent}");
     assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
-    assert!(headers.contains_key("x-client-request-id"));
+    assert!(!headers.contains_key("x-client-request-id"));
     assert!(!headers.contains_key("originator"));
     let session_id = headers
         .get("x-claude-code-session-id")

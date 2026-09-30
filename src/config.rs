@@ -625,6 +625,7 @@ pub struct FakeCodexConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeClaudeConfig {
     pub version: Option<String>,
+    pub build: Option<String>,
     pub package_version: Option<String>,
     pub runtime_version: Option<String>,
     pub timeout: Option<String>,
@@ -833,6 +834,7 @@ struct RawFakeCodexConfig {
 #[serde(deny_unknown_fields)]
 struct RawFakeClaudeConfig {
     version: Option<String>,
+    build: Option<String>,
     package_version: Option<String>,
     runtime_version: Option<String>,
     timeout: Option<String>,
@@ -1359,6 +1361,7 @@ fn build_fake_config(raw: RawFakeConfig) -> Result<FakeConfig> {
         },
         claude: FakeClaudeConfig {
             version: optional_non_empty("fake.claude.version", claude.version)?,
+            build: optional_non_empty("fake.claude.build", claude.build)?,
             package_version: optional_non_empty(
                 "fake.claude.package_version",
                 claude.package_version,
@@ -2430,6 +2433,7 @@ auto_review_enabled = true
 custom_key = "custom value"
 [fake.claude]
 version = "2.1.69"
+build = "6bf"
 package_version = "0.74.0"
 runtime_version = "v22.16.0"
 timeout = "600"
@@ -2471,6 +2475,7 @@ betas = ["claude-code-20250219"]
             Some("custom value")
         );
         assert_eq!(loaded.fake.claude.version.as_deref(), Some("2.1.69"));
+        assert_eq!(loaded.fake.claude.build.as_deref(), Some("6bf"));
         assert_eq!(
             loaded.fake.claude.package_version.as_deref(),
             Some("0.74.0")

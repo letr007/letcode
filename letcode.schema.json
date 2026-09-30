@@ -551,6 +551,7 @@
       "additionalProperties": false,
       "properties": {
         "version": { "type": "string" },
+        "build": { "type": "string" },
         "package_version": { "type": "string" },
         "runtime_version": { "type": "string" },
         "timeout": { "type": "string" },

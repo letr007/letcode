@@ -12,6 +12,7 @@
 //! imitated client's typical values.
 
 use crate::config::FakeConfig;
+use crate::permission::PermissionMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::Path;
@@ -93,8 +94,12 @@ impl FakeIdentity {
         CodexRequestContext::resolve(self, config, cwd)
     }
 
-    pub(crate) fn claude_turn_context(&self, config: &FakeConfig) -> ClaudeRequestContext {
-        ClaudeRequestContext::resolve(self, config)
+    pub(crate) fn claude_turn_context(
+        &self,
+        config: &FakeConfig,
+        permissions: PermissionMode,
+    ) -> ClaudeRequestContext {
+        ClaudeRequestContext::resolve(self, config, permissions)
     }
 }
 
@@ -382,9 +387,10 @@ impl CodexRequestContext {
 /// Per-turn values injected into a Claude Code shaped Messages request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeRequestContext {
-    pub installation_id: String,
+    pub device_id: String,
     pub session_id: String,
     pub version: String,
+    pub build: String,
     pub package_version: String,
     pub runtime_version: String,
     pub timeout: String,
@@ -397,36 +403,52 @@ pub struct ClaudeRequestContext {
 /// Claude Code-typical values for attributes letcode has no equivalent for.
 mod claude_defaults {
     /// These values describe one published client, so they move together.
-    pub(super) const VERSION: &str = "2.1.69";
-    pub(super) const PACKAGE_VERSION: &str = "0.74.0";
-    pub(super) const RUNTIME_VERSION: &str = "v22.16.0";
+    pub(super) const VERSION: &str = "2.1.285";
+    pub(super) const BUILD: &str = "6bf";
+    pub(super) const PACKAGE_VERSION: &str = "0.127.0";
+    pub(super) const RUNTIME_VERSION: &str = "v26.3.0";
     pub(super) const TIMEOUT: &str = "600";
-    pub(super) const ENTRYPOINT: &str = "(external, cli)";
+    pub(super) const ENTRYPOINT: &str = "cli";
     pub(super) const APP: &str = "cli";
     pub(super) const LANG: &str = "js";
     pub(super) const RUNTIME: &str = "node";
     pub(super) const RETRY_COUNT: &str = "0";
+    /// Some gateways serve only bodies carrying this beta and its body field.
+    pub(super) const CONTEXT_MANAGEMENT: &str = "context-management-2025-06-27";
+    pub(super) const AUTO_MODE_BETAS: &[&str] =
+        &["dangerous-tool-use-2026-09-03", "afk-mode-2026-01-31"];
+    /// Gateways that front this client match the block verbatim.
+    pub(super) const AGENT_PREAMBLE: &str =
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
     pub(super) const BETAS: &[&str] = &[
         "claude-code-20250219",
-        "oauth-2025-04-20",
-        "adaptive-thinking-2026-01-28",
+        "interleaved-thinking-2025-05-14",
+        "thinking-token-count-2026-05-13",
         "context-management-2025-06-27",
         "prompt-caching-scope-2026-01-05",
-        "advanced-tool-use-2025-11-20",
+        "mid-conversation-system-2026-04-07",
+        "per-turn-control-2026-07-01",
+        "mid-conversation-tool-changes-2026-07-01",
         "effort-2025-11-24",
+        "dangerous-tool-use-2026-09-03",
+        "afk-mode-2026-01-31",
     ];
 }
 
 impl ClaudeRequestContext {
-    fn resolve(identity: &FakeIdentity, config: &FakeConfig) -> Self {
+    fn resolve(identity: &FakeIdentity, config: &FakeConfig, permissions: PermissionMode) -> Self {
         let claude = &config.claude;
         Self {
-            installation_id: identity.installation_id.clone(),
+            device_id: device_id_from(&identity.installation_id),
             session_id: identity.session_id.clone(),
             version: claude
                 .version
                 .clone()
                 .unwrap_or_else(|| claude_defaults::VERSION.to_string()),
+            build: claude
+                .build
+                .clone()
+                .unwrap_or_else(|| claude_defaults::BUILD.to_string()),
             package_version: claude
                 .package_version
                 .clone()
@@ -441,26 +463,33 @@ impl ClaudeRequestContext {
                 .unwrap_or_else(|| claude_defaults::TIMEOUT.to_string()),
             os: claude.os.clone().unwrap_or_else(stainless_os),
             arch: claude.arch.clone().unwrap_or_else(stainless_arch),
-            betas: claude.betas.clone().unwrap_or_else(|| {
-                claude_defaults::BETAS
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect()
-            }),
-            account_uuid: config
-                .identity
-                .account_uuid
+            betas: claude
+                .betas
                 .clone()
-                .unwrap_or_else(|| account_uuid_from(&identity.installation_id)),
+                .unwrap_or_else(|| default_betas(permissions)),
+            account_uuid: config.identity.account_uuid.clone().unwrap_or_default(),
         }
     }
 
     pub fn user_agent(&self) -> String {
         format!(
-            "claude-cli/{} {}",
+            "claude-cli/{} (external, {})",
             self.version,
             claude_defaults::ENTRYPOINT
         )
+    }
+
+    /// Ordered ahead of the agent's own prompt.
+    pub fn client_system_blocks(&self) -> Vec<String> {
+        vec![
+            format!(
+                "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={};",
+                self.version,
+                self.build,
+                claude_defaults::ENTRYPOINT
+            ),
+            claude_defaults::AGENT_PREAMBLE.to_string(),
+        ]
     }
 
     /// HTTP headers the client sends on Messages requests.
@@ -493,7 +522,6 @@ impl ClaudeRequestContext {
                 "anthropic-dangerous-direct-browser-access".into(),
                 "true".into(),
             ),
-            ("x-client-request-id".into(), synthetic_uuid()),
             ("x-claude-code-session-id".into(), self.session_id.clone()),
         ];
         if !self.betas.is_empty() {
@@ -505,7 +533,7 @@ impl ClaudeRequestContext {
     /// The `metadata.user_id` the 2.x client reports, as a JSON blob string.
     pub fn metadata_user_id(&self) -> String {
         serde_json::json!({
-            "device_id": self.installation_id,
+            "device_id": self.device_id,
             "account_uuid": self.account_uuid,
             "session_id": self.session_id,
         })
@@ -547,18 +575,17 @@ fn stainless_arch() -> String {
     }
 }
 
-/// Synthesized account id, derived from the installation id so it stays stable.
-fn account_uuid_from(installation_id: &str) -> String {
-    use sha2::{Digest, Sha256};
+fn device_id_from(installation_id: &str) -> String {
+    crate::request_builder::sha256_hex(installation_id.as_bytes())
+}
 
-    let digest = Sha256::digest(installation_id.as_bytes());
-    let mut hi_bytes = [0u8; 8];
-    let mut lo_bytes = [0u8; 8];
-    hi_bytes.copy_from_slice(&digest[..8]);
-    lo_bytes.copy_from_slice(&digest[8..16]);
-    let hi = (u64::from_be_bytes(hi_bytes) & 0xffff_ffff_ffff_0fff) | 0x4000;
-    let lo = (u64::from_be_bytes(lo_bytes) & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
-    format_uuid(hi, lo)
+fn default_betas(permissions: PermissionMode) -> Vec<String> {
+    let bypassed = permissions == PermissionMode::Yolo;
+    claude_defaults::BETAS
+        .iter()
+        .filter(|beta| !(bypassed && claude_defaults::AUTO_MODE_BETAS.contains(*beta)))
+        .map(|beta| (*beta).to_string())
+        .collect()
 }
 
 /// Writes the client identity the Messages body reports into `metadata`.
@@ -573,6 +600,16 @@ pub fn apply_claude_body_shape(request: &mut Value, context: &ClaudeRequestConte
         return;
     };
     metadata.insert("user_id".into(), Value::String(context.metadata_user_id()));
+    if context
+        .betas
+        .iter()
+        .any(|beta| beta == claude_defaults::CONTEXT_MANAGEMENT)
+    {
+        object.insert(
+            "context_management".into(),
+            serde_json::json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}),
+        );
+    }
 }
 
 /// Rewrite a serialized OpenAI Responses request into the observed Codex
@@ -683,6 +720,8 @@ fn push_xml_escaped_text(rendered: &mut String, value: &str) {
 /// Beta value the WebSocket transport uses to negotiate its protocol version.
 /// The HTTP transport does not send it.
 pub const CODEX_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+
+pub const CLAUDE_MESSAGES_QUERY: &str = "?beta=true";
 
 #[derive(Default)]
 struct GitFacts {
@@ -1158,7 +1197,8 @@ mod tests {
 
     #[test]
     fn claude_headers_report_the_client_profile() {
-        let context = FakeIdentity::new("installation").claude_turn_context(&FakeConfig::default());
+        let context = FakeIdentity::new("installation")
+            .claude_turn_context(&FakeConfig::default(), PermissionMode::Auto);
         let headers = context.headers();
         let value = |name: &str| {
             headers
@@ -1197,38 +1237,39 @@ mod tests {
         );
         assert!(value("originator").is_none());
         assert!(value("x-codex-turn-metadata").is_none());
+        // The client reads this id from responses; it never sends one.
+        assert!(value("x-client-request-id").is_none());
     }
 
     #[test]
-    fn claude_request_id_is_minted_per_request() {
-        let context = FakeIdentity::new("installation").claude_turn_context(&FakeConfig::default());
-        let value = |headers: &[(String, String)], name: &str| {
-            headers
-                .iter()
-                .find(|(header, _)| header == name)
-                .map(|(_, value)| value.clone())
-        };
+    fn claude_client_blocks_name_the_reported_client() {
+        let context = FakeIdentity::new("installation")
+            .claude_turn_context(&FakeConfig::default(), PermissionMode::Auto);
+        assert_eq!(
+            context.client_system_blocks(),
+            vec![
+                format!(
+                    "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={};",
+                    super::claude_defaults::VERSION,
+                    super::claude_defaults::BUILD,
+                    super::claude_defaults::ENTRYPOINT
+                ),
+                "You are a Claude agent, built on Anthropic's Claude Agent SDK.".to_string(),
+            ]
+        );
 
-        let first = context.headers();
-        let second = context.headers();
-        assert_ne!(
-            value(&first, "x-client-request-id"),
-            value(&second, "x-client-request-id")
-        );
-        assert_eq!(
-            value(&first, "x-claude-code-session-id"),
-            Some(context.session_id.clone())
-        );
-        assert_eq!(
-            value(&first, "x-claude-code-session-id"),
-            value(&second, "x-claude-code-session-id")
-        );
+        let mut declared = FakeConfig::default();
+        declared.claude.version = Some("9.9.9".into());
+        declared.claude.build = Some("abc".into());
+        let declared =
+            FakeIdentity::new("installation").claude_turn_context(&declared, PermissionMode::Auto);
+        assert!(declared.client_system_blocks()[0].contains("cc_version=9.9.9.abc;"));
     }
 
     #[test]
     fn claude_body_reports_the_session_as_metadata_user_id() {
         let identity = FakeIdentity::new("installation");
-        let context = identity.claude_turn_context(&FakeConfig::default());
+        let context = identity.claude_turn_context(&FakeConfig::default(), PermissionMode::Auto);
         let mut request = serde_json::json!({
             "model": "claude",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1238,33 +1279,76 @@ mod tests {
 
         let user_id = request["metadata"]["user_id"].as_str().expect("user id");
         let decoded: Value = serde_json::from_str(user_id).expect("json blob");
-        assert_eq!(decoded["device_id"], "installation");
+        assert_eq!(decoded["device_id"], context.device_id.as_str());
         assert_eq!(decoded["session_id"], context.session_id.as_str());
-        assert_eq!(decoded["account_uuid"], context.account_uuid.as_str());
+        // The API-key client reports no account.
+        assert_eq!(decoded["account_uuid"], "");
         assert_eq!(request["messages"][0]["content"], "hi");
+        assert_eq!(
+            request["context_management"],
+            serde_json::json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
+        );
 
         let mut declared = FakeConfig::default();
         declared.identity.account_uuid = Some("declared-account".into());
-        let declared = identity.claude_turn_context(&declared);
+        let declared = identity.claude_turn_context(&declared, PermissionMode::Auto);
         assert_eq!(declared.account_uuid, "declared-account");
     }
 
     #[test]
-    fn claude_account_id_is_stable_per_installation() {
+    fn claude_context_management_follows_its_beta() {
+        let identity = FakeIdentity::new("installation");
+        let mut declared = FakeConfig::default();
+        declared.claude.betas = Some(vec!["claude-code-20250219".into()]);
+        let context = identity.claude_turn_context(&declared, PermissionMode::Auto);
+        let mut request = serde_json::json!({"model": "claude"});
+        apply_claude_body_shape(&mut request, &context);
+        assert!(request.get("context_management").is_none());
+    }
+
+    #[test]
+    fn claude_auto_mode_betas_follow_the_permission_posture() {
+        let identity = FakeIdentity::new("installation");
+        let active = identity.claude_turn_context(&FakeConfig::default(), PermissionMode::Auto);
+        assert!(
+            active
+                .betas
+                .iter()
+                .any(|beta| beta == "dangerous-tool-use-2026-09-03")
+        );
+
+        let bypassed = identity.claude_turn_context(&FakeConfig::default(), PermissionMode::Yolo);
+        assert!(
+            !bypassed
+                .betas
+                .iter()
+                .any(|beta| super::claude_defaults::AUTO_MODE_BETAS.contains(&beta.as_str()))
+        );
+
+        // A declared list is explicit, so it is reported verbatim.
+        let mut declared = FakeConfig::default();
+        declared.claude.betas = Some(vec!["afk-mode-2026-01-31".into()]);
+        let declared = identity.claude_turn_context(&declared, PermissionMode::Yolo);
+        assert_eq!(declared.betas, vec!["afk-mode-2026-01-31".to_string()]);
+    }
+
+    #[test]
+    fn claude_device_id_is_a_stable_digest_of_the_installation() {
         let identity = FakeIdentity::new("installation");
         let first = identity
-            .claude_turn_context(&FakeConfig::default())
-            .account_uuid;
+            .claude_turn_context(&FakeConfig::default(), PermissionMode::Auto)
+            .device_id;
         let second = identity
-            .claude_turn_context(&FakeConfig::default())
-            .account_uuid;
+            .claude_turn_context(&FakeConfig::default(), PermissionMode::Auto)
+            .device_id;
         assert_eq!(first, second);
-        assert_eq!(first.as_bytes()[14], b'4', "account ids are version 4");
+        assert_eq!(first.len(), 64, "device ids are sha256 hex: {first}");
+        assert!(first.chars().all(|digit| digit.is_ascii_hexdigit()));
         assert_ne!(
             first,
             FakeIdentity::new("other-installation")
-                .claude_turn_context(&FakeConfig::default())
-                .account_uuid
+                .claude_turn_context(&FakeConfig::default(), PermissionMode::Auto)
+                .device_id
         );
     }
 }

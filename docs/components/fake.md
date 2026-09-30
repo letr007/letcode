@@ -9,7 +9,8 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 仿真机制严格约束在网络传输的外围契约中：
 
 - 仅修饰请求传输元数据（如请求头、客户端标识、会话安装 ID）；
-- 仅提供服务商协议约定的环境报告块（如终端环境、Git 状态与工作区路径）；
+- 仅提供服务商协议约定的环境报告块（如终端环境、Git 状态与工作区路径）与客户端自述块；
+- Agent 自身系统提示词保持原样，置于客户端自述块之后；
 - 不篡改 Agent 的核心系统提示词；
 - 不篡改工具目录的真实定义与安全参数。
 
@@ -18,7 +19,7 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 系统支持两种面向主流协议的传输剖面，各自模仿一个真实的编码客户端。
 
 1. **Codex 剖面**：面向基于 Responses 协议的服务商，构造匹配的客户端版本标头与回合扩展元数据；
-2. **Claude Code 剖面**：面向 Anthropic Messages 协议，构造匹配的 Claude Code 客户端标头，并在请求体的 `metadata.user_id` 中报告当前会话。
+2. **Claude Code 剖面**：面向 Anthropic Messages 协议，构造匹配的 Claude Code 客户端标头与 `/messages?beta=true` 端点形态，在系统块首位报告客户端归属行 `x-anthropic-billing-header` 与客户端声明行 `You are a Claude agent, built on Anthropic's Claude Agent SDK.`，并在请求体的 `metadata.user_id` 中报告当前会话。
 
 两个剖面模仿的客户端不同，可配置项各成一段。Codex 剖面读取 `[fake.codex]`，Claude Code 剖面读取 `[fake.claude]`。`auto` 模式下，系统按当前激活的服务商协议选择剖面。
 
@@ -31,7 +32,9 @@ letcode 提供可选的客户端特征仿真机制（Fake / Request Disguise）�
 - 工作区与版本库：读取当前工作区的绝对路径，并自动探测当前 Git 提交哈希（`git rev-parse HEAD`）与工作区变更状态；
 - 时区与日期：默认依据本机系统时钟与 IANA 本地时区换算。
 
-无法从本机确认的属性取自被模仿客户端的典型值，如客户端版本、依赖包版本和能力标记。这些值随被模仿客户端发版变化，需要同步更新。针对特定服务商专有的沙箱标记（如 `sandbox_mode` 与 `node_repl_disabled`），系统填充规范的默认值。用户也可以在配置文件的 `[fake.codex.extra]` 中添加自定义键值对，最多允许配置 16 项。
+部分服务商的网关只接受携带客户端自述块（归属行与 Agent 声明行）且附带 `metadata.user_id` 的请求，缺少任一项时以 `Service Unavailable` 类响应退回；这两项在仿真开启时始终发送。
+
+无法从本机确认的属性取自被模仿客户端的典型值，如客户端版本、依赖包版本和能力标记。这些值描述同一个已发布客户端：标头的 `claude-cli/<version>`、归属行的 `cc_version=<version>.<build>`、`x-stainless-package-version`、`x-stainless-runtime-version` 与 `anthropic-beta` 列表随被模仿客户端发版整体变化，需要同步更新。针对特定服务商专有的沙箱标记（如 `sandbox_mode` 与 `node_repl_disabled`），系统填充规范的默认值。用户也可以在配置文件的 `[fake.codex.extra]` 中添加自定义键值对，最多允许配置 16 项。
 
 ## 运行与动态切换
 

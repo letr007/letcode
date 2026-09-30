@@ -66,6 +66,9 @@ impl FakeRequestDecorator {
                 request.body = rewrite_body(&request.body, |body| {
                     crate::fake::apply_claude_body_shape(body, context);
                 })?;
+                if !request.url.contains('?') {
+                    request.url.push_str(crate::fake::CLAUDE_MESSAGES_QUERY);
+                }
                 self.replace_headers(&mut request, context.headers())?;
             }
             _ => {
@@ -186,10 +189,10 @@ mod tests {
     }
 
     fn claude_context() -> FakeRequestContext {
-        FakeRequestContext::Claude(
-            FakeIdentity::new("fake-installation")
-                .claude_turn_context(&crate::config::FakeConfig::default()),
-        )
+        FakeRequestContext::Claude(FakeIdentity::new("fake-installation").claude_turn_context(
+            &crate::config::FakeConfig::default(),
+            crate::permission::PermissionMode::Auto,
+        ))
     }
 
     #[test]
@@ -269,9 +272,12 @@ mod tests {
         assert_eq!(body["model"], original["model"]);
         assert_eq!(body["messages"], original["messages"]);
         assert_eq!(body["stream"], original["stream"]);
+        assert_eq!(decorated.url, "https://example.invalid/anthropic?beta=true");
         let user_id = body["metadata"]["user_id"].as_str().expect("user id");
-        assert!(user_id.contains("fake-installation"), "{user_id}");
-        assert!(user_id.contains("session_id"), "{user_id}");
+        let user_id: Value = serde_json::from_str(user_id).expect("user id blob");
+        assert_eq!(user_id["device_id"].as_str().expect("device id").len(), 64);
+        assert!(user_id["session_id"].is_string());
+        assert_eq!(user_id["account_uuid"], "");
 
         assert_eq!(
             decorated.protocol_headers["anthropic-version"],
@@ -298,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_requests_share_the_session_but_not_the_request_id() {
+    fn claude_requests_share_the_session_without_a_request_id() {
         let protocol = ProtocolId::new("anthropic").unwrap();
         let decorator =
             FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
@@ -319,9 +325,12 @@ mod tests {
             first.protocol_headers["x-claude-code-session-id"],
             second.protocol_headers["x-claude-code-session-id"]
         );
-        assert_ne!(
-            first.protocol_headers["x-client-request-id"],
-            second.protocol_headers["x-client-request-id"]
+        assert!(!first.protocol_headers.contains_key("x-client-request-id"));
+        let mut already_suffixed = request("anthropic", serde_json::json!({"model": "claude"}));
+        already_suffixed.url = "https://example.invalid/anthropic?beta=true".into();
+        assert_eq!(
+            decorator.decorate(&protocol, already_suffixed).unwrap().url,
+            "https://example.invalid/anthropic?beta=true"
         );
         let session = |decorated: &PreparedHttpRequest| {
             let body: Value = serde_json::from_slice(&decorated.body).unwrap();

@@ -1659,7 +1659,7 @@ impl Agent {
         }
         let context = match profile {
             crate::fake::FakeClient::Anthropic => crate::fake::FakeRequestContext::Claude(
-                identity.claude_turn_context(&self.fake_config),
+                identity.claude_turn_context(&self.fake_config, self.permission_mode()),
             ),
             crate::fake::FakeClient::Auto | crate::fake::FakeClient::Codex => {
                 crate::fake::FakeRequestContext::Codex(
@@ -2042,6 +2042,7 @@ impl Agent {
         let runtime_message = runtime_context_message(fake_codex_context(self).as_ref());
         let skill_message = self.skill_prelude_message();
         let mut prelude = self.prelude.clone();
+        prepend_fake_claude_client_blocks(self, &mut prelude);
         prelude.push(runtime_message);
         if let Some(message) = skill_message {
             prelude.push(message);
@@ -3788,6 +3789,7 @@ impl Agent {
         self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
 
         let mut turn_prelude = self.prelude.clone();
+        prepend_fake_claude_client_blocks(self, &mut turn_prelude);
         self.append_model_strategy_prelude(&mut turn_prelude);
         turn_prelude.push(runtime_context_message(fake_codex_context(self).as_ref()));
         if let Some(message) = self.skill_prelude_message() {
@@ -5245,6 +5247,20 @@ fn fake_codex_context(agent: &Agent) -> Option<crate::fake::CodexRequestContext>
     match agent.fake_turn_context(crate::fake::FakeClient::Codex)? {
         crate::fake::FakeRequestContext::Codex(context) => Some(context),
         crate::fake::FakeRequestContext::Claude(_) => None,
+    }
+}
+
+fn prepend_fake_claude_client_blocks(agent: &Agent, prelude: &mut Vec<PromptMessage>) {
+    if agent.active_protocol() != ApiProtocol::Anthropic {
+        return;
+    }
+    let Some(crate::fake::FakeRequestContext::Claude(context)) =
+        agent.fake_turn_context(crate::fake::FakeClient::Anthropic)
+    else {
+        return;
+    };
+    for (offset, text) in context.client_system_blocks().into_iter().enumerate() {
+        prelude.insert(offset, PromptMessage::system(text));
     }
 }
 
