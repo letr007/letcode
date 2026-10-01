@@ -214,7 +214,7 @@ async fn process_pending(
     Ok(false)
 }
 
-/// 巩固没有来源游标可推进，失败只记日志，下一次 tick 再试。
+/// 巩固没有来源游标可推进，有候选时每次尝试都计入间隔。
 async fn curate_pending(store: &MemoryStore, helper: Agent) -> bool {
     let candidate_store = store.clone();
     let batch = match blocking(move || {
@@ -258,7 +258,7 @@ async fn curate_pending(store: &MemoryStore, helper: Agent) -> bool {
         }
         Err(error) => {
             tracing::warn!(error = %error, "project memory curation failed");
-            false
+            true
         }
     }
 }
