@@ -5524,7 +5524,7 @@ fn adjacent_transport_events_merge_without_crossing_barriers() {
 
 #[test]
 fn deferred_transport_events_are_bounded_per_drain() {
-    let (_tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     let mut runtime = TuiRuntime::new(
         TuiState::default(),
         rx,
@@ -5533,11 +5533,18 @@ fn deferred_transport_events_are_bounded_per_drain() {
         std::env::temp_dir(),
         std::env::temp_dir(),
     );
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
     for index in 0..(MAX_SESSION_EVENTS_PER_FRAME * 2) {
-        runtime.enqueue_deferred_session_event(SessionTransportEvent::Notice(
-            crate::session::NoticeEvent::info(format!("notice-{index}")),
+        runtime.enqueue_deferred_session_event(SessionTransportEvent::ToolStarted(
+            ToolStartedEvent::new(
+                format!("tool-{index}"),
+                "shell__exec",
+                format!("run command {index}"),
+            ),
         ));
     }
+    drop(tx);
 
     let queued = runtime.deferred_session_events.len();
     assert_eq!(queued, MAX_SESSION_EVENTS_PER_FRAME * 2);
@@ -5545,9 +5552,126 @@ fn deferred_transport_events_are_bounded_per_drain() {
     let remaining = runtime.deferred_session_events.len();
     assert!(remaining < queued, "the drain makes forward progress");
     assert!(
+        remaining > 0,
+        "a closed stream does not flush the backlog at once"
+    );
+    assert!(
         queued - remaining <= MAX_SESSION_EVENTS_PER_FRAME,
         "deferred application is frame-bounded"
     );
+
+    for _ in 0..128 {
+        runtime.try_drain_session_events();
+        if runtime.deferred_session_events.is_empty() {
+            break;
+        }
+    }
+    assert!(runtime.deferred_session_events.is_empty());
+    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(
+        runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::Tool(_)))
+            .count(),
+        queued
+    );
+}
+
+#[test]
+fn high_rate_incremental_backlog_preserves_done_and_tool_order() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut runtime = TuiRuntime::new(
+        TuiState::default(),
+        rx,
+        vec![AvailableModel::new("m1", "M1")],
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    );
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+
+    const DELTAS: usize = 300;
+    for index in 0..DELTAS {
+        tx.send(SessionTransportEvent::AssistantDelta(
+            AssistantDeltaEvent::new(format!("delta-{index}")),
+        ))
+        .expect("queue assistant delta");
+        tx.send(SessionTransportEvent::AssistantDone { message_id: None })
+            .expect("queue assistant done");
+    }
+    tx.send(SessionTransportEvent::ToolStarted(ToolStartedEvent::new(
+        "tool-1",
+        "shell__exec",
+        "run command",
+    )))
+    .expect("queue tool start");
+    tx.send(SessionTransportEvent::ToolFinished(ToolFinishedEvent::new(
+        "tool-1",
+        "shell__exec",
+        "command completed",
+        ToolOutcome::Success,
+    )))
+    .expect("queue tool finish");
+    tx.send(SessionTransportEvent::Done)
+        .expect("queue session done");
+    drop(tx);
+
+    for _ in 0..1024 {
+        runtime.try_drain_session_events();
+        runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
+        if runtime.assistant_typewriter.is_none()
+            && runtime.deferred_session_events.is_empty()
+            && runtime.session_transport_rx.try_recv().is_err()
+        {
+            break;
+        }
+    }
+
+    let assistant_texts: Vec<&str> = runtime
+        .state()
+        .timeline
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Assistant(message) => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_texts.len(), DELTAS);
+    assert_eq!(assistant_texts.first().copied(), Some("delta-0"));
+    assert_eq!(assistant_texts.last().copied(), Some("delta-299"));
+    assert!(
+        runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .all(|item| { !matches!(item, TimelineItem::Assistant(message) if message.streaming) })
+    );
+    let tool_index = runtime
+        .state()
+        .timeline
+        .items()
+        .iter()
+        .position(|item| matches!(item, TimelineItem::Tool(tool) if tool.call_id == "tool-1"))
+        .expect("tool is retained after the assistant barriers");
+    assert!(
+        runtime.state().timeline.items()[..tool_index]
+            .iter()
+            .all(|item| matches!(item, TimelineItem::Assistant(_)))
+    );
+    assert!(matches!(
+        runtime.state().timeline.items().iter().find_map(|item| match item {
+            TimelineItem::Tool(tool) if tool.call_id == "tool-1" => Some(tool),
+            _ => None,
+        }),
+        Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Succeeded
+    ));
+    assert_eq!(runtime.state().phase, AppPhase::Completed);
 }
 
 #[test]
@@ -5765,7 +5889,7 @@ fn assistant_typewriter_preserves_grapheme_clusters_split_across_deltas() {
         typewriter.take_frame(now + Duration::from_millis(10), false),
         "e\u{301}"
     );
-    assert_eq!(typewriter.pending, "x");
+    assert_eq!(typewriter.pending_text(), "x");
 }
 
 #[test]
@@ -5784,7 +5908,7 @@ fn assistant_typewriter_preserves_zwj_sequence_split_across_deltas() {
         typewriter.take_frame(now + Duration::from_millis(10), false),
         "👩‍💻"
     );
-    assert_eq!(typewriter.pending, "x");
+    assert_eq!(typewriter.pending_text(), "x");
 }
 
 #[test]
@@ -5821,7 +5945,7 @@ fn assistant_typewriter_does_not_bank_budget_between_deltas() {
         typewriter.take_frame(now + Duration::from_millis(100), false),
         "ab"
     );
-    assert!(typewriter.pending.is_empty());
+    assert!(typewriter.pending_text().is_empty());
 
     assert_eq!(
         typewriter.take_frame(now + Duration::from_millis(600), false),
@@ -5832,7 +5956,7 @@ fn assistant_typewriter_does_not_bank_budget_between_deltas() {
         typewriter.take_frame(now + Duration::from_millis(610), false),
         ""
     );
-    assert_eq!(typewriter.pending, "cd");
+    assert_eq!(typewriter.pending_text(), "cd");
 }
 
 #[test]
@@ -5861,7 +5985,7 @@ fn assistant_typewriter_keeps_live_stream_state_between_deltas() {
     let pending = runtime
         .assistant_typewriter
         .as_ref()
-        .map(|typewriter| typewriter.pending.as_str())
+        .map(|typewriter| typewriter.pending_text())
         .expect("typewriter remains active");
     assert_eq!(format!("{after}{pending}"), "abcd");
     assert!(

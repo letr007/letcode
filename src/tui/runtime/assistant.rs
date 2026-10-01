@@ -82,6 +82,7 @@ pub(crate) struct AssistantTypewriter {
     pub(crate) stream: AssistantDeltaStream,
     pub(crate) agent_name: Option<String>,
     pub(crate) pending: String,
+    pending_start: usize,
     display_budget: f64,
     pub(crate) graphemes_per_second: f64,
     last_delta_at: Option<Instant>,
@@ -98,6 +99,7 @@ impl AssistantTypewriter {
             stream,
             agent_name,
             pending: String::new(),
+            pending_start: 0,
             display_budget: 0.0,
             graphemes_per_second: ASSISTANT_TYPEWRITER_INITIAL_RATE,
             last_delta_at: None,
@@ -109,7 +111,9 @@ impl AssistantTypewriter {
         if delta.is_empty() {
             return;
         }
-        if self.pending.is_empty() {
+        if self.pending_text().is_empty() {
+            self.pending.clear();
+            self.pending_start = 0;
             self.display_budget = 0.0;
             self.last_frame_at = now;
         }
@@ -157,22 +161,47 @@ impl AssistantTypewriter {
             return String::new();
         }
         let count = count.min(pending_graphemes);
-        let released = take_grapheme_prefix(&mut self.pending, count);
+        let split_at = grapheme_prefix_len(self.pending_text(), count);
+        let start = self.pending_start;
+        let released = self.pending[start..start + split_at].to_owned();
+        self.pending_start += split_at;
+        self.compact_pending();
         self.display_budget -=
             UnicodeSegmentation::graphemes(released.as_str(), true).count() as f64;
         released
     }
 
+    pub(crate) fn pending_text(&self) -> &str {
+        &self.pending[self.pending_start..]
+    }
+
+    pub(crate) fn take_pending(&mut self) -> String {
+        let pending_start = self.pending_start;
+        self.pending_start = 0;
+        let pending = std::mem::take(&mut self.pending);
+        pending[pending_start..].to_owned()
+    }
+
     pub(crate) fn pending_graphemes(&self) -> usize {
-        UnicodeSegmentation::graphemes(self.pending.as_str(), true).count()
+        UnicodeSegmentation::graphemes(self.pending_text(), true).count()
+    }
+
+    fn compact_pending(&mut self) {
+        if self.pending_start == self.pending.len() {
+            self.pending.clear();
+            self.pending_start = 0;
+        } else if self.pending_start >= 4096 && self.pending_start >= self.pending.len() / 2 {
+            self.pending.drain(..self.pending_start);
+            self.pending_start = 0;
+        }
     }
 }
 
-fn take_grapheme_prefix(text: &mut String, count: usize) -> String {
+fn grapheme_prefix_len(text: &str, count: usize) -> usize {
     if count == 0 || text.is_empty() {
-        return String::new();
+        return 0;
     }
-    let mut split_at = UnicodeSegmentation::grapheme_indices(text.as_str(), true)
+    let mut split_at = UnicodeSegmentation::grapheme_indices(text, true)
         .nth(count)
         .map(|(index, _)| index)
         .unwrap_or(text.len());
@@ -193,8 +222,7 @@ fn take_grapheme_prefix(text: &mut String, count: usize) -> String {
             split_at += joined.len_utf8();
         }
     }
-    let tail = text.split_off(split_at);
-    std::mem::replace(text, tail)
+    split_at
 }
 
 fn is_grapheme_continuation(character: char) -> bool {

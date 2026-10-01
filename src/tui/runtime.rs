@@ -220,6 +220,7 @@ pub struct TuiRuntime {
     preferences_dir: PathBuf,
     assistant_typewriter: Option<AssistantTypewriter>,
     deferred_session_events: VecDeque<SessionTransportEvent>,
+    session_transport_stream_closed: bool,
     session_title: Option<String>,
     spinner_frame: usize,
     theme_preview_original: Option<(String, Option<Theme>)>,
@@ -263,6 +264,7 @@ impl TuiRuntime {
             preferences_dir,
             assistant_typewriter: None,
             deferred_session_events: VecDeque::new(),
+            session_transport_stream_closed: false,
             session_title: None,
             spinner_frame: 0,
             theme_preview_original: None,
@@ -729,6 +731,13 @@ impl TuiRuntime {
             self.enqueue_deferred_session_event(event);
         }
         if stream_closed {
+            self.session_transport_stream_closed = true;
+            self.flush_assistant_typewriter_pending();
+        }
+        if self.session_transport_stream_closed
+            && self.assistant_typewriter.is_none()
+            && self.deferred_session_events.is_empty()
+        {
             self.handle_session_event_stream_closed();
         }
     }
@@ -833,7 +842,7 @@ impl TuiRuntime {
     }
 
     fn handle_session_event_stream_closed(&mut self) {
-        self.flush_assistant_typewriter();
+        self.session_transport_stream_closed = false;
         if self.has_active_or_pending_session_turn() || self.session_resume_pending {
             self.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
                 "TUI session event stream closed unexpectedly",
@@ -921,7 +930,7 @@ impl TuiRuntime {
         if self.assistant_typewriter.is_some() && budget.can_process() {
             let event = self.assistant_typewriter.as_mut().and_then(|typewriter| {
                 let delta = if view_projection_pending {
-                    std::mem::take(&mut typewriter.pending)
+                    typewriter.take_pending()
                 } else {
                     typewriter.take_frame(now, catch_up)
                 };
@@ -938,7 +947,7 @@ impl TuiRuntime {
             && self
                 .assistant_typewriter
                 .as_ref()
-                .is_some_and(|typewriter| typewriter.pending.is_empty())
+                .is_some_and(|typewriter| typewriter.pending_text().is_empty())
         {
             self.assistant_typewriter = None;
         }
@@ -966,16 +975,21 @@ impl TuiRuntime {
         }
     }
 
-    fn flush_assistant_typewriter(&mut self) {
-        if let Some(typewriter) = self.assistant_typewriter.take()
-            && !typewriter.pending.is_empty()
+    fn flush_assistant_typewriter_pending(&mut self) {
+        if let Some(mut typewriter) = self.assistant_typewriter.take()
+            && !typewriter.pending_text().is_empty()
         {
+            let pending = typewriter.take_pending();
             self.apply_session_transport_event(assistant_delta_event(
                 &typewriter.stream,
                 &typewriter.agent_name,
-                typewriter.pending,
+                pending,
             ));
         }
+    }
+
+    fn flush_assistant_typewriter(&mut self) {
+        self.flush_assistant_typewriter_pending();
         while let Some(event) = self.deferred_session_events.pop_front() {
             self.apply_session_transport_event(event);
         }

@@ -485,10 +485,16 @@ fn visible_cached_transcript_lines(
                 line_end,
             } => {
                 // Slice the same document used to calculate the viewport geometry.
-                let lines = transcript_ratatui::document_to_ratatui(
-                    &state.transcript_render_cache.entries[index].document,
-                );
-                visible.extend(lines[line_start..line_end].iter().cloned());
+                let document = &state.transcript_render_cache.entries[index].document;
+                if line_start == 0 && line_end == document.lines.len() {
+                    visible.extend(transcript_ratatui::document_to_ratatui(document));
+                } else {
+                    visible.extend(
+                        document.lines[line_start..line_end]
+                            .iter()
+                            .map(transcript_ratatui::line_to_ratatui),
+                    );
+                }
             }
         }
     }
