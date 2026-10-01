@@ -652,7 +652,20 @@ impl ModelRuntime {
         };
         let mut accumulator = AttemptAccumulator::default();
         while let Some(chunk) = response.next_chunk().await {
-            let chunk = chunk.map_err(|failure| accumulator.failed(failure))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(failure) => {
+                    // Some gateways close after the terminal event without terminating the
+                    // chunked body, so the decoder may already hold the whole response.
+                    return match decoder.finish() {
+                        Ok(events) => {
+                            observe_events(observer, &mut accumulator, events).await?;
+                            accumulator.finish()
+                        }
+                        Err(_) => Err(accumulator.failed(failure)),
+                    };
+                }
+            };
             let events = decoder
                 .push(&chunk)
                 .map_err(|failure| accumulator.failed(failure))?;
@@ -1597,6 +1610,69 @@ reasoning = true
             .with_code("response_chunk_failed")
             .with_retry_hint(RetryHint::RetryAfterSeconds(0))
             .with_detail("stream interrupted")
+    }
+
+    fn anthropic_stream_body(terminal: bool) -> String {
+        let mut body = String::from(concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        ));
+        if terminal {
+            body.push_str(concat!(
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ));
+        }
+        body
+    }
+
+    fn unterminated_chunk_close() -> ModelFailure {
+        ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+            .with_status(200)
+            .with_code("response_chunk_failed")
+            .with_retry_hint(RetryHint::Retryable)
+            .with_detail("error decoding response body")
+    }
+
+    fn anthropic_stream_attempt(terminal: bool) -> Arc<QueueTransport> {
+        Arc::new(QueueTransport {
+            responses: Mutex::new(VecDeque::from([Ok(TransportResponse::from_results(
+                200,
+                BTreeMap::new(),
+                vec![
+                    Ok(anthropic_stream_body(terminal).into_bytes()),
+                    Err(unterminated_chunk_close()),
+                ],
+            ))])),
+        })
+    }
+
+    #[tokio::test]
+    async fn completed_stream_survives_an_unterminated_chunked_close() {
+        let route = route("anthropic");
+        let runtime = ModelRuntime::new(anthropic_stream_attempt(true));
+        let result = runtime
+            .execute_attempt(&route, &ModelRequestInput::new("model", Vec::new()))
+            .await
+            .expect("a completed stream must not fail on the chunked close");
+        assert_eq!(result.terminal, TerminalStatus::Completed);
+        assert!(result.snapshot.side_effects.text);
+    }
+
+    #[tokio::test]
+    async fn stream_without_terminal_still_fails_on_the_chunk_error() {
+        let route = route("anthropic");
+        let runtime = ModelRuntime::new(anthropic_stream_attempt(false));
+        let failure = runtime
+            .execute_attempt(&route, &ModelRequestInput::new("model", Vec::new()))
+            .await
+            .expect_err("a stream without message_stop must still fail");
+        assert_eq!(
+            failure.failure.code.as_deref(),
+            Some("response_chunk_failed")
+        );
     }
 
     #[tokio::test]
