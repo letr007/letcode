@@ -1140,6 +1140,11 @@ impl AnthropicDecoder {
                                 .id
                                 .clone()
                                 .unwrap_or_else(|| format!("thinking-{index}"));
+                            let replayable = if state.kind == "thinking" {
+                                !state.text.is_empty()
+                            } else {
+                                !state.redacted_data.is_empty()
+                            };
                             let block = if state.kind == "thinking" {
                                 serde_json::json!({
                                     "type": "thinking",
@@ -1152,10 +1157,8 @@ impl AnthropicDecoder {
                                     "data": state.redacted_data,
                                 })
                             };
-                            output.push(ModelEvent::ReasoningDone {
-                                item_id,
-                                text: state.text.clone(),
-                                replay: Some(OpaqueReplayState::new(
+                            let replay = replayable.then(|| {
+                                OpaqueReplayState::new(
                                     "anthropic.thinking_blocks",
                                     1,
                                     ReplayProducer {
@@ -1166,7 +1169,12 @@ impl AnthropicDecoder {
                                         route_identity: None,
                                     },
                                     Value::Array(vec![block]),
-                                )),
+                                )
+                            });
+                            output.push(ModelEvent::ReasoningDone {
+                                item_id,
+                                text: state.text.clone(),
+                                replay,
                             });
                         } else if state.kind == "tool_use" {
                             let arguments = if state.arguments.is_empty() {
@@ -5181,6 +5189,82 @@ anthropic_thinking = { mode = "adaptive" }"#,
                 status: TerminalStatus::ToolUse
             })
         ));
+    }
+
+    #[test]
+    fn anthropic_replay_rejects_thinking_without_text() {
+        let replay = OpaqueReplayState::new(
+            "anthropic.thinking_blocks",
+            1,
+            ReplayProducer {
+                scope: ReplayScope::Protocol,
+                protocol_id: ProtocolId::new("anthropic").unwrap(),
+                profile_identity: None,
+                route_identity: None,
+            },
+            serde_json::json!([{"type":"thinking","thinking":"","signature":"encrypted"}]),
+        );
+        let input = ModelRequestInput::new(
+            "claude-model",
+            vec![ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![
+                    ContentPart::Reasoning {
+                        item_id: "r1".into(),
+                        text: String::new(),
+                        replay: Some(replay),
+                    },
+                    ContentPart::Text("answer".into()),
+                ],
+            }],
+        );
+        assert!(
+            anthropic_binding("")
+                .unwrap()
+                .prepare_request(&input)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn anthropic_decoder_skips_thinking_replay_without_text() {
+        let thinking_stream = |signature: &str| {
+            vec![
+                sse("message_start", r#"{"type":"message_start","message":{}}"#),
+                sse(
+                    "content_block_start",
+                    &format!(
+                        r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"thinking","thinking":"","signature":"{signature}"}}}}"#
+                    ),
+                ),
+                sse(
+                    "content_block_stop",
+                    r#"{"type":"content_block_stop","index":0}"#,
+                ),
+                sse(
+                    "message_delta",
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+                ),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+        };
+        let replay_for = |signature: &str| {
+            let mut decoder = AnthropicDecoder::new();
+            let mut output = Vec::new();
+            for event in thinking_stream(signature) {
+                output.extend(decoder.push(&event).unwrap());
+            }
+            output.extend(decoder.finish().unwrap());
+            output
+                .into_iter()
+                .find_map(|event| match event {
+                    ModelEvent::ReasoningDone { replay, .. } => Some(replay),
+                    _ => None,
+                })
+                .flatten()
+        };
+        assert!(replay_for("encrypted").is_none());
+        assert!(replay_for("").is_none());
     }
 
     #[test]
