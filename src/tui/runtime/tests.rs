@@ -15,7 +15,7 @@ use crate::session::engine::{
     ManualCompactionOperation, SessionEngineCommand, SessionEngineControl,
     derive_interrupt_request, enqueue_deferred_command, flush_parked_commands,
     format_background_subagent_completion, initial_session_metadata,
-    manual_compaction_session_token_usage, next_idle_session_command, park_active_turn_command,
+    manual_compaction_session_token_usage, next_idle_session_operation, park_active_turn_command,
     record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
     select_active_session_operation, select_manual_compaction_operation, send_subagent_interrupted,
     wait_for_subagent_cancel_settle,
@@ -1966,6 +1966,54 @@ fn ctrl_c_quits_once_the_session_is_idle() {
         .expect("idle ctrl-c quits");
     assert_eq!(command, None);
     assert!(runtime.state().quit_requested);
+}
+
+#[test]
+fn reused_child_session_becomes_interruptible_again() {
+    let mut runtime = runtime();
+    let terminal_event = |event| SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event,
+    };
+
+    runtime.apply_session_transport_event(terminal_event(SessionEvent::Done));
+    assert!(!runtime.state().has_running_child_session());
+    runtime.apply_session_transport_event(terminal_event(SessionEvent::UserMessage(
+        UserMessageEvent::new("new turn"),
+    )));
+    assert!(runtime.state().has_running_child_session());
+}
+
+#[test]
+fn ctrl_c_does_not_quit_while_a_child_session_is_running() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime
+        .state_mut()
+        .set_child_view_phase_for_test(AppPhase::Running);
+
+    let first = runtime
+        .handle_input_action(InputAction::Quit)
+        .expect("first ctrl-c arms child interrupt");
+    assert_eq!(first, None);
+    assert!(!runtime.state().quit_requested);
+
+    let second = runtime
+        .handle_input_action(InputAction::Quit)
+        .expect("second ctrl-c interrupts the child session");
+    assert_eq!(second, Some(RuntimeCommand::Interrupt));
+    assert!(!runtime.state().quit_requested);
 }
 
 #[test]
@@ -5032,6 +5080,20 @@ async fn queued_interrupt_then_disconnect_returns_shutdown() {
 }
 
 #[tokio::test]
+async fn idle_interrupt_is_not_dropped_before_engine_dispatch() {
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut deferred_commands = VecDeque::new();
+    control_tx
+        .send(SessionEngineControl::Interrupt)
+        .expect("queue interrupt");
+
+    assert!(matches!(
+        next_idle_session_operation(&mut control_rx, &mut deferred_commands).await,
+        Some(crate::session::engine::IdleSessionOperation::Interrupt)
+    ));
+}
+
+#[tokio::test]
 async fn idle_shutdown_prevents_deferred_command_dispatch() {
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let mut deferred_commands =
@@ -5044,7 +5106,7 @@ async fn idle_shutdown_prevents_deferred_command_dispatch() {
         .expect("queue shutdown");
 
     assert!(
-        next_idle_session_command(&mut control_rx, &mut deferred_commands)
+        next_idle_session_operation(&mut control_rx, &mut deferred_commands)
             .await
             .is_none()
     );
@@ -5062,7 +5124,7 @@ async fn idle_disconnect_prevents_deferred_command_dispatch() {
     drop(control_tx);
 
     assert!(
-        next_idle_session_command(&mut control_rx, &mut deferred_commands)
+        next_idle_session_operation(&mut control_rx, &mut deferred_commands)
             .await
             .is_none()
     );
@@ -6767,6 +6829,47 @@ fn closed_session_transport_event_stream_terminalizes_running_state() {
             item,
             TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
         )));
+}
+
+#[test]
+fn closed_session_transport_event_stream_reports_idle_engine_failure() {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut runtime = TuiRuntime::new(
+        TuiState::default(),
+        event_rx,
+        vec![AvailableModel::new("m1", "M1")],
+        Vec::new(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    );
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("child output")),
+    });
+    assert!(runtime.state().has_running_child_session());
+    drop(event_tx);
+
+    runtime.try_drain_session_events();
+    runtime.try_drain_session_events();
+
+    assert!(!runtime.state().has_running_child_session());
+    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(
+        runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .filter(|item| matches!(
+                item,
+                TimelineItem::Error(error)
+                    if error.message == "TUI session event stream closed unexpectedly"
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -1359,9 +1359,16 @@ async fn run_engine_loop(
                     auto_review_service.clear_sticky();
                 }
             }
-            command = next_idle_session_command(&mut control_rx, &mut deferred_commands) => {
-                let Some(command) = command else {
+            idle_operation = next_idle_session_operation(&mut control_rx, &mut deferred_commands) => {
+                let Some(idle_operation) = idle_operation else {
                     break;
+                };
+                let command = match idle_operation {
+                    IdleSessionOperation::Interrupt => {
+                        subagent_runtime.cancel_active();
+                        continue;
+                    }
+                    IdleSessionOperation::Command(command) => command,
                 };
 
                 if let SessionEngineCommand::SetExpertAllowedModels {

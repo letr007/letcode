@@ -86,6 +86,7 @@ use session_dialog::session_dialog_items;
 use std::sync::Mutex as StdMutex;
 
 const PAGE_SCROLL_ROWS: usize = 10;
+const SESSION_ENGINE_UNAVAILABLE_MESSAGE: &str = "Session engine is no longer available";
 // ~3 seconds at the 33ms TUI frame interval, long enough for deliberate chords.
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 90;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
@@ -221,6 +222,7 @@ pub struct TuiRuntime {
     assistant_typewriter: Option<AssistantTypewriter>,
     deferred_session_events: VecDeque<SessionTransportEvent>,
     session_transport_stream_closed: bool,
+    session_transport_stream_close_reported: bool,
     session_title: Option<String>,
     spinner_frame: usize,
     theme_preview_original: Option<(String, Option<Theme>)>,
@@ -265,6 +267,7 @@ impl TuiRuntime {
             assistant_typewriter: None,
             deferred_session_events: VecDeque::new(),
             session_transport_stream_closed: false,
+            session_transport_stream_close_reported: false,
             session_title: None,
             spinner_frame: 0,
             theme_preview_original: None,
@@ -735,6 +738,7 @@ impl TuiRuntime {
             self.flush_assistant_typewriter_pending();
         }
         if self.session_transport_stream_closed
+            && !self.session_transport_stream_close_reported
             && self.assistant_typewriter.is_none()
             && self.deferred_session_events.is_empty()
         {
@@ -842,12 +846,20 @@ impl TuiRuntime {
     }
 
     fn handle_session_event_stream_closed(&mut self) {
-        self.session_transport_stream_closed = false;
-        if self.has_active_or_pending_session_turn() || self.session_resume_pending {
+        self.session_transport_stream_close_reported = true;
+        let terminalize = self.has_active_or_pending_session_turn() || self.session_resume_pending;
+        if !self.state.quit_requested {
+            self.permission_lifecycle.clear();
+            let _ = self
+                .cancel_pending_question("question cancelled because the session engine stopped");
+            self.state.mark_child_sessions_disconnected();
             self.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
                 "TUI session event stream closed unexpectedly",
             )));
-            self.apply_session_transport_event(SessionTransportEvent::Done);
+            if terminalize {
+                self.apply_session_transport_event(SessionTransportEvent::Done);
+            }
+            self.clear_unaccepted_queued_prompt();
         }
     }
 
@@ -2484,13 +2496,18 @@ impl TuiRuntime {
         }
     }
 
+    pub(super) fn clear_unaccepted_queued_prompt(&mut self) {
+        self.queued_prompt_lifecycle.clear_unaccepted();
+    }
+
     fn has_active_or_pending_session_turn(&self) -> bool {
-        has_active_or_pending_session_turn(active_turn_state(
-            &self.state,
-            self.session_turn_active,
-            self.queued_prompt_lifecycle.has_inflight_handoff(),
-            self.permission_lifecycle.is_pending(),
-        ))
+        self.state.has_running_child_session()
+            || has_active_or_pending_session_turn(active_turn_state(
+                &self.state,
+                self.session_turn_active,
+                self.queued_prompt_lifecycle.has_inflight_handoff(),
+                self.permission_lifecycle.is_pending(),
+            ))
     }
 
     fn history_navigation_is_unavailable(&self) -> bool {

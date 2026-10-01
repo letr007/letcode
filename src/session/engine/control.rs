@@ -401,28 +401,34 @@ fn drain_queued_session_controls(
     }
 }
 
-pub(crate) async fn next_idle_session_command(
+#[derive(Debug)]
+pub(crate) enum IdleSessionOperation {
+    Command(SessionEngineCommand),
+    Interrupt,
+}
+
+pub(crate) async fn next_idle_session_operation(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
-) -> Option<SessionEngineCommand> {
-    loop {
-        if !deferred_commands.is_empty() {
-            match drain_queued_session_controls(control_rx, deferred_commands) {
-                QueuedSessionEngineControlSignal::Shutdown => return None,
-                // An idle interrupt is stale only when it appears before the
-                // next command in the FIFO stream.
-                QueuedSessionEngineControlSignal::Interrupt
-                | QueuedSessionEngineControlSignal::NoSignal => {}
+) -> Option<IdleSessionOperation> {
+    if !deferred_commands.is_empty() {
+        match drain_queued_session_controls(control_rx, deferred_commands) {
+            QueuedSessionEngineControlSignal::Shutdown => return None,
+            QueuedSessionEngineControlSignal::Interrupt => {
+                return Some(IdleSessionOperation::Interrupt);
             }
-
-            return deferred_commands.pop_front();
+            QueuedSessionEngineControlSignal::NoSignal => {}
         }
 
-        match control_rx.recv().await? {
-            SessionEngineControl::Command(command) => return Some(command),
-            SessionEngineControl::Interrupt => {}
-            SessionEngineControl::Shutdown => return None,
-        }
+        return deferred_commands
+            .pop_front()
+            .map(IdleSessionOperation::Command);
+    }
+
+    match control_rx.recv().await? {
+        SessionEngineControl::Command(command) => Some(IdleSessionOperation::Command(command)),
+        SessionEngineControl::Interrupt => Some(IdleSessionOperation::Interrupt),
+        SessionEngineControl::Shutdown => None,
     }
 }
 

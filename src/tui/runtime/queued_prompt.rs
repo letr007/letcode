@@ -108,6 +108,12 @@ impl QueuedPromptLifecycle {
         }
     }
 
+    pub(crate) fn clear_unaccepted(&mut self) {
+        if matches!(self, Self::InFlight(handoff) if !handoff.accepted) {
+            *self = Self::idle(false);
+        }
+    }
+
     pub(crate) fn done_disposition(&self) -> QueuedPromptDoneDisposition {
         match self {
             Self::Idle { .. } => QueuedPromptDoneDisposition::ReadyForNextDispatch,

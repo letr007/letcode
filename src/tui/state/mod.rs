@@ -2723,6 +2723,53 @@ impl TuiState {
         }
     }
 
+    pub fn has_running_child_session(&self) -> bool {
+        let is_running =
+            |phase| matches!(phase, AppPhase::Running | AppPhase::WaitingForPermission);
+        self.child_timeline
+            .as_ref()
+            .is_some_and(|child| is_running(child.phase))
+            || self
+                .child_timeline_cache
+                .values()
+                .any(|child| is_running(child.phase))
+            || self
+                .child_session_summaries
+                .values()
+                .any(|summary| is_running(summary.phase))
+    }
+
+    pub fn mark_child_sessions_disconnected(&mut self) {
+        let mark_phase = |phase: &mut AppPhase| {
+            if matches!(*phase, AppPhase::Running | AppPhase::WaitingForPermission) {
+                *phase = AppPhase::Error;
+            }
+        };
+        if let Some(child) = self.child_timeline.as_mut() {
+            mark_phase(&mut child.phase);
+            child.pending_permission = None;
+            child.active_tool_call_id = None;
+            child.compaction_active = false;
+            child.retry = None;
+        }
+        for child in self.child_timeline_cache.values_mut() {
+            mark_phase(&mut child.phase);
+            child.pending_permission = None;
+            child.active_tool_call_id = None;
+            child.compaction_active = false;
+            child.retry = None;
+        }
+        for summary in self.child_session_summaries.values_mut() {
+            mark_phase(&mut summary.phase);
+        }
+        if matches!(self.retry_toast_scope, Some(RetryToastScope::Child { .. })) {
+            self.retry_toast_scope = None;
+            self.toast = None;
+        }
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
+    }
+
     #[cfg(test)]
     pub fn cached_child_phase(&self, child_session_id: &str) -> Option<AppPhase> {
         self.child_timeline_cache
@@ -3745,7 +3792,9 @@ fn child_phase_for_event(event: &SessionEvent) -> AppPhase {
 }
 
 fn update_child_session_summary(summary: &mut ChildSessionCacheSummary, event: &SessionEvent) {
-    if matches!(summary.phase, AppPhase::Completed | AppPhase::Error) {
+    if matches!(summary.phase, AppPhase::Completed | AppPhase::Error)
+        && !matches!(event, SessionEvent::UserMessage(_))
+    {
         return;
     }
     summary.phase = child_phase_for_event(event);

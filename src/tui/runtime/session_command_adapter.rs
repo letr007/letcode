@@ -13,9 +13,9 @@ use crate::session::{
 use crate::tui::UserMessageEvent;
 use crate::tui::state::{AppPhase, ToastKind};
 
-use super::{SessionTransportEvent, TuiRuntime, child_navigation_anchor};
-
-const SESSION_ENGINE_UNAVAILABLE_MESSAGE: &str = "Session engine is no longer available";
+use super::{
+    SESSION_ENGINE_UNAVAILABLE_MESSAGE, SessionTransportEvent, TuiRuntime, child_navigation_anchor,
+};
 
 /// Applies session commands by enqueueing frontend-neutral engine intent.
 pub(super) struct TuiSessionCommandAdapter<'a> {

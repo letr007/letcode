@@ -1,10 +1,8 @@
 use super::{
-    ErrorEvent, RuntimeCommand, SessionTransportEvent, TuiRuntime,
-    session_command_adapter::TuiSessionCommandAdapter,
+    ErrorEvent, RuntimeCommand, SESSION_ENGINE_UNAVAILABLE_MESSAGE, SessionTransportEvent,
+    TuiRuntime, session_command_adapter::TuiSessionCommandAdapter,
 };
 use crate::session::{SessionCommandHandler, SessionEngineIngress};
-
-const SESSION_ENGINE_UNAVAILABLE_MESSAGE: &str = "Session engine is no longer available";
 
 pub(super) fn dispatch_command(
     runtime: &mut TuiRuntime,
@@ -14,7 +12,6 @@ pub(super) fn dispatch_command(
 ) {
     let mut adapter = TuiSessionCommandAdapter::new(runtime, ingress, allow_submit_family);
     if adapter.handle(command).is_err() {
-        // Channel closed: surface the same unavailable path as before.
         handle_session_engine_unavailable(runtime);
     }
 }
@@ -24,6 +21,7 @@ fn handle_session_engine_unavailable(runtime: &mut TuiRuntime) {
         SESSION_ENGINE_UNAVAILABLE_MESSAGE,
     )));
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    runtime.clear_unaccepted_queued_prompt();
 }
 
 #[cfg(test)]
@@ -400,6 +398,35 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn failed_queued_prompt_dispatch_clears_unaccepted_handoff() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state.phase = AppPhase::Running;
+        runtime.state_mut().set_input("queued prompt");
+        runtime
+            .handle_input_action(crate::tui::InputAction::Submit)
+            .expect("queue prompt succeeds");
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued prompt command");
+        };
+        let (engine, ingress, _egress) = SessionEngine::new();
+        drop(engine);
+
+        dispatch_command(
+            &mut runtime,
+            RuntimeCommand::SubmitPrompt(prompt),
+            &ingress,
+            true,
+        );
+
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert!(!runtime.has_active_or_pending_session_turn());
     }
 
     #[test]
