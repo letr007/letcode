@@ -35,7 +35,7 @@ letcode is a terminal coding Agent built for developer productivity. Powered by 
 
 **Method A: Pre-built binaries (Recommended)**
 
-Download the pre-compiled archive for your OS and architecture from [GitHub Releases](https://github.com/letr007/letcode/releases), extract it, and place the `letcode` binary into your `PATH`.
+Download the pre-compiled archive for your platform from [GitHub Releases](https://github.com/letr007/letcode/releases). Releases currently include Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64/ARM64. Extract the matching archive and place the `letcode` binary into your `PATH`.
 
 **Method B: Build from source**
 

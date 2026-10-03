@@ -35,7 +35,7 @@ letcode 是面向生产力打造的终端编程 Agent。它基于 Ratatui 构建
 
 **方式 A：下载预编译二进制（推荐）**
 
-从 [GitHub Releases](https://github.com/letr007/letcode/releases) 下载适合当前操作系统的打包文件，解压后将 `letcode` 二进制放入系统的 `PATH` 路径中。
+从 [GitHub Releases](https://github.com/letr007/letcode/releases) 下载适合当前平台的打包文件。目前提供 Linux x86-64/ARM64、macOS Intel/Apple Silicon，以及 Windows x86-64/ARM64 版本。解压后将 `letcode` 二进制放入系统的 `PATH` 路径中。
 
 **方式 B：通过源码编译安装**
 

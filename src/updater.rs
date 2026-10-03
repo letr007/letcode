@@ -448,21 +448,51 @@ fn current_target() -> Result<UpdateTarget> {
 }
 
 fn target_for(os: &str, arch: &str) -> Result<UpdateTarget> {
-    match (os, arch) {
-        ("macos", "aarch64") => Ok(UpdateTarget {
-            target: "aarch64-apple-darwin",
-            display: "macOS · Apple Silicon",
-            extension: ".tar.gz",
-            archive_binary: "letcode-{{ version }}-{{ target }}/letcode",
-        }),
-        ("windows", "x86_64") => Ok(UpdateTarget {
-            target: "x86_64-pc-windows-msvc",
-            display: "Windows · x86-64",
-            extension: ".zip",
-            archive_binary: "letcode-{{ version }}-{{ target }}/letcode.exe",
-        }),
+    let (target, display, extension, archive_binary) = match (os, arch) {
+        ("linux", "x86_64") => (
+            "x86_64-unknown-linux-gnu",
+            "Linux · x86-64",
+            ".tar.gz",
+            "letcode-{{ version }}-{{ target }}/letcode",
+        ),
+        ("linux", "aarch64") => (
+            "aarch64-unknown-linux-gnu",
+            "Linux · ARM64",
+            ".tar.gz",
+            "letcode-{{ version }}-{{ target }}/letcode",
+        ),
+        ("macos", "x86_64") => (
+            "x86_64-apple-darwin",
+            "macOS · Intel",
+            ".tar.gz",
+            "letcode-{{ version }}-{{ target }}/letcode",
+        ),
+        ("macos", "aarch64") => (
+            "aarch64-apple-darwin",
+            "macOS · Apple Silicon",
+            ".tar.gz",
+            "letcode-{{ version }}-{{ target }}/letcode",
+        ),
+        ("windows", "x86_64") => (
+            "x86_64-pc-windows-msvc",
+            "Windows · x86-64",
+            ".zip",
+            "letcode-{{ version }}-{{ target }}/letcode.exe",
+        ),
+        ("windows", "aarch64") => (
+            "aarch64-pc-windows-msvc",
+            "Windows · ARM64",
+            ".zip",
+            "letcode-{{ version }}-{{ target }}/letcode.exe",
+        ),
         _ => bail!("self-update is not supported on {os}/{arch}"),
-    }
+    };
+    Ok(UpdateTarget {
+        target,
+        display,
+        extension,
+        archive_binary,
+    })
 }
 
 #[cfg(test)]
@@ -471,20 +501,41 @@ mod tests {
 
     #[test]
     fn release_targets_match_the_packaging_workflow() {
-        let macos = target_for("macos", "aarch64").expect("macOS ARM64 should be supported");
-        assert_eq!(
-            asset_name("1.2.3", macos),
-            "letcode-1.2.3-aarch64-apple-darwin.tar.gz"
-        );
-        assert_eq!(
-            macos.archive_binary,
-            "letcode-{{ version }}-{{ target }}/letcode"
-        );
-        let windows = target_for("windows", "x86_64").expect("Windows x64 should be supported");
-        assert_eq!(
-            asset_name("1.2.3", windows),
-            "letcode-1.2.3-x86_64-pc-windows-msvc.zip"
-        );
+        for (os, arch, expected_asset) in [
+            (
+                "linux",
+                "x86_64",
+                "letcode-1.2.3-x86_64-unknown-linux-gnu.tar.gz",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "letcode-1.2.3-aarch64-unknown-linux-gnu.tar.gz",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "letcode-1.2.3-x86_64-apple-darwin.tar.gz",
+            ),
+            (
+                "macos",
+                "aarch64",
+                "letcode-1.2.3-aarch64-apple-darwin.tar.gz",
+            ),
+            (
+                "windows",
+                "x86_64",
+                "letcode-1.2.3-x86_64-pc-windows-msvc.zip",
+            ),
+            (
+                "windows",
+                "aarch64",
+                "letcode-1.2.3-aarch64-pc-windows-msvc.zip",
+            ),
+        ] {
+            let target = target_for(os, arch).expect("release target should be supported");
+            assert_eq!(asset_name("1.2.3", target), expected_asset);
+        }
     }
 
     #[test]
@@ -542,10 +593,10 @@ mod tests {
 
     #[test]
     fn unsupported_targets_fail_explicitly() {
-        let error = target_for("linux", "x86_64").expect_err("Linux is not released yet");
+        let error = target_for("freebsd", "x86_64").expect_err("FreeBSD is not released yet");
         assert_eq!(
             error.to_string(),
-            "self-update is not supported on linux/x86_64"
+            "self-update is not supported on freebsd/x86_64"
         );
     }
 }
