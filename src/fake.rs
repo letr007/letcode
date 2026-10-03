@@ -48,23 +48,40 @@ impl FakeClient {
         }
     }
 
-    pub const fn supports_protocol(self, protocol: crate::config::ApiProtocol) -> bool {
+    /// Wire profile a request on `protocol` is shaped as. `Auto` follows the
+    /// route protocol; an explicit selection applies only to its own protocol.
+    /// `None` leaves the route undisguised.
+    pub(crate) fn resolve(
+        self,
+        protocol: &crate::model_runtime::ProtocolId,
+    ) -> Option<FakeProfile> {
         match self {
-            Self::Auto => matches!(
-                protocol,
-                crate::config::ApiProtocol::Responses | crate::config::ApiProtocol::Anthropic
-            ),
-            Self::Codex => matches!(protocol, crate::config::ApiProtocol::Responses),
-            Self::Anthropic => matches!(protocol, crate::config::ApiProtocol::Anthropic),
+            Self::Auto => FakeProfile::of_protocol(protocol),
+            Self::Codex => Some(FakeProfile::Codex),
+            Self::Anthropic => Some(FakeProfile::Anthropic),
+        }
+        .filter(|profile| profile.supports_protocol_id(protocol))
+    }
+}
+
+/// Wire profile a disguised request is shaped as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeProfile {
+    Codex,
+    Anthropic,
+}
+
+impl FakeProfile {
+    fn of_protocol(protocol: &crate::model_runtime::ProtocolId) -> Option<Self> {
+        match protocol.as_str() {
+            "responses" => Some(Self::Codex),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
         }
     }
 
     pub(crate) fn supports_protocol_id(self, protocol: &crate::model_runtime::ProtocolId) -> bool {
-        match self {
-            Self::Auto => matches!(protocol.as_str(), "responses" | "anthropic"),
-            Self::Codex => protocol.as_str() == "responses",
-            Self::Anthropic => protocol.as_str() == "anthropic",
-        }
+        Self::of_protocol(protocol) == Some(self)
     }
 }
 
@@ -548,10 +565,10 @@ pub enum FakeRequestContext {
 }
 
 impl FakeRequestContext {
-    pub fn profile(&self) -> FakeClient {
+    pub fn profile(&self) -> FakeProfile {
         match self {
-            Self::Codex(_) => FakeClient::Codex,
-            Self::Claude(_) => FakeClient::Anthropic,
+            Self::Codex(_) => FakeProfile::Codex,
+            Self::Claude(_) => FakeProfile::Anthropic,
         }
     }
 }
@@ -960,23 +977,31 @@ mod tests {
     }
 
     #[test]
-    fn fake_modes_are_protocol_scoped() {
-        use crate::config::ApiProtocol;
-
-        assert!(FakeClient::Auto.supports_protocol(ApiProtocol::Responses));
-        assert!(FakeClient::Auto.supports_protocol(ApiProtocol::Anthropic));
-        assert!(!FakeClient::Auto.supports_protocol(ApiProtocol::Completions));
-        assert!(FakeClient::Codex.supports_protocol(ApiProtocol::Responses));
-        assert!(!FakeClient::Codex.supports_protocol(ApiProtocol::Anthropic));
-        assert!(FakeClient::Anthropic.supports_protocol(ApiProtocol::Anthropic));
-        assert!(!FakeClient::Anthropic.supports_protocol(ApiProtocol::Responses));
-
+    fn fake_modes_resolve_per_route_protocol() {
         let responses = crate::model_runtime::ProtocolId::new("responses").unwrap();
         let anthropic = crate::model_runtime::ProtocolId::new("anthropic").unwrap();
         let completions = crate::model_runtime::ProtocolId::new("completions").unwrap();
-        assert!(FakeClient::Auto.supports_protocol_id(&responses));
-        assert!(FakeClient::Auto.supports_protocol_id(&anthropic));
-        assert!(!FakeClient::Auto.supports_protocol_id(&completions));
+
+        assert_eq!(
+            FakeClient::Auto.resolve(&responses),
+            Some(FakeProfile::Codex)
+        );
+        assert_eq!(
+            FakeClient::Auto.resolve(&anthropic),
+            Some(FakeProfile::Anthropic)
+        );
+        assert_eq!(FakeClient::Auto.resolve(&completions), None);
+        assert_eq!(
+            FakeClient::Codex.resolve(&responses),
+            Some(FakeProfile::Codex)
+        );
+        assert_eq!(FakeClient::Codex.resolve(&anthropic), None);
+        assert_eq!(
+            FakeClient::Anthropic.resolve(&anthropic),
+            Some(FakeProfile::Anthropic)
+        );
+        assert_eq!(FakeClient::Anthropic.resolve(&responses), None);
+        assert_eq!(FakeClient::Codex.resolve(&completions), None);
     }
 
     #[test]

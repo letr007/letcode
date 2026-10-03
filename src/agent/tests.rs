@@ -166,9 +166,13 @@ fn test_agent() -> Agent {
     Agent::new("m1", 4, 4)
 }
 
+fn protocol(id: &str) -> crate::model_runtime::ProtocolId {
+    crate::model_runtime::ProtocolId::new(id).unwrap()
+}
+
 fn codex_context(agent: &Agent) -> crate::fake::CodexRequestContext {
     match agent
-        .fake_turn_context(crate::fake::FakeClient::Codex)
+        .fake_context_for(&protocol("responses"))
         .expect("codex fake context is available")
     {
         crate::fake::FakeRequestContext::Codex(context) => context,
@@ -177,59 +181,37 @@ fn codex_context(agent: &Agent) -> crate::fake::CodexRequestContext {
 }
 
 #[test]
-fn fake_modes_select_only_their_target_protocol() {
+fn fake_selection_resolves_per_request_protocol() {
     let mut agent = test_agent();
+    let responses = protocol("responses");
+    let anthropic = protocol("anthropic");
+    let completions = protocol("completions");
 
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses protocol supports codex fake");
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Codex)
-            .is_some()
-    );
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Anthropic)
-            .is_none()
-    );
+    // An explicit selection applies only to its own protocol.
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
+    assert!(agent.fake_context_for(&responses).is_some());
+    assert!(agent.fake_context_for(&anthropic).is_none());
 
-    agent.set_default_protocol(ApiProtocol::Anthropic);
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
-        .expect("anthropic protocol supports anthropic fake");
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Codex)
-            .is_none()
-    );
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Anthropic)
-            .is_some()
-    );
-
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Auto))
-        .expect("anthropic protocol supports auto fake");
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Codex)
-            .is_some()
-    );
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Anthropic)
-            .is_some()
-    );
-
+    // `auto` follows the request's protocol, including one the session's own
+    // model cannot be disguised as.
     agent.set_default_protocol(ApiProtocol::Completions);
-    let previous = agent.fake_client();
-    let error = agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect_err("completions protocol rejects fake modes");
-    assert!(error.to_string().contains("not supported"));
-    assert_eq!(agent.fake_client(), previous);
+    agent.set_fake_client(Some(crate::fake::FakeClient::Auto));
+    assert!(agent.fake_context_for(&responses).is_some());
+    assert!(agent.fake_context_for(&anthropic).is_some());
+    assert!(agent.fake_context_for(&completions).is_none());
+}
+
+#[test]
+fn a_child_disguises_a_route_its_parent_model_cannot_use() {
+    let mut parent = test_agent();
+    install_active_epoch_route(&mut parent, ApiProtocol::Completions);
+    parent.set_fake_client(Some(crate::fake::FakeClient::Auto));
+
+    let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+    install_active_epoch_route(&mut child, ApiProtocol::Responses);
+
+    assert!(parent.fake_context_for(&protocol("completions")).is_none());
+    assert!(child.fake_context_for(&protocol("responses")).is_some());
 }
 
 #[test]
@@ -243,9 +225,7 @@ fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
     // Startup installs the declared values even with the fake switched off.
     agent.set_fake_config(declared);
 
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses protocol supports codex fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
     let context = codex_context(&agent);
     assert_eq!(context.installation_id, "declared-installation");
     assert_eq!(context.current_date.as_deref(), Some("2001-02-03"));
@@ -261,12 +241,8 @@ fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
     let mut reloaded = crate::config::FakeConfig::default();
     reloaded.identity.installation_id = Some("reloaded-installation".into());
     agent.set_fake_config(reloaded);
-    agent
-        .set_fake_client(None)
-        .expect("disabling the fake is infallible");
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses protocol supports codex fake");
+    agent.set_fake_client(None);
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
     assert_eq!(
         codex_context(&agent).installation_id,
         "reloaded-installation"
@@ -276,9 +252,7 @@ fn enabling_fake_mid_session_uses_the_declared_config_and_installation_id() {
 #[test]
 fn fake_context_is_resolved_once_per_turn_and_has_no_provider_secret() {
     let mut agent = test_agent();
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses protocol supports codex fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
     // Both consumers in a turn (the prompt block and the request decorator)
     // read one resolution, so they share an identity and the host facts behind
     // it are read from the system once.
@@ -302,9 +276,7 @@ fn fake_context_is_resolved_once_per_turn_and_has_no_provider_secret() {
 #[test]
 fn declaring_a_fake_value_refreshes_the_cached_turn_context() {
     let mut agent = test_agent();
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses protocol supports codex fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
     let derived = codex_context(&agent);
     let mut declared = crate::config::FakeConfig::default();
     declared.clock.date = Some("2001-02-03".into());
@@ -318,11 +290,9 @@ fn declaring_a_fake_value_refreshes_the_cached_turn_context() {
 fn the_anthropic_profile_resolves_the_claude_code_context() {
     let mut agent = test_agent();
     agent.set_default_protocol(ApiProtocol::Anthropic);
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
-        .expect("anthropic protocol supports the anthropic fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
     let context = agent
-        .fake_turn_context(crate::fake::FakeClient::Anthropic)
+        .fake_context_for(&protocol("anthropic"))
         .expect("claude context is available");
     let crate::fake::FakeRequestContext::Claude(context) = context else {
         panic!("the anthropic profile must resolve the Claude context");
@@ -335,20 +305,14 @@ fn the_anthropic_profile_resolves_the_claude_code_context() {
             .any(|(name, _)| name == "originator")
     );
     // The profile gate keeps the Codex context out of this agent.
-    assert!(
-        agent
-            .fake_turn_context(crate::fake::FakeClient::Codex)
-            .is_none()
-    );
+    assert!(agent.fake_context_for(&protocol("responses")).is_none());
 }
 
 #[test]
 fn the_anthropic_profile_prepends_the_client_blocks() {
     let mut agent = test_agent();
-    agent.set_default_protocol(ApiProtocol::Anthropic);
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
-        .expect("anthropic protocol supports the anthropic fake");
+    install_active_epoch_route(&mut agent, ApiProtocol::Anthropic);
+    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
 
     let prelude = agent
         .try_prepare_turn_prelude_with_skills(&[])
@@ -377,9 +341,7 @@ fn the_anthropic_profile_prepends_the_client_blocks() {
 fn session_title_request_is_disguised_while_the_fake_is_on() {
     let mut agent = test_agent();
     install_active_epoch_route(&mut agent, ApiProtocol::Responses);
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Codex))
-        .expect("responses protocol supports codex fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
 
     let title_agent = agent.session_title_agent();
     let route = title_agent
@@ -419,9 +381,7 @@ fn anthropic_session_title_request_carries_the_claude_code_profile() {
     let mut agent = test_agent();
     agent.set_default_protocol(ApiProtocol::Anthropic);
     install_active_epoch_route(&mut agent, ApiProtocol::Anthropic);
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
-        .expect("anthropic protocol supports the anthropic fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
 
     let title_agent = agent.session_title_agent();
     let route = title_agent
@@ -560,9 +520,7 @@ async fn the_anthropic_title_oneshot_carries_the_client_profile() {
         false,
         &format!("http://{address}/v1"),
     );
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
-        .expect("anthropic protocol supports the anthropic fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
 
     let mut title_agent = agent.session_title_agent();
     let title = title_agent
@@ -594,9 +552,7 @@ async fn the_anthropic_structured_oneshot_carries_the_client_profile() {
         false,
         &format!("http://{address}/v1"),
     );
-    agent
-        .set_fake_client(Some(crate::fake::FakeClient::Anthropic))
-        .expect("anthropic protocol supports the anthropic fake");
+    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
 
     let (text, _) = agent
         .run_structured_oneshot(

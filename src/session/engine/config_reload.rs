@@ -296,16 +296,6 @@ pub(crate) fn apply_config_reload(
         if let Some(prepared) = prepared_current_route {
             prepared.into_install().apply(agent);
         }
-        if agent
-            .fake_client()
-            .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
-        {
-            agent.set_fake_client(None)?;
-            let _ = event_tx.send(SessionTransportEvent::FakeClientChanged { client: None });
-            let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                "Fake mode disabled: unsupported by the reloaded model protocol",
-            )));
-        }
     } else if !current_route_available {
         let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(format!(
             "Current model '{}' is no longer in the configured model catalog; this session will keep using its existing route until you switch models or start a new session",

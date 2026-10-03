@@ -1,12 +1,12 @@
 use super::{FailureKind, FailurePhase, ModelFailure, PreparedHttpRequest, ProtocolId};
-use crate::fake::{FakeClient, FakeRequestContext};
+use crate::fake::{FakeProfile, FakeRequestContext};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
 /// Per-request fake decoration selected independently from provider flavor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeRequestDecorator {
-    client: FakeClient,
+    profile: FakeProfile,
     context: FakeRequestContext,
     /// The WebSocket transport negotiates its protocol version with a beta
     /// header the HTTP transport does not send.
@@ -15,21 +15,19 @@ pub struct FakeRequestDecorator {
 
 impl FakeRequestDecorator {
     pub fn new(
-        client: FakeClient,
+        profile: FakeProfile,
         protocol_id: &ProtocolId,
         context: FakeRequestContext,
         responses_websocket: bool,
     ) -> Result<Self, ModelFailure> {
-        if !client.supports_protocol_id(protocol_id)
-            || !context.profile().supports_protocol_id(protocol_id)
-        {
+        if !profile.supports_protocol_id(protocol_id) || context.profile() != profile {
             return Err(
                 ModelFailure::new(FailurePhase::Prepare, FailureKind::UnsupportedProtocol)
                     .with_code("fake_protocol_mismatch"),
             );
         }
         Ok(Self {
-            client,
+            profile,
             context,
             responses_websocket,
         })
@@ -42,7 +40,7 @@ impl FakeRequestDecorator {
         protocol_id: &ProtocolId,
         mut request: PreparedHttpRequest,
     ) -> Result<PreparedHttpRequest, ModelFailure> {
-        if !self.client.supports_protocol_id(protocol_id) {
+        if !self.profile.supports_protocol_id(protocol_id) {
             return Err(
                 ModelFailure::new(FailurePhase::Prepare, FailureKind::UnsupportedProtocol)
                     .with_code("fake_protocol_mismatch"),
@@ -199,7 +197,7 @@ mod tests {
     fn codex_decorator_carries_declared_metadata_without_credentials() {
         let protocol = ProtocolId::new("responses").unwrap();
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Codex, &protocol, codex_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Codex, &protocol, codex_context(), false)
                 .unwrap();
         let decorated = decorator
             .decorate(
@@ -258,7 +256,7 @@ mod tests {
     fn anthropic_decorator_carries_the_claude_code_profile() {
         let protocol = ProtocolId::new("anthropic").unwrap();
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Anthropic, &protocol, claude_context(), false)
                 .unwrap();
         let original = serde_json::json!({
             "model":"claude",
@@ -307,7 +305,7 @@ mod tests {
     fn claude_requests_share_the_session_without_a_request_id() {
         let protocol = ProtocolId::new("anthropic").unwrap();
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Anthropic, &protocol, claude_context(), false)
                 .unwrap();
         let body = serde_json::json!({
             "model": "claude",
@@ -347,7 +345,7 @@ mod tests {
     fn claude_profile_replaces_the_adapter_transport_values() {
         let protocol = ProtocolId::new("anthropic").unwrap();
         let decorator =
-            FakeRequestDecorator::new(FakeClient::Anthropic, &protocol, claude_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Anthropic, &protocol, claude_context(), false)
                 .unwrap();
         let mut prepared = request("anthropic", serde_json::json!({"model": "claude"}));
         prepared
@@ -368,17 +366,17 @@ mod tests {
     fn decorator_rejects_incompatible_protocols() {
         let completions = ProtocolId::new("completions").unwrap();
         assert!(
-            FakeRequestDecorator::new(FakeClient::Auto, &completions, codex_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Codex, &completions, codex_context(), false)
                 .is_err()
         );
         let responses = ProtocolId::new("responses").unwrap();
         assert!(
-            FakeRequestDecorator::new(FakeClient::Codex, &responses, claude_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Codex, &responses, claude_context(), false)
                 .is_err()
         );
         let anthropic = ProtocolId::new("anthropic").unwrap();
         assert!(
-            FakeRequestDecorator::new(FakeClient::Anthropic, &anthropic, codex_context(), false)
+            FakeRequestDecorator::new(FakeProfile::Anthropic, &anthropic, codex_context(), false)
                 .is_err()
         );
     }
@@ -393,14 +391,14 @@ mod tests {
             "tools": []
         });
 
-        let http = FakeRequestDecorator::new(FakeClient::Codex, &protocol, codex_context(), false)
+        let http = FakeRequestDecorator::new(FakeProfile::Codex, &protocol, codex_context(), false)
             .unwrap()
             .decorate(&protocol, request("responses", body.clone()))
             .unwrap();
         assert!(!http.protocol_headers.contains_key("openai-beta"));
 
         let websocket =
-            FakeRequestDecorator::new(FakeClient::Codex, &protocol, codex_context(), true)
+            FakeRequestDecorator::new(FakeProfile::Codex, &protocol, codex_context(), true)
                 .unwrap()
                 .decorate(&protocol, request("responses", body))
                 .unwrap();

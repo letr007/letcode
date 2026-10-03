@@ -1501,22 +1501,6 @@ async fn run_engine_loop(
                                     ),
                                 ));
                             }
-                            if agent
-                                .fake_client()
-                                .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
-                            {
-                                agent
-                                    .set_fake_client(None)
-                                    .expect("disabling fake mode is always supported");
-                                let _ = session_transport_tx.send(
-                                    SessionTransportEvent::FakeClientChanged { client: None },
-                                );
-                                let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                    NoticeEvent::info(
-                                        "Fake mode disabled: unsupported by the selected model protocol",
-                                    ),
-                                ));
-                            }
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                                 model_id: model_id.clone(),
                             });
@@ -2253,25 +2237,14 @@ async fn run_engine_loop(
                                 "Fast mode auto-disabled: current model is unavailable",
                             )));
                         }
-                        let recorded_fake_client =
+                        let restored_fake_client =
                             crate::transcript::restore_latest_fake_client(&resumed_event_records);
-                        let restored_fake_client = recorded_fake_client
-                            .filter(|client| client.supports_protocol(agent.active_protocol()));
-                        agent
-                            .set_fake_client(restored_fake_client)
-                            .expect("restoring fake mode must validate against the active protocol");
+                        agent.set_fake_client(restored_fake_client);
                         let _ = session_transport_tx.send(
                             SessionTransportEvent::FakeClientChanged {
                                 client: restored_fake_client,
                             },
                         );
-                        if restored_fake_client.is_none() && recorded_fake_client.is_some() {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                NoticeEvent::info(
-                                    "Fake mode disabled: unsupported by the resumed model protocol",
-                                ),
-                            ));
-                        }
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         auto_review_service.clear_sticky();
                         // Resuming can install a recorded permission mode, and that mode may
@@ -2383,13 +2356,9 @@ async fn run_engine_loop(
                             let _ = remove_empty_session_file(prepared_install.new_path());
                             continue;
                         }
-                        let inherited_fake_client = agent.fake_client();
+                        let new_session_fake_client = agent.fake_client();
                         prepared_install.commit(&mut agent, &transcript);
-                        let new_session_fake_client = inherited_fake_client
-                            .filter(|client| client.supports_protocol(agent.active_protocol()));
-                        agent
-                            .set_fake_client(new_session_fake_client)
-                            .expect("inheriting fake mode must validate against the new model protocol");
+                        agent.set_fake_client(new_session_fake_client);
                         let inherited_reasoning_effort = agent.reasoning_effort();
                         if let Err(error) = transcript
                             .lock()
@@ -3069,9 +3038,7 @@ reasoning_efforts = ["high"]
                     .unwrap(),
             );
             agent.set_primary_route_factory(primary_factory);
-            agent
-                .set_fake_client(Some(crate::fake::FakeClient::Codex))
-                .unwrap();
+            agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
             agent
                 .set_reasoning_effort(ModelReasoningEffort::High)
                 .unwrap();

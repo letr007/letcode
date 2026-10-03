@@ -214,23 +214,15 @@ impl SessionCoordinator {
             }
             SessionCommand::SetFakeClient(client) => {
                 let previous_client = agent.fake_client();
-                if let Err(error) = agent.set_fake_client(client) {
-                    let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
-                        command: SessionCommand::SetFakeClient(client),
-                    });
-                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                        error.to_string(),
-                    )));
-                } else if let Err(error) = transcript
+                agent.set_fake_client(client);
+                if let Err(error) = transcript
                     .lock()
                     .map_err(|_| anyhow!("transcript recorder poisoned"))
                     .and_then(|mut recorder| {
                         recorder.record_fake_client_changed(previous_client, client)
                     })
                 {
-                    agent
-                        .set_fake_client(previous_client)
-                        .expect("restoring the previous fake mode must validate");
+                    agent.set_fake_client(previous_client);
                     let _ = event_tx.send(SessionTransportEvent::SettingChangeFailed {
                         command: SessionCommand::SetFakeClient(client),
                     });
@@ -605,19 +597,6 @@ impl SessionCoordinator {
             )) => {
                 agent.clear_session_reasoning_efforts();
                 apply_prepared_restored_route(agent, route);
-                if agent
-                    .fake_client()
-                    .is_some_and(|client| !client.supports_protocol(agent.active_protocol()))
-                {
-                    agent
-                        .set_fake_client(None)
-                        .expect("disabling fake mode is always supported");
-                    let _ =
-                        event_tx.send(SessionTransportEvent::FakeClientChanged { client: None });
-                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                        "Fake mode disabled: unsupported by the restored model protocol",
-                    )));
-                }
                 let restored_permission_mode = snapshot.latest_permission_mode.is_some();
                 apply_restored_permission_mode(agent, snapshot.latest_permission_mode.as_deref());
                 let reasoning_notice = apply_restored_reasoning_effort(agent, &snapshot.records);

@@ -156,7 +156,7 @@ pub(super) fn work(
     // Use the configured Historian route's actual preparation budget. Never
     // retire a message which did not fit into the producer input.
     let mut prelude = helper.prelude.clone();
-    super::prepend_fake_claude_client_blocks(&helper, &mut prelude);
+    super::prepend_fake_claude_client_blocks(&helper, &route.protocol_id, &mut prelude);
     while end > start {
         let source_ids = frames[start..end]
             .iter()

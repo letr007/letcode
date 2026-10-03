@@ -128,21 +128,14 @@ pub(super) fn fake_request_decorator(
     route: &crate::model_runtime::ResolvedModelRoute,
     responses_websocket: bool,
 ) -> Option<crate::model_runtime::decorator::FakeRequestDecorator> {
-    let profile = match route.protocol_id.as_str() {
-        "responses" => crate::fake::FakeClient::Codex,
-        "anthropic" => crate::fake::FakeClient::Anthropic,
-        _ => return None,
-    };
-    let client = agent.fake_client()?;
-    agent.fake_turn_context(profile).and_then(|context| {
-        crate::model_runtime::decorator::FakeRequestDecorator::new(
-            client,
-            &route.protocol_id,
-            context,
-            responses_websocket,
-        )
-        .ok()
-    })
+    let context = agent.fake_context_for(&route.protocol_id)?;
+    crate::model_runtime::decorator::FakeRequestDecorator::new(
+        context.profile(),
+        &route.protocol_id,
+        context,
+        responses_websocket,
+    )
+    .ok()
 }
 
 fn runtime_failure(

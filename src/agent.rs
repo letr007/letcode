@@ -1586,25 +1586,7 @@ impl Agent {
         self.clear_fake_context_cache();
     }
 
-    pub(crate) fn set_fake_client(
-        &mut self,
-        client: Option<crate::fake::FakeClient>,
-    ) -> Result<()> {
-        if let Some(client) = client {
-            let protocol = self.active_protocol();
-            if !client.supports_protocol(protocol) {
-                bail!(
-                    "fake mode '{}' is not supported by the current model protocol '{}'; use {}",
-                    client.as_str(),
-                    protocol.as_str(),
-                    match protocol {
-                        ApiProtocol::Responses => "codex or auto",
-                        ApiProtocol::Anthropic => "anthropic or auto",
-                        ApiProtocol::Completions => "off",
-                    }
-                );
-            }
-        }
+    pub(crate) fn set_fake_client(&mut self, client: Option<crate::fake::FakeClient>) {
         self.fake_client = client;
         // A declared installation id wins over the seed value, so enabling the
         // fake mid-session picks up `[fake]` as well.
@@ -1616,7 +1598,6 @@ impl Agent {
             .unwrap_or_else(|| self.fake_installation_id.clone());
         self.fake_identity = client.map(|_| crate::fake::FakeIdentity::new(installation_id));
         self.clear_fake_context_cache();
-        Ok(())
     }
 
     pub(crate) fn fake_client(&self) -> Option<crate::fake::FakeClient> {
@@ -1635,16 +1616,12 @@ impl Agent {
         &self.fake_config
     }
 
-    /// Resolves this turn's fake context for a concrete `profile`, once per turn.
-    pub(crate) fn fake_turn_context(
+    /// Resolves this turn's disguise for the request's route, once per turn.
+    pub(crate) fn fake_context_for(
         &self,
-        profile: crate::fake::FakeClient,
+        protocol: &crate::model_runtime::ProtocolId,
     ) -> Option<crate::fake::FakeRequestContext> {
-        if self.fake_client != Some(crate::fake::FakeClient::Auto)
-            && self.fake_client != Some(profile)
-        {
-            return None;
-        }
+        let profile = self.fake_client?.resolve(protocol)?;
         let identity = self.fake_identity.as_ref()?;
         let turn_id = self.turn.turn_id;
         let mut cache = self
@@ -1658,14 +1635,12 @@ impl Agent {
             return Some(context.clone());
         }
         let context = match profile {
-            crate::fake::FakeClient::Anthropic => crate::fake::FakeRequestContext::Claude(
+            crate::fake::FakeProfile::Anthropic => crate::fake::FakeRequestContext::Claude(
                 identity.claude_turn_context(&self.fake_config, self.permission_mode()),
             ),
-            crate::fake::FakeClient::Auto | crate::fake::FakeClient::Codex => {
-                crate::fake::FakeRequestContext::Codex(
-                    identity.turn_context(&self.fake_config, None),
-                )
-            }
+            crate::fake::FakeProfile::Codex => crate::fake::FakeRequestContext::Codex(
+                identity.turn_context(&self.fake_config, None),
+            ),
         };
         *cache = Some((turn_id, context.clone()));
         Some(context)
@@ -1773,17 +1748,6 @@ impl Agent {
 
     pub(crate) fn default_protocol(&self) -> ApiProtocol {
         self.default_protocol
-    }
-
-    pub(crate) fn active_protocol(&self) -> ApiProtocol {
-        self.protocol_for_model(&self.model)
-    }
-
-    fn protocol_for_model(&self, model_id: &str) -> ApiProtocol {
-        self.model_protocols
-            .get(model_id)
-            .cloned()
-            .unwrap_or(self.default_protocol)
     }
 
     pub(crate) fn active_model_metadata(&self) -> ModelRequestMetadata {
@@ -2039,10 +2003,17 @@ impl Agent {
             None,
             effective_input_budget_tokens(model.clone(), &tools),
         );
-        let runtime_message = runtime_context_message(fake_codex_context(self).as_ref());
+        let fake_protocol = runtime_route.map(|route| &route.protocol_id);
+        let runtime_message = runtime_context_message(
+            fake_protocol
+                .and_then(|p| fake_codex_context(self, p))
+                .as_ref(),
+        );
         let skill_message = self.skill_prelude_message();
         let mut prelude = self.prelude.clone();
-        prepend_fake_claude_client_blocks(self, &mut prelude);
+        if let Some(protocol) = fake_protocol {
+            prepend_fake_claude_client_blocks(self, protocol, &mut prelude);
+        }
         prelude.push(runtime_message);
         if let Some(message) = skill_message {
             prelude.push(message);
@@ -3074,7 +3045,7 @@ impl Agent {
             .ok_or_else(|| anyhow!("structured oneshot requires a resolved route"))?;
         let structured_output = contract(route.generation.structured_output);
         let mut prelude = self.prelude.clone();
-        prepend_fake_claude_client_blocks(self, &mut prelude);
+        prepend_fake_claude_client_blocks(self, &route.protocol_id, &mut prelude);
         let (_, input) = protocol_stream::prepare_resolved_oneshot_request(
             route,
             self.active_model_metadata(),
@@ -3102,7 +3073,7 @@ impl Agent {
             .resolved_model_route()
             .ok_or_else(|| anyhow!("helper requires an installed resolved model route"))?;
         let mut prelude = self.prelude.clone();
-        prepend_fake_claude_client_blocks(self, &mut prelude);
+        prepend_fake_claude_client_blocks(self, &route.protocol_id, &mut prelude);
         let decorator = protocol_stream::fake_request_decorator(self, route, false);
         protocol_stream::execute_resolved_text_oneshot(
             route,
@@ -3122,7 +3093,7 @@ impl Agent {
         // disguise while the fake is on.
         let fake_decorator = protocol_stream::fake_request_decorator(self, route, false);
         let mut prelude = self.prelude.clone();
-        prepend_fake_claude_client_blocks(self, &mut prelude);
+        prepend_fake_claude_client_blocks(self, &route.protocol_id, &mut prelude);
         let raw = protocol_stream::execute_resolved_text_oneshot(
             route,
             self.active_model_metadata(),
@@ -3797,10 +3768,20 @@ impl Agent {
         }
         self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
 
+        let fake_protocol = self
+            .resolved_model_route()
+            .map(|route| route.protocol_id.clone());
         let mut turn_prelude = self.prelude.clone();
-        prepend_fake_claude_client_blocks(self, &mut turn_prelude);
+        if let Some(protocol) = fake_protocol.as_ref() {
+            prepend_fake_claude_client_blocks(self, protocol, &mut turn_prelude);
+        }
         self.append_model_strategy_prelude(&mut turn_prelude);
-        turn_prelude.push(runtime_context_message(fake_codex_context(self).as_ref()));
+        turn_prelude.push(runtime_context_message(
+            fake_protocol
+                .as_ref()
+                .and_then(|p| fake_codex_context(self, p))
+                .as_ref(),
+        ));
         if let Some(message) = self.skill_prelude_message() {
             turn_prelude.push(message);
         }
@@ -5247,24 +5228,24 @@ fn default_agent_prelude() -> Vec<PromptMessage> {
     vec![PromptMessage::system(DEFAULT_AGENT_PRELUDE)]
 }
 
-/// Resolves the Codex-shaped context when the Codex profile is active for the
-/// current protocol. The Anthropic profile keeps its native runtime context.
-fn fake_codex_context(agent: &Agent) -> Option<crate::fake::CodexRequestContext> {
-    if agent.active_protocol() != ApiProtocol::Responses {
-        return None;
-    }
-    match agent.fake_turn_context(crate::fake::FakeClient::Codex)? {
+/// Resolves the Codex-shaped context when the request's route carries the
+/// Codex profile. The Anthropic profile keeps its native runtime context.
+fn fake_codex_context(
+    agent: &Agent,
+    protocol: &crate::model_runtime::ProtocolId,
+) -> Option<crate::fake::CodexRequestContext> {
+    match agent.fake_context_for(protocol)? {
         crate::fake::FakeRequestContext::Codex(context) => Some(context),
         crate::fake::FakeRequestContext::Claude(_) => None,
     }
 }
 
-fn prepend_fake_claude_client_blocks(agent: &Agent, prelude: &mut Vec<PromptMessage>) {
-    if agent.active_protocol() != ApiProtocol::Anthropic {
-        return;
-    }
-    let Some(crate::fake::FakeRequestContext::Claude(context)) =
-        agent.fake_turn_context(crate::fake::FakeClient::Anthropic)
+fn prepend_fake_claude_client_blocks(
+    agent: &Agent,
+    protocol: &crate::model_runtime::ProtocolId,
+    prelude: &mut Vec<PromptMessage>,
+) {
+    let Some(crate::fake::FakeRequestContext::Claude(context)) = agent.fake_context_for(protocol)
     else {
         return;
     };
