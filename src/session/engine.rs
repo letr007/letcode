@@ -27,7 +27,7 @@ use crate::agent::{
     Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome, SubagentInvocation,
 };
 use crate::agent_event_journal::persist_agent_event;
-use crate::config::{AppConfig, ModelRoute, ProviderConfig, RetryConfig};
+use crate::config::{AppConfig, ModelRoute, ProviderConfig};
 use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
@@ -269,21 +269,7 @@ impl SessionEngine {
         let task = tokio::spawn(run_engine_loop(
             agent,
             Arc::clone(&transcript),
-            config.sessions_dir,
-            config.workspace_dir,
-            config.model_routes,
-            config.route_api_key_configured,
-            config.new_session_default_route,
-            config.expert_default_routes,
-            config.expert_allowed_models,
-            config.expert_reasoning_efforts,
-            config.providers,
-            config.global_retry,
-            config.provider_api_key_hints,
-            config.api_key_hint,
-            config.mcp_config_path,
-            config.mcp_config,
-            config.runtime_catalog,
+            config,
             jev_reviewer,
             mcp_tools_rx,
             reload_rx,
@@ -1233,24 +1219,7 @@ fn reviewer_jev_config(
 async fn run_engine_loop(
     agent: Agent,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
-    sessions_dir: PathBuf,
-    workspace_dir: Option<PathBuf>,
-    model_routes: indexmap::IndexMap<String, ModelRoute>,
-    route_api_key_configured: indexmap::IndexMap<String, bool>,
-    new_session_default_route: ModelRoute,
-    expert_default_routes: indexmap::IndexMap<String, ModelRoute>,
-    expert_allowed_models: indexmap::IndexMap<String, Vec<ModelRoute>>,
-    expert_reasoning_efforts: indexmap::IndexMap<
-        String,
-        crate::request_builder::ModelReasoningEffort,
-    >,
-    providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
-    global_retry: crate::config::RetryConfig,
-    provider_api_key_hints: indexmap::IndexMap<String, String>,
-    api_key_hint: String,
-    mcp_config_path: PathBuf,
-    mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
-    mut runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
+    mut config: SessionEngineConfig,
     jev_reviewer: Option<std::sync::Arc<dyn crate::agent::AutoReviewService>>,
     mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
     mut reload_rx: mpsc::UnboundedReceiver<()>,
@@ -1263,16 +1232,14 @@ async fn run_engine_loop(
     let transcript = transcript;
     let mut agent = agent;
     let mut mcp_tools_rx = Some(mcp_tools_rx);
-    let mut mcp_config = mcp_config;
-    let mut model_routes = model_routes;
-    let route_api_key_configured = Arc::new(StdMutex::new(route_api_key_configured));
-    let mut new_session_default_route = new_session_default_route;
-    let mut expert_default_routes = expert_default_routes;
-    let mut expert_allowed_models = expert_allowed_models;
-    let mut expert_reasoning_efforts = expert_reasoning_efforts;
-    let mut providers = providers;
-    let mut global_retry = global_retry;
-    let provider_api_key_hints = Arc::new(StdMutex::new(provider_api_key_hints));
+    // The auto-review service reads both maps from outside the engine loop, so
+    // they become shared handles here and leave the configuration value empty.
+    let route_api_key_configured = Arc::new(StdMutex::new(std::mem::take(
+        &mut config.route_api_key_configured,
+    )));
+    let provider_api_key_hints = Arc::new(StdMutex::new(std::mem::take(
+        &mut config.provider_api_key_hints,
+    )));
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
     let subagent_runtime = subagent_runtime;
     let auto_review_service: std::sync::Arc<dyn crate::agent::AutoReviewService> =
@@ -1280,18 +1247,18 @@ async fn run_engine_loop(
             Some(service) => service,
             None => std::sync::Arc::new(crate::session::auto_review::StickyAutoReviewer::new(
                 subagent_runtime.clone(),
-                sessions_dir.clone(),
+                config.sessions_dir.clone(),
                 Arc::clone(&transcript),
                 Some(session_transport_tx.clone()),
                 Arc::clone(&route_api_key_configured),
                 Arc::clone(&provider_api_key_hints),
-                api_key_hint.clone(),
+                config.api_key_hint.clone(),
             )),
         };
     agent.set_auto_review_service(Some(std::sync::Arc::clone(&auto_review_service)));
     agent.historian_runtime = Some(Arc::new(crate::session::historian::HistorianRuntime::new(
         subagent_runtime.clone(),
-        sessions_dir.clone(),
+        config.sessions_dir.clone(),
         Arc::clone(&transcript),
         session_transport_tx.clone(),
     )));
@@ -1320,25 +1287,19 @@ async fn run_engine_loop(
                 }
                 while reload_rx.try_recv().is_ok() {}
                 if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
-                let previous_expert_default_routes = expert_default_routes.clone();
-                let previous_expert_allowed_models = expert_allowed_models.clone();
+                let previous_expert_default_routes = config.expert_default_routes.clone();
+                let previous_expert_allowed_models = config.expert_allowed_models.clone();
+                let mut route_keys = route_api_key_configured
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let mut hints = provider_api_key_hints
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 if let Err(error) = apply_config_reload(
                     &mut agent,
-                    &mcp_config_path,
-                    &mut model_routes,
-                    &mut route_api_key_configured
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &mut expert_default_routes,
-                    &mut expert_allowed_models,
-                    &mut expert_reasoning_efforts,
-                    &mut providers,
-                    &mut global_retry,
-                    &mut provider_api_key_hints
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &mut new_session_default_route,
-                    &mut runtime_catalog,
+                    &mut config,
+                    &mut route_keys,
+                    &mut hints,
                     &session_transport_tx,
                 ) {
                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
@@ -1346,9 +1307,9 @@ async fn run_engine_loop(
                     )));
                 } else if reviewer_policy_changed(
                     &previous_expert_default_routes,
-                    &expert_default_routes,
+                    &config.expert_default_routes,
                     &previous_expert_allowed_models,
-                    &expert_allowed_models,
+                    &config.expert_allowed_models,
                 ) {
                     auto_review_service.clear_sticky();
                 }
@@ -1385,7 +1346,7 @@ async fn run_engine_loop(
                     let mut seen = std::collections::HashSet::new();
                     let mut invalid = None;
                     for model_id in model_ids {
-                        let Some(route) = model_routes.get(model_id).cloned() else {
+                        let Some(route) = config.model_routes.get(model_id).cloned() else {
                             invalid = Some(format!("unknown model: {model_id}"));
                             break;
                         };
@@ -1406,21 +1367,21 @@ async fn run_engine_loop(
                         );
                         continue;
                     }
-                    let mut updated_allowed_models = expert_allowed_models.clone();
+                    let mut updated_allowed_models = config.expert_allowed_models.clone();
                     updated_allowed_models.insert(agent_name.clone(), routes.clone());
                     let expert_factory = match crate::subagent::ExpertRouteFactory::new_with_policies(
                         crate::delegation::supported_agent_names().map(|name| {
                             (
                                 name.to_string(),
-                                expert_default_routes.get(name).cloned(),
+                                config.expert_default_routes.get(name).cloned(),
                                 updated_allowed_models.get(name).cloned().unwrap_or_default(),
-                                expert_reasoning_efforts.get(name).cloned(),
+                                config.expert_reasoning_efforts.get(name).cloned(),
                             )
                         }),
-                        &providers,
-                        &global_retry,
+                        &config.providers,
+                        &config.global_retry,
                     ) {
-                        Ok(factory) => factory.with_runtime_catalog(runtime_catalog.clone()),
+                        Ok(factory) => factory.with_runtime_catalog(config.runtime_catalog.clone()),
                         Err(error) => {
                             send_setting_change_failed(
                                 &session_transport_tx,
@@ -1434,7 +1395,7 @@ async fn run_engine_loop(
                         }
                     };
                     if let Err(error) = crate::config::persist_expert_allowed_models(
-                        &mcp_config_path,
+                        &config.mcp_config_path,
                         agent_name,
                         &routes,
                     ) {
@@ -1449,7 +1410,7 @@ async fn run_engine_loop(
                         continue;
                     }
                     agent.set_subagent_child_factory(Arc::new(expert_factory));
-                    expert_allowed_models = updated_allowed_models;
+                    config.expert_allowed_models = updated_allowed_models;
                     if agent_name == "historian"
                         && let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                     if agent_name == "reviewer" {
@@ -1463,7 +1424,7 @@ async fn run_engine_loop(
                 }
 
                 if let SessionEngineCommand::SetModel(model) = &command {
-                    let Some(route) = model_routes.get(model).cloned() else {
+                    let Some(route) = config.model_routes.get(model).cloned() else {
                         send_setting_change_failed(
                             &session_transport_tx,
                             crate::session::SessionCommand::SetModel(model.clone()),
@@ -1531,7 +1492,7 @@ async fn run_engine_loop(
                                     missing_api_key_error(&route_api_key_hint(
                                         &model_id,
                                         &provider_hints,
-                                        &api_key_hint,
+                                        &config.api_key_hint,
                                     )),
                                 ));
                             }
@@ -1562,7 +1523,7 @@ async fn run_engine_loop(
                         apply_engine_view_child(
                             &transcript,
                             &session_transport_tx,
-                            Some(sessions_dir.as_path()),
+                            Some(config.sessions_dir.as_path()),
                             *navigation,
                             anchor_child_session_id.as_deref(),
                             &mut visible_child_session_id,
@@ -1582,7 +1543,7 @@ async fn run_engine_loop(
                             &mut agent,
                             &transcript,
                             &session_transport_tx,
-                            Some(sessions_dir.as_path()),
+                            Some(config.sessions_dir.as_path()),
                         );
                         if let Err(error) = dispatch_result {
                             let _ = session_transport_tx.send(SessionTransportEvent::Error(
@@ -1674,7 +1635,7 @@ async fn run_engine_loop(
 
                 let prompt = match command {
                     SessionEngineCommand::ToggleMcpServer(server_name) => {
-                        let Some(server_config) = mcp_config.get(&server_name).cloned() else {
+                        let Some(server_config) = config.mcp_config.get(&server_name).cloned() else {
                             let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdating {
                                 name: server_name.clone(),
                                 updating: false,
@@ -1686,7 +1647,7 @@ async fn run_engine_loop(
                         };
                         let enabled = !server_config.enabled;
                         let persisted_config = match crate::config::persist_mcp_server_enabled(
-                            &mcp_config_path,
+                            &config.mcp_config_path,
                             &server_name,
                             enabled,
                         ) {
@@ -1702,7 +1663,7 @@ async fn run_engine_loop(
                                 continue;
                             }
                         };
-                        mcp_config.insert(server_name.clone(), persisted_config);
+                        config.mcp_config.insert(server_name.clone(), persisted_config);
                         if !enabled {
                             for tool_name in mcp_registered_tools
                                 .remove(&server_name)
@@ -1723,7 +1684,7 @@ async fn run_engine_loop(
                         let mut one_server = indexmap::IndexMap::new();
                         one_server.insert(
                             server_name.clone(),
-                            mcp_config
+                            config.mcp_config
                                 .get(&server_name)
                                 .expect("configured MCP server should remain present")
                                 .clone(),
@@ -1827,8 +1788,8 @@ async fn run_engine_loop(
                         };
                         let route_display_name = match delegated_route_for_takeover(
                             &agent,
-                            &expert_default_routes,
-                            &sessions_dir,
+                            &config.expert_default_routes,
+                            &config.sessions_dir,
                             &transcript,
                             &agent_name,
                             invocation.input.target_child_session_id.as_deref(),
@@ -1848,7 +1809,7 @@ async fn run_engine_loop(
                             route_has_api_key(&route_api_keys, &route_display_name)
                                 || delegated_route_display_name(
                                     &agent,
-                                    &expert_default_routes,
+                                    &config.expert_default_routes,
                                     &agent_name,
                                 ) == route_display_name
                         };
@@ -1861,7 +1822,7 @@ async fn run_engine_loop(
                                     &session_transport_tx,
                                     &route_display_name,
                                     &provider_hints,
-                                    &api_key_hint,
+                                    &config.api_key_hint,
                                 );
                             }
                             continue;
@@ -1877,7 +1838,7 @@ async fn run_engine_loop(
                                 &agent,
                                 &agent_name,
                                 invocation,
-                                sessions_dir.clone(),
+                                config.sessions_dir.clone(),
                                 parent_session_id,
                                 format!(
                                     "turn-{}",
@@ -1993,7 +1954,7 @@ async fn run_engine_loop(
                                         apply_engine_view_child(
                                             &transcript,
                                             &session_transport_tx,
-                                            Some(sessions_dir.as_path()),
+                                            Some(config.sessions_dir.as_path()),
                                             navigation,
                                             anchor_child_session_id.as_deref(),
                                             &mut visible_child_session_id,
@@ -2006,7 +1967,7 @@ async fn run_engine_loop(
                                         crate::session::SessionCoordinator::emit_view_parent(
                                             &transcript,
                                             &session_transport_tx,
-                                            Some(sessions_dir.as_path()),
+                                            Some(config.sessions_dir.as_path()),
                                         );
                                         visible_child_session_id = None;
                                         visible_child_view_state = None;
@@ -2114,7 +2075,7 @@ async fn run_engine_loop(
                                     &session_transport_tx,
                                     &route_display_name,
                                     &provider_hints,
-                                    &api_key_hint,
+                                    &config.api_key_hint,
                                 );
                             }
                             continue;
@@ -2131,7 +2092,7 @@ async fn run_engine_loop(
                             &mut agent,
                             &transcript,
                             &session_transport_tx,
-                            &sessions_dir,
+                            &config.sessions_dir,
                             &mut control_rx,
                             &mut deferred_commands,
                             &mut visible_child_session_id,
@@ -2153,7 +2114,7 @@ async fn run_engine_loop(
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
 
                         let session_id = match crate::session::resolve_session_prefix(
-                            &sessions_dir,
+                            &config.sessions_dir,
                             &prefix,
                         ) {
                             Ok(session_id) => session_id,
@@ -2179,7 +2140,7 @@ async fn run_engine_loop(
                             continue;
                         }
                         let prepared = match crate::session::prepare_resume_package(
-                            &sessions_dir,
+                            &config.sessions_dir,
                             session_id,
                         ) {
                             Ok(prepared) => prepared,
@@ -2205,7 +2166,7 @@ async fn run_engine_loop(
                                 &agent,
                                 &transcript,
                                 prepared,
-                                Some(&new_session_default_route),
+                                Some(&config.new_session_default_route),
                             ) {
                                 Ok(prepared) => prepared,
                                 Err(error) => {
@@ -2279,7 +2240,7 @@ async fn run_engine_loop(
                             model_id: Some(agent.route_display_name()),
                             token_usage: Some(token_usage),
                             runtime_context,
-                            expert_models: expert_default_routes
+                            expert_models: config.expert_default_routes
                                 .iter()
                                 .map(|(name, route)| (name.clone(), route.display_name()))
                                 .collect(),
@@ -2296,9 +2257,9 @@ async fn run_engine_loop(
                             match agent.prepare_primary_route(current_route.clone()) {
                                 Ok(route) => Ok((current_route, route)),
                                 Err(current_error) => match agent
-                                    .prepare_primary_route(new_session_default_route.clone())
+                                    .prepare_primary_route(config.new_session_default_route.clone())
                                 {
-                                    Ok(route) => Ok((new_session_default_route.clone(), route)),
+                                    Ok(route) => Ok((config.new_session_default_route.clone(), route)),
                                     Err(default_error) => Err(anyhow!(
                                         "failed to prepare the current model ({current_error}); fallback default model also failed ({default_error})"
                                     )),
@@ -2306,8 +2267,8 @@ async fn run_engine_loop(
                             }
                         } else {
                             agent
-                                .prepare_primary_route(new_session_default_route.clone())
-                                .map(|route| (new_session_default_route.clone(), route))
+                                .prepare_primary_route(config.new_session_default_route.clone())
+                                .map(|route| (config.new_session_default_route.clone(), route))
                         };
                         let (new_session_route, prepared_route) = match prepared_new_route {
                             Ok(prepared) => prepared,
@@ -2321,9 +2282,9 @@ async fn run_engine_loop(
                             }
                         };
                         let prepared = match crate::session::prepare_new_session_package(
-                            &sessions_dir,
+                            &config.sessions_dir,
                             new_session_route.display_name(),
-                            workspace_dir.as_deref(),
+                            config.workspace_dir.as_deref(),
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -2354,7 +2315,7 @@ async fn run_engine_loop(
                             session_id: prepared_install.session().session_id.clone(),
                             records: prepared_install.session().snapshot.records.clone(),
                             runtime_context: prepared_install.session().runtime_context.clone(),
-                            expert_models: expert_default_routes
+                            expert_models: config.expert_default_routes
                                 .iter()
                                 .map(|(name, route)| (name.clone(), route.display_name()))
                                 .collect(),
@@ -2431,7 +2392,7 @@ async fn run_engine_loop(
                             &session_transport_tx,
                             &route_display_name,
                             &provider_hints,
-                            &api_key_hint,
+                            &config.api_key_hint,
                         );
                     }
                     continue;
@@ -2448,7 +2409,7 @@ async fn run_engine_loop(
                     .with_session_title_event_sender(title_event_tx.clone())
                     .with_subagent_runtime(
                         subagent_runtime.clone(),
-                        sessions_dir.clone(),
+                        config.sessions_dir.clone(),
                         route_api_key_configured
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
@@ -2457,7 +2418,7 @@ async fn run_engine_loop(
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .clone(),
-                        api_key_hint.clone(),
+                        config.api_key_hint.clone(),
                         Some(control_tx.clone()),
                         Some(session_transport_tx.clone()),
                     );
@@ -2564,7 +2525,7 @@ async fn run_engine_loop(
                                     apply_engine_view_child(
                                         &transcript,
                                         &session_transport_tx,
-                                        Some(sessions_dir.as_path()),
+                                        Some(config.sessions_dir.as_path()),
                                         navigation,
                                         anchor_child_session_id.as_deref(),
                                         &mut visible_child_session_id,
@@ -2575,7 +2536,7 @@ async fn run_engine_loop(
                                     crate::session::SessionCoordinator::emit_view_parent(
                                         &transcript,
                                         &session_transport_tx,
-                                        Some(sessions_dir.as_path()),
+                                        Some(config.sessions_dir.as_path()),
                                     );
                                     visible_child_session_id = None;
                                     visible_child_view_state = None;
@@ -2822,7 +2783,7 @@ async fn run_engine_loop(
                 refresh_visible_child_session_view(
                     &transcript,
                     &session_transport_tx,
-                    &sessions_dir,
+                    &config.sessions_dir,
                     &mut visible_child_session_id,
                     &mut visible_child_view_state,
                     &mut visible_child_view_cache,
@@ -3558,6 +3519,38 @@ base_url = "http://127.0.0.1:1"
         assert!(rx.try_recv().is_err());
     }
 
+    fn test_engine_config(
+        mcp_config_path: std::path::PathBuf,
+        model_routes: indexmap::IndexMap<String, ModelRoute>,
+        route_api_key_configured: indexmap::IndexMap<String, bool>,
+        expert_default_routes: indexmap::IndexMap<String, ModelRoute>,
+        expert_allowed_models: indexmap::IndexMap<String, Vec<ModelRoute>>,
+        expert_reasoning_efforts: indexmap::IndexMap<String, ModelReasoningEffort>,
+        providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
+        global_retry: crate::config::RetryConfig,
+        provider_api_key_hints: indexmap::IndexMap<String, String>,
+        new_session_default_route: ModelRoute,
+        runtime_catalog: crate::model_runtime::ResolvedRuntimeCatalog,
+    ) -> SessionEngineConfig {
+        SessionEngineConfig {
+            sessions_dir: std::path::PathBuf::new(),
+            workspace_dir: None,
+            model_routes,
+            route_api_key_configured,
+            new_session_default_route,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            api_key_hint: String::new(),
+            mcp_config_path,
+            mcp_config: indexmap::IndexMap::new(),
+            runtime_catalog,
+        }
+    }
+
     #[test]
     fn reload_failure_preserves_engine_owned_state() {
         let old_path = std::env::temp_dir().join(format!(
@@ -3627,54 +3620,71 @@ base_url = "http://127.0.0.1:1"
         let old_global_retry = global_retry.clone();
         let old_provider_api_key_hints = provider_api_key_hints.clone();
         let old_new_session_default_route = new_session_default_route.clone();
+        let mut engine_config = test_engine_config(
+            bad_path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         assert!(
             apply_config_reload(
                 &mut agent,
-                &bad_path,
-                &mut model_routes,
+                &mut engine_config,
                 &mut route_api_key_configured,
-                &mut expert_default_routes,
-                &mut expert_allowed_models,
-                &mut expert_reasoning_efforts,
-                &mut providers,
-                &mut global_retry,
                 &mut provider_api_key_hints,
-                &mut new_session_default_route,
-                &mut runtime_catalog,
                 &event_tx,
             )
             .is_err()
         );
 
         assert_eq!(agent.primary_route(), Some(&route));
-        assert_eq!(model_routes, old_model_routes);
+        assert_eq!(engine_config.model_routes, old_model_routes);
         assert_eq!(route_api_key_configured, old_route_api_key_configured);
-        assert_eq!(expert_default_routes, old_expert_default_routes);
         assert_eq!(
-            providers.keys().collect::<Vec<_>>(),
+            engine_config.expert_default_routes,
+            old_expert_default_routes
+        );
+        assert_eq!(
+            engine_config.providers.keys().collect::<Vec<_>>(),
             old_providers.keys().collect::<Vec<_>>()
         );
         assert_eq!(
-            providers["primary"].api_key,
+            engine_config.providers["primary"].api_key,
             old_providers["primary"].api_key
         );
         assert_eq!(
-            providers["primary"].models.keys().collect::<Vec<_>>(),
+            engine_config.providers["primary"]
+                .models
+                .keys()
+                .collect::<Vec<_>>(),
             old_providers["primary"].models.keys().collect::<Vec<_>>()
         );
-        assert_eq!(global_retry, old_global_retry);
+        assert_eq!(engine_config.global_retry, old_global_retry);
         assert_eq!(provider_api_key_hints, old_provider_api_key_hints);
-        assert_eq!(new_session_default_route, old_new_session_default_route);
         assert_eq!(
-            runtime_catalog.fingerprint(),
+            engine_config.new_session_default_route,
+            old_new_session_default_route
+        );
+        assert_eq!(
+            engine_config.runtime_catalog.fingerprint(),
             old_config.runtime_catalog.fingerprint()
         );
         assert!(event_rx.try_recv().is_err());
 
         let _ = fs::remove_file(old_path);
-        let _ = fs::remove_file(bad_path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     #[test]
@@ -3790,23 +3800,31 @@ base_url = "http://127.0.0.1:1"
             .collect();
         let mut new_session_default_route = route;
         let mut runtime_catalog = config.runtime_catalog.clone();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         crate::config::persist_mcp_server_enabled(&path, "alpha", false)
             .expect("persist non-reloadable global setting");
+        let mut engine_config = test_engine_config(
+            path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("non-reloadable config write should preserve session settings");
@@ -3817,7 +3835,7 @@ base_url = "http://127.0.0.1:1"
             "configuration reload must preserve the session reasoning selection"
         );
         assert!(event_rx.try_recv().is_err());
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     #[test]
@@ -3889,25 +3907,33 @@ base_url = "http://127.0.0.1:1"
         )
         .expect("remove current session model from config");
 
+        let mut engine_config = test_engine_config(
+            path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("catalog reload should keep the current route alive");
 
         assert_eq!(agent.primary_route(), Some(&current_route));
-        assert_eq!(new_session_default_route, default_route);
+        assert_eq!(engine_config.new_session_default_route, default_route);
         assert_eq!(
             route_api_key_configured.get(&current_route.display_name()),
             Some(&true),
@@ -3932,23 +3958,15 @@ base_url = "http://127.0.0.1:1"
 
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("duplicate removed-route reload should be a no-op");
         assert!(event_rx.try_recv().is_err());
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     #[test]
@@ -4024,29 +4042,46 @@ base_url = "http://127.0.0.1:1"
         "#;
         fs::write(&path, changed).expect("remove current provider");
 
+        let mut engine_config = test_engine_config(
+            path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("removed provider reload keeps live route");
 
         assert_eq!(agent.primary_route(), Some(&current_route));
-        assert_eq!(new_session_default_route, next_default);
-        assert!(providers.get("primary").is_some_and(|provider| {
-            provider.has_model("session-model") && !provider.api_key.is_empty()
-        }));
-        assert!(!model_routes.contains_key(&current_route.display_name()));
+        assert_eq!(engine_config.new_session_default_route, next_default);
+        assert!(
+            engine_config
+                .providers
+                .get("primary")
+                .is_some_and(|provider| {
+                    provider.has_model("session-model") && !provider.api_key.is_empty()
+                })
+        );
+        assert!(
+            !engine_config
+                .model_routes
+                .contains_key(&current_route.display_name())
+        );
         assert_eq!(
             route_api_key_configured.get(&current_route.display_name()),
             Some(&true)
@@ -4054,17 +4089,9 @@ base_url = "http://127.0.0.1:1"
         while event_rx.try_recv().is_ok() {}
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("duplicate removed-provider reload should be a no-op");
@@ -4073,7 +4100,7 @@ base_url = "http://127.0.0.1:1"
             route_api_key_configured.get(&current_route.display_name()),
             Some(&true)
         );
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     #[test]
@@ -4153,30 +4180,38 @@ base_url = "http://127.0.0.1:1"
             .fingerprint()
             .clone();
 
+        let mut engine_config = test_engine_config(
+            path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("runtime change reload succeeds");
 
-        assert_eq!(runtime_catalog.fingerprint(), &expected);
+        assert_eq!(engine_config.runtime_catalog.fingerprint(), &expected);
         assert_eq!(agent.primary_route(), Some(&route));
         assert!(
             agent.provider_usage_anchor_for_test().is_none(),
             "reinstalling a changed route clears provider-local usage state"
         );
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     #[test]
@@ -4271,25 +4306,33 @@ base_url = "http://127.0.0.1:1"
             .fingerprint()
             .clone();
 
+        let mut engine_config = test_engine_config(
+            path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("default-only reload succeeds");
 
-        assert_eq!(runtime_catalog.fingerprint(), &expected);
-        assert_eq!(new_session_default_route, next_default);
+        assert_eq!(engine_config.runtime_catalog.fingerprint(), &expected);
+        assert_eq!(engine_config.new_session_default_route, next_default);
         assert_eq!(agent.primary_route(), Some(&active_route));
         assert_eq!(agent.provider_usage_anchor_for_test(), Some(usage));
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
@@ -4303,7 +4346,7 @@ base_url = "http://127.0.0.1:1"
                 .iter()
                 .any(|event| matches!(event, SessionTransportEvent::ModelChanged { .. }))
         );
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     #[test]
@@ -4396,32 +4439,40 @@ base_url = "http://127.0.0.1:1"
         )
         .expect("write updated active route config");
 
+        let mut engine_config = test_engine_config(
+            path,
+            model_routes,
+            route_api_key_configured,
+            expert_default_routes,
+            expert_allowed_models,
+            expert_reasoning_efforts,
+            providers,
+            global_retry,
+            provider_api_key_hints,
+            new_session_default_route,
+            runtime_catalog,
+        );
+        let mut route_api_key_configured =
+            std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         apply_config_reload(
             &mut agent,
-            &path,
-            &mut model_routes,
+            &mut engine_config,
             &mut route_api_key_configured,
-            &mut expert_default_routes,
-            &mut expert_allowed_models,
-            &mut expert_reasoning_efforts,
-            &mut providers,
-            &mut global_retry,
             &mut provider_api_key_hints,
-            &mut new_session_default_route,
-            &mut runtime_catalog,
             &event_tx,
         )
         .expect("active route config should reload");
 
         assert_eq!(agent.primary_route(), Some(&primary_route));
-        assert_eq!(new_session_default_route, secondary_route);
+        assert_eq!(engine_config.new_session_default_route, secondary_route);
         assert!(matches!(
             event_rx.try_recv(),
             Ok(SessionTransportEvent::ModelCatalogUpdated(_))
         ));
         assert!(event_rx.try_recv().is_err());
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(engine_config.mcp_config_path);
     }
 
     const STUB_ANSWER: &str = "the session is still usable";

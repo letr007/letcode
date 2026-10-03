@@ -52,23 +52,12 @@ pub(crate) fn model_catalog_updated_event(config: &AppConfig) -> ModelCatalogUpd
 
 pub(crate) fn apply_config_reload(
     agent: &mut Agent,
-    config_path: &std::path::Path,
-    model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
+    engine_config: &mut SessionEngineConfig,
     route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
-    expert_default_routes: &mut indexmap::IndexMap<String, ModelRoute>,
-    expert_allowed_models: &mut indexmap::IndexMap<String, Vec<ModelRoute>>,
-    expert_reasoning_efforts: &mut indexmap::IndexMap<
-        String,
-        crate::request_builder::ModelReasoningEffort,
-    >,
-    providers: &mut indexmap::IndexMap<String, ProviderConfig>,
-    global_retry: &mut RetryConfig,
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
-    new_session_default_route: &mut ModelRoute,
-    runtime_catalog: &mut crate::model_runtime::ResolvedRuntimeCatalog,
     event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) -> Result<()> {
-    let config = AppConfig::load_from_path(config_path)?;
+    let config = AppConfig::load_from_path(&engine_config.mcp_config_path)?;
     let catalog_event = model_catalog_updated_event(&config);
     let next_runtime_catalog = config.runtime_catalog.clone();
     let next_runtime_fingerprint = next_runtime_catalog.fingerprint().clone();
@@ -100,7 +89,8 @@ pub(crate) fn apply_config_reload(
         })
         .collect::<indexmap::IndexMap<_, _>>();
     if !current_route_available {
-        let configured = providers
+        let configured = engine_config
+            .providers
             .get(&previous_active_route.provider)
             .is_some_and(|provider| !provider.api_key.trim().is_empty());
         next_route_api_key_configured.insert(previous_active_route.display_name(), configured);
@@ -141,7 +131,8 @@ pub(crate) fn apply_config_reload(
         .collect::<indexmap::IndexMap<_, _>>();
     let mut session_providers = config.providers.clone();
     if !current_route_available {
-        let provider = providers
+        let provider = engine_config
+            .providers
             .get(&previous_active_route.provider)
             .ok_or_else(|| {
                 anyhow!(
@@ -222,21 +213,22 @@ pub(crate) fn apply_config_reload(
         .map(|(name, mode)| (name.clone(), *mode))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let runtime_fingerprint_unchanged = runtime_catalog.fingerprint() == &next_runtime_fingerprint;
-    let maps_unchanged = *model_routes == next_model_routes
+    let runtime_fingerprint_unchanged =
+        engine_config.runtime_catalog.fingerprint() == &next_runtime_fingerprint;
+    let maps_unchanged = engine_config.model_routes == next_model_routes
         && *route_api_key_configured == next_route_api_key_configured
-        && *expert_default_routes == next_expert_default_routes
-        && *expert_allowed_models == next_expert_allowed_models
-        && *expert_reasoning_efforts == next_expert_reasoning_efforts
+        && engine_config.expert_default_routes == next_expert_default_routes
+        && engine_config.expert_allowed_models == next_expert_allowed_models
+        && engine_config.expert_reasoning_efforts == next_expert_reasoning_efforts
         && *provider_api_key_hints == next_provider_api_key_hints
-        && *global_retry == next_global_retry;
+        && engine_config.global_retry == next_global_retry;
     let settings_unchanged = agent.compaction_config() == &config.global.compaction
         && agent.tool_timeout_secs() == config.global.tool_timeout_secs
         && agent.retry_config() == &next_agent_retry
         && agent.tool_parallelism_overrides() == &next_parallelism
         && agent.fake_config() == &config.fake;
     let current_route_runtime_unchanged = route_runtime_fingerprint_eq(
-        runtime_catalog.fingerprint(),
+        engine_config.runtime_catalog.fingerprint(),
         &next_runtime_fingerprint,
         &previous_active_route,
     );
@@ -267,7 +259,7 @@ pub(crate) fn apply_config_reload(
     // Global config writes for non-reloadable fields (for example MCP enabled state)
     // and duplicate watcher events land here with no runtime delta. Stay silent.
     let new_session_default_unchanged =
-        *new_session_default_route == next_new_session_default_route;
+        engine_config.new_session_default_route == next_new_session_default_route;
     if !reload_has_runtime_delta(
         runtime_fingerprint_unchanged,
         maps_unchanged,
@@ -277,7 +269,7 @@ pub(crate) fn apply_config_reload(
         new_session_default_unchanged,
     ) {
         if agent.resolved_runtime_catalog().is_none() {
-            agent.set_resolved_runtime_catalog(Some(runtime_catalog.clone()));
+            agent.set_resolved_runtime_catalog(Some(engine_config.runtime_catalog.clone()));
         }
         return Ok(());
     }
@@ -310,21 +302,23 @@ pub(crate) fn apply_config_reload(
         ))));
     }
 
-    *model_routes = next_model_routes;
+    engine_config.model_routes = next_model_routes;
     *route_api_key_configured = next_route_api_key_configured;
     if !current_route_available {
-        let retained_credential = providers
+        let retained_credential = engine_config
+            .providers
             .get(&previous_active_route.provider)
             .is_some_and(|provider| !provider.api_key.trim().is_empty());
         route_api_key_configured
             .entry(previous_active_route.display_name())
             .or_insert(retained_credential);
     }
-    *expert_default_routes = next_expert_default_routes;
+    engine_config.expert_default_routes = next_expert_default_routes;
     let changed_expert_allowed_models = next_expert_allowed_models
         .iter()
         .filter(|(name, routes)| {
-            expert_allowed_models
+            engine_config
+                .expert_allowed_models
                 .get(*name)
                 .map(Vec::as_slice)
                 .unwrap_or_default()
@@ -340,14 +334,14 @@ pub(crate) fn apply_config_reload(
             )
         })
         .collect::<Vec<_>>();
-    *expert_allowed_models = next_expert_allowed_models;
-    *expert_reasoning_efforts = next_expert_reasoning_efforts;
+    engine_config.expert_allowed_models = next_expert_allowed_models;
+    engine_config.expert_reasoning_efforts = next_expert_reasoning_efforts;
     *provider_api_key_hints = next_provider_api_key_hints;
-    *providers = session_providers;
-    *global_retry = next_global_retry;
-    *new_session_default_route = next_new_session_default_route;
+    engine_config.providers = session_providers;
+    engine_config.global_retry = next_global_retry;
+    engine_config.new_session_default_route = next_new_session_default_route;
     agent.set_resolved_runtime_catalog(Some(next_runtime_catalog.clone()));
-    *runtime_catalog = next_runtime_catalog;
+    engine_config.runtime_catalog = next_runtime_catalog;
     let _ = event_tx.send(SessionTransportEvent::ModelCatalogUpdated(catalog_event));
     for (agent_name, model_ids) in changed_expert_allowed_models {
         let _ = event_tx.send(SessionTransportEvent::ExpertAllowedModelsChanged {
