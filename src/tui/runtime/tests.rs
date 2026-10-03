@@ -4853,11 +4853,17 @@ fn parked_commands_stay_before_later_deferred_commands() {
 fn active_turn_reject_is_not_parked_by_engine() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();
+    let (_dir, transcript) = test_transcript("active-turn-reject", Vec::new());
+    let subagent_runtime = crate::subagent::SubagentPool::new();
+    let mut notified_background_runs = std::collections::HashSet::new();
 
     crate::session::engine::handle_active_turn_command(
         SessionEngineCommand::NewSession,
         &mut parked_commands,
         &session_tx,
+        &transcript,
+        &subagent_runtime,
+        &mut notified_background_runs,
     );
 
     assert!(parked_commands.is_empty());
@@ -4865,6 +4871,102 @@ fn active_turn_reject_is_not_parked_by_engine() {
         session_rx.try_recv(),
         Ok(SessionTransportEvent::Notice(notice)) if notice.message == "Turn still running"
     ));
+}
+
+#[test]
+fn active_turn_reports_a_background_completion_before_parking_it() {
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let mut parked_commands = VecDeque::new();
+    let (_dir, transcript) = test_transcript("active-turn-completion", Vec::new());
+    let session_id = transcript
+        .lock()
+        .expect("transcript")
+        .session_id()
+        .to_string();
+    let subagent_runtime = crate::subagent::SubagentPool::new();
+    let mut notified_background_runs = std::collections::HashSet::new();
+
+    crate::session::engine::handle_active_turn_command(
+        SessionEngineCommand::BackgroundSubagentCompleted {
+            parent_session_id: session_id,
+            parent_tool_call_id: Some("call-1".into()),
+            result: Ok(completed_run_summary()),
+        },
+        &mut parked_commands,
+        &session_tx,
+        &transcript,
+        &subagent_runtime,
+        &mut notified_background_runs,
+    );
+
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
+    ));
+    assert!(matches!(
+        parked_commands.pop_front(),
+        Some(SessionEngineCommand::BackgroundSubagentCompleted { .. })
+    ));
+}
+
+#[test]
+fn busy_phases_refuse_history_navigation_with_one_policy() {
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let mut parked_commands = VecDeque::new();
+    let (_dir, transcript) = test_transcript("busy-history-navigation", Vec::new());
+    let subagent_runtime = crate::subagent::SubagentPool::new();
+    let mut notified_background_runs = std::collections::HashSet::new();
+
+    for command in [
+        SessionEngineCommand::Undo,
+        SessionEngineCommand::ShowHistoryTree,
+    ] {
+        crate::session::engine::handle_active_turn_command(
+            command,
+            &mut parked_commands,
+            &session_tx,
+            &transcript,
+            &subagent_runtime,
+            &mut notified_background_runs,
+        );
+    }
+
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::Notice(notice))
+            if notice.message == "history navigation is unavailable while a turn is active"
+    ));
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::Error(_))
+    ));
+    assert!(parked_commands.is_empty());
+}
+
+fn completed_run_summary() -> crate::subagent::SubagentRunSummary {
+    crate::subagent::SubagentRunSummary {
+        run_id: "run-1".into(),
+        child_session_id: "child-1".into(),
+        agent_name: "explorer".into(),
+        status: crate::subagent::SubagentStatus::Completed,
+        failure_kind: None,
+        summary: "the child finished".into(),
+        structured_result: crate::subagent::StructuredSubagentResult {
+            status: "completed".into(),
+            summary: "the child finished".into(),
+            malformed: false,
+            findings: Vec::new(),
+            files_read: Vec::new(),
+            files_changed: Vec::new(),
+            commands_run: Vec::new(),
+            validation: Vec::new(),
+            blockers: Vec::new(),
+            next_steps: Vec::new(),
+            run_id: "run-1".into(),
+            child_session_id: "child-1".into(),
+            raw_excerpt: None,
+        },
+    }
 }
 
 #[tokio::test]

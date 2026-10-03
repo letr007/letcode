@@ -1272,6 +1272,9 @@ async fn run_engine_loop(
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
     let mut delivered_background_runs = std::collections::HashSet::new();
+    // A run's terminal state reaches the frontend when the engine first observes
+    // it; the model delivery waits for a phase that can carry it.
+    let mut notified_background_runs = std::collections::HashSet::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
     let mut visible_child_view_cache = None;
@@ -1565,17 +1568,15 @@ async fn run_engine_loop(
                     result,
                 } = command
                 {
-                    let current_session_id = transcript
-                        .lock()
-                        .ok()
-                        .map(|recorder| recorder.session_id().to_string());
-                    if current_session_id.as_deref() != Some(parent_session_id.as_str()) {
-                        continue;
-                    }
-                    if result.as_ref().is_ok_and(|result| {
-                        result.status == crate::subagent::SubagentStatus::Cancelled
-                            || subagent_runtime.is_foregrounded(&result.run_id)
-                    }) {
+                    if !observe_background_subagent_completion(
+                        &transcript,
+                        &subagent_runtime,
+                        &mut notified_background_runs,
+                        &session_transport_tx,
+                        &parent_session_id,
+                        parent_tool_call_id,
+                        &result,
+                    ) {
                         continue;
                     }
                     let delivered_run = result.as_ref().ok().map(|result| result.run_id.clone());
@@ -1592,12 +1593,6 @@ async fn run_engine_loop(
                                 ));
                                 continue;
                             }
-                            let _ = session_transport_tx.send(
-                                SessionTransportEvent::BackgroundSubagentCompleted {
-                                    parent_tool_call_id,
-                                    result: result.clone(),
-                                },
-                            );
                             format_background_subagent_completion(&result)
                         }
                         Err(error) => format!(
@@ -1972,23 +1967,6 @@ async fn run_engine_loop(
                                         visible_child_session_id = None;
                                         visible_child_view_state = None;
                                     }
-                                    ActiveSessionOperation::Command(Some(
-                                        SessionEngineCommand::Undo | SessionEngineCommand::Redo,
-                                    )) => {
-                                        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                            NoticeEvent::info(
-                                                "history navigation is unavailable while a turn is active",
-                                            ),
-                                        ));
-                                    }
-                                    ActiveSessionOperation::Command(Some(
-                                        SessionEngineCommand::ShowHistoryTree
-                                        | SessionEngineCommand::NavigateHistory { .. },
-                                    )) => {
-                                        let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
-                                            "history navigation is unavailable while a turn is active",
-                                        )));
-                                    }
                                     ActiveSessionOperation::RunnerEvent(_) => {
                                         unreachable!("event-aware selection is not used for delegates")
                                     }
@@ -1997,6 +1975,9 @@ async fn run_engine_loop(
                                             command,
                                             &mut parked_commands,
                                             &session_transport_tx,
+                                            &transcript,
+                                            &subagent_runtime,
+                                            &mut notified_background_runs,
                                         );
                                     }
                                     ActiveSessionOperation::Command(None) => break,
@@ -2541,31 +2522,20 @@ async fn run_engine_loop(
                                     visible_child_session_id = None;
                                     visible_child_view_state = None;
                                 }
-                                Some(SessionEngineCommand::Undo) | Some(SessionEngineCommand::Redo) => {
-                                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(
-                                        NoticeEvent::info(
-                                            "history navigation is unavailable while a turn is active",
-                                        ),
-                                    ));
-                                }
                                 Some(SessionEngineCommand::BackgroundSubagentCompleted {
                                     parent_session_id,
                                     parent_tool_call_id,
                                     result,
                                 }) => {
-                                    let current_session_id = transcript
-                                        .lock()
-                                        .ok()
-                                        .map(|recorder| recorder.session_id().to_string());
-                                    if current_session_id.as_deref()
-                                        != Some(parent_session_id.as_str())
-                                    {
-                                        continue;
-                                    }
-                                    if result.as_ref().is_ok_and(|result| {
-                                        result.status == crate::subagent::SubagentStatus::Cancelled
-                                            || subagent_runtime.is_foregrounded(&result.run_id)
-                                    }) {
+                                    if !observe_background_subagent_completion(
+                                        &transcript,
+                                        &subagent_runtime,
+                                        &mut notified_background_runs,
+                                        &session_transport_tx,
+                                        &parent_session_id,
+                                        parent_tool_call_id,
+                                        &result,
+                                    ) {
                                         continue;
                                     }
                                     let delivered_run = result.as_ref().ok().map(|result| result.run_id.clone());
@@ -2574,12 +2544,6 @@ async fn run_engine_loop(
                                             if delivered_background_runs.contains(&result.run_id) {
                                                 continue;
                                             }
-                                            let _ = session_transport_tx.send(
-                                                SessionTransportEvent::BackgroundSubagentCompleted {
-                                                    parent_tool_call_id,
-                                                    result: result.clone(),
-                                                },
-                                            );
                                             (
                                                 format_background_subagent_completion(&result),
                                                 crate::agent::PendingTurnContinuation {
@@ -2623,17 +2587,14 @@ async fn run_engine_loop(
                                         }
                                     }
                                 }
-                                Some(SessionEngineCommand::ShowHistoryTree)
-                                | Some(SessionEngineCommand::NavigateHistory { .. }) => {
-                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
-                                        "history navigation is unavailable while a turn is active",
-                                    )));
-                                }
                                 Some(command) => {
                                     handle_active_turn_command(
                                         command,
                                         &mut parked_commands,
                                         &session_transport_tx,
+                                        &transcript,
+                                        &subagent_runtime,
+                                        &mut notified_background_runs,
                                     );
                                 }
                                 None => break,
@@ -2844,6 +2805,44 @@ async fn run_engine_loop(
     if let Err(error) = memory_worker.shutdown().await {
         tracing::warn!(error = %error, "project memory worker shutdown failed");
     }
+}
+
+/// A terminal background run is session state rather than turn state: the
+/// frontend learns about it as soon as the engine observes it, while the model
+/// delivery waits for a phase that can carry it.
+///
+/// Returns whether the completion is still deliverable to the model.
+pub(crate) fn observe_background_subagent_completion(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    subagent_runtime: &SubagentPool,
+    notified_runs: &mut std::collections::HashSet<String>,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    parent_session_id: &str,
+    parent_tool_call_id: Option<String>,
+    result: &Result<crate::subagent::SubagentRunSummary, String>,
+) -> bool {
+    let Ok(summary) = result else {
+        return true;
+    };
+    if summary.status == crate::subagent::SubagentStatus::Cancelled
+        || subagent_runtime.is_foregrounded(&summary.run_id)
+    {
+        return false;
+    }
+    let current_session_id = transcript
+        .lock()
+        .ok()
+        .map(|recorder| recorder.session_id().to_string());
+    if current_session_id.as_deref() != Some(parent_session_id) {
+        return false;
+    }
+    if notified_runs.insert(summary.run_id.clone()) {
+        let _ = session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
+            parent_tool_call_id,
+            result: summary.clone(),
+        });
+    }
+    true
 }
 
 pub(crate) fn format_background_subagent_completion(

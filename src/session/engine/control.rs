@@ -212,13 +212,47 @@ pub(crate) fn handle_active_turn_command(
     command: SessionEngineCommand,
     parked_commands: &mut VecDeque<SessionEngineCommand>,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    subagent_runtime: &SubagentPool,
+    notified_background_runs: &mut std::collections::HashSet<String>,
 ) {
-    if matches!(
-        command,
-        SessionEngineCommand::BackgroundSubagentCompleted { .. }
-    ) {
+    if let SessionEngineCommand::BackgroundSubagentCompleted {
+        parent_session_id,
+        parent_tool_call_id,
+        result,
+    } = &command
+    {
+        // Only the model delivery waits for this operation to finish; the run's
+        // terminal state is reported as soon as it is observed.
+        observe_background_subagent_completion(
+            transcript,
+            subagent_runtime,
+            notified_background_runs,
+            session_transport_tx,
+            parent_session_id,
+            parent_tool_call_id.clone(),
+            result,
+        );
         enqueue_deferred_command(parked_commands, command);
         return;
+    }
+
+    // Reading a transcript does not touch the agent, but history navigation
+    // rewrites it, so it waits for the turn in every phase that parks commands.
+    match &command {
+        SessionEngineCommand::Undo | SessionEngineCommand::Redo => {
+            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                "history navigation is unavailable while a turn is active",
+            )));
+            return;
+        }
+        SessionEngineCommand::ShowHistoryTree | SessionEngineCommand::NavigateHistory { .. } => {
+            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                "history navigation is unavailable while a turn is active",
+            )));
+            return;
+        }
+        _ => {}
     }
 
     let disposition = session_engine_command_as_session_command(&command)
@@ -660,5 +694,43 @@ where
                 return shutdown;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compaction holds the agent, so every command that would touch it waits
+    /// without a notice; only transcript navigation is serviced meanwhile.
+    #[test]
+    fn compaction_services_navigation_and_queues_the_rest() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        control_tx
+            .send(SessionEngineControl::Command(
+                SessionEngineCommand::SetModel("next".into()),
+            ))
+            .expect("queue a setting change");
+        control_tx
+            .send(SessionEngineControl::Command(
+                SessionEngineCommand::ViewChild {
+                    navigation: crate::command::ChildNavigation::Next,
+                    anchor_child_session_id: None,
+                },
+            ))
+            .expect("queue a child view request");
+        let mut deferred_commands = VecDeque::new();
+
+        let drained = drain_manual_compaction_controls(&mut control_rx, &mut deferred_commands);
+
+        assert!(matches!(
+            drained.navigation,
+            Some(ManualCompactionNavigation::ViewChild { .. })
+        ));
+        assert!(matches!(
+            deferred_commands.pop_front(),
+            Some(SessionEngineCommand::SetModel(model)) if model == "next"
+        ));
+        assert!(deferred_commands.is_empty());
     }
 }
