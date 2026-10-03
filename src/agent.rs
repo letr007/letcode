@@ -684,7 +684,6 @@ pub(crate) type TurnContinuationProvider =
 pub struct Agent {
     model: String,
     primary_route: Option<ModelRoute>,
-    subagent_model_overrides: HashMap<String, String>,
     default_protocol: ApiProtocol,
     model_protocols: HashMap<String, ApiProtocol>,
     model_catalog: HashMap<String, ModelRequestMetadata>,
@@ -777,15 +776,8 @@ impl AgentFactory {
             bail!("subagent model route selection is not configured");
         }
 
-        let model = parent
-            .subagent_model_override(&template.name)
-            .unwrap_or(parent.model())
-            .to_string();
-        let inherited_runtime_route = parent
-            .subagent_model_override(&template.name)
-            .is_none()
-            .then(|| parent.resolved_model_route.clone())
-            .flatten();
+        let model = parent.model().to_string();
+        let inherited_runtime_route = parent.resolved_model_route.clone();
         let mut child = Self::create_child_with_parts(
             parent,
             template,
@@ -798,9 +790,7 @@ impl AgentFactory {
             parent.resolved_runtime_catalog.clone(),
             max_tool_calls_override,
         );
-        if parent.subagent_model_override(&template.name).is_none()
-            && let Some(route) = parent.primary_route().cloned()
-        {
+        if let Some(route) = parent.primary_route().cloned() {
             child.set_primary_route(route);
         }
         Ok(child)
@@ -936,7 +926,6 @@ impl AgentFactory {
         Agent {
             model: model.clone(),
             primary_route: None,
-            subagent_model_overrides: parent.subagent_model_overrides.clone(),
             default_protocol,
             model_protocols,
             model_catalog,
@@ -1437,7 +1426,6 @@ impl Agent {
         Self {
             model: model.clone(),
             primary_route: None,
-            subagent_model_overrides: HashMap::new(),
             default_protocol: ApiProtocol::Responses,
             model_protocols: HashMap::new(),
             model_catalog: HashMap::new(),
@@ -2112,22 +2100,6 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn retry_config_for_test(&self) -> &RetryConfig {
         &self.retry_config
-    }
-
-    pub fn subagent_model_override(&self, agent_name: &str) -> Option<&str> {
-        self.subagent_model_overrides
-            .get(agent_name)
-            .map(String::as_str)
-    }
-
-    #[allow(dead_code)]
-    pub fn set_subagent_model_override(
-        &mut self,
-        agent_name: impl Into<String>,
-        model: impl Into<String>,
-    ) {
-        self.subagent_model_overrides
-            .insert(agent_name.into(), model.into());
     }
 
     pub fn set_reasoning_effort(&mut self, effort: ModelReasoningEffort) -> Result<()> {
@@ -2950,7 +2922,6 @@ impl Agent {
         Agent {
             model: self.model.clone(),
             primary_route: None,
-            subagent_model_overrides: HashMap::new(),
             default_protocol: self.default_protocol,
             model_protocols: self.model_protocols.clone(),
             model_catalog: self.model_catalog.clone(),
