@@ -4878,6 +4878,33 @@ fn apply_preferences_theme(state: &mut TuiState, preferences_dir: &Path, theme_i
     }
 }
 
+/// A panic inside the alternate screen is wiped when the terminal restores.
+fn install_panic_log(dir: &Path) {
+    let path = dir.join("panic.log");
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let location = info
+                .location()
+                .map(|location| format!("{}:{}", location.file(), location.line()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|payload| (*payload).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".to_string());
+            let _ = writeln!(file, "{location}: {payload}");
+        }
+        previous(info);
+    }));
+}
+
 pub async fn run_tui(
     mut engine: SessionEngine,
     projection: crate::session::SessionEngineProjection,
@@ -4891,6 +4918,7 @@ pub async fn run_tui(
     skill_cards: Vec<SkillCard>,
     resume_session_id: Option<String>,
 ) -> Result<()> {
+    install_panic_log(&preferences_dir);
     let mut state = TuiState::new(
         projection.model_id,
         projection.model_label,
