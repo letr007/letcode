@@ -56,6 +56,9 @@ pub struct TranscriptRenderCache {
     live_render_frames: Vec<Option<usize>>,
     #[cfg(test)]
     row_count_rebuilds: usize,
+    /// Characters of assistant text handed to the markdown renderer.
+    #[cfg(test)]
+    assistant_markdown_chars: usize,
 }
 
 impl TranscriptRenderCache {
@@ -779,6 +782,11 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
     {
         return;
     }
+    #[cfg(test)]
+    let assistant_markdown_chars = match item {
+        TimelineItem::Assistant(message) => message_text(message).len(),
+        _ => 0,
+    };
     let document = render_timeline_item_document(
         item,
         theme,
@@ -802,6 +810,10 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         },
         &state.translator(),
     );
+    #[cfg(test)]
+    {
+        state.transcript_render_cache.assistant_markdown_chars += assistant_markdown_chars;
+    }
     let entry = &mut state.transcript_render_cache.entries[index];
     entry.revision = revision;
     entry.document = document;
@@ -3867,6 +3879,50 @@ mod tests {
         );
         assert!(after_rows >= before_rows);
         assert_eq!(after_rows, transcript_lines(&state, theme, width).len());
+    }
+
+    /// Every frame re-renders the streaming answer in full, so the markdown
+    /// renderer sees a quadratic number of characters over one answer. This pins
+    /// today's cost at one full render per frame; rendering only what changed
+    /// should bring the total down to the answer itself.
+    #[test]
+    fn streaming_markdown_cost_stays_within_one_full_render_per_frame() {
+        let mut state = TuiState::default();
+        let theme = Theme::dark();
+        let width = 80;
+        let chunk = "a streamed line with some words in it\n\n";
+        let frames = 200;
+
+        for _ in 0..frames {
+            state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+                chunk,
+            )));
+            cached_transcript_row_count(&mut state, theme, width);
+        }
+
+        let answer_chars = state
+            .active_timeline()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::Assistant(message) => Some(message.text.len()),
+                _ => None,
+            })
+            .expect("the streamed answer is a timeline item");
+        let rendered_chars = state.transcript_render_cache.assistant_markdown_chars;
+
+        assert_eq!(answer_chars, chunk.len() * frames);
+        assert!(
+            rendered_chars <= answer_chars * frames,
+            "rendered {rendered_chars} characters for a {answer_chars} character answer"
+        );
+        // The sum of the prefix lengths is half of that ceiling, which is what
+        // re-rendering the whole answer every frame costs. Rendering only what
+        // changed replaces this bound with the answer length itself.
+        assert!(
+            rendered_chars > answer_chars * frames / 4,
+            "rendered {rendered_chars} characters for a {answer_chars} character answer"
+        );
     }
 
     #[test]
