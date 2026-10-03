@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 
 use crate::agent::{Agent, AgentFactory, AgentTemplate, PrimaryRouteFactory, SubagentChildFactory};
@@ -17,6 +17,7 @@ pub struct ExpertRouteFactory {
 struct ExpertRoutePolicy {
     default_route: Option<ModelRoute>,
     allowed_models: Vec<ModelRoute>,
+    reasoning_effort: Option<crate::request_builder::ModelReasoningEffort>,
 }
 
 impl ExpertRoutePolicy {
@@ -89,19 +90,28 @@ impl ExpertRouteFactory {
         Self::new_with_policies(
             routes
                 .into_iter()
-                .map(|(name, route)| (name, Some(route), Vec::new())),
+                .map(|(name, route)| (name, Some(route), Vec::new(), None)),
             providers,
             global_retry,
         )
     }
 
+    /// `[agents.<expert>]` in full: the routes an expert may use and the
+    /// settings that follow from the configuration.
     pub fn new_with_policies(
-        policies: impl IntoIterator<Item = (String, Option<ModelRoute>, Vec<ModelRoute>)>,
+        policies: impl IntoIterator<
+            Item = (
+                String,
+                Option<ModelRoute>,
+                Vec<ModelRoute>,
+                Option<crate::request_builder::ModelReasoningEffort>,
+            ),
+        >,
         providers: &indexmap::IndexMap<String, ProviderConfig>,
         global_retry: &RetryConfig,
     ) -> Result<Self> {
         let mut prepared = HashMap::new();
-        for (agent_name, default_route, allowed_models) in policies {
+        for (agent_name, default_route, allowed_models, reasoning_effort) in policies {
             if let Some(route) = &default_route {
                 Self::validate_configured_route(providers, &agent_name, "default", route)?;
             }
@@ -113,6 +123,7 @@ impl ExpertRouteFactory {
                 ExpertRoutePolicy {
                     default_route,
                     allowed_models,
+                    reasoning_effort,
                 },
             );
         }
@@ -215,13 +226,24 @@ impl SubagentChildFactory for ExpertRouteFactory {
         max_tool_calls_override: Option<usize>,
     ) -> Result<Agent> {
         let prepared = parent.prepare_primary_route(route.clone())?;
-        Ok(
-            AgentFactory::create_prepared_routed_child_with_max_tool_calls(
-                parent,
-                template,
-                prepared,
-                max_tool_calls_override,
-            ),
-        )
+        let mut child = AgentFactory::create_prepared_routed_child_with_max_tool_calls(
+            parent,
+            template,
+            prepared,
+            max_tool_calls_override,
+        );
+        if let Some(effort) = self
+            .policies
+            .get(&template.name)
+            .and_then(|policy| policy.reasoning_effort.clone())
+        {
+            child.set_reasoning_effort(effort).with_context(|| {
+                format!(
+                    "agents.{}.reasoning_effort cannot be applied",
+                    template.name
+                )
+            })?;
+        }
+        Ok(child)
     }
 }

@@ -394,6 +394,16 @@ impl AppConfig {
             .or_else(|| self.model_route_for(agent_name).cloned())
             .or_else(|| Some(self.active_route()))
     }
+
+    pub fn expert_reasoning_efforts(&self) -> IndexMap<String, ModelReasoningEffort> {
+        crate::delegation::supported_agent_names()
+            .filter_map(|agent_name| {
+                self.agents
+                    .reasoning_effort_for(agent_name)
+                    .map(|effort| (agent_name.to_string(), effort))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -451,6 +461,11 @@ impl AgentsConfig {
             .map(|config| config.allowed_models.as_slice())
     }
 
+    pub fn reasoning_effort_for(&self, agent_name: &str) -> Option<ModelReasoningEffort> {
+        self.config_for(agent_name)
+            .and_then(|config| config.reasoning_effort.clone())
+    }
+
     fn config_for(&self, agent_name: &str) -> Option<&AgentConfig> {
         match agent_name {
             "explorer" => Some(&self.explorer),
@@ -475,6 +490,7 @@ impl AgentsConfig {
 pub struct AgentConfig {
     pub route: Option<ModelRoute>,
     pub allowed_models: Vec<ModelRoute>,
+    pub reasoning_effort: Option<ModelReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +905,7 @@ struct RawAgentConfig {
     model: Option<String>,
     #[serde(default)]
     allowed_models: Vec<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1561,9 +1578,21 @@ fn build_agent_config(
         }
     }
 
+    let reasoning_effort = raw
+        .reasoning_effort
+        .map(|value| {
+            let value =
+                required_non_empty(&format!("agents.{agent_name}.reasoning_effort"), value)?;
+            parse_reasoning_effort(&value).with_context(|| {
+                format!("agents.{agent_name}.reasoning_effort is not a known level")
+            })
+        })
+        .transpose()?;
+
     Ok(AgentConfig {
         route,
         allowed_models,
+        reasoning_effort,
     })
 }
 
@@ -2777,6 +2806,81 @@ base_url = "https://expert.invalid/v1"
                 .unwrap()
                 .protocol,
             ApiProtocol::Completions
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_expert_reasoning_effort() {
+        let loaded = AppConfig::load_from_path(write_temp_config(
+            r#"active_provider = "primary"
+[agents.oracle]
+provider = "primary"
+model = "shared"
+reasoning_effort = "high"
+[providers.primary]
+default_model = "shared"
+[providers.primary.auth]
+type = "bearer"
+credential = "primary-key"
+[providers.primary.endpoints]
+base_url = "https://primary.invalid/v1"
+[providers.primary.models.shared]
+"#,
+        ))
+        .expect("expert reasoning config loads");
+        assert_eq!(
+            loaded.agents.reasoning_effort_for("oracle"),
+            Some(ModelReasoningEffort::High)
+        );
+        assert_eq!(loaded.agents.reasoning_effort_for("explorer"), None);
+        assert_eq!(
+            loaded.expert_reasoning_efforts().get("oracle"),
+            Some(&ModelReasoningEffort::High)
+        );
+
+        // Provider-specific levels stay available to the model metadata check.
+        let custom = AppConfig::load_from_path(write_temp_config(
+            r#"active_provider = "primary"
+[agents.oracle]
+provider = "primary"
+model = "shared"
+reasoning_effort = "provider ultra"
+[providers.primary]
+default_model = "shared"
+[providers.primary.auth]
+type = "bearer"
+credential = "primary-key"
+[providers.primary.endpoints]
+base_url = "https://primary.invalid/v1"
+[providers.primary.models.shared]
+"#,
+        ))
+        .expect("a provider-specific level loads");
+        assert_eq!(
+            custom.agents.reasoning_effort_for("oracle"),
+            Some(ModelReasoningEffort::Custom("provider ultra".into()))
+        );
+
+        let error = AppConfig::load_from_path(write_temp_config(
+            r#"active_provider = "primary"
+[agents.oracle]
+provider = "primary"
+model = "shared"
+reasoning_effort = ""
+[providers.primary]
+default_model = "shared"
+[providers.primary.auth]
+type = "bearer"
+credential = "primary-key"
+[providers.primary.endpoints]
+base_url = "https://primary.invalid/v1"
+[providers.primary.models.shared]
+"#,
+        ))
+        .expect_err("an empty reasoning level is rejected");
+        assert!(
+            error.to_string().contains("agents.oracle.reasoning_effort"),
+            "{error}"
         );
     }
 

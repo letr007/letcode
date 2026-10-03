@@ -57,6 +57,10 @@ pub(crate) fn apply_config_reload(
     route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
     expert_default_routes: &mut indexmap::IndexMap<String, ModelRoute>,
     expert_allowed_models: &mut indexmap::IndexMap<String, Vec<ModelRoute>>,
+    expert_reasoning_efforts: &mut indexmap::IndexMap<
+        String,
+        crate::request_builder::ModelReasoningEffort,
+    >,
     providers: &mut indexmap::IndexMap<String, ProviderConfig>,
     global_retry: &mut RetryConfig,
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
@@ -120,6 +124,7 @@ pub(crate) fn apply_config_reload(
             )
         })
         .collect::<indexmap::IndexMap<_, _>>();
+    let next_expert_reasoning_efforts = config.expert_reasoning_efforts();
     let next_provider_api_key_hints = config
         .providers
         .keys()
@@ -191,6 +196,7 @@ pub(crate) fn apply_config_reload(
                     .get(name)
                     .cloned()
                     .unwrap_or_default(),
+                next_expert_reasoning_efforts.get(name).cloned(),
             )
         }),
         &config.providers,
@@ -221,6 +227,7 @@ pub(crate) fn apply_config_reload(
         && *route_api_key_configured == next_route_api_key_configured
         && *expert_default_routes == next_expert_default_routes
         && *expert_allowed_models == next_expert_allowed_models
+        && *expert_reasoning_efforts == next_expert_reasoning_efforts
         && *provider_api_key_hints == next_provider_api_key_hints
         && *global_retry == next_global_retry;
     let settings_unchanged = agent.compaction_config() == &config.global.compaction
@@ -334,6 +341,7 @@ pub(crate) fn apply_config_reload(
         })
         .collect::<Vec<_>>();
     *expert_allowed_models = next_expert_allowed_models;
+    *expert_reasoning_efforts = next_expert_reasoning_efforts;
     *provider_api_key_hints = next_provider_api_key_hints;
     *providers = session_providers;
     *global_retry = next_global_retry;

@@ -873,7 +873,7 @@ base_url = "http://127.0.0.1:1"
             parent.set_primary_route_factory(primary_factory);
             parent.set_subagent_child_factory(Arc::new(
                 crate::subagent::ExpertRouteFactory::new_with_policies(
-                    [("reviewer".to_string(), None, Vec::new())],
+                    [("reviewer".to_string(), None, Vec::new(), None)],
                     &config.providers,
                     &config.global.retry,
                 )

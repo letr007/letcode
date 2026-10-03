@@ -230,7 +230,7 @@
     },
     "agents": {
       "type": "object",
-      "description": "Optional per-expert model routing. The key set is fixed.",
+      "description": "Optional per-expert routing and settings. The key set is fixed.",
       "additionalProperties": false,
       "properties": {
         "explorer": { "$ref": "#/definitions/agentRoute" },
@@ -253,6 +253,10 @@
           "type": "array",
           "items": { "type": "string", "pattern": "^[^/]+/.+$" },
           "description": "The first item is the expert's default route and also the allowlist for model overrides in a single agent__* delegation, written as provider/model."
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "description": "Reasoning level every run of this expert uses. Must be supported by the model the run resolves to."
         }
       }
     },

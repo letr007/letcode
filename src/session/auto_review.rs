@@ -771,7 +771,12 @@ mod tests {
             indexmap::IndexMap::from([(route.provider.clone(), test_provider(&route.model))]);
         let factory = Arc::new(
             crate::subagent::ExpertRouteFactory::new_with_policies(
-                [(REVIEWER_AGENT_NAME.into(), Some(route.clone()), Vec::new())],
+                [(
+                    REVIEWER_AGENT_NAME.into(),
+                    Some(route.clone()),
+                    Vec::new(),
+                    None,
+                )],
                 &providers,
                 &crate::config::RetryConfig::default(),
             )
@@ -861,6 +866,7 @@ mod tests {
                     REVIEWER_AGENT_NAME.into(),
                     Some(new_route.clone()),
                     Vec::new(),
+                    None,
                 )],
                 &providers,
                 &crate::config::RetryConfig::default(),

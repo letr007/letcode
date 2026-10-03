@@ -157,6 +157,9 @@ pub struct SessionEngineConfig {
     pub expert_default_routes: indexmap::IndexMap<String, ModelRoute>,
     /// Provider-qualified routes allowed for per-invocation expert selection and takeover.
     pub expert_allowed_models: indexmap::IndexMap<String, Vec<ModelRoute>>,
+    /// Reasoning level each expert declares in `[agents.<expert>]`.
+    pub expert_reasoning_efforts:
+        indexmap::IndexMap<String, crate::request_builder::ModelReasoningEffort>,
     /// Provider catalog used to reconstruct expert route factories after configuration updates.
     pub providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
     pub global_retry: crate::config::RetryConfig,
@@ -273,6 +276,7 @@ impl SessionEngine {
             config.new_session_default_route,
             config.expert_default_routes,
             config.expert_allowed_models,
+            config.expert_reasoning_efforts,
             config.providers,
             config.global_retry,
             config.provider_api_key_hints,
@@ -1236,6 +1240,10 @@ async fn run_engine_loop(
     new_session_default_route: ModelRoute,
     expert_default_routes: indexmap::IndexMap<String, ModelRoute>,
     expert_allowed_models: indexmap::IndexMap<String, Vec<ModelRoute>>,
+    expert_reasoning_efforts: indexmap::IndexMap<
+        String,
+        crate::request_builder::ModelReasoningEffort,
+    >,
     providers: indexmap::IndexMap<String, crate::config::ProviderConfig>,
     global_retry: crate::config::RetryConfig,
     provider_api_key_hints: indexmap::IndexMap<String, String>,
@@ -1261,6 +1269,7 @@ async fn run_engine_loop(
     let mut new_session_default_route = new_session_default_route;
     let mut expert_default_routes = expert_default_routes;
     let mut expert_allowed_models = expert_allowed_models;
+    let mut expert_reasoning_efforts = expert_reasoning_efforts;
     let mut providers = providers;
     let mut global_retry = global_retry;
     let provider_api_key_hints = Arc::new(StdMutex::new(provider_api_key_hints));
@@ -1322,6 +1331,7 @@ async fn run_engine_loop(
                         .unwrap_or_else(|error| error.into_inner()),
                     &mut expert_default_routes,
                     &mut expert_allowed_models,
+                    &mut expert_reasoning_efforts,
                     &mut providers,
                     &mut global_retry,
                     &mut provider_api_key_hints
@@ -1404,6 +1414,7 @@ async fn run_engine_loop(
                                 name.to_string(),
                                 expert_default_routes.get(name).cloned(),
                                 updated_allowed_models.get(name).cloned().unwrap_or_default(),
+                                expert_reasoning_efforts.get(name).cloned(),
                             )
                         }),
                         &providers,
@@ -2942,7 +2953,7 @@ mod tests {
         let mut agent = Agent::new("current", 1, 1);
         agent.set_subagent_child_factory(Arc::new(
             crate::subagent::ExpertRouteFactory::new_with_policies(
-                [("reviewer".to_string(), Some(route), Vec::new())],
+                [("reviewer".to_string(), Some(route), Vec::new(), None)],
                 &config.providers,
                 &config.global.retry,
             )
@@ -3072,6 +3083,7 @@ reasoning_efforts = ["high"]
                         ("reviewer".into(), ModelRoute::new("test", "default")),
                     ]),
                     expert_allowed_models: indexmap::IndexMap::new(),
+                    expert_reasoning_efforts: indexmap::IndexMap::new(),
                     providers: config.providers.clone(),
                     global_retry: config.global.retry.clone(),
                     provider_api_key_hints: indexmap::IndexMap::new(),
@@ -3601,6 +3613,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
         let mut providers = old_config.providers.clone();
         let mut global_retry = old_config.global.retry.clone();
         let mut provider_api_key_hints =
@@ -3624,6 +3637,7 @@ base_url = "http://127.0.0.1:1"
                 &mut route_api_key_configured,
                 &mut expert_default_routes,
                 &mut expert_allowed_models,
+                &mut expert_reasoning_efforts,
                 &mut providers,
                 &mut global_retry,
                 &mut provider_api_key_hints,
@@ -3757,6 +3771,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
         let mut providers = config.providers.clone();
         let mut global_retry = config.global.retry.clone();
         let mut provider_api_key_hints = config
@@ -3786,6 +3801,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -3845,6 +3861,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
 
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
@@ -3879,6 +3896,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -3919,6 +3937,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -3982,6 +4001,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
 
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
@@ -4011,6 +4031,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -4038,6 +4059,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -4111,6 +4133,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
 
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
@@ -4137,6 +4160,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -4227,6 +4251,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
 
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
@@ -4253,6 +4278,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,
@@ -4331,6 +4357,7 @@ base_url = "http://127.0.0.1:1"
         let mut expert_allowed_models = crate::delegation::supported_agent_names()
             .map(|name| (name.to_string(), Vec::new()))
             .collect();
+        let mut expert_reasoning_efforts = indexmap::IndexMap::new();
 
         let mut providers = initial_config.providers.clone();
         let mut global_retry = initial_config.global.retry.clone();
@@ -4376,6 +4403,7 @@ base_url = "http://127.0.0.1:1"
             &mut route_api_key_configured,
             &mut expert_default_routes,
             &mut expert_allowed_models,
+            &mut expert_reasoning_efforts,
             &mut providers,
             &mut global_retry,
             &mut provider_api_key_hints,

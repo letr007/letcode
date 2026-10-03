@@ -248,6 +248,17 @@ model = "gpt-5.5"
 
 `allowed_models` 的第一项是该专家的默认路由，同时是单次 `agent__*` 委派可通过 `model` 参数覆盖时使用的白名单。`allowed_models` 为空时，按 `provider` 与 `model` 解析；未配置专家路由时，回落到配置中的新会话默认模型（`active_provider` 与其 `default_model`）。专家路由始终由配置决定，不支持会话级覆盖。
 
+`reasoning_effort` 指定该专家每次运行使用的思考深度，取值与模型的 `generation.reasoning_efforts` 一致：
+
+```toml
+[agents.oracle]
+provider = "openai"
+model = "gpt-5.5"
+reasoning_effort = "high"
+```
+
+该专家解析到的模型不支持所写档位时，委派会直接失败并给出模型与可用档位。未配置时，专家沿用父代理对同一模型设置的档位。
+
 ## 仿真伪装配置 `[fake]`
 
 配置请求元数据伪装参数，模拟兼容环境特征：

@@ -386,7 +386,7 @@ base_url = "https://test.example.invalid/v1"
         )]);
         let factory = Arc::new(
             ExpertRouteFactory::new_with_policies(
-                [("explorer".into(), None, Vec::new())],
+                [("explorer".into(), None, Vec::new(), None)],
                 &providers,
                 &RetryConfig::default(),
             )
@@ -460,6 +460,7 @@ base_url = "https://test.example.invalid/v1"
                     "explorer".into(),
                     Some(ModelRoute::new("primary", "shared")),
                     vec![selected.clone()],
+                    None,
                 )],
                 &providers,
                 &RetryConfig::default(),
@@ -527,6 +528,7 @@ base_url = "https://test.example.invalid/v1"
                     "explorer".into(),
                     Some(configured_default.clone()),
                     vec![first_selected.clone(), ModelRoute::new("expert", "alt")],
+                    None,
                 )],
                 &providers,
                 &RetryConfig::default(),
@@ -743,6 +745,68 @@ base_url = "https://test.example.invalid/v1"
         assert_eq!(child.active_model_metadata().context_window, Some(8_192));
         assert!(!child.active_model_metadata().supports_tools);
         assert!(!child.retry_config_for_test().enabled);
+    }
+
+    #[test]
+    fn expert_reasoning_effort_from_config_applies_to_the_child() {
+        use crate::request_builder::ModelReasoningEffort;
+
+        let route = ModelRoute::new("expert", "shared");
+        let mut provider = test_provider(
+            "http://127.0.0.1:9876/v1",
+            "expert-key",
+            ApiProtocol::Completions,
+            &["shared"],
+        );
+        let model = provider
+            .models
+            .get_mut("shared")
+            .expect("the expert model is configured");
+        model.supports_reasoning = true;
+        model.reasoning_efforts = vec![ModelReasoningEffort::Low, ModelReasoningEffort::High];
+        let providers = indexmap::IndexMap::from([("expert".into(), provider)]);
+
+        let build = |effort: ModelReasoningEffort| {
+            let factory = Arc::new(
+                ExpertRouteFactory::new_with_policies(
+                    [(
+                        "explorer".into(),
+                        Some(route.clone()),
+                        Vec::new(),
+                        Some(effort),
+                    )],
+                    &providers,
+                    &RetryConfig::default(),
+                )
+                .expect("factory should build")
+                .with_runtime_catalog(resolved_runtime_catalog()),
+            );
+            let mut parent = test_agent();
+            use_resolved_runtime_catalog(&mut parent);
+            parent.set_primary_route_factory(factory.clone());
+            parent.set_subagent_child_factory(factory);
+            AgentFactory::create_child_with_route_and_max_tool_calls(
+                &parent,
+                &AgentTemplate::explorer(),
+                None,
+                false,
+                None,
+            )
+        };
+
+        let child = build(ModelReasoningEffort::High).expect("a supported level reaches the child");
+        assert_eq!(child.reasoning_effort(), Some(ModelReasoningEffort::High));
+
+        let error = match build(ModelReasoningEffort::Max) {
+            Ok(_) => panic!("an unsupported level fails the delegation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("agents.explorer.reasoning_effort"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1011,7 +1075,7 @@ base_url = "https://test.example.invalid/v1"
         let takeover_route = ModelRoute::new("test", "child-resume-model");
         let factory = Arc::new(
             ExpertRouteFactory::new_with_policies(
-                [("explorer".into(), None, vec![takeover_route.clone()])],
+                [("explorer".into(), None, vec![takeover_route.clone()], None)],
                 &indexmap::IndexMap::from([(
                     "test".into(),
                     test_provider(
@@ -1132,6 +1196,7 @@ base_url = "https://test.example.invalid/v1"
                     "explorer".into(),
                     Some(expert_route.clone()),
                     vec![expert_route],
+                    None,
                 )],
                 &indexmap::IndexMap::from([("expert".into(), provider)]),
                 &RetryConfig::default(),

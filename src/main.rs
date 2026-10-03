@@ -378,6 +378,7 @@ fn session_engine_config(
                 )
             })
             .collect(),
+        expert_reasoning_efforts: config.expert_reasoning_efforts(),
         providers: config.providers.clone(),
         global_retry: config.global.retry.clone(),
         provider_api_key_hints,
@@ -576,6 +577,7 @@ fn install_expert_route_factory(agent: &mut Agent, config: &AppConfig) -> Result
                 .allowed_models_for(agent_name)
                 .unwrap_or_default()
                 .to_vec(),
+            config.agents.reasoning_effort_for(agent_name),
         )
     });
     let factory =

@@ -1565,7 +1565,7 @@ mod tests {
             )]),
         };
         let factory = crate::subagent::ExpertRouteFactory::new_with_policies(
-            [("explorer".into(), Some(default_route), allowed_models)],
+            [("explorer".into(), Some(default_route), allowed_models, None)],
             &indexmap::IndexMap::from([("expert".into(), provider)]),
             &crate::config::RetryConfig::default(),
         )
