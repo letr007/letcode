@@ -392,5 +392,5 @@ pub fn inclusive_grapheme_bounds(text: &str, start: usize, end: usize) -> (usize
 
 /// Transcript elements produce backend-neutral layout into a document.
 pub trait Component<S> {
-    fn render(&self, document: &mut Document<S>);
+    fn render(&mut self, document: &mut Document<S>);
 }

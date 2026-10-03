@@ -21,7 +21,7 @@ use crate::subagent::{
 };
 use crate::tui::{
     i18n::Translator,
-    markdown::{MarkdownRenderOptions, render_markdown_document},
+    markdown::{MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown_document},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
     surface,
     theme::Theme,
@@ -59,6 +59,15 @@ pub struct TranscriptRenderCache {
     /// Characters of assistant text handed to the markdown renderer.
     #[cfg(test)]
     assistant_markdown_chars: usize,
+    streaming_markdown: Option<StreamingMarkdownSlot>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingMarkdownSlot {
+    item_index: usize,
+    width: usize,
+    theme: Theme,
+    renderer: StreamingMarkdownRenderer,
 }
 
 impl TranscriptRenderCache {
@@ -72,6 +81,7 @@ impl TranscriptRenderCache {
         self.row_starts.clear();
         self.row_counts.clear();
         self.live_render_frames.clear();
+        self.streaming_markdown = None;
     }
 
     #[cfg(test)]
@@ -85,6 +95,7 @@ impl TranscriptRenderCache {
             && self.row_starts.is_empty()
             && self.row_counts.is_empty()
             && self.live_render_frames.is_empty()
+            && self.streaming_markdown.is_none()
     }
 
     pub(crate) fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) -> bool {
@@ -102,6 +113,7 @@ impl TranscriptRenderCache {
             self.row_starts.clear();
             self.row_counts.clear();
             self.live_render_frames.clear();
+            self.streaming_markdown = None;
         }
         width_changed
     }
@@ -276,6 +288,7 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 compact_tool_group_stats(items, index),
                 compact_reasoning_group_elapsed_ms(items, index),
                 &state.translator(),
+                None,
             ),
         ));
     }
@@ -720,6 +733,32 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
             });
     }
 
+    let streaming = matches!(
+        state.active_timeline().items().get(index),
+        Some(TimelineItem::Assistant(message)) if message.streaming
+    );
+    let mut streaming_slot = state.transcript_render_cache.streaming_markdown.take();
+    if streaming {
+        let slot = streaming_slot.get_or_insert_with(|| StreamingMarkdownSlot {
+            item_index: index,
+            width,
+            theme,
+            renderer: StreamingMarkdownRenderer::new(
+                theme,
+                MarkdownRenderOptions::new(width.saturating_sub(2).max(1)),
+            ),
+        });
+        if slot.item_index != index || slot.width != width || slot.theme != theme {
+            slot.item_index = index;
+            slot.width = width;
+            slot.theme = theme;
+            slot.renderer = StreamingMarkdownRenderer::new(
+                theme,
+                MarkdownRenderOptions::new(width.saturating_sub(2).max(1)),
+            );
+        }
+    }
+
     let (revision, live, item, next_reasoning, next_tool, tool_group_stats) = {
         let timeline = state.active_timeline();
         let items = timeline.items();
@@ -780,13 +819,9 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
     if state.transcript_render_cache.entries[index].revision == revision
         && (!live || state.transcript_render_cache.live_render_frames[index] == Some(frame))
     {
+        state.transcript_render_cache.streaming_markdown = streaming_slot;
         return;
     }
-    #[cfg(test)]
-    let assistant_markdown_chars = match item {
-        TimelineItem::Assistant(message) => message_text(message).len(),
-        _ => 0,
-    };
     let document = render_timeline_item_document(
         item,
         theme,
@@ -809,7 +844,18 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
             compact_reasoning_group_elapsed_ms(state.active_timeline().items(), index)
         },
         &state.translator(),
+        streaming_slot.as_mut().map(|slot| &mut slot.renderer),
     );
+    #[cfg(test)]
+    let assistant_markdown_chars = match item {
+        TimelineItem::Assistant(message) if message.streaming => streaming_slot
+            .as_ref()
+            .map(|slot| slot.renderer.last_parse_chars())
+            .unwrap_or_else(|| message_text(message).len()),
+        TimelineItem::Assistant(message) => message_text(message).len(),
+        _ => 0,
+    };
+    state.transcript_render_cache.streaming_markdown = streaming_slot;
     #[cfg(test)]
     {
         state.transcript_render_cache.assistant_markdown_chars += assistant_markdown_chars;
@@ -892,10 +938,11 @@ struct TimelineItemComponent<'a> {
     tool_group_stats: tool_card::ToolGroupStats,
     compact_reasoning_elapsed_ms: Option<u64>,
     translator: &'a Translator,
+    streaming_markdown: Option<&'a mut StreamingMarkdownRenderer>,
 }
 
 impl Component<Style> for TimelineItemComponent<'_> {
-    fn render(&self, document: &mut Document<Style>) {
+    fn render(&mut self, document: &mut Document<Style>) {
         if self.reviewer_view
             && let Some(specialized) =
                 try_render_reviewer_view_item(self.item, self.theme, self.width)
@@ -946,6 +993,7 @@ impl Component<Style> for TimelineItemComponent<'_> {
                 message.streaming,
                 self.theme,
                 self.width,
+                self.streaming_markdown.as_deref_mut(),
             ),
             TimelineItem::Tool(tool) => {
                 if self.tools_display == crate::command::ToolsDisplayMode::Compact {
@@ -1055,6 +1103,7 @@ fn render_timeline_item_document(
     tool_group_stats: tool_card::ToolGroupStats,
     compact_reasoning_elapsed_ms: Option<u64>,
     translator: &Translator,
+    streaming_markdown: Option<&mut StreamingMarkdownRenderer>,
 ) -> Document<Style> {
     let mut document = Document::default();
     TimelineItemComponent {
@@ -1072,6 +1121,7 @@ fn render_timeline_item_document(
         tool_group_stats,
         compact_reasoning_elapsed_ms,
         translator,
+        streaming_markdown,
     }
     .render(&mut document);
     document.finish();
@@ -1101,6 +1151,7 @@ fn build_compaction_block_lines(
             streaming,
             theme,
             card_content_width(width, theme),
+            None,
         );
         pad_card_lines(&mut out.document, start, width);
     }
@@ -1787,6 +1838,7 @@ fn build_assistant_message_lines(
     streaming: bool,
     theme: Theme,
     width: usize,
+    streaming_markdown: Option<&mut StreamingMarkdownRenderer>,
 ) {
     if text.is_empty() {
         out.push_decoration(
@@ -1818,8 +1870,10 @@ fn build_assistant_message_lines(
     }
 
     let content_width = width.saturating_sub(2).max(1);
-    let mut document =
-        render_markdown_document(text, theme, MarkdownRenderOptions::new(content_width));
+    let mut document = match streaming_markdown {
+        Some(renderer) if streaming => renderer.render(text),
+        _ => render_markdown_document(text, theme, MarkdownRenderOptions::new(content_width)),
+    };
     for line in &mut document.lines {
         line.spans
             .insert(0, RenderSpan::decoration("  ", theme.app_style()));
@@ -2564,6 +2618,7 @@ mod tests {
                     tool_card::ToolGroupStats::default(),
                     Some(960),
                     &state.translator(),
+                    None,
                 );
                 let previous_rows = previous.lines.len();
                 state.transcript_render_cache.entries[index].document = previous;
@@ -2787,6 +2842,7 @@ mod tests {
             tool_card::ToolGroupStats::default(),
             None,
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+            None,
         );
         let expanded = render_timeline_item_document(
             &item,
@@ -2803,6 +2859,7 @@ mod tests {
             tool_card::ToolGroupStats::default(),
             None,
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+            None,
         );
         let collapsed_text = collapsed
             .lines
@@ -2848,6 +2905,7 @@ mod tests {
             tool_card::ToolGroupStats::default(),
             None,
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+            None,
         );
         assert!(narrow.validate());
         assert!(
@@ -2941,6 +2999,7 @@ mod tests {
                         tool_card::ToolGroupStats::default(),
                         None,
                         &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+                        None,
                     ),
                 ));
             assert!(
@@ -2978,6 +3037,7 @@ mod tests {
                 tool_card::ToolGroupStats::default(),
                 None,
                 &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+                None,
             ));
         assert!(
             ordinary_lines
@@ -3881,7 +3941,7 @@ mod tests {
         assert_eq!(after_rows, transcript_lines(&state, theme, width).len());
     }
 
-    /// Pins today's cost: every frame re-renders the whole streaming answer.
+    /// Each frame re-parses only the block that can still change.
     #[test]
     fn streaming_markdown_cost_stays_within_one_full_render_per_frame() {
         let mut state = TuiState::default();
@@ -3909,15 +3969,9 @@ mod tests {
         let rendered_chars = state.transcript_render_cache.assistant_markdown_chars;
 
         assert_eq!(answer_chars, chunk.len() * frames);
+        // One full pass over the answer, plus one blank line carried between frames.
         assert!(
-            rendered_chars <= answer_chars * frames,
-            "rendered {rendered_chars} characters for a {answer_chars} character answer"
-        );
-        // The sum of the prefix lengths is half of that ceiling, which is what
-        // re-rendering the whole answer every frame costs. Rendering only what
-        // changed replaces this bound with the answer length itself.
-        assert!(
-            rendered_chars > answer_chars * frames / 4,
+            rendered_chars >= answer_chars && rendered_chars <= answer_chars * 2,
             "rendered {rendered_chars} characters for a {answer_chars} character answer"
         );
     }

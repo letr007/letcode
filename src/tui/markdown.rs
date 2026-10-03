@@ -53,7 +53,183 @@ pub fn render_markdown_document(
     theme: Theme,
     options: MarkdownRenderOptions,
 ) -> Document<Style> {
-    MarkdownRenderer::new(theme, options).render_document(markdown)
+    let normalized = normalize_markdown_math_delimiters(markdown);
+    MarkdownRenderer::new(theme, options).render_document(&normalized)
+}
+
+/// Re-parses only the blocks that can still change and reuses the final lines.
+#[derive(Debug, Clone)]
+pub struct StreamingMarkdownRenderer {
+    theme: Theme,
+    options: MarkdownRenderOptions,
+    text: String,
+    checkpoint: usize,
+    stable: Document<Style>,
+    definition_seen: bool,
+    #[cfg(test)]
+    last_parse_chars: usize,
+}
+
+impl StreamingMarkdownRenderer {
+    pub fn new(theme: Theme, options: MarkdownRenderOptions) -> Self {
+        Self {
+            theme,
+            options,
+            text: String::new(),
+            checkpoint: 0,
+            stable: Document::default(),
+            definition_seen: false,
+            #[cfg(test)]
+            last_parse_chars: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint(&self) -> usize {
+        self.checkpoint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_parse_chars(&self) -> usize {
+        self.last_parse_chars
+    }
+
+    pub fn render(&mut self, markdown: &str) -> Document<Style> {
+        #[cfg(test)]
+        {
+            self.last_parse_chars = 0;
+        }
+        if !markdown.starts_with(self.text.as_str()) {
+            self.reset();
+        }
+        self.text.clear();
+        self.text.push_str(markdown);
+
+        if self.definition_seen || markdown.contains("]:") {
+            self.definition_seen = true;
+            self.reset_stable();
+            #[cfg(test)]
+            {
+                self.last_parse_chars = markdown.len();
+            }
+            return render_markdown_document(markdown, self.theme, self.options);
+        }
+
+        let normalized = normalize_markdown_math_delimiters(markdown);
+        if self.checkpoint > normalized.len() {
+            self.reset_stable();
+        }
+        let tail = &normalized[self.checkpoint..];
+        if tail.trim().is_empty() {
+            let mut result = self.stable.clone();
+            result.finish();
+            return self.non_empty(result, markdown);
+        }
+
+        #[cfg(test)]
+        {
+            self.last_parse_chars = tail.len();
+        }
+        let mut renderer = MarkdownRenderer::new(self.theme, self.options);
+        renderer.track_boundaries = true;
+        let (tail_document, boundaries) = renderer.render_document_tracked(tail);
+        let mut result = std::mem::take(&mut self.stable);
+        if let Some(boundary) = self.choose_split(tail, &boundaries) {
+            let (mut prefix, rest) =
+                split_document(tail_document, boundary.line, boundary.source_blocks);
+            if let Some(last) = prefix.breaks.last_mut() {
+                *last = boundary.break_after;
+            }
+            extend_document(&mut result, prefix);
+            self.stable = result.clone();
+            self.checkpoint += boundary.end;
+            extend_document(&mut result, rest);
+        } else {
+            self.stable = result.clone();
+            extend_document(&mut result, tail_document);
+        }
+        result.finish();
+        self.non_empty(result, markdown)
+    }
+
+    fn choose_split<'a>(
+        &self,
+        tail: &str,
+        boundaries: &'a [BlockBoundary],
+    ) -> Option<&'a BlockBoundary> {
+        let mut state = None;
+        let mut scanned = 0usize;
+        let mut chosen = None;
+        for boundary in boundaries {
+            if boundary.end > scanned {
+                state = code_span_after(&tail[scanned..boundary.end], state);
+                scanned = boundary.end;
+            }
+            if boundary.finalizable && state.is_none() {
+                chosen = Some(boundary);
+            }
+        }
+        chosen
+    }
+
+    fn non_empty(&self, document: Document<Style>, markdown: &str) -> Document<Style> {
+        if document.lines.is_empty() {
+            render_markdown_document(markdown, self.theme, self.options)
+        } else {
+            document
+        }
+    }
+
+    fn reset(&mut self) {
+        self.reset_stable();
+        self.definition_seen = false;
+    }
+
+    fn reset_stable(&mut self) {
+        self.checkpoint = 0;
+        self.stable = Document::default();
+    }
+}
+
+/// Appends a rendered suffix, rebasing its source blocks onto the target.
+fn extend_document(target: &mut Document<Style>, mut other: Document<Style>) {
+    let base = target.source_blocks.len();
+    target.source_blocks.append(&mut other.source_blocks);
+    for mut line in other.lines {
+        for span in &mut line.spans {
+            if let Some(range) = &mut span.source {
+                range.block_index += base;
+            }
+        }
+        target.lines.push(line);
+    }
+    target.breaks.append(&mut other.breaks);
+}
+
+/// Splits a rendered tail at a block boundary and rebases suffix source blocks.
+fn split_document(
+    mut document: Document<Style>,
+    line: usize,
+    blocks: usize,
+) -> (Document<Style>, Document<Style>) {
+    let line = line.min(document.lines.len());
+    let blocks = blocks.min(document.source_blocks.len());
+    if line == document.lines.len() {
+        return (document, Document::default());
+    }
+    let mut rest = Document {
+        source_blocks: document.source_blocks.split_off(blocks),
+        lines: document.lines.split_off(line),
+        breaks: document.breaks.split_off(line),
+    };
+    for line in &mut rest.lines {
+        for span in &mut line.spans {
+            if let Some(range) = &mut span.source {
+                range.block_index -= blocks;
+            }
+        }
+    }
+    (document, rest)
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +237,15 @@ struct NativeTableState {
     rows: Vec<Vec<Vec<RenderSpan<Style>>>>,
     current_row: Vec<Vec<RenderSpan<Style>>>,
     header_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockBoundary {
+    line: usize,
+    source_blocks: usize,
+    end: usize,
+    finalizable: bool,
+    break_after: Break,
 }
 
 #[derive(Debug)]
@@ -76,6 +261,9 @@ struct MarkdownRenderer {
     item_prefix: Option<String>,
     in_code_block: Option<CodeBlockState>,
     table: Option<NativeTableState>,
+    depth: usize,
+    track_boundaries: bool,
+    boundaries: Vec<BlockBoundary>,
 }
 
 impl MarkdownRenderer {
@@ -92,16 +280,41 @@ impl MarkdownRenderer {
             item_prefix: None,
             in_code_block: None,
             table: None,
+            depth: 0,
+            track_boundaries: false,
+            boundaries: Vec::new(),
         }
     }
 
-    fn render_document(mut self, markdown: &str) -> Document<Style> {
-        let markdown = normalize_markdown_math_delimiters(markdown);
-        for (event, range) in Parser::new_ext(&markdown, markdown_options()).into_offset_iter() {
+    fn render_document(self, markdown: &str) -> Document<Style> {
+        self.render_document_tracked(markdown).0
+    }
+
+    fn render_document_tracked(mut self, markdown: &str) -> (Document<Style>, Vec<BlockBoundary>) {
+        for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
             let code_fence_closed = matches!(event, Event::Start(Tag::CodeBlock(_)))
-                .then(|| code_block_fence_closed(&markdown, range))
+                .then(|| code_block_fence_closed(markdown, range.clone()))
                 .flatten();
+            let range_end = range.end;
+            let is_start = matches!(event, Event::Start(_));
+            let is_end = matches!(event, Event::End(_));
+            let top_level_end = is_end && self.depth == 1;
+            let top_level_start = is_start && self.depth == 0;
+            let is_rule = matches!(event, Event::Rule) && self.depth == 0;
             self.handle_event(event, code_fence_closed);
+            if top_level_end {
+                self.depth = 0;
+                self.record_boundary(markdown, range_end);
+            } else if top_level_start {
+                self.depth = 1;
+            } else if is_start {
+                self.depth += 1;
+            } else if is_end {
+                self.depth = self.depth.saturating_sub(1);
+            }
+            if is_rule {
+                self.record_boundary(markdown, range_end);
+            }
         }
         self.flush_spans(Break::End);
         if self.document.lines.is_empty() {
@@ -115,7 +328,24 @@ impl MarkdownRenderer {
             self.document.finish();
         }
         debug_assert!(self.document.validate());
-        self.document
+        (self.document, std::mem::take(&mut self.boundaries))
+    }
+
+    fn record_boundary(&mut self, markdown: &str, end: usize) {
+        if self.track_boundaries {
+            self.boundaries.push(BlockBoundary {
+                line: self.document.lines.len(),
+                source_blocks: self.document.source_blocks.len(),
+                end,
+                finalizable: end < markdown.len() && gap_has_blank_line(&markdown[end..]),
+                break_after: self
+                    .document
+                    .breaks
+                    .last()
+                    .copied()
+                    .unwrap_or(Break::BlockBreak),
+            });
+        }
     }
 
     fn handle_event(&mut self, event: Event<'_>, code_fence_closed: Option<bool>) {
@@ -1193,38 +1423,38 @@ fn syntect_to_ratatui_style(style: SyntectStyle, theme: Theme) -> Style {
     tui_style
 }
 
-fn normalize_markdown_math_delimiters(markdown: &str) -> String {
-    fn escaped_at(source: &str, index: usize) -> bool {
-        source.as_bytes()[..index]
-            .iter()
-            .rev()
-            .take_while(|byte| **byte == b'\\')
-            .count()
-            % 2
-            == 1
-    }
+fn escaped_at(source: &str, index: usize) -> bool {
+    source.as_bytes()[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
 
-    fn fence_marker(line: &str) -> Option<(u8, usize, bool)> {
-        let content = line.trim_end_matches(&['\n', '\r'][..]);
-        let indent = content.bytes().take_while(|byte| *byte == b' ').count();
-        if indent > 3 {
-            return None;
-        }
-        let marker = *content.as_bytes().get(indent)?;
-        if !matches!(marker, b'`' | b'~') {
-            return None;
-        }
-        let count = content.as_bytes()[indent..]
-            .iter()
-            .take_while(|byte| **byte == marker)
-            .count();
-        if count < 3 {
-            return None;
-        }
-        let closing = content[indent + count..].trim().is_empty();
-        Some((marker, count, closing))
+fn fence_marker(line: &str) -> Option<(u8, usize, bool)> {
+    let content = line.trim_end_matches(&['\n', '\r'][..]);
+    let indent = content.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
     }
+    let marker = *content.as_bytes().get(indent)?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let count = content.as_bytes()[indent..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    if count < 3 {
+        return None;
+    }
+    let closing = content[indent + count..].trim().is_empty();
+    Some((marker, count, closing))
+}
 
+fn fenced_regions(markdown: &str) -> Vec<bool> {
     let mut protected = vec![false; markdown.len()];
     let mut fence: Option<(u8, usize)> = None;
     let mut line_offset = 0usize;
@@ -1254,6 +1484,50 @@ fn normalize_markdown_math_delimiters(markdown: &str) -> String {
         }
         line_offset = line_end;
     }
+    protected
+}
+
+/// The pre-pass code-span state after `markdown`, given the state on entry.
+fn code_span_after(markdown: &str, mut code_span: Option<usize>) -> Option<usize> {
+    let protected = fenced_regions(markdown);
+    let mut index = 0usize;
+    while index < markdown.len() {
+        if protected[index] {
+            code_span = None;
+            index += 1;
+            continue;
+        }
+        if markdown.as_bytes()[index] != b'`' || escaped_at(markdown, index) {
+            index += 1;
+            continue;
+        }
+        let ticks = markdown.as_bytes()[index..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        match code_span {
+            Some(open) if ticks == open => code_span = None,
+            Some(_) => {}
+            None => code_span = Some(ticks),
+        }
+        index += ticks;
+    }
+    code_span
+}
+
+fn gap_has_blank_line(gap: &str) -> bool {
+    gap.split_inclusive('\n').any(|line| {
+        line.ends_with('\n')
+            && line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .trim()
+                .is_empty()
+    })
+}
+
+fn normalize_markdown_math_delimiters(markdown: &str) -> String {
+    let mut protected = fenced_regions(markdown);
 
     let mut code_span = None;
     let mut index = 0usize;
@@ -2575,6 +2849,81 @@ mod tests {
         let text = document_text(&document);
         assert!(text.contains("这是一个非常非常"), "{text}");
         assert!(text.contains("观察换行行为"), "{text}");
+    }
+
+    #[test]
+    fn streaming_markdown_matches_full_render() {
+        let samples: Vec<Vec<&str>> = vec![
+            vec![
+                "first paragraph\n\n",
+                "second paragraph\n\n",
+                "third paragraph\n\n",
+            ],
+            vec!["intro with `code`\n\n", "more `inline` text\n\n"],
+            vec!["opening `tick\n\n", "closing` tick\n\n", "done\n\n"],
+            vec![
+                "see [alpha]\n\n",
+                "[alpha]: https://example.test\n\n",
+                "after\n\n",
+            ],
+            vec!["- one\n- two\n\n", "after list\n\n"],
+            vec!["```rust\nlet x = 1;\n```\n\n", "after code\n\n"],
+            vec!["> quote\n\n", "after quote\n\n"],
+            vec!["math \\(x+1\\)\n\n", "more math \\[y\\]\n\n"],
+            vec!["text\n\n", "unclosed `tick here\n\n", "still open\n\n"],
+            vec!["# heading\n\n", "body\n\n"],
+            vec!["| a | b |\n| - | - |\n| 1 | 2 |\n\n", "after table\n\n"],
+            vec!["- outer\n  - inner\n\n", "after nested list\n\n"],
+        ];
+        for chunks in samples {
+            let theme = Theme::dark();
+            let options = MarkdownRenderOptions::new(40);
+            let mut renderer = StreamingMarkdownRenderer::new(theme, options);
+            let mut text = String::new();
+            for chunk in chunks {
+                text.push_str(chunk);
+                let incremental = renderer.render(&text);
+                let full = render_markdown_document(&text, theme, options);
+                assert_eq!(incremental, full, "text = {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_markdown_advances_checkpoint_for_plain_blocks() {
+        let theme = Theme::dark();
+        let options = MarkdownRenderOptions::new(40);
+        let mut renderer = StreamingMarkdownRenderer::new(theme, options);
+        let mut text = String::new();
+        for chunk in ["one\n\n", "two\n\n", "three\n\n"] {
+            text.push_str(chunk);
+            renderer.render(&text);
+        }
+        assert!(renderer.checkpoint() > 0, "checkpoint stayed at zero");
+    }
+
+    #[test]
+    fn streaming_markdown_holds_checkpoint_for_open_code_span_and_definition() {
+        let theme = Theme::dark();
+        let options = MarkdownRenderOptions::new(40);
+
+        let mut renderer = StreamingMarkdownRenderer::new(theme, options);
+        renderer.render("line with `open tick\n\n");
+        assert_eq!(
+            renderer.checkpoint(),
+            0,
+            "an open code span must not finalize a block"
+        );
+
+        let mut renderer = StreamingMarkdownRenderer::new(theme, options);
+        renderer.render("see [alpha]\n\n");
+        assert!(renderer.checkpoint() > 0);
+        renderer.render("see [alpha]\n\n[alpha]: https://example.test\n\n");
+        assert_eq!(
+            renderer.checkpoint(),
+            0,
+            "a reference definition must reset the checkpoint"
+        );
     }
 
     #[test]
