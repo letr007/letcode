@@ -192,6 +192,23 @@ mod tests {
         assert!(output.contains("missing TUI translation"), "{output}");
     }
 
+    /// English-only by design: the fallback test needs a key the active
+    /// catalog does not carry.
+    const ENGLISH_ONLY_KEYS: &[&str] = &["parse.only_english"];
+
+    #[test]
+    fn chinese_catalog_covers_every_english_key() {
+        let english = english_catalog();
+        let chinese = zh_cn_catalog();
+        let mut missing = english
+            .keys()
+            .filter(|key| !ENGLISH_ONLY_KEYS.contains(&key.as_str()))
+            .filter(|key| !chinese.contains_key(*key))
+            .collect::<Vec<_>>();
+        missing.sort();
+        assert!(missing.is_empty(), "zh-CN is missing keys: {missing:?}");
+    }
+
     #[test]
     fn nested_catalogs_flatten_to_dotted_keys() {
         let catalog = parse_catalog("[parse]\n[parse.inner]\nmessage = \"ok\"\n");

@@ -32,17 +32,24 @@ pub(super) fn render_subagent_lines(
         .cloned()
         .and_then(|value| serde_json::from_value::<StructuredSubagentResult>(value).ok())
         .filter(|result| !result.malformed);
-    let status = data
+    let reported_status = data
         .as_ref()
         .and_then(|data| data.get("status").and_then(serde_json::Value::as_str))
-        .or_else(|| structured.as_ref().map(|result| result.status.as_str()))
-        .map(str::to_owned)
+        .map(str::to_owned);
+    let verdict = structured
+        .as_ref()
+        .map(|result| result.status.as_str())
+        .filter(|verdict| !verdict.is_empty());
+    let status = reported_status
+        .as_deref()
+        .or(verdict)
+        .map(|raw| subagent_status_text(raw, translator))
         .unwrap_or_else(|| subagent_status_label(tool.status, translator));
     // The run status is host-reported; the child's own verdict is separate and
     // stays visible when it differs.
-    let status = match structured.as_ref() {
-        Some(result) if !result.status.is_empty() && result.status != status => {
-            format!("{status} · {}", result.status)
+    let status = match (verdict, reported_status.as_deref()) {
+        (Some(verdict), Some(reported)) if verdict != reported => {
+            format!("{status} · {}", subagent_status_text(verdict, translator))
         }
         _ => status,
     };
@@ -56,7 +63,7 @@ pub(super) fn render_subagent_lines(
                 .map(|result| result.child_session_id.as_str())
         })
         .map(|id| truncate_display_width(id, 16))
-        .unwrap_or_else(|| "child".into());
+        .unwrap_or_else(|| translator.t("subagent.child"));
     let summary = data
         .as_ref()
         .and_then(|data| data.get("summary"))
@@ -102,7 +109,12 @@ pub(super) fn render_subagent_lines(
     let state_suffix = if state_flags.is_empty() {
         String::new()
     } else {
-        format!(" [{}]", state_flags.join("/"))
+        let labels = state_flags
+            .iter()
+            .map(|flag| subagent_state_flag_label(flag, translator))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!(" [{labels}]")
     };
 
     let status_label = if matches!(
@@ -165,12 +177,13 @@ pub(super) fn render_subagent_lines(
         return lines;
     }
 
-    let activity = subagent_activity_summary(&structured);
+    let activity = subagent_activity_summary(&structured, translator);
     if !expanded_output {
+        let expand = translator.t("subagent.expand");
         let activity_label = if activity.is_empty() {
-            "details · expand".to_string()
+            format!("{} · {expand}", translator.t("subagent.details"))
         } else {
-            format!("{activity} · expand")
+            format!("{activity} · {expand}")
         };
         lines.push(render_subagent_compact_line(
             &activity_label,
@@ -183,7 +196,11 @@ pub(super) fn render_subagent_lines(
     }
 
     lines.push(render_subagent_compact_line(
-        "details · collapse",
+        &format!(
+            "{} · {}",
+            translator.t("subagent.details"),
+            translator.t("subagent.collapse")
+        ),
         muted,
         theme,
         width,
@@ -197,7 +214,7 @@ pub(super) fn render_subagent_lines(
         .unwrap_or(structured.run_id.as_str());
     if !run_id.is_empty() {
         lines.push(render_subagent_compact_line(
-            &format!("run {run_id}"),
+            &translator.t_fmt("subagent.run", &[("id", run_id)]),
             muted,
             theme,
             width,
@@ -206,22 +223,22 @@ pub(super) fn render_subagent_lines(
     }
     render_subagent_wrapped_field(
         &mut lines,
-        "summary",
+        &translator.t("subagent.field_summary"),
         std::slice::from_ref(&structured.summary),
         muted,
         theme,
         width,
     );
-    for (label, values) in [
-        ("blocker", &structured.blockers),
-        ("finding", &structured.findings),
-        ("next_step", &structured.next_steps),
-        ("validation", &structured.validation),
-        ("changed", &structured.files_changed),
-        ("read", &structured.files_read),
-        ("command", &structured.commands_run),
+    for (key, values) in [
+        ("subagent.field_blocker", &structured.blockers),
+        ("subagent.field_finding", &structured.findings),
+        ("subagent.field_next_step", &structured.next_steps),
+        ("subagent.field_validation", &structured.validation),
+        ("subagent.field_changed", &structured.files_changed),
+        ("subagent.field_read", &structured.files_read),
+        ("subagent.field_command", &structured.commands_run),
     ] {
-        render_subagent_wrapped_field(&mut lines, label, values, muted, theme, width);
+        render_subagent_wrapped_field(&mut lines, &translator.t(key), values, muted, theme, width);
     }
     if let Some(last) = lines.last_mut() {
         last.boundary = Break::End;
@@ -299,16 +316,19 @@ pub(super) fn structured_subagent_has_details(result: &StructuredSubagentResult)
         || !result.commands_run.is_empty()
 }
 
-pub(super) fn subagent_activity_summary(result: &StructuredSubagentResult) -> String {
+pub(super) fn subagent_activity_summary(
+    result: &StructuredSubagentResult,
+    translator: &Translator,
+) -> String {
     [
-        ("read", result.files_read.len()),
-        ("changed", result.files_changed.len()),
-        ("commands", result.commands_run.len()),
-        ("checks", result.validation.len()),
+        ("subagent.activity_read", result.files_read.len()),
+        ("subagent.activity_changed", result.files_changed.len()),
+        ("subagent.activity_commands", result.commands_run.len()),
+        ("subagent.activity_checks", result.validation.len()),
     ]
     .into_iter()
     .filter(|(_, count)| *count > 0)
-    .map(|(label, count)| format!("{label} {count}"))
+    .map(|(key, count)| format!("{} {count}", translator.t(key)))
     .collect::<Vec<_>>()
     .join(" · ")
 }
@@ -342,6 +362,35 @@ pub(super) fn subagent_status_label(
     })
 }
 
+pub(super) fn subagent_status_text(raw: &str, translator: &Translator) -> String {
+    translator.t(match raw {
+        "preparing" => "status.preparing",
+        "running" => "status.running",
+        "cancelled" => "status.cancelled",
+        "completed" => "status.completed",
+        "failed" => "status.failed",
+        "budget_exhausted" => "status.budget_exhausted",
+        "timed_out" => "status.timed_out",
+        "approval" => "status.approval",
+        "approved" => "status.approved",
+        "denied" => "status.denied",
+        "error" => "status.error",
+        "interrupted" => "status.interrupted",
+        other => return other.to_string(),
+    })
+}
+
+fn subagent_state_flag_label(flag: &str, translator: &Translator) -> String {
+    translator.t(match flag {
+        "background" => "status.background",
+        "active" => "status.active",
+        "malformed" => "status.malformed",
+        "hard" => "status.hard",
+        "logical" => "status.logical",
+        other => return other.to_string(),
+    })
+}
+
 pub(super) fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str> {
     let mut flags = Vec::new();
     if data.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -361,4 +410,53 @@ pub(super) fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str
         flags.push("malformed");
     }
     flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::i18n::Language;
+
+    #[test]
+    fn every_reported_subagent_status_is_localized() {
+        let translator = Translator::new(Language::ZhCn);
+        let terminal = [
+            crate::subagent::SubagentStatus::Running,
+            crate::subagent::SubagentStatus::Completed,
+            crate::subagent::SubagentStatus::Failed,
+            crate::subagent::SubagentStatus::BudgetExhausted,
+            crate::subagent::SubagentStatus::Cancelled,
+            crate::subagent::SubagentStatus::TimedOut,
+        ]
+        .map(|status| status.as_str());
+        let projected = [
+            "preparing",
+            "approval",
+            "approved",
+            "denied",
+            "error",
+            "interrupted",
+        ];
+        for raw in terminal.into_iter().chain(projected) {
+            let text = subagent_status_text(raw, &translator);
+            assert_ne!(text, raw, "{raw} is not localized");
+        }
+    }
+
+    #[test]
+    fn unknown_subagent_status_passes_through() {
+        let translator = Translator::new(Language::ZhCn);
+        assert_eq!(
+            subagent_status_text("changes_requested", &translator),
+            "changes_requested"
+        );
+    }
+
+    #[test]
+    fn every_state_flag_is_localized() {
+        let translator = Translator::new(Language::ZhCn);
+        for flag in ["background", "active", "malformed", "hard", "logical"] {
+            assert_ne!(subagent_state_flag_label(flag, &translator), flag);
+        }
+    }
 }

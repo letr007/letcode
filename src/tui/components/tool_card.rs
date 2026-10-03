@@ -1320,11 +1320,21 @@ mod tests {
 
     #[test]
     fn subagent_card_distinguishes_hard_and_logical_failures() {
-        for (status, failure_kind, summary) in [
-            ("failed", "hard", "provider connection failed"),
-            ("failed", "logical", "out-of-scope changes detected"),
-            ("timed_out", "hard", "provider timed out"),
-            ("cancelled", "logical", "task was cancelled by the delegate"),
+        for (status, status_label, failure_kind, summary) in [
+            ("failed", "failed", "hard", "provider connection failed"),
+            (
+                "failed",
+                "failed",
+                "logical",
+                "out-of-scope changes detected",
+            ),
+            ("timed_out", "timed out", "hard", "provider timed out"),
+            (
+                "cancelled",
+                "cancelled",
+                "logical",
+                "task was cancelled by the delegate",
+            ),
         ] {
             let tool = ToolView {
                 call_id: "run-failure".into(),
@@ -1353,7 +1363,7 @@ mod tests {
 
             assert_eq!(rendered.len(), 1, "{rendered:?}");
             assert!(
-                rendered[0].contains(&format!("{status} [{failure_kind}] fixer {summary}")),
+                rendered[0].contains(&format!("{status_label} [{failure_kind}] fixer {summary}")),
                 "{}",
                 rendered[0]
             );

@@ -4076,6 +4076,7 @@ mod tests {
     #[test]
     fn subagent_parent_transcript_stays_compact_and_keeps_child_details_out() {
         let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
         state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent {
             call_id: "run-1".into(),
             name: "agent__explore".into(),
