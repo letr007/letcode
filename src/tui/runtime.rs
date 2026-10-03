@@ -44,7 +44,10 @@ use crate::session::runner::ModelCatalogUpdatedEvent;
 use crate::session::{
     RunnerQuestionRequest, SessionEngine, SessionEngineIngress, SessionTransportEvent,
 };
-use assistant::{AssistantTypewriter, assistant_delta_event, assistant_delta_parts};
+use assistant::{
+    AssistantDeltaStream, AssistantTypewriter, assistant_delta_event, assistant_delta_parts,
+    assistant_stream_end,
+};
 #[path = "runtime/assistant.rs"]
 mod assistant;
 use branch_poller::BranchPoller;
@@ -219,7 +222,7 @@ pub struct TuiRuntime {
     workspace_key: Option<String>,
     session_summaries: Vec<SessionSummary>,
     preferences_dir: PathBuf,
-    assistant_typewriter: Option<AssistantTypewriter>,
+    assistant_typewriters: Vec<AssistantTypewriter>,
     deferred_session_events: VecDeque<SessionTransportEvent>,
     session_transport_stream_closed: bool,
     session_transport_stream_close_reported: bool,
@@ -264,7 +267,7 @@ impl TuiRuntime {
             workspace_key: None,
             session_summaries: Vec::new(),
             preferences_dir,
-            assistant_typewriter: None,
+            assistant_typewriters: Vec::new(),
             deferred_session_events: VecDeque::new(),
             session_transport_stream_closed: false,
             session_transport_stream_close_reported: false,
@@ -698,7 +701,7 @@ impl TuiRuntime {
         // Leave both time and event slots in every frame for terminal input.
         // An unbounded model stream must not delay a confirmed Esc indefinitely.
         let mut budget = SessionEventBudget::new();
-        self.advance_assistant_typewriter_with_budget(Instant::now(), &mut budget);
+        self.advance_assistant_typewriters_with_budget(Instant::now(), &mut budget);
         self.poll_session_list();
         self.poll_update_check();
         self.poll_session_archive_pass();
@@ -735,11 +738,11 @@ impl TuiRuntime {
         }
         if stream_closed {
             self.session_transport_stream_closed = true;
-            self.flush_assistant_typewriter_pending();
+            self.flush_session_events();
         }
         if self.session_transport_stream_closed
             && !self.session_transport_stream_close_reported
-            && self.assistant_typewriter.is_none()
+            && self.assistant_typewriters.is_empty()
             && self.deferred_session_events.is_empty()
         {
             self.handle_session_event_stream_closed();
@@ -870,11 +873,21 @@ impl TuiRuntime {
     }
 
     fn consume_observed_session_transport_event(&mut self, event: SessionTransportEvent) {
+        // Paced text bypasses the queue unless a queued event precedes it.
+        if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
+            if self.deferred_session_events.is_empty() {
+                self.push_stream_delta(stream, agent_name, delta);
+            } else {
+                self.enqueue_deferred_session_event(event);
+            }
+            return;
+        }
+
         // View projections change which timeline owns subsequent paint work, so
         // commit any paced text before applying the navigation snapshot.
         if is_transcript_view_projection(&event) {
             if self.deferred_session_events.is_empty() {
-                self.flush_assistant_typewriter();
+                self.end_pacing();
                 self.apply_session_transport_event(event);
             } else {
                 self.enqueue_deferred_session_event(event);
@@ -882,28 +895,7 @@ impl TuiRuntime {
             return;
         }
 
-        if !self.deferred_session_events.is_empty() {
-            self.enqueue_deferred_session_event(event);
-            return;
-        }
-
-        if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
-            if self
-                .assistant_typewriter
-                .as_ref()
-                .is_some_and(|typewriter| typewriter.stream != stream)
-            {
-                self.flush_assistant_typewriter();
-            }
-            let now = Instant::now();
-            let typewriter = self
-                .assistant_typewriter
-                .get_or_insert_with(|| AssistantTypewriter::new(stream, agent_name, now));
-            typewriter.push(&delta, now);
-            return;
-        }
-
-        if self.assistant_typewriter.is_some() || !self.deferred_session_events.is_empty() {
+        if self.has_pending_text() || !self.deferred_session_events.is_empty() {
             self.enqueue_deferred_session_event(event);
         } else {
             self.apply_session_transport_event(event);
@@ -917,8 +909,8 @@ impl TuiRuntime {
     #[cfg(test)]
     fn advance_assistant_typewriter_by(&mut self, elapsed: Duration) {
         let now = self
-            .assistant_typewriter
-            .as_ref()
+            .assistant_typewriters
+            .first()
             .map(|typewriter| typewriter.last_frame_at + elapsed)
             .unwrap_or_else(Instant::now);
         let mut budget = SessionEventBudget {
@@ -926,84 +918,146 @@ impl TuiRuntime {
             consumed: 0,
             received: 0,
         };
-        self.advance_assistant_typewriter_with_budget(now, &mut budget);
+        self.advance_assistant_typewriters_with_budget(now, &mut budget);
     }
 
-    fn advance_assistant_typewriter_with_budget(
+    fn advance_assistant_typewriters_with_budget(
         &mut self,
         now: Instant,
         budget: &mut SessionEventBudget,
     ) {
-        let catch_up = !self.deferred_session_events.is_empty();
         let view_projection_pending = self
             .deferred_session_events
             .iter()
             .any(is_transcript_view_projection);
-        if self.assistant_typewriter.is_some() && budget.can_process() {
-            let event = self.assistant_typewriter.as_mut().and_then(|typewriter| {
-                let delta = if view_projection_pending {
+        let mut index = 0;
+        while index < self.assistant_typewriters.len() {
+            if !budget.can_process() {
+                break;
+            }
+            let (stream, agent_name, released) = {
+                let typewriter = &mut self.assistant_typewriters[index];
+                let released = if view_projection_pending {
                     typewriter.take_pending()
                 } else {
-                    typewriter.take_frame(now, catch_up)
+                    typewriter.take_frame(now)
                 };
-                (!delta.is_empty()).then(|| {
-                    assistant_delta_event(&typewriter.stream, &typewriter.agent_name, delta)
-                })
-            });
-            if let Some(event) = event {
+                (
+                    typewriter.stream.clone(),
+                    typewriter.agent_name.clone(),
+                    released,
+                )
+            };
+            if !released.is_empty() {
                 budget.consume();
-                self.apply_session_transport_event(event);
+                self.apply_session_transport_event(assistant_delta_event(
+                    &stream,
+                    &agent_name,
+                    released,
+                ));
             }
-        }
-        if catch_up
-            && self
-                .assistant_typewriter
-                .as_ref()
-                .is_some_and(|typewriter| typewriter.pending_text().is_empty())
-        {
-            self.assistant_typewriter = None;
+            index += 1;
         }
         self.apply_deferred_session_events_with_budget(budget);
     }
 
+    fn typewriter_index(&self, stream: &AssistantDeltaStream) -> Option<usize> {
+        self.assistant_typewriters
+            .iter()
+            .position(|typewriter| &typewriter.stream == stream)
+    }
+
+    fn push_stream_delta(
+        &mut self,
+        stream: AssistantDeltaStream,
+        agent_name: Option<String>,
+        delta: String,
+    ) {
+        let now = Instant::now();
+        let index = self.typewriter_index(&stream).unwrap_or_else(|| {
+            self.assistant_typewriters
+                .push(AssistantTypewriter::new(stream, agent_name, now));
+            self.assistant_typewriters.len() - 1
+        });
+        self.assistant_typewriters[index].push(&delta, now);
+    }
+
+    fn has_pending_text(&self) -> bool {
+        self.assistant_typewriters
+            .iter()
+            .any(|typewriter| !typewriter.pending_text().is_empty())
+    }
+
+    /// Commit what every stream has already produced, without ending its pacing.
+    fn commit_pending_text(&mut self) {
+        for (stream, agent_name, text) in self.take_pending_text() {
+            self.apply_session_transport_event(assistant_delta_event(&stream, &agent_name, text));
+        }
+    }
+
+    /// Commit the paced text of every stream and stop pacing them.
+    fn end_pacing(&mut self) {
+        let pending = self.take_pending_text();
+        self.assistant_typewriters.clear();
+        for (stream, agent_name, text) in pending {
+            self.apply_session_transport_event(assistant_delta_event(&stream, &agent_name, text));
+        }
+    }
+
+    /// Finish everything a closed transport still holds, so the drain is bounded.
+    fn flush_session_events(&mut self) {
+        self.end_pacing();
+        while let Some(event) = self.deferred_session_events.pop_front() {
+            self.apply_session_transport_event(event);
+        }
+    }
+
+    fn take_pending_text(&mut self) -> Vec<(AssistantDeltaStream, Option<String>, String)> {
+        self.assistant_typewriters
+            .iter_mut()
+            .filter_map(|typewriter| {
+                let text = typewriter.take_pending();
+                (!text.is_empty()).then(|| {
+                    (
+                        typewriter.stream.clone(),
+                        typewriter.agent_name.clone(),
+                        text,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Queued events keep their arrival order and never wait for paced text.
     fn apply_deferred_session_events_with_budget(&mut self, budget: &mut SessionEventBudget) {
-        while self.assistant_typewriter.is_none()
-            && !self.deferred_session_events.is_empty()
-            && budget.can_process()
-        {
+        while !self.deferred_session_events.is_empty() && budget.can_process() {
             let event = self
                 .deferred_session_events
                 .pop_front()
                 .expect("deferred queue checked above");
             budget.consume();
             if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
-                let now = Instant::now();
-                let mut typewriter = AssistantTypewriter::new(stream, agent_name, now);
-                typewriter.push(&delta, now);
-                self.assistant_typewriter = Some(typewriter);
-                break;
+                self.push_stream_delta(stream, agent_name, delta);
+                continue;
             }
-            self.apply_session_transport_event(event);
+            self.commit_pending_text();
+            self.apply_session_transport_event(event.clone());
+            if let Some(stream) = assistant_stream_end(&event) {
+                self.end_stream_pacing(&stream);
+            }
         }
     }
 
-    fn flush_assistant_typewriter_pending(&mut self) {
-        if let Some(mut typewriter) = self.assistant_typewriter.take()
-            && !typewriter.pending_text().is_empty()
-        {
-            let pending = typewriter.take_pending();
-            self.apply_session_transport_event(assistant_delta_event(
-                &typewriter.stream,
-                &typewriter.agent_name,
-                pending,
-            ));
-        }
-    }
-
-    fn flush_assistant_typewriter(&mut self) {
-        self.flush_assistant_typewriter_pending();
-        while let Some(event) = self.deferred_session_events.pop_front() {
-            self.apply_session_transport_event(event);
+    fn end_stream_pacing(&mut self, stream: &AssistantDeltaStream) {
+        let Some(index) = self.typewriter_index(stream) else {
+            return;
+        };
+        let typewriter = &mut self.assistant_typewriters[index];
+        let text = typewriter.take_pending();
+        let (stream, agent_name) = (typewriter.stream.clone(), typewriter.agent_name.clone());
+        self.assistant_typewriters.remove(index);
+        if !text.is_empty() {
+            self.apply_session_transport_event(assistant_delta_event(&stream, &agent_name, text));
         }
     }
 

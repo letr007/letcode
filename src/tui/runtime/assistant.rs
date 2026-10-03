@@ -70,6 +70,28 @@ pub(crate) fn assistant_delta_event(
     }
 }
 
+/// The stream an event closes, if it closes one.
+pub(crate) fn assistant_stream_end(event: &SessionTransportEvent) -> Option<AssistantDeltaStream> {
+    match event {
+        SessionTransportEvent::AssistantDone { message_id } => Some(AssistantDeltaStream {
+            child_session_id: None,
+            parent_tool_call_id: None,
+            message_id: message_id.clone(),
+        }),
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            parent_tool_call_id,
+            event: SessionEvent::AssistantDone { message_id, .. },
+            ..
+        } => Some(AssistantDeltaStream {
+            child_session_id: Some(child_session_id.clone()),
+            parent_tool_call_id: parent_tool_call_id.clone(),
+            message_id: message_id.clone(),
+        }),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AssistantDeltaStream {
     pub(crate) child_session_id: Option<String>,
@@ -136,7 +158,7 @@ impl AssistantTypewriter {
         self.last_delta_at = Some(now);
     }
 
-    pub(crate) fn take_frame(&mut self, now: Instant, catch_up: bool) -> String {
+    pub(crate) fn take_frame(&mut self, now: Instant) -> String {
         let elapsed = now.saturating_duration_since(self.last_frame_at);
         self.last_frame_at = now;
 
@@ -146,17 +168,14 @@ impl AssistantTypewriter {
             return String::new();
         }
         self.display_budget += self.graphemes_per_second * elapsed.as_secs_f64();
-        if catch_up {
-            let catchup_rate =
-                pending_graphemes as f64 / ASSISTANT_TYPEWRITER_CATCHUP_WINDOW.as_secs_f64();
-            let frame_rate = self
-                .graphemes_per_second
-                .max(catchup_rate)
-                .min(ASSISTANT_TYPEWRITER_MAX_RATE);
-            self.display_budget += (frame_rate - self.graphemes_per_second) * elapsed.as_secs_f64();
-        }
 
-        let count = self.display_budget.floor() as usize;
+        // The animation smooths output; it may not let display fall behind.
+        let keep = self.graphemes_per_second * ASSISTANT_TYPEWRITER_CATCHUP_WINDOW.as_secs_f64();
+        let release = self
+            .display_budget
+            .max(pending_graphemes as f64 - keep)
+            .max(0.0);
+        let count = (release.floor() as usize).min(pending_graphemes);
         if count == 0 {
             return String::new();
         }
@@ -166,8 +185,9 @@ impl AssistantTypewriter {
         let released = self.pending[start..start + split_at].to_owned();
         self.pending_start += split_at;
         self.compact_pending();
-        self.display_budget -=
-            UnicodeSegmentation::graphemes(released.as_str(), true).count() as f64;
+        self.display_budget = (self.display_budget
+            - UnicodeSegmentation::graphemes(released.as_str(), true).count() as f64)
+            .max(0.0);
         released
     }
 

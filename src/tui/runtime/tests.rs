@@ -5751,14 +5751,14 @@ fn high_rate_incremental_backlog_preserves_done_and_tool_order() {
     .expect("queue tool finish");
     tx.send(SessionTransportEvent::Done)
         .expect("queue session done");
-    drop(tx);
 
+    // The sender stays alive: this test covers backlog order, not engine shutdown.
     for _ in 0..1024 {
         runtime.try_drain_session_events();
         runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
-        if runtime.assistant_typewriter.is_none()
+        if runtime.assistant_typewriters.is_empty()
             && runtime.deferred_session_events.is_empty()
-            && runtime.session_transport_rx.try_recv().is_err()
+            && runtime.session_transport_rx.is_empty()
         {
             break;
         }
@@ -6019,7 +6019,7 @@ fn assistant_typewriter_preserves_grapheme_clusters_split_across_deltas() {
     typewriter.push("\u{301}x", now + Duration::from_millis(5));
 
     assert_eq!(
-        typewriter.take_frame(now + Duration::from_millis(10), false),
+        typewriter.take_frame(now + Duration::from_millis(10)),
         "e\u{301}"
     );
     assert_eq!(typewriter.pending_text(), "x");
@@ -6037,10 +6037,7 @@ fn assistant_typewriter_preserves_zwj_sequence_split_across_deltas() {
     typewriter.push("👩", now);
     typewriter.push("‍💻x", now + Duration::from_millis(5));
 
-    assert_eq!(
-        typewriter.take_frame(now + Duration::from_millis(10), false),
-        "👩‍💻"
-    );
+    assert_eq!(typewriter.take_frame(now + Duration::from_millis(10)), "👩‍💻");
     assert_eq!(typewriter.pending_text(), "x");
 }
 
@@ -6075,21 +6072,40 @@ fn assistant_typewriter_does_not_bank_budget_between_deltas() {
     let mut typewriter = AssistantTypewriter::new(stream, None, now);
     typewriter.push("ab", now);
     assert_eq!(
-        typewriter.take_frame(now + Duration::from_millis(100), false),
+        typewriter.take_frame(now + Duration::from_millis(100)),
         "ab"
     );
     assert!(typewriter.pending_text().is_empty());
 
-    assert_eq!(
-        typewriter.take_frame(now + Duration::from_millis(600), false),
-        ""
-    );
+    assert_eq!(typewriter.take_frame(now + Duration::from_millis(600)), "");
     typewriter.push("cd", now + Duration::from_millis(600));
-    assert_eq!(
-        typewriter.take_frame(now + Duration::from_millis(610), false),
-        ""
-    );
+    assert_eq!(typewriter.take_frame(now + Duration::from_millis(610)), "");
     assert_eq!(typewriter.pending_text(), "cd");
+}
+
+#[test]
+fn a_tool_event_is_not_blocked_behind_streamed_text() {
+    let mut runtime = runtime();
+    for _ in 0..40 {
+        runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+            AssistantDeltaEvent::new("streamed text "),
+        ));
+    }
+    runtime.consume_session_transport_event(SessionTransportEvent::ToolStarted(
+        ToolStartedEvent::new("call-1", "shell__exec", "run a command"),
+    ));
+
+    runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
+
+    assert!(
+        runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .any(|item| matches!(item, TimelineItem::Tool(_))),
+        "a tool card must not wait for the streamed text to finish"
+    );
 }
 
 #[test]
@@ -6100,7 +6116,7 @@ fn assistant_typewriter_keeps_live_stream_state_between_deltas() {
     ));
     runtime.advance_assistant_typewriter_by(Duration::from_millis(100));
 
-    assert!(runtime.assistant_typewriter.is_some());
+    assert!(!runtime.assistant_typewriters.is_empty());
     runtime.advance_assistant_typewriter_by(Duration::from_millis(500));
     let before = match runtime.state().timeline.items().last() {
         Some(TimelineItem::Assistant(message)) => message.text.clone(),
@@ -6116,7 +6132,8 @@ fn assistant_typewriter_keeps_live_stream_state_between_deltas() {
         other => panic!("expected assistant message, got {other:?}"),
     };
     let pending = runtime
-        .assistant_typewriter
+        .assistant_typewriters
+        .first()
         .as_ref()
         .map(|typewriter| typewriter.pending_text())
         .expect("typewriter remains active");
@@ -6143,7 +6160,7 @@ fn assistant_done_waits_for_typewriter_to_drain() {
         runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
     }
 
-    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.assistant_typewriters.is_empty());
     assert!(runtime.deferred_session_events.is_empty());
     assert!(matches!(
         runtime.state().timeline.items().last(),
@@ -6164,7 +6181,7 @@ fn deferred_events_keep_later_deltas_behind_the_barrier() {
         AssistantDeltaEvent::new("after"),
     ));
 
-    runtime.flush_assistant_typewriter();
+    runtime.flush_session_events();
 
     assert_eq!(runtime.state().timeline.items().len(), 2);
     assert!(matches!(
@@ -6263,7 +6280,7 @@ fn child_view_navigation_preserves_complete_structured_result() {
     });
 
     assert!(runtime.state().transcript_view.is_child());
-    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.assistant_typewriters.is_empty());
     assert!(runtime.deferred_session_events.is_empty());
     assert!(matches!(
         runtime.state().active_timeline().items().last(),
@@ -6342,7 +6359,7 @@ fn deferred_child_view_navigation_completes_with_ordered_structured_result() {
     runtime.advance_assistant_typewriter_by(TUI_FRAME_POLL_INTERVAL);
 
     assert!(runtime.state().transcript_view.is_child());
-    assert!(runtime.assistant_typewriter.is_none());
+    assert!(runtime.assistant_typewriters.is_empty());
     assert!(runtime.deferred_session_events.is_empty());
     assert!(matches!(
         runtime.state().active_timeline().items().last(),
@@ -6868,7 +6885,7 @@ fn child_view_snapshot_growth_preserves_unpersisted_live_delta() {
     })
     .expect("queue growing child snapshot");
     runtime.try_drain_session_events();
-    runtime.flush_assistant_typewriter();
+    runtime.flush_session_events();
     render_runtime_transcript(&mut runtime);
 
     assert!(matches!(
