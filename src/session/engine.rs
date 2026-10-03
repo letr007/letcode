@@ -1272,8 +1272,7 @@ async fn run_engine_loop(
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
     let mut delivered_background_runs = std::collections::HashSet::new();
-    // A run's terminal state reaches the frontend when the engine first observes
-    // it; the model delivery waits for a phase that can carry it.
+    // A run's terminal state reaches the frontend on first observation.
     let mut notified_background_runs = std::collections::HashSet::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
@@ -2807,11 +2806,7 @@ async fn run_engine_loop(
     }
 }
 
-/// A terminal background run is session state rather than turn state: the
-/// frontend learns about it as soon as the engine observes it, while the model
-/// delivery waits for a phase that can carry it.
-///
-/// Returns whether the completion is still deliverable to the model.
+/// Report a terminal background run once; returns whether it is deliverable.
 pub(crate) fn observe_background_subagent_completion(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     subagent_runtime: &SubagentPool,

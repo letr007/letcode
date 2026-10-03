@@ -3881,10 +3881,7 @@ mod tests {
         assert_eq!(after_rows, transcript_lines(&state, theme, width).len());
     }
 
-    /// Every frame re-renders the streaming answer in full, so the markdown
-    /// renderer sees a quadratic number of characters over one answer. This pins
-    /// today's cost at one full render per frame; rendering only what changed
-    /// should bring the total down to the answer itself.
+    /// Pins today's cost: every frame re-renders the whole streaming answer.
     #[test]
     fn streaming_markdown_cost_stays_within_one_full_render_per_frame() {
         let mut state = TuiState::default();

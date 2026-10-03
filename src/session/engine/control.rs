@@ -222,8 +222,7 @@ pub(crate) fn handle_active_turn_command(
         result,
     } = &command
     {
-        // Only the model delivery waits for this operation to finish; the run's
-        // terminal state is reported as soon as it is observed.
+        // Only the model delivery waits for this operation to finish.
         observe_background_subagent_completion(
             transcript,
             subagent_runtime,
