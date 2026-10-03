@@ -33,10 +33,6 @@ pub(crate) enum SessionEngineCommand {
     ViewParent,
     SetPermissionMode(crate::permission::PermissionMode),
     SetModel(String),
-    SetExpertModel {
-        agent_name: String,
-        model_id: String,
-    },
     SetExpertAllowedModels {
         agent_name: String,
         model_ids: Vec<String>,
@@ -75,13 +71,6 @@ impl SessionEngineCommand {
             SessionCommand::ViewParent => Self::ViewParent,
             SessionCommand::SetPermissionMode(mode) => Self::SetPermissionMode(mode),
             SessionCommand::SetModel(model) => Self::SetModel(model),
-            SessionCommand::SetExpertModel {
-                agent_name,
-                model_id,
-            } => Self::SetExpertModel {
-                agent_name,
-                model_id,
-            },
             SessionCommand::SetExpertAllowedModels {
                 agent_name,
                 model_ids,
@@ -155,13 +144,6 @@ pub(crate) fn session_engine_command_as_session_command(
         SessionEngineCommand::SetModel(model) => {
             Some(crate::session::SessionCommand::SetModel(model.clone()))
         }
-        SessionEngineCommand::SetExpertModel {
-            agent_name,
-            model_id,
-        } => Some(crate::session::SessionCommand::SetExpertModel {
-            agent_name: agent_name.clone(),
-            model_id: model_id.clone(),
-        }),
         SessionEngineCommand::SetExpertAllowedModels {
             agent_name,
             model_ids,
@@ -210,7 +192,6 @@ pub(crate) fn session_engine_command_as_idle_session_command(
         | crate::session::SessionCommand::DelegateSubagent { .. }
         | crate::session::SessionCommand::Compact
         | crate::session::SessionCommand::SetModel(_)
-        | crate::session::SessionCommand::SetExpertModel { .. }
         | crate::session::SessionCommand::SetExpertAllowedModels { .. }
         | crate::session::SessionCommand::ResumeSession(_)
         | crate::session::SessionCommand::NewSession
@@ -290,7 +271,6 @@ enum QueuedSessionEngineControlSignal {
 enum DeferredCommandKey {
     PermissionMode,
     Model,
-    ExpertModel(String),
     ExpertAllowedModels(String),
     ReasoningEffort,
     FakeClient,
@@ -300,9 +280,6 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
     match command {
         SessionEngineCommand::SetPermissionMode(_) => Some(DeferredCommandKey::PermissionMode),
         SessionEngineCommand::SetModel(_) => Some(DeferredCommandKey::Model),
-        SessionEngineCommand::SetExpertModel { agent_name, .. } => {
-            Some(DeferredCommandKey::ExpertModel(agent_name.clone()))
-        }
         SessionEngineCommand::SetExpertAllowedModels { agent_name, .. } => {
             Some(DeferredCommandKey::ExpertAllowedModels(agent_name.clone()))
         }

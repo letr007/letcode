@@ -161,10 +161,6 @@ pub enum TranscriptEvent {
         model_id: String,
         effort: ModelReasoningEffort,
     },
-    ExpertModelChanged {
-        agent_name: String,
-        model: String,
-    },
     ContextBranchCreated {
         branch_id: String,
         parent_branch_id: String,

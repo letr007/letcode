@@ -275,12 +275,11 @@ impl PreparedRestoredRoute {
 pub(crate) fn prepare_restored_model_route(
     agent: &Agent,
     latest_model: Option<&str>,
-) -> Result<Option<PreparedRestoredRoute>> {
-    let Some(model) = latest_model else {
-        return Ok(None);
-    };
+    fallback_route: Option<&ModelRoute>,
+) -> Option<PreparedRestoredRoute> {
+    let model = latest_model?;
     let Some(active_route) = agent.primary_route().cloned() else {
-        return Ok(Some(PreparedRestoredRoute::ModelOnly(model.to_string())));
+        return Some(PreparedRestoredRoute::ModelOnly(model.to_string()));
     };
 
     if let Some((provider, model_id)) = model.split_once('/')
@@ -288,19 +287,19 @@ pub(crate) fn prepare_restored_model_route(
     {
         let candidate = ModelRoute::new(provider, model_id);
         if let Ok(route) = agent.prepare_primary_route(candidate) {
-            return Ok(Some(PreparedRestoredRoute::Prepared {
+            return Some(PreparedRestoredRoute::Prepared {
                 target_model: model_id.to_string(),
                 route,
-            }));
+            });
         }
     }
 
     let legacy_candidate = ModelRoute::new(active_route.provider.clone(), model);
     if let Ok(route) = agent.prepare_primary_route(legacy_candidate) {
-        return Ok(Some(PreparedRestoredRoute::Prepared {
+        return Some(PreparedRestoredRoute::Prepared {
             target_model: model.to_string(),
             route,
-        }));
+        });
     }
 
     if let Some((provider, model_id)) = model.split_once('/')
@@ -308,17 +307,22 @@ pub(crate) fn prepare_restored_model_route(
     {
         let candidate = ModelRoute::new(provider, model_id);
         if let Ok(route) = agent.prepare_primary_route(candidate) {
-            return Ok(Some(PreparedRestoredRoute::Prepared {
+            return Some(PreparedRestoredRoute::Prepared {
                 target_model: model_id.to_string(),
                 route,
-            }));
+            });
         }
     }
 
-    Err(anyhow::anyhow!(
-        "recorded model '{model}' is not configured for provider '{}' or as a provider-qualified route",
-        active_route.provider
-    ))
+    let fallback = fallback_route.unwrap_or(&active_route).clone();
+    if let Ok(route) = agent.prepare_primary_route(fallback.clone()) {
+        return Some(PreparedRestoredRoute::Prepared {
+            target_model: fallback.model.clone(),
+            route,
+        });
+    }
+
+    None
 }
 
 pub(crate) fn apply_prepared_restored_route(
@@ -357,7 +361,7 @@ pub(crate) fn apply_restored_model_route(
     agent: &mut Agent,
     latest_model: Option<&str>,
 ) -> Result<()> {
-    let route = prepare_restored_model_route(agent, latest_model)?;
+    let route = prepare_restored_model_route(agent, latest_model, None);
     apply_prepared_restored_route(agent, route);
     Ok(())
 }
@@ -406,9 +410,13 @@ pub fn prepare_routed_resume_install(
     agent: &Agent,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
+    fallback_route: Option<&ModelRoute>,
 ) -> std::result::Result<PreparedRoutedResumeInstall, ResumeInstallError> {
-    let route = prepare_restored_model_route(agent, prepared.snapshot.latest_model.as_deref())
-        .map_err(|error| ResumeInstallError::new(error, false))?;
+    let route = prepare_restored_model_route(
+        agent,
+        prepared.snapshot.latest_model.as_deref(),
+        fallback_route,
+    );
     let target_model = route
         .as_ref()
         .map_or_else(|| agent.model(), PreparedRestoredRoute::target_model);
@@ -506,7 +514,7 @@ pub fn install_prepared_routed_resume_for_agent(
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
 ) -> std::result::Result<(bool, crate::session::event::TokenUsageEvent), ResumeInstallError> {
-    let prepared = prepare_routed_resume_install(agent, live, prepared)?;
+    let prepared = prepare_routed_resume_install(agent, live, prepared, None)?;
     Ok(prepared.commit(agent, live))
 }
 
@@ -571,26 +579,6 @@ pub fn restored_session_token_usage(
         0,
     )
     .with_prompt_composition(prompt_composition))
-}
-
-#[cfg(test)]
-fn session_resumed_event(
-    prepared: &PreparedResume,
-    runtime_context: crate::runtime_context::RuntimeActiveContext,
-    token_usage: Option<crate::session::event::TokenUsageEvent>,
-) -> crate::session::runner::SessionTransportEvent {
-    let snapshot = &prepared.snapshot;
-    crate::session::runner::SessionTransportEvent::SessionResumed {
-        session_id: prepared.session_id.clone(),
-        branch_id: snapshot.branch_id.clone(),
-        messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
-        records: snapshot.records.clone(),
-        evidence_count: snapshot.snapshot.evidence.len(),
-        model_id: snapshot.latest_model.clone(),
-        token_usage,
-        runtime_context,
-        expert_models: crate::transcript::restore_latest_expert_models(&snapshot.records),
-    }
 }
 
 #[cfg(test)]
@@ -781,7 +769,7 @@ input_images = {supports_images}
                 let live = Arc::new(Mutex::new(TranscriptRecorder::create(dir.path()).unwrap()));
                 let prepared = prepare_resume_package(dir.path(), &id).unwrap();
                 let original_frames = prepared.snapshot.snapshot.active_protocol_frames();
-                let install = prepare_routed_resume_install(&agent, &live, prepared)
+                let install = prepare_routed_resume_install(&agent, &live, prepared, None)
                     .expect("restoring history does not decode image payloads");
                 let (_, usage) = install.commit(&mut agent, &live);
                 assert_eq!(live.lock().unwrap().session_id(), id);
@@ -864,7 +852,11 @@ input_images = {supports_images}
         assert_eq!(token_usage.output_tokens, 0);
     }
 
-    fn assert_invalid_routed_resume_is_atomic(recorded_model: &str) {
+    fn assert_unavailable_recorded_model_resume(
+        recorded_model: &str,
+        fallback_route: Option<ModelRoute>,
+        expected_route: ModelRoute,
+    ) {
         let sessions_dir = temp_dir();
         let mut target =
             TranscriptRecorder::create(&sessions_dir).expect("create target transcript");
@@ -882,39 +874,54 @@ input_images = {supports_images}
         let current_route = ModelRoute::new("primary", "shared");
         agent.set_primary_route(current_route.clone());
         agent.set_resolved_runtime_catalog(Some(routed_test_catalog()));
+        let mut accepted_routes = vec![current_route.clone()];
+        if let Some(fallback) = &fallback_route {
+            accepted_routes.push(fallback.clone());
+        }
         agent.set_primary_route_factory(Arc::new(SelectiveRouteFactory {
-            accepted_routes: vec![current_route.clone()],
+            accepted_routes,
             attempted_routes: Arc::new(Mutex::new(Vec::new())),
         }));
         let live = Arc::new(Mutex::new(
             TranscriptRecorder::create(&sessions_dir).expect("create live transcript"),
         ));
-        let live_session_id = live
-            .lock()
-            .expect("live transcript")
-            .session_id()
-            .to_string();
         let prepared =
             prepare_resume_package(&sessions_dir, target_session_id).expect("prepare resume");
 
-        install_prepared_routed_resume_for_agent(&mut agent, &live, prepared)
-            .expect_err("invalid routed resume must fail before commit");
-        assert_eq!(agent.primary_route(), Some(&current_route));
-        assert_eq!(agent.model(), "shared");
-        assert_eq!(
-            live.lock().expect("live transcript").session_id(),
-            live_session_id
+        let install =
+            prepare_routed_resume_install(&agent, &live, prepared, fallback_route.as_ref())
+                .expect("unavailable recorded model resumes");
+        install.commit(&mut agent, &live);
+
+        assert_eq!(agent.primary_route(), Some(&expected_route));
+        assert_eq!(agent.model(), expected_route.model.as_str());
+    }
+
+    #[test]
+    fn routed_resume_keeps_the_current_route_when_the_recorded_provider_is_gone() {
+        assert_unavailable_recorded_model_resume(
+            "missing/shared",
+            None,
+            ModelRoute::new("primary", "shared"),
         );
     }
 
     #[test]
-    fn routed_resume_fails_before_mutation_when_provider_route_is_invalid() {
-        assert_invalid_routed_resume_is_atomic("missing/shared");
+    fn routed_resume_keeps_the_current_route_when_the_recorded_model_is_gone() {
+        assert_unavailable_recorded_model_resume(
+            "primary/missing",
+            None,
+            ModelRoute::new("primary", "shared"),
+        );
     }
 
     #[test]
-    fn routed_resume_fails_before_mutation_when_model_is_missing() {
-        assert_invalid_routed_resume_is_atomic("primary/missing");
+    fn routed_resume_falls_back_to_the_configured_default_when_the_recorded_model_is_gone() {
+        assert_unavailable_recorded_model_resume(
+            "primary/missing",
+            Some(ModelRoute::new("primary", "gpt-5.5")),
+            ModelRoute::new("primary", "gpt-5.5"),
+        );
     }
 
     #[test]

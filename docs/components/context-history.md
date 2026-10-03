@@ -26,7 +26,7 @@ Historian 每次读取尚未整理的前缀片段。读取上限为该路由可�
 
 ## Historian 专家路由
 
-未指定配置时，Historian 默认使用主模型路由。用户也可以为其配置独立路由：
+Historian 的路由由配置决定，配置时必须同时写入 `provider` 与 `model`：
 
 ```toml
 [agents.historian]

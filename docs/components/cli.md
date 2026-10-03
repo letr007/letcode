@@ -76,7 +76,7 @@ letcode config validate
 letcode config validate ./my-custom-config.toml
 ```
 
-校验器会检查 TOML 语法、必填字段、服务商协议、模型配置引用以及专家路由规则。存在错误时，命令输出排查提示并返回非零状态码。
+校验器会检查 TOML 语法、必填字段、服务商协议、模型配置引用以及专家路由中的 `provider` 与 `model`。专家配置缺少 `provider` 时校验失败。存在错误时，命令输出排查提示并返回非零状态码。
 
 ### 5. 版本检查与自动升级
 

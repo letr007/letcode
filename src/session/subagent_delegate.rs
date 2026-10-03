@@ -26,7 +26,6 @@ pub(super) struct RunnerSubagentDelegate {
     #[cfg(test)]
     pub(super) background_child_started_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub(super) route_api_key_configured: indexmap::IndexMap<String, bool>,
-    pub(super) retained_session_routes: std::collections::HashSet<String>,
     pub(super) provider_api_key_hints: indexmap::IndexMap<String, String>,
     pub(super) api_key_hint: String,
     pub(super) background_control_tx:
@@ -343,7 +342,7 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                 .route_api_key_configured
                 .get(&route_display_name)
                 .copied()
-                .unwrap_or_else(|| self.retained_session_routes.contains(&route_display_name))
+                .unwrap_or(false)
             {
                 return Ok(self.missing_api_key_result(tool_name, agent_name, route_display_name));
             }

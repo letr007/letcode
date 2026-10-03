@@ -558,7 +558,7 @@ base_url = "https://test.example.invalid/v1"
                 Some(&configured_default),
                 true,
             )
-            .expect("configured default stays restorable for takeover"),
+            .expect("the recorded route stays restorable for takeover"),
             configured_default
         );
     }

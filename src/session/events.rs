@@ -172,10 +172,6 @@ pub(crate) enum SessionTransportEvent {
     ModelChanged {
         model_id: String,
     },
-    ExpertModelChanged {
-        agent_name: String,
-        model_id: String,
-    },
     ExpertAllowedModelsChanged {
         agent_name: String,
         model_ids: Vec<String>,
@@ -348,7 +344,6 @@ impl SessionTransportEvent {
             Self::HistorianStatus { .. }
             | Self::FastModeChanged { .. }
             | Self::ModelChanged { .. }
-            | Self::ExpertModelChanged { .. }
             | Self::ExpertAllowedModelsChanged { .. }
             | Self::PermissionModeChanged { .. }
             | Self::ReasoningEffortChanged { .. }
@@ -544,7 +539,6 @@ pub(super) fn wrap_child_session_transport_event(
         SessionTransportEvent::HistorianStatus { .. }
         | SessionTransportEvent::FastModeChanged { .. }
         | SessionTransportEvent::ModelChanged { .. }
-        | SessionTransportEvent::ExpertModelChanged { .. }
         | SessionTransportEvent::ExpertAllowedModelsChanged { .. }
         | SessionTransportEvent::PermissionModeChanged { .. }
         | SessionTransportEvent::ReasoningEffortChanged { .. }

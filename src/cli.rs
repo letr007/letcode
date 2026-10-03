@@ -924,8 +924,7 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
         }
         SessionCommand::SetPermissionMode(mode) => ReplCommand::PermissionSet(mode),
         SessionCommand::SetModel(model_id) => ReplCommand::ModelSet(model_id),
-        SessionCommand::SetExpertModel { .. }
-        | SessionCommand::SetExpertAllowedModels { .. } => ReplCommand::Unsupported(
+        SessionCommand::SetExpertAllowedModels { .. } => ReplCommand::Unsupported(
             "CLI does not support expert model selection yet; use the TUI.".into(),
         ),
         SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,

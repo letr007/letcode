@@ -230,7 +230,7 @@
     },
     "agents": {
       "type": "object",
-      "description": "Optional per-expert model routing. The key set is fixed; omitting provider makes the expert follow active_provider.",
+      "description": "Optional per-expert model routing. The key set is fixed.",
       "additionalProperties": false,
       "properties": {
         "explorer": { "$ref": "#/definitions/agentRoute" },
@@ -252,7 +252,7 @@
         "allowed_models": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[^/]+/.+$" },
-          "description": "Routes offered to a single agent__* delegation, written as provider/model. Does not change the expert default route."
+          "description": "The first item is the expert's default route and also the allowlist for model overrides in a single agent__* delegation, written as provider/model."
         }
       }
     },

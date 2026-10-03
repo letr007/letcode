@@ -115,8 +115,8 @@ pub(crate) struct AvailableExpert {
 }
 
 impl AvailableExpert {
-    /// Routes this expert accepts. Explicitly allowed models replace the configured
-    /// default route, which only applies while nothing is selected.
+    /// Routes this expert accepts. The first allowed model is the expert default;
+    /// the configured route applies only while nothing is allowed.
     pub(crate) fn model_summary(&self) -> String {
         if self.allowed_models.is_empty() {
             return self.route_id.clone();

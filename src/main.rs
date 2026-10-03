@@ -359,19 +359,10 @@ fn session_engine_config(
             })
             .collect(),
         new_session_default_route: config.active_route(),
-        new_session_default_expert_routes: supported_agent_names()
+        expert_default_routes: supported_agent_names()
             .filter_map(|agent_name| {
                 config
-                    .model_route_for(agent_name)
-                    .cloned()
-                    .map(|route| (agent_name.to_string(), route))
-            })
-            .collect(),
-        expert_model_routes: supported_agent_names()
-            .filter_map(|agent_name| {
-                config
-                    .model_route_for(agent_name)
-                    .cloned()
+                    .expert_route_for(agent_name)
                     .map(|route| (agent_name.to_string(), route))
             })
             .collect(),
@@ -385,14 +376,6 @@ fn session_engine_config(
                         .unwrap_or_default()
                         .to_vec(),
                 )
-            })
-            .collect(),
-        legacy_expert_models: supported_agent_names()
-            .filter(|agent_name| config.agents.follows_active_provider(agent_name))
-            .filter_map(|agent_name| {
-                config
-                    .model_route_for(agent_name)
-                    .map(|route| (agent_name.to_string(), route.model.clone()))
             })
             .collect(),
         providers: config.providers.clone(),
@@ -587,7 +570,7 @@ fn install_expert_route_factory(agent: &mut Agent, config: &AppConfig) -> Result
     let policies = supported_agent_names().map(|agent_name| {
         (
             agent_name.to_string(),
-            config.model_route_for(agent_name).cloned(),
+            config.expert_route_for(agent_name),
             config
                 .agents
                 .allowed_models_for(agent_name)

@@ -72,32 +72,6 @@ pub fn restore_latest_model(records: &[TranscriptRecord]) -> Option<String> {
     transcript_projection::restore_latest_model_projection(records)
 }
 
-pub fn restore_latest_expert_models(
-    records: &[TranscriptRecord],
-) -> indexmap::IndexMap<String, String> {
-    let mut models = indexmap::IndexMap::new();
-    for record in records {
-        if let TranscriptEvent::ExpertModelChanged { agent_name, model } = &record.event {
-            models.insert(agent_name.clone(), model.clone());
-        }
-    }
-    models
-}
-
-#[cfg(test)]
-pub(crate) fn restore_latest_expert_models_for_cursor(
-    session_id: &str,
-    records: &[TranscriptRecord],
-    cursor: transcript_projection::SessionContextCursor,
-) -> anyhow::Result<indexmap::IndexMap<String, String>> {
-    let snapshot = transcript_projection::build_session_context_snapshot(
-        session_id.to_string(),
-        records.to_vec(),
-        cursor,
-    )?;
-    Ok(restore_latest_expert_models(&snapshot.records))
-}
-
 pub fn restore_latest_permission_mode(records: &[TranscriptRecord]) -> Option<String> {
     transcript_projection::restore_latest_permission_mode_projection(records)
 }

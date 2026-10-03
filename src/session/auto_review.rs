@@ -877,7 +877,7 @@ mod tests {
             stale
                 .expect_err("old reviewer route must fail current policy")
                 .to_string()
-                .contains("historical model route 'old-provider/reviewer-model' is not allowed")
+                .contains("cannot resume: recorded route 'old-provider/reviewer-model'")
         );
 
         reviewer.clear_sticky();

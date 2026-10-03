@@ -222,7 +222,7 @@ namespace = "openai"
 
 ## 专家路由配置 `[agents.<expert>]`
 
-为特定内置专家指定独立的服务商与模型：
+为特定内置专家指定独立的服务商与模型。配置专家时必须同时写入 `provider` 与 `model`：
 
 ```toml
 [agents.explorer]
@@ -246,7 +246,7 @@ model = "gpt-5.5"
 7. `reviewer`：权限安全审查内部专家；
 8. `historian`：会话历史整理与上下文压缩内部专家。
 
-`allowed_models` 限制该专家在单次委派时允许动态覆盖的模型白名单。
+`allowed_models` 的第一项是该专家的默认路由，同时是单次 `agent__*` 委派可通过 `model` 参数覆盖时使用的白名单。`allowed_models` 为空时，按 `provider` 与 `model` 解析；未配置专家路由时，回落到配置中的新会话默认模型（`active_provider` 与其 `default_model`）。专家路由始终由配置决定，不支持会话级覆盖。
 
 ## 仿真伪装配置 `[fake]`
 

@@ -20,8 +20,6 @@ struct ExpertRoutePolicy {
 }
 
 impl ExpertRoutePolicy {
-    /// Route used when a delegation does not request one. Selecting allowed models
-    /// replaces the configured default route; the first selection wins.
     fn effective_default_route(&self) -> Option<&ModelRoute> {
         self.allowed_models.first().or(self.default_route.as_ref())
     }
@@ -173,21 +171,20 @@ impl SubagentChildFactory for ExpertRouteFactory {
             .get(&template.name)
             .ok_or_else(|| anyhow!("no route policy configured for expert '{}'", template.name))?;
         if let Some(route) = requested_route {
-            if takeover && parent.prepare_primary_route(route.clone()).is_ok() {
+            if takeover {
+                parent.prepare_primary_route(route.clone()).map_err(|error| {
+                    anyhow!(
+                        "expert '{}' cannot resume: recorded route '{}' is unavailable ({error}); start a new subagent session",
+                        template.name,
+                        route.display_name()
+                    )
+                })?;
                 return Ok(route.clone());
             }
             let allowed = policy.allowed_models.iter().any(|allowed| allowed == route);
-            // Takeover restores a route the child may have been created with: the
-            // effective default (a selected model or the configured one), the
-            // configured default itself, or the parent route when no default is set.
-            let default_takeover = takeover
-                && (policy.effective_default_route() == Some(route)
-                    || policy.default_route.as_ref() == Some(route)
-                    || (policy.default_route.is_none() && parent.primary_route() == Some(route)));
-            if !allowed && !default_takeover {
-                let action = if takeover { "historical" } else { "requested" };
+            if !allowed {
                 bail!(
-                    "{action} model route '{}' is not allowed for expert '{}'",
+                    "requested model route '{}' is not allowed for expert '{}'",
                     route.display_name(),
                     template.name
                 );

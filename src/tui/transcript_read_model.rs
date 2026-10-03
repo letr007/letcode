@@ -235,7 +235,6 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::TurnStarted(_)
             | TranscriptEvent::ModelChanged { .. }
             | TranscriptEvent::ReasoningEffortChanged { .. }
-            | TranscriptEvent::ExpertModelChanged { .. }
             | TranscriptEvent::PermissionModeChanged { .. }
             | TranscriptEvent::FakeClientChanged { .. }
             | TranscriptEvent::AutoContinuationScheduled { .. }

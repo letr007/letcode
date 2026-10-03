@@ -4663,13 +4663,6 @@ fn deferred_settings_use_last_write_wins_per_category() {
     enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
     enqueue_deferred_command(
         &mut commands,
-        SessionEngineCommand::SetExpertModel {
-            agent_name: "explorer".into(),
-            model_id: "explorer-first".into(),
-        },
-    );
-    enqueue_deferred_command(
-        &mut commands,
         SessionEngineCommand::SetExpertAllowedModels {
             agent_name: "explorer".into(),
             model_ids: vec!["allowed-first".into()],
@@ -4680,20 +4673,6 @@ fn deferred_settings_use_last_write_wins_per_category() {
         SessionEngineCommand::SetExpertAllowedModels {
             agent_name: "explorer".into(),
             model_ids: vec!["allowed-last".into()],
-        },
-    );
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetExpertModel {
-            agent_name: "reviewer".into(),
-            model_id: "reviewer-only".into(),
-        },
-    );
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetExpertModel {
-            agent_name: "explorer".into(),
-            model_id: "explorer-last".into(),
         },
     );
 
@@ -4711,16 +4690,6 @@ fn deferred_settings_use_last_write_wins_per_category() {
         commands.pop_front(),
         Some(SessionEngineCommand::SetExpertAllowedModels { agent_name, model_ids })
             if agent_name == "explorer" && model_ids == vec!["allowed-last"]
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetExpertModel { agent_name, model_id })
-            if agent_name == "reviewer" && model_id == "reviewer-only"
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetExpertModel { agent_name, model_id })
-            if agent_name == "explorer" && model_id == "explorer-last"
     ));
     assert!(commands.is_empty());
 }

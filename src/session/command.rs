@@ -43,10 +43,6 @@ pub enum SessionCommand {
     ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
-    SetExpertModel {
-        agent_name: String,
-        model_id: String,
-    },
     SetExpertAllowedModels {
         agent_name: String,
         model_ids: Vec<String>,
@@ -67,7 +63,6 @@ impl SessionCommand {
             Self::ViewChild { .. } | Self::ViewParent => ActiveTurnCommandDisposition::Immediate,
             Self::SetPermissionMode(_)
             | Self::SetModel(_)
-            | Self::SetExpertModel { .. }
             | Self::SetExpertAllowedModels { .. }
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)

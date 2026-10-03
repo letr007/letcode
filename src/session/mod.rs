@@ -48,7 +48,6 @@ pub(crate) use child_view::project_parent_session_view;
 pub(crate) use command::ActiveTurnCommandDisposition;
 pub use command::SessionCommand;
 pub use context_scope::sync_agent_context_scope_from_recorder;
-pub(crate) use coordinator::IdleDispatch;
 pub use coordinator::SessionCoordinator;
 pub use engine::{
     SessionEngine, SessionEngineConfig, SessionEngineIngress, SessionEngineProjection,

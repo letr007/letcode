@@ -73,7 +73,6 @@ impl SessionCoordinator {
     ///
     /// `sessions_dir` is required for child/parent view commands; when `None`,
     /// those commands resolve the directory from the live transcript path.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dispatch_idle_command(
         command: SessionCommand,
         agent: &mut Agent,
@@ -180,9 +179,9 @@ impl SessionCoordinator {
                 }
                 Ok(IdleDispatch::Handled)
             }
-            SessionCommand::SetModel(_)
-            | SessionCommand::SetExpertModel { .. }
-            | SessionCommand::SetExpertAllowedModels { .. } => Ok(IdleDispatch::NotIdle),
+            SessionCommand::SetModel(_) | SessionCommand::SetExpertAllowedModels { .. } => {
+                Ok(IdleDispatch::NotIdle)
+            }
             SessionCommand::ToggleFastMode => {
                 let Some(fast_mode) = agent.fast_mode() else {
                     let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
@@ -545,7 +544,7 @@ impl SessionCoordinator {
             let runtime_snapshot =
                 agent.validate_runtime_snapshot_restore(snapshot.snapshot.clone())?;
             let protocol_frames = runtime_snapshot.active_protocol_frames();
-            let route = prepare_restored_model_route(agent, snapshot.latest_model.as_deref())?;
+            let route = prepare_restored_model_route(agent, snapshot.latest_model.as_deref(), None);
             let fast_mode_model = route
                 .as_ref()
                 .map_or_else(|| agent.model(), |route| route.target_model());
@@ -631,8 +630,16 @@ impl SessionCoordinator {
                     let _ =
                         event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(message)));
                 }
-                let expert_models =
-                    crate::transcript::restore_latest_expert_models(&snapshot.records);
+                let expert_models = crate::delegation::supported_agent_names()
+                    .filter_map(|name| {
+                        let template = crate::agent::AgentTemplate::from_name(name)?;
+                        let route = crate::agent::AgentFactory::resolve_subagent_route(
+                            agent, &template, None, false,
+                        )
+                        .ok()?;
+                        Some((name.to_string(), route.display_name()))
+                    })
+                    .collect();
                 // Navigating can install a recorded permission mode, and that mode
                 // may differ from the one this process runs with. Frontends build
                 // their navigation report from `SessionResumed`, so the mode is
@@ -809,7 +816,6 @@ impl SessionCoordinator {
             | SessionCommand::DelegateSubagent { .. }
             | SessionCommand::Compact
             | SessionCommand::SetModel(_)
-            | SessionCommand::SetExpertModel { .. }
             | SessionCommand::SetExpertAllowedModels { .. }
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession

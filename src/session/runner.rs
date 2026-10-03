@@ -137,7 +137,6 @@ impl AgentRunner {
         self,
         runtime: SubagentPool,
         sessions_dir: PathBuf,
-        expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
         route_api_key_configured: indexmap::IndexMap<String, bool>,
         provider_api_key_hints: indexmap::IndexMap<String, String>,
         api_key_hint: String,
@@ -149,7 +148,6 @@ impl AgentRunner {
         self.with_subagent_runtime_inner(
             runtime,
             sessions_dir,
-            expert_model_routes,
             route_api_key_configured,
             provider_api_key_hints,
             api_key_hint,
@@ -163,7 +161,6 @@ impl AgentRunner {
         self,
         runtime: SubagentPool,
         sessions_dir: PathBuf,
-        expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
         route_api_key_configured: indexmap::IndexMap<String, bool>,
         provider_api_key_hints: indexmap::IndexMap<String, String>,
         api_key_hint: String,
@@ -187,10 +184,6 @@ impl AgentRunner {
                 #[cfg(test)]
                 background_child_started_tx,
                 route_api_key_configured,
-                retained_session_routes: expert_model_routes
-                    .into_values()
-                    .map(|route| route.display_name())
-                    .collect(),
                 provider_api_key_hints,
                 api_key_hint,
                 background_control_tx,
@@ -204,7 +197,6 @@ impl AgentRunner {
         self,
         runtime: SubagentPool,
         sessions_dir: PathBuf,
-        expert_model_routes: indexmap::IndexMap<String, crate::config::ModelRoute>,
         route_api_key_configured: indexmap::IndexMap<String, bool>,
         provider_api_key_hints: indexmap::IndexMap<String, String>,
         api_key_hint: String,
@@ -217,7 +209,6 @@ impl AgentRunner {
         self.with_subagent_runtime_inner(
             runtime,
             sessions_dir,
-            expert_model_routes,
             route_api_key_configured,
             provider_api_key_hints,
             api_key_hint,
@@ -1589,7 +1580,6 @@ mod tests {
                 ("primary/shared".into(), true),
                 ("expert/shared".into(), false),
             ]),
-            retained_session_routes: std::collections::HashSet::new(),
             provider_api_key_hints: indexmap::IndexMap::from([(
                 "expert".into(),
                 "Set EXPERT_API_KEY.".into(),
@@ -1851,32 +1841,6 @@ mod tests {
             .expect("credential denial includes route metadata");
         assert_eq!(data.get("route"), Some(&json!("expert/shared")));
         assert_eq!(data.get("agent_name"), Some(&json!("explorer")));
-    }
-
-    #[test]
-    fn retained_current_expert_route_keeps_its_session_credential() {
-        let mut parent = Agent::new("shared", 1, 1);
-        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
-        let retained = crate::config::ModelRoute::new("expert", "shared");
-        let mut delegate = credential_delegate(&mut parent, retained.clone(), Vec::new());
-        delegate
-            .route_api_key_configured
-            .shift_remove(&retained.display_name());
-        delegate
-            .retained_session_routes
-            .insert(retained.display_name());
-
-        let has_credential = delegate
-            .route_api_key_configured
-            .get(&retained.display_name())
-            .copied()
-            .unwrap_or_else(|| {
-                delegate
-                    .retained_session_routes
-                    .contains(&retained.display_name())
-            });
-
-        assert!(has_credential);
     }
 
     fn temp_transcript() -> Arc<Mutex<TranscriptRecorder>> {

@@ -1345,19 +1345,6 @@ impl TuiRuntime {
                 self.state.set_provider_label_from_model_route(model_id);
                 self.state.clear_pending_model_if(model_id);
             }
-            SessionTransportEvent::ExpertModelChanged {
-                agent_name,
-                model_id,
-            } => {
-                if let Some(expert) = self
-                    .available_experts
-                    .iter_mut()
-                    .find(|expert| expert.agent_name == *agent_name)
-                {
-                    expert.route_id = model_id.clone();
-                }
-                self.refresh_open_agent_picker();
-            }
             SessionTransportEvent::ExpertAllowedModelsChanged {
                 agent_name,
                 model_ids,
@@ -2437,8 +2424,7 @@ impl TuiRuntime {
                 // The optimistic fake badge is authoritative until the next
                 // successful selection; a failed toggle leaves the prior state.
             }
-            crate::session::SessionCommand::SetExpertModel { .. }
-            | crate::session::SessionCommand::SetExpertAllowedModels { .. }
+            crate::session::SessionCommand::SetExpertAllowedModels { .. }
             | crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
@@ -2477,8 +2463,7 @@ impl TuiRuntime {
                 self.state.set_pending_permission_mode(mode.to_string());
             }
             crate::session::SessionCommand::SetFakeClient(_) => {}
-            crate::session::SessionCommand::SetExpertModel { .. }
-            | crate::session::SessionCommand::SetExpertAllowedModels { .. }
+            crate::session::SessionCommand::SetExpertAllowedModels { .. }
             | crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
@@ -2840,15 +2825,6 @@ impl TuiRuntime {
         match command {
             SessionCommand::SubmitPrompt(_) => Ok(None),
             SessionCommand::SetModel(model_id) => self.handle_model_selection(model_id),
-            SessionCommand::SetExpertModel {
-                agent_name,
-                model_id,
-            } => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::SetExpertModel {
-                    agent_name,
-                    model_id,
-                },
-            ))),
             SessionCommand::SetExpertAllowedModels {
                 agent_name,
                 model_ids,

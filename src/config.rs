@@ -320,8 +320,7 @@ impl AppConfig {
         let permissions = build_permissions_config(raw.permissions.unwrap_or_default())?;
         let tools = build_tools_config(raw.tools.unwrap_or_default())?;
         let fake = build_fake_config(raw.fake.unwrap_or_default())?;
-        let agents =
-            build_agents_config(raw.agents.unwrap_or_default(), &active_provider, &providers)?;
+        let agents = build_agents_config(raw.agents.unwrap_or_default(), &providers)?;
         let mcp = raw
             .mcp
             .into_iter()
@@ -384,19 +383,14 @@ impl AppConfig {
         self.agents.route_for(agent_name)
     }
 
-    #[allow(dead_code)]
     pub fn expert_route_for(&self, agent_name: &str) -> Option<ModelRoute> {
         if !crate::delegation::supported_agent_names().any(|name| name == agent_name) {
             return None;
         }
-        self.model_route_for(agent_name)
-            .map(|route| {
-                if self.agents.follows_active_provider(agent_name) {
-                    ModelRoute::new(self.active_provider.clone(), route.model.clone())
-                } else {
-                    route.clone()
-                }
-            })
+        self.agents
+            .allowed_models_for(agent_name)
+            .and_then(|models| models.first().cloned())
+            .or_else(|| self.model_route_for(agent_name).cloned())
             .or_else(|| Some(self.active_route()))
     }
 }
@@ -456,12 +450,6 @@ impl AgentsConfig {
             .map(|config| config.allowed_models.as_slice())
     }
 
-    #[allow(dead_code)]
-    pub fn follows_active_provider(&self, agent_name: &str) -> bool {
-        self.config_for(agent_name)
-            .is_some_and(|config| config.follows_active_provider)
-    }
-
     fn config_for(&self, agent_name: &str) -> Option<&AgentConfig> {
         match agent_name {
             "explorer" => Some(&self.explorer),
@@ -486,8 +474,6 @@ impl AgentsConfig {
 pub struct AgentConfig {
     pub route: Option<ModelRoute>,
     pub allowed_models: Vec<ModelRoute>,
-    #[allow(dead_code)]
-    pub follows_active_provider: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1480,25 +1466,23 @@ fn build_mcp_server_config(
 
 fn build_agents_config(
     raw: RawAgentsConfig,
-    active_provider: &str,
     providers: &IndexMap<String, ProviderConfig>,
 ) -> Result<AgentsConfig> {
     Ok(AgentsConfig {
-        explorer: build_agent_config(raw.explorer, "explorer", active_provider, providers)?,
-        fixer: build_agent_config(raw.fixer, "fixer", active_provider, providers)?,
-        oracle: build_agent_config(raw.oracle, "oracle", active_provider, providers)?,
-        designer: build_agent_config(raw.designer, "designer", active_provider, providers)?,
-        librarian: build_agent_config(raw.librarian, "librarian", active_provider, providers)?,
-        general: build_agent_config(raw.general, "general", active_provider, providers)?,
-        reviewer: build_agent_config(raw.reviewer, "reviewer", active_provider, providers)?,
-        historian: build_agent_config(raw.historian, "historian", active_provider, providers)?,
+        explorer: build_agent_config(raw.explorer, "explorer", providers)?,
+        fixer: build_agent_config(raw.fixer, "fixer", providers)?,
+        oracle: build_agent_config(raw.oracle, "oracle", providers)?,
+        designer: build_agent_config(raw.designer, "designer", providers)?,
+        librarian: build_agent_config(raw.librarian, "librarian", providers)?,
+        general: build_agent_config(raw.general, "general", providers)?,
+        reviewer: build_agent_config(raw.reviewer, "reviewer", providers)?,
+        historian: build_agent_config(raw.historian, "historian", providers)?,
     })
 }
 
 fn build_agent_config(
     raw: Option<RawAgentConfig>,
     agent_name: &str,
-    active_provider: &str,
     providers: &IndexMap<String, ProviderConfig>,
 ) -> Result<AgentConfig> {
     let Some(raw) = raw else {
@@ -1553,11 +1537,10 @@ fn build_agent_config(
         .map(|value| required_non_empty(&format!("agents.{agent_name}.model"), value))
         .transpose()?;
 
-    let follows_active_provider = provider_name.is_none() && model.is_some();
     let route = match (provider_name, model) {
         (None, None) => None,
         (Some(provider), Some(model)) => Some(ModelRoute::new(provider, model)),
-        (None, Some(model)) => Some(ModelRoute::new(active_provider, model)),
+        (None, Some(_)) => bail!("agents.{agent_name}.model requires agents.{agent_name}.provider"),
         (Some(_), None) => bail!("agents.{agent_name}.provider requires agents.{agent_name}.model"),
     };
 
@@ -1580,7 +1563,6 @@ fn build_agent_config(
     Ok(AgentConfig {
         route,
         allowed_models,
-        follows_active_provider,
     })
 }
 
@@ -2751,6 +2733,7 @@ base_url = "https://example.invalid/v1"
         let loaded = AppConfig::load_from_path(write_temp_config(
             r#"active_provider = "primary"
 [agents.explorer]
+provider = "primary"
 model = "shared"
 [agents.fixer]
 provider = "expert"
@@ -2801,6 +2784,7 @@ base_url = "https://expert.invalid/v1"
         let loaded = AppConfig::load_from_path(write_temp_config(
             r#"active_provider = "primary"
 [agents.explorer]
+provider = "primary"
 model = "shared"
 allowed_models = ["expert/special"]
 [providers.primary]
@@ -2882,12 +2866,16 @@ base_url = "https://example.invalid"
 
     #[test]
     fn rejects_unknown_subagent_name_and_model_override() {
-        let unknown_agent = config("openai", "model", "[agents.nosuch]\nmodel = \"model\"");
+        let unknown_agent = config(
+            "openai",
+            "model",
+            "[agents.nosuch]\nprovider = \"openai\"\nmodel = \"model\"",
+        );
         assert!(AppConfig::load_from_path(write_temp_config(unknown_agent)).is_err());
         let unknown_model = config(
             "openai",
             "model",
-            "[agents.explorer]\nmodel = \"missing-model\"",
+            "[agents.explorer]\nprovider = \"openai\"\nmodel = \"missing-model\"",
         );
         assert!(AppConfig::load_from_path(write_temp_config(unknown_model)).is_err());
     }
@@ -2966,7 +2954,7 @@ base_url = "https://example.invalid"
     #[test]
     fn persists_expert_allowed_models_without_rewriting_unrelated_config() {
         let path = write_temp_config(
-            "# keep this comment\nactive_provider = \"primary\"\n\n[providers.primary]\nprotocol = \"responses\"\ndefault_model = \"old\"\nflavor = \"standard\"\n[providers.primary.auth]\ntype = \"bearer\"\ncredential = \"primary-key\"\n[providers.primary.endpoints]\nbase_url = \"https://primary.invalid/v1\"\n[providers.primary.models.old]\n\n[providers.expert]\nprotocol = \"responses\"\ndefault_model = \"shared\"\nflavor = \"standard\"\n[providers.expert.auth]\ntype = \"bearer\"\ncredential = \"expert-key\"\n[providers.expert.endpoints]\nbase_url = \"https://expert.invalid/v1\"\n[providers.expert.models.shared]\n\n[agents.explorer]\nmodel = \"old\"\n# preserve this trailing comment\n",
+            "# keep this comment\nactive_provider = \"primary\"\n\n[providers.primary]\nprotocol = \"responses\"\ndefault_model = \"old\"\nflavor = \"standard\"\n[providers.primary.auth]\ntype = \"bearer\"\ncredential = \"primary-key\"\n[providers.primary.endpoints]\nbase_url = \"https://primary.invalid/v1\"\n[providers.primary.models.old]\n\n[providers.expert]\nprotocol = \"responses\"\ndefault_model = \"shared\"\nflavor = \"standard\"\n[providers.expert.auth]\ntype = \"bearer\"\ncredential = \"expert-key\"\n[providers.expert.endpoints]\nbase_url = \"https://expert.invalid/v1\"\n[providers.expert.models.shared]\n\n[agents.explorer]\nprovider = \"primary\"\nmodel = \"old\"\n# preserve this trailing comment\n",
         );
         persist_expert_allowed_models(
             &path,

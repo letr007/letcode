@@ -55,10 +55,8 @@ pub(crate) fn apply_config_reload(
     config_path: &std::path::Path,
     model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
     route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
-    expert_model_routes: &mut indexmap::IndexMap<String, ModelRoute>,
-    new_session_default_expert_routes: &mut indexmap::IndexMap<String, ModelRoute>,
+    expert_default_routes: &mut indexmap::IndexMap<String, ModelRoute>,
     expert_allowed_models: &mut indexmap::IndexMap<String, Vec<ModelRoute>>,
-    legacy_expert_models: &mut indexmap::IndexMap<String, String>,
     providers: &mut indexmap::IndexMap<String, ProviderConfig>,
     global_retry: &mut RetryConfig,
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
@@ -97,25 +95,16 @@ pub(crate) fn apply_config_reload(
             })
         })
         .collect::<indexmap::IndexMap<_, _>>();
-    for route in expert_model_routes.values() {
-        if !next_route_api_key_configured.contains_key(&route.display_name()) {
-            let configured = providers
-                .get(&route.provider)
-                .is_some_and(|provider| !provider.api_key.trim().is_empty());
-            next_route_api_key_configured.insert(route.display_name(), configured);
-        }
-    }
     if !current_route_available {
         let configured = providers
             .get(&previous_active_route.provider)
             .is_some_and(|provider| !provider.api_key.trim().is_empty());
         next_route_api_key_configured.insert(previous_active_route.display_name(), configured);
     }
-    let next_new_session_default_expert_routes = crate::delegation::supported_agent_names()
+    let next_expert_default_routes = crate::delegation::supported_agent_names()
         .filter_map(|name| {
             config
-                .model_route_for(name)
-                .cloned()
+                .expert_route_for(name)
                 .map(|route| (name.to_string(), route))
         })
         .collect::<indexmap::IndexMap<_, _>>();
@@ -129,14 +118,6 @@ pub(crate) fn apply_config_reload(
                     .unwrap_or_default()
                     .to_vec(),
             )
-        })
-        .collect::<indexmap::IndexMap<_, _>>();
-    let next_legacy_expert_models = crate::delegation::supported_agent_names()
-        .filter(|name| config.agents.follows_active_provider(name))
-        .filter_map(|name| {
-            config
-                .model_route_for(name)
-                .map(|route| (name.to_string(), route.model.clone()))
         })
         .collect::<indexmap::IndexMap<_, _>>();
     let next_provider_api_key_hints = config
@@ -191,37 +172,6 @@ pub(crate) fn apply_config_reload(
         }
     }
     let primary_session_providers = session_providers.clone();
-    for route in expert_model_routes.values() {
-        if config.resolve_route(route).is_ok() {
-            continue;
-        }
-        let provider = providers.get(&route.provider).ok_or_else(|| {
-            anyhow!(
-                "current expert route provider '{}' is unavailable during configuration reload",
-                route.provider
-            )
-        })?;
-        if !provider.has_model(&route.model) {
-            bail!(
-                "current expert route '{}' is unavailable during configuration reload",
-                route.display_name()
-            );
-        }
-        session_providers
-            .entry(route.provider.clone())
-            .or_insert_with(|| provider.clone());
-        if let Some(session_provider) = session_providers.get_mut(&route.provider)
-            && !session_provider.has_model(&route.model)
-        {
-            let model = provider.models.get(&route.model).cloned().ok_or_else(|| {
-                anyhow!(
-                    "current expert route '{}' is unavailable during configuration reload",
-                    route.display_name()
-                )
-            })?;
-            session_provider.models.insert(route.model.clone(), model);
-        }
-    }
     let primary_factory = ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
         primary_session_providers,
         config.global.retry.clone(),
@@ -236,14 +186,14 @@ pub(crate) fn apply_config_reload(
         crate::delegation::supported_agent_names().map(|name| {
             (
                 name.to_string(),
-                expert_model_routes.get(name).cloned(),
+                next_expert_default_routes.get(name).cloned(),
                 next_expert_allowed_models
                     .get(name)
                     .cloned()
                     .unwrap_or_default(),
             )
         }),
-        &session_providers,
+        &config.providers,
         &config.global.retry,
     )?
     .with_runtime_catalog(config.runtime_catalog.clone());
@@ -269,9 +219,8 @@ pub(crate) fn apply_config_reload(
     let runtime_fingerprint_unchanged = runtime_catalog.fingerprint() == &next_runtime_fingerprint;
     let maps_unchanged = *model_routes == next_model_routes
         && *route_api_key_configured == next_route_api_key_configured
-        && *new_session_default_expert_routes == next_new_session_default_expert_routes
+        && *expert_default_routes == next_expert_default_routes
         && *expert_allowed_models == next_expert_allowed_models
-        && *legacy_expert_models == next_legacy_expert_models
         && *provider_api_key_hints == next_provider_api_key_hints
         && *global_retry == next_global_retry;
     let settings_unchanged = agent.compaction_config() == &config.global.compaction
@@ -366,14 +315,6 @@ pub(crate) fn apply_config_reload(
 
     *model_routes = next_model_routes;
     *route_api_key_configured = next_route_api_key_configured;
-    for route in expert_model_routes.values() {
-        let retained_credential = providers
-            .get(&route.provider)
-            .is_some_and(|provider| !provider.api_key.trim().is_empty());
-        route_api_key_configured
-            .entry(route.display_name())
-            .or_insert(retained_credential);
-    }
     if !current_route_available {
         let retained_credential = providers
             .get(&previous_active_route.provider)
@@ -382,7 +323,7 @@ pub(crate) fn apply_config_reload(
             .entry(previous_active_route.display_name())
             .or_insert(retained_credential);
     }
-    *new_session_default_expert_routes = next_new_session_default_expert_routes;
+    *expert_default_routes = next_expert_default_routes;
     let changed_expert_allowed_models = next_expert_allowed_models
         .iter()
         .filter(|(name, routes)| {
@@ -403,7 +344,6 @@ pub(crate) fn apply_config_reload(
         })
         .collect::<Vec<_>>();
     *expert_allowed_models = next_expert_allowed_models;
-    *legacy_expert_models = next_legacy_expert_models;
     *provider_api_key_hints = next_provider_api_key_hints;
     *providers = session_providers;
     *global_retry = next_global_retry;
@@ -510,62 +450,15 @@ pub(crate) fn active_route_has_api_key(
         .unwrap_or(true)
 }
 
-pub(crate) fn config_default_expert_routes_for_primary(
-    configured_expert_routes: &indexmap::IndexMap<String, ModelRoute>,
-    legacy_expert_models: &indexmap::IndexMap<String, String>,
-    primary_route: &ModelRoute,
-) -> indexmap::IndexMap<String, ModelRoute> {
-    let mut routes = configured_expert_routes.clone();
-    for (agent_name, model) in legacy_expert_models {
-        routes.insert(
-            agent_name.clone(),
-            ModelRoute::new(primary_route.provider.clone(), model.clone()),
-        );
-    }
-    routes
-}
-
 pub(crate) fn reviewer_policy_changed(
-    previous_primary_route: Option<&ModelRoute>,
-    current_primary_route: Option<&ModelRoute>,
-    previous_expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
-    current_expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
+    previous_expert_default_routes: &indexmap::IndexMap<String, ModelRoute>,
+    current_expert_default_routes: &indexmap::IndexMap<String, ModelRoute>,
     previous_expert_allowed_models: &indexmap::IndexMap<String, Vec<ModelRoute>>,
     current_expert_allowed_models: &indexmap::IndexMap<String, Vec<ModelRoute>>,
 ) -> bool {
-    previous_primary_route != current_primary_route
-        || previous_expert_model_routes.get("reviewer")
-            != current_expert_model_routes.get("reviewer")
+    previous_expert_default_routes.get("reviewer") != current_expert_default_routes.get("reviewer")
         || previous_expert_allowed_models.get("reviewer")
             != current_expert_allowed_models.get("reviewer")
-}
-
-pub(crate) fn expert_routes_after_primary_switch(
-    expert_model_routes: &indexmap::IndexMap<String, ModelRoute>,
-    legacy_expert_models: &indexmap::IndexMap<String, String>,
-    providers: &indexmap::IndexMap<String, ProviderConfig>,
-    primary_route: &ModelRoute,
-) -> Result<indexmap::IndexMap<String, ModelRoute>> {
-    let mut routes = expert_model_routes.clone();
-    let provider = providers.get(&primary_route.provider).ok_or_else(|| {
-        anyhow!(
-            "provider '{}' is not configured for expert route updates",
-            primary_route.provider
-        )
-    })?;
-    for (agent_name, model) in legacy_expert_models {
-        if !provider.has_model(model) {
-            bail!(
-                "expert '{agent_name}' model '{model}' is not configured for provider '{}'",
-                primary_route.provider
-            );
-        }
-        routes.insert(
-            agent_name.clone(),
-            ModelRoute::new(primary_route.provider.clone(), model.clone()),
-        );
-    }
-    Ok(routes)
 }
 
 #[cfg(test)]
@@ -666,47 +559,7 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn inherited_reviewer_policy_changes_when_primary_route_changes() {
-        let old_primary = ModelRoute::new("old", "shared");
-        let new_primary = ModelRoute::new("new", "shared");
-        let expert_routes = indexmap::IndexMap::new();
-        let allowed_models = indexmap::IndexMap::new();
-
-        assert!(reviewer_policy_changed(
-            Some(&old_primary),
-            Some(&new_primary),
-            &expert_routes,
-            &expert_routes,
-            &allowed_models,
-            &allowed_models,
-        ));
-    }
-
-    #[test]
-    fn configured_expert_defaults_do_not_inherit_current_session_overrides() {
-        let configured = indexmap::IndexMap::from([(
-            "reviewer".into(),
-            ModelRoute::new("configured", "reviewer"),
-        )]);
-        let legacy = indexmap::IndexMap::from([("explorer".into(), "legacy".into())]);
-        let primary = ModelRoute::new("next", "primary");
-
-        let routes = config_default_expert_routes_for_primary(&configured, &legacy, &primary);
-
-        assert_eq!(
-            routes.get("reviewer"),
-            Some(&ModelRoute::new("configured", "reviewer"))
-        );
-        assert_eq!(
-            routes.get("explorer"),
-            Some(&ModelRoute::new("next", "legacy"))
-        );
-        assert!(!routes.contains_key("fixer"));
-    }
-
-    #[test]
     fn unrelated_expert_reload_does_not_change_reviewer_policy() {
-        let primary = ModelRoute::new("primary", "shared");
         let previous_routes = indexmap::IndexMap::from([(
             "explorer".into(),
             ModelRoute::new("primary", "old-explorer"),
@@ -718,38 +571,10 @@ base_url = "https://example.invalid/v1"
         let allowed_models = indexmap::IndexMap::new();
 
         assert!(!reviewer_policy_changed(
-            Some(&primary),
-            Some(&primary),
             &previous_routes,
             &current_routes,
             &allowed_models,
             &allowed_models,
         ));
-    }
-
-    #[test]
-    fn primary_switch_rejects_missing_legacy_expert_model_without_mutating_routes() {
-        let routes = indexmap::IndexMap::from([(
-            "reviewer".into(),
-            ModelRoute::new("fixed", "reviewer-model"),
-        )]);
-        let legacy = indexmap::IndexMap::from([("explorer".into(), "legacy-model".into())]);
-        let providers = indexmap::IndexMap::from([("next".into(), provider(&["primary-model"]))]);
-
-        let error = expert_routes_after_primary_switch(
-            &routes,
-            &legacy,
-            &providers,
-            &ModelRoute::new("next", "primary-model"),
-        )
-        .expect_err("missing follows-active-provider model must fail before switching");
-
-        assert!(error.to_string().contains(
-            "expert 'explorer' model 'legacy-model' is not configured for provider 'next'"
-        ));
-        assert_eq!(
-            routes.get("reviewer"),
-            Some(&ModelRoute::new("fixed", "reviewer-model"))
-        );
     }
 }

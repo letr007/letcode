@@ -510,17 +510,6 @@ impl TranscriptRecorder {
         self.append_metadata(TranscriptEvent::SessionWorkspace { root: root.into() })
     }
 
-    pub fn record_expert_model_changed(
-        &mut self,
-        agent_name: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Result<()> {
-        self.append_metadata(TranscriptEvent::ExpertModelChanged {
-            agent_name: agent_name.into(),
-            model: model.into(),
-        })
-    }
-
     pub fn record_model_changed(
         &mut self,
         previous_model: impl Into<String>,
@@ -1767,7 +1756,6 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
         TranscriptEvent::SessionStarted { .. }
             | TranscriptEvent::ModelChanged { .. }
             | TranscriptEvent::ReasoningEffortChanged { .. }
-            | TranscriptEvent::ExpertModelChanged { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::SubagentResult { .. }
             | TranscriptEvent::ContextBranchCreated { .. }
