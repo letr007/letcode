@@ -2799,6 +2799,9 @@ impl TuiRuntime {
         }
 
         self.interrupt_confirmation_pending = false;
+        // Stop the visible stream now; the engine's Interrupted re-seals it idempotently.
+        self.end_pacing();
+        self.state.seal_active_reasoning(std::time::Instant::now());
         self.state
             .show_toast(self.state.t("runtime.interrupting"), ToastKind::Info);
         Ok(Some(RuntimeCommand::Interrupt))

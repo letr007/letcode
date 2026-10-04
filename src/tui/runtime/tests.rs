@@ -1941,6 +1941,100 @@ fn double_escape_confirms_running_turn_interrupt() {
     assert_eq!(second, Some(RuntimeCommand::Interrupt));
 }
 
+fn timeline_has_streaming_reasoning(runtime: &TuiRuntime) -> bool {
+    runtime
+        .state()
+        .timeline
+        .items()
+        .iter()
+        .any(|item| matches!(item, TimelineItem::Reasoning(reasoning) if reasoning.streaming))
+}
+
+fn timeline_assistant_text(runtime: &TuiRuntime) -> String {
+    runtime
+        .state()
+        .timeline
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Assistant(message) => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn second_escape_stops_pacing_and_seals_reasoning_before_interrupt() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state.phase = AppPhase::Running;
+    runtime
+        .state_mut()
+        .apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+            "reasoning-1",
+            "thinking",
+        )));
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("streamed text"),
+    ));
+
+    assert!(!runtime.assistant_typewriters.is_empty());
+    assert!(timeline_has_streaming_reasoning(&runtime));
+
+    let first = runtime
+        .handle_input_action(InputAction::Interrupt)
+        .expect("first esc succeeds");
+    assert_eq!(first, None);
+
+    let second = runtime
+        .handle_input_action(InputAction::Interrupt)
+        .expect("second esc confirms");
+    assert_eq!(second, Some(RuntimeCommand::Interrupt));
+
+    assert!(runtime.assistant_typewriters.is_empty());
+    assert!(!timeline_has_streaming_reasoning(&runtime));
+
+    let revealed = timeline_assistant_text(&runtime);
+    assert_eq!(revealed, "streamed text");
+    runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
+    assert_eq!(timeline_assistant_text(&runtime), revealed);
+}
+
+#[test]
+fn real_interrupted_after_second_escape_is_idempotent() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state.phase = AppPhase::Running;
+    runtime
+        .state_mut()
+        .apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+            "reasoning-1",
+            "thinking",
+        )));
+    runtime.consume_session_transport_event(SessionTransportEvent::AssistantDelta(
+        AssistantDeltaEvent::new("streamed text"),
+    ));
+
+    runtime
+        .handle_input_action(InputAction::Interrupt)
+        .expect("first esc succeeds");
+    let second = runtime
+        .handle_input_action(InputAction::Interrupt)
+        .expect("second esc confirms");
+    assert_eq!(second, Some(RuntimeCommand::Interrupt));
+
+    let items_before = runtime.state().timeline.items().len();
+    let text_before = timeline_assistant_text(&runtime);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+
+    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert!(runtime.assistant_typewriters.is_empty());
+    assert!(!timeline_has_streaming_reasoning(&runtime));
+    assert_eq!(runtime.state().timeline.items().len(), items_before);
+    assert_eq!(timeline_assistant_text(&runtime), text_before);
+}
+
 #[test]
 fn ctrl_c_arms_interrupt_confirmation_while_turn_is_running() {
     let mut runtime = runtime();

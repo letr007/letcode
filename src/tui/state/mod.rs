@@ -1754,6 +1754,16 @@ impl TuiState {
         }
     }
 
+    pub fn seal_active_reasoning(&mut self, observed_at: std::time::Instant) {
+        if self.is_read_only_child_view()
+            && let Some(child) = self.child_timeline.as_mut()
+        {
+            child.timeline.seal_active_reasoning(observed_at);
+            return;
+        }
+        self.timeline.seal_active_reasoning(observed_at);
+    }
+
     pub fn active_sidebar_model_token_usage(&self) -> Option<&ModelTokenUsage> {
         if self.is_read_only_child_view() {
             self.child_timeline
