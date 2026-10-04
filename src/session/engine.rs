@@ -249,7 +249,7 @@ impl SessionEngine {
         let subagent_runtime = SubagentPool::new();
         let child_live_text = crate::session::child_view::ChildLiveText::default();
         let (child_event_tx, child_event_rx) = mpsc::unbounded_channel();
-        spawn_child_event_forwarder(child_event_rx, event_tx.clone(), child_live_text.clone());
+        spawn_child_event_forwarder(child_event_rx, event_tx.clone());
         // The Jev backend records its reviews in a `reviewer` child session through
         // the same pool the expert backend uses. It is resolved here, where the
         // reviewer route is known and a client failure still reaches the caller
@@ -1214,39 +1214,12 @@ async fn refresh_visible_child_session_view(
     });
 }
 
-/// Taps child events for the live-text buffer. A child's answer is durable only
-/// once persisted, so a tool start or a terminal event drops the streaming tail.
-fn tap_child_live_text(
-    event: &SessionTransportEvent,
-    live_text: &crate::session::child_view::ChildLiveText,
-) {
-    let SessionTransportEvent::ChildSessionEvent {
-        child_session_id,
-        event,
-        ..
-    } = event
-    else {
-        return;
-    };
-    match event {
-        SessionEvent::AssistantDelta(delta) => live_text.append(child_session_id, &delta.delta),
-        SessionEvent::ToolStarted(_)
-        | SessionEvent::AssistantDone { .. }
-        | SessionEvent::Done
-        | SessionEvent::Error(_)
-        | SessionEvent::Interrupted => live_text.clear(child_session_id),
-        _ => {}
-    }
-}
-
 fn spawn_child_event_forwarder(
     mut child_event_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
-    live_text: crate::session::child_view::ChildLiveText,
 ) {
     tokio::spawn(async move {
         while let Some(event) = child_event_rx.recv().await {
-            tap_child_live_text(&event, &live_text);
             if session_transport_tx.send(event).is_err() {
                 break;
             }
@@ -1906,7 +1879,10 @@ async fn run_engine_loop(
                                         .as_millis()
                                 ),
                                 Some(transcript.clone()),
-                                Some(crate::session::subagent_event_sender(child_event_tx.clone())),
+                                Some(crate::session::subagent_event_sender((
+                                    child_event_tx.clone(),
+                                    Some(child_live_text.clone()),
+                                ))),
                             );
 
                             tokio::pin!(delegate);
@@ -2453,6 +2429,7 @@ async fn run_engine_loop(
                     transcript.clone(),
                 )
                     .with_session_title_event_sender(title_event_tx.clone())
+                    .with_child_live_text(child_live_text.clone())
                     .with_subagent_runtime(
                         subagent_runtime.clone(),
                         config.sessions_dir.clone(),
@@ -2543,7 +2520,6 @@ async fn run_engine_loop(
                                 // settled. This keeps external Done authoritative.
                             }
                             ActiveSessionOperation::RunnerEvent(event) => {
-                                tap_child_live_text(&event, &child_live_text);
                                 let _ = session_transport_tx.send(event);
                             }
                             ActiveSessionOperation::Completed(_) => {
@@ -2933,6 +2909,9 @@ mod tests {
     use super::*;
     use crate::agent::PrimaryRouteFactory;
     use crate::request_builder::ModelReasoningEffort;
+    use crate::session::runner::{
+        clear_live_text_at_child_terminal, clear_live_text_before_assistant_persist,
+    };
     use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3474,15 +3453,6 @@ base_url = "http://127.0.0.1:1"
         );
     }
 
-    fn child_delta(child_session_id: &str, delta: &str) -> SessionTransportEvent {
-        SessionTransportEvent::ChildSessionEvent {
-            child_session_id: child_session_id.into(),
-            agent_name: Some("explorer".into()),
-            parent_tool_call_id: None,
-            event: SessionEvent::AssistantDelta(crate::session::AssistantDeltaEvent::new(delta)),
-        }
-    }
-
     fn child_terminal(child_session_id: &str) -> SessionTransportEvent {
         SessionTransportEvent::ChildSessionEvent {
             child_session_id: child_session_id.into(),
@@ -3492,13 +3462,23 @@ base_url = "http://127.0.0.1:1"
         }
     }
 
-    /// A queued terminal child event must clear the streaming tail when the drain forwards it.
+    /// The producer drops a child's streaming tail when its turn ends, so the
+    /// queued drain forwards the terminal event with no live text behind it.
     #[tokio::test]
-    #[ignore = "boundary: completion drain bypasses the live-text tap for queued terminal child events"]
-    async fn completion_drain_clears_child_live_text_for_queued_terminal_events() {
+    async fn queued_terminal_child_events_leave_no_live_text() {
         let live_text = crate::session::child_view::ChildLiveText::default();
-        tap_child_live_text(&child_delta("child-1", "partial"), &live_text);
+        live_text.append("child-1", "partial");
         assert_eq!(live_text.get("child-1").as_deref(), Some("partial"));
+        clear_live_text_at_child_terminal(
+            &live_text,
+            "child-1",
+            &SessionTransportEvent::AssistantDone { message_id: None },
+        );
+        assert_eq!(
+            live_text.get("child-1"),
+            None,
+            "the producer clears the tail when the child's turn ends"
+        );
 
         let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
         let (session_tx, mut session_rx) = mpsc::unbounded_channel();
@@ -3514,17 +3494,30 @@ base_url = "http://127.0.0.1:1"
         assert_eq!(
             live_text.get("child-1"),
             None,
-            "a forwarded terminal child event must clear the streaming tail"
+            "a forwarded terminal child event must not leave a streaming tail"
         );
     }
 
-    /// A continuation without a tool boundary must not keep the persisted segment in live text.
+    /// Persisting an assistant message drops its live prefix, so a turn that
+    /// continues without a tool boundary keeps only the unpersisted tail: a
+    /// projection reading the journal plus live text sees the text once.
     #[test]
-    #[ignore = "boundary: an in-turn continuation without a tool boundary is not observed by the tap"]
-    fn tap_drops_the_persisted_prefix_when_a_turn_continues_without_a_tool_boundary() {
+    fn persisting_an_assistant_message_drops_its_live_prefix_before_the_continuation() {
         let live_text = crate::session::child_view::ChildLiveText::default();
-        tap_child_live_text(&child_delta("child-1", "persisted"), &live_text);
-        tap_child_live_text(&child_delta("child-1", "continued"), &live_text);
+        live_text.append("child-1", "persisted");
+        clear_live_text_before_assistant_persist(
+            &live_text,
+            "child-1",
+            &AgentEvent::AssistantMessage {
+                content: "persisted".into(),
+            },
+        );
+        assert_eq!(
+            live_text.get("child-1"),
+            None,
+            "the durable text must leave the live buffer at persistence"
+        );
+        live_text.append("child-1", "continued");
 
         assert_eq!(
             live_text.get("child-1").as_deref(),

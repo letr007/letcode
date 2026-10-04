@@ -8,6 +8,7 @@ use serde_json::json;
 use crate::agent::{
     Agent, SubagentDelegate, SubagentInvocation, subagent_tool_name_for_agent_name,
 };
+use crate::session::child_view::ChildLiveText;
 use crate::session::engine::{SessionEngineCommand, SessionEngineControl};
 use crate::subagent::{SubagentFailureKind, SubagentJob, SubagentPool, SubagentStatus};
 use crate::tool::ToolResult;
@@ -23,6 +24,7 @@ pub(super) struct RunnerSubagentDelegate {
     pub(super) transcript: Arc<Mutex<TranscriptRecorder>>,
     pub(super) event_tx: Option<SessionTransportEventSender>,
     pub(super) background_event_tx: Option<SessionTransportEventSender>,
+    pub(super) child_live_text: Option<ChildLiveText>,
     #[cfg(test)]
     pub(super) background_child_started_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub(super) route_api_key_configured: indexmap::IndexMap<String, bool>,
@@ -391,7 +393,7 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                 } else {
                     self.event_tx.clone()
                 }
-                .map(subagent_event_sender),
+                .map(|event_tx| subagent_event_sender((event_tx, self.child_live_text.clone()))),
             );
             let started = match started {
                 Ok(started) => started,

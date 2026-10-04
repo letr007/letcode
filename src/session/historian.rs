@@ -315,8 +315,9 @@ impl HistorianRuntime {
                             usage,
                         };
                         let report_json = serde_json::to_string(&report)?;
-                        child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(report_json.clone())?;
+                        // Clear before persisting: a projection must never see the durable record and the live accumulation together.
                         live_text.clear(&child_session_id);
+                        child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(report_json.clone())?;
                         for event in [
                             SessionEvent::AssistantDone { message_id: None },
                             SessionEvent::AssistantDelta(AssistantDeltaEvent::new(report_json)),

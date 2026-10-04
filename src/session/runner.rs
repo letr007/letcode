@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::agent::{Agent, AgentEvent, SubagentDelegate};
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::PermissionApproval;
+use crate::session::child_view::ChildLiveText;
 use crate::subagent::SubagentPool;
 use crate::subagent_events::SubagentEventSender;
 use crate::transcript::{
@@ -130,6 +131,7 @@ pub(crate) struct AgentRunner {
     permission_origin: Option<String>,
     parent_tool_call_id: Option<String>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate>>,
+    child_live_text: Option<ChildLiveText>,
 }
 
 impl AgentRunner {
@@ -181,6 +183,7 @@ impl AgentRunner {
                 transcript,
                 event_tx: self_.event_tx.clone(),
                 background_event_tx,
+                child_live_text: self_.child_live_text.clone(),
                 #[cfg(test)]
                 background_child_started_tx,
                 route_api_key_configured,
@@ -239,6 +242,7 @@ impl AgentRunner {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
+            child_live_text: None,
         }
     }
 
@@ -256,7 +260,13 @@ impl AgentRunner {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
+            child_live_text: None,
         }
+    }
+
+    pub fn with_child_live_text(mut self, child_live_text: ChildLiveText) -> Self {
+        self.child_live_text = Some(child_live_text);
+        self
     }
 
     pub fn with_session_title_event_sender(
@@ -279,6 +289,7 @@ impl AgentRunner {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
+            child_live_text: None,
         }
     }
 
@@ -297,6 +308,7 @@ impl AgentRunner {
             permission_origin: None,
             parent_tool_call_id: None,
             subagent_delegate: None,
+            child_live_text: None,
         }
     }
 
@@ -317,6 +329,7 @@ impl AgentRunner {
             permission_origin: Some(permission_origin.into()),
             parent_tool_call_id,
             subagent_delegate: None,
+            child_live_text: None,
         }
     }
 
@@ -691,6 +704,8 @@ where {
         let parent_tool_call_id = self.parent_tool_call_id.clone();
         let tool_batch_state =
             Arc::new(tokio::sync::Mutex::new(ToolBatchReconciliation::default()));
+        let child_live_text = self.child_live_text.clone();
+        let delta_live_text = child_live_text.clone();
         let response = agent
             .run_stream_content_with_interactions_async(
                 prompt_content.clone(),
@@ -699,8 +714,14 @@ where {
                     let child_session_id = child_session_id.clone();
                     let agent_name = agent_name.clone();
                     let parent_tool_call_id = parent_tool_call_id.clone();
+                    let live_text = delta_live_text.clone();
                     let delta = delta.to_string();
                     async move {
+                        if let (Some(live_text), Some(child_session_id)) =
+                            (live_text.as_ref(), child_session_id.as_deref())
+                        {
+                            live_text.append(child_session_id, &delta);
+                        }
                         send_scoped_event(
                             &sender,
                             child_session_id.as_deref(),
@@ -716,14 +737,25 @@ where {
                     let child_session_id = self.child_session_id.clone();
                     let agent_name = self.permission_origin.clone();
                     let parent_tool_call_id = self.parent_tool_call_id.clone();
+                    let child_live_text = child_live_text.clone();
                     move |event| {
                         let sender = sender.clone();
                         let transcript = transcript.clone();
                         let child_session_id = child_session_id.clone();
                         let agent_name = agent_name.clone();
                         let parent_tool_call_id = parent_tool_call_id.clone();
+                        let child_live_text = child_live_text.clone();
                         let tool_batch_state = Arc::clone(&tool_batch_state);
                         async move {
+                            if let (Some(live_text), Some(child_session_id)) =
+                                (child_live_text.as_ref(), child_session_id.as_deref())
+                            {
+                                clear_live_text_before_assistant_persist(
+                                    live_text,
+                                    child_session_id,
+                                    &event,
+                                );
+                            }
                             let journal_effect = match transcript.as_ref() {
                                 None => JournalEffect {
                                     persisted: false,
@@ -1316,6 +1348,9 @@ where {
 
     fn emit(&self, event: SessionTransportEvent) -> Result<()> {
         let event = if let Some(child_session_id) = &self.child_session_id {
+            if let Some(live_text) = &self.child_live_text {
+                clear_live_text_at_child_terminal(live_text, child_session_id, &event);
+            }
             wrap_child_session_transport_event(
                 child_session_id.clone(),
                 self.permission_origin.clone(),
@@ -1386,6 +1421,39 @@ fn error_event(error: &anyhow::Error) -> ErrorEvent {
     event.with_details(detail)
 }
 
+/// Live text holds only what the journal does not yet: drop the accumulated tail
+/// before the assistant message becomes durable so a projection cannot show the
+/// same text twice.
+pub(crate) fn clear_live_text_before_assistant_persist(
+    live_text: &ChildLiveText,
+    child_session_id: &str,
+    event: &AgentEvent,
+) {
+    if matches!(
+        event,
+        AgentEvent::AssistantMessage { .. } | AgentEvent::AssistantToolCallBatch { .. }
+    ) {
+        live_text.clear(child_session_id);
+    }
+}
+
+/// A child's streaming tail is only meaningful while its turn is live; drop it
+/// when the producer emits a terminal event so no partial text outlives the turn.
+pub(crate) fn clear_live_text_at_child_terminal(
+    live_text: &ChildLiveText,
+    child_session_id: &str,
+    event: &SessionTransportEvent,
+) {
+    if matches!(
+        event,
+        SessionTransportEvent::AssistantDone { .. }
+            | SessionTransportEvent::Error(_)
+            | SessionTransportEvent::Done
+    ) {
+        live_text.clear(child_session_id);
+    }
+}
+
 fn recorded_error_message(event: &ErrorEvent) -> String {
     match event.details.as_deref() {
         Some(details) if !details.is_empty() => {
@@ -1395,7 +1463,44 @@ fn recorded_error_message(event: &ErrorEvent) -> String {
     }
 }
 
-pub(crate) fn subagent_event_sender(event_tx: SessionTransportEventSender) -> SubagentEventSender {
+/// Source for [`subagent_event_sender`]. A bare sender carries no live text; a
+/// sender paired with [`ChildLiveText`] lets the child runner own its buffer.
+pub(crate) struct SubagentEventSenderSource {
+    event_tx: SessionTransportEventSender,
+    child_live_text: Option<ChildLiveText>,
+}
+
+impl From<SessionTransportEventSender> for SubagentEventSenderSource {
+    fn from(event_tx: SessionTransportEventSender) -> Self {
+        Self {
+            event_tx,
+            child_live_text: None,
+        }
+    }
+}
+
+impl From<(SessionTransportEventSender, Option<ChildLiveText>)> for SubagentEventSenderSource {
+    fn from(
+        (event_tx, child_live_text): (SessionTransportEventSender, Option<ChildLiveText>),
+    ) -> Self {
+        Self {
+            event_tx,
+            child_live_text,
+        }
+    }
+}
+
+pub(crate) fn subagent_event_sender(
+    source: impl Into<SubagentEventSenderSource>,
+) -> SubagentEventSender {
+    let source = source.into();
+    build_subagent_event_sender(source.event_tx, source.child_live_text)
+}
+
+fn build_subagent_event_sender(
+    event_tx: SessionTransportEventSender,
+    child_live_text: Option<ChildLiveText>,
+) -> SubagentEventSender {
     let status_tx = event_tx.clone();
     let error_tx = event_tx.clone();
     SubagentEventSender::new(
@@ -1428,6 +1533,10 @@ pub(crate) fn subagent_event_sender(event_tx: SessionTransportEventSender) -> Su
                         event_tx.clone(),
                         child_session_id,
                     )
+                };
+                let runner = match child_live_text.as_ref() {
+                    Some(live_text) => runner.with_child_live_text(live_text.clone()),
+                    None => runner,
                 };
                 let finalize_event_tx = event_tx.clone();
                 Box::pin(async move {
@@ -1588,6 +1697,7 @@ mod tests {
             background_control_tx: None,
             background_event_tx: None,
             background_child_started_tx: None,
+            child_live_text: None,
         }
     }
 
