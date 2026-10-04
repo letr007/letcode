@@ -46,6 +46,7 @@ pub enum SessionEvent {
         blockers: Vec<String>,
     },
     CompactionFailed,
+    CompactionCancelled,
     RuntimeContextUpdated(RuntimeContextUpdatedEvent),
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),

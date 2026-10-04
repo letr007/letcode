@@ -4275,14 +4275,23 @@ mod tests {
     }
 
     #[test]
-    fn compaction_started_clears_stale_usage_and_marks_active() {
+    fn compaction_started_preserves_token_usage_and_marks_active() {
         let mut state = TuiState::default();
-        state.set_token_usage(ModelTokenUsage {
+        state.apply_live_token_usage(ModelTokenUsage {
             used_tokens: 1_000,
             context_window_tokens: 10_000,
             input_tokens: 900,
             output_tokens: 100,
             cached_tokens: 400,
+            cache_report: None,
+            prompt_composition: Vec::new(),
+        });
+        state.sidebar_model_token_usage = Some(ModelTokenUsage {
+            used_tokens: 800,
+            context_window_tokens: 10_000,
+            input_tokens: 700,
+            output_tokens: 100,
+            cached_tokens: 200,
             cache_report: None,
             prompt_composition: Vec::new(),
         });
@@ -4292,7 +4301,18 @@ mod tests {
 
         assert!(state.compaction_active);
         assert_eq!(state.compaction_animation_start_frame, 77);
-        assert_eq!(state.model_token_usage, None);
+        assert_eq!(
+            state
+                .active_model_token_usage()
+                .map(|usage| usage.used_tokens),
+            Some(1_000)
+        );
+        assert_eq!(
+            state
+                .active_sidebar_model_token_usage()
+                .map(|usage| usage.used_tokens),
+            Some(800)
+        );
 
         state.apply_event(SessionEvent::CompactionCommitted {
             summary: Some("compacted".into()),
@@ -4330,6 +4350,29 @@ mod tests {
         state.apply_event(SessionEvent::CompactionStarted);
         state.apply_event(SessionEvent::Interrupted);
         assert!(!state.compaction_active);
+    }
+
+    #[test]
+    fn compaction_cancelled_clears_streaming_block_without_error_toast() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::CompactionStarted);
+        state.apply_event(SessionEvent::CompactionPreviewDelta {
+            delta: "working summary".into(),
+        });
+        assert!(state.compaction_active);
+
+        state.apply_event(SessionEvent::CompactionCancelled);
+
+        assert!(!state.compaction_active);
+        assert!(
+            !state
+                .timeline
+                .items()
+                .iter()
+                .any(|item| matches!(item, crate::tui::timeline::TimelineItem::Compaction(_))),
+            "cancelled compaction must not leave a compaction block"
+        );
+        assert!(state.toast().is_none());
     }
 
     #[test]

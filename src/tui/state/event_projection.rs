@@ -187,8 +187,7 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             ));
         }
         SessionEvent::CompactionStarted => {
-            // 指示条转为往返扫描动画；清掉过期的 token 数字，等压缩后新用量到达再恢复。
-            *projection.model_token_usage = None;
+            // Usage is the last known context fact; a commit sends fresh numbers.
             *projection.compaction_animation_start_frame = *projection.status_spinner_frame;
             *projection.compaction_active = true;
             projection.timeline.start_compaction();
@@ -221,6 +220,10 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
                 ToastKind::Error,
                 ToastState::DEFAULT_TICKS,
             ));
+        }
+        SessionEvent::CompactionCancelled => {
+            *projection.compaction_active = false;
+            projection.timeline.finish_compaction(false);
         }
         SessionEvent::ProcessIssue(issue) => {
             *projection.phase = AppPhase::Running;

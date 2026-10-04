@@ -919,7 +919,7 @@ where
                     }
                 }
             } else {
-                let _ = session_transport_tx.send(SessionTransportEvent::CompactionFailed);
+                let _ = session_transport_tx.send(SessionTransportEvent::CompactionCancelled);
             }
         }
         ManualCompactionOperation::Completed(Ok(ManualCompactionOutcome::Compacted { .. })) => {
@@ -3200,6 +3200,69 @@ base_url = "http://127.0.0.1:1"
         })
         .await
         .expect("new-session history preparation timed out");
+    }
+
+    #[tokio::test]
+    async fn interrupted_manual_compaction_reports_cancelled() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            fs::write(
+                &config_path,
+                r#"
+active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1"
+[providers.test.models.model]
+"#,
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).unwrap();
+            let mut recorder = TranscriptRecorder::create(&config.global.sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            let transcript = Arc::new(StdMutex::new(recorder));
+            let mut agent = Agent::new("model", 1, 1);
+            agent.set_primary_route(ModelRoute::new("test", "model"));
+            agent.set_resolved_model_route(Some(Arc::new(
+                config
+                    .runtime_catalog
+                    .route("test", "model")
+                    .unwrap()
+                    .clone(),
+            )));
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript, "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+            ingress.submit(SessionCommand::Compact).unwrap();
+            ingress.submit(SessionCommand::Interrupt).unwrap();
+
+            let mut cancelled = false;
+            loop {
+                match events.recv().await.expect("engine event stream") {
+                    SessionTransportEvent::CompactionCancelled => cancelled = true,
+                    SessionTransportEvent::CompactionFailed => {
+                        panic!("interrupted manual compaction must report cancellation")
+                    }
+                    SessionTransportEvent::Done => break,
+                    _ => {}
+                }
+            }
+            assert!(cancelled, "interrupt must emit CompactionCancelled");
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+        })
+        .await
+        .expect("interrupted manual compaction timed out");
     }
 
     #[tokio::test]

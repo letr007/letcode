@@ -238,6 +238,7 @@ pub(crate) enum SessionTransportEvent {
         blockers: Vec<String>,
     },
     CompactionFailed,
+    CompactionCancelled,
     RuntimeContextUpdated(RuntimeContextUpdatedEvent),
     #[allow(dead_code)]
     // Transport variants retained for context projection consumers.
@@ -395,6 +396,7 @@ impl SessionTransportEvent {
                 blockers: blockers.clone(),
             }),
             Self::CompactionFailed => Some(SessionEvent::CompactionFailed),
+            Self::CompactionCancelled => Some(SessionEvent::CompactionCancelled),
             Self::McpToolsDiscovered(_)
             | Self::McpServerUpdated(_)
             | Self::McpServerUpdating { .. }
@@ -600,6 +602,12 @@ pub(super) fn wrap_child_session_transport_event(
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
             event: SessionEvent::CompactionFailed,
+        },
+        SessionTransportEvent::CompactionCancelled => SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
+            event: SessionEvent::CompactionCancelled,
         },
         SessionTransportEvent::RuntimeContextUpdated(event) => {
             SessionTransportEvent::ChildSessionEvent {
