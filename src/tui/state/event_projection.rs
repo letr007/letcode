@@ -407,8 +407,6 @@ pub(super) fn project_child_timeline_state(
         timeline: Timeline::from_transcript_records(records),
         model: child_transcript_model(records),
         record_count: records.len(),
-        snapshot_loaded: true,
-        snapshot_dirty: false,
         context: project_context_pane(records)?,
         active_session: true,
         latest_auto_continue: AutoContinueState::default(),

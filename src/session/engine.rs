@@ -247,6 +247,9 @@ impl SessionEngine {
             let _ = mcp_tools_tx.send(result);
         });
         let subagent_runtime = SubagentPool::new();
+        let child_live_text = crate::session::child_view::ChildLiveText::default();
+        let (child_event_tx, child_event_rx) = mpsc::unbounded_channel();
+        spawn_child_event_forwarder(child_event_rx, event_tx.clone(), child_live_text.clone());
         // The Jev backend records its reviews in a `reviewer` child session through
         // the same pool the expert backend uses. It is resolved here, where the
         // reviewer route is known and a client failure still reaches the caller
@@ -256,7 +259,7 @@ impl SessionEngine {
                 crate::session::jev_review::JevReviewer::new(
                     jev,
                     Arc::clone(&transcript),
-                    Some(event_tx.clone()),
+                    Some(child_event_tx.clone()),
                     subagent_runtime.clone(),
                     config.sessions_dir.clone(),
                 )
@@ -278,6 +281,8 @@ impl SessionEngine {
             event_tx.clone(),
             title_event_tx,
             subagent_runtime,
+            child_live_text,
+            child_event_tx,
         ));
         Ok((
             Self {
@@ -713,6 +718,7 @@ pub(crate) async fn run_manual_compaction(
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
     visible_child_session_id: &mut Option<String>,
     visible_child_view_state: &mut Option<VisibleChildViewState>,
+    child_live_text: &crate::session::child_view::ChildLiveText,
 ) -> bool
 where
 {
@@ -834,6 +840,7 @@ where
                             anchor_child_session_id.as_deref(),
                             visible_child_session_id,
                             visible_child_view_state,
+                            child_live_text,
                         );
                     }
                     ManualCompactionNavigation::ViewParent => {
@@ -997,6 +1004,7 @@ fn apply_engine_view_child(
     anchor_child_session_id: Option<&str>,
     visible_child_session_id: &mut Option<String>,
     visible_child_view_state: &mut Option<VisibleChildViewState>,
+    child_live_text: &crate::session::child_view::ChildLiveText,
 ) {
     if navigation == crate::command::ChildNavigation::Toggle && visible_child_session_id.is_some() {
         crate::session::SessionCoordinator::emit_view_parent(
@@ -1017,6 +1025,7 @@ fn apply_engine_view_child(
             sessions_dir,
             effective_nav,
             anchor_child_session_id,
+            child_live_text,
         );
         *visible_child_view_state = None;
     }
@@ -1109,6 +1118,7 @@ async fn refresh_visible_child_session_view(
     visible_child_session_id: &mut Option<String>,
     visible_child_view_state: &mut Option<VisibleChildViewState>,
     visible_child_view_cache: &mut Option<VisibleChildViewCache>,
+    child_live_text: &crate::session::child_view::ChildLiveText,
 ) {
     let Some(child_session_id) = visible_child_session_id.as_deref() else {
         return;
@@ -1185,6 +1195,12 @@ async fn refresh_visible_child_session_view(
         }
     };
     *visible_child_view_state = Some(view_state);
+    let in_progress_assistant_text = if resolution.child.status == "running" {
+        child_live_text.get(&resolution.child.child_session_id)
+    } else {
+        child_live_text.clear(&resolution.child.child_session_id);
+        None
+    };
     let _ = session_transport_tx.send(SessionTransportEvent::ChildSessionViewed {
         parent_session_id: resolution.parent_session_id,
         child_session_id: resolution.child.child_session_id,
@@ -1194,6 +1210,47 @@ async fn refresh_visible_child_session_view(
         pool_ordinal: resolution.child.pool_ordinal,
         records,
         runtime_context,
+        in_progress_assistant_text,
+    });
+}
+
+/// Taps child events for the live-text buffer. A child's answer is durable only
+/// once persisted, so a tool start or a terminal event drops the streaming tail.
+fn tap_child_live_text(
+    event: &SessionTransportEvent,
+    live_text: &crate::session::child_view::ChildLiveText,
+) {
+    let SessionTransportEvent::ChildSessionEvent {
+        child_session_id,
+        event,
+        ..
+    } = event
+    else {
+        return;
+    };
+    match event {
+        SessionEvent::AssistantDelta(delta) => live_text.append(child_session_id, &delta.delta),
+        SessionEvent::ToolStarted(_)
+        | SessionEvent::AssistantDone { .. }
+        | SessionEvent::Done
+        | SessionEvent::Error(_)
+        | SessionEvent::Interrupted => live_text.clear(child_session_id),
+        _ => {}
+    }
+}
+
+fn spawn_child_event_forwarder(
+    mut child_event_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
+    session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
+    live_text: crate::session::child_view::ChildLiveText,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = child_event_rx.recv().await {
+            tap_child_live_text(&event, &live_text);
+            if session_transport_tx.send(event).is_err() {
+                break;
+            }
+        }
     });
 }
 
@@ -1228,6 +1285,8 @@ async fn run_engine_loop(
     session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     title_event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
     subagent_runtime: SubagentPool,
+    child_live_text: crate::session::child_view::ChildLiveText,
+    child_event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
 ) {
     let transcript = transcript;
     let mut agent = agent;
@@ -1249,19 +1308,22 @@ async fn run_engine_loop(
                 subagent_runtime.clone(),
                 config.sessions_dir.clone(),
                 Arc::clone(&transcript),
-                Some(session_transport_tx.clone()),
+                Some(child_event_tx.clone()),
                 Arc::clone(&route_api_key_configured),
                 Arc::clone(&provider_api_key_hints),
                 config.api_key_hint.clone(),
             )),
         };
     agent.set_auto_review_service(Some(std::sync::Arc::clone(&auto_review_service)));
-    agent.historian_runtime = Some(Arc::new(crate::session::historian::HistorianRuntime::new(
-        subagent_runtime.clone(),
-        config.sessions_dir.clone(),
-        Arc::clone(&transcript),
-        session_transport_tx.clone(),
-    )));
+    agent.historian_runtime = Some(Arc::new(
+        crate::session::historian::HistorianRuntime::new(
+            subagent_runtime.clone(),
+            config.sessions_dir.clone(),
+            Arc::clone(&transcript),
+            session_transport_tx.clone(),
+        )
+        .with_live_text(child_live_text.clone()),
+    ));
     let mut memory_worker = crate::project_memory::MemoryWorker::default();
     let memory_refresh_period = std::time::Duration::from_secs(30);
     let mut memory_refresh = tokio::time::interval_at(
@@ -1530,6 +1592,7 @@ async fn run_engine_loop(
                             anchor_child_session_id.as_deref(),
                             &mut visible_child_session_id,
                             &mut visible_child_view_state,
+                            &child_live_text,
                         );
                     } else {
                         let history_navigation = matches!(
@@ -1546,6 +1609,7 @@ async fn run_engine_loop(
                             &transcript,
                             &session_transport_tx,
                             Some(config.sessions_dir.as_path()),
+                            &child_live_text,
                         );
                         if let Err(error) = dispatch_result {
                             let _ = session_transport_tx.send(SessionTransportEvent::Error(
@@ -1842,7 +1906,7 @@ async fn run_engine_loop(
                                         .as_millis()
                                 ),
                                 Some(transcript.clone()),
-                                Some(crate::session::subagent_event_sender(session_transport_tx.clone())),
+                                Some(crate::session::subagent_event_sender(child_event_tx.clone())),
                             );
 
                             tokio::pin!(delegate);
@@ -1953,6 +2017,7 @@ async fn run_engine_loop(
                                             anchor_child_session_id.as_deref(),
                                             &mut visible_child_session_id,
                                             &mut visible_child_view_state,
+                                            &child_live_text,
                                         );
                                     }
                                     ActiveSessionOperation::Command(Some(
@@ -2077,6 +2142,7 @@ async fn run_engine_loop(
                             &mut deferred_commands,
                             &mut visible_child_session_id,
                             &mut visible_child_view_state,
+                            &child_live_text,
                         )
                         .await;
                         if shutdown {
@@ -2477,6 +2543,7 @@ async fn run_engine_loop(
                                 // settled. This keeps external Done authoritative.
                             }
                             ActiveSessionOperation::RunnerEvent(event) => {
+                                tap_child_live_text(&event, &child_live_text);
                                 let _ = session_transport_tx.send(event);
                             }
                             ActiveSessionOperation::Completed(_) => {
@@ -2510,6 +2577,7 @@ async fn run_engine_loop(
                                         anchor_child_session_id.as_deref(),
                                         &mut visible_child_session_id,
                                         &mut visible_child_view_state,
+                                        &child_live_text,
                                     );
                                 }
                                 Some(SessionEngineCommand::ViewParent) => {
@@ -2747,6 +2815,7 @@ async fn run_engine_loop(
                     &mut visible_child_session_id,
                     &mut visible_child_view_state,
                     &mut visible_child_view_cache,
+                    &child_live_text,
                 ).await;
             }
             discovery = async {
@@ -3313,6 +3382,7 @@ base_url = "http://127.0.0.1:1"
             &mut visible_child_session_id,
             &mut view_state,
             &mut cache,
+            &crate::session::child_view::ChildLiveText::default(),
         )
         .await;
         assert_eq!(
@@ -3331,6 +3401,7 @@ base_url = "http://127.0.0.1:1"
             &mut visible_child_session_id,
             &mut view_state,
             &mut cache,
+            &crate::session::child_view::ChildLiveText::default(),
         )
         .await;
         assert!(
@@ -3355,6 +3426,7 @@ base_url = "http://127.0.0.1:1"
             &mut visible_child_session_id,
             &mut view_state,
             &mut cache,
+            &crate::session::child_view::ChildLiveText::default(),
         )
         .await;
         let (_, index, total) =
@@ -3369,6 +3441,7 @@ base_url = "http://127.0.0.1:1"
             &mut visible_child_session_id,
             &mut view_state,
             &mut cache,
+            &crate::session::child_view::ChildLiveText::default(),
         )
         .await;
         let (child_session_id, index, total) = child_view_event(
@@ -3388,6 +3461,7 @@ base_url = "http://127.0.0.1:1"
             &mut visible_child_session_id,
             &mut view_state,
             &mut cache,
+            &crate::session::child_view::ChildLiveText::default(),
         )
         .await;
         assert_eq!(

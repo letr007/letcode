@@ -298,6 +298,7 @@ pub(crate) enum SessionTransportEvent {
         pool_ordinal: u32,
         records: Vec<TranscriptRecord>,
         runtime_context: RuntimeActiveContext,
+        in_progress_assistant_text: Option<String>,
     },
     /// Parent transcript view navigation, symmetrical to [`Self::ChildSessionViewed`].
     /// Unlike [`Self::SessionResumed`] this is not a session restore: frontends must

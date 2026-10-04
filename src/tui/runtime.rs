@@ -1728,6 +1728,7 @@ impl TuiRuntime {
                 pool_ordinal,
                 records,
                 runtime_context,
+                in_progress_assistant_text,
             } => {
                 if let Err(error) = self
                     .state
@@ -1740,6 +1741,7 @@ impl TuiRuntime {
                         *total,
                         *pool_ordinal,
                         runtime_context.clone(),
+                        in_progress_assistant_text.clone(),
                     )
                 {
                     self.state.show_toast(

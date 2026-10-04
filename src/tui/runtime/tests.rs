@@ -1833,6 +1833,7 @@ fn parent_view_refresh_without_usage_preserves_known_parent_usage() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -1866,6 +1867,7 @@ fn parent_view_refresh_preserves_output_token_rate() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -1996,6 +1998,7 @@ fn ctrl_c_does_not_quit_while_a_child_session_is_running() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -2573,6 +2576,7 @@ fn child_view_transport_navigation_does_not_show_toasts() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -4120,6 +4124,7 @@ fn child_session_viewed_does_not_clear_runtime_pending_permission() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -5514,6 +5519,7 @@ fn repeated_child_view_projection_does_not_reset_live_child_state() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: Some("live child output".into()),
         records: vec![],
         runtime_context: event_context("child-session", 1),
     };
@@ -5525,7 +5531,18 @@ fn repeated_child_view_projection_does_not_reset_live_child_state() {
     );
     runtime.apply_session_transport_event(event);
 
-    assert!(runtime.state().child_view_has_unpersisted_projection());
+    // The projection is the complete current state, so re-applying it restores
+    // the live output instead of resetting it.
+    let live_outputs = runtime
+        .state()
+        .active_timeline()
+        .items()
+        .iter()
+        .filter(|item| {
+            matches!(item, TimelineItem::Assistant(message) if message.text == "live child output")
+        })
+        .count();
+    assert_eq!(live_outputs, 1);
 }
 
 #[test]
@@ -5538,6 +5555,7 @@ fn child_view_keeps_the_stream_and_ends_with_the_recorded_report() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6227,6 +6245,7 @@ fn child_view_navigation_preserves_complete_structured_result() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6275,6 +6294,7 @@ fn child_view_navigation_preserves_complete_structured_result() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: Some(result.clone()),
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6311,6 +6331,7 @@ fn deferred_child_view_navigation_completes_with_ordered_structured_result() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6350,7 +6371,16 @@ fn deferred_child_view_navigation_completes_with_ordered_structured_result() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
-        records: vec![],
+        in_progress_assistant_text: None,
+        records: vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: result.clone(),
+            },
+        }],
         runtime_context: event_context("child-session", 1),
     });
 
@@ -6387,6 +6417,7 @@ fn child_delta_flush_before_parent_view_preserves_child_projection() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     })
@@ -6419,6 +6450,7 @@ fn child_delta_flush_before_parent_view_preserves_child_projection() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: Some("child live delta".into()),
         records: vec![],
         runtime_context: event_context("child-session", 1),
     })
@@ -6454,6 +6486,7 @@ fn child_interrupt_does_not_drop_parent_tool_terminal_state_after_parent_view() 
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     })
@@ -6520,6 +6553,7 @@ fn parent_view_navigation_with_live_parent_restores_parent_view() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6664,6 +6698,7 @@ fn unseen_child_terminal_then_first_view_loads_snapshot_history() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![TranscriptRecord {
             session_id: "background-child".into(),
             sequence: 1,
@@ -6718,6 +6753,7 @@ fn unloaded_child_partial_timeline_is_replaced_by_complete_first_view_snapshot()
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records,
         runtime_context: event_context("background-child", 50),
     });
@@ -6743,6 +6779,7 @@ fn child_context_update_does_not_block_later_snapshot_growth() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6765,6 +6802,7 @@ fn child_context_update_does_not_block_later_snapshot_growth() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![TranscriptRecord {
             session_id: "child-session".into(),
             sequence: 1,
@@ -6794,6 +6832,7 @@ fn child_terminal_snapshot_refresh_preserves_canonical_projection() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     });
@@ -6816,15 +6855,27 @@ fn child_terminal_snapshot_refresh_preserves_canonical_projection() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
-        records: vec![TranscriptRecord {
-            session_id: "child-session".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::SessionStarted {
-                model: "gpt-child".into(),
+        in_progress_assistant_text: None,
+        records: vec![
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::SessionStarted {
+                    model: "gpt-child".into(),
+                },
             },
-        }],
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "final live output".into(),
+                },
+            },
+        ],
         runtime_context: event_context("child-session", 1),
     });
     render_runtime_transcript(&mut runtime);
@@ -6854,6 +6905,7 @@ fn child_view_snapshot_growth_preserves_unpersisted_live_delta() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: None,
         records: vec![],
         runtime_context: event_context("child-session", 1),
     })
@@ -6872,6 +6924,7 @@ fn child_view_snapshot_growth_preserves_unpersisted_live_delta() {
         index: 0,
         total: 1,
         pool_ordinal: 1,
+        in_progress_assistant_text: Some("unpersisted live delta".into()),
         records: vec![TranscriptRecord {
             session_id: "child-session".into(),
             sequence: 1,
@@ -6888,10 +6941,147 @@ fn child_view_snapshot_growth_preserves_unpersisted_live_delta() {
     runtime.flush_session_events();
     render_runtime_transcript(&mut runtime);
 
+    // The projection carries the child's in-flight answer, so replacing the
+    // timeline with it keeps the unpersisted delta exactly once.
+    let live_deltas = runtime
+        .state()
+        .active_timeline()
+        .items()
+        .iter()
+        .filter(|item| {
+            matches!(item, TimelineItem::Assistant(message) if message.text == "unpersisted live delta")
+        })
+        .count();
+    assert_eq!(live_deltas, 1);
     assert!(matches!(
         runtime.state().active_timeline().items().last(),
         Some(TimelineItem::Assistant(message)) if message.text == "unpersisted live delta"
     ));
+}
+
+#[test]
+fn child_view_projection_includes_records_and_in_progress_assistant_text() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: Some("streaming tail".into()),
+        records: vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: "persisted child answer".into(),
+            },
+        }],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    let texts: Vec<&str> = runtime
+        .state()
+        .active_timeline()
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Assistant(message) => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["persisted child answer", "streaming tail"]);
+}
+
+#[test]
+fn child_view_projection_does_not_duplicate_a_preceding_live_delta() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: None,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime.state_mut().apply_child_session_event(
+        "child-session",
+        SessionEvent::AssistantDelta(AssistantDeltaEvent::new("live child output")),
+    );
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: Some("live child output".into()),
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    let live_outputs = runtime
+        .state()
+        .active_timeline()
+        .items()
+        .iter()
+        .filter(|item| {
+            matches!(item, TimelineItem::Assistant(message) if message.text == "live child output")
+        })
+        .count();
+    assert_eq!(live_outputs, 1);
+}
+
+#[test]
+fn child_view_projection_after_historian_completion_drops_the_raw_payload() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "historian".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: Some("{\"compartments\":[{\"end\":3}".into()),
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "historian".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: None,
+        records: vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: "recorded historian report".into(),
+            },
+        }],
+        runtime_context: event_context("child-session", 1),
+    });
+
+    let texts: Vec<&str> = runtime
+        .state()
+        .active_timeline()
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Assistant(message) => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["recorded historian report"]);
 }
 
 #[test]

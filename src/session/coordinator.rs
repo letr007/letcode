@@ -12,7 +12,8 @@ use anyhow::{Result, anyhow};
 
 use crate::agent::Agent;
 use crate::session::child_view::{
-    project_child_session_view_from_file, project_parent_session_view, sessions_dir_from_transcript,
+    ChildLiveText, project_child_session_view_from_file, project_parent_session_view,
+    sessions_dir_from_transcript,
 };
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
@@ -79,6 +80,7 @@ impl SessionCoordinator {
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
+        live_text: &ChildLiveText,
     ) -> Result<IdleDispatch> {
         Self::dispatch_idle_command_with_history_prepare(
             command,
@@ -86,6 +88,7 @@ impl SessionCoordinator {
             transcript,
             event_tx,
             sessions_dir,
+            live_text,
             |_| Ok(()),
         )
     }
@@ -96,6 +99,7 @@ impl SessionCoordinator {
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
+        live_text: &ChildLiveText,
         mut prepare_history: F,
     ) -> Result<IdleDispatch>
     where
@@ -267,6 +271,7 @@ impl SessionCoordinator {
                     sessions_dir,
                     navigation,
                     anchor_child_session_id.as_deref(),
+                    live_text,
                 );
                 Ok(IdleDispatch::Handled)
             }
@@ -712,6 +717,7 @@ impl SessionCoordinator {
         sessions_dir: Option<&Path>,
         navigation: crate::command::ChildNavigation,
         anchor_child_session_id: Option<&str>,
+        live_text: &ChildLiveText,
     ) -> Option<String> {
         let dir = match sessions_dir.map(Path::to_path_buf) {
             Some(dir) => Ok(dir),
@@ -728,6 +734,7 @@ impl SessionCoordinator {
                 parent_session_id,
                 navigation,
                 anchor_child_session_id,
+                live_text,
             )
         }) {
             Ok(None) => {
@@ -747,6 +754,7 @@ impl SessionCoordinator {
                     pool_ordinal: view.pool_ordinal,
                     records: view.records,
                     runtime_context: view.runtime_context,
+                    in_progress_assistant_text: view.in_progress_assistant_text,
                 });
                 Some(child_session_id)
             }
@@ -861,6 +869,7 @@ mod tests {
                 &transcript,
                 &tx,
                 None,
+                &ChildLiveText::default(),
             )
             .expect("toggle dispatch"),
             IdleDispatch::Handled
@@ -934,6 +943,7 @@ protocol = "responses"
             &transcript,
             &tx,
             None,
+            &ChildLiveText::default(),
         )
         .expect("dispatch");
 
@@ -981,6 +991,7 @@ protocol = "responses"
             &transcript,
             &tx,
             None,
+            &ChildLiveText::default(),
         )
         .expect("dispatch");
 
@@ -1021,6 +1032,7 @@ protocol = "responses"
             &transcript,
             &tx,
             None,
+            &ChildLiveText::default(),
             |_| anyhow::bail!("expert factory unavailable"),
         )
         .expect("dispatch");
@@ -1065,6 +1077,7 @@ protocol = "responses"
                 &transcript,
                 &tx,
                 None,
+                &ChildLiveText::default(),
             )
             .expect("dispatch"),
             IdleDispatch::HistoryNavigated
@@ -1109,6 +1122,7 @@ protocol = "responses"
                 &transcript,
                 &tx,
                 None,
+                &ChildLiveText::default(),
             )
             .expect("dispatch"),
             IdleDispatch::HistoryNavigated
@@ -1146,8 +1160,15 @@ protocol = "responses"
         rx: &mut mpsc::UnboundedReceiver<SessionTransportEvent>,
     ) {
         assert_eq!(
-            SessionCoordinator::dispatch_idle_command(command, agent, transcript, tx, None)
-                .expect("dispatch navigation"),
+            SessionCoordinator::dispatch_idle_command(
+                command,
+                agent,
+                transcript,
+                tx,
+                None,
+                &ChildLiveText::default(),
+            )
+            .expect("dispatch navigation"),
             IdleDispatch::HistoryNavigated
         );
         match rx.try_recv().expect("navigation result") {

@@ -434,8 +434,6 @@ struct ChildTranscriptState {
     timeline: Timeline,
     model: Option<String>,
     record_count: usize,
-    snapshot_loaded: bool,
-    snapshot_dirty: bool,
     context: ContextPaneState,
     active_session: bool,
     latest_auto_continue: AutoContinueState,
@@ -458,8 +456,6 @@ impl ChildTranscriptState {
             timeline: Timeline::default(),
             model: None,
             record_count: 0,
-            snapshot_loaded: false,
-            snapshot_dirty: false,
             context: ContextPaneState::default(),
             active_session: true,
             latest_auto_continue: AutoContinueState::default(),
@@ -476,12 +472,21 @@ impl ChildTranscriptState {
         }
     }
 
-    fn replace_clean_snapshot(&mut self, records: &[TranscriptRecord], context: ContextPaneState) {
+    fn replace_clean_snapshot(
+        &mut self,
+        records: &[TranscriptRecord],
+        context: ContextPaneState,
+        in_progress_assistant_text: Option<&str>,
+    ) {
         self.timeline = Timeline::from_transcript_records(records);
+        if let Some(text) = in_progress_assistant_text
+            && !text.is_empty()
+        {
+            self.timeline
+                .push_assistant_delta(crate::tui::events::AssistantDeltaEvent::new(text));
+        }
         self.model = child_transcript_model(records);
         self.record_count = records.len();
-        self.snapshot_loaded = true;
-        self.snapshot_dirty = false;
         self.context = context;
     }
 
@@ -489,9 +494,10 @@ impl ChildTranscriptState {
         session_id: impl Into<String>,
         records: &[TranscriptRecord],
         context: ContextPaneState,
+        in_progress_assistant_text: Option<&str>,
     ) -> Self {
         let mut state = Self::empty(session_id);
-        state.replace_clean_snapshot(records, context);
+        state.replace_clean_snapshot(records, context, in_progress_assistant_text);
         state
     }
 }
@@ -2549,6 +2555,7 @@ impl TuiState {
         total: usize,
         pool_ordinal: u32,
         runtime_context: RuntimeActiveContext,
+        in_progress_assistant_text: Option<String>,
     ) -> Result<()> {
         validate_lifecycle_records(records, &runtime_context)?;
         let parent_session_id = parent_session_id.into();
@@ -2564,12 +2571,7 @@ impl TuiState {
         if let Some(active) = self.child_timeline.as_mut()
             && active.session_id == child_session_id
         {
-            if active.snapshot_loaded && active.snapshot_dirty {
-                active.context = context;
-                active.model = child_transcript_model(records);
-            } else {
-                active.replace_clean_snapshot(records, context);
-            }
+            active.replace_clean_snapshot(records, context, in_progress_assistant_text.as_deref());
             self.active_session = true;
             self.clear_input();
             self.close_dialog();
@@ -2594,15 +2596,19 @@ impl TuiState {
         self.child_session_summaries.remove(&child_session_id);
         let child_state = match self.child_timeline_cache.remove(&child_session_id) {
             Some(mut cached) => {
-                if cached.snapshot_loaded && cached.snapshot_dirty {
-                    cached.context = context;
-                    cached.model = child_transcript_model(records);
-                } else {
-                    cached.replace_clean_snapshot(records, context);
-                }
+                cached.replace_clean_snapshot(
+                    records,
+                    context,
+                    in_progress_assistant_text.as_deref(),
+                );
                 cached
             }
-            None => ChildTranscriptState::from_snapshot(child_session_id.clone(), records, context),
+            None => ChildTranscriptState::from_snapshot(
+                child_session_id.clone(),
+                records,
+                context,
+                in_progress_assistant_text.as_deref(),
+            ),
         };
 
         if let Some(active_child) = self.child_timeline.take() {
@@ -2675,8 +2681,6 @@ impl TuiState {
             timeline: Timeline::from_transcript_records(records),
             model: child_transcript_model(records),
             record_count: records.len(),
-            snapshot_loaded: true,
-            snapshot_dirty: false,
             context,
             active_session: true,
             latest_auto_continue: AutoContinueState::default(),
@@ -2701,14 +2705,6 @@ impl TuiState {
             crate::tui::events::RuntimeContextDisposition::ReplaceScope,
         );
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn child_view_has_unpersisted_projection(&self) -> bool {
-        self.child_timeline
-            .as_ref()
-            .map(|child| child.snapshot_dirty)
-            .unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -2839,7 +2835,6 @@ impl TuiState {
             let Some(candidate_index) = self.child_timeline_cache_order.iter().position(|id| {
                 self.child_timeline_cache.get(id).is_some_and(|child| {
                     matches!(child.phase, AppPhase::Completed | AppPhase::Error)
-                        && !child.snapshot_dirty
                 })
             }) else {
                 break;
@@ -3818,12 +3813,6 @@ fn apply_event_to_child_transcript(
     status_spinner_frame: &mut usize,
     toast: &mut Option<ToastState>,
 ) {
-    let terminal_event = matches!(
-        &event,
-        SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
-    );
-    let timeline_revision = child.timeline.mutation_revision();
-
     match event {
         SessionEvent::PermissionRequested(request) => {
             child.phase = AppPhase::WaitingForPermission;
@@ -3863,12 +3852,6 @@ fn apply_event_to_child_transcript(
                 event,
             );
         }
-    }
-
-    if child.timeline.mutation_revision() != timeline_revision
-        && (child.snapshot_loaded || !terminal_event)
-    {
-        child.snapshot_dirty = true;
     }
 }
 

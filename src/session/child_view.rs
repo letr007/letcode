@@ -3,6 +3,7 @@
 //! Phase R extracts navigation selection and restore projection for child and
 //! parent transcript viewing. Event emission remains frontend-owned.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +24,37 @@ use crate::transcript::{
     read_child_session_records_allow_partial_tail, read_records,
 };
 
+/// Streaming assistant text of a child session that is still in flight.
+///
+/// The journal only holds durable messages, so a child view projection reads
+/// this buffer to include the child's current, unpersisted answer.
+#[derive(Clone, Default)]
+pub(crate) struct ChildLiveText {
+    inner: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl ChildLiveText {
+    pub(crate) fn append(&self, child_session_id: &str, delta: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner
+            .entry(child_session_id.to_string())
+            .or_default()
+            .push_str(delta);
+    }
+
+    pub(crate) fn get(&self, child_session_id: &str) -> Option<String> {
+        self.inner.lock().ok()?.get(child_session_id).cloned()
+    }
+
+    pub(crate) fn clear(&self, child_session_id: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.remove(child_session_id);
+        }
+    }
+}
+
 /// Parent-session view projection (frontend maps this to SessionResumed-like UI).
 pub struct ParentViewProjection {
     pub snapshot: RuntimeRestoreSnapshot,
@@ -39,6 +71,7 @@ pub struct ChildViewProjection {
     pub pool_ordinal: u32,
     pub records: Vec<TranscriptRecord>,
     pub runtime_context: RuntimeActiveContext,
+    pub in_progress_assistant_text: Option<String>,
 }
 
 /// Resolve which child index to open for a navigation command.
@@ -123,6 +156,7 @@ pub fn project_child_session_view_from_file(
     parent_session_id: impl Into<String>,
     navigation: ChildNavigation,
     anchor_child_session_id: Option<&str>,
+    live_text: &ChildLiveText,
 ) -> Result<Option<ChildViewProjection>> {
     let sessions_dir = sessions_dir.as_ref();
     let parent_session_id = parent_session_id.into();
@@ -136,6 +170,7 @@ pub fn project_child_session_view_from_file(
         children,
         navigation,
         anchor_child_session_id,
+        live_text,
     )
 }
 
@@ -145,6 +180,7 @@ fn project_child_session_view_with_children(
     children: Vec<ChildSessionSummary>,
     navigation: ChildNavigation,
     anchor_child_session_id: Option<&str>,
+    live_text: &ChildLiveText,
 ) -> Result<Option<ChildViewProjection>> {
     let Some(index) = select_child_navigation_index(&children, navigation, anchor_child_session_id)
     else {
@@ -172,6 +208,7 @@ fn project_child_session_view_with_children(
         pool_ordinal: child.pool_ordinal,
         records,
         runtime_context,
+        in_progress_assistant_text: live_text.get(&child.child_session_id),
     }))
 }
 
@@ -219,6 +256,7 @@ mod tests {
                 parent_session_id.clone(),
                 navigation,
                 anchor.as_deref(),
+                &ChildLiveText::default(),
             )
             .expect("project the child view")
             .expect("a child to view");

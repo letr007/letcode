@@ -73,6 +73,7 @@ pub(crate) struct HistorianRuntime {
     sessions_dir: std::path::PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: SessionTransportEventSender,
+    live_text: crate::session::child_view::ChildLiveText,
     pending: Mutex<Option<Pending>>,
     /// Last terminal failure, cleared by the next successful publication.
     failure: Mutex<Option<HistorianFailure>>,
@@ -92,10 +93,19 @@ impl HistorianRuntime {
             sessions_dir,
             transcript,
             event_tx,
+            live_text: crate::session::child_view::ChildLiveText::default(),
             pending: Mutex::new(None),
             failure: Mutex::new(None),
             pass_limit: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_live_text(
+        mut self,
+        live_text: crate::session::child_view::ChildLiveText,
+    ) -> Self {
+        self.live_text = live_text;
+        self
     }
 
     pub(crate) fn failure(&self) -> Option<HistorianFailure> {
@@ -233,6 +243,7 @@ impl HistorianRuntime {
         let pool = self.pool.clone();
         let recorder = self.transcript.clone();
         let event_tx = self.event_tx.clone();
+        let live_text = self.live_text.clone();
         self.emit(true, false);
         tokio::spawn(async move {
             let produced = Arc::new(Mutex::new(None));
@@ -253,7 +264,9 @@ impl HistorianRuntime {
                     // child view treats it as a separate message.
                     let delta_sender = delta_tx.clone();
                     let delta_child = child_session_id.clone();
+                    let delta_live = live_text.clone();
                     let mut on_delta = move |delta: &str| {
+                        delta_live.append(&delta_child, delta);
                         let _ = delta_sender.send(SessionTransportEvent::ChildSessionEvent {
                             child_session_id: delta_child.clone(),
                             agent_name: Some("historian".to_string()),
@@ -303,6 +316,7 @@ impl HistorianRuntime {
                         };
                         let report_json = serde_json::to_string(&report)?;
                         child.lock().map_err(|_| anyhow!("historian child transcript poisoned"))?.record_assistant_message(report_json.clone())?;
+                        live_text.clear(&child_session_id);
                         for event in [
                             SessionEvent::AssistantDone { message_id: None },
                             SessionEvent::AssistantDelta(AssistantDeltaEvent::new(report_json)),
