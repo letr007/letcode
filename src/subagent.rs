@@ -36,6 +36,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_with_a_closing_brace_before_an_opening_brace_is_not_a_candidate() {
+        let text = "任务描述 } 之后还有一个未闭合的 { 左括号";
+        assert!(try_parse_structured_subagent_result(text).is_none());
+    }
+
+    #[test]
     fn cancel_active_covers_starting_reservations() {
         let runtime = SubagentPool::new();
         let reservation = runtime.starting_reservation_for_test();

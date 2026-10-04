@@ -1520,8 +1520,9 @@ pub(super) fn mermaid_crossings(graph: &ir::MermaidGraph, layers: &[Vec<String>]
             .filter_map(|edge| {
                 let from = *layer_of.get(edge.from.as_str())?;
                 let to = *layer_of.get(edge.to.as_str())?;
-                (from == corridor && to == corridor + 1)
-                    .then_some((col_of[edge.from.as_str()], col_of[edge.to.as_str()]))
+                let from_column = *col_of.get(edge.from.as_str())?;
+                let to_column = *col_of.get(edge.to.as_str())?;
+                (from == corridor && to == corridor + 1).then_some((from_column, to_column))
             })
             .collect::<Vec<_>>();
         for (index, edge) in edges.iter().enumerate() {

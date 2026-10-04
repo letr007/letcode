@@ -299,7 +299,7 @@ fn extract_json_candidate(raw: &str) -> Option<&str> {
     }
     let start = trimmed.find('{')?;
     let end = trimmed.rfind('}')?;
-    (end > start).then_some(trimmed[start..=end].trim())
+    (end > start).then(|| trimmed[start..=end].trim())
 }
 
 pub fn looks_like_structured_subagent_output(raw: &str) -> bool {

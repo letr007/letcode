@@ -338,7 +338,7 @@ impl ProtocolAppendState {
             && self.frontier_token == token
             && self.generation >= generation
             && self.frame_ids.len() >= frame_count)
-            .then_some(&self.frame_ids[frame_count..])
+            .then(|| &self.frame_ids[frame_count..])
     }
 
     pub(crate) fn protected_frame_ids(&self) -> &[RuntimeFrameId] {
