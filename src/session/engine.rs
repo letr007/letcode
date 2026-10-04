@@ -3474,6 +3474,65 @@ base_url = "http://127.0.0.1:1"
         );
     }
 
+    fn child_delta(child_session_id: &str, delta: &str) -> SessionTransportEvent {
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id: child_session_id.into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::AssistantDelta(crate::session::AssistantDeltaEvent::new(delta)),
+        }
+    }
+
+    fn child_terminal(child_session_id: &str) -> SessionTransportEvent {
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id: child_session_id.into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::AssistantDone { message_id: None },
+        }
+    }
+
+    /// A queued terminal child event must clear the streaming tail when the drain forwards it.
+    #[tokio::test]
+    #[ignore = "boundary: completion drain bypasses the live-text tap for queued terminal child events"]
+    async fn completion_drain_clears_child_live_text_for_queued_terminal_events() {
+        let live_text = crate::session::child_view::ChildLiveText::default();
+        tap_child_live_text(&child_delta("child-1", "partial"), &live_text);
+        assert_eq!(live_text.get("child-1").as_deref(), Some("partial"));
+
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        runner_tx
+            .send(child_terminal("child-1"))
+            .expect("queue the terminal child event");
+
+        forward_queued_runner_events(&mut runner_rx, &session_tx);
+        assert!(
+            session_rx.try_recv().is_ok(),
+            "the queued child event is forwarded"
+        );
+        assert_eq!(
+            live_text.get("child-1"),
+            None,
+            "a forwarded terminal child event must clear the streaming tail"
+        );
+    }
+
+    /// A continuation without a tool boundary must not keep the persisted segment in live text.
+    #[test]
+    #[ignore = "boundary: an in-turn continuation without a tool boundary is not observed by the tap"]
+    fn tap_drops_the_persisted_prefix_when_a_turn_continues_without_a_tool_boundary() {
+        let live_text = crate::session::child_view::ChildLiveText::default();
+        tap_child_live_text(&child_delta("child-1", "persisted"), &live_text);
+        tap_child_live_text(&child_delta("child-1", "continued"), &live_text);
+
+        assert_eq!(
+            live_text.get("child-1").as_deref(),
+            Some("continued"),
+            "the persisted segment must not remain in the in-progress text"
+        );
+    }
+
     #[tokio::test]
     async fn command_ingress_preserves_fifo_order() {
         let (mut engine, ingress, _egress) = SessionEngine::new();

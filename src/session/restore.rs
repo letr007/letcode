@@ -637,6 +637,98 @@ mod tests {
         ))
     }
 
+    use crate::transcript::{
+        JOURNAL_SCHEMA_VERSION, JournalRecordEnvelope, TranscriptAssistantTurn, TranscriptEvent,
+        TranscriptRecord, journal_scope_for, serialize_journal_record,
+    };
+
+    fn assistant_line(session_id: &str, sequence: u64, text: &str) -> String {
+        let record = TranscriptRecord {
+            session_id: session_id.into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: Some(text.into()),
+                reasoning_content: None,
+                replay: None,
+                calls: Vec::new(),
+            }),
+        };
+        let envelope = JournalRecordEnvelope {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            event_id: format!("{session_id}:{sequence}"),
+            scope: journal_scope_for(&record),
+            base_revision: sequence - 1,
+            resulting_revision: sequence,
+            transaction_id: None,
+            transaction_index: None,
+            transaction_count: None,
+            record,
+        };
+        String::from_utf8(serialize_journal_record(&envelope).expect("serialize journal record"))
+            .expect("journal record is utf8")
+    }
+
+    fn session_with_assistant_answer() -> (std::path::PathBuf, String, std::path::PathBuf) {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create session dir");
+        let mut recorder = TranscriptRecorder::create(&dir).expect("create session");
+        let session_id = recorder.session_id().to_string();
+        recorder
+            .record_session_started("test/model")
+            .expect("record session start");
+        recorder
+            .record_user_message("question")
+            .expect("record prompt");
+        recorder
+            .record_assistant_message("answer")
+            .expect("record answer");
+        let path = recorder.path().to_path_buf();
+        drop(recorder);
+        (dir, session_id, path)
+    }
+
+    fn resume_error(dir: &std::path::Path, session_id: &str) -> anyhow::Error {
+        match prepare_resume_package(dir, session_id) {
+            Ok(_) => panic!("resume must not accept the unfinished tail"),
+            Err(error) => error,
+        }
+    }
+
+    /// A torn assistant tail makes the resume load fail before any snapshot is built.
+    #[test]
+    fn resume_rejects_a_torn_assistant_tail() {
+        let (dir, session_id, path) = session_with_assistant_answer();
+        let torn = assistant_line(&session_id, 4, "unfinished");
+        let mut content = std::fs::read_to_string(&path).expect("read the journal");
+        content.push_str(&torn[..torn.len() - 2]);
+        std::fs::write(&path, content).expect("append the torn tail");
+
+        let error = resume_error(&dir, &session_id);
+        assert!(
+            error.to_string().contains("EOF while parsing"),
+            "resume must report why the torn tail is unusable: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A complete record without its delimiter is loaded, then blocks the append-open.
+    #[test]
+    fn resume_rejects_a_complete_undelimited_assistant_tail() {
+        let (dir, session_id, path) = session_with_assistant_answer();
+        let mut content = std::fs::read_to_string(&path).expect("read the journal");
+        content.push_str(&assistant_line(&session_id, 4, "continuation"));
+        std::fs::write(&path, content).expect("append the undelimited tail");
+
+        let error = resume_error(&dir, &session_id);
+        assert!(
+            error.to_string().contains("append delimiter"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn test_agent() -> Agent {
         Agent::new("gpt-5.5", 1, 1)
     }

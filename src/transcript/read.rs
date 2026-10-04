@@ -78,9 +78,60 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::transcript::{
-        TranscriptEvent, TranscriptRecorder, record_is_session_content, record_is_session_title,
-        record_is_user_message,
+        JOURNAL_SCHEMA_VERSION, JournalRecordEnvelope, TranscriptAssistantTurn, TranscriptEvent,
+        TranscriptRecord, TranscriptRecorder, journal_scope_for, read_records_allow_partial_tail,
+        read_resumable_records_with_fingerprint, record_is_session_content,
+        record_is_session_title, record_is_user_message, serialize_journal_record,
     };
+
+    fn journal_line(session_id: &str, sequence: u64, event: TranscriptEvent) -> String {
+        let record = TranscriptRecord {
+            session_id: session_id.into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event,
+        };
+        let envelope = JournalRecordEnvelope {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            event_id: format!("{session_id}:{sequence}"),
+            scope: journal_scope_for(&record),
+            base_revision: sequence - 1,
+            resulting_revision: sequence,
+            transaction_id: None,
+            transaction_index: None,
+            transaction_count: None,
+            record,
+        };
+        String::from_utf8(serialize_journal_record(&envelope).expect("serialize journal record"))
+            .expect("journal record is utf8")
+    }
+
+    fn user_line(session_id: &str, sequence: u64) -> String {
+        journal_line(
+            session_id,
+            sequence,
+            TranscriptEvent::UserMessage {
+                content: crate::user_content::UserMessageContent::new(
+                    format!("message-{sequence}"),
+                    Vec::new(),
+                ),
+            },
+        )
+    }
+
+    fn assistant_line(session_id: &str, sequence: u64, text: &str) -> String {
+        journal_line(
+            session_id,
+            sequence,
+            TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: Some(text.into()),
+                reasoning_content: None,
+                replay: None,
+                calls: Vec::new(),
+            }),
+        )
+    }
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -254,5 +305,78 @@ mod tests {
                 full / stats.max(f64::MIN_POSITIVE)
             );
         }
+    }
+
+    /// A torn assistant tail is tolerated only by dropping the record entirely.
+    #[test]
+    fn incomplete_assistant_tail_is_rejected_strictly_and_dropped_by_the_live_reader() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("s.jsonl");
+        let torn = assistant_line("s", 3, "unfinished");
+        let content = format!(
+            "{}\n{}\n{}",
+            user_line("s", 1),
+            user_line("s", 2),
+            &torn[..torn.len() - 2]
+        );
+        fs::write(&path, content).expect("write the journal");
+
+        assert!(
+            read_records(&path).is_err(),
+            "a strict read reports the torn assistant tail"
+        );
+        let live = read_records_allow_partial_tail(&path).expect("live read drops the torn tail");
+        assert_eq!(
+            live.len(),
+            2,
+            "the incomplete message contributes no record"
+        );
+        assert!(
+            !live
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::AssistantTurn(_))),
+            "the dropped tail is not projected as an assistant turn"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A fully written record without its delimiter reads as finished; only append-open refuses it.
+    #[test]
+    fn undelimited_assistant_tail_is_read_but_blocks_resume_append() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("s.jsonl");
+        let content = format!(
+            "{}\n{}",
+            user_line("s", 1),
+            assistant_line("s", 2, "answer")
+        );
+        fs::write(&path, content).expect("write the journal");
+
+        assert_eq!(
+            read_records(&path).expect("strict read").len(),
+            2,
+            "a complete record without its delimiter is still a record"
+        );
+        assert_eq!(
+            read_records_allow_partial_tail(&path)
+                .expect("live read")
+                .len(),
+            2
+        );
+        assert!(
+            read_resumable_records_with_fingerprint(&path).is_ok(),
+            "the resume load sees the complete record"
+        );
+        let error = match TranscriptRecorder::open_existing(&dir, "s") {
+            Ok(_) => panic!("append-open requires the delimiter"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("append delimiter"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }
