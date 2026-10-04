@@ -302,13 +302,6 @@ fn extract_json_candidate(raw: &str) -> Option<&str> {
     (end > start).then(|| trimmed[start..=end].trim())
 }
 
-pub fn looks_like_structured_subagent_output(raw: &str) -> bool {
-    let compact = raw.trim_start();
-    (compact.starts_with('{') || compact.starts_with("```"))
-        && compact.contains("\"status\"")
-        && compact.contains("\"summary\"")
-}
-
 pub fn try_parse_structured_subagent_result(raw: &str) -> Option<StructuredSubagentResult> {
     let candidate = extract_json_candidate(raw)?;
     let value = serde_json::from_str::<Value>(candidate).ok()?;

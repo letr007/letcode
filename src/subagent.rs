@@ -6,7 +6,7 @@ pub use pool::{SubagentJob, SubagentPool, SubagentRunGovernance};
 pub(crate) use result::finalize_report;
 pub use result::{
     StructuredSubagentResult, SubagentFailureKind, SubagentRunSummary, SubagentStatus,
-    looks_like_structured_subagent_output, try_parse_structured_subagent_result,
+    try_parse_structured_subagent_result,
 };
 pub use route_factory::ExpertRouteFactory;
 

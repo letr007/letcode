@@ -16,9 +16,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use crate::subagent::{
-    looks_like_structured_subagent_output, try_parse_structured_subagent_result,
-};
+use crate::subagent::try_parse_structured_subagent_result;
 use crate::tui::{
     i18n::Translator,
     markdown::{MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown_document},
@@ -1858,14 +1856,6 @@ fn build_assistant_message_lines(
             width,
             theme,
         ));
-        return;
-    }
-
-    if streaming && looks_like_structured_subagent_output(text) {
-        out.push_decoration(
-            Line::from(Span::styled("  …", root_muted_style(theme))),
-            Break::End,
-        );
         return;
     }
 
