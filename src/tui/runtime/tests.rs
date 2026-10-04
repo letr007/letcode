@@ -1989,7 +1989,7 @@ fn reused_child_session_becomes_interruptible_again() {
 }
 
 #[test]
-fn ctrl_c_does_not_quit_while_a_child_session_is_running() {
+fn ctrl_c_quits_when_only_a_stale_child_session_phase_is_running() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
         parent_session_id: "parent-session".into(),
@@ -2005,18 +2005,13 @@ fn ctrl_c_does_not_quit_while_a_child_session_is_running() {
     runtime
         .state_mut()
         .set_child_view_phase_for_test(AppPhase::Running);
+    assert!(runtime.state().has_running_child_session());
 
-    let first = runtime
+    let command = runtime
         .handle_input_action(InputAction::Quit)
-        .expect("first ctrl-c arms child interrupt");
-    assert_eq!(first, None);
-    assert!(!runtime.state().quit_requested);
-
-    let second = runtime
-        .handle_input_action(InputAction::Quit)
-        .expect("second ctrl-c interrupts the child session");
-    assert_eq!(second, Some(RuntimeCommand::Interrupt));
-    assert!(!runtime.state().quit_requested);
+        .expect("ctrl-c quits the idle engine");
+    assert_eq!(command, None);
+    assert!(runtime.state().quit_requested);
 }
 
 #[test]
@@ -2379,7 +2374,7 @@ fn slash_subagent_interrupt_terminalizes_parent_runtime_from_parent_view() {
     runtime.session_turn_active = true;
     runtime.state_mut().phase = AppPhase::Running;
 
-    send_subagent_interrupted(&tx, Some("child-session".into()));
+    send_subagent_interrupted(&tx);
     runtime.try_drain_session_events();
 
     assert!(!runtime.session_turn_active);
@@ -2409,7 +2404,7 @@ fn slash_subagent_interrupt_terminalizes_parent_runtime_from_child_view() {
         1,
     );
 
-    send_subagent_interrupted(&tx, Some("child-session".into()));
+    send_subagent_interrupted(&tx);
     runtime.try_drain_session_events();
 
     assert!(!runtime.session_turn_active);
@@ -2447,7 +2442,14 @@ fn parent_interrupt_while_viewing_child_closes_child_active_tools() {
         )),
     );
 
-    send_subagent_interrupted(&tx, Some("child-session".into()));
+    send_subagent_interrupted(&tx);
+    tx.send(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::Interrupted,
+    })
+    .expect("send the child terminal event");
     runtime.try_drain_session_events();
 
     assert!(!runtime.session_turn_active);
@@ -4548,7 +4550,7 @@ fn planned_interrupt(
         });
     InterruptRequest {
         parent_tool_calls,
-        visible_child_session_id: None,
+        active_runs: Vec::new(),
         turn_id,
         transcript_revision,
         branch_id,
@@ -5488,7 +5490,7 @@ fn record_interrupt_transcript_fails_closed_when_branch_projection_cannot_resolv
     let before = serde_json::to_value(records(&transcript)).expect("serialize transcript");
     let stale_plan = InterruptRequest {
         parent_tool_calls: vec![("call-missing".into(), "shell__exec".into())],
-        visible_child_session_id: None,
+        active_runs: Vec::new(),
         turn_id: Some(71),
         transcript_revision: 0,
         branch_id: Some("missing-branch".into()),

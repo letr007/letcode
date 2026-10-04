@@ -35,7 +35,7 @@ use crate::session::{
     AgentRunner, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
     SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent,
 };
-use crate::subagent::SubagentPool;
+use crate::subagent::{SubagentJob, SubagentPool, SubagentStatus};
 use crate::tool::{ToolHandler, normalize_subagent_input};
 
 mod config_reload;
@@ -551,7 +551,7 @@ fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterruptRequest {
     pub(crate) parent_tool_calls: Vec<(String, String)>,
-    pub(crate) visible_child_session_id: Option<String>,
+    pub(crate) active_runs: Vec<SubagentJob>,
     pub(crate) turn_id: Option<u64>,
     pub(crate) transcript_revision: u64,
     pub(crate) branch_id: Option<String>,
@@ -561,9 +561,7 @@ pub(crate) fn derive_interrupt_request(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     subagent_runtime: &SubagentPool,
 ) -> Result<InterruptRequest> {
-    let active_child_session_id = subagent_runtime
-        .active_child()
-        .map(|child| child.child_session_id);
+    let active_runs = subagent_runtime.active_jobs();
     let (transcript_revision, branch_id, turn_id, parent_tool_calls) = transcript
         .lock()
         .map_err(|_| anyhow!("transcript recorder poisoned"))?
@@ -571,7 +569,7 @@ pub(crate) fn derive_interrupt_request(
 
     Ok(InterruptRequest {
         parent_tool_calls,
-        visible_child_session_id: active_child_session_id,
+        active_runs,
         turn_id,
         transcript_revision,
         branch_id,
@@ -592,18 +590,60 @@ fn send_rehydrated_runtime_context(
     Ok(())
 }
 
+pub(crate) fn emit_child_terminal(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    child_session_id: &str,
+) {
+    let _ = session_transport_tx.send(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: child_session_id.to_string(),
+        agent_name: None,
+        parent_tool_call_id: None,
+        event: SessionEvent::Interrupted,
+    });
+}
+
+/// Emits the child-scope terminal for a run whose executor was dropped by cancellation or timeout.
+pub(crate) fn emit_dropped_child_terminal(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    summary: &crate::subagent::SubagentRunSummary,
+) {
+    if matches!(
+        summary.status,
+        SubagentStatus::Cancelled | SubagentStatus::TimedOut
+    ) {
+        emit_child_terminal(session_transport_tx, &summary.child_session_id);
+    }
+}
+
+/// Emits a child-scope terminal for every run whose executor was dropped before publishing one.
+fn emit_dropped_child_terminals(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    subagent_runtime: &SubagentPool,
+    runs: &[SubagentJob],
+    notified_runs: &mut std::collections::HashSet<String>,
+) {
+    for run in runs {
+        // The historian runtime publishes its own terminal.
+        if run.agent_name == "historian" {
+            continue;
+        }
+        let dropped = subagent_runtime
+            .completed_result(&run.run_id)
+            .is_some_and(|summary| {
+                matches!(
+                    summary.status,
+                    SubagentStatus::Cancelled | SubagentStatus::TimedOut
+                )
+            });
+        if dropped && notified_runs.insert(run.run_id.clone()) {
+            emit_child_terminal(session_transport_tx, &run.child_session_id);
+        }
+    }
+}
+
 pub(crate) fn send_subagent_interrupted(
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
-    child_session_id: Option<String>,
 ) {
-    if let Some(child_session_id) = child_session_id {
-        let _ = session_transport_tx.send(SessionTransportEvent::ChildSessionEvent {
-            child_session_id,
-            agent_name: None,
-            parent_tool_call_id: None,
-            event: SessionEvent::Interrupted,
-        });
-    }
     let _ = session_transport_tx.send(SessionTransportEvent::Interrupted);
 }
 
@@ -1861,7 +1901,7 @@ async fn run_engine_loop(
 
                         let (
                             interrupted,
-                            interrupted_child_session_id,
+                            interrupted_active_runs,
                             shutdown,
                             interrupt_failure,
                         ) = {
@@ -1887,7 +1927,7 @@ async fn run_engine_loop(
 
                             tokio::pin!(delegate);
                             let mut interrupted = false;
-                            let mut interrupted_child_session_id = None;
+                            let mut interrupted_active_runs = Vec::new();
                             let mut shutdown = false;
                             let mut interrupt_failure = None;
 
@@ -1925,9 +1965,7 @@ async fn run_engine_loop(
                                             }
                                         };
                                         interrupted = true;
-                                        interrupted_child_session_id = interrupt
-                                            .visible_child_session_id
-                                            .clone();
+                                        interrupted_active_runs = interrupt.active_runs.clone();
                                         subagent_runtime.cancel_active();
                                         if let Err(error) =
                                             record_interrupt_transcript(&transcript, &interrupt)
@@ -1958,7 +1996,11 @@ async fn run_engine_loop(
                                     }
                                     ActiveSessionOperation::Completed(result) => {
                                         match result {
-                                            Ok(_) => {
+                                            Ok(summary) => {
+                                                emit_dropped_child_terminal(
+                                                    &session_transport_tx,
+                                                    &summary,
+                                                );
                                                 let _ = session_transport_tx.send(SessionTransportEvent::Done);
                                             }
                                             Err(error) => {
@@ -2026,7 +2068,7 @@ async fn run_engine_loop(
 
                             (
                                 interrupted,
-                                interrupted_child_session_id,
+                                interrupted_active_runs,
                                 shutdown,
                                 interrupt_failure,
                             )
@@ -2054,10 +2096,13 @@ async fn run_engine_loop(
                                         parked_commands.clear();
                                         break;
                                     }
-                                    send_subagent_interrupted(
+                                    emit_dropped_child_terminals(
                                         &session_transport_tx,
-                                        interrupted_child_session_id,
+                                        &subagent_runtime,
+                                        &interrupted_active_runs,
+                                        &mut notified_background_runs,
                                     );
+                                    send_subagent_interrupted(&session_transport_tx);
                                 }
                                 Err(error) => {
                                     let _ = session_transport_tx.send(SessionTransportEvent::Error(
@@ -2746,10 +2791,13 @@ async fn run_engine_loop(
                                 parked_commands.clear();
                                 break;
                             }
-                            send_subagent_interrupted(
+                            emit_dropped_child_terminals(
                                 &session_transport_tx,
-                                interrupt.visible_child_session_id,
+                                &subagent_runtime,
+                                &interrupt.active_runs,
+                                &mut notified_background_runs,
                             );
+                            send_subagent_interrupted(&session_transport_tx);
                         }
                     } else {
                         deferred_commands.clear();
@@ -2864,9 +2912,7 @@ pub(crate) fn observe_background_subagent_completion(
     let Ok(summary) = result else {
         return true;
     };
-    if summary.status == crate::subagent::SubagentStatus::Cancelled
-        || subagent_runtime.is_foregrounded(&summary.run_id)
-    {
+    if subagent_runtime.is_foregrounded(&summary.run_id) {
         return false;
     }
     let current_session_id = transcript
@@ -2876,7 +2922,17 @@ pub(crate) fn observe_background_subagent_completion(
     if current_session_id.as_deref() != Some(parent_session_id) {
         return false;
     }
+    // A cancelled background run still needs the terminal its dropped executor never published.
+    if summary.status == SubagentStatus::Cancelled {
+        if notified_runs.insert(summary.run_id.clone()) {
+            emit_child_terminal(session_transport_tx, &summary.child_session_id);
+        }
+        return false;
+    }
     if notified_runs.insert(summary.run_id.clone()) {
+        if summary.status == SubagentStatus::TimedOut {
+            emit_child_terminal(session_transport_tx, &summary.child_session_id);
+        }
         let _ = session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
             parent_tool_call_id,
             result: summary.clone(),
@@ -2929,6 +2985,283 @@ mod tests {
     /// Windows 路径里的反斜杠在 TOML 基本字符串中会被当成转义序列，先转义再插值。
     fn toml_path(path: &std::path::Path) -> String {
         path.display().to_string().replace('\\', "\\\\")
+    }
+
+    fn run_summary(
+        run_id: &str,
+        child_session_id: &str,
+        agent_name: &str,
+        status: SubagentStatus,
+    ) -> crate::subagent::SubagentRunSummary {
+        crate::subagent::SubagentRunSummary {
+            run_id: run_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
+            status,
+            failure_kind: None,
+            summary: String::new(),
+            structured_result: crate::subagent::StructuredSubagentResult {
+                status: status.as_str().into(),
+                summary: String::new(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: run_id.into(),
+                child_session_id: child_session_id.into(),
+                raw_excerpt: None,
+            },
+        }
+    }
+
+    fn active_job(run_id: &str, child_session_id: &str, agent_name: &str) -> SubagentJob {
+        SubagentJob {
+            active: true,
+            run_id: run_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
+            status: "running".into(),
+            summary: String::new(),
+            pool_ordinal: 1,
+        }
+    }
+
+    fn child_interrupted(event: SessionTransportEvent) -> Option<String> {
+        match event {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                event: SessionEvent::Interrupted,
+                ..
+            } => Some(child_session_id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn dropped_runs_emit_one_child_terminal_each_and_skip_finished_runs() {
+        let runtime = SubagentPool::new();
+        runtime.record_completed_for_test(run_summary(
+            "run-cancelled",
+            "child-cancelled",
+            "explorer",
+            SubagentStatus::Cancelled,
+        ));
+        runtime.record_completed_for_test(run_summary(
+            "run-timed-out",
+            "child-timed-out",
+            "explorer",
+            SubagentStatus::TimedOut,
+        ));
+        runtime.record_completed_for_test(run_summary(
+            "run-completed",
+            "child-completed",
+            "explorer",
+            SubagentStatus::Completed,
+        ));
+        runtime.record_completed_for_test(run_summary(
+            "run-historian",
+            "child-historian",
+            "historian",
+            SubagentStatus::Cancelled,
+        ));
+        let runs = vec![
+            active_job("run-cancelled", "child-cancelled", "explorer"),
+            active_job("run-timed-out", "child-timed-out", "explorer"),
+            active_job("run-completed", "child-completed", "explorer"),
+            active_job("run-historian", "child-historian", "historian"),
+        ];
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notified = std::collections::HashSet::new();
+        emit_dropped_child_terminals(&tx, &runtime, &runs, &mut notified);
+
+        let mut children = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            children.push(child_interrupted(event).expect("only child terminal events"));
+        }
+        children.sort();
+        assert_eq!(children, vec!["child-cancelled", "child-timed-out"]);
+
+        emit_dropped_child_terminals(&tx, &runtime, &runs, &mut notified);
+        assert!(
+            rx.try_recv().is_err(),
+            "a run must not receive a second terminal event"
+        );
+    }
+
+    #[test]
+    fn interrupting_one_run_does_not_terminalize_an_unrelated_running_child() {
+        let runtime = SubagentPool::new();
+        runtime.record_completed_for_test(run_summary(
+            "run-cancelled",
+            "child-cancelled",
+            "explorer",
+            SubagentStatus::Cancelled,
+        ));
+        let runs = vec![
+            active_job("run-other", "child-other", "explorer"),
+            active_job("run-cancelled", "child-cancelled", "explorer"),
+        ];
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notified = std::collections::HashSet::new();
+        emit_dropped_child_terminals(&tx, &runtime, &runs, &mut notified);
+        assert_eq!(
+            child_interrupted(rx.try_recv().expect("terminal")),
+            Some("child-cancelled".into())
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the still-running child stays untouched"
+        );
+
+        send_subagent_interrupted(&tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionTransportEvent::Interrupted)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the parent interrupt carries no child-scope event"
+        );
+    }
+
+    #[test]
+    fn dropped_child_terminal_only_fires_for_dropped_statuses() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emit_dropped_child_terminal(
+            &tx,
+            &run_summary("run", "child", "explorer", SubagentStatus::Completed),
+        );
+        assert!(rx.try_recv().is_err());
+        emit_dropped_child_terminal(
+            &tx,
+            &run_summary("run", "child", "explorer", SubagentStatus::TimedOut),
+        );
+        assert_eq!(
+            child_interrupted(rx.try_recv().expect("terminal")),
+            Some("child".into())
+        );
+    }
+
+    #[test]
+    fn cancelled_background_completion_emits_a_terminal_without_continuation() {
+        let runtime = SubagentPool::new();
+        let transcript = parent_transcript(&temp_sessions_dir());
+        let parent_session_id = transcript
+            .lock()
+            .expect("lock transcript")
+            .session_id()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notified = std::collections::HashSet::new();
+        let result = Ok(run_summary(
+            "run-cancelled",
+            "child-cancelled",
+            "explorer",
+            SubagentStatus::Cancelled,
+        ));
+
+        let deliverable = observe_background_subagent_completion(
+            &transcript,
+            &runtime,
+            &mut notified,
+            &tx,
+            &parent_session_id,
+            None,
+            &result,
+        );
+        assert!(
+            !deliverable,
+            "a cancelled background run must not continue the turn"
+        );
+        assert_eq!(
+            child_interrupted(rx.try_recv().expect("terminal")),
+            Some("child-cancelled".into())
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no background completion event is delivered for a cancelled run"
+        );
+    }
+
+    #[test]
+    fn timed_out_background_completion_emits_a_terminal_and_still_delivers() {
+        let runtime = SubagentPool::new();
+        let transcript = parent_transcript(&temp_sessions_dir());
+        let parent_session_id = transcript
+            .lock()
+            .expect("lock transcript")
+            .session_id()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notified = std::collections::HashSet::new();
+        let result = Ok(run_summary(
+            "run-timed-out",
+            "child-timed-out",
+            "explorer",
+            SubagentStatus::TimedOut,
+        ));
+
+        let deliverable = observe_background_subagent_completion(
+            &transcript,
+            &runtime,
+            &mut notified,
+            &tx,
+            &parent_session_id,
+            None,
+            &result,
+        );
+        assert!(deliverable);
+        assert_eq!(
+            child_interrupted(rx.try_recv().expect("terminal")),
+            Some("child-timed-out".into())
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn completed_background_run_emits_no_terminal() {
+        let runtime = SubagentPool::new();
+        let transcript = parent_transcript(&temp_sessions_dir());
+        let parent_session_id = transcript
+            .lock()
+            .expect("lock transcript")
+            .session_id()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notified = std::collections::HashSet::new();
+        let result = Ok(run_summary(
+            "run-completed",
+            "child-completed",
+            "explorer",
+            SubagentStatus::Completed,
+        ));
+
+        assert!(observe_background_subagent_completion(
+            &transcript,
+            &runtime,
+            &mut notified,
+            &tx,
+            &parent_session_id,
+            None,
+            &result,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "a completed run already published its terminal"
+        );
     }
 
     #[test]

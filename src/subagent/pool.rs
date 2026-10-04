@@ -347,6 +347,14 @@ impl SubagentPool {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn record_completed_for_test(&self, summary: SubagentRunSummary) {
+        let mut state = self.state.lock().expect("subagent pool lock");
+        state
+            .completed_by_run
+            .insert(summary.run_id.clone(), summary);
+    }
+
     pub fn cancel_run(&self, run_id: &str) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -365,15 +373,6 @@ impl SubagentPool {
             .lock()
             .map(|state| !state.active_by_run.is_empty())
             .unwrap_or(false)
-    }
-
-    pub fn active_child(&self) -> Option<ChildSessionSummary> {
-        let state = self.state.lock().ok()?;
-        state
-            .active_by_run
-            .values()
-            .map(|slot| slot.child.clone())
-            .min_by_key(|child| (child.pool_ordinal, child.child_session_id.clone()))
     }
 
     pub fn active_jobs(&self) -> Vec<SubagentJob> {

@@ -351,6 +351,7 @@ impl HistorianRuntime {
                     outcome
                 }.boxed()
             }).await;
+            emit_historian_terminal_on_drop(&event_tx, &result);
             let result = (|| -> Result<HistoryPublication> {
                 let summary = result?;
                 ensure!(
@@ -457,6 +458,16 @@ impl HistorianRuntime {
                 Err(anyhow!("historian task closed without a result"))
             }
         }
+    }
+}
+
+/// Emits the terminal the historian executor could not publish when it was dropped.
+fn emit_historian_terminal_on_drop(
+    event_tx: &SessionTransportEventSender,
+    result: &Result<crate::subagent::SubagentRunSummary>,
+) {
+    if let Ok(summary) = result {
+        crate::session::engine::emit_dropped_child_terminal(event_tx, summary);
     }
 }
 
@@ -626,5 +637,51 @@ mod tests {
             Some(MAX_HISTORIAN_ATTEMPTS)
         );
         assert!(runtime.exhausted(Some("raw:1")));
+    }
+
+    fn historian_summary(status: SubagentStatus) -> crate::subagent::SubagentRunSummary {
+        crate::subagent::SubagentRunSummary {
+            run_id: "run-historian".into(),
+            child_session_id: "child-historian".into(),
+            agent_name: "historian".into(),
+            status,
+            failure_kind: None,
+            summary: String::new(),
+            structured_result: crate::subagent::StructuredSubagentResult {
+                status: status.as_str().into(),
+                summary: String::new(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-historian".into(),
+                child_session_id: "child-historian".into(),
+                raw_excerpt: None,
+            },
+        }
+    }
+
+    #[test]
+    fn dropped_historian_run_emits_a_child_terminal_only_when_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        emit_historian_terminal_on_drop(&tx, &Ok(historian_summary(SubagentStatus::Completed)));
+        assert!(
+            rx.try_recv().is_err(),
+            "a completed historian published its own terminal"
+        );
+        for status in [SubagentStatus::Cancelled, SubagentStatus::TimedOut] {
+            emit_historian_terminal_on_drop(&tx, &Ok(historian_summary(status)));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(SessionTransportEvent::ChildSessionEvent {
+                    event: SessionEvent::Interrupted,
+                    ..
+                })
+            ));
+        }
     }
 }

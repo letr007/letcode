@@ -2409,8 +2409,8 @@ impl TuiRuntime {
             InputAction::Quit => {
                 // A running turn keeps control: Ctrl+C stops work in flight (same
                 // confirmation as Esc) instead of ending the session and cancelling
-                // its subagents. It quits directly only once the session is idle.
-                if self.has_active_or_pending_session_turn() {
+                // its subagents. A child-session phase alone cannot block quitting.
+                if self.engine_turn_is_active() {
                     return self.handle_interrupt();
                 }
                 let _ = self.cancel_pending_question(
@@ -2541,14 +2541,17 @@ impl TuiRuntime {
         self.queued_prompt_lifecycle.clear_unaccepted();
     }
 
+    fn engine_turn_is_active(&self) -> bool {
+        has_active_or_pending_session_turn(active_turn_state(
+            &self.state,
+            self.session_turn_active,
+            self.queued_prompt_lifecycle.has_inflight_handoff(),
+            self.permission_lifecycle.is_pending(),
+        ))
+    }
+
     fn has_active_or_pending_session_turn(&self) -> bool {
-        self.state.has_running_child_session()
-            || has_active_or_pending_session_turn(active_turn_state(
-                &self.state,
-                self.session_turn_active,
-                self.queued_prompt_lifecycle.has_inflight_handoff(),
-                self.permission_lifecycle.is_pending(),
-            ))
+        self.state.has_running_child_session() || self.engine_turn_is_active()
     }
 
     fn history_navigation_is_unavailable(&self) -> bool {
