@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::{
-    state::{AppPhase, TuiState},
+    state::{AppPhase, OutputRateGraph, TuiState, OUTPUT_RATE_GRAPH_COLUMNS},
     surface,
     theme::Theme,
 };
@@ -81,10 +81,14 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
                 token_budget_spans_with_cache_usage(usage, cache_usage, theme)
             })
             .unwrap_or_default();
-        if let Some(rate) = state.active_output_token_rate() {
+        let graph = state.output_rate_graph();
+        if graph.has_rate() {
             if !spans.is_empty() {
                 spans.push(Span::styled(" · ", footer_dim_style(theme)));
             }
+            spans.extend(output_rate_graph_spans(graph, theme));
+            spans.push(Span::styled(" ", footer_dim_style(theme)));
+            let rate = graph.latest_sample().flatten().unwrap_or(0);
             spans.push(Span::styled(
                 format!("{rate}t/s"),
                 output_token_rate_style(rate, theme),
@@ -321,6 +325,26 @@ fn token_budget_spans_with_cache_usage(
         footer_muted_style(theme),
     ));
     spans
+}
+
+fn output_rate_graph_spans(graph: &OutputRateGraph, theme: Theme) -> Vec<Span<'static>> {
+    let style = Style::default().fg(theme.accent).bg(theme.root_bg);
+    graph
+        .levels(OUTPUT_RATE_GRAPH_COLUMNS)
+        .chunks_exact(2)
+        .map(|pair| Span::styled(output_rate_graph_glyph(pair[0], pair[1]).to_string(), style))
+        .collect()
+}
+
+fn output_rate_graph_glyph(left: usize, right: usize) -> char {
+    const COLUMN_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let mut bits = 0u8;
+    for (column, level) in [left, right].into_iter().enumerate() {
+        for bit in &COLUMN_BITS[column][(4 - level.clamp(1, 4))..] {
+            bits |= bit;
+        }
+    }
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
 }
 
 fn output_token_rate_style(rate: u64, theme: Theme) -> Style {
@@ -834,7 +858,8 @@ fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
 mod tests {
     use super::{
         TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_scanner_cells,
-        footer_status_spans, output_token_rate_style, render_footer, token_budget_bar_spans,
+        footer_status_spans, output_rate_graph_glyph, output_token_rate_style, render_footer,
+        token_budget_bar_spans,
         token_budget_cache_hit_percent, token_budget_segment_units, token_budget_spans,
     };
     use crate::{
@@ -967,27 +992,33 @@ mod tests {
             cache_report: None,
             prompt_composition: Vec::new(),
         });
-        state.set_output_token_rate(Some(60));
+        state.push_output_rate_graph_sample(Some(60));
 
         let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(rendered.contains("~70% · 60t/s"), "{rendered}");
+        assert!(
+            rendered.contains("~70% · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn footer_shows_output_token_rate_before_provider_usage_arrives() {
         let mut state = TuiState::default();
-        state.set_output_token_rate(Some(60));
+        state.push_output_rate_graph_sample(Some(60));
 
         let rendered = footer_hint_spans(&state, crate::tui::Theme::dark(), 80)
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(rendered.contains(" · 60t/s"), "{rendered}");
+        assert!(
+            rendered.contains(" · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1000,6 +1031,15 @@ mod tests {
         assert_eq!(output_token_rate_style(40, theme).fg, Some(theme.warning));
         assert_eq!(output_token_rate_style(79, theme).fg, Some(theme.warning));
         assert_eq!(output_token_rate_style(80, theme).fg, Some(theme.success));
+    }
+
+    #[test]
+    fn output_rate_graph_glyphs_encode_dot_heights() {
+        assert_eq!(output_rate_graph_glyph(1, 1), '⣀');
+        assert_eq!(output_rate_graph_glyph(2, 2), '⣤');
+        assert_eq!(output_rate_graph_glyph(3, 3), '⣶');
+        assert_eq!(output_rate_graph_glyph(4, 4), '⣿');
+        assert_eq!(output_rate_graph_glyph(3, 4), '⣾');
     }
 
     #[test]

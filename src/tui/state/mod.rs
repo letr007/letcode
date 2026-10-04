@@ -1257,6 +1257,7 @@ pub struct TuiState {
     pub model_token_usage: Option<ModelTokenUsage>,
     pub sidebar_model_token_usage: Option<ModelTokenUsage>,
     pub output_token_rate: Option<u64>,
+    output_rate_graph: OutputRateGraph,
     /// 上下文压缩进行中：footer 指示条改用开火车式往返扫描，隐藏过期的 token 数字。
     pub compaction_active: bool,
     /// 压缩动画相对于全局 spinner 的起始帧，确保每次都从左→右填充开始。
@@ -1361,6 +1362,7 @@ impl Default for TuiState {
             model_token_usage: None,
             sidebar_model_token_usage: None,
             output_token_rate: None,
+            output_rate_graph: OutputRateGraph::default(),
             compaction_active: false,
             compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
@@ -1812,12 +1814,28 @@ impl TuiState {
 
     pub fn clear_all_output_token_rates(&mut self) {
         self.output_token_rate = None;
+        self.output_rate_graph.clear();
         if let Some(child) = self.child_timeline.as_mut() {
             child.output_token_rate = None;
         }
         for child in self.child_timeline_cache.values_mut() {
             child.output_token_rate = None;
         }
+    }
+
+    pub fn output_rate_graph(&self) -> &OutputRateGraph {
+        &self.output_rate_graph
+    }
+
+    pub fn push_output_rate_graph_sample(&mut self, rate: Option<u64>) {
+        let view_id = if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .map(|child| child.session_id.clone())
+        } else {
+            None
+        };
+        self.output_rate_graph.push(view_id.as_deref(), rate);
     }
 
     pub fn set_child_output_token_rate(&mut self, child_session_id: &str, rate: Option<u64>) {
@@ -2913,6 +2931,7 @@ impl TuiState {
         self.model_token_usage = None;
         self.sidebar_model_token_usage = None;
         self.output_token_rate = None;
+        self.output_rate_graph.clear();
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
@@ -3784,8 +3803,10 @@ fn column_to_char_offset(text: &str, target_col: u16) -> usize {
 }
 
 mod event_projection;
+mod output_rate_graph;
 use event_projection::*;
 pub(crate) use event_projection::{context_detail_target_exists, context_dialog_items};
+pub use output_rate_graph::{OUTPUT_RATE_GRAPH_COLUMNS, OutputRateGraph};
 
 fn child_phase_for_event(event: &SessionEvent) -> AppPhase {
     match event {

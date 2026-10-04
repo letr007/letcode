@@ -203,6 +203,7 @@ pub struct TuiRuntime {
     queued_prompts: VecDeque<UserMessageSubmission>,
     queued_prompt_lifecycle: QueuedPromptLifecycle,
     session_turn_active: bool,
+    last_output_rate_graph_sample_at: Option<Instant>,
     session_resume_pending: bool,
     /// Background `/resume` directory scan; polled each frame so the UI never blocks.
     session_list_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<SessionSummary>>>>,
@@ -252,6 +253,7 @@ impl TuiRuntime {
             queued_prompts: VecDeque::new(),
             queued_prompt_lifecycle: QueuedPromptLifecycle::default(),
             session_turn_active: false,
+            last_output_rate_graph_sample_at: None,
             session_resume_pending: false,
             session_list_rx: None,
             update_check_rx: None,
@@ -1121,6 +1123,23 @@ impl TuiRuntime {
             }
             _ => self.finish_output_rate_for_transport_event(event, now),
         }
+    }
+
+    fn sample_output_rate_graph(&mut self, now: Instant) {
+        const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+        if self
+            .last_output_rate_graph_sample_at
+            .is_some_and(|last| now.saturating_duration_since(last) < SAMPLE_INTERVAL)
+        {
+            return;
+        }
+        self.last_output_rate_graph_sample_at = Some(now);
+        let rate = if self.session_turn_active {
+            self.state.active_output_token_rate()
+        } else {
+            None
+        };
+        self.state.push_output_rate_graph_sample(rate);
     }
 
     fn set_output_token_rate_for_session(
@@ -2452,6 +2471,7 @@ impl TuiRuntime {
 
     pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
         let now = std::time::Instant::now();
+        self.sample_output_rate_graph(now);
         self.state.begin_live_presentations(now);
         self.state.refresh_live_presentations(now);
         drawer.draw(&mut self.state)
