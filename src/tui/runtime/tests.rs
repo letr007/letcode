@@ -7822,7 +7822,13 @@ fn config_editor_lists_grouped_fields() {
         .collect::<Vec<_>>();
     assert!(labels.contains(&"active_provider"), "{labels:?}");
     assert!(labels.contains(&"mode"), "{labels:?}");
-    assert!(dialog.items.iter().all(|item| item.section.is_some()));
+    assert!(
+        dialog
+            .items
+            .iter()
+            .filter(|item| !item.id.starts_with("new\u{1e}"))
+            .all(|item| item.section.is_some())
+    );
 }
 
 #[test]
@@ -8010,6 +8016,26 @@ fn config_editor_shows_the_selected_field_description() {
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
 
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "active_provider")
+        .expect("active_provider field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("move away");
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("move back and sync the description");
+
     let dialog = runtime.state().dialog().expect("config dialog");
     let description = dialog.description.as_deref().expect("field description");
     assert!(
@@ -8028,6 +8054,26 @@ fn config_editor_translates_schema_descriptions() {
     runtime
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
+
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "active_provider")
+        .expect("active_provider field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("move away");
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("move back and sync the description");
 
     let dialog = runtime.state().dialog().expect("config dialog");
     let description = dialog.description.as_deref().expect("field description");
@@ -8115,4 +8161,82 @@ fn config_editor_edits_array_items() {
         .expect("save the draft");
     let written = std::fs::read_to_string(&path).expect("read config");
     assert!(!written.contains("echo"), "{written}");
+}
+
+#[test]
+fn config_editor_hides_fields_that_do_not_apply() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[mcp.demo]\ntype = \"remote\"\nurl = \"https://m.invalid\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"url"), "{labels:?}");
+    assert!(!labels.contains(&"command"), "{labels:?}");
+    assert!(!labels.contains(&"environment"), "{labels:?}");
+}
+
+#[test]
+fn config_editor_adds_a_new_mcp_server() {
+    let (mut runtime, path) = runtime_with_config_path(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.id == "new\u{1e}mcp")
+        .expect("new mcp entry");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("start naming the server");
+    for ch in "demo".chars() {
+        runtime
+            .handle_input_action(InputAction::ConfigEditInsert(ch))
+            .expect("type the name");
+    }
+    runtime
+        .handle_input_action(InputAction::ConfigEditConfirm)
+        .expect("commit the name");
+
+    let written = std::fs::read_to_string(&path).expect("read config");
+    assert!(!written.contains("[mcp.demo]"), "unsaved entries stay off disk");
+
+    runtime
+        .handle_input_action(InputAction::ConfigSave)
+        .expect("save the draft");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert!(
+        dialog.config_error.is_some(),
+        "a server without a command cannot be saved"
+    );
+    assert!(
+        dialog.config_dirty,
+        "the draft stays dirty after a failed save"
+    );
+    let written = std::fs::read_to_string(&path).expect("read config");
+    assert!(!written.contains("[mcp.demo]"), "{written}");
 }

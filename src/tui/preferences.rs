@@ -50,6 +50,8 @@ pub struct TuiPreferences {
     pub language: Option<String>,
     #[serde(default)]
     pub fake_installation_id: Option<String>,
+    #[serde(default)]
+    pub fast_mode: bool,
 }
 
 impl Default for TuiPreferences {
@@ -64,6 +66,7 @@ impl Default for TuiPreferences {
             tools_display: ToolsDisplayMode::default(),
             language: None,
             fake_installation_id: None,
+            fast_mode: false,
         }
     }
 }
@@ -192,6 +195,7 @@ mod tests {
             tools_display: ToolsDisplayMode::Compact,
             language: Some("zh-CN".into()),
             fake_installation_id: Some("fake-installation".into()),
+            fast_mode: true,
         };
         TuiPreferences::update_in_dir(&base, |current| *current = prefs.clone())
             .expect("save preferences");
@@ -309,6 +313,7 @@ mod tests {
             tools_display: ToolsDisplayMode::Detailed,
             language: None,
             fake_installation_id: None,
+            fast_mode: false,
         };
         let json = serde_json::to_string(&prefs).expect("serialize");
         let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");

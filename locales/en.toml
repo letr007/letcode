@@ -32,6 +32,8 @@ saved_value = "Configuration saved"
 invalid_number = "Enter a whole number"
 save_failed = "Failed to save configuration: {error}"
 unsaved = "unsaved changes"
+new_provider = "＋ Add a provider"
+new_mcp = "＋ Add an MCP server"
 discarded = "Unsaved changes were discarded"
 unavailable = "Configuration file is unavailable"
 

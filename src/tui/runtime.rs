@@ -1420,6 +1420,7 @@ impl TuiRuntime {
             }
             SessionTransportEvent::FastModeChanged { enabled } => {
                 self.state.set_fast_mode_enabled(*enabled);
+                self.persist_fast_mode(*enabled);
             }
             SessionTransportEvent::ModelChanged { model_id } => {
                 self.apply_restored_model(model_id.clone());
@@ -3492,10 +3493,13 @@ impl TuiRuntime {
         let Some(document) = self.config_draft.as_ref() else {
             return Vec::new();
         };
-        let entries = crate::config::config_entries_in(document);
+        let entries = crate::config::config_entries_in(document)
+            .into_iter()
+            .filter(|entry| Self::config_entry_visible(document, &entry.path))
+            .collect::<Vec<_>>();
         let loaded =
             crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string()).ok();
-        entries
+        let mut items = entries
             .into_iter()
             .map(|entry| {
                 let affordance = match entry.kind {
@@ -3529,7 +3533,29 @@ impl TuiRuntime {
                 .with_section(entry.section)
                 .with_right_detail(affordance)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        items.insert(
+            0,
+            DialogItem::new("new\u{1e}mcp", self.state.t("config.new_mcp"), None),
+        );
+        items.insert(
+            0,
+            DialogItem::new(
+                "new\u{1e}providers",
+                self.state.t("config.new_provider"),
+                None,
+            ),
+        );
+        items
+    }
+
+    fn persist_fast_mode(&self, enabled: bool) {
+        if let Err(error) = crate::tui::preferences::TuiPreferences::update_in_dir(
+            &self.preferences_dir,
+            |preferences| preferences.fast_mode = enabled,
+        ) {
+            tracing::warn!(%error, "failed to persist fast mode");
+        }
     }
 
     fn load_config_draft(&mut self) {
@@ -3570,11 +3596,18 @@ impl TuiRuntime {
             Ok(()) => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.config_dirty = false;
+                    dialog.config_error = None;
                 }
                 self.state
                     .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
             }
-            Err(error) => self.report_config_save_failure(error),
+            Err(error) => {
+                let message = error.to_string();
+                if let Some(dialog) = self.state.dialog_mut() {
+                    dialog.config_error = Some(message);
+                }
+                self.report_config_save_failure(error);
+            }
         }
     }
 
@@ -3584,6 +3617,59 @@ impl TuiRuntime {
             .or_else(|| field_id.strip_prefix("choice:"))
             .or_else(|| field_id.strip_prefix("list:"))?;
         Some(path.split('\u{1f}').map(str::to_string).collect())
+    }
+
+    /// Fields whose siblings make them inapplicable stay out of the panel.
+    fn config_entry_visible(document: &toml_edit::DocumentMut, path: &[String]) -> bool {
+        if path.len() == 1 && path[0] == "fast_mode" {
+            return false;
+        }
+        if path.len() == 3 && path[0] == "mcp" {
+            let kind = crate::config::config_value_in(document, &["mcp", path[1].as_str(), "type"])
+                .map(|(_, value)| value);
+            match path[2].as_str() {
+                "command" | "environment" | "env" => return kind.as_deref() != Some("remote"),
+                "url" | "headers" | "oauth" => return kind.as_deref() == Some("remote"),
+                _ => {}
+            }
+        }
+        if path.len() == 6
+            && path[0] == "providers"
+            && path[2] == "models"
+            && path[4] == "generation"
+        {
+            let flag = crate::config::config_value_in(
+                document,
+                &[
+                    "providers",
+                    path[1].as_str(),
+                    "models",
+                    path[3].as_str(),
+                    "capabilities",
+                    "generation",
+                    path[5].as_str(),
+                ],
+            )
+            .map(|(_, value)| value == "true")
+            .unwrap_or(false);
+            return flag;
+        }
+        if path.len() == 5
+            && path[0] == "providers"
+            && path[2] == "models"
+            && path[4] == "protocol_settings"
+        {
+            let protocol = crate::config::config_value_in(
+                document,
+                &["providers", path[1].as_str(), "models", path[3].as_str(), "protocol"],
+            )
+            .or_else(|| {
+                crate::config::config_value_in(document, &["providers", path[1].as_str(), "protocol"])
+            })
+            .map(|(_, value)| value);
+            return protocol.as_deref() == Some("anthropic");
+        }
+        true
     }
 
     fn config_field_values(
@@ -3886,6 +3972,45 @@ impl TuiRuntime {
         }
     }
 
+    fn commit_config_new_entry(&mut self, kind: &str, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let result = self.edit_config_document(|document| {
+            match kind {
+                "providers" => {
+                    crate::config::set_config_scalar(
+                        document,
+                        &["providers", name, "auth", "type"],
+                        crate::config::ConfigScalar::String("bearer".to_string()),
+                    )?;
+                    crate::config::set_config_scalar(
+                        document,
+                        &["providers", name, "endpoints", "base_url"],
+                        crate::config::ConfigScalar::String(String::new()),
+                    )?;
+                }
+                "mcp" => {
+                    crate::config::set_config_scalar(
+                        document,
+                        &["mcp", name, "type"],
+                        crate::config::ConfigScalar::String("local".to_string()),
+                    )?;
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.refresh_config_dialog();
+                self.state
+                    .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
+            }
+            Err(error) => self.report_config_save_failure(error),
+        }
+    }
+
     fn config_list_item_id(field_id: &str, index: usize) -> String {
         format!("item\u{1e}{field_id}\u{1e}{index}")
     }
@@ -3931,6 +4056,14 @@ impl TuiRuntime {
         else {
             return;
         };
+        if item.id.starts_with("new\u{1e}") {
+            self.state.config_edit = Some(crate::tui::state::ConfigEditState {
+                field_id: item.id.clone(),
+                cursor: 0,
+                buffer: String::new(),
+            });
+            return;
+        }
         if item.id.starts_with("choice:") || item.id.starts_with("list:") {
             self.expand_config_field(&item.id);
             return;
@@ -3996,6 +4129,10 @@ impl TuiRuntime {
         let Some(edit) = self.state.config_edit.take() else {
             return;
         };
+        if let Some(kind) = edit.field_id.strip_prefix("new\u{1e}") {
+            self.commit_config_new_entry(kind, edit.buffer.trim());
+            return;
+        }
         if let Some((field_id, index)) = Self::config_list_item_parts(&edit.field_id) {
             self.commit_config_list_item(&field_id, &index, edit.buffer.trim());
             return;

@@ -32,6 +32,8 @@ saved_value = "配置已保存"
 invalid_number = "请输入整数"
 save_failed = "保存配置失败：{error}"
 unsaved = "有未保存的改动"
+new_provider = "＋ 新增 provider"
+new_mcp = "＋ 新增 MCP 服务器"
 discarded = "未保存的改动已丢弃"
 unavailable = "配置文件不可用"
 

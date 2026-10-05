@@ -79,7 +79,15 @@ pub fn render_picker(
         search_y.saturating_add(2)
     } else if dialog.kind == DialogKind::ConfigEditor {
         let description_y = inner.y.saturating_add(2);
-        if let Some(description) = dialog.description.as_deref()
+        if let Some(error) = dialog.config_error.as_deref() {
+            if description_y < footer_y {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(error.to_string(), theme.error_style())))
+                        .style(theme.elevated_style()),
+                    Rect::new(inner.x, description_y, inner.width, 1),
+                );
+            }
+        } else if let Some(description) = dialog.description.as_deref()
             && description_y < footer_y
         {
             render_description(
