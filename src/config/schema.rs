@@ -10,11 +10,9 @@ fn schema() -> Option<&'static Value> {
         .as_ref()
 }
 
-/// The bundled schema's description for a configuration path, together with a
-/// stable key path that replaces provider, model, and server names with `*`.
+/// Returns `(description, key)`; the key replaces provider, model, and server names with `*`.
 ///
-/// Leaf keys without their own description fall back to the nearest documented
-/// ancestor, so `capabilities.tools` still explains what capabilities are.
+/// A leaf without its own description falls back to the nearest documented ancestor.
 pub fn field_schema(path: &[&str]) -> Option<(String, String)> {
     let root = schema()?;
     let mut node = root;
@@ -50,7 +48,6 @@ pub fn field_schema(path: &[&str]) -> Option<(String, String)> {
     Some((description, key_path.join("/")))
 }
 
-/// The allowed string values for an enumerated configuration path.
 pub fn field_enum(path: &[&str]) -> Option<Vec<String>> {
     let root = schema()?;
     let mut node = root;
@@ -74,7 +71,124 @@ pub fn field_enum(path: &[&str]) -> Option<Vec<String>> {
     }
 }
 
-/// Every documented configuration path, keyed like `field_schema`.
+pub fn entry_tables(path: &[&str]) -> Vec<String> {
+    let Some(root) = schema() else {
+        return Vec::new();
+    };
+    let mut node = root;
+    for segment in path {
+        let Some(child) = child_node(root, node, segment) else {
+            return Vec::new();
+        };
+        node = deref(root, child);
+    }
+    node.get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter(|(_, child)| {
+                    deref(root, child)
+                        .get("additionalProperties")
+                        .is_some_and(Value::is_object)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The schema's own value for `path`: default, first enum member, or zero; required children included.
+pub fn default_value(path: &[&str]) -> Option<toml_edit::Item> {
+    let root = schema()?;
+    let mut node = root;
+    for segment in path {
+        let child = child_node(root, node, segment)?;
+        node = deref(root, child);
+    }
+    item_from_schema(root, node)
+}
+
+fn item_from_schema(root: &Value, node: &Value) -> Option<toml_edit::Item> {
+    let node = deref(root, node);
+    if let Some(default) = node.get("default").and_then(json_to_item) {
+        return Some(default);
+    }
+    if let Some(member) = node
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(json_to_item)
+    {
+        return Some(member);
+    }
+    match node.get("type").and_then(Value::as_str) {
+        Some("string") => Some(toml_edit::value(String::new())),
+        Some("integer") | Some("number") => Some(toml_edit::value(0)),
+        Some("boolean") => Some(toml_edit::value(false)),
+        Some("array") => Some(toml_edit::value(toml_edit::Array::new())),
+        Some("object") => {
+            let mut table = toml_edit::Table::new();
+            if let Some(required) = node.get("required").and_then(Value::as_array) {
+                for name in required.iter().filter_map(Value::as_str) {
+                    let Some(child) = child_node(root, node, name) else {
+                        continue;
+                    };
+                    if let Some(item) = item_from_schema(root, child) {
+                        table.insert(name, item);
+                    }
+                }
+            }
+            Some(toml_edit::Item::Table(table))
+        }
+        _ => None,
+    }
+}
+
+fn json_to_item(value: &Value) -> Option<toml_edit::Item> {
+    match value {
+        Value::String(text) => Some(toml_edit::value(text.clone())),
+        Value::Bool(flag) => Some(toml_edit::value(*flag)),
+        Value::Number(number) => number
+            .as_i64()
+            .map(toml_edit::value)
+            .or_else(|| number.as_f64().map(toml_edit::value)),
+        _ => None,
+    }
+}
+
+pub fn schema_properties(path: &[&str]) -> Vec<String> {
+    let Some(root) = schema() else {
+        return Vec::new();
+    };
+    let mut node = root;
+    for segment in path {
+        let Some(child) = child_node(root, node, segment) else {
+            return Vec::new();
+        };
+        node = deref(root, child);
+    }
+    node.get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn table_accepts_entries(path: &[&str]) -> bool {
+    let Some(root) = schema() else {
+        return false;
+    };
+    let mut node = root;
+    for segment in path {
+        let Some(child) = child_node(root, node, segment) else {
+            return false;
+        };
+        node = deref(root, child);
+    }
+    node.get("additionalProperties")
+        .is_some_and(Value::is_object)
+}
+
 #[cfg(test)]
 pub fn schema_keys() -> Vec<String> {
     let Some(root) = schema() else {

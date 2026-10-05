@@ -579,7 +579,7 @@ fn render_config_footer(
         spans.push(Span::styled("  ·  ", muted_style(theme)));
         spans.push(Span::styled("Esc", accent_style(theme)));
         spans.push(Span::styled(
-            format!(" {}", state.t("ui.close")),
+            format!(" {}", state.t("ui.back")),
             muted_style(theme),
         ));
     }

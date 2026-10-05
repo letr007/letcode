@@ -117,11 +117,15 @@ use persistence::acquire_config_read_lock;
 pub(crate) use persistence::{acquire_config_lock, replace_file};
 #[allow(unused_imports)]
 pub use persistence::{
-    config_array_in, config_entries_in, config_value_in, persist_expert_allowed_models,
-    persist_mcp_server_enabled, save_config_document, set_config_scalar, ConfigEntry,
-    ConfigEntryKind, ConfigScalar,
+    config_array_in, config_entries_in, config_value_in, leaf_config_entry,
+    persist_expert_allowed_models,
+    persist_mcp_server_enabled, remove_config_table, save_config_document, set_config_item,
+    set_config_scalar,
+    ConfigEntry, ConfigEntryKind, ConfigScalar,
 };
-pub use schema::{field_enum, field_schema};
+pub use schema::{
+    default_value, entry_tables, field_enum, field_schema, schema_properties, table_accepts_entries,
+};
 #[cfg(test)]
 pub use schema::schema_keys;
 

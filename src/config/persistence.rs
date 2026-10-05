@@ -57,42 +57,25 @@ pub enum ConfigScalar {
 }
 
 /// Persist one scalar at `path` without rewriting unrelated configuration content.
-/// Set one scalar at `path` in an in-memory document.
 pub fn set_config_scalar(
     document: &mut DocumentMut,
     path: &[&str],
     scalar: ConfigScalar,
 ) -> Result<()> {
-    let (key, parents) = path
-        .split_last()
-        .ok_or_else(|| anyhow!("config path is empty"))?;
-    {
-        let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
-        for &segment in parents {
-            if table.get(segment).is_none() {
-                table.insert(segment, Item::Table(Table::new()));
+    let item = match scalar {
+        ConfigScalar::String(v) => value(v),
+        ConfigScalar::Integer(v) => value(v),
+        ConfigScalar::Float(v) => value(v),
+        ConfigScalar::Bool(v) => value(v),
+        ConfigScalar::Array(values) => {
+            let mut array = Array::new();
+            for value in values {
+                array.push(value);
             }
-            table = table
-                .get_mut(segment)
-                .and_then(Item::as_table_like_mut)
-                .ok_or_else(|| anyhow!("config [{segment}] is not a table"))?;
+            Item::Value(toml_edit::Value::Array(array))
         }
-        let item = match scalar {
-            ConfigScalar::String(v) => value(v),
-            ConfigScalar::Integer(v) => value(v),
-            ConfigScalar::Float(v) => value(v),
-            ConfigScalar::Bool(v) => value(v),
-            ConfigScalar::Array(values) => {
-                let mut array = Array::new();
-                for value in values {
-                    array.push(value);
-                }
-                Item::Value(toml_edit::Value::Array(array))
-            }
-        };
-        table.insert(key, item);
-    }
-    Ok(())
+    };
+    set_config_item(document, path, item)
 }
 
 /// One editable leaf of the configuration document, in file order.
@@ -116,7 +99,6 @@ pub enum ConfigEntryKind {
     ReadOnly,
 }
 
-/// Flatten an in-memory configuration document into editable leaves.
 pub fn config_entries_in(document: &DocumentMut) -> Vec<ConfigEntry> {
     let mut entries = Vec::new();
     let mut prefix = Vec::new();
@@ -140,7 +122,7 @@ fn collect_config_entries(
     }
 }
 
-fn leaf_config_entry(path: &[String], value: &toml_edit::Value) -> ConfigEntry {
+pub fn leaf_config_entry(path: &[String], value: &toml_edit::Value) -> ConfigEntry {
     let key = path.last().cloned().unwrap_or_default();
     let sensitive = is_sensitive_key(&key);
     let (display, kind) = match value {
@@ -198,7 +180,6 @@ fn mask_config_secret(value: &str) -> String {
     "•".repeat(value.chars().count().clamp(4, 12))
 }
 
-/// The raw scalar at `path` in an in-memory document.
 pub fn config_value_in(document: &DocumentMut, path: &[&str]) -> Option<(ConfigEntryKind, String)> {
     let mut table: &dyn toml_edit::TableLike = document.as_table();
     for (index, segment) in path.iter().enumerate() {
@@ -214,7 +195,6 @@ pub fn config_value_in(document: &DocumentMut, path: &[&str]) -> Option<(ConfigE
     None
 }
 
-/// The string elements of the array at `path` in an in-memory document.
 pub fn config_array_in(document: &DocumentMut, path: &[&str]) -> Option<Vec<String>> {
     let mut table: &dyn toml_edit::TableLike = document.as_table();
     for (index, segment) in path.iter().enumerate() {
@@ -297,7 +277,39 @@ fn persist_config_document(
     )
 }
 
-/// Validate an edited in-memory document and replace the config file with it.
+pub fn set_config_item(document: &mut DocumentMut, path: &[&str], item: Item) -> Result<()> {
+    let (key, parents) = path
+        .split_last()
+        .ok_or_else(|| anyhow!("config path is empty"))?;
+    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+    for &segment in parents {
+        if table.get(segment).is_none() {
+            table.insert(segment, Item::Table(Table::new()));
+        }
+        table = table
+            .get_mut(segment)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| anyhow!("config [{segment}] is not a table"))?;
+    }
+    table.insert(key, item);
+    Ok(())
+}
+
+pub fn remove_config_table(document: &mut DocumentMut, path: &[&str]) -> Result<()> {
+    let (key, parents) = path
+        .split_last()
+        .ok_or_else(|| anyhow!("config path is empty"))?;
+    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+    for &segment in parents {
+        table = table
+            .get_mut(segment)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| anyhow!("config [{segment}] is not a table"))?;
+    }
+    table.remove(key);
+    Ok(())
+}
+
 pub fn save_config_document(config_path: &Path, document: &DocumentMut) -> Result<()> {
     let config_target = fs::canonicalize(config_path)
         .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;

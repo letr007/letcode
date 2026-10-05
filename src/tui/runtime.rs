@@ -2394,10 +2394,21 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::ConfigListRemove => {
-                self.remove_config_list_item();
+                match self.selected_config_field() {
+                    Some(ConfigFieldRef::Table(path)) => self.remove_config_table(path),
+                    _ => self.remove_config_list_item(),
+                }
                 Ok(None)
             }
             InputAction::DialogCancel => {
+                if self
+                    .state
+                    .dialog()
+                    .is_some_and(|dialog| dialog.kind == DialogKind::ConfigEditor)
+                    && self.leave_config_table()
+                {
+                    return Ok(None);
+                }
                 if self
                     .state
                     .dialog()
@@ -2456,6 +2467,7 @@ impl TuiRuntime {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.insert_query_char(ch);
                 }
+                self.refresh_config_search();
                 self.state.sync_context_picker_preview();
                 Ok(None)
             }
@@ -2472,6 +2484,7 @@ impl TuiRuntime {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.pop_query_char();
                 }
+                self.refresh_config_search();
                 self.state.sync_context_picker_preview();
                 Ok(None)
             }
@@ -3494,36 +3507,150 @@ impl TuiRuntime {
         let Some(document) = self.config_draft.as_ref() else {
             return (Vec::new(), Vec::new());
         };
-        let entries = crate::config::config_entries_in(document)
-            .into_iter()
-            .filter(|entry| Self::config_entry_visible(document, &entry.path))
-            .collect::<Vec<_>>();
+        let query = self
+            .state
+            .dialog()
+            .map(|dialog| dialog.query.trim().to_string())
+            .unwrap_or_default();
+        if !query.is_empty() {
+            return self.config_search_items(config_path, document, &query);
+        }
+        let level = self
+            .state
+            .dialog()
+            .map(|dialog| dialog.config_path.clone())
+            .unwrap_or_default();
+        self.config_level_items(config_path, document, &level)
+    }
+
+    /// Rows for what is there, plus what the schema allows to add.
+    fn config_level_items(
+        &self,
+        config_path: &std::path::Path,
+        document: &toml_edit::DocumentMut,
+        level: &[String],
+    ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
+        let Some(table) = Self::config_table(document, level) else {
+            return (Vec::new(), Vec::new());
+        };
         let loaded =
             crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string()).ok();
+        let section = level.join(".");
         let mut items = Vec::new();
         let mut fields = Vec::new();
-        for (table, key) in [
-            ("providers", "config.new_provider"),
-            ("mcp", "config.new_mcp"),
-        ] {
-            items.push(DialogItem::new(
-                format!("new/{table}"),
-                self.state.t(key),
-                None,
-            ));
-            fields.push(ConfigFieldRef::NewEntry(table.to_string()));
-        }
-        for entry in entries {
-            let affordance = match entry.kind {
-                crate::config::ConfigEntryKind::Bool => {
-                    if entry.display == "true" {
-                        "[x]"
-                    } else {
-                        "[ ]"
-                    }
+        let mut present: Vec<String> = Vec::new();
+        for (key, item) in table.iter() {
+            present.push(key.to_string());
+            let path: Vec<String> = level
+                .iter()
+                .cloned()
+                .chain(std::iter::once(key.to_string()))
+                .collect();
+            if !Self::config_entry_visible(document, &path) {
+                continue;
+            }
+            let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            match item {
+                toml_edit::Item::Table(_) => {
+                    let count = self.config_table_size(document, &path);
+                    items.push(
+                        DialogItem::new(path.join("/"), key.to_string(), Some(count))
+                            .with_section(section.clone()),
+                    );
+                    fields.push(ConfigFieldRef::Table(path));
                 }
-                _ => "",
-            };
+                toml_edit::Item::Value(value) => {
+                    let entry = crate::config::leaf_config_entry(&path, value);
+                    let field = if entry.kind == crate::config::ConfigEntryKind::Array {
+                        ConfigFieldRef::List(path.clone())
+                    } else if Self::config_field_values(document, loaded.as_ref(), &path).is_some() {
+                        ConfigFieldRef::Choice(path.clone())
+                    } else {
+                        ConfigFieldRef::Field(path.clone())
+                    };
+                    let affordance = Self::config_affordance(&entry);
+                    items.push(
+                        DialogItem::new(path.join("/"), entry.label, Some(entry.display))
+                            .with_description(Self::config_description(&self.state, &path_refs))
+                            .with_section(section.clone())
+                            .with_right_detail(affordance),
+                    );
+                    fields.push(field);
+                }
+                _ => {}
+            }
+        }
+        let level_refs: Vec<&str> = level.iter().map(String::as_str).collect();
+        for name in crate::config::schema_properties(&level_refs) {
+            if present.contains(&name) {
+                continue;
+            }
+            let path: Vec<String> = level
+                .iter()
+                .cloned()
+                .chain(std::iter::once(name.clone()))
+                .collect();
+            if !Self::config_entry_visible(document, &path) {
+                continue;
+            }
+            let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            items.push(
+                DialogItem::new(path.join("/"), name, None)
+                    .with_description(Self::config_description(&self.state, &path_refs))
+                    .with_section(section.clone())
+                    .with_right_detail("＋"),
+            );
+            fields.push(ConfigFieldRef::NewField(path));
+        }
+        let level_refs: Vec<&str> = level.iter().map(String::as_str).collect();
+        if level.is_empty() {
+            for table in crate::config::entry_tables(&[]) {
+                if document.get(&table).is_some() {
+                    continue;
+                }
+                items.push(
+                    DialogItem::new(
+                        format!("new/{table}"),
+                        self.state.t_fmt("config.new_entry", &[("table", &table)]),
+                        None,
+                    )
+                    .with_section(section.clone()),
+                );
+                fields.push(ConfigFieldRef::NewEntry(table));
+            }
+        } else if crate::config::table_accepts_entries(&level_refs) {
+            let name = level.last().cloned().unwrap_or_default();
+            items.push(
+                DialogItem::new(
+                    format!("new/{}", level.join("/")),
+                    self.state.t_fmt("config.new_entry", &[("table", &name)]),
+                    None,
+                )
+                .with_section(section.clone()),
+            );
+            fields.push(ConfigFieldRef::NewEntry(level.join("/")));
+        }
+        (items, fields)
+    }
+
+    /// Every matching leaf, flattened across tables, so search stays fast.
+    fn config_search_items(
+        &self,
+        config_path: &std::path::Path,
+        document: &toml_edit::DocumentMut,
+        query: &str,
+    ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
+        let loaded =
+            crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string()).ok();
+        let needle = query.to_lowercase();
+        let mut items = Vec::new();
+        let mut fields = Vec::new();
+        for entry in crate::config::config_entries_in(document) {
+            if !Self::config_entry_visible(document, &entry.path)
+                || !entry.path.join(".").to_lowercase().contains(&needle)
+            {
+                continue;
+            }
             let path: Vec<&str> = entry.path.iter().map(String::as_str).collect();
             let field = if entry.kind == crate::config::ConfigEntryKind::Array {
                 ConfigFieldRef::List(entry.path.clone())
@@ -3532,6 +3659,7 @@ impl TuiRuntime {
             } else {
                 ConfigFieldRef::Field(entry.path.clone())
             };
+            let affordance = Self::config_affordance(&entry);
             items.push(
                 DialogItem::new(
                     entry.path.join("/"),
@@ -3549,6 +3677,53 @@ impl TuiRuntime {
             fields.push(field);
         }
         (items, fields)
+    }
+
+    fn refresh_config_search(&mut self) {
+        if self
+            .state
+            .dialog()
+            .is_some_and(|dialog| dialog.kind == DialogKind::ConfigEditor)
+        {
+            self.refresh_config_dialog();
+            self.sync_config_dialog_description();
+        }
+    }
+
+    fn config_table<'a>(
+        document: &'a toml_edit::DocumentMut,
+        level: &[String],
+    ) -> Option<&'a dyn toml_edit::TableLike> {
+        let mut table: &dyn toml_edit::TableLike = document.as_table();
+        for segment in level {
+            table = table.get(segment).and_then(toml_edit::Item::as_table_like)?;
+        }
+        Some(table)
+    }
+
+    fn config_description(state: &TuiState, path: &[&str]) -> Option<String> {
+        crate::config::field_schema(path).map(|(fallback, key)| {
+            state
+                .t_opt(&format!("config.schema.{key}"))
+                .unwrap_or(fallback)
+        })
+    }
+
+    fn config_affordance(entry: &crate::config::ConfigEntry) -> String {
+        match entry.kind {
+            crate::config::ConfigEntryKind::Bool if entry.display == "true" => "[x]".to_string(),
+            crate::config::ConfigEntryKind::Bool => "[ ]".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn config_table_size(&self, document: &toml_edit::DocumentMut, table: &[String]) -> String {
+        let count = crate::config::config_entries_in(document)
+            .into_iter()
+            .filter(|entry| entry.path.starts_with(table))
+            .count()
+            .to_string();
+        self.state.t_fmt("config.field_count", &[("count", &count)])
     }
 
     fn persist_fast_mode(&self, enabled: bool) {
@@ -3678,6 +3853,20 @@ impl TuiRuntime {
         if path.len() == 3 && path[0] == "providers" && path[2] == "default_model" {
             return Self::provider_models(config, &path[1]);
         }
+        if path.len() == 3 && path[0] == "agents" && path[2] == "allowed_models" {
+            return Some(
+                config
+                    .providers
+                    .iter()
+                    .flat_map(|(name, provider)| {
+                        provider
+                            .models
+                            .keys()
+                            .map(move |model| format!("{name}/{model}"))
+                    })
+                    .collect(),
+            );
+        }
         if path.len() == 3 && path[0] == "agents" {
             match path[2].as_str() {
                 "provider" => return Some(config.providers.keys().cloned().collect()),
@@ -3707,6 +3896,11 @@ impl TuiRuntime {
     fn expanded_field(&self) -> Option<ConfigFieldRef> {
         let dialog = self.state.dialog()?;
         dialog.config_fields.get(dialog.config_expanded?).cloned()
+    }
+
+    fn selected_config_field(&self) -> Option<ConfigFieldRef> {
+        let dialog = self.state.dialog()?;
+        dialog.config_fields.get(dialog.selected).cloned()
     }
 
     fn expanded_index(&self) -> Option<usize> {
@@ -3762,6 +3956,7 @@ impl TuiRuntime {
             dialog.config_expanded = Some(index);
             dialog.config_detail_items = items;
             dialog.config_detail_selected = selected;
+            dialog.config_detail_target = None;
         }
     }
 
@@ -3770,6 +3965,48 @@ impl TuiRuntime {
             dialog.config_expanded = None;
             dialog.config_detail_items.clear();
             dialog.config_detail_selected = 0;
+            dialog.config_detail_target = None;
+        }
+    }
+
+    fn config_list_has_choices(&self, path: &[String]) -> bool {
+        let Some(config_path) = self.config_path.clone() else {
+            return false;
+        };
+        let Some(document) = self.config_draft.as_ref() else {
+            return false;
+        };
+        let Ok(config) =
+            crate::config::AppConfig::load_from_str_at_path(&config_path, &document.to_string())
+        else {
+            return false;
+        };
+        Self::config_field_values(document, Some(&config), path).is_some()
+    }
+
+    fn show_config_element_choices(&mut self, path: &[String], index: usize) {
+        let Some(config_path) = self.config_path.clone() else {
+            return;
+        };
+        let Some(document) = self.config_draft.as_ref() else {
+            return;
+        };
+        let Ok(config) =
+            crate::config::AppConfig::load_from_str_at_path(&config_path, &document.to_string())
+        else {
+            return;
+        };
+        let Some(values) = Self::config_field_values(document, Some(&config), path) else {
+            return;
+        };
+        let items = values
+            .iter()
+            .map(|value| DialogItem::new(value.clone(), value.clone(), None))
+            .collect::<Vec<_>>();
+        if let Some(dialog) = self.state.dialog_mut() {
+            dialog.config_detail_items = items;
+            dialog.config_detail_selected = 0;
+            dialog.config_detail_target = Some(index);
         }
     }
 
@@ -3790,6 +4027,7 @@ impl TuiRuntime {
             return;
         };
         let selected = dialog.config_detail_selected;
+        let target = dialog.config_detail_target;
         let Some(value) = dialog
             .config_detail_items
             .get(selected)
@@ -3798,9 +4036,15 @@ impl TuiRuntime {
             return;
         };
         match field {
-            ConfigFieldRef::List(path) => {
-                self.begin_config_list_item_edit(ConfigFieldRef::ListItem(path, selected));
-            }
+            ConfigFieldRef::List(path) => match target {
+                Some(index) => self.commit_config_list_item(&path, index, &value),
+                None if self.config_list_has_choices(&path) => {
+                    self.show_config_element_choices(&path, selected)
+                }
+                None => {
+                    self.begin_config_list_item_edit(ConfigFieldRef::ListItem(path, selected))
+                }
+            },
             ConfigFieldRef::Choice(path) => self.apply_config_choice(&path, &value),
             _ => {}
         }
@@ -3837,6 +4081,10 @@ impl TuiRuntime {
             .and_then(|document| crate::config::config_array_in(document, &path_refs))
             .map(|values| values.len())
             .unwrap_or(0);
+        if self.config_list_has_choices(&path) {
+            self.show_config_element_choices(&path, next);
+            return;
+        }
         let field = ConfigFieldRef::ListItem(path, next);
         if let Some(dialog) = self.state.dialog_mut() {
             dialog
@@ -3946,34 +4194,28 @@ impl TuiRuntime {
         }
     }
 
-    fn commit_config_new_entry(&mut self, kind: &str, name: &str) {
+    fn commit_config_new_entry(&mut self, table: &str, name: &str) {
         if name.is_empty() {
             return;
         }
+        let path: Vec<String> = table
+            .split('/')
+            .map(str::to_string)
+            .chain(std::iter::once(name.to_string()))
+            .collect();
+        self.commit_config_new_item(&path);
+    }
+
+    fn commit_config_new_field(&mut self, path: &[String]) {
+        self.commit_config_new_item(path);
+    }
+
+    fn commit_config_new_item(&mut self, path: &[String]) {
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let item = crate::config::default_value(&path_refs)
+            .unwrap_or_else(|| toml_edit::Item::Table(toml_edit::Table::new()));
         let result = self.edit_config_document(|document| {
-            match kind {
-                "providers" => {
-                    crate::config::set_config_scalar(
-                        document,
-                        &["providers", name, "auth", "type"],
-                        crate::config::ConfigScalar::String("bearer".to_string()),
-                    )?;
-                    crate::config::set_config_scalar(
-                        document,
-                        &["providers", name, "endpoints", "base_url"],
-                        crate::config::ConfigScalar::String(String::new()),
-                    )?;
-                }
-                "mcp" => {
-                    crate::config::set_config_scalar(
-                        document,
-                        &["mcp", name, "type"],
-                        crate::config::ConfigScalar::String("local".to_string()),
-                    )?;
-                }
-                _ => {}
-            }
-            Ok(())
+            crate::config::set_config_item(document, &path_refs, item)
         });
         match result {
             Ok(()) => {
@@ -4042,7 +4284,49 @@ impl TuiRuntime {
                     _ => {}
                 }
             }
+            ConfigFieldRef::NewField(path) => self.commit_config_new_field(&path),
+            ConfigFieldRef::Table(path) => self.enter_config_table(path),
             ConfigFieldRef::ListItem(..) => {}
+        }
+    }
+
+    fn enter_config_table(&mut self, path: Vec<String>) {
+        if let Some(dialog) = self.state.dialog_mut() {
+            dialog.config_selected.push(dialog.selected);
+            dialog.config_path = path;
+            dialog.selected = 0;
+            dialog.query.clear();
+        }
+        self.refresh_config_dialog();
+        self.sync_config_dialog_description();
+    }
+
+    fn leave_config_table(&mut self) -> bool {
+        let Some(dialog) = self.state.dialog_mut() else {
+            return false;
+        };
+        if dialog.config_path.is_empty() {
+            return false;
+        }
+        dialog.config_path.pop();
+        dialog.selected = dialog.config_selected.pop().unwrap_or(0);
+        self.refresh_config_dialog();
+        self.sync_config_dialog_description();
+        true
+    }
+
+    fn remove_config_table(&mut self, path: Vec<String>) {
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let result = self.edit_config_document(|document| {
+            crate::config::remove_config_table(document, &path_refs)
+        });
+        match result {
+            Ok(()) => {
+                self.refresh_config_dialog();
+                self.state
+                    .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
+            }
+            Err(error) => self.report_config_save_failure(error),
         }
     }
 
@@ -4092,6 +4376,9 @@ impl TuiRuntime {
             ConfigFieldRef::ListItem(path, index) => {
                 self.commit_config_list_item(&path, index, &value);
             }
+            ConfigFieldRef::NewField(path) => {
+                self.commit_config_new_field(&path);
+            }
             ConfigFieldRef::Field(path) => {
                 let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
                 let kind = self
@@ -4131,7 +4418,7 @@ impl TuiRuntime {
                     Err(error) => self.report_config_save_failure(error),
                 }
             }
-            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => {}
+            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) | ConfigFieldRef::Table(_) => {}
         }
     }
 

@@ -205,6 +205,33 @@ fn runtime_with_config(contents: &str) -> TuiRuntime {
     runtime_with_config_path(contents).0
 }
 
+fn search_config(runtime: &mut TuiRuntime, query: &str) {
+    for ch in query.chars() {
+        runtime
+            .handle_input_action(InputAction::DialogInsert(ch))
+            .expect("type the query");
+    }
+}
+
+fn enter_config_table(runtime: &mut TuiRuntime, name: &str) {
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == name)
+        .unwrap_or_else(|| panic!("{name} entry"));
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("enter the table");
+}
+
 fn runtime_with_config_path(contents: &str) -> (TuiRuntime, std::path::PathBuf) {
     static NEXT_CONFIG_DIR: AtomicU64 = AtomicU64::new(0);
     let mut runtime = runtime();
@@ -7821,13 +7848,20 @@ fn config_editor_lists_grouped_fields() {
         .map(|item| item.label.as_str())
         .collect::<Vec<_>>();
     assert!(labels.contains(&"active_provider"), "{labels:?}");
+    assert!(labels.contains(&"providers"), "{labels:?}");
+    assert!(labels.contains(&"permissions"), "{labels:?}");
+
+    enter_config_table(&mut runtime, "permissions");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let labels = dialog
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
     assert!(labels.contains(&"mode"), "{labels:?}");
     assert!(
-        dialog
-            .items
-            .iter()
-            .filter(|item| !item.id.starts_with("new/"))
-            .all(|item| item.section.is_some())
+        !dialog.items.iter().any(|item| item.id.starts_with("new/")),
+        "permissions has a fixed field set"
     );
 }
 
@@ -7888,15 +7922,21 @@ fn config_editor_lists_every_provider_and_masks_credentials() {
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
 
-    let dialog = runtime.state().dialog().expect("config dialog");
-    let sections = dialog
+    enter_config_table(&mut runtime, "providers");
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
         .items
         .iter()
-        .filter_map(|item| item.section.as_deref())
+        .map(|item| item.label.as_str())
         .collect::<Vec<_>>();
-    assert!(sections.contains(&"providers.alpha"), "{sections:?}");
-    assert!(sections.contains(&"providers.beta"), "{sections:?}");
+    assert!(labels.contains(&"alpha"), "{labels:?}");
+    assert!(labels.contains(&"beta"), "{labels:?}");
 
+    enter_config_table(&mut runtime, "alpha");
+    enter_config_table(&mut runtime, "auth");
+    let dialog = runtime.state().dialog().expect("config dialog");
     let credential = dialog
         .items
         .iter()
@@ -7945,6 +7985,7 @@ fn config_editor_attaches_schema_descriptions() {
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
 
+    search_config(&mut runtime, "max_iterations");
     let dialog = runtime.state().dialog().expect("config dialog");
     let item = dialog
         .items
@@ -7965,6 +8006,7 @@ fn config_editor_expands_and_applies_a_choice() {
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
 
+    search_config(&mut runtime, "protocol");
     let index = runtime
         .state()
         .dialog()
@@ -8092,6 +8134,7 @@ fn config_editor_edits_array_items() {
     runtime
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
+    search_config(&mut runtime, "command");
 
     let index = runtime
         .state()
@@ -8173,6 +8216,8 @@ fn config_editor_hides_fields_that_do_not_apply() {
         .handle_input_action(InputAction::Submit)
         .expect("config command is accepted");
 
+    enter_config_table(&mut runtime, "mcp");
+    enter_config_table(&mut runtime, "demo");
     let labels = runtime
         .state()
         .dialog()
@@ -8239,4 +8284,195 @@ fn config_editor_adds_a_new_mcp_server() {
     );
     let written = std::fs::read_to_string(&path).expect("read config");
     assert!(!written.contains("[mcp.demo]"), "{written}");
+}
+
+#[test]
+fn config_editor_picks_an_allowed_model_from_a_choice() {
+    let (mut runtime, path) = runtime_with_config_path(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.explorer]\nallowed_models = [\"alpha/m\"]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "agents");
+    enter_config_table(&mut runtime, "explorer");
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "allowed_models")
+        .expect("allowed_models field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand the list");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .config_detail_items
+            .len(),
+        1
+    );
+
+    runtime
+        .handle_input_action(InputAction::ConfigListAppend)
+        .expect("append an element");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(dialog.config_detail_target, Some(1));
+    assert!(
+        dialog
+            .config_detail_items
+            .iter()
+            .any(|item| item.label == "alpha/m"),
+        "the element editor offers configured routes"
+    );
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("pick the model");
+    runtime
+        .handle_input_action(InputAction::ConfigSave)
+        .expect("save the draft");
+    let written = std::fs::read_to_string(&path).expect("read config");
+    assert!(written.contains("\"alpha/m\""), "{written}");
+}
+
+#[test]
+fn config_editor_only_offers_entries_where_the_schema_allows_them() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let offers_new_entry = |runtime: &TuiRuntime| {
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .any(|item| item.id.starts_with("new/"))
+    };
+
+    enter_config_table(&mut runtime, "providers");
+    assert!(offers_new_entry(&runtime), "providers is keyed by provider name");
+
+    enter_config_table(&mut runtime, "alpha");
+    assert!(
+        !offers_new_entry(&runtime),
+        "a provider has a fixed field set"
+    );
+
+    enter_config_table(&mut runtime, "models");
+    assert!(
+        offers_new_entry(&runtime),
+        "models is keyed by model id"
+    );
+}
+
+#[test]
+fn config_editor_new_entries_start_from_the_schema() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "providers");
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.id == "new/providers")
+        .expect("new provider entry");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("start naming the provider");
+    for ch in "beta".chars() {
+        runtime
+            .handle_input_action(InputAction::ConfigEditInsert(ch))
+            .expect("type the name");
+    }
+    runtime
+        .handle_input_action(InputAction::ConfigEditConfirm)
+        .expect("commit the name");
+
+    let config_labels = |runtime: &TuiRuntime| {
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(config_labels(&runtime).contains(&"beta".to_string()));
+
+    enter_config_table(&mut runtime, "beta");
+    let labels = config_labels(&runtime);
+    assert!(labels.contains(&"default_model".to_string()), "{labels:?}");
+    assert!(labels.contains(&"auth".to_string()), "{labels:?}");
+    assert!(labels.contains(&"endpoints".to_string()), "{labels:?}");
+
+    enter_config_table(&mut runtime, "auth");
+    let labels = config_labels(&runtime);
+    assert!(labels.contains(&"type".to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&"credential".to_string()),
+        "optional fields are offered for filling in: {labels:?}"
+    );
+
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "credential")
+        .expect("credential entry");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("fill the optional field");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let index = dialog
+        .items
+        .iter()
+        .position(|item| item.label == "credential")
+        .expect("credential entry");
+    assert!(
+        matches!(
+            dialog.config_fields.get(index),
+            Some(ConfigFieldRef::Field(path))
+                if path == &["providers", "beta", "auth", "credential"]
+        ),
+        "the optional field became a real one"
+    );
 }

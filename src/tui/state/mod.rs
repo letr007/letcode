@@ -316,12 +316,15 @@ pub enum ConfigFieldRef {
     Field(Vec<String>),
     /// A scalar whose value comes from a fixed or derived set.
     Choice(Vec<String>),
-    /// A string array.
     List(Vec<String>),
     /// One array element, addressed by its index.
     ListItem(Vec<String>, usize),
     /// A table that does not exist yet, named by the user.
     NewEntry(String),
+    /// A documented field that is not in the file yet.
+    NewField(Vec<String>),
+    /// A sub-table the panel can enter and delete.
+    Table(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,9 +550,12 @@ pub struct DialogState {
     pub expert_primary_query: Option<String>,
     pub expert_primary_selected_agent: Option<String>,
     pub config_fields: Vec<ConfigFieldRef>,
+    pub config_path: Vec<String>,
+    pub config_selected: Vec<usize>,
     pub config_expanded: Option<usize>,
     pub config_detail_items: Vec<DialogItem>,
     pub config_detail_selected: usize,
+    pub config_detail_target: Option<usize>,
     pub config_dirty: bool,
     pub config_error: Option<String>,
     pub session_scope: SessionPickerScope,
@@ -1107,9 +1113,12 @@ impl DialogState {
             expert_primary_query: None,
             expert_primary_selected_agent: None,
             config_fields: Vec::new(),
+            config_path: Vec::new(),
+            config_selected: Vec::new(),
             config_expanded: None,
             config_detail_items: Vec::new(),
             config_detail_selected: 0,
+            config_detail_target: None,
             config_dirty: false,
             config_error: None,
             session_scope: SessionPickerScope::default(),
