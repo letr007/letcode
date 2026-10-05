@@ -9,7 +9,10 @@ use ratatui::{
 use crate::tui::{
     components::tool_card::truncate_display_width,
     measure::{display_width, wrap_text_to_width},
-    state::{ConfigEditState, DialogItem, DialogKind, DialogState, SessionPickerScope, TuiState},
+    state::{
+        ConfigEditState, ConfigFieldRef, DialogItem, DialogKind, DialogState, SessionPickerScope,
+        TuiState,
+    },
     theme::Theme,
 };
 
@@ -413,9 +416,15 @@ fn render_picker_body(
                     DialogKind::ContextDetail => {
                         render_session_row(frame, row, theme, item, selected, None)
                     }
-                    DialogKind::ConfigEditor => {
-                        render_config_row(frame, row, theme, item, selected, state.config_edit.as_ref())
-                    }
+                    DialogKind::ConfigEditor => render_config_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        dialog.config_fields.get(index),
+                        state.config_edit.as_ref(),
+                    ),
                 }
             }
         }
@@ -1009,7 +1018,10 @@ fn render_config_detail(
         let row_area = Rect::new(area.x, row, area.width, 1);
         frame.render_widget(Block::default().style(row_style), row_area);
         let marker = if selected { "● " } else { "  " };
-        let spans = if let Some(edit) = edit.filter(|edit| edit.field_id == item.id) {
+        let editing = edit.filter(|edit| {
+            matches!(&edit.field, ConfigFieldRef::ListItem(_, selected) if *selected == index)
+        });
+        let spans = if let Some(edit) = editing {
             let cursor = edit.cursor.min(edit.buffer.len());
             let (before, after) = edit.buffer.split_at(cursor);
             vec![
@@ -1042,6 +1054,7 @@ fn render_config_row(
     theme: Theme,
     item: &DialogItem,
     selected: bool,
+    field: Option<&ConfigFieldRef>,
     edit: Option<&ConfigEditState>,
 ) {
     let row_style = if selected {
@@ -1056,7 +1069,7 @@ fn render_config_row(
         return;
     }
 
-    let editing = edit.filter(|edit| edit.field_id == item.id);
+    let editing = edit.filter(|edit| field == Some(&edit.field));
     let affordance = if editing.is_some() {
         ""
     } else {

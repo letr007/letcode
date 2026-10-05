@@ -28,9 +28,9 @@ use super::preferences::TuiPreferences;
 use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
-    ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
-    PermissionChoice, QuestionAdvance, SessionPickerScope, ToastKind, TranscriptClickTarget,
-    TuiState,
+    ConfigFieldRef, ContextDetailTarget, DialogItem, DialogKind, DialogState,
+    PendingQuestionState, PermissionChoice, QuestionAdvance, SessionPickerScope, ToastKind,
+    TranscriptClickTarget, TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
@@ -3473,25 +3473,26 @@ impl TuiRuntime {
 
     fn show_config_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         self.load_config_draft();
-        let items = self.config_dialog_items();
+        let (items, fields) = self.config_dialog_items();
         let mut dialog = DialogState::new(
             DialogKind::ConfigEditor,
             self.state.t("config.title"),
             None,
             items,
         );
+        dialog.config_fields = fields;
         dialog.selected = 0;
         self.state.open_dialog(dialog);
         self.sync_config_dialog_description();
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn config_dialog_items(&self) -> Vec<DialogItem> {
+    fn config_dialog_items(&self) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
         let Some(config_path) = self.config_path.as_deref() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let Some(document) = self.config_draft.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let entries = crate::config::config_entries_in(document)
             .into_iter()
@@ -3499,29 +3500,41 @@ impl TuiRuntime {
             .collect::<Vec<_>>();
         let loaded =
             crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string()).ok();
-        let mut items = entries
-            .into_iter()
-            .map(|entry| {
-                let affordance = match entry.kind {
-                    crate::config::ConfigEntryKind::Bool => {
-                        if entry.display == "true" {
-                            "[x]"
-                        } else {
-                            "[ ]"
-                        }
+        let mut items = Vec::new();
+        let mut fields = Vec::new();
+        for (table, key) in [
+            ("providers", "config.new_provider"),
+            ("mcp", "config.new_mcp"),
+        ] {
+            items.push(DialogItem::new(
+                format!("new/{table}"),
+                self.state.t(key),
+                None,
+            ));
+            fields.push(ConfigFieldRef::NewEntry(table.to_string()));
+        }
+        for entry in entries {
+            let affordance = match entry.kind {
+                crate::config::ConfigEntryKind::Bool => {
+                    if entry.display == "true" {
+                        "[x]"
+                    } else {
+                        "[ ]"
                     }
-                    _ => "",
-                };
-                let path: Vec<&str> = entry.path.iter().map(String::as_str).collect();
-                let prefix = if entry.kind == crate::config::ConfigEntryKind::Array {
-                    "list:"
-                } else if Self::config_field_values(document, loaded.as_ref(), &entry.path).is_some() {
-                    "choice:"
-                } else {
-                    "config:"
-                };
+                }
+                _ => "",
+            };
+            let path: Vec<&str> = entry.path.iter().map(String::as_str).collect();
+            let field = if entry.kind == crate::config::ConfigEntryKind::Array {
+                ConfigFieldRef::List(entry.path.clone())
+            } else if Self::config_field_values(document, loaded.as_ref(), &entry.path).is_some() {
+                ConfigFieldRef::Choice(entry.path.clone())
+            } else {
+                ConfigFieldRef::Field(entry.path.clone())
+            };
+            items.push(
                 DialogItem::new(
-                    format!("{prefix}{}", entry.path.join("\u{1f}")),
+                    entry.path.join("/"),
                     entry.label,
                     Some(entry.display),
                 )
@@ -3531,22 +3544,11 @@ impl TuiRuntime {
                         .unwrap_or(fallback)
                 }))
                 .with_section(entry.section)
-                .with_right_detail(affordance)
-            })
-            .collect::<Vec<_>>();
-        items.insert(
-            0,
-            DialogItem::new("new\u{1e}mcp", self.state.t("config.new_mcp"), None),
-        );
-        items.insert(
-            0,
-            DialogItem::new(
-                "new\u{1e}providers",
-                self.state.t("config.new_provider"),
-                None,
-            ),
-        );
-        items
+                .with_right_detail(affordance),
+            );
+            fields.push(field);
+        }
+        (items, fields)
     }
 
     fn persist_fast_mode(&self, enabled: bool) {
@@ -3609,14 +3611,6 @@ impl TuiRuntime {
                 self.report_config_save_failure(error);
             }
         }
-    }
-
-    fn config_path_segments(field_id: &str) -> Option<Vec<String>> {
-        let path = field_id
-            .strip_prefix("config:")
-            .or_else(|| field_id.strip_prefix("choice:"))
-            .or_else(|| field_id.strip_prefix("list:"))?;
-        Some(path.split('\u{1f}').map(str::to_string).collect())
     }
 
     /// Fields whose siblings make them inapplicable stay out of the panel.
@@ -3710,8 +3704,24 @@ impl TuiRuntime {
             .map(|provider| provider.models.keys().cloned().collect())
     }
 
-    fn expand_config_field(&mut self, field_id: &str) {
-        let Some(segments) = Self::config_path_segments(field_id) else {
+    fn expanded_field(&self) -> Option<ConfigFieldRef> {
+        let dialog = self.state.dialog()?;
+        dialog.config_fields.get(dialog.config_expanded?).cloned()
+    }
+
+    fn expanded_index(&self) -> Option<usize> {
+        self.state.dialog().and_then(|dialog| dialog.config_expanded)
+    }
+
+    fn expand_config_field(&mut self, index: usize) {
+        let Some(field) = self
+            .state
+            .dialog()
+            .and_then(|dialog| dialog.config_fields.get(index).cloned())
+        else {
+            return;
+        };
+        let (ConfigFieldRef::List(path) | ConfigFieldRef::Choice(path)) = &field else {
             return;
         };
         let Some(config_path) = self.config_path.clone() else {
@@ -3720,8 +3730,8 @@ impl TuiRuntime {
         let Some(document) = self.config_draft.as_ref() else {
             return;
         };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        let array = crate::config::config_array_in(document, &path);
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let array = crate::config::config_array_in(document, &path_refs);
         let values = match &array {
             Some(values) => values.clone(),
             None => {
@@ -3730,13 +3740,12 @@ impl TuiRuntime {
                 else {
                     return;
                 };
-                let Some(values) = Self::config_field_values(document, Some(&config), &segments) else {
+                let Some(values) = Self::config_field_values(document, Some(&config), path) else {
                     return;
                 };
                 values
             }
         };
-        let is_list = array.is_some();
         let current = self
             .state
             .dialog()
@@ -3744,21 +3753,13 @@ impl TuiRuntime {
             .and_then(|item| item.detail.clone());
         let items = values
             .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let id = if is_list {
-                    Self::config_list_item_id(field_id, index)
-                } else {
-                    value.clone()
-                };
-                DialogItem::new(id, value.clone(), None)
-            })
+            .map(|value| DialogItem::new(value.clone(), value.clone(), None))
             .collect::<Vec<_>>();
         let selected = current
             .and_then(|current| items.iter().position(|item| item.label == current))
             .unwrap_or(0);
         if let Some(dialog) = self.state.dialog_mut() {
-            dialog.config_expanded = Some(field_id.to_string());
+            dialog.config_expanded = Some(index);
             dialog.config_detail_items = items;
             dialog.config_detail_selected = selected;
         }
@@ -3772,9 +3773,9 @@ impl TuiRuntime {
         }
     }
 
-    fn reopen_config_detail(&mut self, field_id: &str, selected: usize) {
+    fn reopen_config_detail(&mut self, index: usize, selected: usize) {
         self.collapse_config_field();
-        self.expand_config_field(field_id);
+        self.expand_config_field(index);
         if let Some(dialog) = self.state.dialog_mut() {
             let last = dialog.config_detail_items.len().saturating_sub(1);
             dialog.config_detail_selected = selected.min(last);
@@ -3782,35 +3783,35 @@ impl TuiRuntime {
     }
 
     fn accept_config_detail(&mut self) {
+        let Some(field) = self.expanded_field() else {
+            return;
+        };
         let Some(dialog) = self.state.dialog() else {
             return;
         };
-        let Some(field_id) = dialog.config_expanded.clone() else {
-            return;
-        };
-        let Some(item) = dialog
+        let selected = dialog.config_detail_selected;
+        let Some(value) = dialog
             .config_detail_items
-            .get(dialog.config_detail_selected)
-            .cloned()
+            .get(selected)
+            .map(|item| item.label.clone())
         else {
             return;
         };
-        if item.id.starts_with("item\u{1e}") {
-            self.begin_config_list_item_edit(&item.id);
-            return;
+        match field {
+            ConfigFieldRef::List(path) => {
+                self.begin_config_list_item_edit(ConfigFieldRef::ListItem(path, selected));
+            }
+            ConfigFieldRef::Choice(path) => self.apply_config_choice(&path, &value),
+            _ => {}
         }
-        self.apply_config_choice(&field_id, &item.label);
     }
 
-    fn apply_config_choice(&mut self, field_id: &str, value: &str) {
-        let Some(segments) = Self::config_path_segments(field_id) else {
-            return;
-        };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    fn apply_config_choice(&mut self, path: &[String], value: &str) {
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let result = self.edit_config_document(|document| {
             crate::config::set_config_scalar(
                 document,
-                &path,
+                &path_refs,
                 crate::config::ConfigScalar::String(value.to_string()),
             )
         });
@@ -3826,53 +3827,46 @@ impl TuiRuntime {
     }
 
     fn append_config_list_item(&mut self) {
-        let Some(field_id) = self
-            .state
-            .dialog()
-            .filter(|dialog| dialog.kind == DialogKind::ConfigEditor)
-            .and_then(|dialog| dialog.config_expanded.clone())
-        else {
+        let Some(ConfigFieldRef::List(path)) = self.expanded_field() else {
             return;
         };
-        let item_id = Self::config_list_new_item_id(&field_id);
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let next = self
+            .config_draft
+            .as_ref()
+            .and_then(|document| crate::config::config_array_in(document, &path_refs))
+            .map(|values| values.len())
+            .unwrap_or(0);
+        let field = ConfigFieldRef::ListItem(path, next);
         if let Some(dialog) = self.state.dialog_mut() {
             dialog
                 .config_detail_items
-                .push(DialogItem::new(item_id.clone(), String::new(), None));
+                .push(DialogItem::new(String::new(), String::new(), None));
             dialog.config_detail_selected = dialog.config_detail_items.len() - 1;
         }
         self.state.config_edit = Some(crate::tui::state::ConfigEditState {
-            field_id: item_id,
+            field,
             cursor: 0,
             buffer: String::new(),
         });
     }
 
     fn remove_config_list_item(&mut self) {
-        let Some(dialog) = self.state.dialog() else {
+        let Some(ConfigFieldRef::List(path)) = self.expanded_field() else {
             return;
         };
-        let Some(field_id) = dialog.config_expanded.clone() else {
-            return;
-        };
-        let Some((_, index)) = dialog
-            .config_detail_items
-            .get(dialog.config_detail_selected)
-            .and_then(|item| Self::config_list_item_parts(&item.id))
+        let Some(index) = self
+            .state
+            .dialog()
+            .map(|dialog| dialog.config_detail_selected)
         else {
             return;
         };
-        let Ok(index) = index.parse::<usize>() else {
-            return;
-        };
-        let Some(segments) = Self::config_path_segments(&field_id) else {
-            return;
-        };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let Some(mut values) = self
             .config_draft
             .as_ref()
-            .and_then(|document| crate::config::config_array_in(document, &path))
+            .and_then(|document| crate::config::config_array_in(document, &path_refs))
         else {
             return;
         };
@@ -3883,13 +3877,15 @@ impl TuiRuntime {
         let result = self.edit_config_document(|document| {
             crate::config::set_config_scalar(
                 document,
-                &path,
+                &path_refs,
                 crate::config::ConfigScalar::Array(values),
             )
         });
         match result {
             Ok(()) => {
-                self.reopen_config_detail(&field_id, index);
+                if let Some(expanded) = self.expanded_index() {
+                    self.reopen_config_detail(expanded, index);
+                }
                 self.state
                     .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
             }
@@ -3897,74 +3893,52 @@ impl TuiRuntime {
         }
     }
 
-    fn begin_config_list_item_edit(&mut self, item_id: &str) {
-        let Some((field_id, index)) = Self::config_list_item_parts(item_id) else {
+    fn begin_config_list_item_edit(&mut self, field: ConfigFieldRef) {
+        let ConfigFieldRef::ListItem(path, index) = &field else {
             return;
         };
-        let buffer = if index == "new" {
-            String::new()
-        } else {
-            let Ok(index) = index.parse::<usize>() else {
-                return;
-            };
-            let Some(segments) = Self::config_path_segments(&field_id) else {
-                return;
-            };
-            let path: Vec<&str> = segments.iter().map(String::as_str).collect();
-            let Some(values) = self
-                .config_draft
-                .as_ref()
-                .and_then(|document| crate::config::config_array_in(document, &path))
-            else {
-                return;
-            };
-            let Some(value) = values.get(index) else {
-                return;
-            };
-            value.clone()
-        };
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let buffer = self
+            .config_draft
+            .as_ref()
+            .and_then(|document| crate::config::config_array_in(document, &path_refs))
+            .and_then(|values| values.get(*index).cloned())
+            .unwrap_or_default();
         self.state.config_edit = Some(crate::tui::state::ConfigEditState {
-            field_id: item_id.to_string(),
+            field,
             cursor: buffer.len(),
             buffer,
         });
     }
 
-    fn commit_config_list_item(&mut self, field_id: &str, index: &str, value: &str) {
-        let Some(segments) = Self::config_path_segments(field_id) else {
-            return;
-        };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    fn commit_config_list_item(&mut self, path: &[String], index: usize, value: &str) {
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let Some(mut values) = self
             .config_draft
             .as_ref()
-            .and_then(|document| crate::config::config_array_in(document, &path))
+            .and_then(|document| crate::config::config_array_in(document, &path_refs))
         else {
             return;
         };
-        let selected = if index == "new" {
+        let selected = if index >= values.len() {
             values.push(value.to_string());
             values.len() - 1
         } else {
-            let Ok(index) = index.parse::<usize>() else {
-                return;
-            };
-            let Some(slot) = values.get_mut(index) else {
-                return;
-            };
-            *slot = value.to_string();
+            values[index] = value.to_string();
             index
         };
         let result = self.edit_config_document(|document| {
             crate::config::set_config_scalar(
                 document,
-                &path,
+                &path_refs,
                 crate::config::ConfigScalar::Array(values),
             )
         });
         match result {
             Ok(()) => {
-                self.reopen_config_detail(field_id, selected);
+                if let Some(expanded) = self.expanded_index() {
+                    self.reopen_config_detail(expanded, selected);
+                }
                 self.state
                     .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
             }
@@ -4011,20 +3985,6 @@ impl TuiRuntime {
         }
     }
 
-    fn config_list_item_id(field_id: &str, index: usize) -> String {
-        format!("item\u{1e}{field_id}\u{1e}{index}")
-    }
-
-    fn config_list_new_item_id(field_id: &str) -> String {
-        format!("item\u{1e}{field_id}\u{1e}new")
-    }
-
-    fn config_list_item_parts(item_id: &str) -> Option<(String, String)> {
-        let rest = item_id.strip_prefix("item\u{1e}")?;
-        let (field_id, index) = rest.split_once('\u{1e}')?;
-        Some((field_id.to_string(), index.to_string()))
-    }
-
     fn sync_config_dialog_description(&mut self) {
         let description = self
             .state
@@ -4040,51 +4000,49 @@ impl TuiRuntime {
     }
 
     fn handle_config_editor_accept(&mut self) {
-        if self
-            .state
-            .dialog()
-            .is_some_and(|dialog| dialog.config_expanded.is_some())
-        {
+        if self.expanded_index().is_some() {
             self.accept_config_detail();
             return;
         }
-        let Some(item) = self
-            .state
-            .dialog()
-            .and_then(|dialog| dialog.selected_item())
-            .cloned()
-        else {
+        let Some(dialog) = self.state.dialog() else {
             return;
         };
-        if item.id.starts_with("new\u{1e}") {
-            self.state.config_edit = Some(crate::tui::state::ConfigEditState {
-                field_id: item.id.clone(),
-                cursor: 0,
-                buffer: String::new(),
-            });
-            return;
-        }
-        if item.id.starts_with("choice:") || item.id.starts_with("list:") {
-            self.expand_config_field(&item.id);
-            return;
-        }
-        let Some(segments) = Self::config_path_segments(&item.id) else {
+        let index = dialog.selected;
+        let detail = dialog.selected_item().and_then(|item| item.detail.clone());
+        let Some(field) = dialog.config_fields.get(index).cloned() else {
             return;
         };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        let kind = self
-            .config_draft
-            .as_ref()
-            .and_then(|document| crate::config::config_value_in(document, &path))
-            .map(|(kind, _)| kind);
-        match kind {
-            Some(crate::config::ConfigEntryKind::Bool) => {
-                self.toggle_config_bool(&segments, item.detail.as_deref() == Some("true"))
+        match field {
+            ConfigFieldRef::NewEntry(table) => {
+                self.state.config_edit = Some(crate::tui::state::ConfigEditState {
+                    field: ConfigFieldRef::NewEntry(table),
+                    cursor: 0,
+                    buffer: String::new(),
+                });
             }
-            Some(crate::config::ConfigEntryKind::Text)
-            | Some(crate::config::ConfigEntryKind::Integer)
-            | Some(crate::config::ConfigEntryKind::Float) => self.begin_config_edit(&item.id),
-            _ => {}
+            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => {
+                self.expand_config_field(index)
+            }
+            ConfigFieldRef::Field(path) => {
+                let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+                let kind = self
+                    .config_draft
+                    .as_ref()
+                    .and_then(|document| crate::config::config_value_in(document, &path_refs))
+                    .map(|(kind, _)| kind);
+                match kind {
+                    Some(crate::config::ConfigEntryKind::Bool) => {
+                        self.toggle_config_bool(&path, detail.as_deref() == Some("true"))
+                    }
+                    Some(crate::config::ConfigEntryKind::Text)
+                    | Some(crate::config::ConfigEntryKind::Integer)
+                    | Some(crate::config::ConfigEntryKind::Float) => {
+                        self.begin_config_edit(&path)
+                    }
+                    _ => {}
+                }
+            }
+            ConfigFieldRef::ListItem(..) => {}
         }
     }
 
@@ -4107,19 +4065,16 @@ impl TuiRuntime {
         }
     }
 
-    fn begin_config_edit(&mut self, field_id: &str) {
-        let Some(segments) = Self::config_path_segments(field_id) else {
-            return;
-        };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    fn begin_config_edit(&mut self, path: &[String]) {
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let buffer = self
             .config_draft
             .as_ref()
-            .and_then(|document| crate::config::config_value_in(document, &path))
+            .and_then(|document| crate::config::config_value_in(document, &path_refs))
             .map(|(_, text)| text)
             .unwrap_or_default();
         self.state.config_edit = Some(crate::tui::state::ConfigEditState {
-            field_id: field_id.to_string(),
+            field: ConfigFieldRef::Field(path.to_vec()),
             cursor: buffer.len(),
             buffer,
         });
@@ -4129,54 +4084,54 @@ impl TuiRuntime {
         let Some(edit) = self.state.config_edit.take() else {
             return;
         };
-        if let Some(kind) = edit.field_id.strip_prefix("new\u{1e}") {
-            self.commit_config_new_entry(kind, edit.buffer.trim());
-            return;
-        }
-        if let Some((field_id, index)) = Self::config_list_item_parts(&edit.field_id) {
-            self.commit_config_list_item(&field_id, &index, edit.buffer.trim());
-            return;
-        }
-        let Some(segments) = Self::config_path_segments(&edit.field_id) else {
-            return;
-        };
-        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        let kind = self
-            .config_draft
-            .as_ref()
-            .and_then(|document| crate::config::config_value_in(document, &path))
-            .map(|(kind, _)| kind)
-            .unwrap_or(crate::config::ConfigEntryKind::Text);
-        let trimmed = edit.buffer.trim();
-        let scalar = match kind {
-            crate::config::ConfigEntryKind::Integer => match trimmed.parse::<i64>() {
-                Ok(value) => crate::config::ConfigScalar::Integer(value),
-                Err(_) => {
-                    self.state
-                        .show_toast(self.state.t("config.invalid_number"), ToastKind::Error);
-                    return;
-                }
-            },
-            crate::config::ConfigEntryKind::Float => match trimmed.parse::<f64>() {
-                Ok(value) => crate::config::ConfigScalar::Float(value),
-                Err(_) => {
-                    self.state
-                        .show_toast(self.state.t("config.invalid_number"), ToastKind::Error);
-                    return;
-                }
-            },
-            _ => crate::config::ConfigScalar::String(trimmed.to_string()),
-        };
-        let result = self.edit_config_document(|document| {
-            crate::config::set_config_scalar(document, &path, scalar)
-        });
-        match result {
-            Ok(()) => {
-                self.refresh_config_dialog();
-                self.state
-                    .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
+        let value = edit.buffer.trim().to_string();
+        match edit.field {
+            ConfigFieldRef::NewEntry(table) => {
+                self.commit_config_new_entry(&table, &value);
             }
-            Err(error) => self.report_config_save_failure(error),
+            ConfigFieldRef::ListItem(path, index) => {
+                self.commit_config_list_item(&path, index, &value);
+            }
+            ConfigFieldRef::Field(path) => {
+                let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+                let kind = self
+                    .config_draft
+                    .as_ref()
+                    .and_then(|document| crate::config::config_value_in(document, &path_refs))
+                    .map(|(kind, _)| kind)
+                    .unwrap_or(crate::config::ConfigEntryKind::Text);
+                let scalar = match kind {
+                    crate::config::ConfigEntryKind::Integer => match value.parse::<i64>() {
+                        Ok(number) => crate::config::ConfigScalar::Integer(number),
+                        Err(_) => {
+                            self.state
+                                .show_toast(self.state.t("config.invalid_number"), ToastKind::Error);
+                            return;
+                        }
+                    },
+                    crate::config::ConfigEntryKind::Float => match value.parse::<f64>() {
+                        Ok(number) => crate::config::ConfigScalar::Float(number),
+                        Err(_) => {
+                            self.state
+                                .show_toast(self.state.t("config.invalid_number"), ToastKind::Error);
+                            return;
+                        }
+                    },
+                    _ => crate::config::ConfigScalar::String(value.clone()),
+                };
+                let result = self.edit_config_document(|document| {
+                    crate::config::set_config_scalar(document, &path_refs, scalar)
+                });
+                match result {
+                    Ok(()) => {
+                        self.refresh_config_dialog();
+                        self.state
+                            .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
+                    }
+                    Err(error) => self.report_config_save_failure(error),
+                }
+            }
+            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => {}
         }
     }
 
@@ -4191,10 +4146,11 @@ impl TuiRuntime {
     }
 
     fn refresh_config_dialog(&mut self) {
-        let items = self.config_dialog_items();
+        let (items, fields) = self.config_dialog_items();
         if let Some(dialog) = self.state.dialog_mut() {
             let selected = dialog.selected.min(items.len().saturating_sub(1));
             dialog.items = items;
+            dialog.config_fields = fields;
             dialog.selected = selected;
         }
     }

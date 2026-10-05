@@ -7826,7 +7826,7 @@ fn config_editor_lists_grouped_fields() {
         dialog
             .items
             .iter()
-            .filter(|item| !item.id.starts_with("new\u{1e}"))
+            .filter(|item| !item.id.starts_with("new/"))
             .all(|item| item.section.is_some())
     );
 }
@@ -7857,7 +7857,7 @@ fn config_editor_enters_and_cancels_text_edit() {
         .handle_input_action(InputAction::DialogAccept)
         .expect("enter edit mode");
     let edit = runtime.state().config_edit.as_ref().expect("edit mode");
-    assert!(edit.field_id.starts_with("config:"));
+    assert!(matches!(edit.field, ConfigFieldRef::Field(_)));
 
     runtime
         .handle_input_action(InputAction::ConfigEditInsert('x'))
@@ -7983,10 +7983,10 @@ fn config_editor_expands_and_applies_a_choice() {
         .handle_input_action(InputAction::DialogAccept)
         .expect("expand the field");
     let dialog = runtime.state().dialog().expect("config dialog");
-    assert_eq!(
-        dialog.config_expanded.as_deref(),
-        Some("choice:providers\u{1f}alpha\u{1f}protocol")
-    );
+    assert!(matches!(
+        dialog.config_fields.get(dialog.config_expanded.expect("expanded field")),
+        Some(ConfigFieldRef::Choice(path)) if path == &["providers", "alpha", "protocol"]
+    ));
     assert_eq!(dialog.config_detail_items.len(), 3);
 
     runtime
@@ -8111,10 +8111,10 @@ fn config_editor_edits_array_items() {
         .handle_input_action(InputAction::DialogAccept)
         .expect("expand the array");
     let dialog = runtime.state().dialog().expect("config dialog");
-    assert_eq!(
-        dialog.config_expanded.as_deref(),
-        Some("list:mcp\u{1f}demo\u{1f}command")
-    );
+    assert!(matches!(
+        dialog.config_fields.get(dialog.config_expanded.expect("expanded field")),
+        Some(ConfigFieldRef::List(path)) if path == &["mcp", "demo", "command"]
+    ));
     assert_eq!(dialog.config_detail_items.len(), 2);
 
     runtime
@@ -8202,7 +8202,7 @@ fn config_editor_adds_a_new_mcp_server() {
         .expect("config dialog")
         .items
         .iter()
-        .position(|item| item.id == "new\u{1e}mcp")
+        .position(|item| item.id == "new/mcp")
         .expect("new mcp entry");
     runtime
         .state_mut()

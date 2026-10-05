@@ -309,9 +309,24 @@ impl DialogItem {
     }
 }
 
+/// How a configuration row maps back to the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFieldRef {
+    /// A scalar addressed by its table path.
+    Field(Vec<String>),
+    /// A scalar whose value comes from a fixed or derived set.
+    Choice(Vec<String>),
+    /// A string array.
+    List(Vec<String>),
+    /// One array element, addressed by its index.
+    ListItem(Vec<String>, usize),
+    /// A table that does not exist yet, named by the user.
+    NewEntry(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEditState {
-    pub field_id: String,
+    pub field: ConfigFieldRef,
     pub buffer: String,
     pub cursor: usize,
 }
@@ -531,7 +546,8 @@ pub struct DialogState {
     pub mcp_primary_selected_server: Option<String>,
     pub expert_primary_query: Option<String>,
     pub expert_primary_selected_agent: Option<String>,
-    pub config_expanded: Option<String>,
+    pub config_fields: Vec<ConfigFieldRef>,
+    pub config_expanded: Option<usize>,
     pub config_detail_items: Vec<DialogItem>,
     pub config_detail_selected: usize,
     pub config_dirty: bool,
@@ -1090,6 +1106,7 @@ impl DialogState {
             mcp_primary_selected_server: None,
             expert_primary_query: None,
             expert_primary_selected_agent: None,
+            config_fields: Vec::new(),
             config_expanded: None,
             config_detail_items: Vec::new(),
             config_detail_selected: 0,
