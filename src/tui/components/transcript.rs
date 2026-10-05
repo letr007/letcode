@@ -11,13 +11,14 @@ use unicode_segmentation::UnicodeSegmentation;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
 use crate::subagent::try_parse_structured_subagent_result;
 use crate::tui::{
+    assistant_fade::{self, AssistantFade},
     i18n::Translator,
     markdown::{MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown_document},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
@@ -285,6 +286,8 @@ pub(crate) fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> 
                 index + 1 < items.len() && is_compact_tool_group_item(&items[index + 1]),
                 compact_tool_group_stats(items, index),
                 compact_reasoning_group_elapsed_ms(items, index),
+                std::time::Instant::now(),
+                theme.canvas(),
                 &state.translator(),
                 None,
             ),
@@ -757,6 +760,8 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         }
     }
 
+    let now = std::time::Instant::now();
+    let fade_backdrop = assistant_fade::fade_backdrop(theme, state.terminal_background());
     let (revision, live, item, next_reasoning, next_tool, tool_group_stats) = {
         let timeline = state.active_timeline();
         let items = timeline.items();
@@ -802,7 +807,7 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
                 item,
                 TimelineItem::Reasoning(reasoning)
                     if reasoning.streaming || reasoning.transition_started_at.is_some()
-            )
+            ) || matches!(item, TimelineItem::Assistant(message) if message.is_fading(now))
         };
         (
             revision,
@@ -841,6 +846,8 @@ fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme
         } else {
             compact_reasoning_group_elapsed_ms(state.active_timeline().items(), index)
         },
+        now,
+        fade_backdrop,
         &state.translator(),
         streaming_slot.as_mut().map(|slot| &mut slot.renderer),
     );
@@ -935,6 +942,8 @@ struct TimelineItemComponent<'a> {
     next_tool: bool,
     tool_group_stats: tool_card::ToolGroupStats,
     compact_reasoning_elapsed_ms: Option<u64>,
+    now: std::time::Instant,
+    fade_backdrop: Color,
     translator: &'a Translator,
     streaming_markdown: Option<&'a mut StreamingMarkdownRenderer>,
 }
@@ -985,14 +994,22 @@ impl Component<Style> for TimelineItemComponent<'_> {
             TimelineItem::Delegation(delegation) => {
                 build_delegation_lines(&mut out, delegation, self.theme, self.width)
             }
-            TimelineItem::Assistant(message) => build_assistant_message_lines(
-                &mut out,
-                message_text(message),
-                message.streaming,
-                self.theme,
-                self.width,
-                self.streaming_markdown.as_deref_mut(),
-            ),
+            TimelineItem::Assistant(message) => {
+                let fade = message.is_fading(self.now).then_some(AssistantFade {
+                    reveals: &message.reveal_tail,
+                    now: self.now,
+                    backdrop: self.fade_backdrop,
+                });
+                build_assistant_message_lines(
+                    &mut out,
+                    message_text(message),
+                    message.streaming,
+                    self.theme,
+                    self.width,
+                    self.streaming_markdown.as_deref_mut(),
+                    fade,
+                )
+            }
             TimelineItem::Tool(tool) => {
                 if self.tools_display == crate::command::ToolsDisplayMode::Compact {
                     if tool_keeps_card_in_compact_mode(tool) {
@@ -1100,6 +1117,8 @@ fn render_timeline_item_document(
     next_tool: bool,
     tool_group_stats: tool_card::ToolGroupStats,
     compact_reasoning_elapsed_ms: Option<u64>,
+    now: std::time::Instant,
+    fade_backdrop: Color,
     translator: &Translator,
     streaming_markdown: Option<&mut StreamingMarkdownRenderer>,
 ) -> Document<Style> {
@@ -1118,6 +1137,8 @@ fn render_timeline_item_document(
         next_tool,
         tool_group_stats,
         compact_reasoning_elapsed_ms,
+        now,
+        fade_backdrop,
         translator,
         streaming_markdown,
     }
@@ -1149,6 +1170,7 @@ fn build_compaction_block_lines(
             streaming,
             theme,
             card_content_width(width, theme),
+            None,
             None,
         );
         pad_card_lines(&mut out.document, start, width);
@@ -1837,6 +1859,7 @@ fn build_assistant_message_lines(
     theme: Theme,
     width: usize,
     streaming_markdown: Option<&mut StreamingMarkdownRenderer>,
+    fade: Option<AssistantFade<'_>>,
 ) {
     if text.is_empty() {
         out.push_decoration(
@@ -1864,6 +1887,9 @@ fn build_assistant_message_lines(
         Some(renderer) if streaming => renderer.render(text),
         _ => render_markdown_document(text, theme, MarkdownRenderOptions::new(content_width)),
     };
+    if let Some(fade) = fade {
+        assistant_fade::apply_fade(&mut document, fade);
+    }
     for line in &mut document.lines {
         line.spans
             .insert(0, RenderSpan::decoration("  ", theme.app_style()));
@@ -2607,6 +2633,8 @@ mod tests {
                     false,
                     tool_card::ToolGroupStats::default(),
                     Some(960),
+                    std::time::Instant::now(),
+                    theme.canvas(),
                     &state.translator(),
                     None,
                 );
@@ -2831,6 +2859,8 @@ mod tests {
             false,
             tool_card::ToolGroupStats::default(),
             None,
+            std::time::Instant::now(),
+            theme.canvas(),
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
             None,
         );
@@ -2848,6 +2878,8 @@ mod tests {
             false,
             tool_card::ToolGroupStats::default(),
             None,
+            std::time::Instant::now(),
+            theme.canvas(),
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
             None,
         );
@@ -2894,6 +2926,8 @@ mod tests {
             false,
             tool_card::ToolGroupStats::default(),
             None,
+            std::time::Instant::now(),
+            theme.canvas(),
             &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
             None,
         );
@@ -2968,6 +3002,7 @@ mod tests {
                 selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
+                reveal_tail: std::collections::VecDeque::new(),
             }),
         ];
 
@@ -2988,6 +3023,8 @@ mod tests {
                         false,
                         tool_card::ToolGroupStats::default(),
                         None,
+                        std::time::Instant::now(),
+                        theme.canvas(),
                         &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
                         None,
                     ),
@@ -3010,6 +3047,7 @@ mod tests {
             selected_skills: Vec::new(),
             streaming: false,
             queued: false,
+            reveal_tail: std::collections::VecDeque::new(),
         });
         let ordinary_lines =
             crate::tui::transcript_ratatui::document_to_ratatui(&render_timeline_item_document(
@@ -3026,6 +3064,8 @@ mod tests {
                 false,
                 tool_card::ToolGroupStats::default(),
                 None,
+                std::time::Instant::now(),
+                theme.canvas(),
                 &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
                 None,
             ));
@@ -3044,6 +3084,7 @@ mod tests {
             selected_skills: Vec::new(),
             streaming: false,
             queued: false,
+            reveal_tail: std::collections::VecDeque::new(),
         });
         let review_decision = TimelineItem::Assistant(MessageView {
             id: None,
@@ -3054,6 +3095,7 @@ mod tests {
             selected_skills: Vec::new(),
             streaming: false,
             queued: false,
+            reveal_tail: std::collections::VecDeque::new(),
         });
         for item in [&review_request, &review_decision] {
             let document = try_render_reviewer_view_item(item, theme, width)
@@ -4700,5 +4742,54 @@ mod tests {
             between.iter().any(|line| line.is_empty()),
             "expected a blank timeline separator between tool output and todo card: {lines:?}"
         );
+    }
+
+    #[test]
+    fn streaming_assistant_tail_is_faded() {
+        let theme = Theme::dark();
+        let now = std::time::Instant::now();
+        let item = TimelineItem::Assistant(MessageView {
+            id: None,
+            submission_id: None,
+            role: MessageRole::Assistant,
+            text: "hello world".into(),
+            attachments: Vec::new(),
+            selected_skills: Vec::new(),
+            streaming: true,
+            queued: false,
+            reveal_tail: std::collections::VecDeque::from([(now, 5u32)]),
+        });
+
+        let document = render_timeline_item_document(
+            &item,
+            theme,
+            40,
+            0,
+            false,
+            false,
+            None,
+            crate::command::ThoughtsDisplayMode::Full,
+            false,
+            crate::command::ToolsDisplayMode::Detailed,
+            false,
+            tool_card::ToolGroupStats::default(),
+            None,
+            now,
+            theme.canvas(),
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+            None,
+        );
+
+        assert!(document.validate());
+        let text: String = document.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(text, "  hello world");
+        assert_eq!(document.lines[0].spans[1].style.fg, Some(theme.text));
+        let trailing = document.lines[0].spans.last().expect("trailing span");
+        assert_eq!(trailing.text, "d");
+        assert_ne!(trailing.style.fg, Some(theme.text));
     }
 }

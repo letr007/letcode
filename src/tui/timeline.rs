@@ -14,9 +14,12 @@ use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::assistant_fade::ASSISTANT_FADE_DURATION;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +228,29 @@ pub struct MessageView {
     pub selected_skills: Vec<String>,
     pub streaming: bool,
     pub queued: bool,
+    pub(crate) reveal_tail: VecDeque<(Instant, u32)>,
+}
+
+impl MessageView {
+    pub(crate) fn record_reveal(&mut self, now: Instant, graphemes: u32) {
+        if graphemes == 0 {
+            return;
+        }
+        self.reveal_tail.push_back((now, graphemes));
+        while let Some((revealed_at, _)) = self.reveal_tail.front() {
+            if now.saturating_duration_since(*revealed_at) >= ASSISTANT_FADE_DURATION {
+                self.reveal_tail.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn is_fading(&self, now: Instant) -> bool {
+        self.reveal_tail.back().is_some_and(|(revealed_at, _)| {
+            now.saturating_duration_since(*revealed_at) < ASSISTANT_FADE_DURATION
+        })
+    }
 }
 
 #[cfg(test)]
@@ -512,6 +538,7 @@ impl Timeline {
                     selected_skills: Vec::new(),
                     streaming: false,
                     queued: false,
+                    reveal_tail: VecDeque::new(),
                 })),
                 ConversationRole::Summary if is_runtime_context_section(&message.content) => {}
                 ConversationRole::Summary => timeline.push_restored_compaction(message.content),
@@ -525,6 +552,7 @@ impl Timeline {
                         selected_skills: Vec::new(),
                         streaming: false,
                         queued: false,
+                        reveal_tail: VecDeque::new(),
                     }))
                 }
             }
@@ -638,6 +666,7 @@ impl Timeline {
             selected_skills: event.content.selected_skills,
             streaming: false,
             queued: event.queued,
+            reveal_tail: VecDeque::new(),
         }));
     }
 
@@ -652,6 +681,7 @@ impl Timeline {
                 selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
+                reveal_tail: VecDeque::new(),
             }),
             MessageRole::Assistant => TimelineItem::Assistant(MessageView {
                 id: None,
@@ -662,6 +692,7 @@ impl Timeline {
                 selected_skills: Vec::new(),
                 streaming: false,
                 queued: false,
+                reveal_tail: VecDeque::new(),
             }),
         });
     }
@@ -684,16 +715,28 @@ impl Timeline {
     }
 
     pub fn push_assistant_delta(&mut self, event: AssistantDeltaEvent) {
+        self.push_assistant_text(event, Some(Instant::now()));
+    }
+
+    pub(crate) fn push_restored_assistant_text(&mut self, event: AssistantDeltaEvent) {
+        self.push_assistant_text(event, None);
+    }
+
+    fn push_assistant_text(&mut self, event: AssistantDeltaEvent, revealed_at: Option<Instant>) {
+        let graphemes = UnicodeSegmentation::graphemes(event.delta.as_str(), true).count() as u32;
         if let Some(index) = self.active_assistant_message_index(event.message_id.as_deref()) {
             if let TimelineItem::Assistant(message) = &mut self.items[index] {
                 message.text.push_str(&event.delta);
                 message.streaming = true;
+                if let Some(now) = revealed_at {
+                    message.record_reveal(now, graphemes);
+                }
             }
             self.bump_revision(index);
             return;
         }
 
-        self.push_item(TimelineItem::Assistant(MessageView {
+        let mut message = MessageView {
             id: event.message_id,
             submission_id: None,
             role: MessageRole::Assistant,
@@ -702,7 +745,12 @@ impl Timeline {
             selected_skills: Vec::new(),
             streaming: true,
             queued: false,
-        }));
+            reveal_tail: VecDeque::new(),
+        };
+        if let Some(now) = revealed_at {
+            message.record_reveal(now, graphemes);
+        }
+        self.push_item(TimelineItem::Assistant(message));
     }
 
     /// Close every in-flight assistant stream bubble.
@@ -3414,5 +3462,63 @@ mod tests {
         assert_eq!(tools[0].status, ToolExecutionStatus::Succeeded);
         assert_eq!(tools[1].summary, "inspect new path");
         assert!(tools[1].output.is_none());
+    }
+
+    fn assistant_message() -> MessageView {
+        MessageView {
+            id: None,
+            submission_id: None,
+            role: MessageRole::Assistant,
+            text: String::new(),
+            attachments: Vec::new(),
+            selected_skills: Vec::new(),
+            streaming: true,
+            queued: false,
+            reveal_tail: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn reveal_tail_fades_for_the_window_then_expires() {
+        let start = std::time::Instant::now();
+        let mut message = assistant_message();
+        message.record_reveal(start, 3);
+
+        assert!(message.is_fading(start));
+        assert!(message.is_fading(start + std::time::Duration::from_millis(199)));
+        assert!(!message.is_fading(start + std::time::Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn reveal_tail_drops_batches_older_than_the_fade_window() {
+        let start = std::time::Instant::now();
+        let mut message = assistant_message();
+        message.record_reveal(start, 3);
+        message.record_reveal(start + std::time::Duration::from_millis(300), 2);
+
+        assert_eq!(message.reveal_tail.len(), 1);
+        assert_eq!(message.reveal_tail.back().map(|(_, count)| *count), Some(2));
+    }
+
+    #[test]
+    fn live_delta_records_a_reveal_batch() {
+        let mut timeline = Timeline::new();
+        timeline.push_assistant_delta(AssistantDeltaEvent::new("hi"));
+        let TimelineItem::Assistant(message) = &timeline.items()[0] else {
+            panic!("expected an assistant item");
+        };
+        assert_eq!(message.reveal_tail.len(), 1);
+        assert_eq!(message.reveal_tail[0].1, 2);
+    }
+
+    #[test]
+    fn restored_text_never_fades() {
+        let mut timeline = Timeline::new();
+        timeline.push_restored_assistant_text(AssistantDeltaEvent::new("hello"));
+        let TimelineItem::Assistant(message) = &timeline.items()[0] else {
+            panic!("expected an assistant item");
+        };
+        assert!(message.reveal_tail.is_empty());
+        assert!(!message.is_fading(std::time::Instant::now()));
     }
 }

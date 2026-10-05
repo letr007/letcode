@@ -12,6 +12,7 @@
 //! reference, especially for the dark theme direction, not a blueprint for
 //! architecture.
 
+pub(crate) mod assistant_fade;
 pub mod catalog;
 pub mod components;
 pub mod events;

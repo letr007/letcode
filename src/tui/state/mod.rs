@@ -483,7 +483,7 @@ impl ChildTranscriptState {
             && !text.is_empty()
         {
             self.timeline
-                .push_assistant_delta(crate::tui::events::AssistantDeltaEvent::new(text));
+                .push_restored_assistant_text(crate::tui::events::AssistantDeltaEvent::new(text));
         }
         self.model = child_transcript_model(records);
         self.record_count = records.len();
@@ -1599,6 +1599,10 @@ impl TuiState {
             self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }
+    }
+
+    pub(crate) fn terminal_background(&self) -> Option<Rgb> {
+        self.terminal_bg
     }
 
     pub fn set_active_theme(&mut self, theme_id: String, custom_theme: Option<Theme>) {
