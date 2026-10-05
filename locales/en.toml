@@ -34,6 +34,7 @@ save_failed = "Failed to save configuration: {error}"
 unsaved = "unsaved changes"
 new_entry = "＋ Add {table}"
 field_count = "{count} fields"
+custom_value = "Custom…"
 discarded = "Unsaved changes were discarded"
 unavailable = "Configuration file is unavailable"
 

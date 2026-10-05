@@ -1091,6 +1091,11 @@ fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
     Ok(runtime_config)
 }
 
+/// Reasoning levels the runtime names; providers may also accept their own.
+pub const REASONING_EFFORTS: [&str; 7] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
 fn parse_reasoning_effort(value: &str) -> Result<ModelReasoningEffort> {
     Ok(match value {
         "none" => ModelReasoningEffort::None,

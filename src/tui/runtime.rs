@@ -89,6 +89,7 @@ use session_dialog::session_dialog_items;
 use std::sync::Mutex as StdMutex;
 
 const PAGE_SCROLL_ROWS: usize = 10;
+const CONFIG_CUSTOM_CHOICE: &str = "custom";
 const SESSION_ENGINE_UNAVAILABLE_MESSAGE: &str = "Session engine is no longer available";
 // ~3 seconds at the 33ms TUI frame interval, long enough for deliberate chords.
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 90;
@@ -3568,7 +3569,7 @@ impl TuiRuntime {
                     } else {
                         ConfigFieldRef::Field(path.clone())
                     };
-                    let affordance = Self::config_affordance(&entry);
+                    let affordance = Self::config_affordance(&entry, &field);
                     items.push(
                         DialogItem::new(path.join("/"), entry.label, Some(entry.display))
                             .with_description(Self::config_description(&self.state, &path_refs))
@@ -3659,7 +3660,7 @@ impl TuiRuntime {
             } else {
                 ConfigFieldRef::Field(entry.path.clone())
             };
-            let affordance = Self::config_affordance(&entry);
+            let affordance = Self::config_affordance(&entry, &field);
             items.push(
                 DialogItem::new(
                     entry.path.join("/"),
@@ -3709,10 +3710,12 @@ impl TuiRuntime {
         })
     }
 
-    fn config_affordance(entry: &crate::config::ConfigEntry) -> String {
-        match entry.kind {
-            crate::config::ConfigEntryKind::Bool if entry.display == "true" => "[x]".to_string(),
-            crate::config::ConfigEntryKind::Bool => "[ ]".to_string(),
+    fn config_affordance(entry: &crate::config::ConfigEntry, field: &ConfigFieldRef) -> String {
+        if entry.kind == crate::config::ConfigEntryKind::Bool {
+            return if entry.display == "true" { "[x]" } else { "[ ]" }.to_string();
+        }
+        match field {
+            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => "▸".to_string(),
             _ => String::new(),
         }
     }
@@ -3853,6 +3856,20 @@ impl TuiRuntime {
         if path.len() == 3 && path[0] == "providers" && path[2] == "default_model" {
             return Self::provider_models(config, &path[1]);
         }
+        if (path.len() == 3 && path[0] == "agents" && path[2] == "reasoning_effort")
+            || (path.len() == 6
+                && path[0] == "providers"
+                && path[2] == "models"
+                && path[4] == "generation"
+                && path[5] == "reasoning_effort")
+        {
+            return Some(
+                crate::config::REASONING_EFFORTS
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+            );
+        }
         if path.len() == 3 && path[0] == "agents" && path[2] == "allowed_models" {
             return Some(
                 config
@@ -3924,16 +3941,16 @@ impl TuiRuntime {
         let Some(document) = self.config_draft.as_ref() else {
             return;
         };
+        let Ok(config) =
+            crate::config::AppConfig::load_from_str_at_path(&config_path, &document.to_string())
+        else {
+            return;
+        };
         let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let array = crate::config::config_array_in(document, &path_refs);
         let values = match &array {
             Some(values) => values.clone(),
             None => {
-                let Ok(config) =
-                    crate::config::AppConfig::load_from_str_at_path(&config_path, &document.to_string())
-                else {
-                    return;
-                };
                 let Some(values) = Self::config_field_values(document, Some(&config), path) else {
                     return;
                 };
@@ -3945,10 +3962,19 @@ impl TuiRuntime {
             .dialog()
             .and_then(|dialog| dialog.selected_item())
             .and_then(|item| item.detail.clone());
-        let items = values
+        let mut items = values
             .iter()
             .map(|value| DialogItem::new(value.clone(), value.clone(), None))
             .collect::<Vec<_>>();
+        if matches!(field, ConfigFieldRef::Choice(_))
+            && Self::config_field_allows_custom(document, Some(&config), path)
+        {
+            items.push(DialogItem::new(
+                CONFIG_CUSTOM_CHOICE.to_string(),
+                self.state.t("config.custom_value"),
+                None,
+            ));
+        }
         let selected = current
             .and_then(|current| items.iter().position(|item| item.label == current))
             .unwrap_or(0);
@@ -3967,6 +3993,17 @@ impl TuiRuntime {
             dialog.config_detail_selected = 0;
             dialog.config_detail_target = None;
         }
+    }
+
+    /// A field whose schema is an open string still accepts hand-written values.
+    fn config_field_allows_custom(
+        document: &toml_edit::DocumentMut,
+        config: Option<&crate::config::AppConfig>,
+        path: &[String],
+    ) -> bool {
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        crate::config::field_enum(&path_refs).is_none()
+            && Self::config_field_values(document, config, path).is_some()
     }
 
     fn config_list_has_choices(&self, path: &[String]) -> bool {
@@ -4028,13 +4065,10 @@ impl TuiRuntime {
         };
         let selected = dialog.config_detail_selected;
         let target = dialog.config_detail_target;
-        let Some(value) = dialog
-            .config_detail_items
-            .get(selected)
-            .map(|item| item.label.clone())
-        else {
+        let Some(item) = dialog.config_detail_items.get(selected).cloned() else {
             return;
         };
+        let value = item.label.clone();
         match field {
             ConfigFieldRef::List(path) => match target {
                 Some(index) => self.commit_config_list_item(&path, index, &value),
@@ -4045,7 +4079,14 @@ impl TuiRuntime {
                     self.begin_config_list_item_edit(ConfigFieldRef::ListItem(path, selected))
                 }
             },
-            ConfigFieldRef::Choice(path) => self.apply_config_choice(&path, &value),
+            ConfigFieldRef::Choice(path) => {
+                if item.id == CONFIG_CUSTOM_CHOICE {
+                    self.collapse_config_field();
+                    self.begin_config_edit(&path);
+                } else {
+                    self.apply_config_choice(&path, &value);
+                }
+            }
             _ => {}
         }
     }

@@ -8476,3 +8476,106 @@ fn config_editor_new_entries_start_from_the_schema() {
         "the optional field became a real one"
     );
 }
+
+#[test]
+fn config_editor_offers_choices_for_agent_model_and_reasoning() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.explorer]\nprovider = \"alpha\"\nmodel = \"m\"\nreasoning_effort = \"medium\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "agents");
+    enter_config_table(&mut runtime, "explorer");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    for label in ["model", "reasoning_effort"] {
+        let index = dialog
+            .items
+            .iter()
+            .position(|item| item.label == label)
+            .unwrap_or_else(|| panic!("{label} field"));
+        assert!(
+            matches!(
+                dialog.config_fields.get(index),
+                Some(ConfigFieldRef::Choice(_))
+            ),
+            "{label} should open a choice list"
+        );
+    }
+}
+
+#[test]
+fn config_editor_offers_a_custom_value_for_open_choices() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.explorer]\nreasoning_effort = \"medium\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "agents");
+    enter_config_table(&mut runtime, "explorer");
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "reasoning_effort")
+        .expect("reasoning_effort field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand the field");
+
+    let custom = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .config_detail_items
+        .iter()
+        .position(|item| item.id == "custom")
+        .expect("custom entry");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .config_detail_items
+            .len(),
+        crate::config::REASONING_EFFORTS.len() + 1
+    );
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .config_detail_selected = custom;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("choose the custom entry");
+
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .config_expanded
+            .is_none(),
+        "the list collapses before editing"
+    );
+    assert!(
+        matches!(
+            runtime.state().config_edit.as_ref().map(|edit| &edit.field),
+            Some(ConfigFieldRef::Field(path)) if path == &["agents", "explorer", "reasoning_effort"]
+        ),
+        "the custom entry opens a text editor"
+    );
+}

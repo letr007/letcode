@@ -18,6 +18,7 @@ use crate::tui::{
 
 const PICKER_MIN_WIDTH: u16 = 64;
 const PICKER_MAX_WIDTH: u16 = 96;
+const MAX_DESCRIPTION_ROWS: u16 = 4;
 const PICKER_MIN_HEIGHT: u16 = 18;
 const PICKER_MAX_HEIGHT: u16 = 28;
 // Right-aligned details (session timestamps, status labels) never squeeze the row's
@@ -82,6 +83,7 @@ pub fn render_picker(
         search_y.saturating_add(2)
     } else if dialog.kind == DialogKind::ConfigEditor {
         let description_y = inner.y.saturating_add(2);
+        let mut description_height = 1;
         if let Some(error) = dialog.config_error.as_deref() {
             if description_y < footer_y {
                 frame.render_widget(
@@ -90,18 +92,23 @@ pub fn render_picker(
                     Rect::new(inner.x, description_y, inner.width, 1),
                 );
             }
-        } else if let Some(description) = dialog.description.as_deref()
-            && description_y < footer_y
-        {
-            render_description(
-                frame,
-                Rect::new(inner.x, description_y, inner.width, 1),
-                theme,
-                description,
-            );
+        } else if let Some(description) = dialog.description.as_deref() {
+            let available = footer_y.saturating_sub(description_y);
+            if available > 0 {
+                let rows = description_rows(description, inner.width).min(available);
+                render_description(
+                    frame,
+                    Rect::new(inner.x, description_y, inner.width, rows),
+                    theme,
+                    description,
+                );
+                description_height = rows;
+            }
         }
 
-        let search_y = description_y.saturating_add(2);
+        let search_y = description_y
+            .saturating_add(description_height)
+            .saturating_add(1);
         if search_y < footer_y {
             render_search(
                 frame,
@@ -229,13 +236,20 @@ fn picker_has_search(dialog: &DialogState) -> bool {
 
 fn render_description(frame: &mut Frame<'_>, area: Rect, theme: Theme, description: &str) {
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            description.to_string(),
-            muted_style(theme),
-        )))
-        .style(theme.elevated_style()),
+        Paragraph::new(description.to_string())
+            .style(theme.elevated_style())
+            .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn description_rows(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let rows = text
+        .split('\n')
+        .map(|line| display_width(line).max(1).div_ceil(width))
+        .sum::<usize>();
+    rows.clamp(1, MAX_DESCRIPTION_ROWS as usize) as u16
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {

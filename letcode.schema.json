@@ -2,32 +2,32 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/letr007/letcode/main/letcode.schema.json",
   "title": "letcode configuration",
-  "description": "Schema for ~/.config/letcode/letcode.toml, picked up by editors that understand the `#:schema` directive. Every level rejects unknown keys, mirroring the runtime parser.",
+  "description": "Configuration for ~/.config/letcode/letcode.toml. Unknown keys are rejected at every level.",
   "type": "object",
   "additionalProperties": false,
   "required": ["providers"],
   "properties": {
     "active_provider": {
       "type": "string",
-      "description": "Provider used by the current session. Defaults to the first key under [providers] and must name a configured provider."
+      "description": "Provider used by the current session. Must name a key under [providers]; defaults to the first one."
     },
     "fast_mode": {
       "type": "boolean",
       "default": false,
-      "description": "Skip non-essential retries and reasoning waits. Also toggled inside a session with /fast."
+      "description": "Trade retries and reasoning waits for speed. Also toggled inside a session with /fast."
     },
     "global": { "$ref": "#/definitions/global" },
     "permissions": { "$ref": "#/definitions/permissions" },
     "tools": { "$ref": "#/definitions/tools" },
     "mcp": {
       "type": "object",
-      "description": "Model Context Protocol servers, one table per server.",
+      "description": "Model Context Protocol servers, one table per server name.",
       "additionalProperties": { "$ref": "#/definitions/mcpServer" }
     },
     "agents": { "$ref": "#/definitions/agents" },
     "providers": {
       "type": "object",
-      "description": "Model providers, one table per provider.",
+      "description": "Model providers, one table per provider name.",
       "minProperties": 1,
       "additionalProperties": { "$ref": "#/definitions/provider" }
     },
@@ -94,7 +94,7 @@
     },
     "retry": {
       "type": "object",
-      "description": "Physical retry policy. A provider level [providers.<name>.retry] inherits fields it does not declare from [global.retry].",
+      "description": "Physical retry policy. A provider level table inherits fields it does not declare from here.",
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean", "default": true },
@@ -103,14 +103,14 @@
           "minimum": 1,
           "maximum": 9000,
           "default": 50,
-          "description": "Maximum attempts before an observable side effect; includes the first request."
+          "description": "Attempts allowed before a request produces output, counting the first."
         },
         "max_recovery_attempts": {
           "type": "integer",
           "minimum": 0,
           "maximum": 10,
           "default": 3,
-          "description": "Maximum controlled recovery iterations after partial output."
+          "description": "Recovery attempts allowed after a request produced partial output."
         },
         "initial_delay_secs": {
           "type": "integer",
@@ -130,7 +130,7 @@
         "mode": {
           "enum": ["safe", "default", "auto", "yolo", "solo"],
           "default": "default",
-          "description": "safe asks for everything, default allows reads and asks for writes, auto answers approvals with the reviewer expert, yolo allows everything (solo is an alias)."
+          "description": "safe asks before every tool; default allows reads and asks for writes; auto answers approvals with the reviewer expert; yolo allows everything. solo is an alias of yolo."
         }
       }
     },
@@ -140,7 +140,7 @@
       "properties": {
         "parallelism": {
           "type": "object",
-          "description": "Per-tool concurrency override. Only narrows a tool that already declares Parallel; promoting an exclusive tool is rejected.",
+          "description": "Per-tool concurrency. It can only lower a tool that already allows parallel calls.",
           "additionalProperties": { "enum": ["parallel", "exclusive"] }
         }
       }
@@ -230,7 +230,7 @@
     },
     "agents": {
       "type": "object",
-      "description": "Optional per-expert routing and settings. The key set is fixed.",
+      "description": "Per-expert routing. The expert names are fixed.",
       "additionalProperties": false,
       "properties": {
         "explorer": { "$ref": "#/definitions/agentRoute" },
@@ -252,11 +252,11 @@
         "allowed_models": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[^/]+/.+$" },
-          "description": "The first item is the expert's default route and also the allowlist for model overrides in a single agent__* delegation, written as provider/model."
+          "description": "Routes this expert may use, written as provider/model. The first one is its default and also bounds model overrides in a single delegation."
         },
         "reasoning_effort": {
           "type": "string",
-          "description": "Reasoning level every run of this expert uses. Must be supported by the model the run resolves to."
+          "description": "Reasoning level for every run of this expert. The model it resolves to must support it."
         }
       }
     },
@@ -274,7 +274,7 @@
         "flavor": { "$ref": "#/definitions/flavor" },
         "reviewer": {
           "enum": ["jev"],
-          "description": "Marks the provider as an approval reviewer backend. The Jev reviewer requires auth.type = \"bearer\"."
+          "description": "Marks this provider as an approval reviewer backend. The Jev reviewer needs auth.type = \"bearer\"."
         },
         "auth": { "$ref": "#/definitions/auth" },
         "endpoints": { "$ref": "#/definitions/endpoints" },
@@ -400,7 +400,7 @@
         "cache": { "$ref": "#/definitions/cache" },
         "protocol_settings": {
           "type": "object",
-          "description": "Adapter-owned settings, validated by the selected protocol binding. Anthropic reads anthropic_thinking = { mode = \"disabled\" | \"adaptive\" | \"budget\", budget_tokens = <integer> } and anthropic_betas = [<string>]; both require protocol = \"anthropic\"."
+          "description": "Adapter-owned settings. Anthropic reads anthropic_thinking = { mode, budget_tokens } and anthropic_betas, and needs protocol = \"anthropic\"."
         }
       }
     },
@@ -465,7 +465,7 @@
         "reasoning_efforts": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Reasoning efforts offered to the session."
+          "description": "Reasoning levels the session may switch between for this model."
         },
         "reasoning_summary": { "enum": ["auto", "concise", "detailed"] },
         "text_verbosity": { "enum": ["low", "medium", "high"] },
@@ -543,7 +543,7 @@
         "git_has_changes": { "type": "boolean" },
         "extra": {
           "type": "object",
-          "description": "Free-form turn metadata keys, at most 16 entries. Keys are limited to 64 bytes starting with an ASCII letter; values are limited to 128 bytes. Keys already owned by the turn metadata (session_id, thread_id, turn_id, agent_name, request_kind, ...) are rejected.",
+          "description": "Extra turn metadata keys, at most 16, each up to 64 bytes and starting with an ASCII letter; values up to 128 bytes. Keys the turn already sets are rejected.",
           "maxProperties": 16,
           "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$" },
           "additionalProperties": { "type": "string", "maxLength": 128 }
