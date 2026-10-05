@@ -43,6 +43,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
             .bg(theme.element_bg)
             .add_modifier(Modifier::BOLD),
     )));
+    let session_id_line = lines.len();
     lines.push(Line::from(Span::styled(
         truncate_middle(
             state.session_id.as_deref().unwrap_or("—"),
@@ -183,6 +184,10 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         mcp_header_line.map(|line| rendered_row_before(&lines, line, areas[0].width, style));
     let todos_header_row =
         todos_header_line.map(|line| rendered_row_before(&lines, line, areas[0].width, style));
+    let session_id_row = state
+        .session_id
+        .as_ref()
+        .map(|_| rendered_row_before(&lines, session_id_line, areas[0].width, style));
     let paragraph = Paragraph::new(lines)
         .style(style)
         .wrap(Wrap { trim: false });
@@ -196,6 +201,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         .map(|row| sidebar_header_rect(areas[0], row, scroll))
         .unwrap_or_default();
     state.last_sidebar_todos_header = todos_header_row
+        .map(|row| sidebar_header_rect(areas[0], row, scroll))
+        .unwrap_or_default();
+    state.last_sidebar_session_id = session_id_row
         .map(|row| sidebar_header_rect(areas[0], row, scroll))
         .unwrap_or_default();
     frame.render_widget(paragraph.scroll((scroll, 0)), areas[0]);
@@ -1036,6 +1044,32 @@ mod tests {
             1,
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn sidebar_registers_the_session_id_row_only_when_present() {
+        let mut state = TuiState::default();
+        state.session_id = Some("session-1234567890".into());
+        let backend = TestBackend::new(42, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
+            .expect("draw");
+
+        let area = state.last_sidebar_session_id;
+        assert!(area.width > 0 && area.height > 0);
+        let buffer = terminal.backend().buffer();
+        let text = (area.x..area.right())
+            .filter_map(|column| buffer.cell((column, area.y)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("session-1234567890"), "{text}");
+
+        state.session_id = None;
+        terminal
+            .draw(|frame| render_sidebar(frame, &mut state, frame.area(), Theme::dark()))
+            .expect("draw");
+        assert_eq!(state.last_sidebar_session_id, Rect::default());
     }
 
     #[test]

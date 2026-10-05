@@ -45,6 +45,7 @@ pub enum InputAction {
     ToggleSidebarContext,
     ToggleSidebarMcp,
     ToggleSidebarTodos,
+    CopySessionId,
     MouseSelectionStart(u16, u16),
     MouseSelectionDrag(u16, u16),
     /// Third flag is true when Ctrl/Cmd is held — used to activate underlined links.
@@ -498,6 +499,13 @@ pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
                 .contains((mouse.column, mouse.row).into()) =>
         {
             InputAction::ToggleSidebarTodos
+        }
+        MouseEventKind::Down(MouseButton::Left)
+            if state
+                .last_sidebar_session_id
+                .contains((mouse.column, mouse.row).into()) =>
+        {
+            InputAction::CopySessionId
         }
         MouseEventKind::ScrollUp if over_sidebar => InputAction::SidebarScrollUp,
         MouseEventKind::ScrollDown if over_sidebar => InputAction::SidebarScrollDown,
@@ -1500,6 +1508,20 @@ mod tests {
             map_mouse_event(&state, mouse(MouseEventKind::Up(MouseButton::Left), 40, 7)),
             InputAction::ScrollbarDragEnd
         );
+    }
+
+    #[test]
+    fn sidebar_session_id_click_routes_to_copy_action() {
+        let mut state = TuiState::default();
+        state.last_sidebar_session_id = ratatui::layout::Rect::new(103, 2, 35, 1);
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 110,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(map_mouse_event(&state, mouse), InputAction::CopySessionId);
     }
 
     #[test]

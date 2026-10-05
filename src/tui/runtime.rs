@@ -2048,6 +2048,10 @@ impl TuiRuntime {
                 self.state.toggle_sidebar_mcp();
                 Ok(None)
             }
+            InputAction::CopySessionId => {
+                self.handle_copy_session_id();
+                Ok(None)
+            }
             InputAction::ToggleSidebarTodos => {
                 self.state.toggle_sidebar_todos();
                 Ok(None)
@@ -4350,19 +4354,29 @@ impl TuiRuntime {
     }
 
     fn handle_copy_selection(&mut self) -> Result<()> {
-        use arboard::Clipboard;
-
         let text = crate::tui::selection::extract_selected_text(&self.state);
-        if text.is_empty() {
-            return Ok(());
+        if !text.is_empty() {
+            self.copy_to_clipboard(text, "runtime.copied_clipboard");
         }
+        Ok(())
+    }
+
+    fn handle_copy_session_id(&mut self) {
+        let Some(session_id) = self.state.session_id.clone() else {
+            return;
+        };
+        self.copy_to_clipboard(session_id, "runtime.copied_session_id");
+    }
+
+    fn copy_to_clipboard(&mut self, text: String, copied_key: &str) {
+        use arboard::Clipboard;
 
         match Clipboard::new() {
             Ok(mut clipboard) => {
                 if clipboard.set_text(text).is_err() {
                     self.show_toast(self.state.t("runtime.copy_failed"), ToastKind::Error);
                 } else {
-                    self.show_toast(self.state.t("runtime.copied_clipboard"), ToastKind::Success);
+                    self.show_toast(self.state.t(copied_key), ToastKind::Success);
                 }
             }
             Err(_) => {
@@ -4372,8 +4386,6 @@ impl TuiRuntime {
                 );
             }
         }
-
-        Ok(())
     }
 
     fn clipboard_paste_context(&self) -> ClipboardPasteContext {

@@ -202,6 +202,18 @@ fn runtime() -> TuiRuntime {
 }
 
 #[test]
+fn copying_a_missing_session_id_leaves_no_toast() {
+    let mut runtime = runtime();
+    runtime.state_mut().session_id = None;
+
+    runtime
+        .handle_input_action(InputAction::CopySessionId)
+        .expect("copy session id");
+
+    assert!(runtime.state().toast.is_none());
+}
+
+#[test]
 fn dragging_the_scrollbar_moves_the_transcript() {
     let mut runtime = runtime();
     runtime.state_mut().set_transcript_scrollbar_for_test(
