@@ -205,6 +205,15 @@ mod tests {
     const ENGLISH_ONLY_KEYS: &[&str] = &["parse.only_english"];
 
     #[test]
+    fn chinese_catalog_covers_every_schema_description() {
+        let missing = crate::config::schema_keys()
+            .into_iter()
+            .filter(|key| zh_cn_catalog().get(&format!("config.schema.{key}")).is_none())
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
     fn chinese_catalog_covers_every_english_key() {
         let english = english_catalog();
         let chinese = zh_cn_catalog();

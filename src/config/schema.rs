@@ -57,16 +57,51 @@ pub fn field_enum(path: &[&str]) -> Option<Vec<String>> {
     for segment in path {
         node = child_node(root, node, segment)?;
     }
-    let values = node
+    let mut values = node
         .get("enum")
         .and_then(Value::as_array)?
         .iter()
         .filter_map(|value| value.as_str().map(str::to_string))
         .collect::<Vec<_>>();
+    // `solo` is a historical alias of `yolo`; the editor offers the canonical value.
+    if path.len() == 2 && path[0] == "permissions" && path[1] == "mode" {
+        values.retain(|value| value != "solo");
+    }
     if values.is_empty() {
         None
     } else {
         Some(values)
+    }
+}
+
+/// Every documented configuration path, keyed like `field_schema`.
+#[cfg(test)]
+pub fn schema_keys() -> Vec<String> {
+    let Some(root) = schema() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    collect_keys(root, root, &mut Vec::new(), &mut keys);
+    keys.sort();
+    keys
+}
+
+#[cfg(test)]
+fn collect_keys(root: &Value, node: &Value, path: &mut Vec<String>, keys: &mut Vec<String>) {
+    let node = deref(root, node);
+    if !path.is_empty() && node.get("description").is_some() {
+        keys.push(path.join("/"));
+    }
+    if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+        for (name, child) in properties {
+            path.push(name.clone());
+            collect_keys(root, child, path, keys);
+            path.pop();
+        }
+    } else if let Some(child) = node.get("additionalProperties") {
+        path.push("*".to_string());
+        collect_keys(root, child, path, keys);
+        path.pop();
     }
 }
 

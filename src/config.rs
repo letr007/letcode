@@ -122,6 +122,8 @@ pub use persistence::{
     ConfigEntryKind, ConfigScalar,
 };
 pub use schema::{field_enum, field_schema};
+#[cfg(test)]
+pub use schema::schema_keys;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
