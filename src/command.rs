@@ -172,6 +172,7 @@ pub enum CommandIntent {
     ContextBrowse,
     McpBrowse,
     SkillBrowse,
+    ConfigShow,
     Child(ChildNavigation),
 }
 
@@ -497,6 +498,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/config",
+        insert_text: "/config",
+        description_key: "command.config",
+        usage: "/config",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/child",
         insert_text: "/child",
         description_key: "command.child",
@@ -536,6 +546,7 @@ pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
         "/context",
         "/mcp",
         "/skill",
+        "/config",
         "/child",
     ]
     .join(", ");
@@ -605,6 +616,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/context" => expect_no_extra_args(&parts, "/context", CommandIntent::ContextBrowse),
         "/mcp" => expect_no_extra_args(&parts, "/mcp", CommandIntent::McpBrowse),
         "/skill" => expect_no_extra_args(&parts, "/skill", CommandIntent::SkillBrowse),
+        "/config" => expect_no_extra_args(&parts, "/config", CommandIntent::ConfigShow),
         "/child" => parse_child_navigation(&parts),
         _ => Err(CommandParseError::unknown_command(parts[0])),
     }
@@ -928,6 +940,15 @@ mod tests {
         assert_eq!(
             parse_command("/lang en zh-CN"),
             Err(CommandParseError::usage("/lang [en|zh-CN]"))
+        );
+    }
+
+    #[test]
+    fn parses_config_command() {
+        assert_eq!(parse_command("/config"), Ok(CommandIntent::ConfigShow));
+        assert_eq!(
+            parse_command("/config extra"),
+            Err(CommandParseError::new("Usage: /config"))
         );
     }
 

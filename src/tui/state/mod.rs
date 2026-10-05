@@ -269,6 +269,7 @@ pub struct DialogItem {
     pub id: String,
     pub label: String,
     pub detail: Option<String>,
+    pub description: Option<String>,
     pub section: Option<String>,
     pub right_detail: Option<String>,
     pub checked: bool,
@@ -280,10 +281,16 @@ impl DialogItem {
             id: id.into(),
             label: label.into(),
             detail,
+            description: None,
             section: None,
             right_detail: None,
             checked: false,
         }
+    }
+
+    pub fn with_description(mut self, description: Option<String>) -> Self {
+        self.description = description;
+        self
     }
 
     pub fn with_section(mut self, section: impl Into<String>) -> Self {
@@ -300,6 +307,13 @@ impl DialogItem {
         self.checked = checked;
         self
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEditState {
+    pub field_id: String,
+    pub buffer: String,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -338,6 +352,7 @@ pub enum DialogKind {
     McpPicker,
     McpToolsPicker,
     SkillPicker,
+    ConfigEditor,
 }
 
 impl DialogKind {
@@ -352,6 +367,7 @@ impl DialogKind {
                 | Self::McpPicker
                 | Self::McpToolsPicker
                 | Self::SkillPicker
+                | Self::ConfigEditor
         )
     }
 }
@@ -515,6 +531,10 @@ pub struct DialogState {
     pub mcp_primary_selected_server: Option<String>,
     pub expert_primary_query: Option<String>,
     pub expert_primary_selected_agent: Option<String>,
+    pub config_expanded: Option<String>,
+    pub config_detail_items: Vec<DialogItem>,
+    pub config_detail_selected: usize,
+    pub config_dirty: bool,
     pub session_scope: SessionPickerScope,
     pub detail_focused: bool,
     pub detail_scroll: u16,
@@ -1069,6 +1089,10 @@ impl DialogState {
             mcp_primary_selected_server: None,
             expert_primary_query: None,
             expert_primary_selected_agent: None,
+            config_expanded: None,
+            config_detail_items: Vec::new(),
+            config_detail_selected: 0,
+            config_dirty: false,
             session_scope: SessionPickerScope::default(),
             detail_focused: false,
             detail_scroll: 0,
@@ -1295,6 +1319,7 @@ pub struct TuiState {
     pub last_sidebar_mcp_header: ratatui::layout::Rect,
     pub last_sidebar_todos_header: ratatui::layout::Rect,
     pub last_sidebar_session_id: ratatui::layout::Rect,
+    pub config_edit: Option<ConfigEditState>,
     pub last_terminal_width: u16,
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
@@ -1400,6 +1425,7 @@ impl Default for TuiState {
             last_sidebar_mcp_header: ratatui::layout::Rect::default(),
             last_sidebar_todos_header: ratatui::layout::Rect::default(),
             last_sidebar_session_id: ratatui::layout::Rect::default(),
+            config_edit: None,
             last_terminal_width: 0,
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
@@ -1467,6 +1493,10 @@ impl TuiState {
 
     pub fn translator(&self) -> crate::tui::i18n::Translator {
         crate::tui::i18n::Translator::new(self.language())
+    }
+
+    pub fn t_opt(&self, key: &str) -> Option<String> {
+        self.translator().lookup(key)
     }
 
     pub fn t(&self, key: &str) -> String {

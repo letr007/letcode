@@ -106,7 +106,18 @@ async fn main() -> Result<()> {
             _ => {}
         }
     }
-    let config = AppConfig::load()?;
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(error)
+            if matches!(
+                options.entry_mode,
+                EntryMode::Tui | EntryMode::Resume { .. }
+            ) =>
+        {
+            tui::recover::run(&config_path, &error)?
+        }
+        Err(error) => return Err(error),
+    };
     let _tracing_guards = init_tracing(&config.global.log_file);
 
     let (active_provider_name, active_provider) = config.active_provider();
@@ -296,6 +307,7 @@ async fn main() -> Result<()> {
                 projection,
                 config.global.sessions_dir.clone(),
                 config.config_dir.clone(),
+                config.config_path.clone(),
                 workspace_dir,
                 active_provider_label,
                 available_models,

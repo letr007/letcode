@@ -9,7 +9,7 @@ use ratatui::{
 use crate::tui::{
     components::tool_card::truncate_display_width,
     measure::{display_width, wrap_text_to_width},
-    state::{DialogItem, DialogKind, DialogState, SessionPickerScope, TuiState},
+    state::{ConfigEditState, DialogItem, DialogKind, DialogState, SessionPickerScope, TuiState},
     theme::Theme,
 };
 
@@ -77,6 +77,31 @@ pub fn render_picker(
         }
 
         search_y.saturating_add(2)
+    } else if dialog.kind == DialogKind::ConfigEditor {
+        let description_y = inner.y.saturating_add(2);
+        if let Some(description) = dialog.description.as_deref()
+            && description_y < footer_y
+        {
+            render_description(
+                frame,
+                Rect::new(inner.x, description_y, inner.width, 1),
+                theme,
+                description,
+            );
+        }
+
+        let search_y = description_y.saturating_add(2);
+        if search_y < footer_y {
+            render_search(
+                frame,
+                Rect::new(inner.x, search_y, inner.width, 1),
+                theme,
+                state,
+                dialog,
+            );
+        }
+
+        search_y.saturating_add(2)
     } else if picker_has_search(dialog) {
         let search_y = inner.y.saturating_add(3);
         if search_y < inner.bottom() {
@@ -111,6 +136,8 @@ pub fn render_picker(
     if body_height > 0 {
         if dialog.kind == DialogKind::ContextPicker {
             render_context_picker_body(frame, body_area, theme, state, dialog);
+        } else if dialog.kind == DialogKind::ConfigEditor && dialog.config_expanded.is_some() {
+            render_config_split_body(frame, body_area, theme, state, dialog);
         } else {
             render_picker_body(frame, body_area, theme, state, dialog);
         }
@@ -129,6 +156,8 @@ pub fn render_picker(
             render_expert_model_picker_footer(frame, footer_area, theme, state);
         } else if dialog.kind == DialogKind::SessionPicker {
             render_session_picker_footer(frame, footer_area, theme, state, dialog);
+        } else if dialog.kind == DialogKind::ConfigEditor {
+            render_config_footer(frame, footer_area, theme, state);
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
@@ -184,18 +213,7 @@ fn mcp_tools_description(dialog: &DialogState) -> Option<&str> {
 }
 
 fn picker_has_search(dialog: &DialogState) -> bool {
-    matches!(
-        dialog.kind,
-        DialogKind::ModelPicker
-            | DialogKind::AgentPicker
-            | DialogKind::ExpertModelPicker(_)
-            | DialogKind::SessionPicker
-            | DialogKind::HistoryTree
-            | DialogKind::ContextPicker
-            | DialogKind::McpPicker
-            | DialogKind::McpToolsPicker
-            | DialogKind::SkillPicker
-    )
+    dialog.kind.is_searchable() || dialog.kind == DialogKind::AgentPicker
 }
 
 fn render_description(frame: &mut Frame<'_>, area: Rect, theme: Theme, description: &str) {
@@ -387,6 +405,9 @@ fn render_picker_body(
                     DialogKind::ContextDetail => {
                         render_session_row(frame, row, theme, item, selected, None)
                     }
+                    DialogKind::ConfigEditor => {
+                        render_config_row(frame, row, theme, item, selected, state.config_edit.as_ref())
+                    }
                 }
             }
         }
@@ -471,6 +492,80 @@ fn render_expert_model_picker_footer(
         Span::styled("Esc", accent_style(theme)),
         Span::styled(format!(" {}", state.t("ui.back")), muted_style(theme)),
     ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
+        area,
+    );
+}
+
+fn render_config_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+) {
+    let expanded = state
+        .dialog()
+        .is_some_and(|dialog| dialog.config_expanded.is_some());
+    let mut spans = Vec::new();
+    if state
+        .dialog()
+        .is_some_and(|dialog| dialog.config_expanded.is_none())
+        && state
+            .dialog()
+            .is_some_and(|dialog| dialog.config_dirty)
+    {
+        spans.push(Span::styled("● ", accent_style(theme)));
+        spans.push(Span::styled(
+            state.t("config.unsaved"),
+            muted_style(theme),
+        ));
+        spans.push(Span::styled("  ·  ", muted_style(theme)));
+    }
+    spans.push(Span::styled("↑/↓", accent_style(theme)));
+    spans.push(Span::styled(
+        format!(" {}", state.t("ui.navigate")),
+        muted_style(theme),
+    ));
+    spans.push(Span::styled("  ·  ", muted_style(theme)));
+    spans.push(Span::styled("Enter", accent_style(theme)));
+    spans.push(Span::styled(
+        format!(" {}", state.t("ui.edit")),
+        muted_style(theme),
+    ));
+    if expanded {
+        spans.push(Span::styled("  ·  ", muted_style(theme)));
+        spans.push(Span::styled("a", accent_style(theme)));
+        spans.push(Span::styled(
+            format!(" {}", state.t("ui.add")),
+            muted_style(theme),
+        ));
+        spans.push(Span::styled("  ·  ", muted_style(theme)));
+        spans.push(Span::styled("d", accent_style(theme)));
+        spans.push(Span::styled(
+            format!(" {}", state.t("ui.remove")),
+            muted_style(theme),
+        ));
+        spans.push(Span::styled("  ·  ", muted_style(theme)));
+        spans.push(Span::styled("←", accent_style(theme)));
+        spans.push(Span::styled(
+            format!(" {}", state.t("ui.collapse")),
+            muted_style(theme),
+        ));
+    } else {
+        spans.push(Span::styled("  ·  ", muted_style(theme)));
+        spans.push(Span::styled("Ctrl-S", accent_style(theme)));
+        spans.push(Span::styled(
+            format!(" {}", state.t("ui.save")),
+            muted_style(theme),
+        ));
+        spans.push(Span::styled("  ·  ", muted_style(theme)));
+        spans.push(Span::styled("Esc", accent_style(theme)));
+        spans.push(Span::styled(
+            format!(" {}", state.t("ui.close")),
+            muted_style(theme),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
         area,
@@ -732,6 +827,7 @@ fn picker_entries<'a>(dialog: &'a DialogState, body_width: u16) -> Vec<PickerEnt
                 | DialogKind::SessionPicker
                 | DialogKind::HistoryTree
                 | DialogKind::ContextPicker
+                | DialogKind::ConfigEditor
         ) {
             let section = item.section.as_deref().unwrap_or_else(|| {
                 if dialog.kind == DialogKind::HistoryTree {
@@ -848,6 +944,166 @@ fn render_model_row(
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), content);
+}
+
+fn render_config_split_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &mut TuiState,
+    dialog: &DialogState,
+) {
+    let [list_area, gap_area, detail_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(52),
+            Constraint::Length(2),
+            Constraint::Percentage(46),
+        ])
+        .split(area)
+        .as_ref()
+        .try_into()
+        .unwrap_or([
+            area,
+            Rect::new(area.x, area.y, 0, 0),
+            Rect::new(area.x, area.y, 0, 0),
+        ]);
+
+    render_picker_body(frame, list_area, theme, state, dialog);
+    frame.render_widget(
+        Block::default().style(theme.elevated_style()),
+        gap_area,
+    );
+    render_config_detail(frame, detail_area, theme, dialog, state.config_edit.as_ref());
+}
+
+fn render_config_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    dialog: &DialogState,
+    edit: Option<&ConfigEditState>,
+) {
+    if area.is_empty() {
+        return;
+    }
+    for (index, item) in dialog.config_detail_items.iter().enumerate() {
+        let row = area.y.saturating_add(index as u16);
+        if row >= area.bottom() {
+            break;
+        }
+        let selected = index == dialog.config_detail_selected;
+        let row_style = if selected {
+            selected_item_style(theme)
+        } else {
+            item_style(theme)
+        };
+        let row_area = Rect::new(area.x, row, area.width, 1);
+        frame.render_widget(Block::default().style(row_style), row_area);
+        let marker = if selected { "● " } else { "  " };
+        let spans = if let Some(edit) = edit.filter(|edit| edit.field_id == item.id) {
+            let cursor = edit.cursor.min(edit.buffer.len());
+            let (before, after) = edit.buffer.split_at(cursor);
+            vec![
+                Span::styled(marker, row_style),
+                Span::styled(before.to_string(), row_style),
+                Span::styled("▏", row_style),
+                Span::styled(after.to_string(), row_style),
+            ]
+        } else {
+            vec![
+                Span::styled(marker, row_style),
+                Span::styled(item.label.clone(), row_style),
+            ]
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(row_style),
+            Rect::new(
+                row_area.x.saturating_add(1),
+                row,
+                row_area.width.saturating_sub(1),
+                1,
+            ),
+        );
+    }
+}
+
+fn render_config_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    item: &DialogItem,
+    selected: bool,
+    edit: Option<&ConfigEditState>,
+) {
+    let row_style = if selected {
+        selected_item_style(theme)
+    } else {
+        item_style(theme)
+    };
+    frame.render_widget(Block::default().style(row_style), area);
+
+    let content = area.inner(Margin::new(1, 0));
+    if content.is_empty() {
+        return;
+    }
+
+    let editing = edit.filter(|edit| edit.field_id == item.id);
+    let affordance = if editing.is_some() {
+        ""
+    } else {
+        item.right_detail.as_deref().unwrap_or("")
+    };
+    let right_width = (display_width(affordance) as u16)
+        .min(content.width.saturating_sub(MIN_LEFT_LABEL_WIDTH));
+    let left_width = content.width.saturating_sub(right_width.saturating_add(2));
+    let left_area = Rect::new(content.x, content.y, left_width, content.height);
+    let right_area = Rect::new(
+        content.right().saturating_sub(right_width),
+        content.y,
+        right_width,
+        content.height,
+    );
+
+    let marker = if selected { "● " } else { "  " };
+    let mut spans = vec![
+        Span::styled(marker, row_style),
+        Span::styled(item.label.clone(), row_style),
+    ];
+    if let Some(edit) = editing {
+        spans.push(Span::styled("  ", row_style));
+        let cursor = edit.cursor.min(edit.buffer.len());
+        let (before, after) = edit.buffer.split_at(cursor);
+        spans.push(Span::styled(before.to_string(), row_style));
+        spans.push(Span::styled("▏", row_style));
+        spans.push(Span::styled(after.to_string(), row_style));
+    } else if let Some(detail) = &item.detail {
+        spans.push(Span::styled("  ", row_style));
+        spans.push(Span::styled(
+            detail.clone(),
+            if selected {
+                selected_muted_style(theme)
+            } else {
+                muted_style(theme)
+            },
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), left_area);
+
+    if right_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                affordance.to_string(),
+                if selected {
+                    selected_item_style(theme)
+                } else {
+                    muted_style(theme)
+                },
+            )))
+            .style(row_style),
+            right_area,
+        );
+    }
 }
 
 fn render_permission_row(

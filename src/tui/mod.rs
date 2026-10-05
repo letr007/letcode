@@ -24,6 +24,7 @@ pub mod measure;
 pub(crate) mod mermaid;
 pub mod preferences;
 pub mod presentation;
+pub(crate) mod recover;
 pub mod render;
 pub mod runtime;
 pub(crate) mod scrollbar;

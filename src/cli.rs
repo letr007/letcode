@@ -891,6 +891,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::McpBrowse | CommandIntent::SkillBrowse => {
             ReplCommand::Unsupported("CLI does not support this panel; use the TUI.".into())
         }
+        CommandIntent::ConfigShow => ReplCommand::Unsupported(
+            "CLI does not support /config; use the TUI to edit configuration.".into(),
+        ),
         CommandIntent::Language(_) => ReplCommand::Unsupported(
             "Unsupported: /language and /lang are available only in the TUI.".into(),
         ),

@@ -62,6 +62,14 @@ impl Translator {
         }
     }
 
+    /// The translation for `key` in the active language, falling back to English.
+    pub fn lookup(&self, key: &str) -> Option<String> {
+        self.current
+            .get(key)
+            .or_else(|| self.english.get(key))
+            .cloned()
+    }
+
     pub fn t(&self, key: &str) -> String {
         if let Some(value) = self.current.get(key) {
             return value.clone();

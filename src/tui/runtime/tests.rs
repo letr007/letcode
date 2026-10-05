@@ -201,6 +201,25 @@ fn runtime() -> TuiRuntime {
     runtime_with_experts(Vec::new())
 }
 
+fn runtime_with_config(contents: &str) -> TuiRuntime {
+    runtime_with_config_path(contents).0
+}
+
+fn runtime_with_config_path(contents: &str) -> (TuiRuntime, std::path::PathBuf) {
+    static NEXT_CONFIG_DIR: AtomicU64 = AtomicU64::new(0);
+    let mut runtime = runtime();
+    let dir = std::env::temp_dir().join(format!(
+        "letcode-tui-config-test-{}-{}",
+        std::process::id(),
+        NEXT_CONFIG_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    let path = dir.join("letcode.toml");
+    std::fs::write(&path, contents).expect("write config");
+    runtime.set_config_path(path.clone());
+    (runtime, path)
+}
+
 #[test]
 fn copying_a_missing_session_id_leaves_no_toast() {
     let mut runtime = runtime();
@@ -7766,4 +7785,334 @@ fn session_scope_switch_regroups_the_resume_listing() {
         SessionPickerScope::Workspace
     );
     assert_eq!(listed(&runtime), ["current"]);
+}
+
+#[test]
+fn config_command_opens_the_config_editor() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("/config");
+
+    let command = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+    assert!(command.is_none());
+    assert_eq!(
+        runtime.state().dialog().map(|dialog| dialog.kind.clone()),
+        Some(crate::tui::state::DialogKind::ConfigEditor)
+    );
+}
+
+#[test]
+fn config_editor_lists_grouped_fields() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"openai\"\n\n[providers.openai]\ndefault_model = \"gpt-5.5\"\n\n[permissions]\nmode = \"default\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(dialog.kind, crate::tui::state::DialogKind::ConfigEditor);
+    let labels = dialog
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"active_provider"), "{labels:?}");
+    assert!(labels.contains(&"mode"), "{labels:?}");
+    assert!(dialog.items.iter().all(|item| item.section.is_some()));
+}
+
+#[test]
+fn config_editor_enters_and_cancels_text_edit() {
+    let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "active_provider")
+        .expect("active_provider field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("enter edit mode");
+    let edit = runtime.state().config_edit.as_ref().expect("edit mode");
+    assert!(edit.field_id.starts_with("config:"));
+
+    runtime
+        .handle_input_action(InputAction::ConfigEditInsert('x'))
+        .expect("insert into edit buffer");
+    assert!(
+        runtime
+            .state()
+            .config_edit
+            .as_ref()
+            .expect("edit mode")
+            .buffer
+            .ends_with('x')
+    );
+
+    runtime
+        .handle_input_action(InputAction::ConfigEditCancel)
+        .expect("cancel edit");
+    assert!(runtime.state().config_edit.is_none());
+}
+
+#[test]
+fn config_editor_lists_every_provider_and_masks_credentials() {
+    let mut runtime = runtime_with_config(
+        "[providers.alpha]\nbase_url = \"https://a.invalid\"\n\n[providers.alpha.auth]\ncredential = \"secret-key\"\n\n[providers.beta]\nbase_url = \"https://b.invalid\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let sections = dialog
+        .items
+        .iter()
+        .filter_map(|item| item.section.as_deref())
+        .collect::<Vec<_>>();
+    assert!(sections.contains(&"providers.alpha"), "{sections:?}");
+    assert!(sections.contains(&"providers.beta"), "{sections:?}");
+
+    let credential = dialog
+        .items
+        .iter()
+        .find(|item| item.label == "credential")
+        .expect("credential field");
+    let display = credential.detail.as_deref().unwrap_or_default();
+    assert!(!display.contains("secret-key"), "{display}");
+}
+
+#[test]
+fn config_editor_filters_fields_by_query() {
+    let mut runtime =
+        runtime_with_config("active_provider = \"openai\"\n\n[global]\nmax_iterations = 5\n");
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    for ch in "max".chars() {
+        runtime
+            .handle_input_action(InputAction::DialogInsert(ch))
+            .expect("type into the search query");
+    }
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(dialog.query, "max");
+    let visible = dialog
+        .visible_items()
+        .map(|(_, item)| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(visible, ["max_iterations"]);
+}
+
+#[test]
+fn config_editor_attaches_schema_descriptions() {
+    let mut runtime =
+        runtime_with_config("active_provider = \"openai\"\n\n[global]\nmax_iterations = 5\n");
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let item = dialog
+        .items
+        .iter()
+        .find(|item| item.label == "max_iterations")
+        .expect("max_iterations field");
+    let description = item.description.as_deref().expect("schema description");
+    assert!(description.contains("Maximum iterations"), "{description}");
+}
+
+#[test]
+fn config_editor_expands_and_applies_a_choice() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\nflavor = \"standard\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "protocol")
+        .expect("protocol field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand the field");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(
+        dialog.config_expanded.as_deref(),
+        Some("choice:providers\u{1f}alpha\u{1f}protocol")
+    );
+    assert_eq!(dialog.config_detail_items.len(), 3);
+
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("select the next value");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("apply the choice");
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .config_expanded
+            .is_none()
+    );
+}
+
+#[test]
+fn config_editor_shows_the_selected_field_description() {
+    let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let description = dialog.description.as_deref().expect("field description");
+    assert!(
+        description.contains("Provider used by the current session"),
+        "{description}"
+    );
+}
+
+#[test]
+fn config_editor_translates_schema_descriptions() {
+    let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::ZhCn));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let description = dialog.description.as_deref().expect("field description");
+    assert!(
+        description.contains("当前会话使用的 provider"),
+        "{description}"
+    );
+}
+
+#[test]
+fn config_editor_edits_array_items() {
+    let (mut runtime, path) = runtime_with_config_path(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\nflavor = \"standard\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[mcp.demo]\ntype = \"local\"\ncommand = [\"echo\", \"hi\"]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "command")
+        .expect("command field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand the array");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(
+        dialog.config_expanded.as_deref(),
+        Some("list:mcp\u{1f}demo\u{1f}command")
+    );
+    assert_eq!(dialog.config_detail_items.len(), 2);
+
+    runtime
+        .handle_input_action(InputAction::ConfigListAppend)
+        .expect("append a new element");
+    for ch in "bye".chars() {
+        runtime
+            .handle_input_action(InputAction::ConfigEditInsert(ch))
+            .expect("type the element value");
+    }
+    runtime
+        .handle_input_action(InputAction::ConfigEditConfirm)
+        .expect("commit the element");
+
+    let written = std::fs::read_to_string(&path).expect("read config");
+    assert!(!written.contains("bye"), "unsaved edits stay off disk");
+
+    runtime
+        .handle_input_action(InputAction::ConfigSave)
+        .expect("save the draft");
+    let written = std::fs::read_to_string(&path).expect("read config");
+    assert!(written.contains("bye"), "{written}");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .config_detail_items
+            .len(),
+        3
+    );
+
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("select the previous element");
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
+        .expect("select the first element");
+    runtime
+        .handle_input_action(InputAction::ConfigListRemove)
+        .expect("remove the element");
+    runtime
+        .handle_input_action(InputAction::ConfigSave)
+        .expect("save the draft");
+    let written = std::fs::read_to_string(&path).expect("read config");
+    assert!(!written.contains("echo"), "{written}");
 }

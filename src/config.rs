@@ -111,11 +111,17 @@ const RESERVED_FAKE_EXTRA_KEYS: &[&str] = &[
 const MAX_RETRY_ATTEMPTS: usize = 9_000;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
 mod persistence;
+mod schema;
 
 use persistence::acquire_config_read_lock;
 pub(crate) use persistence::{acquire_config_lock, replace_file};
 #[allow(unused_imports)]
-pub use persistence::{persist_expert_allowed_models, persist_mcp_server_enabled};
+pub use persistence::{
+    config_array_in, config_entries_in, config_value_in, persist_expert_allowed_models,
+    persist_mcp_server_enabled, save_config_document, set_config_scalar, ConfigEntry,
+    ConfigEntryKind, ConfigScalar,
+};
+pub use schema::{field_enum, field_schema};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -233,7 +239,7 @@ impl AppConfig {
         Self::load_from_str_at_path(&config_path, &config_text)
     }
 
-    fn load_from_str_at_path(config_path: &Path, config_text: &str) -> Result<Self> {
+    pub(crate) fn load_from_str_at_path(config_path: &Path, config_text: &str) -> Result<Self> {
         let config_path = config_path.to_path_buf();
         let raw: RawAppConfig = toml::from_str(config_text)
             .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
@@ -3075,6 +3081,28 @@ base_url = "https://example.invalid"
         assert!(written.contains("# preserve this trailing comment"));
         assert!(written.contains("primary/old"));
         assert!(written.contains("expert/shared"));
+    }
+
+    #[test]
+    fn persists_scalar_without_rewriting_unrelated_config() {
+        let path = write_temp_config(format!(
+            "# keep this comment\n{}\n",
+            config("openai", "model", "")
+        ));
+        let mut document = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        set_config_scalar(
+            &mut document,
+            &["global", "max_iterations"],
+            ConfigScalar::Integer(42),
+        )
+        .expect("set scalar");
+        save_config_document(&path, &document).expect("save config");
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# keep this comment"));
+        assert!(written.contains("max_iterations = 42"));
     }
 
     #[cfg(unix)]

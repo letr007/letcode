@@ -26,6 +26,19 @@ pub enum InputAction {
     DialogAccept,
     DialogToggle,
     DialogCancel,
+    ConfigEditInsert(char),
+    ConfigEditBackspace,
+    ConfigEditDelete,
+    ConfigEditLeft,
+    ConfigEditRight,
+    ConfigEditHome,
+    ConfigEditEnd,
+    ConfigEditConfirm,
+    ConfigEditCancel,
+    ConfigSave,
+    ConfigCollapse,
+    ConfigListAppend,
+    ConfigListRemove,
     SlashPanelNext,
     SlashPanelPrev,
     SlashPanelAccept,
@@ -97,6 +110,56 @@ pub enum InputAction {
     Quit,
     Tick,
     NoOp,
+}
+
+fn config_editor_key_action(state: &TuiState, key: KeyEvent) -> InputAction {
+    if state.config_edit.is_some() {
+        return match key.code {
+            KeyCode::Enter => InputAction::ConfigEditConfirm,
+            KeyCode::Esc => InputAction::ConfigEditCancel,
+            KeyCode::Backspace => InputAction::ConfigEditBackspace,
+            KeyCode::Delete => InputAction::ConfigEditDelete,
+            KeyCode::Left => InputAction::ConfigEditLeft,
+            KeyCode::Right => InputAction::ConfigEditRight,
+            KeyCode::Home => InputAction::ConfigEditHome,
+            KeyCode::End => InputAction::ConfigEditEnd,
+            KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => {
+                InputAction::ConfigEditInsert(ch)
+            }
+            _ => InputAction::NoOp,
+        };
+    }
+    if state
+        .dialog()
+        .is_some_and(|dialog| dialog.config_expanded.is_some())
+    {
+        return match key.code {
+            KeyCode::Up => InputAction::DialogPrev,
+            KeyCode::Down => InputAction::DialogNext,
+            KeyCode::Enter => InputAction::DialogAccept,
+            KeyCode::Left | KeyCode::Esc => InputAction::ConfigCollapse,
+            KeyCode::Char('a') => InputAction::ConfigListAppend,
+            KeyCode::Char('d') | KeyCode::Delete => InputAction::ConfigListRemove,
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                InputAction::ConfigSave
+            }
+            _ => InputAction::NoOp,
+        };
+    }
+    match key.code {
+        KeyCode::Up => InputAction::DialogPrev,
+        KeyCode::Down => InputAction::DialogNext,
+        KeyCode::Right | KeyCode::Enter => InputAction::DialogAccept,
+        KeyCode::Esc => InputAction::DialogCancel,
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            InputAction::ConfigSave
+        }
+        KeyCode::Backspace => InputAction::DialogBackspace,
+        KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => {
+            InputAction::DialogInsert(ch)
+        }
+        _ => InputAction::NoOp,
+    }
 }
 
 pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
@@ -277,6 +340,12 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     if state.dialog_is_open() {
+        if state
+            .dialog()
+            .is_some_and(|dialog| dialog.kind == DialogKind::ConfigEditor)
+        {
+            return config_editor_key_action(state, key);
+        }
         let search_dialog = state
             .dialog()
             .is_some_and(|dialog| dialog.kind.is_searchable());
@@ -995,6 +1064,7 @@ mod tests {
             (DialogKind::ThemePicker, false),
             (DialogKind::FakePicker, false),
             (DialogKind::LanguagePicker, false),
+            (DialogKind::ConfigEditor, true),
             (DialogKind::ContextDetail, false),
         ];
 

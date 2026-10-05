@@ -140,7 +140,8 @@ impl SessionCommand {
             | CommandIntent::ResumeShow
             | CommandIntent::ContextBrowse
             | CommandIntent::McpBrowse
-            | CommandIntent::SkillBrowse => None,
+            | CommandIntent::SkillBrowse
+            | CommandIntent::ConfigShow => None,
         }
     }
 }

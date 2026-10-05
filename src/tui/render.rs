@@ -2265,6 +2265,38 @@ mod tests {
     }
 
     #[test]
+    fn config_editor_renders_grouped_fields_and_footer() {
+        let mut state = TuiState::default();
+        let items = vec![
+            crate::tui::state::DialogItem::new(
+                "active_provider",
+                "Active provider",
+                Some("openai".into()),
+            )
+            .with_section("Provider"),
+            crate::tui::state::DialogItem::new(
+                "permissions.mode",
+                "Permission mode",
+                Some("default".into()),
+            )
+            .with_section("Permission")
+            .with_right_detail("▸"),
+        ];
+        state.open_dialog(crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ConfigEditor,
+            "Configuration",
+            None,
+            items,
+        ));
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("Provider"), "{rendered}");
+        assert!(rendered.contains("Permission"), "{rendered}");
+        assert!(rendered.contains("Enter"), "{rendered}");
+    }
+
+    #[test]
     fn permission_dialog_uses_picker_style() {
         let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
         let mut dialog = crate::tui::state::DialogState::new(

@@ -46,6 +46,214 @@ pub fn persist_expert_allowed_models(
     })
 }
 
+/// A scalar configuration value addressed by a dotted table path.
+#[derive(Debug)]
+pub enum ConfigScalar {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    Array(Vec<String>),
+}
+
+/// Persist one scalar at `path` without rewriting unrelated configuration content.
+/// Set one scalar at `path` in an in-memory document.
+pub fn set_config_scalar(
+    document: &mut DocumentMut,
+    path: &[&str],
+    scalar: ConfigScalar,
+) -> Result<()> {
+    let (key, parents) = path
+        .split_last()
+        .ok_or_else(|| anyhow!("config path is empty"))?;
+    {
+        let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+        for &segment in parents {
+            if table.get(segment).is_none() {
+                table.insert(segment, Item::Table(Table::new()));
+            }
+            table = table
+                .get_mut(segment)
+                .and_then(Item::as_table_like_mut)
+                .ok_or_else(|| anyhow!("config [{segment}] is not a table"))?;
+        }
+        let item = match scalar {
+            ConfigScalar::String(v) => value(v),
+            ConfigScalar::Integer(v) => value(v),
+            ConfigScalar::Float(v) => value(v),
+            ConfigScalar::Bool(v) => value(v),
+            ConfigScalar::Array(values) => {
+                let mut array = Array::new();
+                for value in values {
+                    array.push(value);
+                }
+                Item::Value(toml_edit::Value::Array(array))
+            }
+        };
+        table.insert(key, item);
+    }
+    Ok(())
+}
+
+/// One editable leaf of the configuration document, in file order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigEntry {
+    pub path: Vec<String>,
+    pub section: String,
+    pub label: String,
+    pub display: String,
+    pub kind: ConfigEntryKind,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigEntryKind {
+    Text,
+    Integer,
+    Float,
+    Bool,
+    Array,
+    ReadOnly,
+}
+
+/// Flatten an in-memory configuration document into editable leaves.
+pub fn config_entries_in(document: &DocumentMut) -> Vec<ConfigEntry> {
+    let mut entries = Vec::new();
+    let mut prefix = Vec::new();
+    collect_config_entries(document.as_table(), &mut prefix, &mut entries);
+    entries
+}
+
+fn collect_config_entries(
+    table: &dyn toml_edit::TableLike,
+    prefix: &mut Vec<String>,
+    entries: &mut Vec<ConfigEntry>,
+) {
+    for (key, item) in table.iter() {
+        prefix.push(key.to_string());
+        match item {
+            Item::Value(value) => entries.push(leaf_config_entry(prefix, value)),
+            Item::Table(child) => collect_config_entries(child, prefix, entries),
+            Item::ArrayOfTables(_) | Item::None => {}
+        }
+        prefix.pop();
+    }
+}
+
+fn leaf_config_entry(path: &[String], value: &toml_edit::Value) -> ConfigEntry {
+    let key = path.last().cloned().unwrap_or_default();
+    let sensitive = is_sensitive_key(&key);
+    let (display, kind) = match value {
+        toml_edit::Value::String(text) => {
+            let raw = text.value();
+            let display = if sensitive {
+                mask_config_secret(raw)
+            } else {
+                raw.clone()
+            };
+            (display, ConfigEntryKind::Text)
+        }
+        toml_edit::Value::Integer(number) => (number.value().to_string(), ConfigEntryKind::Integer),
+        toml_edit::Value::Float(number) => (number.value().to_string(), ConfigEntryKind::Float),
+        toml_edit::Value::Boolean(flag) => (flag.value().to_string(), ConfigEntryKind::Bool),
+        toml_edit::Value::Datetime(_) => ("(datetime)".to_string(), ConfigEntryKind::ReadOnly),
+        toml_edit::Value::Array(array) => (
+            format!("{} items", array.len()),
+            ConfigEntryKind::Array,
+        ),
+        toml_edit::Value::InlineTable(_) => ("(table)".to_string(), ConfigEntryKind::ReadOnly),
+    };
+    ConfigEntry {
+        path: path.to_vec(),
+        section: config_entry_section(path),
+        label: config_entry_label(path),
+        display,
+        kind,
+        sensitive,
+    }
+}
+
+fn config_entry_section(path: &[String]) -> String {
+    if path.len() <= 1 {
+        String::new()
+    } else {
+        path[..path.len() - 1].join(".")
+    }
+}
+
+fn config_entry_label(path: &[String]) -> String {
+    path.last().cloned().unwrap_or_default()
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("credential")
+        || lower.contains("api_key")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+}
+
+fn mask_config_secret(value: &str) -> String {
+    "•".repeat(value.chars().count().clamp(4, 12))
+}
+
+/// The raw scalar at `path` in an in-memory document.
+pub fn config_value_in(document: &DocumentMut, path: &[&str]) -> Option<(ConfigEntryKind, String)> {
+    let mut table: &dyn toml_edit::TableLike = document.as_table();
+    for (index, segment) in path.iter().enumerate() {
+        let item = table.get(segment)?;
+        if index + 1 == path.len() {
+            return item_value_text(item);
+        }
+        match item {
+            Item::Table(child) => table = child,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The string elements of the array at `path` in an in-memory document.
+pub fn config_array_in(document: &DocumentMut, path: &[&str]) -> Option<Vec<String>> {
+    let mut table: &dyn toml_edit::TableLike = document.as_table();
+    for (index, segment) in path.iter().enumerate() {
+        let item = table.get(segment)?;
+        if index + 1 == path.len() {
+            let array = item.as_value().and_then(toml_edit::Value::as_array)?;
+            return Some(
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        match item {
+            Item::Table(child) => table = child,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn item_value_text(item: &Item) -> Option<(ConfigEntryKind, String)> {
+    match item {
+        Item::Value(toml_edit::Value::String(text)) => {
+            Some((ConfigEntryKind::Text, text.value().clone()))
+        }
+        Item::Value(toml_edit::Value::Integer(number)) => {
+            Some((ConfigEntryKind::Integer, number.value().to_string()))
+        }
+        Item::Value(toml_edit::Value::Float(number)) => {
+            Some((ConfigEntryKind::Float, number.value().to_string()))
+        }
+        Item::Value(toml_edit::Value::Boolean(flag)) => {
+            Some((ConfigEntryKind::Bool, flag.value().to_string()))
+        }
+        _ => None,
+    }
+}
+
 fn persist_config_document(
     config_path: &Path,
     update_name: &str,
@@ -80,6 +288,31 @@ fn persist_config_document(
         update_name,
         require_full_config,
     )?;
+    atomic_write_config_with_source(
+        &config_target,
+        &config_text,
+        &original_metadata,
+        updated_config.as_bytes(),
+        Some(&config_file),
+    )
+}
+
+/// Validate an edited in-memory document and replace the config file with it.
+pub fn save_config_document(config_path: &Path, document: &DocumentMut) -> Result<()> {
+    let config_target = fs::canonicalize(config_path)
+        .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
+    let _lock = acquire_config_lock(&config_target)?;
+    let mut config_file = fs::File::open(&config_target)
+        .with_context(|| format!("failed to open config file {}", config_target.display()))?;
+    let original_metadata = config_file
+        .metadata()
+        .with_context(|| format!("failed to stat config file {}", config_target.display()))?;
+    let mut config_text = String::new();
+    config_file
+        .read_to_string(&mut config_text)
+        .with_context(|| format!("failed to read config file {}", config_target.display()))?;
+    let updated_config = document.to_string();
+    validate_updated_config_document(&config_target, &updated_config, "configuration", true)?;
     atomic_write_config_with_source(
         &config_target,
         &config_text,
