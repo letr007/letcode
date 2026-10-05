@@ -2412,6 +2412,18 @@ impl TuiRuntime {
                 self.handle_selection_end(col, row, activate_link);
                 Ok(None)
             }
+            InputAction::ScrollbarDragStart(col, row) => {
+                self.handle_scrollbar_drag_start(col, row);
+                Ok(None)
+            }
+            InputAction::ScrollbarDragMove(_, row) => {
+                self.handle_scrollbar_drag_move(row);
+                Ok(None)
+            }
+            InputAction::ScrollbarDragEnd => {
+                self.state.transcript_scrollbar_drag = None;
+                Ok(None)
+            }
             InputAction::CopySelection => {
                 self.handle_copy_selection()?;
                 Ok(None)
@@ -4206,6 +4218,34 @@ impl TuiRuntime {
             }
             Some(TranscriptClickTarget::ToolCard(_)) | None => {}
         }
+    }
+
+    fn handle_scrollbar_drag_start(&mut self, column: u16, row: u16) {
+        let area = self.state.last_scrollbar_area;
+        if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
+            return;
+        }
+        let track_row = usize::from(row - area.y);
+        let Some(geometry) = self.state.transcript_scrollbar() else {
+            return;
+        };
+        if !geometry.contains_row(track_row) {
+            return;
+        }
+        self.state.transcript_scrollbar_drag = Some(geometry.grab_offset(track_row));
+    }
+
+    fn handle_scrollbar_drag_move(&mut self, row: u16) {
+        let Some(grab) = self.state.transcript_scrollbar_drag else {
+            return;
+        };
+        let area = self.state.last_scrollbar_area;
+        let Some(geometry) = self.state.transcript_scrollbar() else {
+            return;
+        };
+        let track_row = usize::from(row.saturating_sub(area.y));
+        let position = geometry.position_for_grab(track_row, grab);
+        self.state.scroll_transcript_to_top_row(position);
     }
 
     fn handle_selection_start(&mut self, col: u16, row: u16) {

@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Paragraph},
 };
 
 use crate::subagent::try_parse_structured_subagent_result;
@@ -22,6 +22,7 @@ use crate::tui::{
     i18n::Translator,
     markdown::{MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown_document},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
+    scrollbar::ScrollbarGeometry,
     surface,
     theme::Theme,
     timeline::{
@@ -189,6 +190,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     // 存储实际文本渲染区域（不含 scrollbar 列）与解析后的 top-relative 滚动偏移，
     // 供鼠标坐标映射与选择高亮使用——三者必须共用同一坐标系。
     state.last_transcript_area = content_area;
+    state.last_scrollbar_area = scrollbar_area.unwrap_or_default();
 
     let width = content_area.width.max(1) as usize;
     let (total_rows, width_reflowed) = cached_transcript_row_count_with_reflow(state, theme, width);
@@ -214,18 +216,22 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     );
 
     if let Some(scrollbar_area) = scrollbar_area
-        && total_rows > visible_rows as usize
         && visible_rows > 0
+        && let Some(geometry) = ScrollbarGeometry::new(
+            usize::from(scrollbar_area.height),
+            total_rows,
+            usize::from(visible_rows),
+            scroll,
+        )
     {
-        let mut scrollbar_state = ScrollbarState::new(total_rows)
-            .position(scroll)
-            .viewport_content_length(visible_rows as usize);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .thumb_style(Style::default().fg(theme.dim_text).bg(theme.root_bg))
-            .track_style(Style::default().fg(theme.element_bg).bg(theme.root_bg));
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+        let backdrop = assistant_fade::fade_backdrop(theme, state.terminal_background());
+        let buffer = frame.buffer_mut();
+        for row in 0..scrollbar_area.height {
+            let (symbol, style) = geometry.cell(usize::from(row), theme, backdrop);
+            if let Some(cell) = buffer.cell_mut((scrollbar_area.x, scrollbar_area.y + row)) {
+                cell.set_char(symbol).set_style(style);
+            }
+        }
     }
 }
 

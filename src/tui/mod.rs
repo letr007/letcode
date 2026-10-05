@@ -26,6 +26,7 @@ pub mod preferences;
 pub mod presentation;
 pub mod render;
 pub mod runtime;
+pub(crate) mod scrollbar;
 pub mod selection;
 pub(crate) mod setup;
 pub mod slash;

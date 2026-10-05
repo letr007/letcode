@@ -201,6 +201,63 @@ fn runtime() -> TuiRuntime {
     runtime_with_experts(Vec::new())
 }
 
+#[test]
+fn dragging_the_scrollbar_moves_the_transcript() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_transcript_scrollbar_for_test(
+        ratatui::layout::Rect::new(40, 0, 1, 10),
+        ratatui::layout::Rect::new(0, 0, 40, 10),
+        100,
+        0,
+    );
+
+    runtime
+        .handle_input_action(InputAction::ScrollbarDragStart(40, 0))
+        .expect("grab the thumb");
+    assert!(runtime.state().transcript_scrollbar_drag.is_some());
+
+    runtime
+        .handle_input_action(InputAction::ScrollbarDragMove(40, 9))
+        .expect("drag to the bottom");
+    assert_eq!(runtime.state().transcript_scroll, 0);
+    assert!(runtime.state().auto_scroll);
+
+    runtime
+        .handle_input_action(InputAction::ScrollbarDragMove(40, 0))
+        .expect("drag to the top");
+    assert_eq!(runtime.state().transcript_scroll, 90);
+    assert!(!runtime.state().auto_scroll);
+
+    runtime
+        .handle_input_action(InputAction::ScrollbarDragEnd)
+        .expect("release the thumb");
+    assert!(runtime.state().transcript_scrollbar_drag.is_none());
+}
+
+#[test]
+fn scrollbar_draws_a_single_line_track_and_a_block_thumb() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .timeline
+        .push_assistant_delta(AssistantDeltaEvent::new("paragraph\n\n".repeat(60)));
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .expect("render transcript");
+
+    let area = runtime.state().last_scrollbar_area;
+    assert!(area.height > 0, "a long transcript reserves a scrollbar");
+    let column = (area.y..area.bottom())
+        .filter_map(|row| terminal.backend().buffer().cell((area.x, row)))
+        .map(|cell| cell.symbol().to_string())
+        .collect::<Vec<_>>();
+    assert!(column.iter().any(|symbol| symbol == "│"), "{column:?}");
+    assert!(column.iter().any(|symbol| symbol == "█"), "{column:?}");
+}
+
 struct ReasoningTransitionProbe {
     started_at: Option<std::time::Instant>,
 }

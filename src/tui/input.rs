@@ -49,6 +49,9 @@ pub enum InputAction {
     MouseSelectionDrag(u16, u16),
     /// Third flag is true when Ctrl/Cmd is held — used to activate underlined links.
     MouseSelectionEnd(u16, u16, bool),
+    ScrollbarDragStart(u16, u16),
+    ScrollbarDragMove(u16, u16),
+    ScrollbarDragEnd,
     CopySelection,
     ClearSelection,
     CycleReasoningEffort,
@@ -452,6 +455,18 @@ fn pasted_text_line_count(text: &str) -> usize {
     text.split('\n').count().max(1)
 }
 
+fn scrollbar_thumb_row(state: &TuiState, column: u16, row: u16) -> Option<usize> {
+    let area = state.last_scrollbar_area;
+    if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
+        return None;
+    }
+    let track_row = usize::from(row - area.y);
+    state
+        .transcript_scrollbar()
+        .filter(|geometry| geometry.contains_row(track_row))
+        .map(|_| track_row)
+}
+
 pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
     use crossterm::event::MouseButton;
 
@@ -488,6 +503,18 @@ pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
         MouseEventKind::ScrollDown if over_sidebar => InputAction::SidebarScrollDown,
         MouseEventKind::ScrollUp => InputAction::MouseScrollUp,
         MouseEventKind::ScrollDown => InputAction::MouseScrollDown,
+
+        MouseEventKind::Down(MouseButton::Left)
+            if scrollbar_thumb_row(state, mouse.column, mouse.row).is_some() =>
+        {
+            InputAction::ScrollbarDragStart(mouse.column, mouse.row)
+        }
+        MouseEventKind::Drag(MouseButton::Left) if state.transcript_scrollbar_drag.is_some() => {
+            InputAction::ScrollbarDragMove(mouse.column, mouse.row)
+        }
+        MouseEventKind::Up(MouseButton::Left) if state.transcript_scrollbar_drag.is_some() => {
+            InputAction::ScrollbarDragEnd
+        }
 
         // 左键按下：开始选择
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1420,6 +1447,58 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Down)),
             InputAction::DialogNext
+        );
+    }
+
+    #[test]
+    fn mouse_on_the_scrollbar_thumb_drags_instead_of_selecting() {
+        let mut state = TuiState::default();
+        state.set_transcript_scrollbar_for_test(
+            ratatui::layout::Rect::new(40, 0, 1, 10),
+            ratatui::layout::Rect::new(0, 0, 40, 10),
+            100,
+            0,
+        );
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 40, 0)
+            ),
+            InputAction::ScrollbarDragStart(40, 0)
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 40, 5)
+            ),
+            InputAction::MouseSelectionStart(40, 5)
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 39, 0)
+            ),
+            InputAction::MouseSelectionStart(39, 0)
+        );
+
+        state.transcript_scrollbar_drag = Some(4);
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                mouse(MouseEventKind::Drag(MouseButton::Left), 40, 7)
+            ),
+            InputAction::ScrollbarDragMove(40, 7)
+        );
+        assert_eq!(
+            map_mouse_event(&state, mouse(MouseEventKind::Up(MouseButton::Left), 40, 7)),
+            InputAction::ScrollbarDragEnd
         );
     }
 

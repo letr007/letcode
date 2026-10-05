@@ -1323,6 +1323,8 @@ pub struct TuiState {
     /// `transcript_scroll` 是 bottom-relative，选择锚点/高亮必须用 top-relative，否则
     /// 底部 auto-scroll 时会把点击映射到全文顶部不可见区域。
     pub last_transcript_scroll_top: usize,
+    pub last_scrollbar_area: ratatui::layout::Rect,
+    pub transcript_scrollbar_drag: Option<usize>,
     /// 拖拽选择期间最后一次鼠标位置，用于边缘自动滚动
     pub selection_last_mouse: Option<(u16, u16)>,
 }
@@ -1418,6 +1420,8 @@ impl Default for TuiState {
             selection_dragged: false,
             last_transcript_area: ratatui::layout::Rect::default(),
             last_transcript_scroll_top: 0,
+            last_scrollbar_area: ratatui::layout::Rect::default(),
+            transcript_scrollbar_drag: None,
             selection_last_mouse: None,
         }
     }
@@ -2387,6 +2391,38 @@ impl TuiState {
     pub fn scroll_transcript_to_bottom(&mut self) {
         self.transcript_scroll = 0;
         self.auto_scroll = true;
+    }
+
+    pub(crate) fn scroll_transcript_to_top_row(&mut self, top_row: usize) {
+        let max_scroll = self
+            .last_transcript_total_rows
+            .map(|total_rows| measure::max_scroll(total_rows, self.last_transcript_area.height))
+            .unwrap_or(0);
+        self.transcript_scroll = max_scroll.saturating_sub(top_row.min(max_scroll));
+        self.auto_scroll = self.transcript_scroll == 0;
+    }
+
+    pub(crate) fn transcript_scrollbar(&self) -> Option<super::scrollbar::ScrollbarGeometry> {
+        super::scrollbar::ScrollbarGeometry::new(
+            usize::from(self.last_scrollbar_area.height),
+            self.last_transcript_total_rows?,
+            usize::from(self.last_transcript_area.height),
+            self.last_transcript_scroll_top,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transcript_scrollbar_for_test(
+        &mut self,
+        scrollbar_area: ratatui::layout::Rect,
+        transcript_area: ratatui::layout::Rect,
+        total_rows: usize,
+        top_row: usize,
+    ) {
+        self.last_scrollbar_area = scrollbar_area;
+        self.last_transcript_area = transcript_area;
+        self.last_transcript_total_rows = Some(total_rows);
+        self.last_transcript_scroll_top = top_row;
     }
 
     pub fn sync_transcript_viewport_rows_with_reflow(
