@@ -1561,6 +1561,9 @@ fn thoughts_command_opens_picker_and_persists_selected_mode() {
 
     runtime
         .handle_input_action(InputAction::DialogPrev)
+        .expect("select scroll");
+    runtime
+        .handle_input_action(InputAction::DialogPrev)
         .expect("select titles");
     runtime
         .handle_input_action(InputAction::DialogAccept)

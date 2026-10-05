@@ -3637,6 +3637,11 @@ impl TuiRuntime {
                     Some(self.state.t("runtime.thinking_level_titles_desc")),
                 ),
                 DialogItem::new(
+                    ThoughtsDisplayMode::Scroll.as_str(),
+                    self.state.t("runtime.thinking_level_scroll"),
+                    Some(self.state.t("runtime.thinking_level_scroll_desc")),
+                ),
+                DialogItem::new(
                     ThoughtsDisplayMode::Full.as_str(),
                     self.state.t("runtime.thinking_level_full"),
                     Some(self.state.t("runtime.thinking_level_full_desc")),
@@ -3646,7 +3651,8 @@ impl TuiRuntime {
         dialog.selected = match self.state.thoughts_display {
             ThoughtsDisplayMode::Compact => 0,
             ThoughtsDisplayMode::Titles => 1,
-            ThoughtsDisplayMode::Full => 2,
+            ThoughtsDisplayMode::Scroll => 2,
+            ThoughtsDisplayMode::Full => 3,
         };
         self.state.open_dialog(dialog);
         Ok(Some(SubmittedCommand::LocalOnly))

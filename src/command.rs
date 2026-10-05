@@ -66,6 +66,7 @@ pub enum PanelMode {
 pub enum ThoughtsDisplayMode {
     Compact,
     Titles,
+    Scroll,
     #[default]
     Full,
 }
@@ -75,6 +76,7 @@ impl ThoughtsDisplayMode {
         match self {
             Self::Compact => "compact",
             Self::Titles => "titles",
+            Self::Scroll => "scroll",
             Self::Full => "full",
         }
     }
@@ -83,7 +85,8 @@ impl ThoughtsDisplayMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "1" | "compact" => Some(Self::Compact),
             "2" | "titles" => Some(Self::Titles),
-            "3" | "full" => Some(Self::Full),
+            "3" | "scroll" => Some(Self::Scroll),
+            "4" | "full" => Some(Self::Full),
             _ => None,
         }
     }
@@ -353,7 +356,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/thoughts",
         insert_text: "/thoughts",
         description_key: "command.thoughts",
-        usage: "/thoughts <compact|titles|full>",
+        usage: "/thoughts <compact|titles|scroll|full>",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -687,7 +690,7 @@ fn parse_thoughts(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
             None => Err(CommandParseError::with_args("parse.unknown_thoughts", [])),
         },
         ["/thoughts", ..] => Err(CommandParseError::new(
-            "Usage: /thoughts <compact|titles|full>",
+            "Usage: /thoughts <compact|titles|scroll|full>",
         )),
         _ => unreachable!(),
     }
@@ -1100,6 +1103,10 @@ mod tests {
         assert_eq!(
             parse_command("/thoughts 2"),
             Ok(CommandIntent::ThoughtsSet(ThoughtsDisplayMode::Titles))
+        );
+        assert_eq!(
+            parse_command("/thoughts 3"),
+            Ok(CommandIntent::ThoughtsSet(ThoughtsDisplayMode::Scroll))
         );
         assert_eq!(
             parse_command("/thoughts full"),

@@ -1310,6 +1310,8 @@ fn push_drawn_horizontal_rule(out: &mut TimelineDocument, theme: Theme, width: u
     );
 }
 
+const REASONING_SCROLL_LINES: usize = 3;
+
 fn build_reasoning_lines(
     out: &mut TimelineDocument,
     reasoning: &ReasoningView,
@@ -1372,11 +1374,20 @@ fn build_reasoning_lines(
     let body_block = out.add_source(cleaned_body.clone());
     let chunks = wrap_text_to_width_with_offsets(&cleaned_body, content_width);
 
+    let visible = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, chunk)| chunk.source_start_char != chunk.source_end_char)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let first = if display == crate::command::ThoughtsDisplayMode::Scroll {
+        visible.len().saturating_sub(REASONING_SCROLL_LINES)
+    } else {
+        0
+    };
     let mut pushed = false;
-    for (index, chunk) in chunks.iter().enumerate() {
-        if chunk.source_start_char == chunk.source_end_char {
-            continue;
-        }
+    for &index in &visible[first..] {
+        let chunk = &chunks[index];
         pushed = true;
         out.push_content(
             "  ",
@@ -3726,6 +3737,7 @@ mod tests {
         for mode in [
             crate::command::ThoughtsDisplayMode::Compact,
             crate::command::ThoughtsDisplayMode::Titles,
+            crate::command::ThoughtsDisplayMode::Scroll,
             crate::command::ThoughtsDisplayMode::Full,
         ] {
             state.set_thoughts_display(mode);
@@ -3747,6 +3759,32 @@ mod tests {
                 "{mode:?}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn scroll_reasoning_shows_only_the_latest_three_lines() {
+        let start = std::time::Instant::now();
+        let text = "Title\nline one\nline two\nline three\nline four\nline five";
+        let mut state = TuiState::default();
+        state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Scroll);
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
+            "reasoning-1", text, start,
+        )));
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
+            "reasoning-1", text, start,
+        )));
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Title"));
+        assert!(!rendered.contains("line one"));
+        assert!(!rendered.contains("line two"));
+        assert!(rendered.contains("line three"));
+        assert!(rendered.contains("line four"));
+        assert!(rendered.contains("line five"));
     }
 
     #[test]
