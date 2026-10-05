@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::{
-    state::{AppPhase, OutputRateGraph, TuiState, OUTPUT_RATE_GRAPH_COLUMNS},
+    state::{AppPhase, OUTPUT_RATE_GRAPH_COLUMNS, OutputRateGraph, TuiState},
     surface,
     theme::Theme,
 };
@@ -859,8 +859,8 @@ mod tests {
     use super::{
         TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_scanner_cells,
         footer_status_spans, output_rate_graph_glyph, output_token_rate_style, render_footer,
-        token_budget_bar_spans,
-        token_budget_cache_hit_percent, token_budget_segment_units, token_budget_spans,
+        token_budget_bar_spans, token_budget_cache_hit_percent, token_budget_segment_units,
+        token_budget_spans,
     };
     use crate::{
         session::RetryLifecycleEvent,
@@ -999,10 +999,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(
-            rendered.contains("~70% · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("~70% · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"), "{rendered}");
     }
 
     #[test]
@@ -1015,10 +1012,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(
-            rendered.contains(" · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"),
-            "{rendered}"
-        );
+        assert!(rendered.contains(" · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"), "{rendered}");
     }
 
     #[test]

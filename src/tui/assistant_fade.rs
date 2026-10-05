@@ -216,7 +216,10 @@ mod tests {
         assert!(document.validate());
         let spans = &document.lines[0].spans;
         assert_eq!(
-            spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(),
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b", "c", "d"]
         );
         assert!(red(&spans[0]) > red(&spans[2]));

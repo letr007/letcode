@@ -228,7 +228,8 @@ fn child_node<'a>(root: &'a Value, node: &'a Value, key: &str) -> Option<&'a Val
         return Some(deref(root, child));
     }
     // providers.<name>, models.<id>, and mcp.<name> are keyed maps.
-    node.get("additionalProperties").map(|child| deref(root, child))
+    node.get("additionalProperties")
+        .map(|child| deref(root, child))
 }
 
 fn deref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {

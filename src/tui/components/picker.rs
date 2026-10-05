@@ -87,8 +87,11 @@ pub fn render_picker(
         if let Some(error) = dialog.config_error.as_deref() {
             if description_y < footer_y {
                 frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(error.to_string(), theme.error_style())))
-                        .style(theme.elevated_style()),
+                    Paragraph::new(Line::from(Span::styled(
+                        error.to_string(),
+                        theme.error_style(),
+                    )))
+                    .style(theme.elevated_style()),
                     Rect::new(inner.x, description_y, inner.width, 1),
                 );
             }
@@ -529,12 +532,7 @@ fn render_expert_model_picker_footer(
     );
 }
 
-fn render_config_footer(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    theme: Theme,
-    state: &TuiState,
-) {
+fn render_config_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme, state: &TuiState) {
     let expanded = state
         .dialog()
         .is_some_and(|dialog| dialog.config_expanded.is_some());
@@ -542,15 +540,10 @@ fn render_config_footer(
     if state
         .dialog()
         .is_some_and(|dialog| dialog.config_expanded.is_none())
-        && state
-            .dialog()
-            .is_some_and(|dialog| dialog.config_dirty)
+        && state.dialog().is_some_and(|dialog| dialog.config_dirty)
     {
         spans.push(Span::styled("● ", accent_style(theme)));
-        spans.push(Span::styled(
-            state.t("config.unsaved"),
-            muted_style(theme),
-        ));
+        spans.push(Span::styled(state.t("config.unsaved"), muted_style(theme)));
         spans.push(Span::styled("  ·  ", muted_style(theme)));
     }
     spans.push(Span::styled("↑/↓", accent_style(theme)));
@@ -1001,11 +994,14 @@ fn render_config_split_body(
         ]);
 
     render_picker_body(frame, list_area, theme, state, dialog);
-    frame.render_widget(
-        Block::default().style(theme.elevated_style()),
-        gap_area,
+    frame.render_widget(Block::default().style(theme.elevated_style()), gap_area);
+    render_config_detail(
+        frame,
+        detail_area,
+        theme,
+        dialog,
+        state.config_edit.as_ref(),
     );
-    render_config_detail(frame, detail_area, theme, dialog, state.config_edit.as_ref());
 }
 
 fn render_config_detail(
@@ -1089,8 +1085,8 @@ fn render_config_row(
     } else {
         item.right_detail.as_deref().unwrap_or("")
     };
-    let right_width = (display_width(affordance) as u16)
-        .min(content.width.saturating_sub(MIN_LEFT_LABEL_WIDTH));
+    let right_width =
+        (display_width(affordance) as u16).min(content.width.saturating_sub(MIN_LEFT_LABEL_WIDTH));
     let left_width = content.width.saturating_sub(right_width.saturating_add(2));
     let left_area = Rect::new(content.x, content.y, left_width, content.height);
     let right_area = Rect::new(
@@ -1123,7 +1119,10 @@ fn render_config_row(
             },
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), left_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(row_style),
+        left_area,
+    );
 
     if right_width > 0 {
         frame.render_widget(

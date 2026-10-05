@@ -114,20 +114,18 @@ mod persistence;
 mod schema;
 
 use persistence::acquire_config_read_lock;
-pub(crate) use persistence::{acquire_config_lock, replace_file};
 #[allow(unused_imports)]
 pub use persistence::{
-    config_array_in, config_entries_in, config_value_in, leaf_config_entry,
-    persist_expert_allowed_models,
-    persist_mcp_server_enabled, remove_config_table, save_config_document, set_config_item,
-    set_config_scalar,
-    ConfigEntry, ConfigEntryKind, ConfigScalar,
+    ConfigEntry, ConfigEntryKind, ConfigScalar, config_array_in, config_entries_in,
+    config_value_in, leaf_config_entry, persist_expert_allowed_models, persist_mcp_server_enabled,
+    remove_config_table, save_config_document, set_config_item, set_config_scalar,
 };
+pub(crate) use persistence::{acquire_config_lock, replace_file};
+#[cfg(test)]
+pub use schema::schema_keys;
 pub use schema::{
     default_value, entry_tables, field_enum, field_schema, schema_properties, table_accepts_entries,
 };
-#[cfg(test)]
-pub use schema::schema_keys;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1092,9 +1090,8 @@ fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
 }
 
 /// Reasoning levels the runtime names; providers may also accept their own.
-pub const REASONING_EFFORTS: [&str; 7] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "max",
-];
+pub const REASONING_EFFORTS: [&str; 7] =
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn parse_reasoning_effort(value: &str) -> Result<ModelReasoningEffort> {
     Ok(match value {

@@ -52,7 +52,9 @@ impl ScrollbarGeometry {
     }
 
     pub(crate) fn position_for_grab(&self, track_row: usize, grab_eighths: usize) -> usize {
-        let start = self.row_centre_eighths(track_row).saturating_sub(grab_eighths);
+        let start = self
+            .row_centre_eighths(track_row)
+            .saturating_sub(grab_eighths);
         self.position_for_thumb_start(start)
     }
 
@@ -194,10 +196,16 @@ mod tests {
         let middle = geometry(45);
         assert_eq!(middle.cell(0, theme, backdrop()).0, '│');
         assert_eq!(middle.cell(1, theme, backdrop()).0, '▄');
-        assert_eq!(middle.cell(1, theme, backdrop()).1.fg, Some(theme.muted_text));
+        assert_eq!(
+            middle.cell(1, theme, backdrop()).1.fg,
+            Some(theme.muted_text)
+        );
         assert_eq!(middle.cell(2, theme, backdrop()).0, '▄');
         assert_eq!(middle.cell(2, theme, backdrop()).1.fg, Some(backdrop()));
-        assert_eq!(middle.cell(2, theme, backdrop()).1.bg, Some(theme.muted_text));
+        assert_eq!(
+            middle.cell(2, theme, backdrop()).1.bg,
+            Some(theme.muted_text)
+        );
         assert_eq!(middle.cell(3, theme, backdrop()).0, '│');
     }
 
@@ -205,10 +213,7 @@ mod tests {
     fn every_cell_of_a_tall_track_stays_within_the_thumb_bounds() {
         let theme = Theme::dark();
         let geometry = ScrollbarGeometry::new(40, 1000, 40, 500).expect("scrollable");
-        let (start, end) = (
-            geometry.thumb_start_eighths(),
-            geometry.thumb_end_eighths(),
-        );
+        let (start, end) = (geometry.thumb_start_eighths(), geometry.thumb_end_eighths());
         for row in 0..40 {
             let (symbol, _) = geometry.cell(row, theme, backdrop());
             let row_start = row * EIGHTHS;

@@ -139,10 +139,9 @@ pub fn leaf_config_entry(path: &[String], value: &toml_edit::Value) -> ConfigEnt
         toml_edit::Value::Float(number) => (number.value().to_string(), ConfigEntryKind::Float),
         toml_edit::Value::Boolean(flag) => (flag.value().to_string(), ConfigEntryKind::Bool),
         toml_edit::Value::Datetime(_) => ("(datetime)".to_string(), ConfigEntryKind::ReadOnly),
-        toml_edit::Value::Array(array) => (
-            format!("{} items", array.len()),
-            ConfigEntryKind::Array,
-        ),
+        toml_edit::Value::Array(array) => {
+            (format!("{} items", array.len()), ConfigEntryKind::Array)
+        }
         toml_edit::Value::InlineTable(_) => ("(table)".to_string(), ConfigEntryKind::ReadOnly),
     };
     ConfigEntry {

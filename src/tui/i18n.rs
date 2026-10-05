@@ -208,7 +208,11 @@ mod tests {
     fn chinese_catalog_covers_every_schema_description() {
         let missing = crate::config::schema_keys()
             .into_iter()
-            .filter(|key| zh_cn_catalog().get(&format!("config.schema.{key}")).is_none())
+            .filter(|key| {
+                zh_cn_catalog()
+                    .get(&format!("config.schema.{key}"))
+                    .is_none()
+            })
             .collect::<Vec<_>>();
         assert!(missing.is_empty(), "{missing:?}");
     }

@@ -8268,7 +8268,10 @@ fn config_editor_adds_a_new_mcp_server() {
         .expect("commit the name");
 
     let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(!written.contains("[mcp.demo]"), "unsaved entries stay off disk");
+    assert!(
+        !written.contains("[mcp.demo]"),
+        "unsaved entries stay off disk"
+    );
 
     runtime
         .handle_input_action(InputAction::ConfigSave)
@@ -8368,7 +8371,10 @@ fn config_editor_only_offers_entries_where_the_schema_allows_them() {
     };
 
     enter_config_table(&mut runtime, "providers");
-    assert!(offers_new_entry(&runtime), "providers is keyed by provider name");
+    assert!(
+        offers_new_entry(&runtime),
+        "providers is keyed by provider name"
+    );
 
     enter_config_table(&mut runtime, "alpha");
     assert!(
@@ -8377,10 +8383,7 @@ fn config_editor_only_offers_entries_where_the_schema_allows_them() {
     );
 
     enter_config_table(&mut runtime, "models");
-    assert!(
-        offers_new_entry(&runtime),
-        "models is keyed by model id"
-    );
+    assert!(offers_new_entry(&runtime), "models is keyed by model id");
 }
 
 #[test]

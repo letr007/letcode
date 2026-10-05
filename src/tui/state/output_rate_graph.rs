@@ -40,7 +40,6 @@ impl OutputRateGraph {
         self.samples.iter().any(Option::is_some)
     }
 
-
     /// 每个点列的高度档位（1..=4）。空闲列为底部一点，样本不足时左侧同样补底部一点。
     pub fn levels(&self, columns: usize) -> Vec<usize> {
         let low = self.samples.iter().flatten().copied().min().unwrap_or(0);

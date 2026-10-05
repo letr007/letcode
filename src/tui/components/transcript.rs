@@ -3774,10 +3774,14 @@ mod tests {
         let mut state = TuiState::default();
         state.set_thoughts_display(crate::command::ThoughtsDisplayMode::Scroll);
         state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::at(
-            "reasoning-1", text, start,
+            "reasoning-1",
+            text,
+            start,
         )));
         state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::at(
-            "reasoning-1", text, start,
+            "reasoning-1",
+            text,
+            start,
         )));
 
         let rendered = transcript_lines(&state, Theme::dark(), 80)

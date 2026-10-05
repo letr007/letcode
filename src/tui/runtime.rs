@@ -28,9 +28,9 @@ use super::preferences::TuiPreferences;
 use super::render;
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
-    ConfigFieldRef, ContextDetailTarget, DialogItem, DialogKind, DialogState,
-    PendingQuestionState, PermissionChoice, QuestionAdvance, SessionPickerScope, ToastKind,
-    TranscriptClickTarget, TuiState,
+    ConfigFieldRef, ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
+    PermissionChoice, QuestionAdvance, SessionPickerScope, ToastKind, TranscriptClickTarget,
+    TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
@@ -2264,10 +2264,8 @@ impl TuiRuntime {
                 if let Some(dialog) = self.state.dialog_mut() {
                     if dialog.kind == DialogKind::ConfigEditor && dialog.config_expanded.is_some() {
                         let last = dialog.config_detail_items.len().saturating_sub(1);
-                        dialog.config_detail_selected = dialog
-                            .config_detail_selected
-                            .saturating_add(1)
-                            .min(last);
+                        dialog.config_detail_selected =
+                            dialog.config_detail_selected.saturating_add(1).min(last);
                     } else if dialog.kind == DialogKind::ContextPicker && dialog.detail_focused {
                         dialog.scroll_detail_next();
                     } else {
@@ -2282,7 +2280,8 @@ impl TuiRuntime {
             InputAction::DialogPrev => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     if dialog.kind == DialogKind::ConfigEditor && dialog.config_expanded.is_some() {
-                        dialog.config_detail_selected = dialog.config_detail_selected.saturating_sub(1);
+                        dialog.config_detail_selected =
+                            dialog.config_detail_selected.saturating_sub(1);
                     } else if dialog.kind == DialogKind::ContextPicker && dialog.detail_focused {
                         dialog.scroll_detail_previous();
                     } else {
@@ -2410,13 +2409,9 @@ impl TuiRuntime {
                 {
                     return Ok(None);
                 }
-                if self
-                    .state
-                    .dialog()
-                    .is_some_and(|dialog| {
-                        dialog.kind == DialogKind::ConfigEditor && dialog.config_dirty
-                    })
-                {
+                if self.state.dialog().is_some_and(|dialog| {
+                    dialog.kind == DialogKind::ConfigEditor && dialog.config_dirty
+                }) {
                     self.state
                         .show_toast(self.state.t("config.discarded"), ToastKind::Info);
                 }
@@ -3535,7 +3530,8 @@ impl TuiRuntime {
             return (Vec::new(), Vec::new());
         };
         let loaded =
-            crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string()).ok();
+            crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string())
+                .ok();
         let section = level.join(".");
         let mut items = Vec::new();
         let mut fields = Vec::new();
@@ -3564,7 +3560,8 @@ impl TuiRuntime {
                     let entry = crate::config::leaf_config_entry(&path, value);
                     let field = if entry.kind == crate::config::ConfigEntryKind::Array {
                         ConfigFieldRef::List(path.clone())
-                    } else if Self::config_field_values(document, loaded.as_ref(), &path).is_some() {
+                    } else if Self::config_field_values(document, loaded.as_ref(), &path).is_some()
+                    {
                         ConfigFieldRef::Choice(path.clone())
                     } else {
                         ConfigFieldRef::Field(path.clone())
@@ -3642,7 +3639,8 @@ impl TuiRuntime {
         query: &str,
     ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
         let loaded =
-            crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string()).ok();
+            crate::config::AppConfig::load_from_str_at_path(config_path, &document.to_string())
+                .ok();
         let needle = query.to_lowercase();
         let mut items = Vec::new();
         let mut fields = Vec::new();
@@ -3662,18 +3660,14 @@ impl TuiRuntime {
             };
             let affordance = Self::config_affordance(&entry, &field);
             items.push(
-                DialogItem::new(
-                    entry.path.join("/"),
-                    entry.label,
-                    Some(entry.display),
-                )
-                .with_description(crate::config::field_schema(&path).map(|(fallback, key)| {
-                    self.state
-                        .t_opt(&format!("config.schema.{key}"))
-                        .unwrap_or(fallback)
-                }))
-                .with_section(entry.section)
-                .with_right_detail(affordance),
+                DialogItem::new(entry.path.join("/"), entry.label, Some(entry.display))
+                    .with_description(crate::config::field_schema(&path).map(|(fallback, key)| {
+                        self.state
+                            .t_opt(&format!("config.schema.{key}"))
+                            .unwrap_or(fallback)
+                    }))
+                    .with_section(entry.section)
+                    .with_right_detail(affordance),
             );
             fields.push(field);
         }
@@ -3697,7 +3691,9 @@ impl TuiRuntime {
     ) -> Option<&'a dyn toml_edit::TableLike> {
         let mut table: &dyn toml_edit::TableLike = document.as_table();
         for segment in level {
-            table = table.get(segment).and_then(toml_edit::Item::as_table_like)?;
+            table = table
+                .get(segment)
+                .and_then(toml_edit::Item::as_table_like)?;
         }
         Some(table)
     }
@@ -3712,7 +3708,12 @@ impl TuiRuntime {
 
     fn config_affordance(entry: &crate::config::ConfigEntry, field: &ConfigFieldRef) -> String {
         if entry.kind == crate::config::ConfigEntryKind::Bool {
-            return if entry.display == "true" { "[x]" } else { "[ ]" }.to_string();
+            return if entry.display == "true" {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+            .to_string();
         }
         match field {
             ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => "▸".to_string(),
@@ -3833,10 +3834,19 @@ impl TuiRuntime {
         {
             let protocol = crate::config::config_value_in(
                 document,
-                &["providers", path[1].as_str(), "models", path[3].as_str(), "protocol"],
+                &[
+                    "providers",
+                    path[1].as_str(),
+                    "models",
+                    path[3].as_str(),
+                    "protocol",
+                ],
             )
             .or_else(|| {
-                crate::config::config_value_in(document, &["providers", path[1].as_str(), "protocol"])
+                crate::config::config_value_in(
+                    document,
+                    &["providers", path[1].as_str(), "protocol"],
+                )
             })
             .map(|(_, value)| value);
             return protocol.as_deref() == Some("anthropic");
@@ -3921,7 +3931,9 @@ impl TuiRuntime {
     }
 
     fn expanded_index(&self) -> Option<usize> {
-        self.state.dialog().and_then(|dialog| dialog.config_expanded)
+        self.state
+            .dialog()
+            .and_then(|dialog| dialog.config_expanded)
     }
 
     fn expand_config_field(&mut self, index: usize) {
@@ -4075,9 +4087,7 @@ impl TuiRuntime {
                 None if self.config_list_has_choices(&path) => {
                     self.show_config_element_choices(&path, selected)
                 }
-                None => {
-                    self.begin_config_list_item_edit(ConfigFieldRef::ListItem(path, selected))
-                }
+                None => self.begin_config_list_item_edit(ConfigFieldRef::ListItem(path, selected)),
             },
             ConfigFieldRef::Choice(path) => {
                 if item.id == CONFIG_CUSTOM_CHOICE {
@@ -4303,9 +4313,7 @@ impl TuiRuntime {
                     buffer: String::new(),
                 });
             }
-            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => {
-                self.expand_config_field(index)
-            }
+            ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => self.expand_config_field(index),
             ConfigFieldRef::Field(path) => {
                 let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
                 let kind = self
@@ -4319,9 +4327,7 @@ impl TuiRuntime {
                     }
                     Some(crate::config::ConfigEntryKind::Text)
                     | Some(crate::config::ConfigEntryKind::Integer)
-                    | Some(crate::config::ConfigEntryKind::Float) => {
-                        self.begin_config_edit(&path)
-                    }
+                    | Some(crate::config::ConfigEntryKind::Float) => self.begin_config_edit(&path),
                     _ => {}
                 }
             }
@@ -4432,16 +4438,20 @@ impl TuiRuntime {
                     crate::config::ConfigEntryKind::Integer => match value.parse::<i64>() {
                         Ok(number) => crate::config::ConfigScalar::Integer(number),
                         Err(_) => {
-                            self.state
-                                .show_toast(self.state.t("config.invalid_number"), ToastKind::Error);
+                            self.state.show_toast(
+                                self.state.t("config.invalid_number"),
+                                ToastKind::Error,
+                            );
                             return;
                         }
                     },
                     crate::config::ConfigEntryKind::Float => match value.parse::<f64>() {
                         Ok(number) => crate::config::ConfigScalar::Float(number),
                         Err(_) => {
-                            self.state
-                                .show_toast(self.state.t("config.invalid_number"), ToastKind::Error);
+                            self.state.show_toast(
+                                self.state.t("config.invalid_number"),
+                                ToastKind::Error,
+                            );
                             return;
                         }
                     },
