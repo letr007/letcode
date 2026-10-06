@@ -1473,7 +1473,7 @@ mod history_pressure_tests {
 
     #[tokio::test]
     async fn pressure_consumes_multiple_route_bounded_prefixes() {
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {

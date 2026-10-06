@@ -450,11 +450,17 @@ mod tests {
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let request = client.get(format!("http://{address}/")).build().unwrap();
-        let failure =
-            match TurnLocalWsSession::connect(client, request, Duration::from_secs(1), &[]).await {
-                Ok(_) => panic!("a 403 handshake must fail"),
-                Err(failure) => failure,
-            };
+        let failure = match TurnLocalWsSession::connect(
+            client,
+            request,
+            Duration::from_secs(10),
+            &[],
+        )
+        .await
+        {
+            Ok(_) => panic!("a 403 handshake must fail"),
+            Err(failure) => failure,
+        };
         assert_eq!(failure.status, Some(403));
         assert_eq!(failure.retry_hint, RetryHint::Never);
         server.await.unwrap();

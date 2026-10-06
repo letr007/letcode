@@ -579,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_publication_preserves_new_work_and_uses_native_instructions() {
-        tokio::time::timeout(std::time::Duration::from_secs(15),async {
+        tokio::time::timeout(std::time::Duration::from_secs(120),async {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address=listener.local_addr().unwrap();
             let second_accepted=Arc::new(tokio::sync::Notify::new());

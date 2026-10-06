@@ -5909,8 +5909,6 @@ fn deferred_transport_events_are_bounded_per_drain() {
             ),
         ));
     }
-    drop(tx);
-
     let queued = runtime.deferred_session_events.len();
     assert_eq!(queued, MAX_SESSION_EVENTS_PER_FRAME * 2);
     runtime.try_drain_session_events();
@@ -5918,16 +5916,17 @@ fn deferred_transport_events_are_bounded_per_drain() {
     assert!(remaining < queued, "the drain makes forward progress");
     assert!(
         remaining > 0,
-        "a closed stream does not flush the backlog at once"
+        "an open stream does not flush the backlog at once"
     );
     assert!(
         queued - remaining <= MAX_SESSION_EVENTS_PER_FRAME,
         "deferred application is frame-bounded"
     );
 
-    for _ in 0..128 {
+    drop(tx);
+    for _ in 0..(MAX_SESSION_EVENTS_PER_FRAME * 2) {
         runtime.try_drain_session_events();
-        if runtime.deferred_session_events.is_empty() {
+        if runtime.state().phase == AppPhase::Completed {
             break;
         }
     }
