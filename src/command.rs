@@ -1,4 +1,4 @@
-use crate::delegation::{delegation_help_summary, delegation_usage_list, find_expert};
+use crate::delegation::{delegation_usage_list, find_expert};
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use serde::{Deserialize, Serialize};
@@ -519,44 +519,6 @@ const COMMANDS: &[CommandMetadata] = &[
 
 pub fn command_metadata() -> &'static [CommandMetadata] {
     COMMANDS
-}
-
-pub fn help_summary(translator: &crate::tui::i18n::Translator) -> String {
-    let commands = [
-        "/help",
-        "/exit",
-        "/quit",
-        "/model",
-        "/agents",
-        "/fast",
-        "/reasoning",
-        "/thoughts",
-        "/permission",
-        "/tools",
-        "/scrollbar",
-        "/panel",
-        "/theme",
-        "/fake",
-        "/compact",
-        "/tree",
-        "/undo",
-        "/redo",
-        "/resume",
-        "/new",
-        "/context",
-        "/mcp",
-        "/skill",
-        "/config",
-        "/child",
-    ]
-    .join(", ");
-    translator.t_fmt(
-        "help.summary",
-        &[
-            ("commands", &commands),
-            ("delegation", &delegation_help_summary()),
-        ],
-    )
 }
 
 pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {

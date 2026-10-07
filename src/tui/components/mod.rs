@@ -3,6 +3,7 @@ pub mod composer;
 pub mod dialog;
 pub mod diff_render;
 pub mod footer;
+pub mod help_reader;
 pub mod historian_report;
 pub mod layout;
 pub mod picker;

@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn translator_interpolates_and_falls_back_to_english() {
         let translator = Translator::new(Language::ZhCn);
-        assert_eq!(translator.t("command.help"), "显示可用的本地命令");
+        assert_eq!(translator.t("command.help"), "查看命令与使用说明");
         assert_eq!(translator.t("unknown.key"), "unknown.key");
     }
 

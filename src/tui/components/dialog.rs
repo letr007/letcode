@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::{
-    components::picker,
+    components::{help_reader, picker},
     measure::{display_width, wrapped_row_count},
     state::{DialogItem, DialogKind, DialogState, TuiState},
     theme::Theme,
@@ -17,6 +17,13 @@ const DIALOG_MIN_WIDTH: u16 = 36;
 const DIALOG_MAX_WIDTH: u16 = 72;
 
 pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+    if state
+        .dialog()
+        .is_some_and(|dialog| dialog.kind == DialogKind::Help)
+    {
+        help_reader::render_help_reader(frame, state, area, theme);
+        return;
+    }
     let Some(dialog) = state.dialog().cloned() else {
         return;
     };

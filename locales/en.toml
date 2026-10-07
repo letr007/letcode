@@ -1,5 +1,5 @@
 [command]
-help = "Show available local commands"
+help = "Show commands and usage"
 exit = "Exit the current session"
 language = "Show or switch TUI language"
 permission = "Show or switch permission mode"
@@ -51,7 +51,10 @@ librarian = "Delegate documentation or reference gathering"
 general = "Delegate general-purpose task execution"
 
 [help]
-summary = "Commands: {commands} · Delegation: {delegation}"
+title = "Help"
+hint_document = "Esc close · Tab contents · ↑↓ scroll · PgUp/PgDn page"
+hint_contents = "Esc close · Tab read · ↑↓ chapter · Enter read"
+hint_compact = "Esc close · Tab switch"
 
 [parse]
 unknown_command = "Unknown command: {command}. Type /help for available local commands."

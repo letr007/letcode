@@ -73,14 +73,6 @@ pub fn find_expert(agent_name: &str) -> Option<&'static DelegationMetadata> {
         .find(|expert| expert.agent_name == agent_name)
 }
 
-pub fn delegation_help_summary() -> String {
-    DELEGATION_EXPERTS
-        .iter()
-        .map(|expert| expert.usage)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 pub fn delegation_usage_list() -> String {
     let experts = DELEGATION_EXPERTS
         .iter()

@@ -1,5 +1,5 @@
 [command]
-help = "显示可用的本地命令"
+help = "查看命令与使用说明"
 exit = "退出当前会话"
 language = "查看或切换 TUI 语言"
 permission = "查看或切换权限模式"
@@ -51,7 +51,10 @@ librarian = "委派文档或资料整理任务"
 general = "委派通用任务执行"
 
 [help]
-summary = "命令：{commands} · 委派：{delegation}"
+title = "帮助"
+hint_document = "Esc 关闭 · Tab 目录 · ↑↓ 滚动 · PgUp/PgDn 翻页"
+hint_contents = "Esc 关闭 · Tab 正文 · ↑↓ 章节 · Enter 阅读"
+hint_compact = "Esc 关闭 · Tab 切换"
 
 [parse]
 unknown_command = "未知命令：{command}。输入 /help 查看可用的本地命令。"

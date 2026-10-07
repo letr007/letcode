@@ -30,6 +30,7 @@ use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
 };
 use crate::tui::events::NoticeEvent;
+use crate::tui::help::HelpAction;
 use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_empty_session};
 use crate::tui::state::MAX_CACHED_CHILD_TIMELINES;
 use crate::tui::{
@@ -2749,6 +2750,358 @@ fn child_transcript_view_blocks_parent_mutating_submit_paths() {
 
         assert_eq!(command, None, "{input}");
         assert!(runtime.submitted_prompts().is_empty(), "{input}");
+    }
+}
+
+#[test]
+fn help_commands_open_a_local_reader_while_idle_or_running() {
+    for running in [false, true] {
+        for input in ["/help", "/?"] {
+            let mut runtime = runtime();
+            runtime.session_turn_active = running;
+            if running {
+                runtime.state_mut().phase = AppPhase::Running;
+            }
+            let phase = runtime.state().phase;
+            runtime.state_mut().set_input(input);
+            let timeline_len = runtime.state().timeline.items().len();
+
+            assert_eq!(
+                runtime
+                    .handle_input_action(InputAction::Submit)
+                    .expect("submit help"),
+                None
+            );
+            let dialog = runtime.state().dialog().expect("help reader");
+            assert_eq!(dialog.kind, DialogKind::Help);
+            let help = dialog.help.as_ref().expect("help state");
+            assert_eq!(help.selected, 0);
+            assert!(!help.contents_focused);
+            assert!(runtime.state().input_buffer.is_empty());
+            assert!(runtime.state().toast().is_none());
+            assert_eq!(runtime.state().timeline.items().len(), timeline_len);
+            assert!(runtime.submitted_prompts().is_empty());
+            assert_eq!(runtime.state().phase, phase);
+            assert_eq!(runtime.session_turn_active, running);
+        }
+    }
+}
+
+#[test]
+fn help_shortcut_and_exit_preserve_the_composer_draft() {
+    for exit in [KeyCode::Esc, KeyCode::Char('q')] {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("original draft");
+        runtime
+            .state_mut()
+            .add_composer_pasted_text("attached text".into());
+        runtime.state_mut().input_cursor = 3;
+        let draft = runtime.state().input_buffer.clone();
+        let tokens = runtime.state().composer_tokens.clone();
+        let content = runtime.state().composer_content();
+
+        let prefix = map_key_event(
+            runtime.state(),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(prefix, InputAction::ChildPrefix);
+        assert_eq!(
+            runtime
+                .handle_input_action(prefix)
+                .expect("shortcut prefix"),
+            None
+        );
+        let shortcut = map_key_event(
+            runtime.state(),
+            KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(shortcut, InputAction::ShowHelp);
+        assert_eq!(
+            runtime.handle_input_action(shortcut).expect("open help"),
+            None
+        );
+        assert_eq!(runtime.state().dialog().unwrap().kind, DialogKind::Help);
+
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Enter,
+        ] {
+            let action = map_key_event(runtime.state(), KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(
+                runtime.handle_input_action(action).expect("reader key"),
+                None
+            );
+        }
+        let paste = map_paste_event(runtime.state(), "pasted\ntext".into());
+        assert_eq!(
+            runtime.handle_input_action(paste).expect("reader paste"),
+            None
+        );
+        let action = map_key_event(runtime.state(), KeyEvent::new(exit, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::DialogCancel);
+        assert_eq!(
+            runtime.handle_input_action(action).expect("close help"),
+            None
+        );
+
+        assert!(runtime.state().dialog().is_none());
+        assert_eq!(runtime.state().input_buffer, draft);
+        assert_eq!(runtime.state().input_cursor, 3);
+        assert_eq!(runtime.state().composer_tokens, tokens);
+        assert_eq!(runtime.state().composer_content(), content);
+        assert!(runtime.state().toast().is_none());
+        assert!(runtime.state().timeline.items().is_empty());
+        assert!(runtime.submitted_prompts().is_empty());
+    }
+}
+
+#[test]
+fn help_commands_and_chapter_navigation_preserve_the_child_view() {
+    let mut runtime = runtime();
+    runtime.state_mut().replace_child_timeline_from_records(
+        &[],
+        "parent-session",
+        "child-session",
+        "explorer",
+        0,
+        1,
+        1,
+    );
+    let view = runtime.state().transcript_view.clone();
+    runtime.state_mut().set_input("/help");
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("child help"),
+        None
+    );
+    runtime
+        .handle_input_action(InputAction::Help(HelpAction::NextChapter))
+        .expect("next chapter");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .unwrap()
+            .help
+            .as_ref()
+            .unwrap()
+            .selected,
+        1
+    );
+    assert_eq!(runtime.state().transcript_view, view);
+    assert!(runtime.submitted_prompts().is_empty());
+}
+
+#[test]
+fn help_reader_reflows_in_a_live_child_view_and_yields_to_questions() {
+    let mut runtime = runtime();
+    let (tx, rx) = mpsc::unbounded_channel();
+    runtime.session_transport_rx = rx;
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: Some("Child output\n\n".repeat(60)),
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    runtime.state_mut().set_input("original draft");
+    let view = runtime.state().transcript_view.clone();
+    runtime
+        .handle_input_action(InputAction::ShowHelp)
+        .expect("open help");
+    runtime
+        .handle_input_action(InputAction::Help(HelpAction::NextChapter))
+        .expect("commands chapter");
+    render_runtime_transcript(&mut runtime);
+    runtime
+        .handle_input_action(InputAction::Help(HelpAction::PageDown))
+        .expect("page help");
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .unwrap()
+            .help
+            .as_ref()
+            .unwrap()
+            .scroll
+            > 0
+    );
+
+    for (width, height) in [(70, 24), (120, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+            .expect("render help");
+        let help = runtime.state().dialog().unwrap().help.as_ref().unwrap();
+        assert_eq!(help.selected, 1);
+        assert!(help.scroll <= help.scroll_max);
+        assert!(help.viewport_rows > 0);
+        assert_eq!(runtime.state().transcript_view, view);
+    }
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("close help");
+    render_runtime_transcript(&mut runtime);
+    let action = map_key_event(
+        runtime.state(),
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    );
+    assert_eq!(action, InputAction::ScrollPageUp);
+    runtime
+        .handle_input_action(action)
+        .expect("scroll transcript");
+    assert!(runtime.state().transcript_scroll > 0);
+    assert_eq!(runtime.state().input_buffer, "original draft");
+
+    runtime
+        .handle_input_action(InputAction::ShowHelp)
+        .expect("reopen help");
+    tx.send(SessionTransportEvent::ChildSessionEvent {
+        child_session_id: "child-session".into(),
+        agent_name: Some("explorer".into()),
+        parent_tool_call_id: None,
+        event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("Continued output")),
+    })
+    .expect("queue child output");
+    let (answer_tx, _answer_rx) = oneshot::channel();
+    tx.send(SessionTransportEvent::ChildQuestionRequested {
+        child_session_id: "child-session".into(),
+        request: sample_question_request(false),
+        handle: RunnerQuestionRequest::new(answer_tx),
+    })
+    .expect("queue child question");
+    runtime.try_drain_session_events();
+    runtime.advance_assistant_typewriter_by(Duration::from_secs(2));
+    render_runtime_transcript(&mut runtime);
+    assert!(runtime.state().dialog().is_none());
+    assert!(runtime.state().pending_question.is_some());
+    assert_eq!(runtime.state().transcript_view, view);
+    assert_eq!(runtime.state().input_buffer, "original draft");
+    assert!(
+        runtime
+            .state()
+            .active_timeline()
+            .items()
+            .iter()
+            .any(|item| matches!(
+                item, TimelineItem::Assistant(message) if message.text.contains("Continued output")
+            ))
+    );
+    assert_eq!(
+        map_key_event(
+            runtime.state(),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+        ),
+        InputAction::QuestionNextOption
+    );
+}
+
+#[test]
+fn new_questions_close_help_without_closing_other_dialogs() {
+    for child in [false, true] {
+        for help in [false, true] {
+            let mut runtime = runtime();
+            runtime.state_mut().set_input("original draft");
+            runtime
+                .handle_input_action(if help {
+                    InputAction::ShowHelp
+                } else {
+                    InputAction::ShowModel
+                })
+                .expect("open dialog");
+            let (tx, _rx) = oneshot::channel();
+            let request = sample_question_request(false);
+            let handle = RunnerQuestionRequest::new(tx);
+            runtime.apply_session_transport_event(if child {
+                SessionTransportEvent::ChildQuestionRequested {
+                    child_session_id: "child-session".into(),
+                    request,
+                    handle,
+                }
+            } else {
+                SessionTransportEvent::QuestionRequested { request, handle }
+            });
+
+            assert!(runtime.state().pending_question.is_some());
+            assert!(runtime.pending_question_handle.is_some());
+            assert_eq!(
+                runtime.state().dialog().map(|dialog| &dialog.kind),
+                if help {
+                    None
+                } else {
+                    Some(&DialogKind::ModelPicker)
+                }
+            );
+            assert_eq!(runtime.state().input_buffer, "original draft");
+            assert_eq!(
+                map_key_event(
+                    runtime.state(),
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+                ),
+                InputAction::QuestionNextOption
+            );
+        }
+    }
+}
+
+#[test]
+fn new_permissions_close_help_without_closing_other_dialogs() {
+    for child in [false, true] {
+        for help in [false, true] {
+            let mut runtime = runtime();
+            runtime.state_mut().set_input("original draft");
+            runtime
+                .handle_input_action(if help {
+                    InputAction::ShowHelp
+                } else {
+                    InputAction::ShowModel
+                })
+                .expect("open dialog");
+            let (tx, _rx) = oneshot::channel();
+            let event = PermissionRequestEvent::new("call-1", "shell__exec", "cargo test");
+            let handle = RunnerPermissionRequest::new(tx);
+            runtime.apply_session_transport_event(if child {
+                SessionTransportEvent::ChildPermissionRequested {
+                    child_session_id: "child-session".into(),
+                    agent_name: Some("explorer".into()),
+                    parent_tool_call_id: Some("parent-call".into()),
+                    event,
+                    handle,
+                }
+            } else {
+                SessionTransportEvent::PermissionRequested { event, handle }
+            });
+
+            assert!(runtime.state().pending_permission.is_some());
+            assert!(runtime.pending_permission_handle().is_some());
+            assert_eq!(
+                runtime.state().dialog().map(|dialog| &dialog.kind),
+                if help {
+                    None
+                } else {
+                    Some(&DialogKind::ModelPicker)
+                }
+            );
+            assert_eq!(runtime.state().input_buffer, "original draft");
+            assert_eq!(
+                map_key_event(
+                    runtime.state(),
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                ),
+                InputAction::PermissionActivate
+            );
+        }
     }
 }
 

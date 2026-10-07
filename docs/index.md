@@ -127,7 +127,7 @@ flowchart TD
 
 ### [TUI](components/tui.md)
 
-基于 Ratatui 的终端用户界面，提供流式对话展示、思考块折叠、原生 Markdown、原生 LaTeX 公式与 Mermaid 矢量图表渲染、斜杠命令及多语言切换。
+基于 Ratatui 的终端用户界面，提供流式对话、Markdown、LaTeX 公式和 Mermaid 图表渲染。支持命令补全、内置帮助手册、语言和主题切换。
 
 ### [Configuration](components/configuration.md)
 

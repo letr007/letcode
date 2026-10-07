@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, FakeCommand, PanelMode, ThemeCommand,
-    ThoughtsDisplayMode, ToolsDisplayMode, TranscriptScrollbarMode, help_summary, parse_command,
+    ThoughtsDisplayMode, ToolsDisplayMode, TranscriptScrollbarMode, parse_command,
 };
 use crate::mcp;
 use crate::permission::PermissionMode;
@@ -21,6 +21,7 @@ use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
 use super::events::{ErrorEvent, SessionEvent};
+use super::help::HelpState;
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
 };
@@ -1903,6 +1904,15 @@ impl TuiRuntime {
             self.state.apply_event(session_event);
             self.reproject_pending_permission();
         }
+
+        if (self.state.pending_question.is_some() || self.state.pending_permission.is_some())
+            && self
+                .state
+                .dialog()
+                .is_some_and(|dialog| dialog.kind == DialogKind::Help)
+        {
+            self.state.close_dialog();
+        }
     }
 }
 
@@ -1998,6 +2008,17 @@ impl TuiRuntime {
         }
 
         match action {
+            InputAction::Help(action) => {
+                if let Some(help) = self
+                    .state
+                    .dialog_mut()
+                    .filter(|dialog| dialog.kind == DialogKind::Help)
+                    .and_then(|dialog| dialog.help.as_mut())
+                {
+                    help.apply(action);
+                }
+                Ok(None)
+            }
             InputAction::SlashPanelNext => {
                 self.select_next_slash_command();
                 Ok(None)
@@ -3054,7 +3075,14 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::Help => {
-                self.push_command_notice(help_summary(&self.state.translator()));
+                let mut dialog = DialogState::new(
+                    DialogKind::Help,
+                    self.state.t("help.title"),
+                    None,
+                    Vec::new(),
+                );
+                dialog.help = Some(HelpState::new(self.state.language()));
+                self.state.open_dialog(dialog);
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::ModelShow => self.show_model_dialog(),
@@ -5267,7 +5295,7 @@ impl TuiRuntime {
                 self.show_mcp_tools_dialog(selected.id);
                 Ok(None)
             }
-            DialogKind::McpToolsPicker => Ok(None),
+            DialogKind::Help | DialogKind::McpToolsPicker => Ok(None),
             DialogKind::ContextDetail => {
                 self.state.close_dialog();
                 Ok(None)

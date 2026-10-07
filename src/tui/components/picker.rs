@@ -262,7 +262,7 @@ fn render_config_editor(
     }
 }
 
-fn render_three_sided_frame(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+pub(super) fn render_three_sided_frame(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     if !theme.card_frame || area.width < 3 || area.height < 3 {
         return;
     }
@@ -321,7 +321,7 @@ fn render_description(frame: &mut Frame<'_>, area: Rect, theme: Theme, descripti
     );
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {
+pub(super) fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             title.to_string(),
@@ -499,6 +499,7 @@ fn render_picker_body(
                     DialogKind::ContextDetail => {
                         render_session_row(frame, row, theme, item, selected, None)
                     }
+                    DialogKind::Help => unreachable!("help uses the document reader"),
                     DialogKind::ConfigEditor => render_config_row(
                         frame,
                         row,
@@ -1533,22 +1534,22 @@ fn centered_picker_area(area: Rect) -> Rect {
     )
 }
 
-fn item_style(theme: Theme) -> Style {
+pub(super) fn item_style(theme: Theme) -> Style {
     Style::default().fg(theme.text).bg(theme.elevated_bg)
 }
 
-fn selected_item_style(theme: Theme) -> Style {
+pub(super) fn selected_item_style(theme: Theme) -> Style {
     Style::default()
         .fg(theme.text)
         .bg(theme.element_bg)
         .add_modifier(Modifier::BOLD)
 }
 
-fn muted_style(theme: Theme) -> Style {
+pub(super) fn muted_style(theme: Theme) -> Style {
     Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
 }
 
-fn accent_style(theme: Theme) -> Style {
+pub(super) fn accent_style(theme: Theme) -> Style {
     Style::default()
         .fg(theme.accent)
         .bg(theme.elevated_bg)

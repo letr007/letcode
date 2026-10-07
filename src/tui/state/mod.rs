@@ -4,6 +4,7 @@ use super::events::{
     AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
     PermissionResolutionEvent, SessionEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
 };
+use super::help::HelpState;
 use super::measure;
 use super::slash;
 use super::terminal_bg::Rgb;
@@ -352,6 +353,7 @@ impl SessionPickerScope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogKind {
+    Help,
     ModelPicker,
     AgentPicker,
     ExpertModelPicker(String),
@@ -539,6 +541,7 @@ impl ChildTranscriptState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogState {
     pub kind: DialogKind,
+    pub help: Option<HelpState>,
     pub title: String,
     pub description: Option<String>,
     pub items: Vec<DialogItem>,
@@ -1103,6 +1106,7 @@ impl DialogState {
     ) -> Self {
         Self {
             kind,
+            help: None,
             title: title.into(),
             description,
             items,

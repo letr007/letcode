@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+use super::help::HelpAction;
 use super::state::{COMPOSER_ATTACHMENT_MARKER, DialogKind, TuiState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub enum InputAction {
     DialogAccept,
     DialogToggle,
     DialogCancel,
+    Help(HelpAction),
     ConfigEditInsert(char),
     ConfigEditPaste(String),
     ConfigEditBackspace,
@@ -189,6 +191,45 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         } else {
             return InputAction::Quit;
         }
+    }
+
+    if state.pending_question.is_none()
+        && state.pending_permission.is_none()
+        && let Some(help) = state
+            .dialog()
+            .filter(|dialog| dialog.kind == DialogKind::Help)
+            .and_then(|dialog| dialog.help.as_ref())
+    {
+        return match key.code {
+            _ if has_non_shift_modifiers(key.modifiers) => InputAction::NoOp,
+            KeyCode::Esc | KeyCode::Char('q') => InputAction::DialogCancel,
+            KeyCode::Tab | KeyCode::BackTab => InputAction::Help(HelpAction::ToggleContents),
+            KeyCode::Left => InputAction::Help(HelpAction::FocusContents),
+            KeyCode::Right | KeyCode::Enter => InputAction::Help(HelpAction::FocusDocument),
+            KeyCode::Up | KeyCode::Char('k') => InputAction::Help(if help.contents_focused {
+                HelpAction::PreviousChapter
+            } else {
+                HelpAction::ScrollUp(1)
+            }),
+            KeyCode::Down | KeyCode::Char('j') => InputAction::Help(if help.contents_focused {
+                HelpAction::NextChapter
+            } else {
+                HelpAction::ScrollDown(1)
+            }),
+            KeyCode::PageUp => InputAction::Help(HelpAction::PageUp),
+            KeyCode::PageDown => InputAction::Help(HelpAction::PageDown),
+            KeyCode::Home => InputAction::Help(if help.contents_focused {
+                HelpAction::SelectChapter(0)
+            } else {
+                HelpAction::Top
+            }),
+            KeyCode::End => InputAction::Help(if help.contents_focused {
+                HelpAction::SelectChapter(help.chapters.len().saturating_sub(1))
+            } else {
+                HelpAction::Bottom
+            }),
+            _ => InputAction::NoOp,
+        };
     }
 
     if let Some(question) = state.pending_question.as_ref() {
@@ -515,6 +556,15 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
 }
 
 pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
+    if state.pending_question.is_none()
+        && state.pending_permission.is_none()
+        && state
+            .dialog()
+            .is_some_and(|dialog| dialog.kind == DialogKind::Help)
+    {
+        return InputAction::NoOp;
+    }
+
     // Terminal paste commonly uses CR, while the system clipboard uses CRLF.
     // Normalize once per paste; embedded newlines never become Submit actions.
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -576,6 +626,19 @@ fn scrollbar_thumb_row(state: &TuiState, column: u16, row: u16) -> Option<usize>
 
 pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
     use crossterm::event::MouseButton;
+
+    if state.pending_question.is_none()
+        && state.pending_permission.is_none()
+        && state
+            .dialog()
+            .is_some_and(|dialog| dialog.kind == DialogKind::Help)
+    {
+        return match mouse.kind {
+            MouseEventKind::ScrollUp => InputAction::Help(HelpAction::ScrollUp(3)),
+            MouseEventKind::ScrollDown => InputAction::Help(HelpAction::ScrollDown(3)),
+            _ => InputAction::NoOp,
+        };
+    }
 
     let over_sidebar = state.sidebar_visible(state.last_terminal_width)
         && state.last_sidebar_area.width > 0
@@ -1142,6 +1205,208 @@ mod tests {
             ('?', InputAction::ShowHelp),
         ] {
             assert_eq!(map_key_event(&state, key(KeyCode::Char(ch))), action);
+        }
+    }
+
+    fn help_state() -> TuiState {
+        let mut state = TuiState::default();
+        let mut dialog =
+            crate::tui::state::DialogState::new(DialogKind::Help, "Help", None, Vec::new());
+        dialog.help = Some(crate::tui::help::HelpState::new(state.language()));
+        state.open_dialog(dialog);
+        state
+    }
+
+    #[test]
+    fn help_keys_follow_contents_and_document_focus() {
+        let mut state = help_state();
+        for contents_focused in [true, false] {
+            state
+                .dialog_mut()
+                .unwrap()
+                .help
+                .as_mut()
+                .unwrap()
+                .contents_focused = contents_focused;
+            for (code, action) in [
+                (KeyCode::Esc, InputAction::DialogCancel),
+                (KeyCode::Char('q'), InputAction::DialogCancel),
+                (KeyCode::Tab, InputAction::Help(HelpAction::ToggleContents)),
+                (
+                    KeyCode::BackTab,
+                    InputAction::Help(HelpAction::ToggleContents),
+                ),
+                (KeyCode::Left, InputAction::Help(HelpAction::FocusContents)),
+                (KeyCode::Right, InputAction::Help(HelpAction::FocusDocument)),
+                (KeyCode::Enter, InputAction::Help(HelpAction::FocusDocument)),
+                (KeyCode::PageUp, InputAction::Help(HelpAction::PageUp)),
+                (KeyCode::PageDown, InputAction::Help(HelpAction::PageDown)),
+                (
+                    KeyCode::Home,
+                    InputAction::Help(if contents_focused {
+                        HelpAction::SelectChapter(0)
+                    } else {
+                        HelpAction::Top
+                    }),
+                ),
+                (
+                    KeyCode::End,
+                    InputAction::Help(if contents_focused {
+                        HelpAction::SelectChapter(
+                            state
+                                .dialog()
+                                .unwrap()
+                                .help
+                                .as_ref()
+                                .unwrap()
+                                .chapters
+                                .len()
+                                - 1,
+                        )
+                    } else {
+                        HelpAction::Bottom
+                    }),
+                ),
+            ] {
+                assert_eq!(map_key_event(&state, key(code)), action);
+            }
+            for code in [KeyCode::Up, KeyCode::Char('k')] {
+                assert_eq!(
+                    map_key_event(&state, key(code)),
+                    InputAction::Help(if contents_focused {
+                        HelpAction::PreviousChapter
+                    } else {
+                        HelpAction::ScrollUp(1)
+                    })
+                );
+            }
+            for code in [KeyCode::Down, KeyCode::Char('j')] {
+                assert_eq!(
+                    map_key_event(&state, key(code)),
+                    InputAction::Help(if contents_focused {
+                        HelpAction::NextChapter
+                    } else {
+                        HelpAction::ScrollDown(1)
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_blocks_composer_keys_and_paste_but_preserves_ctrl_c() {
+        let state = help_state();
+        for event in [
+            key(KeyCode::Char('x')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Delete),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER),
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(map_key_event(&state, event), InputAction::NoOp);
+        }
+        assert_eq!(
+            map_paste_event(&state, "pasted\ntext".into()),
+            InputAction::NoOp
+        );
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            InputAction::Quit
+        );
+    }
+
+    #[test]
+    fn help_keys_take_precedence_over_read_only_child_navigation() {
+        let mut state = help_state();
+        let dialog = state.dialog().unwrap().clone();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        state.open_dialog(dialog);
+        assert!(state.is_read_only_child_view());
+        assert!(state.input_buffer.is_empty());
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::Help(HelpAction::FocusContents)
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::Help(HelpAction::FocusDocument)
+        );
+        state
+            .dialog_mut()
+            .unwrap()
+            .help
+            .as_mut()
+            .unwrap()
+            .contents_focused = true;
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::Help(HelpAction::PreviousChapter)
+        );
+        state
+            .dialog_mut()
+            .unwrap()
+            .help
+            .as_mut()
+            .unwrap()
+            .contents_focused = false;
+        for code in [KeyCode::Up, KeyCode::Char('k')] {
+            assert_eq!(
+                map_key_event(&state, key(code)),
+                InputAction::Help(HelpAction::ScrollUp(1))
+            );
+        }
+        for code in [KeyCode::Down, KeyCode::Char('j')] {
+            assert_eq!(
+                map_key_event(&state, key(code)),
+                InputAction::Help(HelpAction::ScrollDown(1))
+            );
+        }
+    }
+
+    #[test]
+    fn help_mouse_events_scroll_the_document_and_block_background_interaction() {
+        let state = help_state();
+        for (kind, action) in [
+            (
+                MouseEventKind::ScrollUp,
+                InputAction::Help(HelpAction::ScrollUp(3)),
+            ),
+            (
+                MouseEventKind::ScrollDown,
+                InputAction::Help(HelpAction::ScrollDown(3)),
+            ),
+            (MouseEventKind::Down(MouseButton::Left), InputAction::NoOp),
+            (MouseEventKind::Drag(MouseButton::Left), InputAction::NoOp),
+            (MouseEventKind::Up(MouseButton::Left), InputAction::NoOp),
+            (MouseEventKind::Moved, InputAction::NoOp),
+        ] {
+            assert_eq!(
+                map_mouse_event(
+                    &state,
+                    MouseEvent {
+                        kind,
+                        column: 1,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    }
+                ),
+                action
+            );
         }
     }
 
