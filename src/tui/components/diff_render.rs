@@ -11,11 +11,13 @@ use crate::tui::{
 };
 
 pub(super) const DIFF_CARD_HEADER_ARROW: &str = "←";
+const DIFF_EXPAND_HINT: &str = "… click to expand for details";
 
 pub(super) fn render_write_diff_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
@@ -46,6 +48,7 @@ pub(super) fn render_write_diff_lines(
         None,
         theme,
         width,
+        expanded_output,
     )
 }
 
@@ -53,6 +56,7 @@ pub(super) fn render_append_diff_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
@@ -83,6 +87,7 @@ pub(super) fn render_append_diff_lines(
         None,
         theme,
         width,
+        expanded_output,
     )
 }
 
@@ -90,6 +95,7 @@ pub(super) fn render_edit_diff_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
@@ -145,6 +151,7 @@ pub(super) fn render_edit_diff_lines(
                 None,
                 theme,
                 width,
+                expanded_output,
             )
         })
         .collect()
@@ -156,6 +163,7 @@ pub(super) fn render_diff_block(
     truncated: Option<&serde_json::Value>,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     if width == 0 {
         return Vec::new();
@@ -179,11 +187,15 @@ pub(super) fn render_diff_block(
     let mut body = diff
         .lines()
         .filter(|line| !is_diff_file_header_line(line))
-        .take(max_body_lines().saturating_add(1))
+        .take(if expanded_output {
+            usize::MAX
+        } else {
+            max_body_lines().saturating_add(1)
+        })
         .collect::<Vec<_>>();
-    if body.len() > max_body_lines() {
+    if !expanded_output && body.len() > max_body_lines() {
         body.pop();
-        body.push("… output clipped in TUI");
+        body.push(DIFF_EXPAND_HINT);
     }
 
     if diff_uses_side_by_side_layout(width)
@@ -356,7 +368,7 @@ pub(super) fn render_diff_side(
     // Strip control/ANSI from the diff body before it reaches display cells; the
     // on-disk content itself stays untouched — filtering is presentation-only.
     let body = terminal_safe_text(&body);
-    let clipped_notice = content == "… output clipped in TUI";
+    let clipped_notice = content == DIFF_EXPAND_HINT;
     let marker_span = if clipped_notice {
         SemanticSpan::decoration(marker, marker_style)
     } else {
@@ -449,7 +461,7 @@ pub(super) fn render_diff_card_body_line(
     // Strip control/ANSI from the diff body before it reaches display cells; the
     // on-disk content itself stays untouched — filtering is presentation-only.
     let body = terminal_safe_text(&body);
-    let clipped_notice = content == "… output clipped in TUI";
+    let clipped_notice = content == DIFF_EXPAND_HINT;
     let marker_span = if clipped_notice {
         SemanticSpan::decoration(marker, marker_style)
     } else {

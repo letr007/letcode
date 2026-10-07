@@ -577,10 +577,10 @@ fn render_tool_body_lines(
                 Vec::new()
             }
         }
-        "fs__write" => render_write_diff_lines(tool, theme, width),
-        "fs__append" => render_append_diff_lines(tool, theme, width),
+        "fs__write" => render_write_diff_lines(tool, theme, width, expanded_output),
+        "fs__append" => render_append_diff_lines(tool, theme, width, expanded_output),
         "shell__exec" => render_shell_output_lines(tool, theme, width, expanded_output),
-        "edit__apply_patch" => render_edit_diff_lines(tool, theme, width),
+        "edit__apply_patch" => render_edit_diff_lines(tool, theme, width, expanded_output),
         _ => {
             if tool.status == ToolExecutionStatus::Failed {
                 render_generic_output_lines(tool, theme, width, expanded_output)
@@ -1481,6 +1481,66 @@ mod tests {
         assert_segments_have_no_controls(&completed);
         assert_eq!(segment_texts(&completed), vec!["plain", "red"]);
         assert_eq!(completed[1].1.fg, Some(Color::Rgb(205, 49, 49)));
+    }
+
+    #[test]
+    fn file_diff_cards_respect_output_expansion() {
+        let translator = crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En);
+        for name in ["fs__write", "fs__append", "edit__apply_patch"] {
+            let deleted_lines = usize::from(name == "edit__apply_patch");
+            for body_lines in [max_body_lines(), max_body_lines() + 1] {
+                let content = "line\n".repeat(body_lines - deleted_lines - 1) + "tail-line";
+                let arguments = if name == "edit__apply_patch" {
+                    json!({"edits": [{"path": "one.rs", "find": "old line", "replace": content}]})
+                } else {
+                    json!({"path": "one.rs", "content": content})
+                };
+                let tool = ToolView {
+                    call_id: name.into(),
+                    name: name.into(),
+                    summary: "changed".into(),
+                    arguments: Some(arguments.to_string()),
+                    output: None,
+                    status: ToolExecutionStatus::Succeeded,
+                };
+                for expanded in [false, true] {
+                    let document = render_tool_card_document(
+                        &tool,
+                        Theme::dark(),
+                        40,
+                        0,
+                        expanded,
+                        &translator,
+                    );
+                    let rendered = document
+                        .lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .map(|span| span.text.as_str())
+                        .collect::<String>();
+                    let clipped = !expanded && body_lines > max_body_lines();
+                    assert_eq!(
+                        rendered.contains("tail-line"),
+                        !clipped,
+                        "{name} {body_lines} {expanded}"
+                    );
+                    assert_eq!(
+                        rendered.contains("click to expand"),
+                        clipped,
+                        "{name} {body_lines} {expanded}"
+                    );
+                    assert!(
+                        !document
+                            .lines
+                            .iter()
+                            .flat_map(|line| &line.spans)
+                            .any(|span| {
+                                span.source.is_some() && span.text.contains("click to expand")
+                            })
+                    );
+                }
+            }
+        }
     }
 
     #[test]

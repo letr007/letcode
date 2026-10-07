@@ -775,6 +775,51 @@ fn zero_distance_drag_does_not_swallow_auto_review_toggle() {
 }
 
 #[test]
+fn clicking_a_long_write_diff_reveals_and_hides_the_tail() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_tool_output_expanded(false);
+    let content = "body line\n".repeat(120) + "tail-121";
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolStarted(ToolStartedEvent {
+        call_id: "call-write".into(),
+        name: "fs__write".into(),
+        summary: "write file".into(),
+        arguments: Some(serde_json::json!({"path": "big.rs", "content": content}).to_string()),
+    }));
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolFinished(
+        ToolFinishedEvent::new(
+            "call-write",
+            "fs__write",
+            "write file",
+            ToolOutcome::Success,
+        ),
+    ));
+    let transcript_text = |runtime: &TuiRuntime| {
+        runtime.state().transcript_render_cache.entries()[0]
+            .document
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>()
+    };
+
+    render_runtime_transcript(&mut runtime);
+    let collapsed = transcript_text(&runtime);
+    assert!(!collapsed.contains("tail-121"));
+    assert!(collapsed.contains("click to expand for details"));
+
+    for expanded in [true, false] {
+        let area = runtime.state().last_transcript_area;
+        runtime.handle_selection_start(area.x + 3, area.y);
+        runtime.handle_selection_end(area.x + 3, area.y, false);
+        render_runtime_transcript(&mut runtime);
+        let text = transcript_text(&runtime);
+        assert_eq!(text.contains("tail-121"), expanded);
+        assert_eq!(text.contains("click to expand for details"), !expanded);
+    }
+}
+
+#[test]
 fn model_catalog_update_refreshes_open_picker_without_toast() {
     let mut runtime = runtime();
     let mut dialog = DialogState::new(
