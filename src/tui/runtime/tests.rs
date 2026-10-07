@@ -6508,22 +6508,8 @@ fn child_view_navigation_preserves_complete_structured_result() {
         runtime_context: event_context("child-session", 1),
     });
 
-    let result = serde_json::json!({
-        "status": "completed",
-        "summary": "Structured result survives parent and child view navigation",
-        "findings": [
-            "The already streamed result remains visible",
-            "Later delta content is appended to the same result"
-        ],
-        "files_read": ["src/tui/runtime.rs"],
-        "files_changed": [],
-        "commands_run": [],
-        "validation": ["view navigation completed immediately"],
-        "blockers": [],
-        "next_steps": []
-    })
-    .to_string();
-    let split_at = result.find("\"validation\"").expect("validation field");
+    let result = "<subagent_report><status>completed</status><summary>Structured result survives parent and child view navigation</summary><finding>The already streamed result remains visible</finding><finding>Later delta content is appended to the same result</finding><file_read>src/tui/runtime.rs</file_read><validation>view navigation completed immediately</validation></subagent_report>".to_string();
+    let split_at = result.find("<validation>").expect("validation tag");
     let (initial, later) = result.split_at(split_at);
 
     runtime.consume_session_transport_event(SessionTransportEvent::ChildSessionEvent {

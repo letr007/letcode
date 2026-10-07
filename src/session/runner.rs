@@ -1538,10 +1538,9 @@ fn build_subagent_event_sender(
                     Some(live_text) => runner.with_child_live_text(live_text.clone()),
                     None => runner,
                 };
-                let finalize_event_tx = event_tx.clone();
                 Box::pin(async move {
                     let mut agent = agent;
-                    let message = runner
+                    runner
                         .run_prompt(
                             &mut agent,
                             UserMessageSubmission::new(
@@ -1549,20 +1548,7 @@ fn build_subagent_event_sender(
                                 UserMessageContent::new(prompt, Vec::new()),
                             ),
                         )
-                        .await?;
-                    match crate::subagent::finalize_report(&agent, &message).await {
-                        Ok(message) => Ok(message),
-                        Err(error) => {
-                            let _ = finalize_event_tx.send(SessionTransportEvent::ProcessIssue(
-                                ProcessIssueEvent {
-                                    message: "Subagent result normalization failed; keeping the child's own report.".into(),
-                                    detail: Some(format!("{error:#}")),
-                                    action: None,
-                                },
-                            ));
-                            Ok(message)
-                        }
-                    }
+                        .await
                 })
             },
         ),

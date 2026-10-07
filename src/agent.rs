@@ -3297,8 +3297,9 @@ impl Agent {
 
     fn render_subagent_prompt(&self, tool_name: &str, input: &NormalizedSubagentInput) -> String {
         format!(
-            "{}\n\nReturn only a single JSON object with fields: status, summary, findings, files_read, files_changed, commands_run, validation, blockers, next_steps. `status` and `summary` are strings; `findings`, `files_read`, `files_changed`, `commands_run`, `validation`, `blockers` and `next_steps` are arrays of strings. Keep details in those arrays instead of nesting them inside `summary`.",
-            input.render_for_delegate(tool_name)
+            "{}\n\n{}",
+            input.render_for_delegate(tool_name),
+            crate::subagent::REPORT_PROMPT
         )
     }
 

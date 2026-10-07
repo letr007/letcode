@@ -100,6 +100,22 @@
 
 结构化产出统一包含执行发现、读取文件、修改文件、执行命令、验证结果、阻碍因素和后续建议，便于父级 Agent 理解与汇总。
 
+模型报告使用与 Historian 相同的自定义标签子集，由宿主直接解析，不做额外的模型改写。工具结果、结构化证据和日志仍使用 JSON，旧 JSON 报告保持可读。
+
+报告包在 `<subagent_report>` 内，`<status>` 和 `<summary>` 各写一次。列表项使用重复的 `<finding>`、`<file_read>`、`<file_changed>`、`<command_run>`、`<validation>`、`<blocker>` 和 `<next_step>`，空列表省略对应标签。
+
+```text
+<subagent_report>
+<status>completed</status>
+<summary>完成局部修复</summary>
+<finding>核实了 Vec<T> & ready 的处理</finding>
+<file_changed>src/main.rs</file_changed>
+<validation>cargo test passed</validation>
+</subagent_report>
+```
+
+这套语法只识别固定的开闭标签，不支持属性、嵌套、自闭合标签或实体解码。字段正文原样保留，无需转义；正文中的完整契约标签仍会被识别为分隔符。字段值读到最近的同名闭标签、下一个契约开标签或报告末尾。标量取第一次出现的值，列表按出现顺序收集。缺少有效的状态或摘要时，结果标记为 `malformed` 并保留原文摘录。
+
 ## 源码索引
 
 - `src/agent/catalog.rs`：定义专家模板、子代理能力契约与目录信息。

@@ -3,7 +3,7 @@ mod result;
 mod route_factory;
 
 pub use pool::{SubagentJob, SubagentPool, SubagentRunGovernance};
-pub(crate) use result::finalize_report;
+pub(crate) use result::REPORT_PROMPT;
 pub use result::{
     StructuredSubagentResult, SubagentFailureKind, SubagentRunSummary, SubagentStatus,
     try_parse_structured_subagent_result,
@@ -830,39 +830,70 @@ base_url = "https://test.example.invalid/v1"
     }
 
     #[test]
-    fn declared_structured_output_follows_the_route_capability() {
-        use super::result::structured_output;
-        use crate::model_runtime::{StructuredOutput, StructuredOutputSupport};
-
-        assert!(structured_output(None).is_none());
+    fn tagged_and_json_reports_produce_the_same_result() {
+        let tags = r#"<subagent_report>
+<status>blocked</status>
+<summary>Reviewed</summary>
+<finding>Vec<T> & "value"
+  &lt; stays literal</finding>
+<finding>second finding</finding>
+<file_read>src/main.rs</file_read>
+<file_changed>src/subagent.rs</file_changed>
+<command_run>cargo test</command_run>
+<validation>cargo test failed</validation>
+<validation>cargo fmt not_run</validation>
+<blocker>tests failed</blocker>
+<next_step>fix tests</next_step>
+</subagent_report>"#;
+        let json = serde_json::json!({
+            "status": "blocked", "summary": "Reviewed",
+            "findings": ["Vec<T> & \"value\"\n  &lt; stays literal", "second finding"],
+            "files_read": ["src/main.rs"], "files_changed": ["src/subagent.rs"],
+            "commands_run": ["cargo test"], "validation": ["cargo test failed", "cargo fmt not_run"],
+            "blockers": ["tests failed"], "next_steps": ["fix tests"]
+        }).to_string();
         assert_eq!(
-            structured_output(Some(StructuredOutputSupport::JsonObject)),
-            Some(StructuredOutput::JsonObject)
+            StructuredSubagentResult::from_model_output(tags, "run", "child"),
+            StructuredSubagentResult::from_model_output(&json, "run", "child")
         );
-        let Some(StructuredOutput::JsonSchema(schema)) =
-            structured_output(Some(StructuredOutputSupport::JsonSchema))
-        else {
-            panic!("json_schema support must request an enforced schema");
-        };
-        assert!(schema.strict);
-        assert_eq!(schema.schema["additionalProperties"], false);
-        for field in [
-            "status",
-            "summary",
-            "findings",
-            "files_read",
-            "files_changed",
-            "commands_run",
-            "validation",
-            "blockers",
-            "next_steps",
+        let parsed = try_parse_structured_subagent_result(tags).expect("tag report");
+        assert_eq!(Some(parsed), try_parse_structured_subagent_result(&json));
+        let legacy = r#"{"status":"completed","summary":"done","findings":["<subagent_report> is literal"]}"#;
+        let legacy = format!("```json\n{legacy}\n```");
+        assert_eq!(
+            try_parse_structured_subagent_result(&legacy)
+                .unwrap()
+                .findings,
+            vec!["<subagent_report> is literal"]
+        );
+    }
+
+    #[test]
+    fn tagged_reports_recover_unclosed_values_without_inventing_a_summary() {
+        let report = "<subagent_report><status>failed</status><summary>汉 Vec<T> & ready</summary><finding>one</finding><finding>two</finding><validation>cargo test failed</validation></subagent_report>";
+        let expected = StructuredSubagentResult::from_model_output(
+            r#"{"status":"failed","summary":"汉 Vec<T> & ready","findings":["one","two"],"validation":["cargo test failed"]}"#,
+            "run",
+            "child",
+        );
+        for text in [
+            report.to_string(),
+            report.replace("</summary>", ""),
+            report.replacen("</finding>", "", 1),
+            report.replace("</validation></subagent_report>", ""),
+            report.replace("</summary>", "</summary><summary>ignored</summary>"),
         ] {
-            assert!(
-                schema.schema["properties"].get(field).is_some(),
-                "missing {field}"
+            assert_eq!(
+                StructuredSubagentResult::from_model_output(&text, "run", "child"),
+                expected
             );
+            assert!(try_parse_structured_subagent_result(&text).is_some());
         }
-        assert_eq!(schema.schema["required"].as_array().map(Vec::len), Some(9));
+        let missing = r#"<subagent_report><status>failed</status><finding>{"status":"completed","summary":"fake","findings":[]}</finding></subagent_report>"#;
+        let result = StructuredSubagentResult::from_model_output(missing, "run", "child");
+        assert!(result.malformed);
+        assert!(result.raw_excerpt.is_some());
+        assert!(try_parse_structured_subagent_result(missing).is_none());
     }
 
     #[test]
@@ -878,7 +909,7 @@ base_url = "https://test.example.invalid/v1"
             "run-2",
             "child-2",
             "fixer",
-            r#"{"status":"failed","summary":"task requirements not met"}"#.into(),
+            "<subagent_report><status>failed</status><summary>task requirements not met</summary></subagent_report>".into(),
         );
 
         assert_eq!(hard.failure_kind, Some(SubagentFailureKind::Hard));
@@ -940,8 +971,7 @@ base_url = "https://test.example.invalid/v1"
                 |_agent, _task, _transcript, _session_transport_tx, _child_session_id, _agent_name| {
                     async move {
                         Ok(
-                            r#"{"status":"completed","summary":"changed files","files_changed":["src/outside.rs"]}"#
-                                .into(),
+                            "<subagent_report><status>completed</status><summary>changed files</summary><file_changed>src/outside.rs</file_changed></subagent_report>".into(),
                         )
                     }
                     .boxed()

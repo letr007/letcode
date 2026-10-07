@@ -4320,21 +4320,10 @@ mod tests {
     }
 
     #[test]
-    fn structured_subagent_json_renders_as_compact_card_at_narrow_width() {
+    fn structured_subagent_tags_render_as_compact_card_at_narrow_width() {
         let mut state = TuiState::default();
         state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
-            json!({
-                "status": "completed",
-                "summary": "Updated transcript rendering",
-                "findings": ["Structured results no longer expose raw JSON"],
-                "files_read": ["src/tui/components/transcript.rs"],
-                "files_changed": ["src/tui/components/transcript.rs"],
-                "commands_run": ["cargo test transcript"],
-                "validation": ["focused tests passed"],
-                "blockers": [],
-                "next_steps": ["review the card"],
-            })
-            .to_string(),
+            "<subagent_report><status>completed</status><summary>Updated transcript rendering</summary><finding>Structured results render as a card</finding><file_read>src/tui/components/transcript.rs</file_read><file_changed>src/tui/components/transcript.rs</file_changed><command_run>cargo test transcript</command_run><validation>focused tests passed</validation><next_step>review the card</next_step></subagent_report>",
         )));
         state.apply_event(SessionEvent::AssistantDone { message_id: None });
 
@@ -4349,8 +4338,8 @@ mod tests {
         assert!(rendered.contains("Updated transcript"), "{rendered}");
         assert!(rendered.contains("read"), "{rendered}");
         assert!(rendered.contains("Findings"), "{rendered}");
-        assert!(!rendered.contains("\"status\""), "{rendered}");
-        assert!(!rendered.contains('{'), "{rendered}");
+        assert!(!rendered.contains("<status>"), "{rendered}");
+        assert!(!rendered.contains("<subagent_report>"), "{rendered}");
         assert!(
             lines.iter().all(|line| line.chars().count() <= 24),
             "{lines:?}"

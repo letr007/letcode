@@ -40,6 +40,7 @@ mod session;
 mod skills;
 mod subagent;
 mod subagent_events;
+mod tagged_text;
 mod tool;
 mod tool_format;
 mod tool_names;

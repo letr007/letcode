@@ -2702,7 +2702,7 @@ async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() 
 async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
     let mut agent = test_agent();
     agent.prepare_turn_prelude();
-    agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+    let (delegate, _, prompts) = capturing_delegate(ToolResult::ok(
         "agent__fixer",
         json!({
             "run_id": "run-structured-1",
@@ -2725,7 +2725,8 @@ async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
                 "child_session_id": "child-structured-1"
             }
         }),
-    )));
+    ));
+    agent.set_subagent_delegate(delegate);
 
     let call = test_tool_call(
         "agent__fixer",
@@ -2747,6 +2748,7 @@ async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
         .await
         .expect("subagent tool execution should succeed");
 
+    assert!(prompts.lock().expect("captured prompt")[0].ends_with(crate::subagent::REPORT_PROMPT));
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::EvidenceRecorded(record)

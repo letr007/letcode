@@ -2,6 +2,7 @@
 //! copied from model prose. All tiers are authored in the same bounded pass.
 use crate::context_history::{HistoryCompartment, HistoryPublication};
 use crate::protocol_frames::ProtocolItem;
+use crate::tagged_text::{bounded, recover_blocks};
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -444,42 +445,6 @@ fn recover_value(block: &str, tag: &str) -> Option<String> {
             .trim()
             .to_string(),
     )
-}
-
-/// Every episode block, each bounded by the same three candidates with the next
-/// wrapper as its boundary, so a missing close tag ends at the next episode
-/// instead of swallowing it.
-fn recover_blocks<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut blocks = Vec::new();
-    let mut cursor = 0;
-    while let Some(offset) = text[cursor..].find(&open) {
-        let start = cursor + offset + open.len();
-        let rest = &text[start..];
-        let body = bounded(rest, &close, &[open.as_str()]);
-        blocks.push(body);
-        if body.len() == rest.len() {
-            break;
-        }
-        cursor = start + body.len();
-    }
-    blocks
-}
-
-/// The nearest of three candidates: the close tag, any listed boundary, or the
-/// end of the text.
-fn bounded<'a>(rest: &'a str, close: &str, boundaries: &[&str]) -> &'a str {
-    let mut end = rest.len();
-    if let Some(position) = rest.find(close) {
-        end = end.min(position);
-    }
-    for boundary in boundaries {
-        if let Some(position) = rest.find(boundary) {
-            end = end.min(position);
-        }
-    }
-    &rest[..end]
 }
 
 /// Read a block's typed episode out of its recovery record. A tag that never
