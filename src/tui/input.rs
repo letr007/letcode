@@ -27,6 +27,7 @@ pub enum InputAction {
     DialogToggle,
     DialogCancel,
     ConfigEditInsert(char),
+    ConfigEditPaste(String),
     ConfigEditBackspace,
     ConfigEditDelete,
     ConfigEditLeft,
@@ -113,6 +114,18 @@ pub enum InputAction {
 }
 
 fn config_editor_key_action(state: &TuiState, key: KeyEvent) -> InputAction {
+    if state
+        .dialog()
+        .is_some_and(|dialog| dialog.config_close_selected.is_some())
+    {
+        return match key.code {
+            KeyCode::Up => InputAction::DialogPrev,
+            KeyCode::Down => InputAction::DialogNext,
+            KeyCode::Enter => InputAction::DialogAccept,
+            KeyCode::Esc => InputAction::DialogCancel,
+            _ => InputAction::NoOp,
+        };
+    }
     if state.config_edit.is_some() {
         return match key.code {
             KeyCode::Enter => InputAction::ConfigEditConfirm,
@@ -129,17 +142,22 @@ fn config_editor_key_action(state: &TuiState, key: KeyEvent) -> InputAction {
             _ => InputAction::NoOp,
         };
     }
-    if state
+    if let Some(dialog) = state
         .dialog()
-        .is_some_and(|dialog| dialog.config_expanded.is_some())
+        .filter(|dialog| dialog.config_expanded.is_some())
     {
+        let editable_list = dialog.config_detail_target.is_none()
+            && dialog
+                .config_expanded
+                .and_then(|index| dialog.config_fields.get(index))
+                .is_some_and(|field| matches!(field, super::state::ConfigFieldRef::List(_)));
         return match key.code {
             KeyCode::Up => InputAction::DialogPrev,
             KeyCode::Down => InputAction::DialogNext,
             KeyCode::Enter => InputAction::DialogAccept,
             KeyCode::Left | KeyCode::Esc => InputAction::ConfigCollapse,
-            KeyCode::Char('a') => InputAction::ConfigListAppend,
-            KeyCode::Char('d') | KeyCode::Delete => InputAction::ConfigListRemove,
+            KeyCode::Char('a') if editable_list => InputAction::ConfigListAppend,
+            KeyCode::Char('d') | KeyCode::Delete if editable_list => InputAction::ConfigListRemove,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 InputAction::ConfigSave
             }
@@ -498,6 +516,17 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
         .is_some_and(|question| question.editing_custom)
     {
         return InputAction::QuestionPaste(text);
+    }
+
+    if let Some(dialog) = state.dialog()
+        && dialog.kind == DialogKind::ConfigEditor
+    {
+        if state.config_edit.is_some() {
+            return InputAction::ConfigEditPaste(text);
+        }
+        if dialog.config_expanded.is_some() || dialog.config_close_selected.is_some() {
+            return InputAction::NoOp;
+        }
     }
 
     if state.dialog_is_open() {
@@ -1015,6 +1044,100 @@ mod tests {
             ),
             InputAction::PasteFromClipboard
         );
+    }
+
+    #[test]
+    fn config_editor_keys_and_paste_follow_the_current_mode() {
+        use crate::tui::state::{ConfigEditState, ConfigFieldRef, DialogState};
+
+        let mut state = TuiState::default();
+        let mut dialog = DialogState::new(DialogKind::ConfigEditor, "Configuration", None, vec![]);
+        dialog.config_fields = vec![ConfigFieldRef::Choice(vec!["protocol".into()])];
+        dialog.config_expanded = Some(0);
+        state.open_dialog(dialog);
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('a'))),
+            InputAction::NoOp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('d'))),
+            InputAction::NoOp
+        );
+        assert_eq!(map_paste_event(&state, "text".into()), InputAction::NoOp);
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            ),
+            InputAction::ConfigSave
+        );
+
+        state.dialog_mut().expect("dialog").config_fields[0] =
+            ConfigFieldRef::List(vec!["command".into()]);
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('a'))),
+            InputAction::ConfigListAppend
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Delete)),
+            InputAction::ConfigListRemove
+        );
+        state.dialog_mut().expect("dialog").config_detail_target = Some(0);
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('a'))),
+            InputAction::NoOp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Delete)),
+            InputAction::NoOp
+        );
+
+        state.config_edit = Some(ConfigEditState {
+            field: ConfigFieldRef::ListItem(vec!["command".into()], 0),
+            buffer: String::new(),
+            cursor: 0,
+        });
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::ConfigEditConfirm
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Esc)),
+            InputAction::ConfigEditCancel
+        );
+        assert_eq!(map_key_event(&state, key(KeyCode::Down)), InputAction::NoOp);
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            ),
+            InputAction::NoOp
+        );
+        assert_eq!(
+            map_paste_event(&state, "text".into()),
+            InputAction::ConfigEditPaste("text".into())
+        );
+
+        state.config_edit = None;
+        state.dialog_mut().expect("dialog").config_expanded = None;
+        state.dialog_mut().expect("dialog").config_close_selected = Some(0);
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::DialogAccept
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Esc)),
+            InputAction::DialogCancel
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::DialogNext
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('a'))),
+            InputAction::NoOp
+        );
+        assert_eq!(map_paste_event(&state, "text".into()), InputAction::NoOp);
     }
 
     #[test]

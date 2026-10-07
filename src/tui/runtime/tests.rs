@@ -8581,3 +8581,447 @@ fn config_editor_offers_a_custom_value_for_open_choices() {
         "the custom entry opens a text editor"
     );
 }
+
+const EDITABLE_CONFIG: &str = r#"fast_mode = false
+active_provider = "alpha"
+[global]
+max_iterations = 5
+[global.retry]
+enabled = false
+backoff_multiplier = 2.0
+[providers.alpha]
+protocol = "responses"
+default_model = "m"
+[providers.alpha.auth]
+type = "bearer"
+credential = "key"
+[providers.alpha.endpoints]
+base_url = "https://a.invalid/v1"
+[providers.alpha.models.m]
+[mcp.demo]
+type = "local"
+command = ["echo", "hello"]
+"#;
+
+fn open_editable_config() -> (TuiRuntime, std::path::PathBuf) {
+    let (mut runtime, path) = runtime_with_config_path(EDITABLE_CONFIG);
+    crate::config::AppConfig::load_from_path(&path).expect("valid editable configuration");
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("open configuration");
+    (runtime, path)
+}
+
+fn toggle_config_retry(runtime: &mut TuiRuntime) {
+    search_config(runtime, "enabled");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("toggle retry");
+}
+
+#[test]
+fn config_editor_only_reports_saved_after_writing_the_file() {
+    let (mut runtime, path) = open_editable_config();
+    toggle_config_retry(&mut runtime);
+    assert!(runtime.state().dialog().expect("dialog").config_dirty);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read configuration"),
+        EDITABLE_CONFIG
+    );
+    assert!(
+        runtime
+            .state()
+            .toast
+            .as_ref()
+            .is_none_or(|toast| toast.message != "Configuration saved")
+    );
+    runtime
+        .handle_input_action(InputAction::ConfigSave)
+        .expect("save configuration");
+    assert!(!runtime.state().dialog().expect("dialog").config_dirty);
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("read configuration")
+            .contains("enabled = true")
+    );
+    assert_eq!(
+        runtime.state().toast.as_ref().expect("saved toast").message,
+        "Configuration saved"
+    );
+}
+
+#[test]
+fn config_editor_closing_dirty_draft_requires_a_choice() {
+    let (mut runtime, path) = open_editable_config();
+    toggle_config_retry(&mut runtime);
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("request close");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("close confirmation")
+            .config_close_selected,
+        Some(0)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read configuration"),
+        EDITABLE_CONFIG
+    );
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("cancel close");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_close_selected,
+        None
+    );
+    assert!(runtime.state().dialog().expect("dialog").config_dirty);
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("request close");
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("choose discard");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("discard and close");
+    assert!(runtime.state().dialog().is_none());
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read configuration"),
+        EDITABLE_CONFIG
+    );
+}
+
+#[test]
+fn config_editor_can_save_or_continue_from_close_confirmation() {
+    let (mut runtime, path) = open_editable_config();
+    toggle_config_retry(&mut runtime);
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("request close");
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("choose discard");
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("choose continue");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("continue editing");
+    assert!(runtime.state().dialog().expect("dialog").config_dirty);
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_close_selected,
+        None
+    );
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("request close");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("save and close");
+    assert!(runtime.state().dialog().is_none());
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("read configuration")
+            .contains("enabled = true")
+    );
+}
+
+#[test]
+fn config_editor_pastes_into_the_edit_buffer_at_the_cursor() {
+    let (mut runtime, _) = open_editable_config();
+    search_config(&mut runtime, "base_url");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("edit URL");
+    let query = runtime.state().dialog().expect("dialog").query.clone();
+    runtime
+        .state_mut()
+        .config_edit
+        .as_mut()
+        .expect("editing")
+        .cursor = 8;
+    let text = "server.example/路径";
+    let action = crate::tui::input::map_paste_event(runtime.state(), text.into());
+    runtime
+        .handle_input_action(action)
+        .expect("paste into field");
+    let edit = runtime.state().config_edit.as_ref().expect("editing");
+    assert_eq!(edit.buffer, "https://server.example/路径a.invalid/v1");
+    assert_eq!(edit.cursor, 8 + text.len());
+    assert_eq!(runtime.state().dialog().expect("dialog").query, query);
+}
+
+#[test]
+fn config_editor_pasted_search_matches_typed_search() {
+    let (mut runtime, _) = open_editable_config();
+    let action = crate::tui::input::map_paste_event(runtime.state(), "max_iterations".into());
+    runtime.handle_input_action(action).expect("paste query");
+    let dialog = runtime.state().dialog().expect("dialog");
+    assert_eq!(
+        dialog
+            .visible_items()
+            .map(|(_, item)| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["max_iterations"]
+    );
+}
+
+#[test]
+fn config_editor_invalid_numbers_keep_the_edit_buffer_and_focus() {
+    for (query, input, message) in [
+        ("max_iterations", "five", "Enter a whole number"),
+        ("backoff_multiplier", "two", "Enter a number"),
+    ] {
+        let (mut runtime, _) = open_editable_config();
+        search_config(&mut runtime, query);
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("edit number");
+        let edit = runtime.state_mut().config_edit.as_mut().expect("editing");
+        edit.buffer = input.into();
+        edit.cursor = input.len();
+        runtime
+            .handle_input_action(InputAction::ConfigEditConfirm)
+            .expect("reject invalid number");
+        let edit = runtime.state().config_edit.as_ref().expect("keep editing");
+        assert_eq!(edit.buffer, input);
+        assert_eq!(edit.cursor, input.len());
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("dialog")
+                .config_error
+                .as_deref(),
+            Some(message)
+        );
+        assert!(!runtime.state().dialog().expect("dialog").config_dirty);
+        runtime
+            .handle_input_action(InputAction::ConfigEditCancel)
+            .expect("cancel edit");
+        assert!(
+            runtime
+                .state()
+                .dialog()
+                .expect("dialog")
+                .config_error
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn config_editor_invalid_draft_keeps_choices_and_arrays_editable() {
+    let (mut runtime, _) = open_editable_config();
+    runtime.config_draft.as_mut().expect("draft")["global"]["max_iterations"] = toml_edit::value(0);
+    search_config(&mut runtime, "protocol");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand protocol");
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_expanded
+            .is_some()
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_detail_items
+            .len(),
+        3
+    );
+    runtime
+        .handle_input_action(InputAction::ConfigCollapse)
+        .expect("collapse");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("dialog")
+        .query
+        .clear();
+    search_config(&mut runtime, "command");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand array");
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_expanded
+            .is_some()
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_detail_items
+            .len(),
+        2
+    );
+    runtime
+        .handle_input_action(InputAction::ConfigCollapse)
+        .expect("collapse");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("dialog")
+        .query
+        .clear();
+    search_config(&mut runtime, "default_model");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand model choices");
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_detail_items
+            .iter()
+            .any(|item| item.label == "m")
+    );
+}
+
+#[test]
+fn config_editor_failed_save_retains_the_draft_and_detailed_error() {
+    let (mut runtime, path) = open_editable_config();
+    runtime
+        .edit_config_document(|document| {
+            document["global"]["max_iterations"] = toml_edit::value(0);
+            Ok(())
+        })
+        .expect("edit draft");
+    runtime
+        .handle_input_action(InputAction::ConfigSave)
+        .expect("attempt save");
+    let dialog = runtime.state().dialog().expect("dialog");
+    assert!(dialog.config_dirty);
+    assert!(
+        dialog
+            .config_error
+            .as_deref()
+            .expect("validation error")
+            .contains("max_iterations")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read configuration"),
+        EDITABLE_CONFIG
+    );
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("request close");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("attempt save and close");
+    assert!(
+        runtime
+            .state()
+            .dialog()
+            .expect("keep dialog on failure")
+            .config_dirty
+    );
+}
+
+#[test]
+fn config_editor_search_matches_dotted_field_paths() {
+    let (mut runtime, _) = open_editable_config();
+    search_config(&mut runtime, "global.max_iterations");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .visible_items()
+            .map(|(_, item)| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["max_iterations"]
+    );
+}
+
+#[test]
+fn config_editor_cancelling_a_new_array_item_restores_the_list() {
+    let (mut runtime, _) = open_editable_config();
+    search_config(&mut runtime, "command");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand array");
+    runtime
+        .handle_input_action(InputAction::ConfigListAppend)
+        .expect("append item");
+    runtime
+        .handle_input_action(InputAction::ConfigEditCancel)
+        .expect("cancel item");
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .expect("dialog")
+            .config_detail_items
+            .len(),
+        2
+    );
+    assert!(!runtime.state().dialog().expect("dialog").config_dirty);
+}
+
+#[test]
+fn config_editor_custom_choice_displays_the_edit_buffer_and_cursor() {
+    let (mut runtime, _) = open_editable_config();
+    search_config(&mut runtime, "default_model");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expand model choices");
+    let custom = runtime
+        .state()
+        .dialog()
+        .expect("dialog")
+        .config_detail_items
+        .iter()
+        .position(|item| item.id == "custom")
+        .expect("custom choice");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("dialog")
+        .config_detail_selected = custom;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("edit custom value");
+    let action = crate::tui::input::map_paste_event(runtime.state(), "CUSTOM-EDIT".into());
+    runtime
+        .handle_input_action(action)
+        .expect("paste custom value");
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    terminal
+        .draw(|frame| crate::tui::render::render(frame, runtime.state_mut()))
+        .expect("draw");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("mCUSTOM-EDIT▏"), "{text}");
+}

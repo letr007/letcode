@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::tui::{
     components::tool_card::truncate_display_width,
@@ -42,9 +43,20 @@ pub fn render_picker(
     let inner = if theme.card_frame {
         picker_area.inner(Margin::new(2, 1))
     } else {
-        picker_area.inner(Margin::new(3, 2))
+        let vertical_margin = if dialog.kind == DialogKind::ConfigEditor && picker_area.height < 9 {
+            1
+        } else {
+            2
+        };
+        picker_area.inner(Margin::new(3, vertical_margin))
     };
     if inner.is_empty() {
+        return;
+    }
+
+    if dialog.kind == DialogKind::ConfigEditor {
+        render_config_editor(frame, state, inner, theme, dialog);
+        render_three_sided_frame(frame, picker_area, theme);
         return;
     }
 
@@ -70,48 +82,6 @@ pub fn render_picker(
         }
 
         let search_y = description_y.saturating_add(2);
-        if search_y < footer_y {
-            render_search(
-                frame,
-                Rect::new(inner.x, search_y, inner.width, 1),
-                theme,
-                state,
-                dialog,
-            );
-        }
-
-        search_y.saturating_add(2)
-    } else if dialog.kind == DialogKind::ConfigEditor {
-        let description_y = inner.y.saturating_add(2);
-        let mut description_height = 1;
-        if let Some(error) = dialog.config_error.as_deref() {
-            if description_y < footer_y {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        error.to_string(),
-                        theme.error_style(),
-                    )))
-                    .style(theme.elevated_style()),
-                    Rect::new(inner.x, description_y, inner.width, 1),
-                );
-            }
-        } else if let Some(description) = dialog.description.as_deref() {
-            let available = footer_y.saturating_sub(description_y);
-            if available > 0 {
-                let rows = description_rows(description, inner.width).min(available);
-                render_description(
-                    frame,
-                    Rect::new(inner.x, description_y, inner.width, rows),
-                    theme,
-                    description,
-                );
-                description_height = rows;
-            }
-        }
-
-        let search_y = description_y
-            .saturating_add(description_height)
-            .saturating_add(1);
         if search_y < footer_y {
             render_search(
                 frame,
@@ -157,8 +127,6 @@ pub fn render_picker(
     if body_height > 0 {
         if dialog.kind == DialogKind::ContextPicker {
             render_context_picker_body(frame, body_area, theme, state, dialog);
-        } else if dialog.kind == DialogKind::ConfigEditor && dialog.config_expanded.is_some() {
-            render_config_split_body(frame, body_area, theme, state, dialog);
         } else {
             render_picker_body(frame, body_area, theme, state, dialog);
         }
@@ -177,14 +145,121 @@ pub fn render_picker(
             render_expert_model_picker_footer(frame, footer_area, theme, state);
         } else if dialog.kind == DialogKind::SessionPicker {
             render_session_picker_footer(frame, footer_area, theme, state, dialog);
-        } else if dialog.kind == DialogKind::ConfigEditor {
-            render_config_footer(frame, footer_area, theme, state);
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
     }
 
     render_three_sided_frame(frame, picker_area, theme);
+}
+
+fn render_config_editor(
+    frame: &mut Frame<'_>,
+    state: &mut TuiState,
+    inner: Rect,
+    theme: Theme,
+    dialog: &DialogState,
+) {
+    let confirming = dialog.config_close_selected.is_some();
+    let title = if confirming {
+        state.t("config.unsaved")
+    } else {
+        dialog.title.clone()
+    };
+    render_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        theme,
+        &title,
+    );
+    let footer_y = inner.bottom().saturating_sub(1);
+    let gap = u16::from(inner.height >= 12);
+    let mut y = inner.y.saturating_add(1).saturating_add(gap);
+    let expanded = dialog.config_expanded.is_some();
+    let search = !confirming && !expanded && state.config_edit.is_none();
+    let body_rows = if confirming {
+        3
+    } else if expanded {
+        1
+    } else {
+        2
+    };
+    let reserved = body_rows + u16::from(search) + gap * 2;
+    let description = dialog.config_error.as_deref().or(if confirming {
+        None
+    } else {
+        dialog.description.as_deref()
+    });
+    if let Some(description) = description {
+        let lines = wrap_text_to_width(description, inner.width as usize);
+        let height = (lines.len().min(MAX_DESCRIPTION_ROWS as usize) as u16)
+            .min(footer_y.saturating_sub(y).saturating_sub(reserved));
+        if height > 0 {
+            let style = if dialog.config_error.is_some() {
+                theme.error_style()
+            } else {
+                theme.elevated_style()
+            };
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()).style(style),
+                Rect::new(inner.x, y, inner.width, height),
+            );
+            y = y.saturating_add(height).saturating_add(gap);
+        }
+    }
+    if search && footer_y.saturating_sub(y) > body_rows {
+        render_search(
+            frame,
+            Rect::new(inner.x, y, inner.width, 1),
+            theme,
+            state,
+            dialog,
+        );
+        y = y.saturating_add(1).saturating_add(gap);
+    }
+    let body = Rect::new(inner.x, y, inner.width, footer_y.saturating_sub(y));
+    if let Some(selected) = dialog.config_close_selected {
+        let rows = body.height as usize;
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(rows)
+            .min(3usize.saturating_sub(rows));
+        for (index, key) in [
+            "config.save_and_close",
+            "config.discard_and_close",
+            "config.continue_editing",
+        ]
+        .into_iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        {
+            let style = if index == selected {
+                selected_item_style(theme)
+            } else {
+                item_style(theme)
+            };
+            let marker = if index == selected { "● " } else { "  " };
+            let row = Rect::new(body.x, body.y + (index - start) as u16, body.width, 1);
+            frame.render_widget(Block::default().style(style), row);
+            frame.render_widget(
+                Paragraph::new(format!("{marker}{}", state.t(key))).style(style),
+                row,
+            );
+        }
+    } else if expanded {
+        render_config_split_body(frame, body, theme, state, dialog);
+    } else {
+        render_picker_body(frame, body, theme, state, dialog);
+    }
+    if footer_y > inner.y {
+        render_config_footer(
+            frame,
+            Rect::new(inner.x, footer_y, inner.width, 1),
+            theme,
+            state,
+        );
+    }
 }
 
 fn render_three_sided_frame(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
@@ -244,15 +319,6 @@ fn render_description(frame: &mut Frame<'_>, area: Rect, theme: Theme, descripti
             .wrap(Wrap { trim: true }),
         area,
     );
-}
-
-fn description_rows(text: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let rows = text
-        .split('\n')
-        .map(|line| display_width(line).max(1).div_ceil(width))
-        .sum::<usize>();
-    rows.clamp(1, MAX_DESCRIPTION_ROWS as usize) as u16
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {
@@ -533,62 +599,100 @@ fn render_expert_model_picker_footer(
 }
 
 fn render_config_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme, state: &TuiState) {
-    let expanded = state
-        .dialog()
-        .is_some_and(|dialog| dialog.config_expanded.is_some());
+    let Some(dialog) = state.dialog() else {
+        return;
+    };
+    let confirming = dialog.config_close_selected.is_some();
+    let editing = state.config_edit.is_some();
+    let expanded = dialog.config_expanded.is_some();
+    let list_content = dialog.config_detail_target.is_none()
+        && dialog.config_expanded.is_some_and(|index| {
+            matches!(
+                dialog.config_fields.get(index),
+                Some(ConfigFieldRef::List(_))
+            )
+        });
+    let mut hints = if confirming || editing {
+        vec![
+            (
+                "Enter",
+                state.t(if confirming {
+                    "ui.select"
+                } else {
+                    "ui.confirm"
+                }),
+            ),
+            ("Esc", state.t("ui.cancel")),
+        ]
+    } else {
+        vec![
+            ("Ctrl-S", state.t("ui.save")),
+            (
+                "Esc",
+                state.t(if expanded {
+                    "ui.collapse"
+                } else if dialog.config_path.is_empty() {
+                    "ui.close"
+                } else {
+                    "ui.back"
+                }),
+            ),
+            (
+                "Enter",
+                state.t(if expanded && !list_content {
+                    "ui.select"
+                } else {
+                    "ui.edit"
+                }),
+            ),
+        ]
+    };
+    if !confirming && !editing && list_content {
+        hints.push(("a", state.t("ui.add")));
+        hints.push(("d", state.t("ui.remove")));
+    }
+    if !editing {
+        hints.push(("↑/↓", state.t("ui.navigate")));
+        if expanded && !confirming {
+            hints.push(("←", state.t("ui.collapse")));
+        }
+    }
+    let separator = "  ·  ";
+    let core_width = hints
+        .iter()
+        .take(2)
+        .map(|(key, label)| display_width(key) + 1 + display_width(label))
+        .sum::<usize>()
+        + display_width(separator);
     let mut spans = Vec::new();
-    if state
-        .dialog()
-        .is_some_and(|dialog| dialog.config_expanded.is_none())
-        && state.dialog().is_some_and(|dialog| dialog.config_dirty)
+    let mut width = 0;
+    let unsaved = state.t("config.unsaved");
+    let unsaved_width = display_width("● ") + display_width(&unsaved);
+    if dialog.config_dirty
+        && !editing
+        && !confirming
+        && unsaved_width + display_width(separator) + core_width <= area.width as usize
     {
         spans.push(Span::styled("● ", accent_style(theme)));
-        spans.push(Span::styled(state.t("config.unsaved"), muted_style(theme)));
-        spans.push(Span::styled("  ·  ", muted_style(theme)));
+        spans.push(Span::styled(unsaved, muted_style(theme)));
+        width = unsaved_width;
     }
-    spans.push(Span::styled("↑/↓", accent_style(theme)));
-    spans.push(Span::styled(
-        format!(" {}", state.t("ui.navigate")),
-        muted_style(theme),
-    ));
-    spans.push(Span::styled("  ·  ", muted_style(theme)));
-    spans.push(Span::styled("Enter", accent_style(theme)));
-    spans.push(Span::styled(
-        format!(" {}", state.t("ui.edit")),
-        muted_style(theme),
-    ));
-    if expanded {
-        spans.push(Span::styled("  ·  ", muted_style(theme)));
-        spans.push(Span::styled("a", accent_style(theme)));
-        spans.push(Span::styled(
-            format!(" {}", state.t("ui.add")),
-            muted_style(theme),
-        ));
-        spans.push(Span::styled("  ·  ", muted_style(theme)));
-        spans.push(Span::styled("d", accent_style(theme)));
-        spans.push(Span::styled(
-            format!(" {}", state.t("ui.remove")),
-            muted_style(theme),
-        ));
-        spans.push(Span::styled("  ·  ", muted_style(theme)));
-        spans.push(Span::styled("←", accent_style(theme)));
-        spans.push(Span::styled(
-            format!(" {}", state.t("ui.collapse")),
-            muted_style(theme),
-        ));
-    } else {
-        spans.push(Span::styled("  ·  ", muted_style(theme)));
-        spans.push(Span::styled("Ctrl-S", accent_style(theme)));
-        spans.push(Span::styled(
-            format!(" {}", state.t("ui.save")),
-            muted_style(theme),
-        ));
-        spans.push(Span::styled("  ·  ", muted_style(theme)));
-        spans.push(Span::styled("Esc", accent_style(theme)));
-        spans.push(Span::styled(
-            format!(" {}", state.t("ui.back")),
-            muted_style(theme),
-        ));
+    for (index, (key, label)) in hints.into_iter().enumerate() {
+        let hint_width = display_width(key) + 1 + display_width(&label);
+        let separator_width = if spans.is_empty() {
+            0
+        } else {
+            display_width(separator)
+        };
+        if index >= 2 && width + separator_width + hint_width > area.width as usize {
+            break;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(separator, muted_style(theme)));
+        }
+        spans.push(Span::styled(key, accent_style(theme)));
+        spans.push(Span::styled(format!(" {label}"), muted_style(theme)));
+        width += separator_width + hint_width;
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
@@ -977,6 +1081,10 @@ fn render_config_split_body(
     state: &mut TuiState,
     dialog: &DialogState,
 ) {
+    if area.width < 50 {
+        render_config_detail(frame, area, theme, dialog, state.config_edit.as_ref());
+        return;
+    }
     let [list_area, gap_area, detail_area] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1014,11 +1122,20 @@ fn render_config_detail(
     if area.is_empty() {
         return;
     }
-    for (index, item) in dialog.config_detail_items.iter().enumerate() {
-        let row = area.y.saturating_add(index as u16);
-        if row >= area.bottom() {
-            break;
-        }
+    let rows = area.height as usize;
+    let start = dialog
+        .config_detail_selected
+        .saturating_add(1)
+        .saturating_sub(rows)
+        .min(dialog.config_detail_items.len().saturating_sub(rows));
+    for (index, item) in dialog
+        .config_detail_items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+    {
+        let row = area.y.saturating_add((index - start) as u16);
         let selected = index == dialog.config_detail_selected;
         let row_style = if selected {
             selected_item_style(theme)
@@ -1032,13 +1149,11 @@ fn render_config_detail(
             matches!(&edit.field, ConfigFieldRef::ListItem(_, selected) if *selected == index)
         });
         let spans = if let Some(edit) = editing {
-            let cursor = edit.cursor.min(edit.buffer.len());
-            let (before, after) = edit.buffer.split_at(cursor);
+            let marker = if area.width < 4 { "" } else { marker };
+            let width = area.width.saturating_sub(1) as usize - display_width(marker);
             vec![
                 Span::styled(marker, row_style),
-                Span::styled(before.to_string(), row_style),
-                Span::styled("▏", row_style),
-                Span::styled(after.to_string(), row_style),
+                Span::styled(config_edit_text(edit, width), row_style),
             ]
         } else {
             vec![
@@ -1056,6 +1171,44 @@ fn render_config_detail(
             ),
         );
     }
+}
+
+fn config_edit_text(edit: &ConfigEditState, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let (before, after) = edit.buffer.split_at(edit.cursor.min(edit.buffer.len()));
+    let before = before
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    let after = after
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    let after_width = display_width(&after).min(width / 3);
+    let before_width = width.saturating_sub(1 + after_width);
+    let mut used = 0;
+    let mut start = before.len();
+    for (index, grapheme) in before.grapheme_indices(true).rev() {
+        let next = used + display_width(grapheme);
+        if next > before_width {
+            break;
+        }
+        used = next;
+        start = index;
+    }
+    let mut text = format!("{}▏", &before[start..]);
+    used += 1;
+    for grapheme in after.graphemes(true) {
+        let next = used + display_width(grapheme);
+        if next > width {
+            break;
+        }
+        used = next;
+        text.push_str(grapheme);
+    }
+    text
 }
 
 fn render_config_row(
@@ -1079,12 +1232,34 @@ fn render_config_row(
         return;
     }
 
-    let editing = edit.filter(|edit| field == Some(&edit.field));
-    let affordance = if editing.is_some() {
-        ""
-    } else {
-        item.right_detail.as_deref().unwrap_or("")
-    };
+    let editing = edit.filter(|edit| {
+        field == Some(&edit.field)
+            || matches!((field, &edit.field), (Some(ConfigFieldRef::Choice(path)), ConfigFieldRef::Field(edit_path)) if path == edit_path)
+    });
+    if let Some(edit) = editing {
+        let marker = if content.width < 4 {
+            ""
+        } else if selected {
+            "● "
+        } else {
+            "  "
+        };
+        let available = content.width as usize - display_width(marker);
+        let label_width = display_width(&item.label).min(available.saturating_sub(3) / 3);
+        let label = truncate_display_width(&item.label, label_width);
+        let prefix = if label.is_empty() {
+            String::new()
+        } else {
+            format!("{label}  ")
+        };
+        let text = config_edit_text(edit, available.saturating_sub(display_width(&prefix)));
+        frame.render_widget(
+            Paragraph::new(format!("{marker}{prefix}{text}")).style(row_style),
+            content,
+        );
+        return;
+    }
+    let affordance = item.right_detail.as_deref().unwrap_or("");
     let right_width =
         (display_width(affordance) as u16).min(content.width.saturating_sub(MIN_LEFT_LABEL_WIDTH));
     let left_width = content.width.saturating_sub(right_width.saturating_add(2));
@@ -1101,14 +1276,7 @@ fn render_config_row(
         Span::styled(marker, row_style),
         Span::styled(item.label.clone(), row_style),
     ];
-    if let Some(edit) = editing {
-        spans.push(Span::styled("  ", row_style));
-        let cursor = edit.cursor.min(edit.buffer.len());
-        let (before, after) = edit.buffer.split_at(cursor);
-        spans.push(Span::styled(before.to_string(), row_style));
-        spans.push(Span::styled("▏", row_style));
-        spans.push(Span::styled(after.to_string(), row_style));
-    } else if let Some(detail) = &item.detail {
+    if let Some(detail) = &item.detail {
         spans.push(Span::styled("  ", row_style));
         spans.push(Span::styled(
             detail.clone(),
@@ -1485,6 +1653,198 @@ mod tests {
         assert!(rendered.contains("zhipu/glm-5"), "{rendered}");
         assert!(rendered.contains("moonshot/kimi-k2"), "{rendered}");
         assert!(!rendered.contains('…'), "{rendered}");
+    }
+
+    fn config_state(field: ConfigFieldRef) -> TuiState {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        let mut dialog = DialogState::new(
+            DialogKind::ConfigEditor,
+            "Configuration",
+            None,
+            vec![DialogItem::new("field", "Field", Some("value".into())).with_section("Settings")],
+        );
+        dialog.config_fields.push(field);
+        state.open_dialog(dialog);
+        state
+    }
+
+    fn config_buffer(state: &mut TuiState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let dialog = state.dialog().expect("config dialog").clone();
+        let theme = state.theme();
+        terminal
+            .draw(|frame| render_picker(frame, state, frame.area(), theme, &dialog))
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = buffer.area.x;
+                while x < buffer.area.right() {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += display_width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    fn config_footer_text(state: &TuiState, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_config_footer(frame, frame.area(), state.theme(), state))
+            .expect("draw");
+        buffer_rows(terminal.backend().buffer()).join("\n")
+    }
+
+    #[test]
+    fn config_render_detail_keeps_selection_and_editing_visible() {
+        for (width, height) in [(100, 24), (40, 14)] {
+            let path = vec!["items".into()];
+            let mut state = config_state(ConfigFieldRef::List(path.clone()));
+            let dialog = state.dialog_mut().expect("config dialog");
+            dialog.config_expanded = Some(0);
+            dialog.config_detail_items = (0..32)
+                .map(|index| DialogItem::new(index.to_string(), format!("item-{index:02}"), None))
+                .collect();
+            dialog.config_detail_selected = 31;
+            let rows = buffer_rows(&config_buffer(&mut state, width, height));
+            assert!(rows.iter().any(|row| row.contains("● item-31")), "{rows:?}");
+            state.config_edit = Some(ConfigEditState {
+                field: ConfigFieldRef::ListItem(path, 31),
+                buffer: "EDITED-LAST".into(),
+                cursor: "EDITED-LAST".len(),
+            });
+            let rows = buffer_rows(&config_buffer(&mut state, width, height));
+            assert!(
+                rows.iter().any(|row| row.contains("EDITED-LAST▏")),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_render_unicode_edit_keeps_the_cursor_and_input_visible() {
+        for list_item in [false, true] {
+            for width in [40, 100] {
+                let path = vec!["value".into()];
+                let field = if list_item {
+                    ConfigFieldRef::List(path.clone())
+                } else {
+                    ConfigFieldRef::Field(path.clone())
+                };
+                let mut state = config_state(field.clone());
+                state.dialog_mut().expect("config dialog").items[0].label =
+                    "A very long field name that must not hide the input cursor".into();
+                let edit_field = if list_item {
+                    let dialog = state.dialog_mut().expect("config dialog");
+                    dialog.config_expanded = Some(0);
+                    dialog.config_detail_items = vec![DialogItem::new("0", "item", None)];
+                    ConfigFieldRef::ListItem(path, 0)
+                } else {
+                    field
+                };
+                let buffer = format!("{}新输入TAIL", "中🙂e\u{301}👩‍💻".repeat(30));
+                state.config_edit = Some(ConfigEditState {
+                    field: edit_field,
+                    cursor: buffer.len() - "TAIL".len(),
+                    buffer,
+                });
+                let rows = buffer_rows(&config_buffer(&mut state, width, 24));
+                assert!(
+                    rows.iter().any(|row| row.contains("新输入▏TAIL")),
+                    "{width}: {rows:?}"
+                );
+                let edit = state.config_edit.as_mut().expect("edit");
+                edit.cursor = edit.buffer.len();
+                let rows = buffer_rows(&config_buffer(&mut state, width, 24));
+                assert!(
+                    rows.iter().any(|row| row.contains("TAIL▏")),
+                    "{width}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_render_text_footer_only_confirms_or_cancels() {
+        for field in [
+            ConfigFieldRef::Field(vec!["prompt".into()]),
+            ConfigFieldRef::ListItem(vec!["items".into()], 0),
+        ] {
+            let mut state = config_state(field.clone());
+            state.config_edit = Some(ConfigEditState {
+                field,
+                buffer: "value".into(),
+                cursor: 5,
+            });
+            let text = config_footer_text(&state, 96);
+            assert!(text.contains("Enter confirm"), "{text}");
+            assert!(text.contains("Esc cancel"), "{text}");
+            for invalid in ["Ctrl-S", "↑/↓", "a add", "d remove"] {
+                assert!(!text.contains(invalid), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn config_render_multiline_edit_keeps_the_cursor_without_changing_the_buffer() {
+        let field = ConfigFieldRef::Field(vec!["prompt".into()]);
+        let mut state = config_state(field.clone());
+        state.config_edit = Some(ConfigEditState {
+            field,
+            buffer: "first\nsecond".into(),
+            cursor: "first\nsecond".len(),
+        });
+        let rows = buffer_rows(&config_buffer(&mut state, 80, 24));
+        assert!(rows.iter().any(|row| row.contains("second▏")), "{rows:?}");
+        assert_eq!(
+            state.config_edit.as_ref().expect("edit").buffer,
+            "first\nsecond"
+        );
+    }
+
+    #[test]
+    fn config_render_nested_footer_returns_to_the_parent() {
+        let mut state = config_state(ConfigFieldRef::Field(vec!["prompt".into()]));
+        state.dialog_mut().expect("dialog").config_path = vec!["global".into()];
+        let text = config_footer_text(&state, 96);
+        assert!(text.contains("Esc back"), "{text}");
+        assert!(!text.contains("Esc close"), "{text}");
+    }
+
+    #[test]
+    fn config_render_expanded_footer_matches_the_current_mode() {
+        for (field, target, list_content) in [
+            (ConfigFieldRef::Choice(vec!["mode".into()]), None, false),
+            (ConfigFieldRef::List(vec!["items".into()]), Some(0), false),
+            (ConfigFieldRef::List(vec!["items".into()]), None, true),
+        ] {
+            let mut state = config_state(field);
+            let dialog = state.dialog_mut().expect("config dialog");
+            dialog.config_expanded = Some(0);
+            dialog.config_detail_target = target;
+            let text = config_footer_text(&state, 96);
+            for hint in [
+                "Ctrl-S save",
+                "Esc collapse",
+                if list_content {
+                    "Enter edit"
+                } else {
+                    "Enter select"
+                },
+            ] {
+                assert!(text.contains(hint), "{text}");
+            }
+            for hint in ["a add", "d remove"] {
+                assert_eq!(text.contains(hint), list_content, "{text}");
+            }
+        }
     }
 
     #[test]

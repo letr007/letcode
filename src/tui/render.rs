@@ -2296,6 +2296,117 @@ mod tests {
         assert!(rendered.contains("Enter"), "{rendered}");
     }
 
+    fn chinese_config_state() -> TuiState {
+        use crate::tui::state::{ConfigFieldRef, DialogItem, DialogKind, DialogState};
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+        let mut dialog = DialogState::new(
+            DialogKind::ConfigEditor,
+            state.t("config.title"),
+            Some("配置文件说明".repeat(40)),
+            vec![
+                DialogItem::new("prompt", "ActualConfigField", Some("value".into()))
+                    .with_section("设置"),
+            ],
+        );
+        dialog.config_fields = vec![ConfigFieldRef::Field(vec!["prompt".into()])];
+        dialog.config_dirty = true;
+        state.open_dialog(dialog);
+        state
+    }
+
+    fn config_screen_rows(state: &mut TuiState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| render(frame, state)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += display_width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn config_render_small_windows_preserve_fields_and_actions() {
+        for height in [8, 14, 24] {
+            let mut state = chinese_config_state();
+            let rows = config_screen_rows(&mut state, 80, height);
+            for text in [
+                "ActualConfigField",
+                "Ctrl-S 保存",
+                "Esc 关闭",
+                &state.t("config.unsaved"),
+            ] {
+                assert!(
+                    rows.iter().any(|row| row.contains(text)),
+                    "{height}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_render_close_confirmation_keeps_the_selection_visible() {
+        for height in [7, 24] {
+            for selected in 0..3 {
+                let mut state = chinese_config_state();
+                state.dialog_mut().expect("dialog").config_close_selected = Some(selected);
+                let options = [
+                    state.t("config.save_and_close"),
+                    state.t("config.discard_and_close"),
+                    state.t("config.continue_editing"),
+                ];
+                let rows = config_screen_rows(&mut state, 80, height);
+                assert!(
+                    rows.iter()
+                        .any(|row| row.contains(&format!("● {}", options[selected]))),
+                    "{height}: {rows:?}"
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row.contains("Enter 选择") && row.contains("Esc 取消")),
+                    "{height}: {rows:?}"
+                );
+                if height >= 14 {
+                    for option in options {
+                        assert!(
+                            rows.iter().any(|row| row.contains(&option)),
+                            "{height}: {rows:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_render_error_preserves_the_diagnostic_and_fields() {
+        for height in [14, 24] {
+            let mut state = chinese_config_state();
+            let error = "cannot save config at /very/long/project/path/letcode.toml because permissions.mode is invalid: expected safe/default/auto/yolo; ERROR-END";
+            state.dialog_mut().expect("config dialog").config_error = Some(error.into());
+            let rows = config_screen_rows(&mut state, 80, height);
+            for detail in [
+                "permissions.mode",
+                "invalid",
+                "ERROR-END",
+                "ActualConfigField",
+            ] {
+                assert!(
+                    rows.iter().any(|row| row.contains(detail)),
+                    "{height}: {rows:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn permission_dialog_uses_picker_style() {
         let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
