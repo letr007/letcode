@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::Modifier,
+    style::{Color, Modifier},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
@@ -9,8 +9,8 @@ use ratatui::{
 use super::picker;
 
 use crate::tui::{
-    help::HelpState, measure::display_width, scrollbar::ScrollbarGeometry, state::TuiState,
-    theme::Theme, transcript_ratatui::line_to_ratatui,
+    assistant_fade, help::HelpState, measure::display_width, scrollbar::ScrollbarGeometry,
+    state::TuiState, theme::Theme, transcript_ratatui::line_to_ratatui,
 };
 
 pub fn render_help_reader(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
@@ -19,6 +19,7 @@ pub fn render_help_reader(frame: &mut Frame<'_>, state: &mut TuiState, area: Rec
     }
     let language = state.language();
     let translator = state.translator();
+    let terminal_bg = state.terminal_background();
     let Some(help) = state.dialog_mut().and_then(|dialog| dialog.help.as_mut()) else {
         return;
     };
@@ -110,7 +111,8 @@ pub fn render_help_reader(frame: &mut Frame<'_>, state: &mut TuiState, area: Rec
         render_contents(frame, help, contents, theme);
     }
     if wide || !help.contents_focused {
-        render_document(frame, help, text_area, document, document_theme);
+        let backdrop = assistant_fade::fade_backdrop(document_theme, terminal_bg);
+        render_document(frame, help, text_area, document, document_theme, backdrop);
     }
 
     let progress = format!(
@@ -215,6 +217,7 @@ fn render_document(
     text_area: Rect,
     area: Rect,
     theme: Theme,
+    backdrop: Color,
 ) {
     let lines = help
         .visible_lines()
@@ -233,7 +236,7 @@ fn render_document(
     ) {
         let column = area.right().saturating_sub(1);
         for row in 0..area.height {
-            let (symbol, style) = geometry.cell(usize::from(row), theme, theme.elevated_bg);
+            let (symbol, style) = geometry.cell(usize::from(row), theme, backdrop);
             if let Some(cell) = frame.buffer_mut().cell_mut((column, area.y + row)) {
                 cell.set_char(symbol).set_style(style);
             }
