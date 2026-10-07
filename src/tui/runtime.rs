@@ -2520,6 +2520,10 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Submit => self.handle_submit(),
+            InputAction::RemoveLastQueuedPrompt => {
+                self.remove_last_queued_prompt();
+                Ok(None)
+            }
             InputAction::HistoryPrev => {
                 self.navigate_history_previous();
                 Ok(None)
@@ -2952,6 +2956,24 @@ impl TuiRuntime {
         self.queued_prompts.push_back(prompt.clone());
         self.state.push_queued_user_message_preview(prompt);
         self.state.toast = None;
+    }
+
+    fn remove_last_queued_prompt(&mut self) {
+        if self.state.is_read_only_child_view() {
+            return;
+        }
+        let Some(prompt) = self.queued_prompts.back() else {
+            return;
+        };
+        if self.queued_prompt_lifecycle.dispatched_submission_id() == Some(prompt.id.as_str()) {
+            return;
+        }
+
+        let submission_id = prompt.id.clone();
+        self.queued_prompts.pop_back();
+        self.state
+            .timeline
+            .remove_first_queued_user_message_preview(&submission_id);
     }
 
     fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {

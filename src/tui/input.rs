@@ -45,6 +45,7 @@ pub enum InputAction {
     SlashPanelAccept,
     SlashPanelDismiss,
     Submit,
+    RemoveLastQueuedPrompt,
     HistoryPrev,
     HistoryNext,
     ScrollUp,
@@ -405,6 +406,13 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                 _ => InputAction::NoOp,
             }
         };
+    }
+
+    if matches!(key.code, KeyCode::Backspace)
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !state.is_read_only_child_view()
+    {
+        return InputAction::RemoveLastQueuedPrompt;
     }
 
     if state.slash_panel_is_open() {
@@ -848,6 +856,140 @@ mod tests {
     }
 
     #[test]
+    fn backspace_keeps_composer_editing() {
+        for phase in [AppPhase::Editing, AppPhase::Running] {
+            let mut state = TuiState::default();
+            state.phase = phase;
+            state.input_buffer = "a🙂b".into();
+            state.input_cursor = "a🙂".len();
+
+            let action = map_key_event(&state, key(KeyCode::Backspace));
+            assert_eq!(action, InputAction::Backspace);
+            assert!(apply_edit_action(&mut state, &action));
+            assert_eq!(state.input_buffer, "ab");
+            assert_eq!(state.input_cursor, 1);
+            assert_eq!(state.phase, phase);
+        }
+
+        let mut state = TuiState::default();
+        let action = map_key_event(&state, key(KeyCode::Backspace));
+        assert_eq!(action, InputAction::Backspace);
+        assert!(!apply_edit_action(&mut state, &action));
+        assert!(state.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn ctrl_backspace_maps_to_queue_removal_without_editing_the_draft() {
+        for phase in [AppPhase::Idle, AppPhase::Editing, AppPhase::Running] {
+            for draft in ["", "draft"] {
+                let mut state = TuiState::default();
+                state.phase = phase;
+                state.input_buffer = draft.into();
+                state.input_cursor = draft.len();
+
+                let action = map_key_event(
+                    &state,
+                    KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+                );
+                assert_eq!(action, InputAction::RemoveLastQueuedPrompt);
+                assert!(!apply_edit_action(&mut state, &action));
+                assert_eq!(state.input_buffer, draft);
+                assert_eq!(state.input_cursor, draft.len());
+                assert_eq!(state.phase, phase);
+            }
+        }
+    }
+
+    #[test]
+    fn queue_removal_requires_control_backspace() {
+        let state = TuiState::default();
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT, KeyModifiers::SUPER] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::Backspace
+            );
+        }
+        for event in [
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+            KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('\u{8}')),
+        ] {
+            assert_ne!(
+                map_key_event(&state, event),
+                InputAction::RemoveLastQueuedPrompt
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_backspace_preserves_prefix_and_read_only_child_editing() {
+        let mut state = TuiState::default();
+        state.child_navigation_prefix = true;
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::NoOp
+            );
+        }
+
+        state.child_navigation_prefix = false;
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        assert!(state.is_read_only_child_view());
+        for draft in ["", "/help"] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+                state.input_buffer = draft.into();
+                state.input_cursor = draft.len();
+                let action = map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers));
+                assert_eq!(action, InputAction::Backspace);
+                assert_eq!(apply_edit_action(&mut state, &action), !draft.is_empty());
+                assert_eq!(
+                    state.input_buffer,
+                    if draft.is_empty() { "" } else { "/hel" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_backspace_preserves_the_slash_completion_draft() {
+        let mut state = TuiState::default();
+        state.set_input("/");
+        assert!(state.slash_panel_is_open());
+        let action = map_key_event(
+            &state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        );
+        assert_eq!(action, InputAction::RemoveLastQueuedPrompt);
+        assert!(!apply_edit_action(&mut state, &action));
+        assert_eq!(state.input_buffer, "/");
+        assert_eq!(state.input_cursor, 1);
+        assert!(state.slash_panel_is_open());
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Tab)),
+            InputAction::SlashPanelAccept
+        );
+
+        let action = map_key_event(&state, key(KeyCode::Backspace));
+        assert_eq!(action, InputAction::Backspace);
+        assert!(apply_edit_action(&mut state, &action));
+        assert!(state.input_buffer.is_empty());
+        assert!(!state.slash_panel_is_open());
+    }
+
+    #[test]
     fn long_text_paste_becomes_an_atomic_composer_token() {
         let state = TuiState::default();
         let pasted = "one\ntwo\nthree".to_string();
@@ -1055,6 +1197,12 @@ mod tests {
         dialog.config_fields = vec![ConfigFieldRef::Choice(vec!["protocol".into()])];
         dialog.config_expanded = Some(0);
         state.open_dialog(dialog);
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::NoOp
+            );
+        }
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('a'))),
             InputAction::NoOp
@@ -1097,6 +1245,12 @@ mod tests {
             buffer: String::new(),
             cursor: 0,
         });
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::ConfigEditBackspace
+            );
+        }
         assert_eq!(
             map_key_event(&state, key(KeyCode::Enter)),
             InputAction::ConfigEditConfirm
@@ -1121,6 +1275,12 @@ mod tests {
         state.config_edit = None;
         state.dialog_mut().expect("dialog").config_expanded = None;
         state.dialog_mut().expect("dialog").config_close_selected = Some(0);
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::NoOp
+            );
+        }
         assert_eq!(
             map_key_event(&state, key(KeyCode::Enter)),
             InputAction::DialogAccept
@@ -1208,6 +1368,16 @@ mod tests {
                     InputAction::NoOp
                 }
             );
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+                assert_eq!(
+                    map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                    if searchable {
+                        InputAction::DialogBackspace
+                    } else {
+                        InputAction::NoOp
+                    }
+                );
+            }
             assert_eq!(
                 map_paste_event(&state, "x".into()),
                 if searchable {
@@ -1327,6 +1497,12 @@ mod tests {
         state.pending_permission = Some(crate::tui::PermissionView::from_request(
             PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
         ));
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::NoOp
+            );
+        }
 
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('y'))),
@@ -1473,6 +1649,12 @@ mod tests {
             },
             None,
         ));
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::NoOp
+            );
+        }
 
         assert_eq!(
             map_key_event(&state, key(KeyCode::Right)),
@@ -1583,6 +1765,12 @@ mod tests {
         question.active_row.focus(1);
         question.begin_custom_edit();
         state.pending_question = Some(question);
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                map_key_event(&state, KeyEvent::new(KeyCode::Backspace, modifiers)),
+                InputAction::QuestionBackspace
+            );
+        }
 
         assert_eq!(
             map_key_event(&state, key(KeyCode::Left)),

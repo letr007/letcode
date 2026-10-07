@@ -2880,6 +2880,198 @@ fn running_turn_queues_plain_prompts() {
 }
 
 #[test]
+fn ctrl_backspace_removes_latest_queued_prompt_without_changing_draft_or_active_turn() {
+    let mut runtime = runtime();
+    runtime.session_turn_active = true;
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().active_tool_call_id = Some("tool-1".into());
+    for text in ["first", "same", "same"] {
+        runtime.state_mut().set_input(text);
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+    }
+    let submission_ids: Vec<_> = runtime
+        .queued_prompts
+        .iter()
+        .map(|prompt| prompt.id.clone())
+        .collect();
+
+    runtime.state_mut().set_input("draft in progress");
+    assert!(runtime.state_mut().add_composer_skill("rust-audit".into()));
+    runtime
+        .state_mut()
+        .add_composer_attachment(UserImageAttachment {
+            id: "draft-image".into(),
+            label: "screen.png".into(),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        });
+    runtime.state_mut().input_cursor = 4;
+    let draft = runtime.state().input_buffer.clone();
+    let tokens = runtime.state().composer_tokens.clone();
+    let lifecycle = runtime.queued_prompt_lifecycle.clone();
+    let action = map_key_event(
+        runtime.state(),
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+    );
+
+    assert_eq!(
+        runtime
+            .handle_input_action(action)
+            .expect("remove succeeds"),
+        None
+    );
+    assert_eq!(
+        runtime
+            .queued_prompts
+            .iter()
+            .map(|prompt| prompt.id.clone())
+            .collect::<Vec<_>>(),
+        submission_ids[..2]
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::User(message) if message.queued => message.submission_id.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        submission_ids[..2]
+    );
+    assert_eq!(runtime.state().input_buffer, draft);
+    assert_eq!(runtime.state().input_cursor, 4);
+    assert_eq!(runtime.state().composer_tokens, tokens);
+    assert_eq!(runtime.state().phase, AppPhase::Running);
+    assert_eq!(
+        runtime.state().active_tool_call_id.as_deref(),
+        Some("tool-1")
+    );
+    assert!(runtime.session_turn_active);
+    assert_eq!(runtime.queued_prompt_lifecycle, lifecycle);
+
+    runtime
+        .handle_input_action(InputAction::HistoryPrev)
+        .expect("history navigation succeeds");
+    assert_eq!(runtime.state().input_buffer, "same");
+    runtime
+        .handle_input_action(InputAction::HistoryNext)
+        .expect("draft restore succeeds");
+    assert_eq!(runtime.state().input_buffer, draft);
+    assert_eq!(runtime.state().input_cursor, 4);
+    assert_eq!(runtime.state().composer_tokens, tokens);
+
+    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
+    else {
+        panic!("expected remaining queued prompt");
+    };
+    assert_eq!(prompt.id, submission_ids[0]);
+}
+
+#[test]
+fn removing_queued_prompts_preserves_inflight_handoff() {
+    for accepted in [false, true] {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        for text in ["same", "second", "same"] {
+            runtime.state_mut().set_input(text);
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("queue succeeds");
+        }
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command");
+        };
+        if accepted {
+            runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+                prompt: prompt.clone(),
+            });
+        }
+        let lifecycle = runtime.queued_prompt_lifecycle.clone();
+        for _ in 0..3 {
+            assert_eq!(
+                runtime
+                    .handle_input_action(InputAction::RemoveLastQueuedPrompt)
+                    .expect("remove succeeds"),
+                None
+            );
+        }
+        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert_eq!(runtime.queued_prompts[0].id, prompt.id);
+        assert_eq!(runtime.queued_prompt_lifecycle, lifecycle);
+        assert!(runtime.session_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Running);
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [TimelineItem::User(message)] if message.submission_id.as_deref() == Some(prompt.id.as_str())
+                && message.queued
+        ));
+
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(prompt),
+        ));
+        assert!(runtime.queued_prompts.is_empty());
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    }
+}
+
+#[test]
+fn removing_last_queued_prompt_is_idle_when_queue_is_empty() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("draft");
+    let phase = runtime.state().phase;
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::RemoveLastQueuedPrompt)
+            .expect("empty queue is unchanged"),
+        None
+    );
+    assert_eq!(runtime.state().input_buffer, "draft");
+    assert_eq!(runtime.state().phase, phase);
+    assert!(runtime.state().timeline.items().is_empty());
+    assert!(!runtime.session_turn_active);
+    assert_eq!(runtime.take_next_queued_prompt_command(), None);
+}
+
+#[test]
+fn child_view_preserves_parent_queued_prompts_on_remove_action() {
+    let mut runtime = runtime();
+    runtime.state_mut().phase = AppPhase::Running;
+    runtime.state_mut().set_input("follow up");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds");
+    let submission_id = runtime.queued_prompts[0].id.clone();
+    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id: "parent-session".into(),
+        child_session_id: "child-session".into(),
+        agent_name: "explorer".into(),
+        index: 0,
+        total: 1,
+        pool_ordinal: 1,
+        in_progress_assistant_text: None,
+        records: vec![],
+        runtime_context: event_context("child-session", 1),
+    });
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::RemoveLastQueuedPrompt)
+            .expect("parent queue is unchanged"),
+        None
+    );
+    assert_eq!(runtime.queued_prompts.len(), 1);
+    assert_eq!(runtime.queued_prompts[0].id, submission_id);
+}
+
+#[test]
 fn panel_command_toggles_visibility() {
     let mut runtime = runtime();
     runtime.state_mut().last_terminal_width = 160;
