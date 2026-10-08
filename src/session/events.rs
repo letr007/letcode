@@ -140,6 +140,7 @@ pub(crate) struct ModelCatalogUpdatedEvent {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionTransportEvent {
+    TurnStarted,
     UserMessage(UserMessageEvent),
     ReasoningDelta(ReasoningDeltaEvent),
     ReasoningDone(ReasoningDoneEvent),
@@ -325,6 +326,7 @@ pub(crate) enum SessionTransportEvent {
 impl SessionTransportEvent {
     pub fn session_event(&self) -> Option<SessionEvent> {
         match self {
+            Self::TurnStarted => Some(SessionEvent::TurnStarted),
             Self::UserMessage(event) => Some(SessionEvent::UserMessage(event.clone())),
             Self::ReasoningDelta(event) => Some(SessionEvent::ReasoningDelta(event.clone())),
             Self::ReasoningDone(event) => Some(SessionEvent::ReasoningDone(event.clone())),
@@ -449,6 +451,12 @@ pub(super) fn wrap_child_session_transport_event(
     event: SessionTransportEvent,
 ) -> SessionTransportEvent {
     match event {
+        SessionTransportEvent::TurnStarted => SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
+            event: SessionEvent::TurnStarted,
+        },
         SessionTransportEvent::UserMessage(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),

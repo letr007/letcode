@@ -68,8 +68,6 @@ use support::{
 mod command_dispatch;
 #[path = "runtime/history_tree_dialog.rs"]
 mod history_tree_dialog;
-#[path = "runtime/lifecycle.rs"]
-mod lifecycle;
 #[path = "runtime/permission_lifecycle.rs"]
 mod permission_lifecycle;
 #[path = "runtime/queued_prompt.rs"]
@@ -82,7 +80,6 @@ mod session_command_adapter;
 #[path = "runtime/session_dialog.rs"]
 mod session_dialog;
 use history_tree_dialog::history_tree_dialog_items;
-use lifecycle::{active_turn_state, has_active_or_pending_session_turn};
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
 use session_dialog::session_dialog_items;
@@ -358,7 +355,7 @@ impl TuiRuntime {
         };
         let title = format_terminal_title(
             self.session_title.as_deref(),
-            (pending_marker.is_none() && self.has_active_or_pending_session_turn())
+            (pending_marker.is_none() && self.engine_turn_is_active())
                 .then_some(self.spinner_frame / TERMINAL_TITLE_TICKS_PER_FRAME),
         );
         match pending_marker {
@@ -862,7 +859,7 @@ impl TuiRuntime {
 
     fn handle_session_event_stream_closed(&mut self) {
         self.session_transport_stream_close_reported = true;
-        let terminalize = self.has_active_or_pending_session_turn() || self.session_resume_pending;
+        let terminalize = self.has_cancellable_work() || self.session_resume_pending;
         if !self.state.quit_requested {
             self.permission_lifecycle.clear();
             let _ = self
@@ -1291,6 +1288,11 @@ impl TuiRuntime {
         let mut suppress_session_event = false;
 
         match &event {
+            SessionTransportEvent::TurnStarted => {
+                self.session_turn_active = true;
+                self.current_turn_output_tokens = 0;
+                self.queued_prompt_lifecycle.clear_dispatch_ready();
+            }
             SessionTransportEvent::QuestionRequested { request, handle }
                 if self
                     .begin_pending_question(request.clone(), handle.clone(), None)
@@ -2759,20 +2761,28 @@ impl TuiRuntime {
     }
 
     fn engine_turn_is_active(&self) -> bool {
-        has_active_or_pending_session_turn(active_turn_state(
-            &self.state,
-            self.session_turn_active,
-            self.queued_prompt_lifecycle.has_inflight_handoff(),
-            self.permission_lifecycle.is_pending(),
-        ))
+        self.session_turn_active || self.queued_prompt_lifecycle.has_inflight_handoff()
     }
 
-    fn has_active_or_pending_session_turn(&self) -> bool {
-        self.state.has_running_child_session() || self.engine_turn_is_active()
+    fn has_cancellable_work(&self) -> bool {
+        self.engine_turn_is_active() || self.state.has_running_child_session()
+    }
+
+    fn history_command_is_unavailable(&self, command: &crate::session::SessionCommand) -> bool {
+        matches!(
+            command,
+            crate::session::SessionCommand::ShowHistoryTree
+                | crate::session::SessionCommand::Undo
+                | crate::session::SessionCommand::Redo
+                | crate::session::SessionCommand::NavigateHistory { .. }
+        ) && self.history_navigation_is_unavailable()
     }
 
     fn history_navigation_is_unavailable(&self) -> bool {
-        self.has_active_or_pending_session_turn()
+        self.engine_turn_is_active()
+            || self.state.has_running_child_session()
+            || self.permission_lifecycle.is_pending()
+            || self.state.pending_permission.is_some()
             || self.state.pending_question.is_some()
             || self.pending_question_handle.is_some()
             || !self.queued_prompts.is_empty()
@@ -2819,11 +2829,22 @@ impl TuiRuntime {
             return Ok(None);
         }
         self.reset_history_navigation();
-        let active_session_turn = self.has_active_or_pending_session_turn();
-        let active_turn_disposition = parsed_command.as_ref().ok().and_then(|intent| {
-            crate::session::SessionCommand::from_command_intent(intent.clone())
-                .map(|command| command.active_turn_disposition())
-        });
+        let active_session_turn = self.engine_turn_is_active();
+        let session_command = parsed_command
+            .as_ref()
+            .ok()
+            .and_then(|intent| crate::session::SessionCommand::from_command_intent(intent.clone()));
+        if session_command
+            .as_ref()
+            .is_some_and(|command| self.history_command_is_unavailable(command))
+        {
+            self.state
+                .show_toast(self.state.t("runtime.turn_running"), ToastKind::Info);
+            return Ok(None);
+        }
+        let active_turn_disposition = session_command
+            .as_ref()
+            .map(crate::session::SessionCommand::active_turn_disposition);
         let active_turn_local_rejected = matches!(
             &parsed_command,
             Ok(CommandIntent::Exit | CommandIntent::ResumeShow)
@@ -3019,7 +3040,7 @@ impl TuiRuntime {
     }
 
     fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
-        if !self.has_active_or_pending_session_turn() {
+        if !self.has_cancellable_work() {
             self.interrupt_confirmation_pending = false;
             return Ok(None);
         }
@@ -5113,7 +5134,7 @@ impl TuiRuntime {
             );
             return Ok(None);
         }
-        if !self.has_active_or_pending_session_turn() {
+        if !self.engine_turn_is_active() {
             self.state
                 .set_mcp_server_updating(server_name.clone(), true);
             self.refresh_open_mcp_dialog();

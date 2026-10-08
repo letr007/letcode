@@ -43,6 +43,13 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
                 *projection.toast = None;
             }
         }
+        SessionEvent::TurnStarted => {
+            *projection.active_session = true;
+            *projection.retry = None;
+            *projection.phase = AppPhase::Running;
+            *projection.active_tool_call_id = None;
+            *projection.ignore_late_tool_events = false;
+        }
         SessionEvent::UserMessage(message) => {
             *projection.active_session = true;
             projection.timeline.push_user_message(message);

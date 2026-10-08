@@ -2465,6 +2465,8 @@ async fn run_engine_loop(
                     continue;
                 }
 
+                let _ = session_transport_tx.send(SessionTransportEvent::TurnStarted);
+
                 let turn_continuation_queue = Arc::new(StdMutex::new(
                     crate::agent::TurnContinuationQueue::default(),
                 ));
@@ -5123,7 +5125,50 @@ base_url = "http://127.0.0.1:1"
 
     #[tokio::test]
     async fn a_recorded_background_result_is_delivered_once_and_continues_the_session() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
         tokio::time::timeout(Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+            let (stop_stub_tx, stop_stub_rx) = tokio::sync::oneshot::channel();
+            let stub = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    let (stream, _) = listener.accept().await.expect("stub accepts the request");
+                    let mut stream = tokio::io::BufReader::new(stream);
+                    let mut content_length = None;
+                    loop {
+                        let mut line = String::new();
+                        let read = stream.read_line(&mut line).await.expect("stub header read");
+                        assert!(read > 0, "stub request closed before headers");
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let mut body = vec![0; content_length.expect("responses request has content length")];
+                    stream.read_exact(&mut body).await.expect("stub body read");
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                    stream
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("stub response headers");
+                    request_tx.send(request).expect("the request is observed");
+                    stop_stub_rx.await.expect("the stub is stopped after interruption");
+                    drop(stream);
+                })
+                .await
+                .expect("responses stub timed out");
+            });
+
             let directory = tempfile::tempdir().unwrap();
             let config_path = directory.path().join("letcode.toml");
             let sessions_dir = directory.path().join("sessions");
@@ -5143,7 +5188,7 @@ default_model = "model"
 type = "bearer"
 credential = "test-key"
 [providers.test.endpoints]
-base_url = "http://127.0.0.1:1"
+base_url = "http://{address}"
 [providers.test.models.model]
 # Retains the pre-recorded history, so historian work stays out of the turn.
 context_window = 128000
@@ -5232,51 +5277,99 @@ max_output_tokens = 4096
             };
 
             ingress.submit_transitional(completion()).unwrap();
-            let delivery = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut deliveries = 0;
                 loop {
-                    match events.recv().await {
-                        Some(SessionTransportEvent::BackgroundSubagentCompleted { .. }) => {
-                            return true;
+                    match events.recv().await.expect("engine event stream") {
+                        SessionTransportEvent::BackgroundSubagentCompleted { .. } => {
+                            deliveries += 1;
                         }
-                        Some(_) => {}
-                        None => return false,
+                        SessionTransportEvent::TurnStarted => {
+                            assert_eq!(deliveries, 1, "the recorded result is delivered before execution");
+                            break;
+                        }
+                        SessionTransportEvent::AssistantDelta(_)
+                        | SessionTransportEvent::ReasoningDelta(_) => {
+                            panic!("execution must start before model output");
+                        }
+                        SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                        SessionTransportEvent::Done | SessionTransportEvent::Interrupted => {
+                            panic!("the continuation ended before execution started");
+                        }
+                        _ => {}
                     }
                 }
             })
             .await
-            .expect("the delivered event arrives");
-            assert!(delivery, "a recorded result must still be delivered");
+            .expect("the continuation starts before the first response output");
 
-            let mut continued = false;
-            for _ in 0..100 {
-                let records = read_records(transcript.lock().unwrap().path()).unwrap();
-                continued = records.iter().any(|record| {
-                    matches!(
-                        &record.event,
-                        TranscriptEvent::InternalContinuation {
-                            source:
-                                crate::transcript::InternalContinuationSource::SubagentCompletion,
-                            ..
+            let request = tokio::time::timeout(Duration::from_secs(10), request_rx)
+                .await
+                .expect("the continuation reaches the provider")
+                .expect("the stub reports the request");
+            assert_eq!(request["model"], "model");
+            assert!(
+                request["input"].to_string().contains("the child finished"),
+                "the model request includes the background result"
+            );
+
+            ingress.request_interrupt().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await.expect("engine event stream") {
+                        SessionTransportEvent::Interrupted => break,
+                        SessionTransportEvent::TurnStarted
+                        | SessionTransportEvent::BackgroundSubagentCompleted { .. } => {
+                            panic!("the result must start exactly one execution");
                         }
-                    )
-                });
-                if continued {
-                    break;
+                        SessionTransportEvent::AssistantDelta(_)
+                        | SessionTransportEvent::ReasoningDelta(_) => {
+                            panic!("the stub holds the first model output until interruption");
+                        }
+                        SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                        SessionTransportEvent::Done => panic!("the held request completed before interruption"),
+                        _ => {}
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(continued, "the completion must queue a continuation turn");
+            })
+            .await
+            .expect("a continuation waiting for model output can be interrupted");
+            stop_stub_tx.send(()).unwrap();
+            stub.await.unwrap();
 
             ingress.submit_transitional(completion()).unwrap();
-            let duplicate = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
-            assert!(
-                !matches!(
-                    duplicate,
-                    Ok(Some(
-                        SessionTransportEvent::BackgroundSubagentCompleted { .. }
+            let (history_tx, history_rx) = tokio::sync::oneshot::channel();
+            ingress
+                .submit_transitional(SessionEngineCommand::InspectHistory(history_tx))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), history_rx)
+                .await
+                .expect("the duplicate completion leaves the engine idle")
+                .expect("the engine reports its history");
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    SessionTransportEvent::BackgroundSubagentCompleted { .. }
+                    | SessionTransportEvent::TurnStarted => {
+                        panic!("the same run must not be delivered or executed twice");
+                    }
+                    SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                    _ => {}
+                }
+            }
+            let records = read_records(transcript.lock().unwrap().path()).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(
+                        &record.event,
+                        TranscriptEvent::InternalContinuation {
+                            source: crate::transcript::InternalContinuationSource::SubagentCompletion,
+                            ..
+                        }
                     ))
-                ),
-                "the same run must not be delivered twice"
+                    .count(),
+                1,
+                "the background result continues the session once"
             );
 
             ingress.shutdown().unwrap();

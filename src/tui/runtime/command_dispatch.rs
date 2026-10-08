@@ -75,7 +75,7 @@ mod tests {
                 blockers: Vec::new(),
             });
             runtime.apply_session_transport_event(SessionTransportEvent::Done);
-            assert!(!runtime.has_active_or_pending_session_turn());
+            assert!(!runtime.engine_turn_is_active());
             assert_eq!(runtime.state.phase, AppPhase::Completed);
         }
     }
@@ -164,7 +164,7 @@ mod tests {
 
         dispatch_command(&mut runtime, command, &ingress, true);
 
-        assert!(!runtime.has_active_or_pending_session_turn());
+        assert!(!runtime.engine_turn_is_active());
         assert_eq!(runtime.state.phase, AppPhase::Completed);
     }
 
@@ -426,7 +426,7 @@ mod tests {
 
         assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
         assert_eq!(runtime.queued_prompts.len(), 1);
-        assert!(!runtime.has_active_or_pending_session_turn());
+        assert!(!runtime.engine_turn_is_active());
     }
 
     #[test]

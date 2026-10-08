@@ -1498,8 +1498,8 @@ fn history_tree_acceptance_rechecks_pending_running_queued_question_and_inflight
 }
 
 #[test]
-fn navigation_commands_are_blocked_for_running_pending_and_queued_turns() {
-    for state in ["running", "pending", "queued"] {
+fn navigation_commands_respect_pending_work() {
+    for state in ["running", "pending", "queued", "background"] {
         let mut runtime = runtime();
         match state {
             "running" => runtime.session_turn_active = true,
@@ -1513,17 +1513,43 @@ fn navigation_commands_are_blocked_for_running_pending_and_queued_turns() {
             "queued" => runtime
                 .queued_prompt_lifecycle
                 .dispatch(UserMessageSubmission::from("queued")),
+            "background" => {
+                runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+                    child_session_id: "background-child".into(),
+                    agent_name: Some("explorer".into()),
+                    parent_tool_call_id: None,
+                    event: SessionEvent::UserMessage(UserMessageEvent::new("background work")),
+                });
+                runtime.apply_session_transport_event(SessionTransportEvent::Done);
+            }
             _ => unreachable!(),
         }
-        runtime.state_mut().set_input("/undo");
-        assert_eq!(
-            runtime
-                .handle_input_action(InputAction::Submit)
-                .expect("submit"),
-            None,
-            "{state} turn must block undo"
-        );
-        assert_eq!(runtime.state().input_buffer, "/undo");
+        for input in ["/undo", "/redo", "/tree"] {
+            runtime.state_mut().set_input(input);
+            assert_eq!(
+                runtime
+                    .handle_input_action(InputAction::Submit)
+                    .expect("submit"),
+                None,
+                "{state} must block {input}"
+            );
+            assert_eq!(runtime.state().input_buffer, input);
+        }
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        for command in [
+            RuntimeCommand::Undo,
+            RuntimeCommand::Redo,
+            RuntimeCommand::ShowHistoryTree,
+            RuntimeCommand::NavigateHistory {
+                target_entry_id: "entry-1".into(),
+            },
+        ] {
+            command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+            assert!(matches!(
+                engine.try_recv_control(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 }
 
@@ -2074,7 +2100,7 @@ fn parent_view_refresh_preserves_confirmed_reasoning_effort() {
 fn running_turn_blocks_exit_and_quit_commands() {
     for command_text in ["exit", "quit", "/exit", "/quit"] {
         let mut runtime = runtime();
-        runtime.state_mut().phase = AppPhase::Running;
+        runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
         runtime.state_mut().set_input(command_text);
 
         let command = runtime
@@ -2092,7 +2118,14 @@ fn running_turn_blocks_exit_and_quit_commands() {
 #[test]
 fn double_escape_confirms_running_turn_interrupt() {
     let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
     runtime.state.phase = AppPhase::Running;
+    assert!(!runtime.engine_turn_is_active());
+
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
+    assert!(runtime.engine_turn_is_active());
+    assert_eq!(runtime.state.phase, AppPhase::Running);
+    assert!(runtime.state.timeline.items().is_empty());
 
     let first = runtime
         .handle_input_action(InputAction::Interrupt)
@@ -2103,6 +2136,55 @@ fn double_escape_confirms_running_turn_interrupt() {
         .handle_input_action(InputAction::Interrupt)
         .expect("second interrupt returns command");
     assert_eq!(second, Some(RuntimeCommand::Interrupt));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::ToolStarted(
+        ToolStartedEvent::new("call-1", "shell__exec", "run ls"),
+    ));
+    assert_eq!(runtime.state.active_tool_call_id.as_deref(), Some("call-1"));
+    runtime.state.set_input("follow up");
+    assert_eq!(
+        runtime.handle_input_action(InputAction::Submit).unwrap(),
+        None
+    );
+    assert_eq!(runtime.queued_prompts.len(), 1);
+}
+
+#[test]
+fn background_children_do_not_hold_parent_turn_open() {
+    for terminal in [
+        SessionTransportEvent::Done,
+        SessionTransportEvent::Interrupted,
+    ] {
+        let mut runtime = runtime();
+        runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+            child_session_id: "background-child".into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::UserMessage(UserMessageEvent::new("background work")),
+        });
+        runtime.apply_session_transport_event(terminal);
+
+        assert!(!runtime.engine_turn_is_active());
+        assert!(runtime.state.has_running_child_session());
+        assert_eq!(runtime.state.phase, AppPhase::Completed);
+        assert_eq!(
+            runtime.handle_input_action(InputAction::Interrupt).unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime.handle_input_action(InputAction::Interrupt).unwrap(),
+            Some(RuntimeCommand::Interrupt)
+        );
+        assert!(!runtime.engine_turn_is_active());
+
+        runtime.state.set_input("next prompt");
+        assert!(matches!(
+            runtime.handle_input_action(InputAction::Submit).unwrap(),
+            Some(RuntimeCommand::SubmitPrompt(prompt)) if prompt.text() == "next prompt"
+        ));
+        assert!(runtime.queued_prompts.is_empty());
+    }
 }
 
 fn timeline_has_streaming_reasoning(runtime: &TuiRuntime) -> bool {
@@ -2202,7 +2284,7 @@ fn real_interrupted_after_second_escape_is_idempotent() {
 #[test]
 fn ctrl_c_arms_interrupt_confirmation_while_turn_is_running() {
     let mut runtime = runtime();
-    runtime.state.phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
 
     let first = runtime
         .handle_input_action(InputAction::Quit)
@@ -2275,7 +2357,7 @@ fn ctrl_c_quits_when_only_a_stale_child_session_phase_is_running() {
 #[test]
 fn interrupt_confirmation_survives_tick() {
     let mut runtime = runtime();
-    runtime.state.phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
 
     runtime
         .handle_input_action(InputAction::Interrupt)
@@ -3211,7 +3293,7 @@ fn running_turn_queues_plain_prompts() {
     runtime
         .state_mut()
         .show_toast("stale notice", ToastKind::Info);
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
 
     let command = runtime
@@ -3397,7 +3479,7 @@ fn removing_last_queued_prompt_is_idle_when_queue_is_empty() {
 #[test]
 fn child_view_preserves_parent_queued_prompts_on_remove_action() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
     runtime
         .handle_input_action(InputAction::Submit)
@@ -3489,7 +3571,7 @@ fn submitted_long_paste_history_matches_trimmed_prompt_content() {
 #[test]
 fn running_turn_preserves_selected_skills_in_queued_prompt() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
     assert!(runtime.state_mut().add_composer_skill("rust-audit".into()));
 
@@ -3508,7 +3590,7 @@ fn running_turn_preserves_selected_skills_in_queued_prompt() {
 #[test]
 fn running_turn_rejects_delegate_commands_without_queueing() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("@fixer fix failing test");
 
     let command = runtime
@@ -3884,7 +3966,7 @@ fn parent_view_navigation_projection_failure_restores_pending_question() {
 #[test]
 fn dispatched_queued_prompt_failure_before_ack_clears_handoff_without_redispatch() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
     runtime
         .handle_input_action(InputAction::Submit)
@@ -4074,7 +4156,7 @@ fn manual_submit_during_queued_handoff_is_queued_behind_pending_prompt() {
 #[test]
 fn queued_prompt_dispatches_after_turn_done() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
     runtime
         .handle_input_action(InputAction::Submit)
@@ -4121,7 +4203,7 @@ fn queued_prompt_dispatches_after_turn_done() {
 #[test]
 fn queued_prompts_become_history_on_interruption() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
     runtime
         .handle_input_action(InputAction::Submit)
@@ -4283,7 +4365,7 @@ fn queued_prompt_dispatches_after_tool_batch_finished() {
 #[test]
 fn non_terminal_error_does_not_drop_or_dispatch_queued_prompt() {
     let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("follow up");
     runtime
         .handle_input_action(InputAction::Submit)
@@ -5073,6 +5155,15 @@ async fn child_permission_request_survives_view_switch_and_can_be_approved() {
         handle: RunnerPermissionRequest::new(tx),
     });
     runtime.state_mut().restore_parent_timeline_view();
+    assert_eq!(runtime.state.phase, AppPhase::WaitingForPermission);
+    assert!(!runtime.engine_turn_is_active());
+    runtime.state.set_input("next prompt");
+    assert_eq!(
+        runtime.handle_input_action(InputAction::Submit).unwrap(),
+        None
+    );
+    assert!(runtime.queued_prompts.is_empty());
+    assert_eq!(runtime.state.input_buffer, "next prompt");
 
     runtime
         .handle_input_action(InputAction::ApprovePermission)

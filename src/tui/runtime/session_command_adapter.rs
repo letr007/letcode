@@ -38,7 +38,7 @@ impl<'a> TuiSessionCommandAdapter<'a> {
     }
 
     fn submit(&mut self, command: SessionCommand) -> Result<()> {
-        let active_turn = self.runtime.has_active_or_pending_session_turn();
+        let active_turn = self.runtime.engine_turn_is_active();
         let pending_mcp_server = match &command {
             SessionCommand::ToggleMcpServer(server_name) => Some(server_name.clone()),
             _ => None,
@@ -48,11 +48,12 @@ impl<'a> TuiSessionCommandAdapter<'a> {
                 command.active_turn_disposition(),
                 ActiveTurnCommandDisposition::Defer
             );
-        let rejected = active_turn
-            && matches!(
-                command.active_turn_disposition(),
-                ActiveTurnCommandDisposition::Reject
-            );
+        let rejected = self.runtime.history_command_is_unavailable(&command)
+            || active_turn
+                && matches!(
+                    command.active_turn_disposition(),
+                    ActiveTurnCommandDisposition::Reject
+                );
         if rejected {
             let message = self.runtime.state().t("runtime.turn_running");
             self.runtime.show_toast(message, ToastKind::Info);

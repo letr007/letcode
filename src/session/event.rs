@@ -15,6 +15,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Tick,
+    TurnStarted,
     UserMessage(UserMessageEvent),
     ReasoningDelta(ReasoningDeltaEvent),
     ReasoningDone(ReasoningDoneEvent),
