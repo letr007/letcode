@@ -867,13 +867,12 @@ where {
                                     }
                                 }
                                 AgentEvent::FastModeChanged { enabled } => {
-                                    send_scoped_event(
-                                        &sender,
-                                        child_session_id.as_deref(),
-                                        agent_name.as_deref(),
-                                        parent_tool_call_id.as_deref(),
-                                        SessionTransportEvent::FastModeChanged { enabled },
-                                    )?;
+                                    if child_session_id.is_none() {
+                                        send_optional_event(
+                                            &sender,
+                                            SessionTransportEvent::FastModeChanged { enabled },
+                                        )?;
+                                    }
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -1585,6 +1584,127 @@ mod tests {
             Some("provider says the request field is invalid")
         );
         assert!(recorded_error_message(&event).contains("Provider response:"));
+    }
+
+    #[tokio::test]
+    async fn fast_mode_auto_disable_keeps_child_settings_out_of_parent_events() {
+        use crate::agent::{AgentFactory, AgentTemplate};
+        use crate::config::ModelRoute;
+        use crate::model_runtime::{ProtocolRegistry, RuntimeConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        for child_session_id in [None, Some("child-session")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                timeout(Duration::from_secs(5), async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = std::str::from_utf8(&request[..at]).unwrap();
+                            let length = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap();
+                            if request.len() >= at + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let body = concat!(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }).await.unwrap();
+            });
+            let catalog = RuntimeConfig::from_toml(&format!(
+                r#"active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model.capabilities]
+tools = true
+parallel_tool_calls = true
+[providers.test.models.model.capabilities.generation]
+parallel_tool_calls = true
+"#
+            ))
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap();
+            let route = Arc::new(catalog.route("test", "model").unwrap().clone());
+            let mode = crate::fast_mode::FastMode::load("letcode.toml", true);
+            let mut parent = Agent::new("gpt-test", 1, 1);
+            parent.set_fast_mode(mode.clone());
+            let mut agent = if child_session_id.is_some() {
+                AgentFactory::create_child(&parent, &AgentTemplate::explorer())
+            } else {
+                parent
+            };
+            agent.set_resolved_runtime_catalog(Some(catalog));
+            agent.set_model_route_authority(ModelRoute::new("test", "model"), route);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut runner = AgentRunner::new(tx);
+            runner.child_session_id = child_session_id.map(str::to_owned);
+            let result = timeout(
+                Duration::from_secs(5),
+                runner.run_prompt(
+                    &mut agent,
+                    UserMessageSubmission::new("prompt", UserMessageContent::from("say ok")),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, "ok");
+            server.await.unwrap();
+            assert!(!agent.fast_mode_enabled());
+            assert_eq!(mode.enabled(), child_session_id.is_some());
+
+            let mut settings_changes = 0;
+            let mut auto_disable_notice = false;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    SessionTransportEvent::FastModeChanged { enabled } => {
+                        assert!(!enabled);
+                        settings_changes += 1;
+                    }
+                    SessionTransportEvent::ChildSessionEvent {
+                        child_session_id: id,
+                        event: SessionEvent::Notice(notice),
+                        ..
+                    } if notice.message.contains("Fast mode auto-disabled") => {
+                        assert_eq!(Some(id.as_str()), child_session_id);
+                        auto_disable_notice = true;
+                    }
+                    SessionTransportEvent::Notice(notice)
+                        if notice.message.contains("Fast mode auto-disabled") =>
+                    {
+                        assert!(child_session_id.is_none());
+                        auto_disable_notice = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(settings_changes, usize::from(child_session_id.is_none()));
+            assert!(auto_disable_notice);
+        }
     }
 
     #[test]
