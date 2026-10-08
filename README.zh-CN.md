@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/letr007/letcode/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/letr007/letcode/test.yml?branch=main&style=flat-square" alt="Test"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-0.17.0-informational?style=flat-square" alt="Changelog"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fletr007%2Fletcode%2Fmain%2FCHANGELOG.md&amp;search=%5E%23%23%20%5C%5B%28%5B0-9%5D%2B%5C.%5B0-9%5D%2B%5C.%5B0-9%5D%2B%29%5C%5D&amp;replace=%241&amp;flags=m&amp;label=changelog&amp;color=informational&amp;style=flat-square" alt="Changelog"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue?style=flat-square" alt="MIT License | Apache-2.0 License"></a>
 </p>
 
