@@ -1705,27 +1705,28 @@ mod tests {
     }
 
     #[test]
-    fn fixer_requires_owned_paths_for_file_locking() {
-        let missing = normalize_subagent_input(
-            "agent__fixer",
-            &json!({
-                "task": "fix",
-                "objective": null,
-                "success_criteria": null,
-                "allowed_paths": null,
-                "forbidden_paths": null,
-                "owned_paths": null,
-                "model": null,
-                "target_child_session_id": null,
-                "background": true
-            }),
-        )
-        .expect_err("fixer without locks must fail");
-        assert!(
-            missing
-                .to_string()
-                .contains("requires non-empty owned_paths")
-        );
+    fn writable_subagents_require_owned_paths_for_file_locking() {
+        for tool in ["agent__fixer", "agent__general"] {
+            for args in [
+                json!({"task": "implement"}),
+                json!({"task": "implement", "owned_paths": null}),
+                json!({"task": "implement", "owned_paths": []}),
+            ] {
+                let missing = normalize_subagent_input(tool, &args)
+                    .expect_err("writable subagent without locks must fail");
+                assert!(
+                    missing
+                        .to_string()
+                        .contains(&format!("{tool} requires non-empty owned_paths"))
+                );
+            }
+            let input = normalize_subagent_input(
+                tool,
+                &json!({"task": "implement", "owned_paths": ["src"]}),
+            )
+            .expect("writable subagent with owned paths normalizes");
+            assert_eq!(input.owned_paths, vec!["src"]);
+        }
     }
 
     #[test]
@@ -1774,22 +1775,24 @@ mod tests {
 
     #[test]
     fn normalized_subagent_input_enforces_write_scope_paths() {
-        let input = normalize_subagent_input(
-            "agent__fixer",
-            &json!({
-                "objective": "fix",
-                "allowed_paths": ["src"],
-                "owned_paths": ["src/fixes"],
-                "forbidden_paths": ["src/secrets"]
-            }),
-        )
-        .expect("scope should normalize");
+        for tool in ["agent__fixer", "agent__general"] {
+            let input = normalize_subagent_input(
+                tool,
+                &json!({
+                    "objective": "fix",
+                    "allowed_paths": ["src"],
+                    "owned_paths": ["src/fixes"],
+                    "forbidden_paths": ["src/secrets"]
+                }),
+            )
+            .expect("scope should normalize");
 
-        assert!(input.has_write_scope());
-        assert!(input.permits_write_path("src/fixes/mod.rs"));
-        assert!(input.permits_write_path("src/lib.rs"));
-        assert!(!input.permits_write_path("src/secrets/token.rs"));
-        assert!(!input.permits_write_path("tests/outside.rs"));
+            assert!(input.has_write_scope());
+            assert!(input.permits_write_path("src/fixes/mod.rs"));
+            assert!(input.permits_write_path("src/lib.rs"));
+            assert!(!input.permits_write_path("src/secrets/token.rs"));
+            assert!(!input.permits_write_path("tests/outside.rs"));
+        }
     }
 
     #[tokio::test]

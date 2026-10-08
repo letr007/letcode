@@ -66,9 +66,9 @@ pub(crate) const SUBAGENT_CATALOG: &[SubagentCatalogEntry] = &[
     SubagentCatalogEntry {
         agent_name: "general",
         tool_name: tool_names::TOOL_AGENT_GENERAL,
-        task_description: "交给 general 子代理执行的限定范围只读通用辅助任务",
-        tool_description: "将限定范围的只读通用辅助任务委派给 general 子代理，并返回摘要。",
-        read_only: true,
+        task_description: "交给 general 子代理执行的限定范围通用任务，可读取和修改文件",
+        tool_description: "将限定范围的通用任务委派给可读可写的 general 子代理，并返回摘要。",
+        read_only: false,
     },
 ];
 
@@ -126,7 +126,7 @@ impl AgentTemplate {
             can_delegate: false,
             timeout_secs: None,
             max_tool_calls: None,
-            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
+            input_expectations: "需要明确的 task 或 objective，以及非空 owned_paths；可选 success_criteria、allowed_paths、forbidden_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
             expected_result_shape: "包含 run_id、child_session_id、agent_name、status、summary 字段的 JSON 对象。".into(),
         }
     }
@@ -165,14 +165,22 @@ impl AgentTemplate {
     }
 
     pub fn general() -> Self {
-        Self::read_only(
-            "general",
-            "只读通用问题助手",
-            concat!(
-                "你是 general 子代理。用于边界明确但不属于其他专家的只读辅助任务，例如梳理奇怪输出、归纳现象、总结仓库事实。",
-                "保持只读，不要实现修改，不要替代 fixer，不要继续委派。"
-            ),
-        )
+        Self {
+            name: "general".into(),
+            purpose: "可读可写的通用专家".into(),
+            system_prompt: concat!(
+                "你是可读可写的 general 子代理。用于边界明确但不属于其他专家的通用任务。",
+                "按主代理要求读取和修改文件，仅编辑 owned_paths 内的文件，不要继续委派。"
+            ).into(),
+            tool_scope: ToolScope::FullAccess,
+            permission_mode: PermissionMode::Default,
+            can_write: true,
+            can_delegate: false,
+            timeout_secs: None,
+            max_tool_calls: None,
+            input_expectations: "需要明确的 task 或 objective，以及非空 owned_paths；可选 success_criteria、allowed_paths、forbidden_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
+            expected_result_shape: "包含 run_id、child_session_id、agent_name、status、summary 字段的 JSON 对象。".into(),
+        }
     }
 
     pub fn historian() -> Self {
@@ -303,6 +311,36 @@ pub(crate) fn subagent_catalog_entry_by_agent_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_templates_match_catalog_contracts() {
+        for entry in SUBAGENT_CATALOG {
+            let template = AgentTemplate::from_name(entry.agent_name).expect("catalog template");
+            let writable = matches!(entry.agent_name, "fixer" | "general");
+            let contract = template.capability_contract();
+            assert_eq!(template.can_write, writable);
+            assert_eq!(entry.read_only, !writable);
+            assert_eq!(contract.can_write, writable);
+            assert!(!contract.can_delegate);
+            assert_eq!(contract.permission_mode, PermissionMode::Default);
+            assert_eq!(
+                contract.tool_scope,
+                if writable {
+                    ToolScope::FullAccess
+                } else {
+                    ToolScope::ReadOnlyExplorer
+                }
+            );
+            assert_eq!(
+                crate::permission::classify_tool(entry.tool_name),
+                if writable {
+                    crate::permission::ToolPermissionClass::Write
+                } else {
+                    crate::permission::ToolPermissionClass::Preview
+                }
+            );
+        }
+    }
 
     #[test]
     fn reviewer_evidence_parent_tool_uses_system_prefix() {

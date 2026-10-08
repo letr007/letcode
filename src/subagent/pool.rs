@@ -1515,7 +1515,9 @@ fn enforce_write_scope(
     governance: &SubagentRunGovernance,
     observed_changed_paths: &[String],
 ) {
-    if summary.agent_name != "fixer" || !governance.input.has_write_scope() {
+    if !matches!(summary.agent_name.as_str(), "fixer" | "general")
+        || !governance.input.has_write_scope()
+    {
         return;
     }
 

@@ -588,10 +588,10 @@ const DEFAULT_AGENT_PRELUDE: &str = r#"你是运行在本地仓库中的编程�
 工程任务工作流：
 若本回合涉及代码修复、重构、调试、多文件改动、需要验证或跨模块的工程任务，先像工作流管理者一样行动：先判断是否需要专家通道，再直接动手。
 仅在琐碎、单文件、边界清晰的工作，或委派开销明显超过收益时直接执行；否则保持简短计划，有意识地选择合适专家或直接路径，调和委派结果，并以最清晰且经过验证的结果收尾。
-有意识地选择专家：explorer 用于广泛或未知代码搜索；fixer 用于有界实现与多文件机械修改；oracle 用于根因分析、风险审查或关键评估；designer 用于 UI/UX 决策；librarian 用于外部文档或库/框架行为；general 用于有界只读辅助工作。
+有意识地选择专家：explorer 用于广泛或未知代码搜索；fixer 用于有界实现与多文件机械修改；oracle 用于根因分析、风险审查或关键评估；designer 用于 UI/UX 决策；librarian 用于外部文档或库/框架行为；general 用于有界的通用读写任务。
 优先复用先前专家成果：使用会话历史或任务板中已完成或已调和的会话，再启动重叠工作；绝不要把已取消或出错的会话当作权威结果复用。
 当委派能提升质量、速度或上下文卫生时，委派有界工作，尤其是会污染主代理上下文的底层或读密集任务。
-SubagentPool 支持同角色并发；只读任务共享读锁，fixer 必须声明非空 owned_paths 并取得对应文件或目录子树的写锁。路径重叠的读写或写写任务不会排队，而是明确拒绝，待冲突任务完成或取消后再启动。使用 agent__jobs/status/wait/cancel 管理后台任务；查询和等待不得隐式接管或重复执行。引用子代理时优先使用稳定的池序号（#N），而不是列表位置。两种启动模式：省略 target_child_session_id 以创建新子会话，或设置 target_child_session_id 以接管已结束的子会话并复用其上下文。历史子会话是池记录；只有显式接管才会继续既有会话。
+SubagentPool 支持同角色并发；只读任务共享读锁，fixer 和 general 必须声明非空 owned_paths 并取得对应文件或目录子树的写锁。路径重叠的读写或写写任务不会排队，而是明确拒绝，待冲突任务完成或取消后再启动。使用 agent__jobs/status/wait/cancel 管理后台任务；查询和等待不得隐式接管或重复执行。引用子代理时优先使用稳定的池序号（#N），而不是列表位置。两种启动模式：省略 target_child_session_id 以创建新子会话，或设置 target_child_session_id 以接管已结束的子会话并复用其上下文。历史子会话是池记录；只有显式接管才会继续既有会话。
 保持委派受控：避免递归委派，避免不必要的多智能体编排，保持清晰的父代理叙事，调和子结果，并在停止前暴露剩余阻塞或有针对性的验证缺口。
 保持在范围内。除非必要，不要重构、重排格式、重命名或修改无关代码；若需要更广改动，说明原因。
 当工具、编辑或验证失败时，先检查错误再重试。不要用宽泛回退或跳过验证来掩盖失败；快速失败并解释可操作原因。
@@ -4458,8 +4458,8 @@ impl ToolEffects {
                     | "git__diff"
                     | "git__log"
                     | "code__ast_replace_preview" => ToolEffectKind::Read,
-                    "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir"
-                    | "edit__apply_patch" => ToolEffectKind::Write,
+                    "agent__fixer" | "agent__general" | "fs__write" | "fs__append"
+                    | "fs__mkdir" | "edit__apply_patch" => ToolEffectKind::Write,
                     "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
                         if shell_command_succeeded(output) {
                             ToolEffectKind::Validation

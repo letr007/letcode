@@ -473,12 +473,12 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER
         | tool_names::TOOL_AGENT_LIBRARIAN
-        | tool_names::TOOL_AGENT_GENERAL
         | tool_names::TOOL_AGENT_JOBS
         | tool_names::TOOL_AGENT_STATUS
         | tool_names::TOOL_AGENT_WAIT
         | tool_names::TOOL_AGENT_CANCEL => ToolPermissionClass::Preview,
         tool_names::TOOL_AGENT_FIXER
+        | tool_names::TOOL_AGENT_GENERAL
         | tool_names::TOOL_FS_WRITE
         | tool_names::TOOL_FS_APPEND
         | tool_names::TOOL_FS_MKDIR

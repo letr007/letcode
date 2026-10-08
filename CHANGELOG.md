@@ -5,6 +5,12 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Changed
+
+- `general` 专家支持限定范围的文件修改。委派时需提供非空的 `owned_paths`，与 `fixer` 使用相同的写锁和范围审计。
+
 ## [0.19.0] - 2026-10-06
 
 ### Added

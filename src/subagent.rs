@@ -216,15 +216,31 @@ mod tests {
     #[test]
     fn child_agents_do_not_expose_recursive_subagent_tools() {
         let agent = test_agent();
-        let child = AgentFactory::create_child(&agent, &AgentTemplate::fixer());
-        let tool_names = child
-            .tool_definitions_for_test()
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>();
+        for template in AgentTemplate::catalog() {
+            let child = AgentFactory::create_child(&agent, &template);
+            let tool_names = child
+                .tool_definitions_for_test()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>();
 
-        assert!(!tool_names.iter().any(|name| name == "agent__explore"));
-        assert!(!tool_names.iter().any(|name| name == "agent__fixer"));
+            assert!(!tool_names.iter().any(|name| name.starts_with("agent__")));
+            assert!(tool_names.iter().any(|name| name == "fs__read"));
+            for tool in [
+                "fs__write",
+                "fs__append",
+                "fs__mkdir",
+                "edit__apply_patch",
+                "shell__exec",
+            ] {
+                assert_eq!(
+                    tool_names.iter().any(|name| name == tool),
+                    template.can_write,
+                    "{} {tool}",
+                    template.name
+                );
+            }
+        }
     }
 
     async fn spawn_endpoint(
@@ -947,19 +963,47 @@ base_url = "https://test.example.invalid/v1"
         path
     }
 
-    #[tokio::test]
-    async fn fixer_out_of_scope_changes_are_visible_and_fail_the_run() {
-        let runtime = SubagentPool::new();
-        let owned = temp_scope_root("owned");
-        let owned_label = owned.to_string_lossy().into_owned();
-        let mut governance = test_governance();
-        governance.input.allowed_paths = vec![owned_label.clone()];
-        governance.input.owned_paths = vec![owned_label];
+    #[test]
+    fn writable_subagent_start_requires_owned_paths() {
+        for name in ["fixer", "general"] {
+            let runtime = SubagentPool::new();
+            let error = runtime
+                .start_named_governed(
+                    &test_agent(),
+                    name,
+                    crate::agent::SubagentInvocation {
+                        prompt: "implement".into(),
+                        input: test_governance().input,
+                        model: None,
+                        parent_tool_call_id: None,
+                    },
+                    temp_sessions_dir(),
+                    "parent-session".into(),
+                    "turn-1".into(),
+                    None,
+                    None,
+                )
+                .err()
+                .expect("writable subagent without locks must fail");
+            assert!(error.to_string().contains("requires non-empty owned_paths"));
+            assert!(!runtime.is_running());
+        }
+    }
 
-        let summary = runtime
+    #[tokio::test]
+    async fn writable_subagent_out_of_scope_changes_are_visible_and_fail_the_run() {
+        for template in [AgentTemplate::fixer(), AgentTemplate::general()] {
+            let runtime = SubagentPool::new();
+            let owned = temp_scope_root("owned");
+            let owned_label = owned.to_string_lossy().into_owned();
+            let mut governance = test_governance();
+            governance.input.allowed_paths = vec![owned_label.clone()];
+            governance.input.owned_paths = vec![owned_label];
+
+            let summary = runtime
             .run_with_executor(
                 &test_agent(),
-                AgentTemplate::fixer(),
+                template,
                 "apply fix".into(),
                 governance,
                 temp_sessions_dir(),
@@ -980,71 +1024,74 @@ base_url = "https://test.example.invalid/v1"
             .await
             .expect("run returns governed summary");
 
-        assert_eq!(summary.status, SubagentStatus::Failed);
-        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Logical));
-        assert_eq!(summary.structured_result.status, "failed");
-        assert!(summary.summary.contains("out-of-scope changes detected"));
-        assert!(
-            summary
-                .structured_result
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("src/outside.rs"))
-        );
-        let _ = std::fs::remove_file(owned);
+            assert_eq!(summary.status, SubagentStatus::Failed);
+            assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Logical));
+            assert_eq!(summary.structured_result.status, "failed");
+            assert!(summary.summary.contains("out-of-scope changes detected"));
+            assert!(
+                summary
+                    .structured_result
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("src/outside.rs"))
+            );
+            let _ = std::fs::remove_file(owned);
+        }
     }
 
     #[tokio::test]
     async fn observed_child_write_effects_enforce_scope_even_when_files_changed_missing() {
-        let runtime = SubagentPool::new();
-        let owned = temp_scope_root("allowed");
-        let mut governance = test_governance();
-        governance.input.allowed_paths = vec![owned.to_string_lossy().into_owned()];
-        governance.input.owned_paths = governance.input.allowed_paths.clone();
+        for template in [AgentTemplate::fixer(), AgentTemplate::general()] {
+            let runtime = SubagentPool::new();
+            let owned = temp_scope_root("allowed");
+            let mut governance = test_governance();
+            governance.input.allowed_paths = vec![owned.to_string_lossy().into_owned()];
+            governance.input.owned_paths = governance.input.allowed_paths.clone();
 
-        let summary = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::fixer(),
-                "apply fix".into(),
-                governance,
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent,
-                 _task,
-                 transcript,
-                 _session_transport_tx,
-                 _child_session_id,
-                 _agent_name| {
-                    async move {
-                        transcript
-                            .lock()
-                            .expect("lock child transcript")
-                            .record_tool_call_finished(
-                                "call-1",
-                                "fs__write",
-                                true,
-                                crate::tool::ToolResult::ok(
+            let summary = runtime
+                .run_with_executor(
+                    &test_agent(),
+                    template,
+                    "apply fix".into(),
+                    governance,
+                    temp_sessions_dir(),
+                    "parent-session".into(),
+                    "turn-1".into(),
+                    None,
+                    no_event_sender(),
+                    None,
+                    |_agent,
+                     _task,
+                     transcript,
+                     _session_transport_tx,
+                     _child_session_id,
+                     _agent_name| {
+                        async move {
+                            transcript
+                                .lock()
+                                .expect("lock child transcript")
+                                .record_tool_call_finished(
+                                    "call-1",
                                     "fs__write",
-                                    serde_json::json!({"path":"src/outside.rs"}),
-                                ),
-                            )
-                            .expect("record child write");
-                        Ok(r#"{"status":"completed","summary":"done"}"#.into())
-                    }
-                    .boxed()
-                },
-            )
-            .await
-            .expect("run returns summary");
+                                    true,
+                                    crate::tool::ToolResult::ok(
+                                        "fs__write",
+                                        serde_json::json!({"path":"src/outside.rs"}),
+                                    ),
+                                )
+                                .expect("record child write");
+                            Ok(r#"{"status":"completed","summary":"done"}"#.into())
+                        }
+                        .boxed()
+                    },
+                )
+                .await
+                .expect("run returns summary");
 
-        assert_eq!(summary.status, SubagentStatus::Failed);
-        assert!(summary.summary.contains("src/outside.rs"));
-        let _ = std::fs::remove_file(owned);
+            assert_eq!(summary.status, SubagentStatus::Failed);
+            assert!(summary.summary.contains("src/outside.rs"));
+            let _ = std::fs::remove_file(owned);
+        }
     }
 
     #[tokio::test]
@@ -1415,153 +1462,173 @@ base_url = "https://test.example.invalid/v1"
     }
 
     #[tokio::test]
-    async fn overlapping_fixer_write_locks_are_rejected() {
-        let runtime = SubagentPool::new();
-        let agent = test_agent();
-        let owned_dir =
-            std::env::temp_dir().join(format!("letcode-lock-dir-{}", generate_run_id()));
-        std::fs::create_dir_all(&owned_dir).expect("create owned dir");
-        let mut governance = test_governance();
-        governance.input.owned_paths = vec![owned_dir.to_string_lossy().into_owned()];
-        let barrier = Arc::new(Barrier::new(2));
-        let (release_first, wait_for_release) = oneshot::channel();
+    async fn overlapping_subagent_read_write_locks_are_rejected() {
+        for (first_template, second_template) in [
+            (AgentTemplate::fixer(), AgentTemplate::fixer()),
+            (AgentTemplate::fixer(), AgentTemplate::general()),
+            (AgentTemplate::general(), AgentTemplate::fixer()),
+            (AgentTemplate::general(), AgentTemplate::general()),
+            (AgentTemplate::fixer(), AgentTemplate::explorer()),
+            (AgentTemplate::general(), AgentTemplate::explorer()),
+            (AgentTemplate::explorer(), AgentTemplate::fixer()),
+            (AgentTemplate::explorer(), AgentTemplate::general()),
+        ] {
+            let runtime = SubagentPool::new();
+            let agent = test_agent();
+            let owned_dir =
+                std::env::temp_dir().join(format!("letcode-lock-dir-{}", generate_run_id()));
+            std::fs::create_dir_all(&owned_dir).expect("create owned dir");
+            let mut governance = test_governance();
+            governance.input.owned_paths = vec![owned_dir.to_string_lossy().into_owned()];
+            let barrier = Arc::new(Barrier::new(2));
+            let (release_first, wait_for_release) = oneshot::channel();
 
-        let first_runtime = runtime.clone();
-        let first_barrier = Arc::clone(&barrier);
-        let first_governance = governance.clone();
-        let first = tokio::spawn(async move {
-            first_runtime
+            let first_runtime = runtime.clone();
+            let first_barrier = Arc::clone(&barrier);
+            let first_governance = governance.clone();
+            let first = tokio::spawn(async move {
+                first_runtime
+                    .run_with_executor(
+                        &agent,
+                        first_template,
+                        "first task".into(),
+                        first_governance,
+                        temp_sessions_dir(),
+                        "parent-session".into(),
+                        "turn-1".into(),
+                        None,
+                        no_event_sender(),
+                        None,
+                        move |_agent, _task, _transcript, _tx, _child, _name| {
+                            async move {
+                                first_barrier.wait().await;
+                                wait_for_release.await.expect("release first writer");
+                                Ok("done".into())
+                            }
+                            .boxed()
+                        },
+                    )
+                    .await
+            });
+
+            barrier.wait().await;
+            let error = runtime
                 .run_with_executor(
-                    &agent,
-                    AgentTemplate::fixer(),
-                    "first fix".into(),
-                    first_governance,
+                    &test_agent(),
+                    second_template,
+                    "second task".into(),
+                    governance,
                     temp_sessions_dir(),
                     "parent-session".into(),
-                    "turn-1".into(),
+                    "turn-2".into(),
                     None,
                     no_event_sender(),
                     None,
-                    move |_agent, _task, _transcript, _tx, _child, _name| {
-                        async move {
-                            first_barrier.wait().await;
-                            wait_for_release.await.expect("release first writer");
-                            Ok("done".into())
-                        }
-                        .boxed()
+                    |_agent, _task, _transcript, _tx, _child, _name| {
+                        async move { Ok("done".into()) }.boxed()
                     },
                 )
-                .await
-        });
-
-        barrier.wait().await;
-        let error = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::fixer(),
-                "second fix".into(),
-                governance,
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-2".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent, _task, _transcript, _tx, _child, _name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
-            )
-            .now_or_never();
-        release_first.send(()).expect("first writer is waiting");
-        let error = error
-            .expect("overlapping writer rejection must not wait")
-            .expect_err("overlapping writer must be rejected")
-            .to_string();
-        assert!(error.contains("path lock conflict"), "{error}");
-        assert_eq!(
-            first
-                .await
-                .expect("join first")
-                .expect("first summary")
-                .status,
-            SubagentStatus::Completed
-        );
-        let _ = std::fs::remove_dir_all(owned_dir);
+                .now_or_never();
+            release_first.send(()).expect("first task is waiting");
+            let error = error
+                .expect("conflicting task rejection must not wait")
+                .expect_err("conflicting task must be rejected")
+                .to_string();
+            assert!(error.contains("path lock conflict"), "{error}");
+            assert_eq!(
+                first
+                    .await
+                    .expect("join first")
+                    .expect("first summary")
+                    .status,
+                SubagentStatus::Completed
+            );
+            let _ = std::fs::remove_dir_all(owned_dir);
+        }
     }
 
     #[tokio::test]
-    async fn disjoint_fixer_write_locks_can_run_concurrently() {
-        let runtime = SubagentPool::new();
-        let left = std::env::temp_dir().join(format!("letcode-lock-left-{}", generate_run_id()));
-        let right = std::env::temp_dir().join(format!("letcode-lock-right-{}", generate_run_id()));
-        std::fs::create_dir_all(&left).expect("create left");
-        std::fs::create_dir_all(&right).expect("create right");
-        let mut left_governance = test_governance();
-        left_governance.input.owned_paths = vec![left.to_string_lossy().into_owned()];
-        let mut right_governance = test_governance();
-        right_governance.input.owned_paths = vec![right.to_string_lossy().into_owned()];
-        let barrier = Arc::new(Barrier::new(2));
-        let (release_first, wait_for_release) = oneshot::channel();
+    async fn disjoint_subagent_write_locks_can_run_concurrently() {
+        for (left_template, right_template) in [
+            (AgentTemplate::fixer(), AgentTemplate::fixer()),
+            (AgentTemplate::fixer(), AgentTemplate::general()),
+            (AgentTemplate::general(), AgentTemplate::fixer()),
+            (AgentTemplate::general(), AgentTemplate::general()),
+        ] {
+            let runtime = SubagentPool::new();
+            let left =
+                std::env::temp_dir().join(format!("letcode-lock-left-{}", generate_run_id()));
+            let right =
+                std::env::temp_dir().join(format!("letcode-lock-right-{}", generate_run_id()));
+            std::fs::create_dir_all(&left).expect("create left");
+            std::fs::create_dir_all(&right).expect("create right");
+            let mut left_governance = test_governance();
+            left_governance.input.owned_paths = vec![left.to_string_lossy().into_owned()];
+            let mut right_governance = test_governance();
+            right_governance.input.owned_paths = vec![right.to_string_lossy().into_owned()];
+            let barrier = Arc::new(Barrier::new(2));
+            let (release_first, wait_for_release) = oneshot::channel();
 
-        let first_runtime = runtime.clone();
-        let first_barrier = Arc::clone(&barrier);
-        let first = tokio::spawn(async move {
-            first_runtime
+            let first_runtime = runtime.clone();
+            let first_barrier = Arc::clone(&barrier);
+            let first = tokio::spawn(async move {
+                first_runtime
+                    .run_with_executor(
+                        &test_agent(),
+                        left_template,
+                        "left task".into(),
+                        left_governance,
+                        temp_sessions_dir(),
+                        "parent-session".into(),
+                        "turn-1".into(),
+                        None,
+                        no_event_sender(),
+                        None,
+                        move |_agent, _task, _transcript, _tx, _child, _name| {
+                            async move {
+                                first_barrier.wait().await;
+                                wait_for_release.await.expect("release first writer");
+                                Ok("done".into())
+                            }
+                            .boxed()
+                        },
+                    )
+                    .await
+            });
+            barrier.wait().await;
+            let second = runtime
                 .run_with_executor(
                     &test_agent(),
-                    AgentTemplate::fixer(),
-                    "left fix".into(),
-                    left_governance,
+                    right_template,
+                    "right task".into(),
+                    right_governance,
                     temp_sessions_dir(),
                     "parent-session".into(),
-                    "turn-1".into(),
+                    "turn-2".into(),
                     None,
                     no_event_sender(),
                     None,
-                    move |_agent, _task, _transcript, _tx, _child, _name| {
-                        async move {
-                            first_barrier.wait().await;
-                            wait_for_release.await.expect("release first writer");
-                            Ok("done".into())
-                        }
-                        .boxed()
+                    |_agent, _task, _transcript, _tx, _child, _name| {
+                        async move { Ok("done".into()) }.boxed()
                     },
                 )
-                .await
-        });
-        barrier.wait().await;
-        let second = runtime
-            .run_with_executor(
-                &test_agent(),
-                AgentTemplate::fixer(),
-                "right fix".into(),
-                right_governance,
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-2".into(),
-                None,
-                no_event_sender(),
-                None,
-                |_agent, _task, _transcript, _tx, _child, _name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
-            )
-            .now_or_never();
-        release_first.send(()).expect("first writer is waiting");
-        let second = second
-            .expect("disjoint writer must not wait for the active writer")
-            .expect("disjoint writer starts");
-        assert_eq!(second.status, SubagentStatus::Completed);
-        assert_eq!(
-            first
-                .await
-                .expect("join first")
-                .expect("first summary")
-                .status,
-            SubagentStatus::Completed
-        );
-        let _ = std::fs::remove_dir_all(left);
-        let _ = std::fs::remove_dir_all(right);
+                .now_or_never();
+            release_first.send(()).expect("first writer is waiting");
+            let second = second
+                .expect("disjoint writer must not wait for the active writer")
+                .expect("disjoint writer starts");
+            assert_eq!(second.status, SubagentStatus::Completed);
+            assert_eq!(
+                first
+                    .await
+                    .expect("join first")
+                    .expect("first summary")
+                    .status,
+                SubagentStatus::Completed
+            );
+            let _ = std::fs::remove_dir_all(left);
+            let _ = std::fs::remove_dir_all(right);
+        }
     }
 
     #[tokio::test]

@@ -113,15 +113,15 @@ Keep the task bounded and state the expected result.
 - `@oracle` analyzes root causes, risks, and verification plans without editing files.
 - `@designer` develops designs and interface decisions without editing files.
 - `@librarian` gathers documentation and reference material without editing files.
-- `@general` handles bounded read-only assistance.
+- `@general` handles bounded general-purpose tasks and can edit files within an assigned write scope.
 
 ```text
 @explorer Find the authentication entry points without changing files.
 ```
 
-`fixer` requires non-empty `owned_paths` to acquire write locks.
-The `@fixer <task>` shorthand passes only task text and is rejected without assigned paths.
-For file changes, specify the task and target paths to the main agent so it can delegate to `fixer`.
+`fixer` and `general` require non-empty `owned_paths` to acquire write locks.
+The `@fixer <task>` and `@general <task>` shorthands pass only task text and are rejected without assigned paths.
+To use these experts, specify the task and target paths to the main agent so it can delegate.
 
 `/agents` configures expert model choices; it does not start a task.
 `reviewer` handles permission review and `historian` handles context summaries.

@@ -2777,60 +2777,86 @@ async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() 
 
 #[tokio::test]
 async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
-    let mut agent = test_agent();
-    agent.prepare_turn_prelude();
-    let (delegate, _, prompts) = capturing_delegate(ToolResult::ok(
-        "agent__fixer",
-        json!({
-            "run_id": "run-structured-1",
-            "child_session_id": "child-structured-1",
-            "agent_name": "fixer",
-            "status": "completed",
-            "summary": "implemented bounded fix",
-            "structured_result": {
+    for (tool, name) in [("agent__fixer", "fixer"), ("agent__general", "general")] {
+        let mut agent = test_agent();
+        agent.prepare_turn_prelude();
+        let (delegate, explorer_prompts, fixer_prompts) = capturing_delegate(ToolResult::ok(
+            tool,
+            json!({
+                "run_id": "run-structured-1",
+                "child_session_id": "child-structured-1",
+                "agent_name": name,
                 "status": "completed",
                 "summary": "implemented bounded fix",
-                "malformed": false,
-                "findings": [],
-                "files_read": ["src/agent.rs"],
-                "files_changed": ["src/agent.rs"],
-                "commands_run": ["cargo test subagent --quiet"],
-                "validation": ["cargo test subagent --quiet passed"],
-                "blockers": [],
-                "next_steps": ["continue parent task"],
-                "run_id": "run-structured-1",
-                "child_session_id": "child-structured-1"
-            }
-        }),
-    ));
-    agent.set_subagent_delegate(delegate);
+                "structured_result": {
+                    "status": "completed",
+                    "summary": "implemented bounded fix",
+                    "malformed": false,
+                    "findings": [],
+                    "files_read": ["src/agent.rs"],
+                    "files_changed": ["src/agent.rs"],
+                    "commands_run": ["cargo test subagent --quiet"],
+                    "validation": ["cargo test subagent --quiet passed"],
+                    "blockers": [],
+                    "next_steps": ["continue parent task"],
+                    "run_id": "run-structured-1",
+                    "child_session_id": "child-structured-1"
+                }
+            }),
+        ));
+        agent.set_subagent_delegate(delegate);
+        let prompts = if name == "fixer" {
+            fixer_prompts
+        } else {
+            explorer_prompts
+        };
 
-    let call = test_tool_call(
-        "agent__fixer",
-        r#"{"task":"implement bounded fix","owned_paths":["src/agent.rs"]}"#,
-    );
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("assistant tool calls should append");
-    let mut events = Vec::new();
-    agent
-        .execute_tool_call_and_record(
-            &call,
-            &mut |event| {
+        let call = test_tool_call(
+            tool,
+            r#"{"task":"implement bounded fix","owned_paths":["src/agent.rs"]}"#,
+        );
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant tool calls should append");
+        let mut events = Vec::new();
+        let mut approvals = 0usize;
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("subagent tool execution should succeed");
+        assert_eq!(approvals, 1);
+        assert_eq!(
+            record.permission_class,
+            crate::permission::ToolPermissionClass::Write
+        );
+        assert_eq!(record.effects.kind, ToolEffectKind::Write);
+        agent
+            .record_tool_call_result(&call, record, &mut |event| {
                 events.push(event);
                 std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("subagent tool execution should succeed");
+            })
+            .await
+            .expect("subagent tool result records");
 
-    assert!(prompts.lock().expect("captured prompt")[0].ends_with(crate::subagent::REPORT_PROMPT));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::EvidenceRecorded(record)
-            if record.tags.iter().any(|tag| tag == "subagent_result")
-    )));
+        assert!(
+            prompts.lock().expect("captured prompt")[0].ends_with(crate::subagent::REPORT_PROMPT)
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::EvidenceRecorded(record)
+                if record.tags.iter().any(|tag| tag == "subagent_result")
+        )));
+    }
 }
 
 #[tokio::test]
@@ -4400,83 +4426,85 @@ async fn child_shell_allow_always_stays_within_child_session() {
 #[cfg(unix)]
 #[tokio::test]
 async fn delegation_scope_authorizes_owned_writes_and_denies_outside() {
-    let fixture = UnixWritableFixture::new("delegation-scope-write");
-    let owned = fixture.external.join("owned");
-    let outside = fixture.external.join("outside");
-    fs::create_dir_all(&owned).expect("owned dir");
-    fs::create_dir_all(&outside).expect("outside dir");
-    let owned_file = owned.join("ok.txt");
-    let outside_file = outside.join("no.txt");
+    for template in [AgentTemplate::fixer(), AgentTemplate::general()] {
+        let fixture = UnixWritableFixture::new("delegation-scope-write");
+        let owned = fixture.external.join("owned");
+        let outside = fixture.external.join("outside");
+        fs::create_dir_all(&owned).expect("owned dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let owned_file = owned.join("ok.txt");
+        let outside_file = outside.join("no.txt");
 
-    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
-        objective: "scoped write".into(),
-        success_criteria: Vec::new(),
-        allowed_paths: Vec::new(),
-        forbidden_paths: Vec::new(),
-        owned_paths: vec![owned.to_string_lossy().into()],
-        timeout_secs: None,
-        max_tool_calls: None,
-        model: None,
-        target_child_session_id: None,
-        background: false,
-    })
-    .expect("scope")
-    .expect("non-empty scope");
+        let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+            objective: "scoped write".into(),
+            success_criteria: Vec::new(),
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+            owned_paths: vec![owned.to_string_lossy().into()],
+            timeout_secs: None,
+            max_tool_calls: None,
+            model: None,
+            target_child_session_id: None,
+            background: false,
+        })
+        .expect("scope")
+        .expect("non-empty scope");
 
-    let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
-    child.set_permission_mode(PermissionMode::Default);
-    child.set_subagent_path_scope(Some(Arc::new(scope)));
+        let mut child = AgentFactory::create_child(&test_agent(), &template);
+        child.set_permission_mode(PermissionMode::Default);
+        child.set_subagent_path_scope(Some(Arc::new(scope)));
 
-    let mut approvals = 0usize;
-    let allowed = child
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-write-ok".into(),
-                name: "fs__write".into(),
-                arguments_json: json!({
-                    "path": owned_file,
-                    "content": "ok",
-                })
-                .to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                approvals += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("owned write");
-    assert_eq!(approvals, 0, "owned_paths must pre-authorize writes");
-    assert_eq!(allowed.status, ToolExecutionStatus::Executed);
-    assert_eq!(fs::read_to_string(&owned_file).expect("read"), "ok");
+        let mut approvals = 0usize;
+        let allowed = child
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-write-ok".into(),
+                    name: "fs__write".into(),
+                    arguments_json: json!({
+                        "path": owned_file,
+                        "content": "ok",
+                    })
+                    .to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("owned write");
+        assert_eq!(approvals, 0, "owned_paths must pre-authorize writes");
+        assert_eq!(allowed.status, ToolExecutionStatus::Executed);
+        assert_eq!(fs::read_to_string(&owned_file).expect("read"), "ok");
 
-    let denied = child
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-write-denied".into(),
-                name: "fs__write".into(),
-                arguments_json: json!({
-                    "path": outside_file,
-                    "content": "no",
-                })
-                .to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                approvals += 1;
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("outside write");
-    assert_eq!(approvals, 0, "scope denial must not reach approver");
-    assert_eq!(denied.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        denied.rejection,
-        Some(ToolExecutionRejection::DelegationScopeDenied)
-    );
-    assert!(!outside_file.exists());
+        let denied = child
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-write-denied".into(),
+                    name: "fs__write".into(),
+                    arguments_json: json!({
+                        "path": outside_file,
+                        "content": "no",
+                    })
+                    .to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("outside write");
+        assert_eq!(approvals, 0, "scope denial must not reach approver");
+        assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            denied.rejection,
+            Some(ToolExecutionRejection::DelegationScopeDenied)
+        );
+        assert!(!outside_file.exists());
+    }
 }
 
 #[cfg(unix)]

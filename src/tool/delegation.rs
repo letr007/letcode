@@ -427,8 +427,12 @@ pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<Normali
     }
 
     let owned_paths = optional_trimmed_string_list(args, "owned_paths")?;
-    if tool_name == tool_names::TOOL_AGENT_FIXER && owned_paths.is_empty() {
-        bail!("agent__fixer requires non-empty owned_paths for file-level write locking");
+    if matches!(
+        tool_name,
+        tool_names::TOOL_AGENT_FIXER | tool_names::TOOL_AGENT_GENERAL
+    ) && owned_paths.is_empty()
+    {
+        bail!("{tool_name} requires non-empty owned_paths for file-level write locking");
     }
 
     Ok(NormalizedSubagentInput {
@@ -558,7 +562,7 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
             "owned_paths": {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
-                "description": "当前委派拥有编辑权的文件或目录子树；fixer 必填，路径重叠的读写/写写任务会被拒绝"
+                "description": "当前委派拥有编辑权的文件或目录子树；fixer 和 general 必须提供非空列表，路径重叠的读写/写写任务会被拒绝"
             },
             "model": {
                 "type": ["string", "null"],

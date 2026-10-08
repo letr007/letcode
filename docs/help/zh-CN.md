@@ -113,15 +113,15 @@ letcode
 - `@oracle` 只读分析根因、风险和验证方案。
 - `@designer` 只读整理设计方案和接口决策。
 - `@librarian` 只读收集文档和参考资料。
-- `@general` 处理范围明确的只读辅助任务。
+- `@general` 处理范围明确的通用任务，可在指定写入范围内修改文件。
 
 ```text
 @explorer 找出认证入口，不修改文件。
 ```
 
-`fixer` 需要非空的 `owned_paths`，用于申请写锁。
-`@fixer <task>` 简写只传任务文本，会因缺少负责路径被拒绝。
-修改文件时，向主代理说明任务和文件范围，由主代理委派 `fixer`。
+`fixer` 和 `general` 需要非空的 `owned_paths`，用于申请写锁。
+`@fixer <task>` 和 `@general <task>` 简写只传任务文本，会因缺少负责路径被拒绝。
+使用这两个专家时，向主代理说明任务和文件范围，由主代理委派。
 
 `/agents` 配置专家模型选项，不启动任务。
 内部专家 `reviewer` 负责权限审查，`historian` 负责上下文整理。
