@@ -4375,27 +4375,28 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_defaults_to_wide_auto_and_can_be_forced_on_narrow_terminals() {
+    fn sidebar_visibility_respects_terminal_width_and_user_preference() {
         let mut state = TuiState::default();
-        assert!(state.sidebar_visible(121));
-        assert!(!state.sidebar_visible(120));
+        let width = SIDEBAR_WIDTH * 3;
+        assert!(state.sidebar_visible(width));
+        assert!(!state.sidebar_visible(width - 1));
 
-        state.last_terminal_width = 100;
+        state.last_terminal_width = width;
         state.toggle_sidebar();
-        assert!(state.sidebar_visible(100));
+        assert!(!state.sidebar_visible(width));
         state.toggle_sidebar();
-        assert!(!state.sidebar_visible(160));
+        assert!(state.sidebar_visible(width));
     }
 
     #[test]
     fn sidebar_is_dropped_below_the_minimum_terminal_width_even_when_forced_open() {
         let mut state = TuiState::default();
-        let narrow = SIDEBAR_WIDTH * 2 - 1;
+        let narrow = SIDEBAR_WIDTH * 3 - 1;
         state.last_terminal_width = narrow;
         state.toggle_sidebar();
 
         assert!(!state.sidebar_visible(narrow));
-        assert!(state.sidebar_visible(SIDEBAR_WIDTH * 2));
+        assert!(state.sidebar_visible(SIDEBAR_WIDTH * 3));
     }
 
     #[test]

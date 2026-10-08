@@ -14,9 +14,7 @@ pub struct WorkspaceLayoutMetrics {
 }
 
 pub const SIDEBAR_WIDTH: u16 = 42;
-/// Narrowest terminal that still renders the panel. Below it the overlay would cover more
-/// than half of the workspace, so the panel is dropped instead.
-pub const SIDEBAR_MIN_TERMINAL_WIDTH: u16 = SIDEBAR_WIDTH * 2;
+pub const SIDEBAR_MIN_TERMINAL_WIDTH: u16 = SIDEBAR_WIDTH * 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidebarLayout {

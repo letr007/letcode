@@ -3509,7 +3509,8 @@ fn child_view_preserves_parent_queued_prompts_on_remove_action() {
 #[test]
 fn panel_command_toggles_visibility() {
     let mut runtime = runtime();
-    runtime.state_mut().last_terminal_width = 160;
+    let width = crate::tui::components::layout::SIDEBAR_MIN_TERMINAL_WIDTH;
+    runtime.state_mut().last_terminal_width = width;
     runtime.state_mut().set_input("/panel off");
     assert_eq!(
         runtime
@@ -3517,7 +3518,7 @@ fn panel_command_toggles_visibility() {
             .expect("panel off"),
         None
     );
-    assert!(!runtime.state().sidebar_visible(160));
+    assert!(!runtime.state().sidebar_visible(width));
 
     runtime.state_mut().set_input("/panel on");
     assert_eq!(
@@ -3526,7 +3527,8 @@ fn panel_command_toggles_visibility() {
             .expect("panel on"),
         None
     );
-    assert!(runtime.state().sidebar_visible(100));
+    assert!(runtime.state().sidebar_visible(width));
+    assert!(!runtime.state().sidebar_visible(width - 1));
 }
 
 #[test]

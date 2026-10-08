@@ -1367,20 +1367,18 @@ mod tests {
     }
 
     #[test]
-    fn forced_overlay_sidebar_hides_the_workspace_layer_behind_it() {
+    fn sidebar_columns_do_not_render_workspace_content() {
         let mut state = TuiState::default();
         state.reasoning_effort_label = Some("leak-probe-reasoning".into());
         state.toggle_sidebar();
 
-        let (width, height) = (100u16, 30u16);
+        let (width, height) = (layout::SIDEBAR_MIN_TERMINAL_WIDTH, 30u16);
         let rows = draw_rows(&mut state, width, height);
         let sidebar = layout::split_sidebar_layout(Rect::new(0, 0, width, height), true)
             .sidebar
             .expect("forced sidebar is rendered");
-        assert!(
-            sidebar.right() == width,
-            "expected the overlay layout: {sidebar:?}"
-        );
+        assert_eq!(state.last_sidebar_bounds, sidebar);
+        assert_eq!(sidebar.right(), width);
 
         for (index, row) in rows.iter().enumerate() {
             let panel: String = row.chars().skip(sidebar.x as usize).collect();
@@ -1398,7 +1396,7 @@ mod tests {
         let mut hidden = TuiState::default();
         hidden.sidebar_hidden = true;
 
-        let narrow = layout::SIDEBAR_WIDTH * 2 - 1;
+        let narrow = layout::SIDEBAR_WIDTH * 3 - 1;
         assert_eq!(
             draw_rows(&mut forced, narrow, 30),
             draw_rows(&mut hidden, narrow, 30)
@@ -1410,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_sidebar_blocks_transcript_hits_inside_its_columns() {
+    fn sidebar_columns_do_not_expose_transcript_hits() {
         let mut state = TuiState::default();
         state.toggle_sidebar();
         state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
@@ -1418,15 +1416,16 @@ mod tests {
             "shell__exec",
         )));
 
-        let (width, height) = (100u16, 30u16);
+        let (width, height) = (layout::SIDEBAR_MIN_TERMINAL_WIDTH, 30u16);
         draw_rows(&mut state, width, height);
         let sidebar = layout::split_sidebar_layout(Rect::new(0, 0, width, height), true)
             .sidebar
             .expect("forced sidebar is rendered");
         let transcript = state.last_transcript_area;
+        assert_eq!(state.last_sidebar_bounds, sidebar);
         assert!(
-            transcript.width > 0 && sidebar.x > transcript.x && sidebar.right() == width,
-            "expected an overlay panel over a live transcript: {transcript:?} {sidebar:?}"
+            transcript.width > 0 && sidebar.x >= transcript.right() && sidebar.right() == width,
+            "expected a sidebar next to a live transcript: {transcript:?} {sidebar:?}"
         );
 
         let mut visible_hits = 0usize;
@@ -1434,7 +1433,7 @@ mod tests {
             for col in transcript.left()..sidebar.x {
                 visible_hits += usize::from(state.transcript_click_target(col, row).is_some());
             }
-            for col in sidebar.left()..transcript.right() {
+            for col in sidebar.left()..sidebar.right() {
                 assert!(
                     state.transcript_click_target(col, row).is_none(),
                     "row {row} col {col} kept a transcript click target under the panel"
