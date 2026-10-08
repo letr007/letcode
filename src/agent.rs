@@ -972,7 +972,7 @@ impl AgentFactory {
             provider_usage_anchor: None,
             request_projection_generation: 0,
             pressure_compaction_suppressed: false,
-            fast_mode: parent.fast_mode.clone(),
+            fast_mode: parent.fast_mode.as_ref().map(|mode| mode.fork()),
             fake_client: parent.fake_client,
             fake_installation_id: parent.fake_installation_id.clone(),
             fake_config: parent.fake_config.clone(),

@@ -17,6 +17,12 @@ impl FastMode {
         })
     }
 
+    pub(crate) fn fork(&self) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(self.enabled()),
+        })
+    }
+
     pub fn enabled(&self) -> bool {
         *self.state.lock().expect("Fast Mode state poisoned")
     }

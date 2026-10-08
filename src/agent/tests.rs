@@ -837,6 +837,83 @@ fn active_epoch_appends_complete_groups_for_both_protocols() {
 }
 
 #[test]
+fn active_epoch_preserves_fast_mode_after_child_request_preparation() {
+    use crate::model_runtime::projection::model_request_from_prompt_plan;
+
+    let protocol = ApiProtocol::Responses;
+    let catalog = crate::model_runtime::RuntimeConfig::from_toml(
+        r#"active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "gpt-test"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "https://test.example.invalid/v1"
+[providers.test.models.gpt-test.capabilities]
+tools = true
+parallel_tool_calls = true
+priority_service = true
+[providers.test.models.gpt-test.capabilities.generation]
+parallel_tool_calls = true
+priority_service = true
+"#,
+    )
+    .unwrap()
+    .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+    .unwrap();
+    let route = Arc::new(catalog.route("test", "gpt-test").unwrap().clone());
+    let mut parent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    parent.set_resolved_runtime_catalog(Some(catalog));
+    parent.set_model_route_authority(ModelRoute::new("test", "gpt-test"), route.clone());
+    parent.set_fast_mode(crate::fast_mode::FastMode::load("letcode.toml", true));
+    let tools = active_epoch_tools();
+    let observe = |agent: &Agent, preview: &ActiveEpochPreview| {
+        let input = model_request_from_prompt_plan(
+            &route,
+            &agent.active_model_metadata(),
+            &preview.build.prompt_plan,
+            &tools,
+        )
+        .unwrap();
+        let request = route.binding.prepare_request(&input).unwrap();
+        let inspection = route
+            .binding
+            .inspect_prepared_request(&request, None)
+            .unwrap();
+        let shape: Value = serde_json::from_slice(&inspection.request_shape).unwrap();
+        assert_eq!(shape["service_tier"], "priority");
+        crate::request_builder::observe_prepared_model_request(
+            &inspection,
+            &preview.build.prompt_plan,
+        )
+        .unwrap()
+    };
+    let first = parent.preview_active_epoch(protocol, &[], &tools).unwrap();
+    let observation = observe(&parent, &first);
+    parent
+        .commit_resolved_active_epoch(first, observation)
+        .unwrap();
+
+    let mut child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
+    child.set_model("deepseek-flash");
+    assert!(child.prepare_fast_mode_for_request().unwrap());
+    assert!(!child.fast_mode_enabled());
+    append_active_epoch_history(&mut parent, active_epoch_history_with_complete_tool_group());
+
+    let ActiveEpochPreparation::Warm(append) =
+        parent.prepare_active_epoch(protocol, &[], &tools).unwrap()
+    else {
+        panic!("complete tool group must preserve the active epoch");
+    };
+    let observation = observe(&parent, &append);
+    parent
+        .commit_resolved_active_epoch(append, observation)
+        .unwrap();
+    assert!(parent.fast_mode_enabled());
+}
+
+#[test]
 fn active_epoch_rejects_non_append_changes_without_advancing() {
     let tools = active_epoch_tools();
     for mutation in ["mutated", "truncated"] {
@@ -4207,6 +4284,21 @@ fn reviewer_child_does_not_inherit_auto_review_service() {
 
     assert!(reviewer.auto_review_service.is_none());
     assert_eq!(reviewer.permission_mode(), PermissionMode::Yolo);
+}
+
+#[test]
+fn child_fast_mode_inherits_value_without_sharing_changes() {
+    for enabled in [false, true] {
+        let mut parent = test_agent();
+        let mode = crate::fast_mode::FastMode::load("letcode.toml", enabled);
+        parent.set_fast_mode(mode.clone());
+        let child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
+        assert_eq!(child.fast_mode_enabled(), enabled);
+
+        mode.toggle("gpt-test").unwrap();
+        assert_eq!(parent.fast_mode_enabled(), !enabled);
+        assert_eq!(child.fast_mode_enabled(), enabled);
+    }
 }
 
 #[test]
