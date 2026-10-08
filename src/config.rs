@@ -120,7 +120,7 @@ pub use persistence::{
     config_value_in, leaf_config_entry, persist_expert_allowed_models, persist_mcp_server_enabled,
     remove_config_table, save_config_document, set_config_item, set_config_scalar,
 };
-pub(crate) use persistence::{acquire_config_lock, replace_file};
+pub(crate) use persistence::{acquire_config_lock, replace_file, resolve_config_target};
 #[cfg(test)]
 pub use schema::schema_keys;
 pub use schema::{
@@ -175,7 +175,8 @@ pub(crate) fn initialize_config(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    let _lock = acquire_config_lock(path)?;
+    let config_target = resolve_config_target(path)?;
+    let _lock = acquire_config_lock(&config_target)?;
     if fs::symlink_metadata(path).is_ok() {
         bail!(
             "configuration file was created while setting up: {}",
@@ -195,27 +196,27 @@ pub(crate) fn initialize_config(
         std::process::id(),
         stamp
     ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temp_path)
+        .with_context(|| format!("failed to create temporary config {}", temp_path.display()))?;
     let write_result = (|| -> Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temp_path).with_context(|| {
-            format!("failed to create temporary config {}", temp_path.display())
-        })?;
         file.write_all(config_text.as_bytes())
             .with_context(|| format!("failed to write temporary config {}", temp_path.display()))?;
         file.sync_all()
             .with_context(|| format!("failed to sync temporary config {}", temp_path.display()))?;
-        drop(file);
-        replace_file(&temp_path, path)
-            .with_context(|| format!("failed to install config {}", path.display()))?;
         Ok(())
     })();
-    if write_result.is_err() {
+    drop(file);
+    if let Err(error) = write_result {
         let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    write_result
+    replace_file(&temp_path, path)
+        .with_context(|| format!("failed to install config {}", path.display()))
 }
 
 fn toml_string(value: &str) -> String {
@@ -229,17 +230,25 @@ impl AppConfig {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let config_path = path.as_ref().to_path_buf();
-        if !config_path.exists() {
-            bail!(missing_config_message(&config_path));
-        }
-        // Lock the canonical target rather than the directory entry. Writers
-        // replace the target atomically, so this keeps reads compatible with
-        // the existing writer lock across an atomic rename (and symlinks).
-        let config_target = fs::canonicalize(&config_path)
-            .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
+        let config_target = resolve_config_target(&config_path).map_err(|error| {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound)
+            {
+                error.context(missing_config_message(&config_path))
+            } else {
+                error
+            }
+        })?;
         let _lock = acquire_config_read_lock(&config_target)?;
-        let config_text = fs::read_to_string(&config_target)
-            .with_context(|| format!("failed to read config file {}", config_path.display()))?;
+        let config_text = fs::read_to_string(&config_target).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                missing_config_message(&config_path)
+            } else {
+                format!("failed to read config file {}", config_path.display())
+            };
+            anyhow::Error::new(error).context(message)
+        })?;
         Self::load_from_str_at_path(&config_path, &config_text)
     }
 
@@ -2428,6 +2437,163 @@ model_override = "wire-model"
         drop(second);
         drop(lock);
         acquire_config_lock(&target).unwrap();
+    }
+
+    fn assert_config_read_waits_for_writer(path: PathBuf, target: PathBuf) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let lock = acquire_config_lock(&target).unwrap();
+        let original = target.with_extension("original");
+        fs::rename(&target, &original).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let result = AppConfig::load_from_path(&path);
+            let _ = tx.send(result);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_unlock = rx.recv_timeout(Duration::from_millis(100));
+        fs::rename(&original, &target).unwrap();
+        drop(lock);
+        assert!(matches!(
+            before_unlock,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn config_read_waits_for_replacement_before_checking_the_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("letcode.toml");
+        fs::write(&path, config("openai", "model", "")).unwrap();
+        let target = fs::canonicalize(&path).unwrap();
+        assert_config_read_waits_for_writer(path, target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_read_waits_for_the_target_writer() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_dir = directory.path().join("target");
+        let alias_dir = directory.path().join("alias");
+        fs::create_dir(&target_dir).unwrap();
+        fs::create_dir(&alias_dir).unwrap();
+        let path = alias_dir.join("letcode.toml");
+        let target = target_dir.join("config.toml");
+        fs::write(&target, config("openai", "model", "")).unwrap();
+        symlink("../target/config.toml", alias_dir.join("next.toml")).unwrap();
+        symlink("next.toml", &path).unwrap();
+        let target = fs::canonicalize(&target).unwrap();
+        assert_config_read_waits_for_writer(path.clone(), target);
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn config_save_waits_for_an_existing_writer_before_opening_the_target() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("letcode.toml");
+        let text = config("openai", "model", "");
+        fs::write(&path, &text).unwrap();
+        let mut document = text.parse::<toml_edit::DocumentMut>().unwrap();
+        document["global"]["max_iterations"] = toml_edit::value(42);
+        let target = fs::canonicalize(&path).unwrap();
+        let lock = acquire_config_lock(&target).unwrap();
+        let original = target.with_extension("original");
+        fs::rename(&target, &original).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let _ = tx.send(save_config_document(&writer_path, &document));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_unlock = rx.recv_timeout(Duration::from_millis(100));
+        fs::rename(&original, &target).unwrap();
+        drop(lock);
+        assert!(matches!(
+            before_unlock,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            AppConfig::load_from_path(path)
+                .unwrap()
+                .global
+                .max_iterations,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn config_read_preserves_missing_and_other_io_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        for missing in [
+            directory.path().join("missing.toml"),
+            directory.path().join("missing-dir/letcode.toml"),
+        ] {
+            let error = AppConfig::load_from_path(missing).unwrap_err();
+            assert!(error.to_string().starts_with("config file not found:"));
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+        let invalid = directory.path().join("directory.toml");
+        fs::create_dir(&invalid).unwrap();
+        let error = AppConfig::load_from_path(invalid).unwrap_err();
+        assert!(error.to_string().starts_with("failed to read config file"));
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_target_and_lock_are_stable_when_the_target_is_missing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let alias_dir = directory.path().join("alias");
+        let target_dir = directory.path().join("target");
+        fs::create_dir(&alias_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let alias = alias_dir.join("config.toml");
+        let target = target_dir.join("letcode.toml");
+        symlink("next.toml", &alias).unwrap();
+        symlink("../target/letcode.toml", alias_dir.join("next.toml")).unwrap();
+        let missing = resolve_config_target(&alias).unwrap();
+        assert_eq!(missing, resolve_config_target(&target).unwrap());
+        fs::write(&target, "original").unwrap();
+        let present = resolve_config_target(&alias).unwrap();
+        assert_eq!(missing, present);
+        assert_eq!(present, fs::canonicalize(target).unwrap());
+        assert_eq!(
+            config_lock_path(&missing).unwrap(),
+            config_lock_path(&present).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_cycles_report_resolution_errors() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.toml");
+        let second = directory.path().join("second.toml");
+        symlink("second.toml", &first).unwrap();
+        symlink("first.toml", &second).unwrap();
+        let error = AppConfig::load_from_path(first).unwrap_err();
+        assert!(error.to_string().contains("config symlink cycle"));
     }
 
     #[test]

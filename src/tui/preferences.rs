@@ -1,7 +1,8 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,6 @@ use crate::command::{ThemeName, ThoughtsDisplayMode, ToolsDisplayMode};
 use crate::tui::i18n::Language;
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
-static PREFERENCES_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a persisted value has the shape of a UUID: five groups of hex digits
 /// separated by dashes, `8-4-4-4-12`.
@@ -134,26 +134,16 @@ impl TuiPreferences {
         let file_name = path
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("preferences path has no file name"))?;
-        let temp_path = parent.join(format!(
-            ".{}.{}.{}.tmp",
-            file_name.to_string_lossy(),
-            std::process::id(),
-            PREFERENCES_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let write_result = (|| -> Result<()> {
-            let mut temp = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            temp.write_all(&json)?;
-            temp.sync_all()?;
-            drop(temp);
-            crate::config::replace_file(&temp_path, &path)
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        write_result
+        let prefix = format!(".{}.", file_name.to_string_lossy());
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix).suffix(".tmp");
+        #[cfg(unix)]
+        builder.permissions(fs::Permissions::from_mode(0o666));
+        let mut temp = builder.tempfile_in(parent)?;
+        temp.write_all(&json)?;
+        temp.as_file().sync_all()?;
+        let temp_path = temp.into_temp_path().keep()?;
+        crate::config::replace_file(&temp_path, &path)
     }
 }
 
@@ -202,6 +192,54 @@ mod tests {
 
         let loaded = TuiPreferences::load_from_dir(&base);
         assert_eq!(loaded, prefs);
+    }
+
+    #[test]
+    fn replacement_failures_preserve_unique_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = preferences_path(dir.path());
+        fs::create_dir(&path).unwrap();
+        let mut failed_sources = std::collections::BTreeMap::new();
+
+        for theme in ["forest", "sunset"] {
+            TuiPreferences::update_in_dir(dir.path(), |prefs| prefs.theme = theme.into())
+                .unwrap_err();
+            let sources: std::collections::BTreeMap<_, _> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                .map(|source| {
+                    let bytes = fs::read(&source).unwrap();
+                    (source, bytes)
+                })
+                .collect();
+            assert_eq!(sources.len(), failed_sources.len() + 1);
+            for (source, bytes) in &failed_sources {
+                assert_eq!(sources.get(source), Some(bytes));
+            }
+            let expected = serde_json::to_vec_pretty(&TuiPreferences {
+                theme: theme.into(),
+                ..TuiPreferences::default()
+            })
+            .unwrap();
+            assert!(sources.values().any(|bytes| bytes == &expected));
+            failed_sources = sources;
+        }
+
+        fs::remove_dir(&path).unwrap();
+        TuiPreferences::update_in_dir(dir.path(), |prefs| prefs.theme = "forest".into()).unwrap();
+        assert_eq!(TuiPreferences::load_from_dir(dir.path()).theme, "forest");
+        for (source, bytes) in &failed_sources {
+            assert_eq!(&fs::read(source).unwrap(), bytes);
+        }
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                .count(),
+            failed_sources.len()
+        );
     }
 
     #[test]

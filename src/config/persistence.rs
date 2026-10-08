@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -239,12 +240,7 @@ fn persist_config_document(
     require_full_config: bool,
     edit: impl FnOnce(&mut DocumentMut) -> Result<()>,
 ) -> Result<()> {
-    // Resolve before editing so a config symlink remains a symlink while its
-    // existing target is atomically replaced.
-    let config_target = fs::canonicalize(config_path)
-        .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
-    // The lock lives beside the canonical target, so it survives the target's
-    // atomic replacement and serializes all cooperating letcode writers.
+    let config_target = resolve_config_target(config_path)?;
     let _lock = acquire_config_lock(&config_target)?;
     let mut config_file = fs::File::open(&config_target)
         .with_context(|| format!("failed to open config file {}", config_target.display()))?;
@@ -272,7 +268,7 @@ fn persist_config_document(
         &config_text,
         &original_metadata,
         updated_config.as_bytes(),
-        Some(&config_file),
+        Some(config_file),
     )
 }
 
@@ -310,8 +306,7 @@ pub fn remove_config_table(document: &mut DocumentMut, path: &[&str]) -> Result<
 }
 
 pub fn save_config_document(config_path: &Path, document: &DocumentMut) -> Result<()> {
-    let config_target = fs::canonicalize(config_path)
-        .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
+    let config_target = resolve_config_target(config_path)?;
     let _lock = acquire_config_lock(&config_target)?;
     let mut config_file = fs::File::open(&config_target)
         .with_context(|| format!("failed to open config file {}", config_target.display()))?;
@@ -329,7 +324,7 @@ pub fn save_config_document(config_path: &Path, document: &DocumentMut) -> Resul
         &config_text,
         &original_metadata,
         updated_config.as_bytes(),
-        Some(&config_file),
+        Some(config_file),
     )
 }
 
@@ -407,7 +402,7 @@ fn atomic_write_config_with_source(
     original_contents: &str,
     original_metadata: &fs::Metadata,
     contents: &[u8],
-    source_file: Option<&fs::File>,
+    source_file: Option<fs::File>,
 ) -> Result<()> {
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = config_path
@@ -419,8 +414,15 @@ fn atomic_write_config_with_source(
         std::process::id(),
         CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
+    let mut temp = create_config_temp_file(&temp_path, original_metadata)?;
     let write_result = (|| -> Result<()> {
-        let mut temp = create_config_temp_file(&temp_path, original_metadata)?;
+        temp.set_permissions(original_metadata.permissions())
+            .with_context(|| {
+                format!(
+                    "failed to preserve config permissions for {}",
+                    temp_path.display()
+                )
+            })?;
         temp.write_all(contents).with_context(|| {
             format!(
                 "failed to write temporary config file {}",
@@ -433,26 +435,26 @@ fn atomic_write_config_with_source(
                 temp_path.display()
             )
         })?;
-        drop(temp);
         revalidate_config_source(
             config_path,
             original_contents,
             original_metadata,
-            source_file,
-        )?;
-        replace_file(&temp_path, config_path).with_context(|| {
-            format!(
-                "failed to atomically replace config file {} with {}",
-                config_path.display(),
-                temp_path.display()
-            )
-        })?;
-        Ok(())
+            source_file.as_ref(),
+        )
     })();
-    if write_result.is_err() && temp_path.exists() {
+    drop(temp);
+    if let Err(error) = write_result {
         let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    write_result
+    drop(source_file);
+    replace_file(&temp_path, config_path).with_context(|| {
+        format!(
+            "failed to atomically replace config file {} with {}",
+            config_path.display(),
+            temp_path.display()
+        )
+    })
 }
 
 fn create_config_temp_file(temp_path: &Path, source_metadata: &fs::Metadata) -> Result<fs::File> {
@@ -464,22 +466,14 @@ fn create_config_temp_file(temp_path: &Path, source_metadata: &fs::Metadata) -> 
         // observed. The umask may make it more restrictive, never broader.
         options.mode(source_metadata.mode() & 0o777);
     }
-    let temp = options.open(temp_path).with_context(|| {
+    #[cfg(not(unix))]
+    let _ = source_metadata;
+    options.open(temp_path).with_context(|| {
         format!(
             "failed to create temporary config file {}",
             temp_path.display()
         )
-    })?;
-    // Restore the exact original permissions when a restrictive umask changed
-    // them. This occurs only after safe initial creation.
-    temp.set_permissions(source_metadata.permissions())
-        .with_context(|| {
-            format!(
-                "failed to preserve config permissions for {}",
-                temp_path.display()
-            )
-        })?;
-    Ok(temp)
+    })
 }
 
 fn revalidate_config_source(
@@ -551,6 +545,45 @@ fn config_metadata_matches(expected: &fs::Metadata, current: &fs::Metadata) -> b
     }
 }
 
+pub(crate) fn resolve_config_target(config_path: &Path) -> Result<PathBuf> {
+    let mut candidate = config_path.to_path_buf();
+    let mut visited = HashSet::new();
+    for _ in 0..64 {
+        let parent = candidate
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = candidate
+            .file_name()
+            .ok_or_else(|| anyhow!("config path has no file name: {}", candidate.display()))?;
+        let target = fs::canonicalize(parent)
+            .with_context(|| format!("failed to resolve config directory {}", parent.display()))?
+            .join(file_name);
+        if !visited.insert(target.clone()) {
+            bail!("config symlink cycle at {}", target.display());
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&target).with_context(|| {
+                    format!("failed to read config symlink {}", target.display())
+                })?;
+                candidate = target.parent().unwrap().join(link);
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect config file {}", target.display())
+                });
+            }
+        }
+    }
+    bail!(
+        "too many config symlinks resolving {}",
+        config_path.display()
+    )
+}
+
 pub(crate) struct ConfigLock {
     _file: fs::File,
 }
@@ -558,44 +591,112 @@ pub(crate) struct ConfigLock {
 pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     match fs::symlink_metadata(destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return fs::rename(source, destination).context("failed to install new file");
+            return fs::rename(source, destination).with_context(|| {
+                format!(
+                    "failed to install {} from {}",
+                    destination.display(),
+                    source.display()
+                )
+            });
         }
-        Err(error) => return Err(error).context("failed to inspect replacement destination"),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect replacement destination {}; replacement file retained at {}",
+                    destination.display(),
+                    source.display()
+                )
+            });
+        }
         Ok(_) => {}
     }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-        let source = source
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let destination = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let ok = unsafe {
-            ReplaceFileW(
-                destination.as_ptr(),
-                source.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to replace file");
-        }
-        Ok(())
+        replace_file_with_backup(
+            source,
+            destination,
+            |source, destination, backup| {
+                let wide = |path: &Path| {
+                    path.as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>()
+                };
+                let source = wide(source);
+                let destination = wide(destination);
+                let backup = wide(backup);
+                let ok = unsafe {
+                    ReplaceFileW(
+                        destination.as_ptr(),
+                        source.as_ptr(),
+                        backup.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                };
+                if ok == 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+            |path| fs::remove_dir_all(path),
+        )
     }
     #[cfg(not(windows))]
     {
-        fs::rename(source, destination).context("failed to replace file")
+        fs::rename(source, destination).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                destination.display(),
+                source.display()
+            )
+        })
     }
+}
+
+#[cfg(any(windows, test))]
+fn replace_file_with_backup(
+    source: &Path,
+    destination: &Path,
+    replace: impl FnOnce(&Path, &Path, &Path) -> std::io::Result<()>,
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let backup_dir = tempfile::Builder::new()
+        .prefix(".letcode-replace-")
+        .tempdir_in(parent)
+        .with_context(|| {
+            format!(
+                "failed to create replacement backup directory for {}; replacement file retained at {}",
+                destination.display(),
+                source.display()
+            )
+        })?
+        .keep();
+    let backup = backup_dir.join("original");
+    replace(source, destination, &backup).with_context(|| {
+        format!(
+            "failed to replace {}; replacement file: {}; backup directory retained at {}",
+            destination.display(),
+            source.display(),
+            backup_dir.display()
+        )
+    })?;
+    if let Err(error) = cleanup(&backup_dir) {
+        tracing::warn!(
+            %error,
+            path = %backup_dir.display(),
+            "file replaced but replacement backup cleanup failed"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn acquire_config_lock(config_target: &Path) -> Result<ConfigLock> {
@@ -707,4 +808,140 @@ pub(super) fn acquire_config_read_lock(config_target: &Path) -> Result<ConfigLoc
     let file = open_config_lock_file(&lock_path)?;
     lock_file_shared(&file)?;
     Ok(ConfigLock { _file: file })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_failure_keeps_the_source_and_original_file_names() {
+        for error_code in [5, 1175, 1176] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("new.toml");
+            let destination = directory.path().join("config.toml");
+            fs::write(&source, "new").unwrap();
+            fs::write(&destination, "old").unwrap();
+            let mut backup = None;
+            let error = replace_file_with_backup(
+                &source,
+                &destination,
+                |_, _, path| {
+                    backup = Some(path.to_path_buf());
+                    Err(std::io::Error::from_raw_os_error(error_code))
+                },
+                |_| panic!("failed replacements must not be cleaned up"),
+            )
+            .unwrap_err();
+            let backup = backup.unwrap();
+            assert_eq!(fs::read_to_string(&source).unwrap(), "new");
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "old");
+            assert!(backup.parent().unwrap().is_dir());
+            assert!(!backup.exists());
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(error_code)
+            );
+            let detail = format!("{error:#}");
+            assert!(detail.contains(source.to_str().unwrap()));
+            assert!(detail.contains(destination.to_str().unwrap()));
+            assert!(detail.contains(backup.parent().unwrap().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn partial_replacement_failure_keeps_both_recovery_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("new.toml");
+        let destination = directory.path().join("config.toml");
+        fs::write(&source, "new").unwrap();
+        fs::write(&destination, "old").unwrap();
+        let mut backup = None;
+        let error = replace_file_with_backup(
+            &source,
+            &destination,
+            |_, destination, path| {
+                backup = Some(path.to_path_buf());
+                fs::rename(destination, path)?;
+                Err(std::io::Error::from_raw_os_error(1177))
+            },
+            |_| panic!("partial replacements must not be cleaned up"),
+        )
+        .unwrap_err();
+        let backup = backup.unwrap();
+        assert!(!destination.exists());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(1177)
+        );
+        assert!(format!("{error:#}").contains(backup.parent().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn successful_replacement_cleans_up_its_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("new.toml");
+        let destination = directory.path().join("config.toml");
+        fs::write(&source, "new").unwrap();
+        fs::write(&destination, "old").unwrap();
+        let mut backup = None;
+        replace_file_with_backup(
+            &source,
+            &destination,
+            |source, destination, path| {
+                backup = Some(path.to_path_buf());
+                fs::rename(destination, path)?;
+                fs::rename(source, destination)
+            },
+            |path| fs::remove_dir_all(path),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new");
+        assert!(!source.exists());
+        assert!(!backup.unwrap().parent().unwrap().exists());
+    }
+
+    #[test]
+    fn backup_cleanup_failure_does_not_report_a_successful_replace_as_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("new.toml");
+        let destination = directory.path().join("config.toml");
+        fs::write(&source, "new").unwrap();
+        fs::write(&destination, "old").unwrap();
+        let mut backup = None;
+        replace_file_with_backup(
+            &source,
+            &destination,
+            |source, destination, path| {
+                backup = Some(path.to_path_buf());
+                fs::rename(destination, path)?;
+                fs::rename(source, destination)
+            },
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new");
+        assert_eq!(fs::read_to_string(backup.unwrap()).unwrap(), "old");
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn config_preparation_failure_removes_only_the_new_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "original").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        fs::write(&path, "external edit").unwrap();
+        atomic_write_config(&path, "original", &metadata, b"new").unwrap_err();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external edit");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }

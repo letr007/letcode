@@ -6,6 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -95,10 +98,24 @@ fn load_index(base_dir: &Path) -> SessionsIndexFile {
 fn save_index(base_dir: &Path, index: &SessionsIndexFile) -> Result<()> {
     fs::create_dir_all(base_dir)?;
     let path = index_path(base_dir);
-    let tmp = base_dir.join(format!("{INDEX_FILE}.tmp"));
     let bytes = serde_json::to_vec_pretty(index)?;
-    fs::write(&tmp, bytes)
-        .with_context(|| format!("failed to write session index {}", tmp.display()))?;
+    let prefix = format!(".{INDEX_FILE}.");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o666));
+    let mut temp = builder.tempfile_in(base_dir).with_context(|| {
+        format!(
+            "failed to create session index temporary file in {}",
+            base_dir.display()
+        )
+    })?;
+    temp.write_all(&bytes)
+        .with_context(|| format!("failed to write session index {}", temp.path().display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync session index {}", temp.path().display()))?;
+    let tmp = temp.into_temp_path().keep()?;
     crate::config::replace_file(&tmp, &path)
         .with_context(|| format!("failed to replace session index {}", path.display()))?;
     Ok(())
@@ -204,4 +221,63 @@ pub(super) fn list_sessions_with_index(
     sessions.sort_by_key(|session| session.last_timestamp_ms.unwrap_or(0));
     sessions.reverse();
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_failures_preserve_unique_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = index_path(dir.path());
+        fs::create_dir(&path).unwrap();
+        let mut index = SessionsIndexFile {
+            version: INDEX_VERSION,
+            ..SessionsIndexFile::default()
+        };
+        let mut failed_sources = BTreeMap::new();
+
+        for record_count in [3, 5] {
+            index.sessions.insert(
+                "parent".into(),
+                IndexedSession {
+                    record_count,
+                    ..IndexedSession::default()
+                },
+            );
+            save_index(dir.path(), &index).unwrap_err();
+            let sources: BTreeMap<_, _> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                .map(|source| {
+                    let bytes = fs::read(&source).unwrap();
+                    (source, bytes)
+                })
+                .collect();
+            assert_eq!(sources.len(), failed_sources.len() + 1);
+            for (source, bytes) in &failed_sources {
+                assert_eq!(sources.get(source), Some(bytes));
+            }
+            let expected = serde_json::to_vec_pretty(&index).unwrap();
+            assert!(sources.values().any(|bytes| bytes == &expected));
+            failed_sources = sources;
+        }
+
+        fs::remove_dir(&path).unwrap();
+        save_index(dir.path(), &index).unwrap();
+        assert_eq!(load_index(dir.path()).sessions["parent"].record_count, 5);
+        for (source, bytes) in &failed_sources {
+            assert_eq!(&fs::read(source).unwrap(), bytes);
+        }
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                .count(),
+            failed_sources.len()
+        );
+    }
 }

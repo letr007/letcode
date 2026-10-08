@@ -12,6 +12,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
@@ -311,10 +314,24 @@ fn load_index(base_dir: &Path) -> ArchiveIndexFile {
 fn save_index(base_dir: &Path, index: &ArchiveIndexFile) -> Result<()> {
     let dir = ensure_archive_dir(base_dir)?;
     let path = dir.join(INDEX_FILE);
-    let tmp = dir.join(format!("{INDEX_FILE}.tmp"));
     let bytes = serde_json::to_vec_pretty(index)?;
-    fs::write(&tmp, bytes)
-        .with_context(|| format!("failed to write archive index {}", tmp.display()))?;
+    let prefix = format!(".{INDEX_FILE}.");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o666));
+    let mut temp = builder.tempfile_in(&dir).with_context(|| {
+        format!(
+            "failed to create archive index temporary file in {}",
+            dir.display()
+        )
+    })?;
+    temp.write_all(&bytes)
+        .with_context(|| format!("failed to write archive index {}", temp.path().display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync archive index {}", temp.path().display()))?;
+    let tmp = temp.into_temp_path().keep()?;
     crate::config::replace_file(&tmp, &path)
         .with_context(|| format!("failed to replace archive index {}", path.display()))?;
     Ok(())
@@ -350,6 +367,52 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows["parent"].record_count, 3);
         assert_eq!(rows["other"].record_count, 5);
+    }
+
+    #[test]
+    fn replacement_failures_preserve_unique_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = ensure_archive_dir(dir.path()).unwrap();
+        let path = archive.join(INDEX_FILE);
+        fs::create_dir(&path).unwrap();
+        let mut index = ArchiveIndexFile::default();
+        let mut failed_sources = BTreeMap::new();
+
+        for record_count in [3, 5] {
+            index.sessions.insert("parent".into(), row(record_count));
+            save_index(dir.path(), &index).unwrap_err();
+            let sources: BTreeMap<_, _> = fs::read_dir(&archive)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                .map(|source| {
+                    let bytes = fs::read(&source).unwrap();
+                    (source, bytes)
+                })
+                .collect();
+            assert_eq!(sources.len(), failed_sources.len() + 1);
+            for (source, bytes) in &failed_sources {
+                assert_eq!(sources.get(source), Some(bytes));
+            }
+            let expected = serde_json::to_vec_pretty(&index).unwrap();
+            assert!(sources.values().any(|bytes| bytes == &expected));
+            failed_sources = sources;
+        }
+
+        fs::remove_dir(&path).unwrap();
+        save_index(dir.path(), &index).unwrap();
+        assert_eq!(rows(dir.path())["parent"].record_count, 5);
+        for (source, bytes) in &failed_sources {
+            assert_eq!(&fs::read(source).unwrap(), bytes);
+        }
+        assert_eq!(
+            fs::read_dir(&archive)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                .count(),
+            failed_sources.len()
+        );
     }
 
     #[test]

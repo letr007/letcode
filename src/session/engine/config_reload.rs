@@ -382,7 +382,7 @@ pub(crate) fn create_config_watcher(
     config_path: &std::path::Path,
     reload_tx: mpsc::UnboundedSender<()>,
 ) -> Result<RecommendedWatcher> {
-    let target = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let target = crate::config::resolve_config_target(config_path)?;
     let watch_dir = target
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
