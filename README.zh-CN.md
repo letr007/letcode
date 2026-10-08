@@ -22,7 +22,7 @@ letcode 是面向生产力打造的终端编程 Agent。它基于 Ratatui 构建
 
 ## 核心特性
 
-- **多专家协同机制**：内置 `explorer`（只读探索）、`fixer`（代码修复）、`oracle`（根因分析与风险审查）、`designer`（方案设计）、`librarian`（资料检索）与 `general`（通用辅助）六类专家，基于任务池管理并发调度与独占文件路径锁；
+- **多专家协同机制**：内置 `explorer`（只读探索）、`fixer`（代码修复）、`oracle`（根因分析与风险审查）、`designer`（方案设计）、`librarian`（资料检索）与 `general`（通用任务与修改）六类专家，基于任务池管理并发调度与独占文件路径锁；
 - **终端原生富文本渲染**：在终端网格中原生渲染流式 Markdown、LaTeX 数学公式与 Mermaid 矢量图表（流程图、时序图、状态图），无需外部浏览器辅助；
 - **原生多协议支持**：完整支持 OpenAI Responses、Chat Completions 与 Anthropic Messages 协议，支持 Responses 协议下的全双工 WebSocket 流式传输；
 - **分层安全权限模型**：提供 `safe`（完全人工确认）、`default`（读放行写确认）、`auto`（智能审查自动判定）与 `yolo`（全自动）四种运行模式，支持会话级授权表与参数特征比对；

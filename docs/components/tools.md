@@ -14,7 +14,9 @@ Tools 模块将模型工具调用分发到本地处理器、子代理任务池�
 - 命令与版本库：`shell__exec`、`search__rg`、`git__status`、`git__diff`、`git__log`；
 - 网络通信：`web__fetch`。
 
-六个专家委派工具各有专长：`explorer` 用于只读代码探索，`fixer` 负责限定范围的代码修复，`oracle` 提供根因分析与风险审查，`designer` 负责方案设计与交互梳理，`librarian` 整理资料与检索代码，`general` 处理明确的通用辅助任务。`reviewer` 与 `historian` 属于内部系统专家，不提供委派工具；任务控制工具用于管理已有任务，不创建新专家。`context__search` 与 `context__expand` 提供受控的历史记录与证据检索，不恢复旧的运行时状态。
+`explorer` 只读探索代码，`fixer` 实现和修复代码。`oracle` 分析根因与风险，`designer` 整理设计与接口，`librarian` 检索资料。`general` 处理限定范围的通用任务，可读取和修改文件。
+
+`reviewer` 和 `historian` 是内部专家，不提供委派工具。任务控制工具只管理已有任务。`context__search` 与 `context__expand` 检索历史记录和证据，不恢复旧运行时状态。
 
 `ToolRegistry` 按名称统一管理工具处理器，提供 `register`、`try_register` 和 `remove` 操作。受保护的系统检查点与控制指令禁止被动态覆盖。`spec()` 方法将处理器描述转换为面向模型的结构化定义，系统根据当前调用方权限和运行环境动态筛选可见工具。
 

@@ -7,9 +7,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- `/help` 和 `/?` 打开内置中英文帮助手册，支持章节目录、翻页、鼠标滚动和窄屏浏览。
+- `Ctrl+Backspace` 撤回队尾尚未派发的消息，保留输入草稿和当前执行。
+
 ### Changed
 
-- `general` 专家支持限定范围的文件修改。委派时需提供非空的 `owned_paths`，与 `fixer` 使用相同的写锁和范围审计。
+- `general` 专家支持限定范围的文件修改。
+- 子代理最终报告由宿主直接解析，不再额外调用模型改写。
+
+### Fixed
+
+- 配置编辑器关闭未保存草稿时提供保存、丢弃或继续编辑选项。修复粘贴、字段搜索和无效数字输入的交互问题。
+- 修复文件修改卡片展开后仍截断 diff 的问题，点击可查看完整内容。
+- 修复子代理自动关闭 Fast Mode 时影响主会话设置的问题，子代理与主会话独立维护开关状态。
+- 修复配置保存期间重载误报文件不存在的问题，读取会等待写入完成。
+- 修复 Windows 文件替换失败时恢复文件被清理的问题，错误信息会列出恢复路径。
 
 ## [0.19.0] - 2026-10-06
 
@@ -496,7 +510,9 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/letr007/letcode/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/letr007/letcode/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/letr007/letcode/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/letr007/letcode/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/letr007/letcode/compare/v0.15.0...v0.16.0

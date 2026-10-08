@@ -2,7 +2,7 @@
 
 ## Quick start
 
-- Press `Tab` to switch between contents and text.
+- Press `Tab` to switch between contents and text. Press `←` to focus contents, or `→` / `Enter` to focus document text.
 - Press `↑` / `↓` or `k` / `j` to select a chapter or scroll the text.
 - Press `PgUp` / `PgDn` to page, or `Home` / `End` to reach the top or bottom.
 - Press `Esc` or `q` to close help.
@@ -69,8 +69,10 @@ These shortcuts apply outside dialogs, completion lists, questions, and approval
 - In searchable dialogs, type to filter the list and press `Backspace` to edit the filter.
   In non-searchable selection dialogs, press `k` / `j` to move between items.
 - In the session picker, press `←` / `→` to switch between this workspace and all workspaces.
-- In the configuration editor, press `Enter` to edit or expand an item.
-  Outside a field editor, press `Ctrl+S` to save the configuration draft.
+- In the configuration editor, press `Enter` or `→` to edit a field or enter a table.
+  Press `←` or `Esc` to collapse an expanded list, or `Esc` to leave a table.
+  Editable arrays support `a` to append and `d` or `Delete` to remove items.
+  Outside a field editor, press `Ctrl+S` to save the draft. Closing with unsaved changes offers save, discard, or continue editing.
 - In a child view with empty input, press `↑` to return to the parent.
   Press `←` / `→` or `h` / `l` to browse children; press `j` / `k` to scroll the conversation.
 - From the main input or a child view, press `Alt+←` / `Alt+→` to browse children,
