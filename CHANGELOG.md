@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [0.20.1] - 2026-10-09
 
 ### Changed
 
@@ -13,7 +13,8 @@
 
 ### Fixed
 
-- 修复主回合结束后，新输入仍因后台任务排队的问题。
+- 修复主回合结束后，新输入仍因后台任务排队、终端标题持续旋转的问题。
+- 修复后台任务完成后自动续跑、等待模型响应期间无法中断的问题。
 
 ## [0.20.0] - 2026-10-08
 
@@ -520,7 +521,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/letr007/letcode/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/letr007/letcode/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/letr007/letcode/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/letr007/letcode/compare/v0.17.0...v0.18.0
