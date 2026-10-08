@@ -5,6 +5,16 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Changed
+
+- 右侧面板显示下限提高为 126 列终端宽度，宽度不足时手动打开仍隐藏。
+
+### Fixed
+
+- 修复主回合结束后，新输入仍因后台任务排队的问题。
+
 ## [0.20.0] - 2026-10-08
 
 ### Added
