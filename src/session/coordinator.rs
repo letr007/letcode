@@ -16,7 +16,7 @@ use crate::session::child_view::{
     sessions_dir_from_transcript,
 };
 use crate::session::command::SessionCommand;
-use crate::session::event::{ErrorEvent, NoticeEvent};
+use crate::session::event::{ErrorEvent, NoticeEvent, NoticeId};
 use crate::session::restore::{
     apply_prepared_restored_route, apply_restored_permission_mode, apply_restored_reasoning_effort,
     prepare_restored_model_route, restored_messages_from_protocol_frames,
@@ -188,9 +188,10 @@ impl SessionCoordinator {
             }
             SessionCommand::ToggleFastMode => {
                 let Some(fast_mode) = agent.fast_mode() else {
-                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                        "Fast mode unavailable",
-                    )));
+                    let _ = event_tx.send(SessionTransportEvent::Notice(
+                        NoticeEvent::info("Fast mode unavailable")
+                            .with_message_id(NoticeId::FastModeUnavailable),
+                    ));
                     return Ok(IdleDispatch::Handled);
                 };
                 match fast_mode.toggle(agent.model()) {
@@ -204,8 +205,10 @@ impl SessionCoordinator {
                         };
                         let _ = event_tx.send(SessionTransportEvent::FastModeChanged { enabled });
                         if let Some(notice) = notice {
-                            let _ = event_tx
-                                .send(SessionTransportEvent::Notice(NoticeEvent::info(notice)));
+                            let _ = event_tx.send(SessionTransportEvent::Notice(
+                                NoticeEvent::info(notice)
+                                    .with_message_id(NoticeId::FastModeUnavailableForModel),
+                            ));
                         }
                     }
                     Err(error) => {
@@ -428,9 +431,10 @@ impl SessionCoordinator {
 
     fn emit_fast_mode_auto_disabled(event_tx: &mpsc::UnboundedSender<SessionTransportEvent>) {
         let _ = event_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
-        let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-            "Fast mode auto-disabled: current model is unavailable",
-        )));
+        let _ = event_tx.send(SessionTransportEvent::Notice(
+            NoticeEvent::info("Fast mode auto-disabled: current model is unavailable")
+                .with_message_id(NoticeId::FastModeAutoDisabled),
+        ));
     }
 
     fn entry_sequence(entry_id: &str) -> Result<u64> {
@@ -662,7 +666,11 @@ impl SessionCoordinator {
                     match operation {
                         crate::transcript::HistoryNavigationOperation::Undo
                         | crate::transcript::HistoryNavigationOperation::Redo => {
-                            SessionTransportEvent::Notice(NoticeEvent::info(message))
+                            SessionTransportEvent::Notice(
+                                NoticeEvent::info(message)
+                                    .with_message_id(NoticeId::HistoryNavigationFailed)
+                                    .with_args([("error", error.error.to_string())]),
+                            )
                         }
                         crate::transcript::HistoryNavigationOperation::Navigate => {
                             SessionTransportEvent::Error(ErrorEvent::new(message))
@@ -738,9 +746,10 @@ impl SessionCoordinator {
             )
         }) {
             Ok(None) => {
-                let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                    "No child subagent transcripts for this session",
-                )));
+                let _ = event_tx.send(SessionTransportEvent::Notice(
+                    NoticeEvent::info("No child subagent transcripts for this session")
+                        .with_message_id(NoticeId::NoChildTranscripts),
+                ));
                 None
             }
             Ok(Some(view)) => {

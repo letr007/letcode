@@ -32,8 +32,9 @@ use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
 use crate::session::{
-    AgentRunner, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
-    SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent,
+    AgentRunner, ErrorEvent, NoticeEvent, NoticeId, RuntimeContextDisposition,
+    RuntimeContextUpdatedEvent, SessionCommand, SessionEvent, SessionTransportEvent,
+    TokenUsageEvent,
 };
 use crate::subagent::{SubagentJob, SubagentPool, SubagentStatus};
 use crate::tool::{ToolHandler, normalize_subagent_input};
@@ -1547,7 +1548,8 @@ async fn run_engine_loop(
                                 let _ = session_transport_tx.send(SessionTransportEvent::Notice(
                                     NoticeEvent::info(
                                         "Fast mode auto-disabled: current model is unavailable",
-                                    ),
+                                    )
+                                    .with_message_id(NoticeId::FastModeAutoDisabled),
                                 ));
                             }
                             let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
@@ -1582,7 +1584,8 @@ async fn run_engine_loop(
                                 let _ = session_transport_tx.send(SessionTransportEvent::Notice(
                                     NoticeEvent::info(
                                         "Fast mode auto-disabled: current model is unavailable",
-                                    ),
+                                    )
+                                    .with_message_id(NoticeId::FastModeAutoDisabled),
                                 ));
                             }
                             send_setting_change_failed(
@@ -2147,9 +2150,12 @@ async fn run_engine_loop(
                             continue;
                         }
                         if subagent_runtime.is_running() {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                                "Wait for the active subagent to finish before compacting context",
-                            )));
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                NoticeEvent::info(
+                                    "Wait for the active subagent to finish before compacting context",
+                                )
+                                .with_message_id(NoticeId::WaitForSubagentBeforeCompaction),
+                            ));
                             let _ = session_transport_tx.send(SessionTransportEvent::Done);
                             continue;
                         }
@@ -2272,9 +2278,12 @@ async fn run_engine_loop(
                         };
                         if fast_mode_auto_disabled {
                             let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
-                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                                "Fast mode auto-disabled: current model is unavailable",
-                            )));
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                NoticeEvent::info(
+                                    "Fast mode auto-disabled: current model is unavailable",
+                                )
+                                .with_message_id(NoticeId::FastModeAutoDisabled),
+                            ));
                         }
                         let restored_fake_client =
                             crate::transcript::restore_latest_fake_client(&resumed_event_records);
@@ -2828,9 +2837,12 @@ async fn run_engine_loop(
             _ = memory_refresh.tick() => {
                 if let Err(error) = memory_worker.tick(&agent).await {
                     tracing::warn!(error = %error, "project memory worker unavailable");
-                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                        "Background memory processing is unavailable; see the application log",
-                    )));
+                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                        NoticeEvent::info(
+                            "Background memory processing is unavailable; see the application log",
+                        )
+                        .with_message_id(NoticeId::BackgroundMemoryUnavailable),
+                    ));
                 }
             }
             _ = child_refresh.tick(), if visible_child_session_id.is_some() => {

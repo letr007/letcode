@@ -10,6 +10,7 @@ use crate::context_view::{
 };
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeActiveContext;
+use crate::session::NoticeId;
 use crate::session::engine::{
     ActiveSessionOperation, InterruptRequest, ManualCompactionNavigation,
     ManualCompactionOperation, SessionEngineCommand, SessionEngineControl,
@@ -1767,6 +1768,30 @@ fn expert_allowlist_change_during_a_turn_shows_in_the_panel() {
     runtime
         .handle_input_action(InputAction::DialogCancel)
         .expect("returns to the agents picker");
+}
+
+#[test]
+fn notice_messages_follow_the_active_language() {
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::ZhCn));
+
+    runtime.apply_session_transport_event(SessionTransportEvent::Notice(
+        NoticeEvent::info("Turn still running").with_message_id(NoticeId::TurnRunning),
+    ));
+    assert_eq!(
+        runtime.state().toast().map(|toast| toast.message.as_str()),
+        Some("回合仍在运行")
+    );
+
+    runtime.apply_session_transport_event(SessionTransportEvent::Notice(NoticeEvent::info(
+        "Turn still running",
+    )));
+    assert_eq!(
+        runtime.state().toast().map(|toast| toast.message.as_str()),
+        Some("Turn still running")
+    );
 }
 
 #[test]

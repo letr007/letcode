@@ -55,11 +55,11 @@ pub use engine::{
 pub use event::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
-    NoticeEvent, NoticeKind, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
-    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RetryLifecycleEvent,
-    RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent,
-    TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
-    ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+    NoticeEvent, NoticeId, NoticeKind, PermissionDecision, PermissionRequestEvent,
+    PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
+    RetryLifecycleEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent,
+    TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome,
+    ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
 
 pub use lifecycle::{prepare_new_session_package, resolve_session_prefix};

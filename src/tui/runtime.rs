@@ -1286,7 +1286,28 @@ impl TuiRuntime {
         self.set_output_token_rate_for_session(sample.child_session_id.as_deref(), Some(rate));
     }
 
+    fn localized_notice(&self, event: SessionTransportEvent) -> SessionTransportEvent {
+        match event {
+            SessionTransportEvent::Notice(notice) => {
+                SessionTransportEvent::Notice(self.state.localized_notice(notice))
+            }
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name,
+                parent_tool_call_id,
+                event: SessionEvent::Notice(notice),
+            } => SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name,
+                parent_tool_call_id,
+                event: SessionEvent::Notice(self.state.localized_notice(notice)),
+            },
+            event => event,
+        }
+    }
+
     pub fn apply_session_transport_event(&mut self, event: SessionTransportEvent) {
+        let event = self.localized_notice(event);
         let mut suppress_session_event = false;
 
         match &event {

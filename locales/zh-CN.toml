@@ -485,3 +485,18 @@ providers = "模型 provider，每个 provider 一张表。"
 "providers/*/models/*/cache/enabled" = "该路由上 provider 原生提示缓存的唯一开关。"
 "providers/*/models/*/cache/retention" = "缓存保留时长。24h 仅 Responses 可用，且要求 enabled = true。"
 "tools/parallelism" = "逐工具的并发数，只能降低已允许并行的工具。"
+
+# 引擎提示的英文原文在代码中，这里只维护译文。
+[notice]
+background_memory_unavailable = "后台记忆处理不可用，详见应用日志"
+change_queued = "更改已排队，将在当前回合后生效"
+fast_mode_auto_disabled = "快速模式已自动关闭：当前模型不可用"
+fast_mode_unavailable = "快速模式不可用"
+fast_mode_unavailable_for_model = "当前模型不支持快速模式"
+history_navigation_failed = "会话历史导航失败：{error}"
+history_navigation_unavailable = "回合进行中无法导航会话历史"
+model_missing_from_catalog = "当前模型“{model}”已不在配置的模型目录中；在切换模型或新建会话前，本会话继续使用原有路由"
+no_child_transcripts = "本会话没有子代理 transcript"
+project_memory_unavailable = "项目记忆记录不可用，详见应用日志"
+turn_running = "回合仍在运行"
+wait_for_subagent_before_compaction = "请等待当前子代理结束后再压缩上下文"

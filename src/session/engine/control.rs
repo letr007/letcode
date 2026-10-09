@@ -240,9 +240,10 @@ pub(crate) fn handle_active_turn_command(
     // rewrites it, so it waits for the turn in every phase that parks commands.
     match &command {
         SessionEngineCommand::Undo | SessionEngineCommand::Redo => {
-            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                "history navigation is unavailable while a turn is active",
-            )));
+            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                NoticeEvent::info("history navigation is unavailable while a turn is active")
+                    .with_message_id(NoticeId::HistoryNavigationUnavailable),
+            ));
             return;
         }
         SessionEngineCommand::ShowHistoryTree | SessionEngineCommand::NavigateHistory { .. } => {
@@ -262,9 +263,9 @@ pub(crate) fn handle_active_turn_command(
             park_active_turn_command(parked_commands, command, session_transport_tx);
         }
         crate::session::ActiveTurnCommandDisposition::Reject => {
-            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                "Turn still running",
-            )));
+            let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                NoticeEvent::info("Turn still running").with_message_id(NoticeId::TurnRunning),
+            ));
         }
         crate::session::ActiveTurnCommandDisposition::QueuePrompt
         | crate::session::ActiveTurnCommandDisposition::Immediate
@@ -370,9 +371,10 @@ pub(crate) fn park_active_turn_command(
     let first_parked = parked_commands.is_empty();
     enqueue_deferred_command(parked_commands, command);
     if first_parked {
-        let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-            "Change queued for after the current turn",
-        )));
+        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+            NoticeEvent::info("Change queued for after the current turn")
+                .with_message_id(NoticeId::ChangeQueued),
+        ));
     }
 }
 

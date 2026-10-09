@@ -87,10 +87,23 @@ impl Translator {
     }
 
     pub fn t_fmt(&self, key: &str, args: &[(&str, &str)]) -> String {
-        args.iter().fold(self.t(key), |value, (name, replacement)| {
-            value.replace(&format!("{{{name}}}"), replacement)
-        })
+        substitute(self.t(key), args)
     }
+
+    /// [`Self::lookup`] with `{name}` placeholders replaced by `args`.
+    pub fn lookup_fmt(&self, key: &str, args: &[(String, String)]) -> Option<String> {
+        let args: Vec<(&str, &str)> = args
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        self.lookup(key).map(|value| substitute(value, &args))
+    }
+}
+
+fn substitute(value: String, args: &[(&str, &str)]) -> String {
+    args.iter().fold(value, |value, (name, replacement)| {
+        value.replace(&format!("{{{name}}}"), replacement)
+    })
 }
 
 fn english_catalog() -> &'static HashMap<String, String> {
@@ -152,6 +165,18 @@ mod tests {
         assert_eq!(language_from_locale(Some("en-GB")), Language::En);
         assert_eq!(language_from_locale(Some("fr-FR")), Language::En);
         assert_eq!(language_from_locale(None), Language::En);
+    }
+
+    #[test]
+    fn every_notice_id_has_a_translation() {
+        let catalog = zh_cn_catalog();
+        for message_id in crate::session::NoticeId::ALL {
+            assert!(
+                catalog.contains_key(message_id.key()),
+                "missing translation for {}",
+                message_id.key()
+            );
+        }
     }
 
     #[test]

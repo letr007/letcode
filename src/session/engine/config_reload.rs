@@ -296,10 +296,14 @@ pub(crate) fn apply_config_reload(
             prepared.into_install().apply(agent);
         }
     } else if !current_route_available {
-        let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(format!(
-            "Current model '{}' is no longer in the configured model catalog; this session will keep using its existing route until you switch models or start a new session",
-            previous_active_route.display_name()
-        ))));
+        let _ = event_tx.send(SessionTransportEvent::Notice(
+            NoticeEvent::info(format!(
+                "Current model '{}' is no longer in the configured model catalog; this session will keep using its existing route until you switch models or start a new session",
+                previous_active_route.display_name()
+            ))
+            .with_message_id(NoticeId::ModelMissingFromCatalog)
+            .with_args([("model", previous_active_route.display_name())]),
+        ));
     }
 
     engine_config.model_routes = next_model_routes;

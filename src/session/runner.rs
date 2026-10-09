@@ -40,10 +40,10 @@ use events::{
 use subagent_delegate::RunnerSubagentDelegate;
 
 use crate::session::{
-    AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent, ProcessIssueEvent,
-    ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition, SessionEvent,
-    TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome,
-    ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+    AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent, NoticeId,
+    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition,
+    SessionEvent, TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent,
+    ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
 use crate::tool_format::format_tool_call;
 use formatting::{output_json, output_summary};
@@ -598,9 +598,12 @@ where {
                 .map_err(|_| anyhow!("transcript recorder poisoned"))?;
             if let Err(error) = crate::project_memory::enroll(&recorder) {
                 warn!(error = %error, "could not register project memory source");
-                self.emit(SessionTransportEvent::Notice(NoticeEvent::info(
-                    "Project memory recording is unavailable; see the application log",
-                )))?;
+                self.emit(SessionTransportEvent::Notice(
+                    NoticeEvent::info(
+                        "Project memory recording is unavailable; see the application log",
+                    )
+                    .with_message_id(NoticeId::ProjectMemoryUnavailable),
+                ))?;
             }
         }
         if let Some(transcript) = self.transcript.clone() {
@@ -878,9 +881,12 @@ where {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        SessionTransportEvent::Notice(NoticeEvent::info(
-                                            "Fast mode auto-disabled: current model is unavailable",
-                                        )),
+                                        SessionTransportEvent::Notice(
+                                            NoticeEvent::info(
+                                                "Fast mode auto-disabled: current model is unavailable",
+                                            )
+                                            .with_message_id(NoticeId::FastModeAutoDisabled),
+                                        ),
                                     )?;
                                 }
                                 AgentEvent::LlmRetryScheduled(retry) => {

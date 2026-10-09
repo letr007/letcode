@@ -1541,6 +1541,22 @@ impl TuiState {
         self.translator().t_fmt(key, args)
     }
 
+    pub fn t_opt_fmt(&self, key: &str, args: &[(String, String)]) -> Option<String> {
+        self.translator().lookup_fmt(key, args)
+    }
+
+    pub fn localized_notice(
+        &self,
+        mut notice: crate::session::NoticeEvent,
+    ) -> crate::session::NoticeEvent {
+        if let Some(message_id) = notice.message_id
+            && let Some(message) = self.t_opt_fmt(message_id.key(), &notice.args)
+        {
+            notice.message = message;
+        }
+        notice
+    }
+
     pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
         self.model_id = model_id.into();
         self.model_label = model_label.into();

@@ -344,6 +344,60 @@ impl AssistantDeltaEvent {
 pub struct NoticeEvent {
     pub message: String,
     pub kind: NoticeKind,
+    /// Translation key for frontends with a catalog; `message` stays the fallback.
+    pub message_id: Option<NoticeId>,
+    pub args: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeId {
+    BackgroundMemoryUnavailable,
+    ChangeQueued,
+    FastModeAutoDisabled,
+    FastModeUnavailable,
+    FastModeUnavailableForModel,
+    HistoryNavigationFailed,
+    HistoryNavigationUnavailable,
+    ModelMissingFromCatalog,
+    NoChildTranscripts,
+    ProjectMemoryUnavailable,
+    TurnRunning,
+    WaitForSubagentBeforeCompaction,
+}
+
+impl NoticeId {
+    #[cfg(test)]
+    pub const ALL: &'static [Self] = &[
+        Self::BackgroundMemoryUnavailable,
+        Self::ChangeQueued,
+        Self::FastModeAutoDisabled,
+        Self::FastModeUnavailable,
+        Self::FastModeUnavailableForModel,
+        Self::HistoryNavigationFailed,
+        Self::HistoryNavigationUnavailable,
+        Self::ModelMissingFromCatalog,
+        Self::NoChildTranscripts,
+        Self::ProjectMemoryUnavailable,
+        Self::TurnRunning,
+        Self::WaitForSubagentBeforeCompaction,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::BackgroundMemoryUnavailable => "notice.background_memory_unavailable",
+            Self::ChangeQueued => "notice.change_queued",
+            Self::FastModeAutoDisabled => "notice.fast_mode_auto_disabled",
+            Self::FastModeUnavailable => "notice.fast_mode_unavailable",
+            Self::FastModeUnavailableForModel => "notice.fast_mode_unavailable_for_model",
+            Self::HistoryNavigationFailed => "notice.history_navigation_failed",
+            Self::HistoryNavigationUnavailable => "notice.history_navigation_unavailable",
+            Self::ModelMissingFromCatalog => "notice.model_missing_from_catalog",
+            Self::NoChildTranscripts => "notice.no_child_transcripts",
+            Self::ProjectMemoryUnavailable => "notice.project_memory_unavailable",
+            Self::TurnRunning => "notice.turn_running",
+            Self::WaitForSubagentBeforeCompaction => "notice.wait_for_subagent_before_compaction",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,11 +416,31 @@ impl NoticeEvent {
         Self {
             message: message.into(),
             kind,
+            message_id: None,
+            args: Vec::new(),
         }
     }
 
     pub fn info(message: impl Into<String>) -> Self {
         Self::new(message, NoticeKind::Info)
+    }
+
+    pub fn with_message_id(mut self, message_id: NoticeId) -> Self {
+        self.message_id = Some(message_id);
+        self
+    }
+
+    pub fn with_args<I, K, V>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.args = args
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        self
     }
 }
 
