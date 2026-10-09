@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -217,6 +217,7 @@ pub struct TuiRuntime {
     history_draft: Option<ComposerDraft>,
     available_models: Vec<AvailableModel>,
     available_experts: Vec<AvailableExpert>,
+    pending_expert_allowed_models: BTreeMap<String, Vec<String>>,
     branch_poller: BranchPoller,
     sessions_dir: PathBuf,
     workspace_key: Option<String>,
@@ -265,6 +266,7 @@ impl TuiRuntime {
             history_draft: None,
             available_models,
             available_experts,
+            pending_expert_allowed_models: BTreeMap::new(),
             branch_poller: BranchPoller::new(),
             sessions_dir,
             workspace_key: None,
@@ -1442,16 +1444,10 @@ impl TuiRuntime {
                 {
                     expert.allowed_models = model_ids.clone();
                 }
-                if let Some(dialog) = self.state.dialog_mut().filter(|dialog| {
-                    matches!(
-                        &dialog.kind,
-                        DialogKind::ExpertModelPicker(open_agent) if open_agent == agent_name
-                    )
-                }) {
-                    for item in &mut dialog.items {
-                        item.checked = model_ids.contains(&item.id);
-                    }
+                if self.pending_expert_allowed_models.get(agent_name) == Some(model_ids) {
+                    self.pending_expert_allowed_models.remove(agent_name);
                 }
+                self.sync_open_expert_model_picker(agent_name);
                 self.refresh_open_agent_picker();
             }
             SessionTransportEvent::PermissionModeChanged { mode } => {
@@ -2699,8 +2695,17 @@ impl TuiRuntime {
                 // The optimistic fake badge is authoritative until the next
                 // successful selection; a failed toggle leaves the prior state.
             }
-            crate::session::SessionCommand::SetExpertAllowedModels { .. }
-            | crate::session::SessionCommand::ToggleFastMode
+            crate::session::SessionCommand::SetExpertAllowedModels {
+                agent_name,
+                model_ids,
+            } => {
+                if self.pending_expert_allowed_models.get(agent_name) == Some(model_ids) {
+                    self.pending_expert_allowed_models.remove(agent_name);
+                    self.sync_open_expert_model_picker(agent_name);
+                    self.refresh_open_agent_picker();
+                }
+            }
+            crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
             | crate::session::SessionCommand::DelegateSubagent { .. }
@@ -2738,8 +2743,15 @@ impl TuiRuntime {
                 self.state.set_pending_permission_mode(mode.to_string());
             }
             crate::session::SessionCommand::SetFakeClient(_) => {}
-            crate::session::SessionCommand::SetExpertAllowedModels { .. }
-            | crate::session::SessionCommand::ToggleFastMode
+            crate::session::SessionCommand::SetExpertAllowedModels {
+                agent_name,
+                model_ids,
+            } => {
+                self.pending_expert_allowed_models
+                    .insert(agent_name.clone(), model_ids.clone());
+                self.refresh_open_agent_picker();
+            }
+            crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
             | crate::session::SessionCommand::DelegateSubagent { .. }
@@ -4684,6 +4696,34 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn expert_allowed_models<'a>(&'a self, expert: &'a AvailableExpert) -> &'a [String] {
+        self.pending_expert_allowed_models
+            .get(&expert.agent_name)
+            .map(Vec::as_slice)
+            .unwrap_or(expert.allowed_models.as_slice())
+    }
+
+    fn sync_open_expert_model_picker(&mut self, agent_name: &str) {
+        let Some(allowed_models) = self
+            .available_experts
+            .iter()
+            .find(|expert| expert.agent_name == agent_name)
+            .map(|expert| self.expert_allowed_models(expert).to_vec())
+        else {
+            return;
+        };
+        if let Some(dialog) = self.state.dialog_mut().filter(|dialog| {
+            matches!(
+                &dialog.kind,
+                DialogKind::ExpertModelPicker(open_agent) if open_agent == agent_name
+            )
+        }) {
+            for item in &mut dialog.items {
+                item.checked = allowed_models.contains(&item.id);
+            }
+        }
+    }
+
     /// Rebuilds an open expert list so its route summaries track the experts' live routes.
     fn refresh_open_agent_picker(&mut self) {
         let Some((query, selected_agent)) = self
@@ -4709,7 +4749,7 @@ impl TuiRuntime {
             .map(|expert| {
                 DialogItem::new(expert.agent_name.clone(), expert.agent_name.clone(), None)
                     .with_section(self.state.t("ui.experts"))
-                    .with_right_detail(expert.model_summary())
+                    .with_right_detail(expert.model_summary(self.expert_allowed_models(expert)))
             })
             .collect();
         let mut dialog = DialogState::new(
@@ -4747,7 +4787,7 @@ impl TuiRuntime {
             .map(|expert| expert.route_id.clone())
             .unwrap_or_else(|| self.state.model_id.clone());
         let allowed_models = expert
-            .map(|expert| expert.allowed_models.clone())
+            .map(|expert| self.expert_allowed_models(expert).to_vec())
             .unwrap_or_default();
         let mut dialog = DialogState::new(
             DialogKind::ExpertModelPicker(agent_name),

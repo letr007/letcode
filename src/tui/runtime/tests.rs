@@ -1711,6 +1711,65 @@ fn agent_model_picker_escape_discards_changes_and_returns_to_agent_picker() {
 }
 
 #[test]
+fn expert_allowlist_change_during_a_turn_shows_in_the_panel() {
+    let mut runtime = runtime_with_experts(vec![AvailableExpert {
+        agent_name: "explorer".into(),
+        route_id: "gpt-5.5".into(),
+        allowed_models: vec!["gpt-5.5".into()],
+    }]);
+    runtime
+        .available_models
+        .push(AvailableModel::new("p/other", "Other"));
+    runtime.session_turn_active = true;
+    runtime.state_mut().set_input("/agents");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("agents picker opens");
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expert picker opens");
+    runtime
+        .handle_input_action(InputAction::DialogNext)
+        .expect("moves to the second model");
+    runtime
+        .handle_input_action(InputAction::DialogToggle)
+        .expect("toggles the second model");
+    let command = runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("confirming produces a command")
+        .expect("command");
+    let (mut engine, ingress, _egress) = SessionEngine::new();
+    command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+
+    assert!(matches!(
+        engine.try_recv_control(),
+        Ok(SessionEngineControl::Command(
+            SessionEngineCommand::SetExpertAllowedModels { .. }
+        ))
+    ));
+    assert_eq!(
+        runtime
+            .state()
+            .dialog()
+            .and_then(|dialog| dialog.items[0].right_detail.clone()),
+        Some("gpt-5.5 · p/other".into())
+    );
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("expert picker reopens");
+    assert!(matches!(
+        runtime.state().dialog(),
+        Some(dialog)
+            if matches!(dialog.kind, DialogKind::ExpertModelPicker(_))
+                && dialog.items.iter().filter(|item| item.checked).count() == 2
+    ));
+    runtime
+        .handle_input_action(InputAction::DialogCancel)
+        .expect("returns to the agents picker");
+}
+
+#[test]
 fn running_turn_opens_session_setting_dialogs() {
     for command_text in ["/model", "/agents", "/permission", "/reasoning"] {
         let mut runtime = runtime();
