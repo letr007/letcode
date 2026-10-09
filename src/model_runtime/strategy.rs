@@ -52,27 +52,21 @@ impl ModelStrategyId {
     }
 
     pub const fn default_protocol(self) -> &'static str {
-        "responses"
+        "completions"
     }
 
     pub const fn default_flavor(self) -> ProviderFlavor {
         ProviderFlavor::Standard
     }
 
-    pub fn validate_binding(self, protocol: &str, flavor: ProviderFlavor) -> Result<(), String> {
-        match self {
-            Self::Default | Self::Deepseek => Ok(()),
-            Self::Astra
-                if protocol == self.default_protocol() && flavor == self.default_flavor() =>
-            {
-                Ok(())
-            }
-            Self::Astra => Err(format!(
-                "strategy 'astra' requires protocol '{}' and flavor '{}'",
-                self.default_protocol(),
+    pub fn validate_binding(self, flavor: ProviderFlavor) -> Result<(), String> {
+        if self == Self::Astra && flavor != self.default_flavor() {
+            return Err(format!(
+                "strategy 'astra' requires flavor '{}'",
                 self.default_flavor().as_str()
-            )),
+            ));
         }
+        Ok(())
     }
 
     pub fn validate_generation(

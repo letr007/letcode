@@ -5594,6 +5594,7 @@ fn astra_strategy_injects_one_turn_scoped_harness_without_mutating_base_prelude(
     let catalog = crate::model_runtime::RuntimeConfig::from_toml(
         r#"active_provider = "openai"
 [providers.openai]
+protocol = "responses"
 default_model = "gpt-6-astra"
 [providers.openai.auth]
 type = "none"

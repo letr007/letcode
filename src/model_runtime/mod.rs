@@ -1776,10 +1776,10 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCapabilities {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub tools: bool,
     #[serde(default)]
     pub parallel_tool_calls: bool,
@@ -1793,6 +1793,20 @@ pub struct RuntimeCapabilities {
     pub priority_service: bool,
     #[serde(default)]
     pub generation: RuntimeGenerationConfig,
+}
+
+impl Default for RuntimeCapabilities {
+    fn default() -> Self {
+        Self {
+            tools: true,
+            parallel_tool_calls: false,
+            reasoning: false,
+            input_images: false,
+            tool_result_images: false,
+            priority_service: false,
+            generation: RuntimeGenerationConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2228,7 +2242,7 @@ impl RuntimeConfig {
                 let generation = &model.capabilities.generation;
                 let effective_flavor = resolved_model_flavor(provider, model_name, model);
                 strategy
-                    .validate_binding(protocol, effective_flavor)
+                    .validate_binding(effective_flavor)
                     .map_err(|reason| RuntimeConfigError::InvalidValue {
                         field: format!("providers.{provider_name}.models.{model_name}.strategy"),
                         reason,

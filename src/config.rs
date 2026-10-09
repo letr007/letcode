@@ -165,7 +165,7 @@ pub(crate) fn initialize_config(
 
     let model = toml_string(model);
     let config_text = format!(
-        "{CONFIG_SCHEMA_COMMENT}\n\nactive_provider = \"default\"\n\n[providers.default]\nprotocol = \"responses\"\ndefault_model = {model}\n\n[providers.default.auth]\ntype = \"bearer\"\ncredential = {}\n\n[providers.default.endpoints]\nbase_url = {}\n\n[providers.default.models.{model}.capabilities]\ntools = true\n",
+        "{CONFIG_SCHEMA_COMMENT}\n\nactive_provider = \"default\"\n\n[providers.default]\nprotocol = \"completions\"\ndefault_model = {model}\n\n[providers.default.auth]\ntype = \"bearer\"\ncredential = {}\n\n[providers.default.endpoints]\nbase_url = {}\n\n[providers.default.models.{model}.capabilities]\ntools = true\n",
         toml_string(api_key),
         toml_string(base_url),
     );
@@ -1882,6 +1882,24 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
+    fn unspecified_protocol_defaults_to_completions_for_every_strategy() {
+        for model in ["model", "deepseek-chat", "gpt-6-astra"] {
+            let text = config("openai", model, "").replace("protocol = \"responses\"\n", "");
+            let loaded = AppConfig::load_from_path(write_temp_config(text))
+                .expect("config without protocol should load");
+            assert_eq!(
+                loaded
+                    .runtime_catalog
+                    .route("openai", model)
+                    .unwrap()
+                    .protocol_id
+                    .as_str(),
+                "completions"
+            );
+        }
+    }
+
+    #[test]
     fn permissions_jev_section_is_rejected_as_unknown() {
         let text = format!(
             "{}\n[permissions]\nmode = \"auto\"\n\n[permissions.jev]\nbase_url = \"https://api.typesafe.ai\"\nmodel = \"jev-latest\"\n",
@@ -2118,7 +2136,7 @@ reasoning_efforts = ["high"]
     }
 
     #[test]
-    fn astra_strategy_owns_protocol_defaults_but_rejects_incompatible_overrides() {
+    fn astra_strategy_uses_the_protocol_default_and_rejects_other_flavors() {
         let inferred = r#"active_provider = "openai"
 [providers.openai]
 default_model = "gpt-6-astra"
@@ -2135,17 +2153,34 @@ base_url = "https://example.invalid/v1"
             .runtime_catalog
             .route("openai", "gpt-6-astra")
             .unwrap();
-        assert_eq!(route.protocol_id.as_str(), "responses");
+        assert_eq!(route.protocol_id.as_str(), "completions");
         assert_eq!(route.flavor, ProviderFlavor::Standard);
 
-        let incompatible = config(
+        let explicit_responses = config(
             "openai",
             "alias",
-            "strategy = \"astra\"\nprotocol = \"completions\"\n",
+            "strategy = \"astra\"\nprotocol = \"responses\"\n",
         );
-        let error = AppConfig::load_from_path(write_temp_config(incompatible))
-            .expect_err("incompatible explicit protocol must fail");
-        assert!(format!("{error:#}").contains("requires protocol 'responses'"));
+        let loaded = AppConfig::load_from_path(write_temp_config(explicit_responses))
+            .expect("an explicit astra protocol should load");
+        assert_eq!(
+            loaded
+                .runtime_catalog
+                .route("openai", "alias")
+                .unwrap()
+                .protocol_id
+                .as_str(),
+            "responses"
+        );
+
+        let incompatible_flavor = config(
+            "openai",
+            "alias",
+            "strategy = \"astra\"\nflavor = \"deepseek\"\n",
+        );
+        let error = AppConfig::load_from_path(write_temp_config(incompatible_flavor))
+            .expect_err("incompatible astra flavor must fail");
+        assert!(format!("{error:#}").contains("requires flavor 'standard'"));
 
         let missing_generation_support = config(
             "openai",
@@ -2296,13 +2331,29 @@ model_override = "wire-model"
     }
 
     #[test]
-    fn capabilities_default_off_and_typed_cache_settings_validate() {
+    fn capabilities_default_with_tools_enabled_and_typed_cache_settings_validate() {
         let loaded = AppConfig::load_from_path(write_temp_config(config("openai", "model", "")))
             .expect("minimal new config should load");
         let route = loaded.runtime_catalog.route("openai", "model").unwrap();
-        assert_eq!(route.capabilities, RouteCapabilities::default());
+        assert_eq!(
+            route.capabilities,
+            RouteCapabilities {
+                tools: true,
+                ..RouteCapabilities::default()
+            }
+        );
         assert_eq!(route.generation, GenerationSupport::default());
         assert!(!route.cache.enabled);
+
+        let partial = AppConfig::load_from_path(write_temp_config(config(
+            "openai",
+            "model",
+            "[capabilities]\ninput_images = true\n",
+        )))
+        .expect("partial capabilities table should load");
+        let partial_route = partial.runtime_catalog.route("openai", "model").unwrap();
+        assert!(partial_route.capabilities.tools);
+        assert!(partial_route.capabilities.input_images);
 
         let invalid = config(
             "openai",
