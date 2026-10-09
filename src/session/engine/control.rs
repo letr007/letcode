@@ -367,10 +367,13 @@ pub(crate) fn park_active_turn_command(
     command: SessionEngineCommand,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) {
+    let first_parked = parked_commands.is_empty();
     enqueue_deferred_command(parked_commands, command);
-    let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-        "Change queued for after the current turn",
-    )));
+    if first_parked {
+        let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+            "Change queued for after the current turn",
+        )));
+    }
 }
 
 pub(crate) fn flush_parked_commands(
