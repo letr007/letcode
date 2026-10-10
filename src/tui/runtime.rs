@@ -232,6 +232,7 @@ pub struct TuiRuntime {
     theme_preview_original: Option<(String, Option<Theme>)>,
     config_path: Option<PathBuf>,
     config_draft: Option<toml_edit::DocumentMut>,
+    config_draft_baseline: Option<String>,
 }
 
 impl TuiRuntime {
@@ -281,6 +282,7 @@ impl TuiRuntime {
             theme_preview_original: None,
             config_path: None,
             config_draft: None,
+            config_draft_baseline: None,
         }
     }
 
@@ -3867,11 +3869,14 @@ impl TuiRuntime {
     }
 
     fn load_config_draft(&mut self) {
-        self.config_draft = self.config_path.as_deref().and_then(|config_path| {
-            std::fs::read_to_string(config_path)
-                .ok()
-                .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
-        });
+        let text = self
+            .config_path
+            .as_deref()
+            .and_then(|config_path| std::fs::read_to_string(config_path).ok());
+        self.config_draft = text
+            .as_deref()
+            .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok());
+        self.config_draft_baseline = text;
     }
 
     fn edit_config_document(
@@ -3901,14 +3906,22 @@ impl TuiRuntime {
         let Some(document) = self.config_draft.as_ref() else {
             return false;
         };
+        let saved_text = document.to_string();
+        let externally_changed = std::fs::read_to_string(&config_path).ok().as_deref()
+            != self.config_draft_baseline.as_deref();
         match crate::config::save_config_document(&config_path, document) {
             Ok(()) => {
+                self.config_draft_baseline = Some(saved_text);
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.config_dirty = false;
                     dialog.config_error = None;
                 }
-                self.state
-                    .show_toast(self.state.t("config.saved_value"), ToastKind::Info);
+                let key = if externally_changed {
+                    "config.saved_over_external"
+                } else {
+                    "config.saved_value"
+                };
+                self.state.show_toast(self.state.t(key), ToastKind::Info);
                 true
             }
             Err(error) => {
