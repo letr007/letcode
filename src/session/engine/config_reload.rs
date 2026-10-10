@@ -53,11 +53,11 @@ pub(crate) fn model_catalog_updated_event(config: &AppConfig) -> ModelCatalogUpd
 pub(crate) fn apply_config_reload(
     agent: &mut Agent,
     engine_config: &mut SessionEngineConfig,
+    config: AppConfig,
     route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
     event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) -> Result<()> {
-    let config = AppConfig::load_from_path(&engine_config.mcp_config_path)?;
     let catalog_event = model_catalog_updated_event(&config);
     let next_runtime_catalog = config.runtime_catalog.clone();
     let next_runtime_fingerprint = next_runtime_catalog.fingerprint().clone();

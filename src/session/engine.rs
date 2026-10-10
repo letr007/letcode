@@ -1367,19 +1367,32 @@ async fn run_engine_loop(
                 if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                 let previous_expert_default_routes = config.expert_default_routes.clone();
                 let previous_expert_allowed_models = config.expert_allowed_models.clone();
-                let mut route_keys = route_api_key_configured
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                let mut hints = provider_api_key_hints
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Err(error) = apply_config_reload(
-                    &mut agent,
-                    &mut config,
-                    &mut route_keys,
-                    &mut hints,
-                    &session_transport_tx,
-                ) {
+                let reload_config_path = config.mcp_config_path.clone();
+                let reload_config = tokio::task::spawn_blocking(move || {
+                    AppConfig::load_from_path(&reload_config_path)
+                })
+                .await;
+                let reload_result = match reload_config {
+                    Ok(Ok(reload_config)) => {
+                        let mut route_keys = route_api_key_configured
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        let mut hints = provider_api_key_hints
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        apply_config_reload(
+                            &mut agent,
+                            &mut config,
+                            reload_config,
+                            &mut route_keys,
+                            &mut hints,
+                            &session_transport_tx,
+                        )
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow!("configuration reload task failed: {error}")),
+                };
+                if let Err(error) = reload_result {
                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
                         format!("failed to reload configuration: {error}"),
                     )));
@@ -2986,6 +2999,24 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    fn reload_for_test(
+        agent: &mut Agent,
+        engine_config: &mut SessionEngineConfig,
+        route_api_key_configured: &mut indexmap::IndexMap<String, bool>,
+        provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    ) -> Result<()> {
+        let config = AppConfig::load_from_path(&engine_config.mcp_config_path)?;
+        apply_config_reload(
+            agent,
+            engine_config,
+            config,
+            route_api_key_configured,
+            provider_api_key_hints,
+            event_tx,
+        )
+    }
+
     fn temp_sessions_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
             "letcode-session-engine-test-{}",
@@ -4169,7 +4200,7 @@ base_url = "http://127.0.0.1:1"
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         assert!(
-            apply_config_reload(
+            reload_for_test(
                 &mut agent,
                 &mut engine_config,
                 &mut route_api_key_configured,
@@ -4350,7 +4381,7 @@ base_url = "http://127.0.0.1:1"
             std::mem::take(&mut engine_config.route_api_key_configured);
         let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4453,7 +4484,7 @@ base_url = "http://127.0.0.1:1"
         let mut route_api_key_configured =
             std::mem::take(&mut engine_config.route_api_key_configured);
         let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4486,7 +4517,7 @@ base_url = "http://127.0.0.1:1"
                 .any(|event| matches!(event, SessionTransportEvent::ModelChanged { .. }))
         );
 
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4588,7 +4619,7 @@ base_url = "http://127.0.0.1:1"
         let mut route_api_key_configured =
             std::mem::take(&mut engine_config.route_api_key_configured);
         let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4617,7 +4648,7 @@ base_url = "http://127.0.0.1:1"
             Some(&true)
         );
         while event_rx.try_recv().is_ok() {}
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4726,7 +4757,7 @@ base_url = "http://127.0.0.1:1"
         let mut route_api_key_configured =
             std::mem::take(&mut engine_config.route_api_key_configured);
         let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4852,7 +4883,7 @@ base_url = "http://127.0.0.1:1"
         let mut route_api_key_configured =
             std::mem::take(&mut engine_config.route_api_key_configured);
         let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
@@ -4985,7 +5016,7 @@ base_url = "http://127.0.0.1:1"
         let mut route_api_key_configured =
             std::mem::take(&mut engine_config.route_api_key_configured);
         let mut provider_api_key_hints = std::mem::take(&mut engine_config.provider_api_key_hints);
-        apply_config_reload(
+        reload_for_test(
             &mut agent,
             &mut engine_config,
             &mut route_api_key_configured,
