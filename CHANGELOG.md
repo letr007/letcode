@@ -5,6 +5,23 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Added
+
+- `letcode config schema` 生成配置 schema，`letcode config schema check` 校验其是否与代码一致。
+
+### Changed
+
+- historian 只接受 `<episode>` 标签块，不再兼容逐行 JSON 输出。
+- 配置编辑器为省略字段预填运行时默认值，不再使用 schema 枚举的首项。
+
+### Fixed
+
+- 配置编辑器保存时若配置文件已被外部修改，提示该修改已被覆盖。
+- git 分支查询超时后不再永久冻结分支显示。
+- 回合内的后台任务完成不再吞掉“更改已排队”提示。
+
 ## [0.21.0] - 2026-10-10
 
 ### Added
