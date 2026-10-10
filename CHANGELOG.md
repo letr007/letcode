@@ -5,6 +5,19 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Changed
+
+- 未指定 `protocol` 的 provider 默认使用 completions 协议，`capabilities.tools` 默认开启。
+- 回合进行中修改专家模型白名单时，专家列表与模型选择器立即显示待生效范围。
+- 引擎提示消息跟随界面语言显示。
+
+### Fixed
+
+- 未指定 `context_window` 时回退值由 8K 提高到 256K，修复首个请求因输入预算不足而失败的问题。
+- 排队更改的提示每个回合只出现一次。
+
 ## [0.20.1] - 2026-10-09
 
 ### Changed
