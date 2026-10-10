@@ -56,8 +56,6 @@ pub enum SessionCommand {
     Interrupt,
 }
 
-/// How the backend schedules one command: whether the coordinator may run it as
-/// idle work, and what an active turn does with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CommandSchedule {
     pub(crate) idle: bool,

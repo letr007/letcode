@@ -15,11 +15,8 @@ use tokio::sync::mpsc;
 use crate::tui::state::TuiState;
 
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// A git query that has not answered within this window is abandoned; the
-/// branch keeps its last value until a later refresh succeeds.
+/// Git can wedge on network mounts; abandon a query that does not answer in time.
 const GIT_BRANCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// A stalled query is retried at this slower cadence so a wedged git process
-/// cannot spawn a worker every refresh interval.
 const GIT_BRANCH_STALL_RETRY: Duration = Duration::from_secs(60);
 
 /// Polls the current git branch without blocking the TUI for frames.
