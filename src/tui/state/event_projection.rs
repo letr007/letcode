@@ -31,18 +31,7 @@ impl<'a> EventProjection<'a> {
 
 pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, event: SessionEvent) {
     match event {
-        SessionEvent::Tick => {
-            *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
-            projection
-                .timeline
-                .tick_reasoning_elapsed(std::time::Instant::now());
-            if let Some(retry) = projection.retry.as_ref() {
-                // Sticky red countdown for the whole backoff window.
-                *projection.toast = Some(retry.sticky_toast());
-            } else if projection.toast.as_mut().is_some_and(ToastState::tick) {
-                *projection.toast = None;
-            }
-        }
+        SessionEvent::Tick => unreachable!("tick is applied through tick_frame"),
         SessionEvent::TurnStarted => {
             *projection.active_session = true;
             *projection.retry = None;
