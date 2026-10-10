@@ -214,7 +214,7 @@ pub(crate) fn handle_active_turn_command(
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     subagent_runtime: &SubagentPool,
-    notified_background_runs: &mut std::collections::HashSet<String>,
+    background_deliveries: &mut std::collections::HashMap<String, BackgroundDelivery>,
 ) {
     if let SessionEngineCommand::BackgroundSubagentCompleted {
         parent_session_id,
@@ -226,7 +226,7 @@ pub(crate) fn handle_active_turn_command(
         observe_background_subagent_completion(
             transcript,
             subagent_runtime,
-            notified_background_runs,
+            background_deliveries,
             session_transport_tx,
             parent_session_id,
             parent_tool_call_id.clone(),

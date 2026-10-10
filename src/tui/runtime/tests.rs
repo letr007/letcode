@@ -5867,7 +5867,7 @@ fn active_turn_reject_is_not_parked_by_engine() {
     let mut parked_commands = VecDeque::new();
     let (_dir, transcript) = test_transcript("active-turn-reject", Vec::new());
     let subagent_runtime = crate::subagent::SubagentPool::new();
-    let mut notified_background_runs = std::collections::HashSet::new();
+    let mut background_deliveries = std::collections::HashMap::new();
 
     crate::session::engine::handle_active_turn_command(
         SessionEngineCommand::NewSession,
@@ -5875,7 +5875,7 @@ fn active_turn_reject_is_not_parked_by_engine() {
         &session_tx,
         &transcript,
         &subagent_runtime,
-        &mut notified_background_runs,
+        &mut background_deliveries,
     );
 
     assert!(parked_commands.is_empty());
@@ -5896,7 +5896,7 @@ fn active_turn_reports_a_background_completion_before_parking_it() {
         .session_id()
         .to_string();
     let subagent_runtime = crate::subagent::SubagentPool::new();
-    let mut notified_background_runs = std::collections::HashSet::new();
+    let mut background_deliveries = std::collections::HashMap::new();
 
     crate::session::engine::handle_active_turn_command(
         SessionEngineCommand::BackgroundSubagentCompleted {
@@ -5908,7 +5908,7 @@ fn active_turn_reports_a_background_completion_before_parking_it() {
         &session_tx,
         &transcript,
         &subagent_runtime,
-        &mut notified_background_runs,
+        &mut background_deliveries,
     );
 
     assert!(matches!(
@@ -5927,7 +5927,7 @@ fn busy_phases_refuse_history_navigation_with_one_policy() {
     let mut parked_commands = VecDeque::new();
     let (_dir, transcript) = test_transcript("busy-history-navigation", Vec::new());
     let subagent_runtime = crate::subagent::SubagentPool::new();
-    let mut notified_background_runs = std::collections::HashSet::new();
+    let mut background_deliveries = std::collections::HashMap::new();
 
     for command in [
         SessionEngineCommand::Undo,
@@ -5939,7 +5939,7 @@ fn busy_phases_refuse_history_navigation_with_one_policy() {
             &session_tx,
             &transcript,
             &subagent_runtime,
-            &mut notified_background_runs,
+            &mut background_deliveries,
         );
     }
 

@@ -621,7 +621,7 @@ fn emit_dropped_child_terminals(
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     subagent_runtime: &SubagentPool,
     runs: &[SubagentJob],
-    notified_runs: &mut std::collections::HashSet<String>,
+    background_deliveries: &mut HashMap<String, BackgroundDelivery>,
 ) {
     for run in runs {
         // The historian runtime publishes its own terminal.
@@ -636,7 +636,12 @@ fn emit_dropped_child_terminals(
                     SubagentStatus::Cancelled | SubagentStatus::TimedOut
                 )
             });
-        if dropped && notified_runs.insert(run.run_id.clone()) {
+        if dropped
+            && background_deliveries
+                .entry(run.run_id.clone())
+                .or_default()
+                .mark_notified()
+        {
             emit_child_terminal(session_transport_tx, &run.child_session_id);
         }
     }
@@ -1347,9 +1352,7 @@ async fn run_engine_loop(
     memory_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
-    let mut delivered_background_runs = std::collections::HashSet::new();
-    // A run's terminal state reaches the frontend on first observation.
-    let mut notified_background_runs = std::collections::HashSet::new();
+    let mut background_deliveries: HashMap<String, BackgroundDelivery> = HashMap::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
     let mut visible_child_view_cache = None;
@@ -1663,7 +1666,7 @@ async fn run_engine_loop(
                     if !observe_background_subagent_completion(
                         &transcript,
                         &subagent_runtime,
-                        &mut notified_background_runs,
+                        &mut background_deliveries,
                         &session_transport_tx,
                         &parent_session_id,
                         parent_tool_call_id,
@@ -1674,7 +1677,7 @@ async fn run_engine_loop(
                     let delivered_run = result.as_ref().ok().map(|result| result.run_id.clone());
                     let prompt = match result {
                         Ok(result) => {
-                            if delivered_background_runs.contains(&result.run_id) {
+                            if background_deliveries.get(&result.run_id).is_some_and(|delivery| delivery.delivered) {
                                 continue;
                             }
                             if let Err(error) = agent.install_background_subagent_result(&result) {
@@ -1715,7 +1718,7 @@ async fn run_engine_loop(
                     }
                     deferred_commands.push_front(SessionEngineCommand::ContinueSession);
                     if let Some(run_id) = delivered_run {
-                        delivered_background_runs.insert(run_id);
+                        background_deliveries.entry(run_id).or_default().mark_delivered();
                     }
                     continue;
                 }
@@ -2075,7 +2078,7 @@ async fn run_engine_loop(
                                             &session_transport_tx,
                                             &transcript,
                                             &subagent_runtime,
-                                            &mut notified_background_runs,
+                                            &mut background_deliveries,
                                         );
                                     }
                                     ActiveSessionOperation::Command(None) => break,
@@ -2116,7 +2119,7 @@ async fn run_engine_loop(
                                         &session_transport_tx,
                                         &subagent_runtime,
                                         &interrupted_active_runs,
-                                        &mut notified_background_runs,
+                                        &mut background_deliveries,
                                     );
                                     send_subagent_interrupted(&session_transport_tx);
                                 }
@@ -2642,7 +2645,7 @@ async fn run_engine_loop(
                                     if !observe_background_subagent_completion(
                                         &transcript,
                                         &subagent_runtime,
-                                        &mut notified_background_runs,
+                                        &mut background_deliveries,
                                         &session_transport_tx,
                                         &parent_session_id,
                                         parent_tool_call_id,
@@ -2653,7 +2656,7 @@ async fn run_engine_loop(
                                     let delivered_run = result.as_ref().ok().map(|result| result.run_id.clone());
                                     let (text, continuation) = match result {
                                         Ok(result) => {
-                                            if delivered_background_runs.contains(&result.run_id) {
+                                            if background_deliveries.get(&result.run_id).is_some_and(|delivery| delivery.delivered) {
                                                 continue;
                                             }
                                             (
@@ -2687,7 +2690,7 @@ async fn run_engine_loop(
                                         }) {
                                         Ok(()) => {
                                             if let Some(run_id) = delivered_run {
-                                                delivered_background_runs.insert(run_id);
+                                                background_deliveries.entry(run_id).or_default().mark_delivered();
                                             }
                                         }
                                         Err(error) => {
@@ -2706,7 +2709,7 @@ async fn run_engine_loop(
                                         &session_transport_tx,
                                         &transcript,
                                         &subagent_runtime,
-                                        &mut notified_background_runs,
+                                        &mut background_deliveries,
                                     );
                                 }
                                 None => break,
@@ -2819,7 +2822,7 @@ async fn run_engine_loop(
                                 &session_transport_tx,
                                 &subagent_runtime,
                                 &interrupt.active_runs,
-                                &mut notified_background_runs,
+                                &mut background_deliveries,
                             );
                             send_subagent_interrupted(&session_transport_tx);
                         }
@@ -2926,11 +2929,30 @@ async fn run_engine_loop(
     }
 }
 
+/// Per-run bookkeeping for a background completion: the terminal reaches the
+/// frontend on first observation, and the result reaches the model once.
+#[derive(Default)]
+pub(crate) struct BackgroundDelivery {
+    notified: bool,
+    delivered: bool,
+}
+
+impl BackgroundDelivery {
+    /// Marks the run notified; returns whether this call was the first.
+    pub(crate) fn mark_notified(&mut self) -> bool {
+        !std::mem::replace(&mut self.notified, true)
+    }
+
+    pub(crate) fn mark_delivered(&mut self) {
+        self.delivered = true;
+    }
+}
+
 /// Report a terminal background run once; returns whether it is deliverable.
 pub(crate) fn observe_background_subagent_completion(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     subagent_runtime: &SubagentPool,
-    notified_runs: &mut std::collections::HashSet<String>,
+    background_deliveries: &mut HashMap<String, BackgroundDelivery>,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     parent_session_id: &str,
     parent_tool_call_id: Option<String>,
@@ -2951,12 +2973,20 @@ pub(crate) fn observe_background_subagent_completion(
     }
     // A cancelled background run still needs the terminal its dropped executor never published.
     if summary.status == SubagentStatus::Cancelled {
-        if notified_runs.insert(summary.run_id.clone()) {
+        if background_deliveries
+            .entry(summary.run_id.clone())
+            .or_default()
+            .mark_notified()
+        {
             emit_child_terminal(session_transport_tx, &summary.child_session_id);
         }
         return false;
     }
-    if notified_runs.insert(summary.run_id.clone()) {
+    if background_deliveries
+        .entry(summary.run_id.clone())
+        .or_default()
+        .mark_notified()
+    {
         if summary.status == SubagentStatus::TimedOut {
             emit_child_terminal(session_transport_tx, &summary.child_session_id);
         }
@@ -3121,7 +3151,7 @@ mod tests {
         ];
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashSet::new();
+        let mut notified = std::collections::HashMap::new();
         emit_dropped_child_terminals(&tx, &runtime, &runs, &mut notified);
 
         let mut children = Vec::new();
@@ -3153,7 +3183,7 @@ mod tests {
         ];
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashSet::new();
+        let mut notified = std::collections::HashMap::new();
         emit_dropped_child_terminals(&tx, &runtime, &runs, &mut notified);
         assert_eq!(
             child_interrupted(rx.try_recv().expect("terminal")),
@@ -3203,7 +3233,7 @@ mod tests {
             .session_id()
             .to_string();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashSet::new();
+        let mut notified = std::collections::HashMap::new();
         let result = Ok(run_summary(
             "run-cancelled",
             "child-cancelled",
@@ -3244,7 +3274,7 @@ mod tests {
             .session_id()
             .to_string();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashSet::new();
+        let mut notified = std::collections::HashMap::new();
         let result = Ok(run_summary(
             "run-timed-out",
             "child-timed-out",
@@ -3282,7 +3312,7 @@ mod tests {
             .session_id()
             .to_string();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashSet::new();
+        let mut notified = std::collections::HashMap::new();
         let result = Ok(run_summary(
             "run-completed",
             "child-completed",
