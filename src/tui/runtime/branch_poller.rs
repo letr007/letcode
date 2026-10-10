@@ -15,12 +15,19 @@ use tokio::sync::mpsc;
 use crate::tui::state::TuiState;
 
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// A git query that has not answered within this window is abandoned; the
+/// branch keeps its last value until a later refresh succeeds.
+const GIT_BRANCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// A stalled query is retried at this slower cadence so a wedged git process
+/// cannot spawn a worker every refresh interval.
+const GIT_BRANCH_STALL_RETRY: Duration = Duration::from_secs(60);
 
 /// Polls the current git branch without blocking the TUI for frames.
 pub(crate) struct BranchPoller {
     workspace_dir: Option<PathBuf>,
     branch_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
     next_refresh: Instant,
+    deadline: Option<Instant>,
 }
 
 impl BranchPoller {
@@ -29,6 +36,7 @@ impl BranchPoller {
             workspace_dir: None,
             branch_rx: None,
             next_refresh: Instant::now(),
+            deadline: None,
         }
     }
 
@@ -44,15 +52,24 @@ impl BranchPoller {
             match rx.try_recv() {
                 Ok(branch) => {
                     self.branch_rx = None;
+                    self.deadline = None;
                     state.set_git_branch(branch);
                     self.next_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.branch_rx = None;
+                    self.deadline = None;
                     state.set_git_branch(None);
                     self.next_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => return,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        self.branch_rx = None;
+                        self.deadline = None;
+                        self.next_refresh = Instant::now() + GIT_BRANCH_STALL_RETRY;
+                    }
+                    return;
+                }
             }
         }
         if self.branch_rx.is_some() || Instant::now() < self.next_refresh {
@@ -63,6 +80,7 @@ impl BranchPoller {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         self.branch_rx = Some(rx);
+        self.deadline = Some(Instant::now() + GIT_BRANCH_TIMEOUT);
         std::thread::spawn(move || {
             let _ = tx.send(read_git_branch(&workspace_dir));
         });
@@ -157,5 +175,19 @@ mod tests {
         poller.enqueue_for_test(None);
         poller.poll(&mut state);
         assert_eq!(state.git_branch, None);
+    }
+
+    #[test]
+    fn poll_abandons_a_stalled_query_and_slows_the_next_refresh() {
+        let (mut poller, mut state) = poller();
+        let (tx, rx) = mpsc::unbounded_channel();
+        poller.branch_rx = Some(rx);
+        poller.deadline = Some(Instant::now() - Duration::from_secs(1));
+        state.set_git_branch(Some("stale".into()));
+        poller.poll(&mut state);
+        assert!(poller.branch_rx.is_none());
+        assert_eq!(state.git_branch.as_deref(), Some("stale"));
+        assert!(poller.next_refresh > Instant::now() + GIT_BRANCH_REFRESH_INTERVAL);
+        drop(tx);
     }
 }
