@@ -169,7 +169,7 @@ pub(crate) fn parse_publication(
     source_ids: &[String],
     text: &str,
 ) -> Result<HistoryPublication> {
-    parse_publication_inner(id, source_ids, text).inspect_err(|error| {
+    parse_tagged_episodes(id, source_ids, text).inspect_err(|error| {
         tracing::warn!(
             error = %error,
             raw = %raw_excerpt(text),
@@ -312,40 +312,10 @@ pub(crate) fn raw_tail(text: &str) -> String {
     }
 }
 
-/// Episodes arrive as tag blocks, or as one JSON object per line for data written
-/// before the tag contract. The first episode that is not usable, or whose cut
-/// does not advance, ends the accepted prefix: the episodes before it still
+/// Episodes arrive as tag blocks. The first episode that is not usable, or whose
+/// cut does not advance, ends the accepted prefix: the episodes before it still
 /// describe a real prefix of the supplied sources, and the host retires exactly
 /// that prefix. A response with no usable episode at all is still a failure.
-fn parse_publication_inner(
-    id: &str,
-    source_ids: &[String],
-    text: &str,
-) -> Result<HistoryPublication> {
-    if text.contains("<episode>") {
-        parse_tagged_episodes(id, source_ids, text)
-    } else {
-        parse_json_episodes(id, source_ids, text)
-    }
-}
-
-/// Legacy read path: one JSON object per line. Kept so publications recorded
-/// before the tag contract stay readable.
-fn parse_json_episodes(id: &str, source_ids: &[String], text: &str) -> Result<HistoryPublication> {
-    let mut episodes = Vec::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with("```") {
-            continue;
-        }
-        episodes.push(
-            serde_json::from_str::<Episode>(line)
-                .map_err(|error| format!("line {} is not an episode: {error}", index + 1)),
-        );
-    }
-    collect_episodes(id, source_ids, episodes)
-}
-
 fn parse_tagged_episodes(
     id: &str,
     source_ids: &[String],
@@ -448,8 +418,7 @@ fn recover_value(block: &str, tag: &str) -> Option<String> {
 }
 
 /// Read a block's typed episode out of its recovery record. A tag that never
-/// appeared makes the block unusable, the same outcome a missing JSON field
-/// produced.
+/// appeared makes the block unusable.
 fn episode_from_record(record: &RecoveredEpisode) -> std::result::Result<Episode, String> {
     let missing = record.missing();
     if !missing.is_empty() {
@@ -714,22 +683,16 @@ mod tests {
     #[test]
     fn three_tiers_are_bound_to_host_sources() {
         let publication =
-            parse_publication("p", &["raw:1".into(), "raw:2".into()], &episode(1)).unwrap();
+            parse_publication("p", &["raw:1".into(), "raw:2".into()], &tagged_episode(1)).unwrap();
         assert_eq!(publication.source_ids, vec!["raw:1"]);
         assert_eq!(publication.compartments[0].id, "p:c0");
         // A first cut beyond the supplied sources leaves nothing usable.
-        assert!(parse_publication("p", &["raw:1".into()], &episode(2)).is_err());
+        assert!(parse_publication("p", &["raw:1".into()], &tagged_episode(2)).is_err());
     }
 
-    fn episode(end: usize) -> String {
-        format!(
-            r#"{{"end":{end},"title":"Parser","importance":60,"detailed":"Detailed","compact":"Compact","anchor":"Parser"}}"#
-        )
-    }
-
-    fn response(cuts: &[usize]) -> String {
+    fn tagged_response(cuts: &[usize]) -> String {
         cuts.iter()
-            .map(|end| episode(*end))
+            .map(|end| tagged_episode(*end))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -738,51 +701,51 @@ mod tests {
     fn episode_cuts_define_the_covered_prefix() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
         for cut in [3usize, 4] {
-            let publication = parse_publication("p", &sources, &response(&[2, cut])).unwrap();
+            let publication = parse_publication("p", &sources, &tagged_response(&[2, cut])).unwrap();
             assert_eq!(publication.source_ids, sources[..cut]);
             assert_eq!(publication.compartments[0].source_ids, sources[..2]);
             assert_eq!(publication.compartments[1].source_ids, sources[2..cut]);
         }
         assert!(
-            parse_publication("p", &sources, &response(&[]))
+            parse_publication("p", &sources, &tagged_response(&[]))
                 .unwrap_err()
                 .to_string()
                 .contains("historian produced no completed work")
         );
     }
 
-    /// A response is read line by line: the first line that does not parse, or
-    /// whose cut does not advance, ends the accepted prefix instead of failing the
-    /// whole response. Only a response with no usable episode is a failure.
+    /// The first block that is unusable, or whose cut does not advance, ends the
+    /// accepted prefix instead of failing the whole response. Only a response with
+    /// no usable episode is a failure.
     #[test]
-    fn a_broken_or_regressing_line_ends_the_accepted_prefix() {
+    fn a_broken_or_regressing_block_ends_the_accepted_prefix() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
-        let broken = format!("{}\n{}", episode(2), r#"{"end":4,"title":"#);
+        let broken = format!("{}\n<episode><end>4</end><title>", tagged_episode(2));
         let publication = parse_publication("p", &sources, &broken).unwrap();
         assert_eq!(publication.source_ids, sources[..2]);
         assert_eq!(publication.compartments.len(), 1);
 
         for cuts in [vec![2, 1, 3], vec![2, 9], vec![2, 2]] {
-            let publication = parse_publication("p", &sources, &response(&cuts)).unwrap();
+            let publication = parse_publication("p", &sources, &tagged_response(&cuts)).unwrap();
             assert_eq!(publication.source_ids, sources[..2], "{cuts:?}");
         }
 
-        assert!(parse_publication("p", &sources, r#"{"end":4}"#).is_err());
+        assert!(parse_publication("p", &sources, "<episode><end>4</end>").is_err());
     }
 
-    /// A line that parses but breaks the episode contract ends the prefix like a
-    /// broken line: the episodes before it stay usable instead of voiding the
+    /// A block that parses but breaks the episode contract ends the prefix like a
+    /// broken block: the episodes before it stay usable instead of voiding the
     /// whole response.
     #[test]
     fn an_unusable_episode_ends_the_accepted_prefix() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
         for unusable in [
-            r#"{"end":3,"title":"","importance":60,"detailed":"d","compact":"c","anchor":"a"}"#,
-            r#"{"end":3,"title":"T","importance":0,"detailed":"d","compact":"c","anchor":"a"}"#,
-            r#"{"end":3,"title":"T","importance":60,"detailed":" ","compact":"c","anchor":"a"}"#,
-            r#"{"end":3,"title":"T","importance":900,"detailed":"d","compact":"c","anchor":"a"}"#,
+            "<episode><end>3</end><title></title><importance>60</importance><detailed>d</detailed><compact>c</compact><anchor>a</anchor></episode>",
+            "<episode><end>3</end><title>T</title><importance>0</importance><detailed>d</detailed><compact>c</compact><anchor>a</anchor></episode>",
+            "<episode><end>3</end><title>T</title><importance>60</importance><detailed> </detailed><compact>c</compact><anchor>a</anchor></episode>",
+            "<episode><end>3</end><title>T</title><importance>900</importance><detailed>d</detailed><compact>c</compact><anchor>a</anchor></episode>",
         ] {
-            let text = format!("{}\n{unusable}", episode(2));
+            let text = format!("{}\n{unusable}", tagged_episode(2));
             let publication = parse_publication("p", &sources, &text).unwrap();
             assert_eq!(publication.source_ids, sources[..2], "{unusable}");
             assert_eq!(publication.compartments.len(), 1, "{unusable}");
@@ -791,27 +754,6 @@ mod tests {
                 "{unusable}"
             );
         }
-    }
-
-    #[test]
-    fn fences_and_blank_lines_are_skipped() {
-        let sources: Vec<_> = (0..2).map(|i| format!("raw:{i}")).collect();
-        let text = format!("```json\n\n{}\n```", episode(2));
-        let publication = parse_publication("p", &sources, &text).unwrap();
-        assert_eq!(publication.source_ids, sources);
-    }
-
-    #[test]
-    fn unknown_fields_are_ignored_and_a_short_answer_stays_short() {
-        let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
-        // `start` is host-derived and `facts`/`unprocessed_from` belong to other
-        // versions of the contract; none of them change the covered prefix.
-        let legacy = r#"{"start":3,"end":2,"title":"Parser","importance":60,"detailed":"Detailed","compact":"Compact","anchor":"Parser","facts":[],"unprocessed_from":3}"#;
-        let publication = parse_publication("p", &sources, legacy).unwrap();
-        assert_eq!(publication.source_ids, sources[..2]);
-        assert_eq!(publication.facts, Vec::new());
-        assert_eq!(publication.withdrawn_fact_ids, Vec::<String>::new());
-        assert_eq!(publication.compartments.len(), 1);
     }
 
     #[test]
@@ -876,20 +818,6 @@ mod tests {
         format!(
             "<episode><end>{end}</end><title>Parser</title><importance>60</importance><detailed>Detailed</detailed><compact>Compact</compact><anchor>Parser</anchor></episode>"
         )
-    }
-
-    #[test]
-    fn tagged_and_json_episodes_publish_the_same_compartments() {
-        let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
-        let json = parse_publication("p", &sources, &response(&[2, 4])).unwrap();
-        let tags = parse_publication(
-            "p",
-            &sources,
-            &format!("{}\n{}", tagged_episode(2), tagged_episode(4)),
-        )
-        .unwrap();
-        assert_eq!(json, tags);
-        assert_eq!(tags.compartments.len(), 2);
     }
 
     #[test]

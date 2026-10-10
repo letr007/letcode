@@ -631,7 +631,7 @@ mod tests {
                 }
                 if attempt==1 { accepted.notify_one(); release.notified().await; }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let output=serde_json::json!({"end":if attempt==0 {4} else {1},"title":"Parser fix","importance":70,"detailed":"Fixed UTF-8 parser offsets","compact":"Parser offset fix","anchor":"UTF-8 parser"}).to_string();
+                let output=format!("<episode><end>{}</end><title>Parser fix</title><importance>70</importance><detailed>Fixed UTF-8 parser offsets</detailed><compact>Parser offset fix</compact><anchor>UTF-8 parser</anchor></episode>", if attempt==0 {4} else {1});
                 let delta=serde_json::json!({"type":"response.output_text.delta","delta":output});
                 let terminal=serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":200,"output_tokens":60,"total_tokens":260}}});
                 let body=format!("data: {delta}\n\ndata: {terminal}\n\n");
@@ -1288,27 +1288,11 @@ max_output_tokens=128
                     bytes.extend_from_slice(&buffer[..n]);
                 }
                 let publication = if attempt == 0 {
-                    serde_json::json!({
-                        "end": 0,
-                        "title": "Rejected",
-                        "importance": 95,
-                        "detailed": "not covered",
-                        "compact": "not covered",
-                        "anchor": "rejected"
-                    })
-                    .to_string()
+                    "<episode><end>0</end><title>Rejected</title><importance>95</importance><detailed>not covered</detailed><compact>not covered</compact><anchor>rejected</anchor></episode>".to_string()
                 } else {
                     // Any chunk has at least one source, so a one-episode repair
                     // is accepted whatever this session holds.
-                    serde_json::json!({
-                        "end": 1,
-                        "title": "Repaired",
-                        "importance": 95,
-                        "detailed": "covered",
-                        "compact": "covered",
-                        "anchor": "repaired"
-                    })
-                    .to_string()
+                    "<episode><end>1</end><title>Repaired</title><importance>95</importance><detailed>covered</detailed><compact>covered</compact><anchor>repaired</anchor></episode>".to_string()
                 };
                 let delta = serde_json::json!({
                     "type": "response.output_text.delta",
@@ -1501,7 +1485,7 @@ max_output_tokens=4096
                 exchange.response_chars,
                 Some(response.chars().count() as u64)
             );
-            assert!(response.contains("\"end\":0"));
+            assert!(response.contains("<end>0</end>"));
             server.await.unwrap();
         })
         .await
@@ -1624,9 +1608,12 @@ max_output_tokens=4096
         assert_eq!(prepared.source_ids, expected);
         assert_eq!(prepared.source_ids.len(), 10);
         assert!(prepared.input.text.contains("unique body first-7"));
-        let mut publication = crate::historian::parse_publication(&prepared.id,&prepared.source_ids,&serde_json::json!({
-            "end":10,"title":"Inspected sources","importance":70,"detailed":"Detailed result","compact":"Result","anchor":"Sources"
-        }).to_string()).unwrap();
+        let mut publication = crate::historian::parse_publication(
+            &prepared.id,
+            &prepared.source_ids,
+            "<episode><end>10</end><title>Inspected sources</title><importance>70</importance><detailed>Detailed result</detailed><compact>Result</compact><anchor>Sources</anchor></episode>",
+        )
+        .unwrap();
         publication.project_path = Some(prepared.project_path);
         recorder
             .lock()
@@ -1658,8 +1645,15 @@ max_output_tokens=4096
             Some(&tail.last().unwrap().item)
         );
         let second = work(&agent, true, None).unwrap().unwrap();
-        let publication = crate::historian::parse_publication(&second.id, &second.source_ids,
-            &serde_json::json!({"end":second.source_ids.len(),"title":"Second group","importance":70,"detailed":"Second result","compact":"Result","anchor":"Second"}).to_string()).unwrap();
+        let publication = crate::historian::parse_publication(
+            &second.id,
+            &second.source_ids,
+            &format!(
+                "<episode><end>{}</end><title>Second group</title><importance>70</importance><detailed>Second result</detailed><compact>Result</compact><anchor>Second</anchor></episode>",
+                second.source_ids.len()
+            ),
+        )
+        .unwrap();
         recorder
             .lock()
             .unwrap()
