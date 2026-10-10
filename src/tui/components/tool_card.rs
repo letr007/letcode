@@ -306,7 +306,7 @@ pub fn render_tool_card_document(
     let lines = if is_subagent_tool(&tool.name) {
         render_subagent_lines(tool, theme, width, frame, expanded_output, translator)
     } else {
-        let body = render_tool_body_lines(tool, theme, width, expanded_output);
+        let body = render_tool_body_lines(tool, theme, width, frame, expanded_output);
         if body.is_empty() {
             vec![render_tool_trace_line(tool, theme, width, frame)]
         } else {
@@ -557,6 +557,7 @@ fn render_tool_body_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
+    frame: usize,
     expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     if width == 0 || tool.status == ToolExecutionStatus::Pending {
@@ -579,7 +580,7 @@ fn render_tool_body_lines(
         }
         "fs__write" => render_write_diff_lines(tool, theme, width, expanded_output),
         "fs__append" => render_append_diff_lines(tool, theme, width, expanded_output),
-        "shell__exec" => render_shell_output_lines(tool, theme, width, expanded_output),
+        "shell__exec" => render_shell_output_lines(tool, theme, width, frame, expanded_output),
         "edit__apply_patch" => render_edit_diff_lines(tool, theme, width, expanded_output),
         _ => {
             if tool.status == ToolExecutionStatus::Failed {

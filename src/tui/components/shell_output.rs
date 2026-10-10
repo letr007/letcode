@@ -6,7 +6,7 @@ use super::semantic_spans::*;
 use crate::tui::{
     measure::wrap_text_to_width,
     theme::Theme,
-    timeline::ToolView,
+    timeline::{ToolExecutionStatus, ToolView},
     transcript_render::{Break, SemanticLine, SemanticSpan},
 };
 
@@ -14,6 +14,7 @@ pub(super) fn render_shell_output_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
+    frame: usize,
     expanded_output: bool,
 ) -> Vec<SemanticLine<Style>> {
     let Some(data) = tool_output_data(tool) else {
@@ -47,7 +48,7 @@ pub(super) fn render_shell_output_lines(
         && [stdout, stderr]
             .into_iter()
             .any(|output| output.lines().count() > COMPACT_SHELL_BODY_LINES);
-    let mut lines = render_shell_card_header_lines(tool, theme, width);
+    let mut lines = render_shell_card_header_lines(tool, theme, width, frame);
     if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
         mark_last_source_boundary(&mut lines, Break::BlockBreak);
     }
@@ -116,10 +117,16 @@ pub(super) fn render_shell_card_header_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
+    frame: usize,
 ) -> Vec<SemanticLine<Style>> {
     let mut lines = Vec::new();
     let command = shell_command(tool);
     let title = shell_card_title(tool, command.as_deref());
+    let glyph = if tool.status == ToolExecutionStatus::Running {
+        PROCESS_FRAMES[frame % PROCESS_FRAMES.len()]
+    } else {
+        "#"
+    };
 
     lines.push(render_card_line(
         &[],
@@ -128,7 +135,7 @@ pub(super) fn render_shell_card_header_lines(
         width,
     ));
     lines.push(render_card_line(
-        &[(format!("# {title}"), shell_card_title_style(theme))],
+        &[(format!("{glyph} {title}"), shell_card_title_style(theme))],
         Style::default().bg(theme.card_bg()),
         theme,
         width,
