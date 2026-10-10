@@ -5807,6 +5807,7 @@ fn deferred_toggles_retain_each_operation() {
 fn parked_commands_stay_before_later_deferred_commands() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
     let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetPermissionMode(
         crate::permission::PermissionMode::Auto,
     )]);
@@ -5815,6 +5816,7 @@ fn parked_commands_stay_before_later_deferred_commands() {
         &mut parked_commands,
         SessionEngineCommand::SetModel("earlier".into()),
         &session_tx,
+        &mut change_notice_sent,
     );
     flush_parked_commands(&mut deferred_commands, &mut parked_commands);
 
@@ -5839,6 +5841,7 @@ fn parked_commands_stay_before_later_deferred_commands() {
 fn a_background_completion_does_not_suppress_the_queued_change_notice() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
     enqueue_deferred_command(
         &mut parked_commands,
         SessionEngineCommand::BackgroundSubagentCompleted {
@@ -5852,6 +5855,7 @@ fn a_background_completion_does_not_suppress_the_queued_change_notice() {
         &mut parked_commands,
         SessionEngineCommand::ToggleFastMode,
         &session_tx,
+        &mut change_notice_sent,
     );
 
     assert!(matches!(
@@ -5865,6 +5869,7 @@ fn a_background_completion_does_not_suppress_the_queued_change_notice() {
 fn active_turn_reject_is_not_parked_by_engine() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
     let (_dir, transcript) = test_transcript("active-turn-reject", Vec::new());
     let subagent_runtime = crate::subagent::SubagentPool::new();
     let mut background_deliveries = std::collections::HashMap::new();
@@ -5876,6 +5881,7 @@ fn active_turn_reject_is_not_parked_by_engine() {
         &transcript,
         &subagent_runtime,
         &mut background_deliveries,
+        &mut change_notice_sent,
     );
 
     assert!(parked_commands.is_empty());
@@ -5889,6 +5895,7 @@ fn active_turn_reject_is_not_parked_by_engine() {
 fn active_turn_reports_a_background_completion_before_parking_it() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
     let (_dir, transcript) = test_transcript("active-turn-completion", Vec::new());
     let session_id = transcript
         .lock()
@@ -5909,6 +5916,7 @@ fn active_turn_reports_a_background_completion_before_parking_it() {
         &transcript,
         &subagent_runtime,
         &mut background_deliveries,
+        &mut change_notice_sent,
     );
 
     assert!(matches!(
@@ -5925,6 +5933,7 @@ fn active_turn_reports_a_background_completion_before_parking_it() {
 fn busy_phases_refuse_history_navigation_with_one_policy() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
     let (_dir, transcript) = test_transcript("busy-history-navigation", Vec::new());
     let subagent_runtime = crate::subagent::SubagentPool::new();
     let mut background_deliveries = std::collections::HashMap::new();
@@ -5940,6 +5949,7 @@ fn busy_phases_refuse_history_navigation_with_one_policy() {
             &transcript,
             &subagent_runtime,
             &mut background_deliveries,
+            &mut change_notice_sent,
         );
     }
 

@@ -1352,6 +1352,7 @@ async fn run_engine_loop(
     memory_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
     let mut background_deliveries: HashMap<String, BackgroundDelivery> = HashMap::new();
     let mut visible_child_session_id = None;
     let mut visible_child_view_state = None;
@@ -2079,6 +2080,7 @@ async fn run_engine_loop(
                                             &transcript,
                                             &subagent_runtime,
                                             &mut background_deliveries,
+                                            &mut change_notice_sent,
                                         );
                                     }
                                     ActiveSessionOperation::Command(None) => break,
@@ -2141,6 +2143,7 @@ async fn run_engine_loop(
                             break;
                         }
                         flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+                        change_notice_sent = false;
                         continue;
                     }
                     SessionEngineCommand::Compact => {
@@ -2710,6 +2713,7 @@ async fn run_engine_loop(
                                         &transcript,
                                         &subagent_runtime,
                                         &mut background_deliveries,
+                                        &mut change_notice_sent,
                                     );
                                 }
                                 None => break,
@@ -2849,6 +2853,7 @@ async fn run_engine_loop(
                     Err(_) => tracing::warn!("could not update poisoned project memory source"),
                 }
                 flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+                change_notice_sent = false;
             }
             _ = memory_refresh.tick() => {
                 if let Err(error) = memory_worker.tick(&agent).await {
@@ -2929,8 +2934,6 @@ async fn run_engine_loop(
     }
 }
 
-/// Per-run bookkeeping for a background completion: the terminal reaches the
-/// frontend on first observation, and the result reaches the model once.
 #[derive(Default)]
 pub(crate) struct BackgroundDelivery {
     notified: bool,

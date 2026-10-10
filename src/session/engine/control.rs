@@ -195,6 +195,7 @@ pub(crate) fn handle_active_turn_command(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     subagent_runtime: &SubagentPool,
     background_deliveries: &mut std::collections::HashMap<String, BackgroundDelivery>,
+    change_notice_sent: &mut bool,
 ) {
     if let SessionEngineCommand::BackgroundSubagentCompleted {
         parent_session_id,
@@ -240,7 +241,12 @@ pub(crate) fn handle_active_turn_command(
         .unwrap_or(crate::session::ActiveTurnCommandDisposition::Defer);
     match disposition {
         crate::session::ActiveTurnCommandDisposition::Defer => {
-            park_active_turn_command(parked_commands, command, session_transport_tx);
+            park_active_turn_command(
+                parked_commands,
+                command,
+                session_transport_tx,
+                change_notice_sent,
+            );
         }
         crate::session::ActiveTurnCommandDisposition::Reject => {
             let _ = session_transport_tx.send(SessionTransportEvent::Notice(
@@ -343,23 +349,16 @@ pub(crate) fn enqueue_deferred_command(
     commands.push_back(command);
 }
 
-/// Internal background completions queue alongside user changes but must not
-/// suppress the queued-change notice for the first user change of the turn.
-fn is_user_parked_change(command: &SessionEngineCommand) -> bool {
-    !matches!(
-        command,
-        SessionEngineCommand::BackgroundSubagentCompleted { .. }
-    )
-}
-
 pub(crate) fn park_active_turn_command(
     parked_commands: &mut VecDeque<SessionEngineCommand>,
     command: SessionEngineCommand,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    change_notice_sent: &mut bool,
 ) {
-    let first_parked = !parked_commands.iter().any(is_user_parked_change);
+    let first_parked = !*change_notice_sent;
     enqueue_deferred_command(parked_commands, command);
     if first_parked {
+        *change_notice_sent = true;
         let _ = session_transport_tx.send(SessionTransportEvent::Notice(
             NoticeEvent::info("Change queued for after the current turn")
                 .with_message_id(NoticeId::ChangeQueued),
