@@ -12,7 +12,6 @@ pub struct OutputRateGraph {
 }
 
 impl OutputRateGraph {
-    /// `None` 表示该秒没有活跃输出：只画底部基线，且不参与自适应量程。
     pub fn push(&mut self, view_id: Option<&str>, rate: Option<u64>) {
         if self.view_id.as_deref() != view_id {
             *self = Self {
@@ -30,17 +29,14 @@ impl OutputRateGraph {
         *self = Self::default();
     }
 
-    /// 最新一列：外层 `None` 表示还没有任何采样；内层 `None` 表示静默。
     pub fn latest_sample(&self) -> Option<Option<u64>> {
         self.samples.back().copied()
     }
 
-    /// 窗口内是否出现过真实速率；用于决定速率区域是否显示。
     pub fn has_rate(&self) -> bool {
         self.samples.iter().any(Option::is_some)
     }
 
-    /// 每个点列的高度档位（1..=4）。空闲列为底部一点，样本不足时左侧同样补底部一点。
     pub fn levels(&self, columns: usize) -> Vec<usize> {
         let low = self.samples.iter().flatten().copied().min().unwrap_or(0);
         let high = self.samples.iter().flatten().copied().max().unwrap_or(0);
