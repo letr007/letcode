@@ -5,7 +5,11 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [0.21.0] - 2026-10-10
+
+### Added
+
+- shell 卡片标题在命令运行期间显示进度动画，命令结束后还原。
 
 ### Changed
 
@@ -534,7 +538,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/letr007/letcode/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/letr007/letcode/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/letr007/letcode/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/letr007/letcode/compare/v0.18.0...v0.19.0
