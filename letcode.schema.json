@@ -51,6 +51,7 @@
         "tool_timeout_secs": {
           "type": "integer",
           "minimum": 1,
+          "default": 60,
           "description": "Default timeout for ordinary tools in seconds. shell__exec keeps its own 300 second default."
         },
         "sessions_dir": {
@@ -81,11 +82,13 @@
           "properties": {
             "enabled": {
               "type": "boolean",
+              "default": true,
               "description": "Archive idle session transcripts in the background."
             },
             "older_than_days": {
               "type": "integer",
               "minimum": 0,
+              "default": 7,
               "description": "Idle days after which a transcript is archived. Archived sessions still resume."
             }
           }
@@ -299,6 +302,7 @@
     },
     "protocol": {
       "enum": ["responses", "completions", "anthropic"],
+      "default": "completions",
       "description": "Wire protocol. Adapter defaults apply when omitted."
     },
     "flavor": {
@@ -376,7 +380,7 @@
       "properties": {
         "display": { "type": "string", "description": "Human readable model label." },
         "strategy": { "$ref": "#/definitions/strategy" },
-        "context_window": { "type": "integer", "minimum": 1 },
+        "context_window": { "type": "integer", "minimum": 1, "default": 262144 },
         "effective_input_limit_tokens": { "type": "integer", "minimum": 1 },
         "protocol": { "$ref": "#/definitions/protocol" },
         "model_override": {

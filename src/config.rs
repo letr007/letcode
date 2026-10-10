@@ -47,7 +47,7 @@ pub enum ProviderAuthMode {
     Bearer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheRetention {
     InMemory,
@@ -64,6 +64,7 @@ pub struct PromptCacheConfig {
 
 const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
+pub(crate) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
 /// Editor directive (Taplo, Even Better TOML, Zed) naming the published
@@ -112,6 +113,7 @@ const MAX_RETRY_ATTEMPTS: usize = 9_000;
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
 mod persistence;
 mod schema;
+mod schema_gen;
 
 use persistence::acquire_config_read_lock;
 #[allow(unused_imports)]
@@ -126,6 +128,7 @@ pub use schema::schema_keys;
 pub use schema::{
     default_value, entry_tables, field_enum, field_schema, schema_properties, table_accepts_entries,
 };
+pub(crate) use schema_gen::{SCHEMA_FILE, generate_schema};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -298,7 +301,7 @@ impl AppConfig {
                 "global.tool_timeout_secs",
                 raw_global.tool_timeout_secs,
             )?
-            .or(Some(60)),
+            .or(Some(DEFAULT_TOOL_TIMEOUT_SECS)),
             sessions_dir: resolve_relative_path(
                 &config_dir,
                 &required_non_empty(
@@ -960,7 +963,7 @@ struct RawMcpServerConfig {
     oauth: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawMcpServerKind {
     Local,

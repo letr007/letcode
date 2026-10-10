@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     match options.entry_mode {
         EntryMode::ValidateConfig { path } => return run_config_validate(path),
+        EntryMode::GenerateSchema { check } => return run_generate_schema(check),
         EntryMode::Version => {
             println!("letcode {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -334,7 +335,10 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        EntryMode::ValidateConfig { .. } | EntryMode::Version | EntryMode::Update { .. } => {
+        EntryMode::ValidateConfig { .. }
+        | EntryMode::GenerateSchema { .. }
+        | EntryMode::Version
+        | EntryMode::Update { .. } => {
             unreachable!("early command exits before AppConfig::load")
         }
     }
@@ -409,6 +413,7 @@ enum EntryMode {
     Tui,
     Resume { session_id: String },
     ValidateConfig { path: Option<String> },
+    GenerateSchema { check: bool },
     Version,
     Update { check_only: bool },
 }
@@ -470,6 +475,21 @@ impl CliOptions {
                             }
                             return Ok(Self {
                                 entry_mode: EntryMode::ValidateConfig { path },
+                            });
+                        }
+                        "schema" => {
+                            let check = match args.next() {
+                                None => false,
+                                Some(value) if value.as_ref() == "check" => true,
+                                Some(value) => {
+                                    bail!("unknown config schema argument: {}", value.as_ref())
+                                }
+                            };
+                            if args.next().is_some() {
+                                bail!("config schema accepts at most one argument (check)");
+                            }
+                            return Ok(Self {
+                                entry_mode: EntryMode::GenerateSchema { check },
                             });
                         }
                         other => bail!("unknown config subcommand: {other}"),
@@ -545,6 +565,10 @@ impl CliOptions {
 
         Ok(Self { entry_mode })
     }
+}
+
+fn run_generate_schema(check: bool) -> Result<()> {
+    config::generate_schema(std::path::Path::new(config::SCHEMA_FILE), check)
 }
 
 fn run_config_validate(path: Option<String>) -> Result<()> {
@@ -955,6 +979,24 @@ mod tests {
                 .entry_mode,
             EntryMode::Update { check_only: true }
         );
+    }
+
+    #[test]
+    fn cli_options_parse_config_schema_commands() {
+        assert_eq!(
+            CliOptions::parse_from(["config", "schema"])
+                .expect("config schema should parse")
+                .entry_mode,
+            EntryMode::GenerateSchema { check: false }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["config", "schema", "check"])
+                .expect("config schema check should parse")
+                .entry_mode,
+            EntryMode::GenerateSchema { check: true }
+        );
+        assert!(CliOptions::parse_from(["config", "schema", "latest"]).is_err());
+        assert!(CliOptions::parse_from(["config", "schema", "check", "extra"]).is_err());
     }
 
     #[test]
