@@ -5836,6 +5836,32 @@ fn parked_commands_stay_before_later_deferred_commands() {
 }
 
 #[test]
+fn a_background_completion_does_not_suppress_the_queued_change_notice() {
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let mut parked_commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut parked_commands,
+        SessionEngineCommand::BackgroundSubagentCompleted {
+            parent_session_id: "parent".into(),
+            parent_tool_call_id: None,
+            result: Err("failed".into()),
+        },
+    );
+
+    park_active_turn_command(
+        &mut parked_commands,
+        SessionEngineCommand::ToggleFastMode,
+        &session_tx,
+    );
+
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::Notice(notice))
+            if notice.message == "Change queued for after the current turn"
+    ));
+}
+
+#[test]
 fn active_turn_reject_is_not_parked_by_engine() {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
     let mut parked_commands = VecDeque::new();

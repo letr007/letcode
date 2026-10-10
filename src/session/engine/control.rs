@@ -363,12 +363,21 @@ pub(crate) fn enqueue_deferred_command(
     commands.push_back(command);
 }
 
+/// Internal background completions queue alongside user changes but must not
+/// suppress the queued-change notice for the first user change of the turn.
+fn is_user_parked_change(command: &SessionEngineCommand) -> bool {
+    !matches!(
+        command,
+        SessionEngineCommand::BackgroundSubagentCompleted { .. }
+    )
+}
+
 pub(crate) fn park_active_turn_command(
     parked_commands: &mut VecDeque<SessionEngineCommand>,
     command: SessionEngineCommand,
     session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) {
-    let first_parked = parked_commands.is_empty();
+    let first_parked = !parked_commands.iter().any(is_user_parked_change);
     enqueue_deferred_command(parked_commands, command);
     if first_parked {
         let _ = session_transport_tx.send(SessionTransportEvent::Notice(
