@@ -56,28 +56,43 @@ pub enum SessionCommand {
     Interrupt,
 }
 
+/// How the backend schedules one command: whether the coordinator may run it as
+/// idle work, and what an active turn does with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandSchedule {
+    pub(crate) idle: bool,
+    pub(crate) active_turn: ActiveTurnCommandDisposition,
+}
+
 impl SessionCommand {
-    pub(crate) fn active_turn_disposition(&self) -> ActiveTurnCommandDisposition {
-        match self {
-            Self::SubmitPrompt(_) => ActiveTurnCommandDisposition::QueuePrompt,
-            Self::ViewChild { .. } | Self::ViewParent => ActiveTurnCommandDisposition::Immediate,
+    pub(crate) fn schedule(&self) -> CommandSchedule {
+        let (idle, active_turn) = match self {
+            Self::SubmitPrompt(_) => (false, ActiveTurnCommandDisposition::QueuePrompt),
+            Self::ViewChild { .. } | Self::ViewParent => {
+                (true, ActiveTurnCommandDisposition::Immediate)
+            }
             Self::SetPermissionMode(_)
-            | Self::SetModel(_)
-            | Self::SetExpertAllowedModels { .. }
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)
-            | Self::SetFakeClient(_)
-            | Self::ToggleMcpServer(_) => ActiveTurnCommandDisposition::Defer,
-            Self::Interrupt => ActiveTurnCommandDisposition::Interrupt,
+            | Self::SetFakeClient(_) => (true, ActiveTurnCommandDisposition::Defer),
+            Self::SetModel(_)
+            | Self::SetExpertAllowedModels { .. }
+            | Self::ToggleMcpServer(_) => (false, ActiveTurnCommandDisposition::Defer),
+            Self::Interrupt => (false, ActiveTurnCommandDisposition::Interrupt),
             Self::DelegateSubagent { .. }
             | Self::Compact
-            | Self::ShowHistoryTree
+            | Self::ResumeSession(_)
+            | Self::NewSession => (false, ActiveTurnCommandDisposition::Reject),
+            Self::ShowHistoryTree
             | Self::Undo
             | Self::Redo
-            | Self::NavigateHistory { .. }
-            | Self::ResumeSession(_)
-            | Self::NewSession => ActiveTurnCommandDisposition::Reject,
-        }
+            | Self::NavigateHistory { .. } => (true, ActiveTurnCommandDisposition::Reject),
+        };
+        CommandSchedule { idle, active_turn }
+    }
+
+    pub(crate) fn active_turn_disposition(&self) -> ActiveTurnCommandDisposition {
+        self.schedule().active_turn
     }
 
     /// Map a shared slash/line [`crate::command::CommandIntent`] into a session

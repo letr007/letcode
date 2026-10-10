@@ -177,27 +177,7 @@ pub(crate) fn send_setting_change_failed(
 pub(crate) fn session_engine_command_as_idle_session_command(
     command: &SessionEngineCommand,
 ) -> Option<crate::session::SessionCommand> {
-    match session_engine_command_as_session_command(command)? {
-        command @ (crate::session::SessionCommand::ShowHistoryTree
-        | crate::session::SessionCommand::Undo
-        | crate::session::SessionCommand::Redo
-        | crate::session::SessionCommand::NavigateHistory { .. }
-        | crate::session::SessionCommand::SetPermissionMode(_)
-        | crate::session::SessionCommand::ToggleFastMode
-        | crate::session::SessionCommand::SetReasoningEffort(_)
-        | crate::session::SessionCommand::SetFakeClient(_)
-        | crate::session::SessionCommand::ViewParent
-        | crate::session::SessionCommand::ViewChild { .. }) => Some(command),
-        crate::session::SessionCommand::SubmitPrompt(_)
-        | crate::session::SessionCommand::DelegateSubagent { .. }
-        | crate::session::SessionCommand::Compact
-        | crate::session::SessionCommand::SetModel(_)
-        | crate::session::SessionCommand::SetExpertAllowedModels { .. }
-        | crate::session::SessionCommand::ResumeSession(_)
-        | crate::session::SessionCommand::NewSession
-        | crate::session::SessionCommand::ToggleMcpServer(_)
-        | crate::session::SessionCommand::Interrupt => None,
-    }
+    session_engine_command_as_session_command(command).filter(|command| command.schedule().idle)
 }
 
 pub(crate) enum ActiveSessionOperation<T> {

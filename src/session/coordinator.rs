@@ -779,19 +779,7 @@ impl SessionCoordinator {
     /// Whether this command is currently handled as idle work by the coordinator.
     #[cfg(test)]
     pub fn is_idle_command(command: &SessionCommand) -> bool {
-        matches!(
-            command,
-            SessionCommand::ShowHistoryTree
-                | SessionCommand::Undo
-                | SessionCommand::Redo
-                | SessionCommand::NavigateHistory { .. }
-                | SessionCommand::SetPermissionMode(_)
-                | SessionCommand::ToggleFastMode
-                | SessionCommand::SetReasoningEffort(_)
-                | SessionCommand::SetFakeClient(_)
-                | SessionCommand::ViewParent
-                | SessionCommand::ViewChild { .. }
-        )
+        command.schedule().idle
     }
 
     /// Exhaustive ownership table for migration tracking.
