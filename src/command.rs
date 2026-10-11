@@ -736,7 +736,7 @@ fn normalize_theme_command_id(value: &str) -> Option<String> {
     }
     let id = trimmed.to_ascii_lowercase();
     let id = match id.as_str() {
-        "tokyo-night" | "tokyo_night" => "tokyonight".to_string(),
+        "tokyo-night" | "tokyo_night" => "tokyonight-night".to_string(),
         _ => id,
     };
     if id

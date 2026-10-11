@@ -1,4 +1,5 @@
-label = "TokyoNight"
+label = "TokyoNight Night"
+light = false
 
 root_bg = "#1a1b26"
 surface_bg = "#16161e"

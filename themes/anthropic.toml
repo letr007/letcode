@@ -1,4 +1,5 @@
 label = "Anthropic"
+light = false
 
 root_bg = "#141413"
 surface_bg = "#1e1d1b"

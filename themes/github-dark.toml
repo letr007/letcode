@@ -1,4 +1,5 @@
 label = "GitHub Dark"
+light = false
 
 root_bg = "#0d1117"
 surface_bg = "#161b22"

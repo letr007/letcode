@@ -1,0 +1,26 @@
+label = "TokyoNight Day"
+light = true
+
+root_bg = "#e1e2e7"
+surface_bg = "#d0d5e3"
+element_bg = "#c4c8da"
+elevated_bg = "#babecf"
+border = "#a8aecb"
+text = "#3760bf"
+muted_text = "#6172b0"
+dim_text = "#848cb5"
+
+on_accent = "#e1e2e7"
+accent = "#2e7de9"
+assistant = "#587539"
+user = "#9854f1"
+success = "#387068"
+warning = "#8c6c3e"
+error = "#f52a65"
+approval = "#b15c00"
+notice = "#7847bd"
+fake = "#d20065"
+
+diff_add_bg = "#b7ced5"
+diff_delete_bg = "#dababe"
+diff_hunk_bg = "#d5d9e4"

@@ -1,0 +1,26 @@
+label = "TokyoNight Storm"
+light = false
+
+root_bg = "#24283b"
+surface_bg = "#1f2335"
+element_bg = "#292e42"
+elevated_bg = "#34384c"
+border = "#3b4261"
+text = "#c0caf5"
+muted_text = "#a9b1d6"
+dim_text = "#565f89"
+
+on_accent = "#24283b"
+accent = "#7aa2f7"
+assistant = "#9ece6a"
+user = "#bb9af7"
+success = "#73daca"
+warning = "#e0af68"
+error = "#f7768e"
+approval = "#ff9e64"
+notice = "#9d7cd8"
+fake = "#ff007c"
+
+diff_add_bg = "#2b485a"
+diff_delete_bg = "#52313f"
+diff_hunk_bg = "#272d43"

@@ -1,4 +1,5 @@
 label = "Matrix"
+light = false
 
 root_bg = "#000000"
 surface_bg = "#04140a"

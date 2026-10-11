@@ -1,0 +1,26 @@
+label = "Catppuccin Macchiato"
+light = false
+
+root_bg = "#24273a"
+surface_bg = "#363a4f"
+element_bg = "#494d64"
+elevated_bg = "#5b6078"
+border = "#6e738d"
+text = "#cad3f5"
+muted_text = "#a5adcb"
+dim_text = "#8087a2"
+
+on_accent = "#24273a"
+accent = "#8aadf4"
+assistant = "#a6da95"
+user = "#8aadf4"
+success = "#a6da95"
+warning = "#eed49f"
+error = "#ed8796"
+approval = "#f5a97f"
+notice = "#a5adcb"
+fake = "#c6a0f6"
+
+diff_add_bg = "#2f3f36"
+diff_delete_bg = "#3f2f36"
+diff_hunk_bg = "#2e3849"

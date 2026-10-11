@@ -10,9 +10,12 @@ use super::theme::{Theme, ThemeName};
 const THEMES_DIR: &str = "themes";
 
 const BUNDLED_THEMES: &[(&str, &str)] = &[
-    ("tokyonight", include_str!("../../themes/tokyonight.toml")),
+    (
+        "tokyonight-night",
+        include_str!("../../themes/tokyonight-night.toml"),
+    ),
     ("matrix", include_str!("../../themes/matrix.toml")),
-    ("github", include_str!("../../themes/github.toml")),
+    ("github-dark", include_str!("../../themes/github-dark.toml")),
     ("anthropic", include_str!("../../themes/anthropic.toml")),
     (
         "github-light",
@@ -25,6 +28,34 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
     (
         "letcode-light",
         include_str!("../../themes/letcode-light.toml"),
+    ),
+    (
+        "catppuccin-latte",
+        include_str!("../../themes/catppuccin-latte.toml"),
+    ),
+    (
+        "catppuccin-frappe",
+        include_str!("../../themes/catppuccin-frappe.toml"),
+    ),
+    (
+        "catppuccin-macchiato",
+        include_str!("../../themes/catppuccin-macchiato.toml"),
+    ),
+    (
+        "catppuccin-mocha",
+        include_str!("../../themes/catppuccin-mocha.toml"),
+    ),
+    (
+        "tokyonight-storm",
+        include_str!("../../themes/tokyonight-storm.toml"),
+    ),
+    (
+        "tokyonight-moon",
+        include_str!("../../themes/tokyonight-moon.toml"),
+    ),
+    (
+        "tokyonight-day",
+        include_str!("../../themes/tokyonight-day.toml"),
     ),
 ];
 
@@ -106,7 +137,7 @@ pub fn normalize_theme_id(value: &str) -> Option<String> {
     }
     let id = trimmed.to_ascii_lowercase();
     let id = match id.as_str() {
-        "tokyo-night" | "tokyo_night" => "tokyonight".to_string(),
+        "tokyo-night" | "tokyo_night" => "tokyonight-night".to_string(),
         _ => id,
     };
     if !id
@@ -368,12 +399,19 @@ mod tests {
             ids,
             vec![
                 "anthropic",
-                "github",
+                "catppuccin-frappe",
+                "catppuccin-latte",
+                "catppuccin-macchiato",
+                "catppuccin-mocha",
+                "github-dark",
                 "github-light",
                 "gruvbox-light",
                 "letcode-light",
                 "matrix",
-                "tokyonight",
+                "tokyonight-day",
+                "tokyonight-moon",
+                "tokyonight-night",
+                "tokyonight-storm",
             ]
         );
     }

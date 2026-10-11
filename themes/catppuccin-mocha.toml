@@ -1,0 +1,26 @@
+label = "Catppuccin Mocha"
+light = false
+
+root_bg = "#1e1e2e"
+surface_bg = "#313244"
+element_bg = "#45475a"
+elevated_bg = "#585b70"
+border = "#6c7086"
+text = "#cdd6f4"
+muted_text = "#a6adc8"
+dim_text = "#7f849c"
+
+on_accent = "#1e1e2e"
+accent = "#89b4fa"
+assistant = "#a6e3a1"
+user = "#89b4fa"
+success = "#a6e3a1"
+warning = "#f9e2af"
+error = "#f38ba8"
+approval = "#fab387"
+notice = "#a6adc8"
+fake = "#cba6f7"
+
+diff_add_bg = "#28372e"
+diff_delete_bg = "#37282f"
+diff_hunk_bg = "#273143"

@@ -306,8 +306,10 @@ letcode 把指令 markdown 载入 agent prompt：
 - 文件名 stem 即主题 `id`：小写 ASCII 字母/数字/`-`/`_`；`tokyo-night` /
   `tokyo_night` 会规范成 `tokyonight`。
 - 保留 id（文件会被忽略，不能覆盖）：`dark`（别名 `default`）、`rainbow`。
-- 若不存在会种子写入的捆绑主题：`tokyonight`、`matrix`、`github`、`anthropic`、
-  `github-light`、`gruvbox-light`、`letcode-light`（可改；不会覆盖已有文件）。
+- 若不存在会种子写入的捆绑主题：`tokyonight-night`、`matrix`、`github-dark`、
+  `anthropic`、`github-light`、`gruvbox-light`、`letcode-light`、`catppuccin-latte`、
+  `catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`、
+  `tokyonight-storm`、`tokyonight-moon`、`tokyonight-day`（可改；不会覆盖已有文件）。
 - TUI 用 `/theme` 选择；热重载会重新发现主题目录。
 
 可接受字段（均为可选；颜色未写则回退 dark 调色板）。颜色值必须是

@@ -1,0 +1,26 @@
+label = "TokyoNight Moon"
+light = false
+
+root_bg = "#222436"
+surface_bg = "#1e2030"
+element_bg = "#2f334d"
+elevated_bg = "#393d56"
+border = "#3b4261"
+text = "#c8d3f5"
+muted_text = "#828bb8"
+dim_text = "#636da6"
+
+on_accent = "#222436"
+accent = "#82aaff"
+assistant = "#c3e88d"
+user = "#c099ff"
+success = "#4fd6be"
+warning = "#ffc777"
+error = "#ff757f"
+approval = "#ff966c"
+notice = "#fca7ea"
+fake = "#ff007c"
+
+diff_add_bg = "#2a4556"
+diff_delete_bg = "#4b2a3d"
+diff_hunk_bg = "#252a3f"
