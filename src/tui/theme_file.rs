@@ -14,6 +14,18 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
     ("matrix", include_str!("../../themes/matrix.toml")),
     ("github", include_str!("../../themes/github.toml")),
     ("anthropic", include_str!("../../themes/anthropic.toml")),
+    (
+        "github-light",
+        include_str!("../../themes/github-light.toml"),
+    ),
+    (
+        "gruvbox-light",
+        include_str!("../../themes/gruvbox-light.toml"),
+    ),
+    (
+        "letcode-light",
+        include_str!("../../themes/letcode-light.toml"),
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +364,17 @@ mod tests {
             .into_iter()
             .map(|theme| theme.id)
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["anthropic", "github", "matrix", "tokyonight"]);
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic",
+                "github",
+                "github-light",
+                "gruvbox-light",
+                "letcode-light",
+                "matrix",
+                "tokyonight",
+            ]
+        );
     }
 }

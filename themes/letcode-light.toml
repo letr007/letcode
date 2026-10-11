@@ -1,0 +1,26 @@
+label = "Letcode Light"
+light = true
+
+root_bg = "#f7f7f7"
+surface_bg = "#f0f0f2"
+element_bg = "#e9e9eb"
+elevated_bg = "#e0e0e2"
+border = "#c9c9ce"
+text = "#282828"
+muted_text = "#7d7d7d"
+dim_text = "#afafaf"
+
+on_accent = "#f7f7f7"
+accent = "#14739b"
+assistant = "#238746"
+user = "#14739b"
+success = "#238232"
+warning = "#8c7814"
+error = "#b92828"
+approval = "#a06e0a"
+notice = "#6e6e6e"
+fake = "#a032be"
+
+diff_add_bg = "#def0e4"
+diff_delete_bg = "#fae2e6"
+diff_hunk_bg = "#deecfa"

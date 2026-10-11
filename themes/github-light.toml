@@ -1,0 +1,26 @@
+label = "GitHub Light"
+light = true
+
+root_bg = "#ffffff"
+surface_bg = "#f6f8fa"
+element_bg = "#eaeef2"
+elevated_bg = "#d0d7de"
+border = "#d0d7de"
+text = "#1f2328"
+muted_text = "#57606a"
+dim_text = "#8c959f"
+
+on_accent = "#ffffff"
+accent = "#0969da"
+assistant = "#1a7f37"
+user = "#0969da"
+success = "#1a7f37"
+warning = "#9a6700"
+error = "#cf222e"
+approval = "#bc4c00"
+notice = "#57606a"
+fake = "#8250df"
+
+diff_add_bg = "#dafbe1"
+diff_delete_bg = "#ffebe9"
+diff_hunk_bg = "#ddf4ff"
