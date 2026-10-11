@@ -330,6 +330,7 @@ dim_text = "#505050"
 
 # 语义色
 accent = "#50b4dc"
+on_accent = "#121212"
 assistant = "#64d282"
 user = "#50b4dc"
 success = "#64c864"
@@ -337,6 +338,7 @@ warning = "#b4b464"
 error = "#dc5050"
 approval = "#dcb43c"
 notice = "#646464"
+fake = "#e879f9"
 
 # Diff
 diff_add_bg = "#162d20"
