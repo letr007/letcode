@@ -10,26 +10,22 @@ use super::theme::{Theme, ThemeName};
 const THEMES_DIR: &str = "themes";
 
 const BUNDLED_THEMES: &[(&str, &str)] = &[
-    ("ocean", include_str!("../../themes/ocean.toml")),
-    ("forest", include_str!("../../themes/forest.toml")),
-    ("rose", include_str!("../../themes/rose.toml")),
     ("tokyonight", include_str!("../../themes/tokyonight.toml")),
+    ("matrix", include_str!("../../themes/matrix.toml")),
+    ("github", include_str!("../../themes/github.toml")),
+    ("anthropic", include_str!("../../themes/anthropic.toml")),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomThemeInfo {
     pub id: String,
-    pub path: PathBuf,
     pub label: String,
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ThemeFile {
     #[serde(default)]
     label: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
     #[serde(default)]
     root_bg: Option<String>,
     #[serde(default)]
@@ -38,6 +34,8 @@ struct ThemeFile {
     element_bg: Option<String>,
     #[serde(default)]
     elevated_bg: Option<String>,
+    #[serde(default)]
+    light: Option<bool>,
     #[serde(default)]
     border: Option<String>,
     #[serde(default)]
@@ -157,17 +155,7 @@ pub fn discover_custom_themes(preferences_dir: &Path) -> Vec<CustomThemeInfo> {
                     .label
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| id.clone());
-                let description = file
-                    .description
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| Some(format!("Custom theme ({})", path.display())));
-                themes.push(CustomThemeInfo {
-                    id,
-                    path,
-                    label,
-                    description,
-                });
+                themes.push(CustomThemeInfo { id, label });
             }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "skipping invalid custom theme");
@@ -187,14 +175,6 @@ pub fn load_custom_theme(preferences_dir: &Path, id: &str) -> Result<Theme> {
     let (_, theme) = load_theme_file(&path)
         .with_context(|| format!("failed to load theme '{}'", path.display()))?;
     Ok(theme)
-}
-
-pub fn bundled_theme_description(id: &str) -> Option<String> {
-    let (_, contents) = BUNDLED_THEMES
-        .iter()
-        .find(|(bundle_id, _)| *bundle_id == id)?;
-    let file: ThemeFile = toml::from_str(contents).ok()?;
-    file.description
 }
 
 fn load_theme_file(path: &Path) -> Result<(ThemeFile, Theme)> {
@@ -219,6 +199,7 @@ impl ThemeFile {
             elevated_bg: parse_optional_color(self.elevated_bg.as_deref(), "elevated_bg")?
                 .unwrap_or(base.elevated_bg),
             card_frame: base.card_frame,
+            light: self.light.unwrap_or(base.light),
             border: parse_optional_color(self.border.as_deref(), "border")?.unwrap_or(base.border),
             text: parse_optional_color(self.text.as_deref(), "text")?.unwrap_or(base.text),
             muted_text: parse_optional_color(self.muted_text.as_deref(), "muted_text")?
@@ -310,15 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn bundled_descriptions_come_from_the_shipped_files() {
-        assert_eq!(
-            bundled_theme_description("ocean").as_deref(),
-            Some("Deep teal water with bright cyan accents")
-        );
-        assert_eq!(bundled_theme_description("mine"), None);
-    }
-
-    #[test]
     fn default_leaves_a_slot_to_the_terminal() {
         let prefs = temp_prefs_dir("default-color");
         fs::write(
@@ -358,20 +330,20 @@ mod tests {
         let prefs = temp_prefs_dir("bundled");
         ensure_bundled_themes(&prefs);
 
-        let ocean_path = theme_file_path(&prefs, "ocean");
-        assert!(ocean_path.exists());
+        let anthropic_path = theme_file_path(&prefs, "anthropic");
+        assert!(anthropic_path.exists());
         assert_eq!(
-            load_custom_theme(&prefs, "ocean")
-                .expect("load ocean")
+            load_custom_theme(&prefs, "anthropic")
+                .expect("load anthropic")
                 .accent,
-            Color::Rgb(0x3e, 0xbe, 0xd3)
+            Color::Rgb(0xd9, 0x77, 0x57)
         );
 
-        fs::write(&ocean_path, r##"accent = "#010203""##).expect("edit ocean");
+        fs::write(&anthropic_path, r##"accent = "#010203""##).expect("edit anthropic");
         ensure_bundled_themes(&prefs);
         assert_eq!(
-            load_custom_theme(&prefs, "ocean")
-                .expect("reload ocean")
+            load_custom_theme(&prefs, "anthropic")
+                .expect("reload anthropic")
                 .accent,
             Color::Rgb(0x01, 0x02, 0x03)
         );
@@ -380,6 +352,6 @@ mod tests {
             .into_iter()
             .map(|theme| theme.id)
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["forest", "ocean", "rose", "tokyonight"]);
+        assert_eq!(ids, vec!["anthropic", "github", "matrix", "tokyonight"]);
     }
 }

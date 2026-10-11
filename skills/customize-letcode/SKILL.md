@@ -306,7 +306,7 @@ letcode 把指令 markdown 载入 agent prompt：
 - 文件名 stem 即主题 `id`：小写 ASCII 字母/数字/`-`/`_`；`tokyo-night` /
   `tokyo_night` 会规范成 `tokyonight`。
 - 保留 id（文件会被忽略，不能覆盖）：`dark`（别名 `default`）、`rainbow`。
-- 若不存在会种子写入的捆绑主题：`ocean`、`forest`、`rose`、`tokyonight`
+- 若不存在会种子写入的捆绑主题：`tokyonight`、`matrix`、`github`、`anthropic`
   （可改；不会覆盖已有文件）。
 - TUI 用 `/theme` 选择；热重载会重新发现主题目录。
 
@@ -314,9 +314,9 @@ letcode 把指令 markdown 载入 agent prompt：
 `#RRGGBB` 或 `#RGB` 字符串：
 
 ```toml
-# 元数据（字符串）
+# 元数据
 label = "Sunset"                 # 选择器显示名；省略则用 id
-description = "Warm accent"      # 选择器说明；省略则用路径提示
+light = false                    # 浅色系；切换代码高亮与 ANSI 输出调色板
 
 # 表面 / 文字
 root_bg = "#121212"

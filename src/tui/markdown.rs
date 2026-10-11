@@ -1333,7 +1333,8 @@ impl<'a> CodeHighlighter<'a> {
     fn new(language: Option<&str>, theme: Theme) -> Self {
         let syntax_set = syntax_set();
         let syntax = language.and_then(|language| find_syntax(syntax_set, language));
-        let highlighter = syntax.map(|syntax| HighlightLines::new(syntax, syntect_theme()));
+        let highlighter =
+            syntax.map(|syntax| HighlightLines::new(syntax, syntect_theme(theme.light)));
 
         Self {
             syntax_set,
@@ -1368,13 +1369,20 @@ fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-fn syntect_theme() -> &'static SyntectTheme {
-    static THEME: OnceLock<SyntectTheme> = OnceLock::new();
-    THEME.get_or_init(|| {
+fn syntect_theme(light: bool) -> &'static SyntectTheme {
+    static DARK: OnceLock<SyntectTheme> = OnceLock::new();
+    static LIGHT: OnceLock<SyntectTheme> = OnceLock::new();
+    let theme = if light { &LIGHT } else { &DARK };
+    theme.get_or_init(|| {
         let theme_set = ThemeSet::load_defaults();
+        let key = if light {
+            "InspiredGitHub"
+        } else {
+            "base16-ocean.dark"
+        };
         theme_set
             .themes
-            .get("base16-ocean.dark")
+            .get(key)
             .or_else(|| theme_set.themes.values().next())
             .cloned()
             .unwrap_or_default()
@@ -1834,6 +1842,18 @@ fn muted_style(theme: Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_scheme_selects_a_light_syntax_theme() {
+        let themes = ThemeSet::load_defaults();
+
+        assert!(
+            themes.themes.contains_key("InspiredGitHub"),
+            "available: {:?}",
+            themes.themes.keys().collect::<Vec<_>>()
+        );
+        assert_ne!(syntect_theme(true).name, syntect_theme(false).name);
+    }
 
     fn rendered(markdown: &str, width: usize) -> Vec<Line<'static>> {
         render_markdown(markdown, Theme::dark(), MarkdownRenderOptions::new(width))

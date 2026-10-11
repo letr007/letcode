@@ -848,7 +848,12 @@ fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursor
 }
 
 fn composer_cursor_target_color(theme: Theme) -> Color {
-    mix_color(theme.text, Color::Rgb(255, 255, 255), 24)
+    let target = if theme.light {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
+    };
+    mix_color(theme.text, target, 24)
 }
 
 fn cursor_pulse_intensity(animation_frame: usize) -> f32 {

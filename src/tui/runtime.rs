@@ -38,8 +38,7 @@ use super::state::{
 use super::terminal::OwnedTerminal;
 use super::theme::{Theme, ThemeName};
 use super::theme_file::{
-    CustomThemeInfo, bundled_theme_description, discover_custom_themes, ensure_bundled_themes,
-    load_custom_theme, normalize_theme_id,
+    discover_custom_themes, ensure_bundled_themes, load_custom_theme, normalize_theme_id,
 };
 #[cfg(test)]
 use crate::session::RunnerPermissionRequest;
@@ -3472,35 +3471,14 @@ impl TuiRuntime {
         self.theme_preview_original = Some((self.state.theme_id.clone(), self.state.custom_theme));
         ensure_bundled_themes(&self.preferences_dir);
         let mut items = vec![
-            DialogItem::new(
-                "dark",
-                "Dark",
-                Some(self.state.t("runtime.theme_dark_desc")),
-            ),
-            DialogItem::new(
-                "plain",
-                "Plain",
-                Some(self.state.t("runtime.theme_plain_desc")),
-            ),
-            DialogItem::new(
-                "glass",
-                "Glass",
-                Some(self.state.t("runtime.theme_glass_desc")),
-            ),
-            DialogItem::new(
-                "wireframe",
-                "Wireframe",
-                Some(self.state.t("runtime.theme_wireframe_desc")),
-            ),
-            DialogItem::new(
-                "rainbow",
-                "Rainbow",
-                Some(self.state.t("runtime.theme_rainbow_desc")),
-            ),
+            DialogItem::new("dark", "Letcode Dark", None),
+            DialogItem::new("plain", "Plain", None),
+            DialogItem::new("glass", "Glass", None),
+            DialogItem::new("wireframe", "Wireframe", None),
+            DialogItem::new("rainbow", "Rainbow", None),
         ];
         for custom in discover_custom_themes(&self.preferences_dir) {
-            let description = custom_theme_description(self.state(), &custom);
-            items.push(DialogItem::new(custom.id, custom.label, description));
+            items.push(DialogItem::new(custom.id, custom.label, None));
         }
         let mut dialog = DialogState::new(
             DialogKind::ThemePicker,
@@ -6075,22 +6053,6 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/theme"
             | "/context"
     )
-}
-
-fn custom_theme_description(state: &TuiState, custom: &CustomThemeInfo) -> Option<String> {
-    let key = match custom.id.as_str() {
-        "ocean" => "runtime.theme_ocean_desc",
-        "forest" => "runtime.theme_forest_desc",
-        "rose" => "runtime.theme_rose_desc",
-        "tokyonight" => "runtime.theme_tokyonight_desc",
-        _ => return custom.description.clone(),
-    };
-    match bundled_theme_description(&custom.id) {
-        Some(default) if custom.description.as_deref() == Some(default.as_str()) => {
-            Some(state.t(key))
-        }
-        _ => custom.description.clone(),
-    }
 }
 
 #[cfg(test)]

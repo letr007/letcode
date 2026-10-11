@@ -118,7 +118,7 @@ pub(super) fn render_limited_text_lines(
             break;
         }
         let line = if raw.is_empty() { " " } else { raw };
-        let segments = ansi_sgr_segments(line, text_style.bg(theme.card_bg()));
+        let segments = ansi_sgr_segments(line, text_style.bg(theme.card_bg()), theme.light);
         lines.push(render_source_card_line_with_boundary(
             &segments,
             Style::default().bg(theme.card_bg()),
@@ -148,7 +148,7 @@ pub(super) fn render_tail_limited_text_lines(
     let mut lines = Vec::new();
     for raw in body {
         let line = if raw.is_empty() { " " } else { raw };
-        let segments = ansi_sgr_segments(line, text_style.bg(theme.card_bg()));
+        let segments = ansi_sgr_segments(line, text_style.bg(theme.card_bg()), theme.light);
         lines.push(render_source_card_line_with_boundary(
             &segments,
             Style::default().bg(theme.card_bg()),
@@ -161,7 +161,7 @@ pub(super) fn render_tail_limited_text_lines(
 }
 
 pub(super) fn terminal_safe_text(text: &str) -> String {
-    ansi_sgr_segments(text, Style::default())
+    ansi_sgr_segments(text, Style::default(), false)
         .into_iter()
         .map(|(text, _)| text)
         .collect()
@@ -172,7 +172,11 @@ pub(super) fn terminal_safe_text(text: &str) -> String {
 /// Contract: segment text never contains control characters. SGR becomes style;
 /// other CSI/OSC/C0 and truncated escapes are dropped so VT state cannot escape
 /// into the ratatui write path.
-pub(super) fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, Style)> {
+pub(super) fn ansi_sgr_segments(
+    text: &str,
+    base_style: Style,
+    light: bool,
+) -> Vec<(String, Style)> {
     // Progress bars overwrite with CR; only the suffix after the last CR is visible.
     let text = text.rsplit('\r').next().unwrap_or(text);
 
@@ -192,7 +196,7 @@ pub(super) fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, S
                                 segments.push((std::mem::take(&mut current_text), current_style));
                             }
                             current_style =
-                                apply_sgr_sequence(&sequence, base_style, current_style);
+                                apply_sgr_sequence(&sequence, base_style, current_style, light);
                         }
                         CsiOutcome::Other | CsiOutcome::Incomplete => {}
                     }
@@ -297,7 +301,12 @@ pub(super) fn consume_osc_sequence(chars: &mut std::iter::Peekable<std::str::Cha
     false
 }
 
-pub(super) fn apply_sgr_sequence(sequence: &str, base_style: Style, mut style: Style) -> Style {
+pub(super) fn apply_sgr_sequence(
+    sequence: &str,
+    base_style: Style,
+    mut style: Style,
+    light: bool,
+) -> Style {
     let codes: Vec<u16> = if sequence.is_empty() {
         vec![0]
     } else {
@@ -317,17 +326,17 @@ pub(super) fn apply_sgr_sequence(sequence: &str, base_style: Style, mut style: S
             22 => style = style.remove_modifier(Modifier::BOLD),
             23 => style = style.remove_modifier(Modifier::ITALIC),
             24 => style = style.remove_modifier(Modifier::UNDERLINED),
-            30..=37 => style = style.fg(ansi_basic_color(codes[index] - 30, false)),
+            30..=37 => style = style.fg(ansi_basic_color(codes[index] - 30, false, light)),
             39 => {
                 style = match base_style.fg {
                     Some(color) => style.fg(color),
                     None => style,
                 }
             }
-            90..=97 => style = style.fg(ansi_basic_color(codes[index] - 90, true)),
+            90..=97 => style = style.fg(ansi_basic_color(codes[index] - 90, true, light)),
             38 if codes.get(index + 1) == Some(&5) => {
                 if let Some(color_index) = codes.get(index + 2).copied() {
-                    style = style.fg(ansi_256_color(color_index));
+                    style = style.fg(ansi_256_color(color_index, light));
                     index += 2;
                 }
             }
@@ -349,37 +358,61 @@ pub(super) fn apply_sgr_sequence(sequence: &str, base_style: Style, mut style: S
     style
 }
 
-pub(super) fn ansi_basic_color(index: u16, bright: bool) -> Color {
-    let colors = if bright {
-        [
-            Color::Rgb(128, 128, 128),
-            Color::Rgb(255, 85, 85),
-            Color::Rgb(80, 250, 123),
-            Color::Rgb(241, 250, 140),
-            Color::Rgb(98, 114, 164),
-            Color::Rgb(255, 121, 198),
-            Color::Rgb(139, 233, 253),
-            Color::Rgb(248, 248, 242),
-        ]
-    } else {
-        [
-            Color::Rgb(0, 0, 0),
-            Color::Rgb(205, 49, 49),
-            Color::Rgb(13, 188, 121),
-            Color::Rgb(229, 229, 16),
-            Color::Rgb(36, 114, 200),
-            Color::Rgb(188, 63, 188),
-            Color::Rgb(17, 168, 205),
-            Color::Rgb(229, 229, 229),
-        ]
-    };
-    colors[index as usize]
+const ANSI_DARK: [[Color; 8]; 2] = [
+    [
+        Color::Rgb(0, 0, 0),
+        Color::Rgb(205, 49, 49),
+        Color::Rgb(13, 188, 121),
+        Color::Rgb(229, 229, 16),
+        Color::Rgb(36, 114, 200),
+        Color::Rgb(188, 63, 188),
+        Color::Rgb(17, 168, 205),
+        Color::Rgb(229, 229, 229),
+    ],
+    [
+        Color::Rgb(128, 128, 128),
+        Color::Rgb(255, 85, 85),
+        Color::Rgb(80, 250, 123),
+        Color::Rgb(241, 250, 140),
+        Color::Rgb(98, 114, 164),
+        Color::Rgb(255, 121, 198),
+        Color::Rgb(139, 233, 253),
+        Color::Rgb(248, 248, 242),
+    ],
+];
+
+const ANSI_LIGHT: [[Color; 8]; 2] = [
+    [
+        Color::Rgb(0, 0, 0),
+        Color::Rgb(205, 49, 49),
+        Color::Rgb(0, 188, 0),
+        Color::Rgb(148, 152, 0),
+        Color::Rgb(4, 81, 165),
+        Color::Rgb(188, 5, 188),
+        Color::Rgb(5, 152, 188),
+        Color::Rgb(85, 85, 85),
+    ],
+    [
+        Color::Rgb(102, 102, 102),
+        Color::Rgb(205, 49, 49),
+        Color::Rgb(20, 206, 20),
+        Color::Rgb(181, 186, 0),
+        Color::Rgb(4, 81, 165),
+        Color::Rgb(188, 5, 188),
+        Color::Rgb(5, 152, 188),
+        Color::Rgb(165, 165, 165),
+    ],
+];
+
+pub(super) fn ansi_basic_color(index: u16, bright: bool, light: bool) -> Color {
+    let palette = if light { ANSI_LIGHT } else { ANSI_DARK };
+    palette[if bright { 1 } else { 0 }][index as usize]
 }
 
-pub(super) fn ansi_256_color(index: u16) -> Color {
+pub(super) fn ansi_256_color(index: u16, light: bool) -> Color {
     match index {
-        0..=7 => ansi_basic_color(index, false),
-        8..=15 => ansi_basic_color(index - 8, true),
+        0..=7 => ansi_basic_color(index, false, light),
+        8..=15 => ansi_basic_color(index - 8, true, light),
         16..=231 => {
             let value = index - 16;
             let r = value / 36;

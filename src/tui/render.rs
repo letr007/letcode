@@ -1227,12 +1227,18 @@ fn wordmark_shadow_style(theme: Theme) -> Style {
 /// Approximate a dim foreground without emitting SGR DIM, whose treatment of
 /// block glyphs differs between terminal emulators.
 ///
-/// Anchored on the palette's dark tone: a transparent root leaves the background unknown.
+/// Blends toward the scheme's tone so the shadow recedes on either background.
 fn wordmark_shadow_color(theme: Theme) -> Color {
     const FOREGROUND_WEIGHT: u16 = 38;
-    const PALETTE_DARK: (u8, u8, u8) = (18, 18, 18);
+    const DARK_ANCHOR: (u8, u8, u8) = (18, 18, 18);
+    const LIGHT_ANCHOR: (u8, u8, u8) = (255, 255, 255);
     let Color::Rgb(red, green, blue) = theme.notice else {
         return theme.dim_text;
+    };
+    let anchor = if theme.light {
+        LIGHT_ANCHOR
+    } else {
+        DARK_ANCHOR
     };
     let blend = |foreground: u8, background: u8| {
         ((u16::from(foreground) * FOREGROUND_WEIGHT
@@ -1240,9 +1246,9 @@ fn wordmark_shadow_color(theme: Theme) -> Color {
             / 100) as u8
     };
     Color::Rgb(
-        blend(red, PALETTE_DARK.0),
-        blend(green, PALETTE_DARK.1),
-        blend(blue, PALETTE_DARK.2),
+        blend(red, anchor.0),
+        blend(green, anchor.1),
+        blend(blue, anchor.2),
     )
 }
 

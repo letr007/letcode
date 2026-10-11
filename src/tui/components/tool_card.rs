@@ -1450,7 +1450,7 @@ mod tests {
             ("hide\u{1b}[?25lcursor", "hidecursor"),
         ];
         for (input, expected) in cases {
-            let segments = ansi_sgr_segments(input, base);
+            let segments = ansi_sgr_segments(input, base, false);
             assert_segments_have_no_controls(&segments);
             assert_eq!(
                 segment_texts(&segments).join(""),
@@ -1466,6 +1466,7 @@ mod tests {
         let segments = ansi_sgr_segments(
             "\u{1b}]8;;http://example.test\u{07}link\u{1b}]8;;\u{07}",
             base,
+            false,
         );
         assert_segments_have_no_controls(&segments);
         assert_eq!(segment_texts(&segments), vec!["link"]);
@@ -1474,11 +1475,11 @@ mod tests {
     #[test]
     fn shell_output_drops_truncated_escape_without_leaking_esc() {
         let base = root_text_style(Theme::dark()).bg(Theme::dark().card_bg());
-        let truncated = ansi_sgr_segments("plain\u{1b}[3", base);
+        let truncated = ansi_sgr_segments("plain\u{1b}[3", base, false);
         assert_segments_have_no_controls(&truncated);
         assert_eq!(segment_texts(&truncated), vec!["plain"]);
 
-        let completed = ansi_sgr_segments("plain\u{1b}[31mred", base);
+        let completed = ansi_sgr_segments("plain\u{1b}[31mred", base, false);
         assert_segments_have_no_controls(&completed);
         assert_eq!(segment_texts(&completed), vec!["plain", "red"]);
         assert_eq!(completed[1].1.fg, Some(Color::Rgb(205, 49, 49)));

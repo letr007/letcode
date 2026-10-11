@@ -10,11 +10,14 @@
 ### Added
 
 - `letcode config schema` 生成配置 schema，`letcode config schema check` 校验其是否与代码一致。
+- 主题文件新增 `light` 字段声明浅色系；代码高亮与 ANSI 输出随之切换调色板。
 
 ### Changed
 
 - historian 只接受 `<episode>` 标签块，不再兼容逐行 JSON 输出。
 - 配置编辑器为省略字段预填运行时默认值，不再使用 schema 枚举的首项。
+- 捆绑主题改为 `tokyonight`、`matrix`、`github`、`anthropic`。
+- 主题选择器只显示主题名，移除主题描述；内置 `dark` 显示为 `Letcode Dark`。
 
 ### Fixed
 
