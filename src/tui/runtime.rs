@@ -3476,7 +3476,7 @@ impl TuiRuntime {
             DialogItem::new("glass", "Glass", None),
             DialogItem::new("wireframe", "Wireframe", None),
             DialogItem::new("rainbow", "Rainbow", None),
-            DialogItem::new("letcode-light", "Letcode Light", None),
+            DialogItem::new("light", "Letcode Light", None),
         ];
         for custom in discover_custom_themes(&self.preferences_dir) {
             items.push(DialogItem::new(custom.id, custom.label, None));

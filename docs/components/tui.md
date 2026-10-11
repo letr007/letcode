@@ -74,7 +74,7 @@ TUI 内置英文和简体中文。
 输入 `/language en` 或 `/language zh-CN` 切换语言。
 语言设置保存后，下次启动继续使用。
 
-内置主题包括 `dark`、`plain`、`glass`、`wireframe`、`rainbow` 和 `letcode-light`。
+内置主题包括 `dark`、`plain`、`glass`、`wireframe`、`rainbow` 和 `light`。
 `/theme` 打开主题选择器。
 外部主题使用 `themes/*.toml` 配置前景色、背景色和强调色。
 

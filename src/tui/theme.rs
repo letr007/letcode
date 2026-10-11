@@ -121,7 +121,7 @@ impl Theme {
         theme
     }
 
-    pub const fn letcode_light() -> Self {
+    pub const fn light() -> Self {
         let mut theme = Self::dark();
         theme.light = true;
         theme.root_bg = Color::Rgb(0xf7, 0xf7, 0xf7);
@@ -159,7 +159,7 @@ impl Theme {
             ThemeName::Glass => Self::glass(),
             ThemeName::Wireframe => Self::wireframe(),
             ThemeName::Rainbow => Self::dark().with_rainbow_accent(frame),
-            ThemeName::LetcodeLight => Self::letcode_light(),
+            ThemeName::Light => Self::light(),
         }
     }
 
