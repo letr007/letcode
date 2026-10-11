@@ -5,19 +5,21 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [0.22.0] - 2026-10-12
 
 ### Added
 
-- `letcode config schema` 生成配置 schema，`letcode config schema check` 校验其是否与代码一致。
-- 主题文件新增 `light` 字段声明浅色系；代码高亮与 ANSI 输出随之切换调色板。
+- `letcode config schema` 可生成配置 schema，由 `letcode config schema check` 校验。
+- `/resume` 会话选择器支持删除会话及其子会话。
+- 主题文件新增 `light` 字段声明浅色系。
 
 ### Changed
 
 - historian 只接受 `<episode>` 标签块，不再兼容逐行 JSON 输出。
 - 配置编辑器为省略字段预填运行时默认值，不再使用 schema 枚举的首项。
-- 捆绑主题改为 `tokyonight`、`matrix`、`github`、`anthropic`。
-- 主题选择器只显示主题名，移除主题描述；内置 `dark` 显示为 `Letcode Dark`。
+- 捆绑主题更新为 `tokyonight-night`、`tokyonight-storm`、`tokyonight-moon`、`tokyonight-day`、`catppuccin-latte`、`catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`、`github-dark`、`github-light`、`gruvbox-light`、`matrix` 和 `anthropic`。
+- 主题 id 仅允许小写字母、数字、短横线和下划线，旧别名 `tokyo-night` 与 `tokyo_night` 规范化为 `tokyonight-night`。
+- 主题选择器只显示主题名称，内置 `dark` 显示为 `Letcode Dark`。
 
 ### Fixed
 

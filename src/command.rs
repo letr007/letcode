@@ -405,7 +405,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/theme",
         insert_text: "/theme ",
         description_key: "command.theme",
-        usage: "/theme [dark|rainbow|<themes/*.toml>]",
+        usage: "/theme [dark|plain|glass|wireframe|rainbow|light|<themes/*.toml>]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -723,7 +723,7 @@ fn parse_theme(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
             None => Err(CommandParseError::with_args("parse.unknown_theme", [])),
         },
         ["/theme", ..] => Err(CommandParseError::new(
-            "Usage: /theme <dark|plain|glass|rainbow|<themes/*.toml>>",
+            "Usage: /theme <dark|plain|glass|wireframe|rainbow|light|<themes/*.toml>>",
         )),
         _ => unreachable!(),
     }

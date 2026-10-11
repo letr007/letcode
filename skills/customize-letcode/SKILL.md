@@ -301,16 +301,12 @@ letcode 把指令 markdown 载入 agent prompt：
 
 ## 主题
 
-自定义 TUI 主题：`~/.config/letcode/themes/<id>.toml`。
+自定义 TUI 主题路径为 `~/.config/letcode/themes/<id>.toml`。
 
-- 文件名 stem 即主题 `id`：小写 ASCII 字母/数字/`-`/`_`；`tokyo-night` /
-  `tokyo_night` 会规范成 `tokyonight`。
-- 保留 id（文件会被忽略，不能覆盖）：`dark`（别名 `default`）、`rainbow`、`light`。
-- 若不存在会种子写入的捆绑主题：`tokyonight-night`、`matrix`、`github-dark`、
-  `anthropic`、`github-light`、`gruvbox-light`、`catppuccin-latte`、
-  `catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`、
-  `tokyonight-storm`、`tokyonight-moon`、`tokyonight-day`（可改；不会覆盖已有文件）。
-- TUI 用 `/theme` 选择；热重载会重新发现主题目录。
+- 文件名 stem 即主题 `id`，由小写 ASCII 字母、数字、`-` 和 `_` 组成。`tokyo-night` 与 `tokyo_night` 会规范化为 `tokyonight-night`。
+- 保留 id（文件会被忽略，不能覆盖）：`dark`（别名 `default`）、`plain`、`glass`（别名 `transparent`）、`wireframe`、`rainbow` 和 `light`。
+- 若不存在会写入捆绑主题：`tokyonight-night`、`matrix`、`github-dark`、`anthropic`、`github-light`、`gruvbox-light`、`catppuccin-latte`、`catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`、`tokyonight-storm`、`tokyonight-moon` 和 `tokyonight-day`（可修改，不会覆盖已有文件）。
+- TUI 用 `/theme` 选择，热重载会重新发现主题目录。
 
 可接受字段（均为可选；颜色未写则回退 dark 调色板）。颜色值必须是
 `#RRGGBB` 或 `#RGB` 字符串：
