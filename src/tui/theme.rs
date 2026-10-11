@@ -121,6 +121,33 @@ impl Theme {
         theme
     }
 
+    pub const fn letcode_light() -> Self {
+        let mut theme = Self::dark();
+        theme.light = true;
+        theme.root_bg = Color::Rgb(0xf7, 0xf7, 0xf7);
+        theme.surface_bg = Color::Rgb(0xf0, 0xf0, 0xf2);
+        theme.element_bg = Color::Rgb(0xe9, 0xe9, 0xeb);
+        theme.elevated_bg = Color::Rgb(0xe0, 0xe0, 0xe2);
+        theme.border = Color::Rgb(0xc9, 0xc9, 0xce);
+        theme.text = Color::Rgb(0x28, 0x28, 0x28);
+        theme.muted_text = Color::Rgb(0x7d, 0x7d, 0x7d);
+        theme.dim_text = Color::Rgb(0xaf, 0xaf, 0xaf);
+        theme.on_accent = Color::Rgb(0xf7, 0xf7, 0xf7);
+        theme.accent = Color::Rgb(0x14, 0x73, 0x9b);
+        theme.assistant = Color::Rgb(0x23, 0x87, 0x46);
+        theme.user = Color::Rgb(0x14, 0x73, 0x9b);
+        theme.success = Color::Rgb(0x23, 0x82, 0x32);
+        theme.warning = Color::Rgb(0x8c, 0x78, 0x14);
+        theme.error = Color::Rgb(0xb9, 0x28, 0x28);
+        theme.approval = Color::Rgb(0xa0, 0x6e, 0x0a);
+        theme.notice = Color::Rgb(0x6e, 0x6e, 0x6e);
+        theme.fake = Color::Rgb(0xa0, 0x32, 0xbe);
+        theme.diff_add_bg = Color::Rgb(0xde, 0xf0, 0xe4);
+        theme.diff_delete_bg = Color::Rgb(0xfa, 0xe2, 0xe6);
+        theme.diff_hunk_bg = Color::Rgb(0xde, 0xec, 0xfa);
+        theme
+    }
+
     pub const fn paints_panels(self) -> bool {
         !matches!(self.element_bg, Color::Reset)
     }
@@ -132,6 +159,7 @@ impl Theme {
             ThemeName::Glass => Self::glass(),
             ThemeName::Wireframe => Self::wireframe(),
             ThemeName::Rainbow => Self::dark().with_rainbow_accent(frame),
+            ThemeName::LetcodeLight => Self::letcode_light(),
         }
     }
 

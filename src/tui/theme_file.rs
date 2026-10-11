@@ -26,10 +26,6 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
         include_str!("../../themes/gruvbox-light.toml"),
     ),
     (
-        "letcode-light",
-        include_str!("../../themes/letcode-light.toml"),
-    ),
-    (
         "catppuccin-latte",
         include_str!("../../themes/catppuccin-latte.toml"),
     ),
@@ -406,7 +402,6 @@ mod tests {
                 "github-dark",
                 "github-light",
                 "gruvbox-light",
-                "letcode-light",
                 "matrix",
                 "tokyonight-day",
                 "tokyonight-moon",

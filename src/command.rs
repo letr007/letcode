@@ -102,6 +102,7 @@ pub enum ThemeName {
     Glass,
     Wireframe,
     Rainbow,
+    LetcodeLight,
 }
 
 impl ThemeName {
@@ -112,6 +113,7 @@ impl ThemeName {
             Self::Glass => "glass",
             Self::Wireframe => "wireframe",
             Self::Rainbow => "rainbow",
+            Self::LetcodeLight => "letcode-light",
         }
     }
 
@@ -122,6 +124,7 @@ impl ThemeName {
             "glass" | "transparent" => Some(Self::Glass),
             "wireframe" => Some(Self::Wireframe),
             "rainbow" => Some(Self::Rainbow),
+            "letcode-light" => Some(Self::LetcodeLight),
             _ => None,
         }
     }
