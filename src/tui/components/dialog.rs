@@ -84,13 +84,19 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
         lines.push(Line::default());
     }
 
-    let footer = if matches!(dialog.kind, DialogKind::ContextDetail) {
-        Line::from(vec![
+    let footer = match &dialog.kind {
+        DialogKind::ContextDetail => Line::from(vec![
             Span::styled("Esc", accent_style(theme)),
             Span::styled(format!(" {}", state.t("ui.close")), muted_style(theme)),
-        ])
-    } else {
-        Line::from(vec![
+        ]),
+        DialogKind::SessionDeleteConfirm => Line::from(vec![
+            Span::styled("Enter", accent_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.confirm")), muted_style(theme)),
+            Span::styled("  •  ", muted_style(theme)),
+            Span::styled("Esc", accent_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.cancel")), muted_style(theme)),
+        ]),
+        _ => Line::from(vec![
             Span::styled("↑/↓", accent_style(theme)),
             Span::styled(format!(" {}", state.t("ui.navigate")), muted_style(theme)),
             Span::styled("  •  ", muted_style(theme)),
@@ -99,7 +105,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             Span::styled("  •  ", muted_style(theme)),
             Span::styled("Esc", accent_style(theme)),
             Span::styled(format!(" {}", state.t("ui.cancel")), muted_style(theme)),
-        ])
+        ]),
     };
     lines.push(footer);
 
@@ -109,6 +115,8 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             .wrap(Wrap { trim: false }),
         inner,
     );
+
+    picker::render_three_sided_frame(frame, dialog_area, theme);
 }
 
 fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {

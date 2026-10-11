@@ -365,6 +365,7 @@ pub enum DialogKind {
     FakePicker,
     LanguagePicker,
     SessionPicker,
+    SessionDeleteConfirm,
     HistoryTree,
     ContextPicker,
     #[allow(dead_code)] // Context detail is constructed by runtime dialog routing.

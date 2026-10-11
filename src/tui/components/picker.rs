@@ -500,6 +500,9 @@ fn render_picker_body(
                         render_session_row(frame, row, theme, item, selected, None)
                     }
                     DialogKind::Help => unreachable!("help uses the document reader"),
+                    DialogKind::SessionDeleteConfirm => {
+                        unreachable!("session delete confirmation uses the plain dialog")
+                    }
                     DialogKind::ConfigEditor => render_config_row(
                         frame,
                         row,
@@ -567,6 +570,9 @@ fn render_session_picker_footer(
         Span::styled("  ·  ", muted_style(theme)),
         Span::styled("Enter", accent_style(theme)),
         Span::styled(format!(" {}", state.t("ui.select")), muted_style(theme)),
+        Span::styled("  ·  ", muted_style(theme)),
+        Span::styled("Ctrl-D", accent_style(theme)),
+        Span::styled(format!(" {}", state.t("ui.delete")), muted_style(theme)),
         Span::styled("  ·  ", muted_style(theme)),
         Span::styled("Esc", accent_style(theme)),
         Span::styled(format!(" {}", state.t("ui.close")), muted_style(theme)),

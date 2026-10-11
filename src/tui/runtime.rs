@@ -14,7 +14,9 @@ use crate::command::{
 use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
-use crate::session::archive::{self, ArchiveBudget, ArchiveRunReport, merged_session_summaries};
+use crate::session::archive::{
+    self, ArchiveBudget, ArchiveRunReport, delete_session_family, merged_session_summaries,
+};
 use crate::skills::SkillCard;
 use crate::transcript::{SessionSummary, read_records, transcript_projection};
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
@@ -170,6 +172,14 @@ enum SubmittedCommand {
     Runtime(RuntimeCommand),
 }
 
+enum SessionDeleteOutcome {
+    Deleted(Vec<SessionSummary>),
+    Failed(String),
+}
+
+/// Session ids come from transcript file names, so `cancel` is never a real target.
+const SESSION_DELETE_CANCEL_ID: &str = "cancel";
+
 #[derive(Debug, Clone)]
 struct ComposerDraft {
     input_buffer: String,
@@ -206,6 +216,8 @@ pub struct TuiRuntime {
     session_resume_pending: bool,
     /// Background `/resume` directory scan; polled each frame so the UI never blocks.
     session_list_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<SessionSummary>>>>,
+    /// Background session delete; polled each frame so the UI never blocks.
+    session_delete_rx: Option<mpsc::UnboundedReceiver<SessionDeleteOutcome>>,
     /// One-shot background release check. Failures are logged and never interrupt the TUI.
     update_check_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Option<String>>>>,
     /// One-shot background archive pass started at TUI startup. Its report only
@@ -259,6 +271,7 @@ impl TuiRuntime {
             last_output_rate_graph_sample_at: None,
             session_resume_pending: false,
             session_list_rx: None,
+            session_delete_rx: None,
             update_check_rx: None,
             archive_pass_rx: None,
             current_turn_output_tokens: 0,
@@ -716,6 +729,7 @@ impl TuiRuntime {
         let mut budget = SessionEventBudget::new();
         self.advance_assistant_typewriters_with_budget(Instant::now(), &mut budget);
         self.poll_session_list();
+        self.poll_session_delete();
         self.poll_update_check();
         self.poll_session_archive_pass();
         self.poll_git_branch();
@@ -2348,6 +2362,7 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::DialogAccept => self.handle_dialog_accept(),
+            InputAction::DialogDelete => self.show_session_delete_confirm(),
             InputAction::DialogToggle => {
                 if self
                     .state
@@ -4939,6 +4954,100 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn show_session_delete_confirm(&mut self) -> Result<Option<RuntimeCommand>> {
+        let Some((session_id, label)) = self.state.dialog().and_then(|dialog| {
+            if dialog.kind != DialogKind::SessionPicker {
+                return None;
+            }
+            dialog
+                .selected_item()
+                .map(|item| (item.id.clone(), item.label.clone()))
+        }) else {
+            return Ok(None);
+        };
+
+        let title = self.state.t("dialog.session_delete_title");
+        let description = self
+            .state
+            .t_fmt("dialog.session_delete_body", &[("session", &label)]);
+        let confirm_label = self.state.t("dialog.session_delete_confirm");
+        let cancel_label = self.state.t("ui.cancel");
+        let mut dialog = DialogState::new(
+            DialogKind::SessionDeleteConfirm,
+            title,
+            Some(description),
+            vec![
+                DialogItem::new(session_id, confirm_label, None),
+                DialogItem::new(SESSION_DELETE_CANCEL_ID, cancel_label, None),
+            ],
+        );
+        dialog.selected = 1;
+        self.state.open_dialog(dialog);
+        Ok(None)
+    }
+
+    fn start_session_delete(&mut self, session_id: String) {
+        if self.session_delete_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.session_delete_rx = Some(rx);
+        let sessions_dir = self.sessions_dir.clone();
+        self.state
+            .show_toast(self.state.t("runtime.deleting_session"), ToastKind::Info);
+        std::thread::spawn(move || {
+            let outcome = match delete_session_family(&sessions_dir, &session_id) {
+                Ok(_) => match merged_session_summaries(&sessions_dir) {
+                    Ok(sessions) => SessionDeleteOutcome::Deleted(sessions),
+                    Err(error) => SessionDeleteOutcome::Failed(error.to_string()),
+                },
+                Err(error) => SessionDeleteOutcome::Failed(error.to_string()),
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    fn poll_session_delete(&mut self) {
+        let Some(rx) = self.session_delete_rx.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(SessionDeleteOutcome::Deleted(sessions)) => {
+                self.session_delete_rx = None;
+                self.session_summaries = sessions;
+                let scope = self
+                    .state
+                    .dialog()
+                    .filter(|dialog| dialog.kind == DialogKind::SessionPicker)
+                    .map(|dialog| dialog.session_scope);
+                if let Some(scope) = scope {
+                    let items = self.session_rows(&self.session_summaries, scope);
+                    if let Some(dialog) = self.state.dialog_mut() {
+                        dialog.session_scope = scope;
+                        dialog.replace_items(items);
+                    }
+                }
+                self.state
+                    .show_toast(self.state.t("runtime.session_deleted"), ToastKind::Info);
+            }
+            Ok(SessionDeleteOutcome::Failed(error)) => {
+                self.session_delete_rx = None;
+                let message = self
+                    .state
+                    .t_fmt("runtime.session_delete_failed", &[("error", &error)]);
+                self.state.show_toast(message, ToastKind::Error);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.session_delete_rx = None;
+                self.state.show_toast(
+                    self.state.t("runtime.session_delete_worker_stopped"),
+                    ToastKind::Error,
+                );
+            }
+        }
+    }
+
     fn open_history_tree_dialog(&mut self, entries: &[transcript_projection::SessionHistoryEntry]) {
         if entries.is_empty() {
             self.push_command_notice(self.state.t("runtime.no_transcript_entries"));
@@ -5321,6 +5430,14 @@ impl TuiRuntime {
             DialogKind::SessionPicker => {
                 self.state.close_dialog();
                 Ok(Some(RuntimeCommand::ResumeSession(selected.id)))
+            }
+            DialogKind::SessionDeleteConfirm => {
+                self.state.close_dialog();
+                if selected.id == SESSION_DELETE_CANCEL_ID {
+                    return Ok(None);
+                }
+                self.start_session_delete(selected.id);
+                Ok(None)
             }
             DialogKind::HistoryTree => {
                 if self.history_navigation_is_unavailable() {

@@ -764,13 +764,13 @@ fn commit_restore(
     // The family is in place; only now drop the archive copies, including those
     // of members that were already live.
     for member in &plan.members {
-        remove_archive_file(&member.archived);
+        remove_file_if_present(&member.archived);
     }
     for artifacts in &plan.artifacts {
-        remove_archive_file(&artifacts.archived);
+        remove_file_if_present(&artifacts.archived);
     }
     for path in &plan.stale_archives {
-        remove_archive_file(path);
+        remove_file_if_present(path);
     }
     archive_index::remove(sessions_dir, session_id)?;
 
@@ -780,12 +780,108 @@ fn commit_restore(
     })
 }
 
-fn remove_archive_file(path: &Path) {
+fn remove_file_if_present(path: &Path) {
     if let Err(error) = fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        warn!(path = %path.display(), error = %error, "failed to remove archive file");
+        warn!(path = %path.display(), error = %error, "failed to remove file");
     }
+}
+
+/// Every member must be free of a writer, so a live or in-flight family is left untouched.
+pub(crate) fn delete_session_family(sessions_dir: &Path, session_id: &str) -> Result<usize> {
+    let family = collect_family_ids(sessions_dir, session_id)?;
+    if family.is_empty() {
+        return Err(anyhow!("session {session_id} not found"));
+    }
+
+    let mut locks = Vec::with_capacity(family.len());
+    for id in &family {
+        let live = family_live_transcript(sessions_dir, session_id, id);
+        let Some(lock) = TranscriptWriterLock::try_acquire(&live)? else {
+            return Err(anyhow!(
+                "session {session_id} is busy: another process is writing, archiving, or restoring it"
+            ));
+        };
+        locks.push(lock);
+    }
+
+    // Rows first: a row failure leaves every transcript in place; a missing row is rebuilt on the next listing.
+    crate::transcript::remove_session_index_row(sessions_dir, session_id);
+    archive_index::remove(sessions_dir, session_id)?;
+
+    for id in &family {
+        remove_file_if_present(&family_live_transcript(sessions_dir, session_id, id));
+        remove_file_if_present(&family_transcript_archive(sessions_dir, session_id, id));
+        remove_file_if_present(&archive_index::artifacts_path(sessions_dir, id));
+        let live_artifacts = sessions_dir.join("artifacts").join(id);
+        if let Err(error) = fs::remove_dir_all(&live_artifacts)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %live_artifacts.display(), error = %error, "failed to remove session artifacts");
+        }
+    }
+
+    drop(locks);
+    Ok(family.len())
+}
+
+/// Family ids from the live transcripts when present, the archived copies otherwise.
+fn collect_family_ids(sessions_dir: &Path, parent_session_id: &str) -> Result<Vec<String>> {
+    let staging = staging_root(sessions_dir).join(format!(
+        "{parent_session_id}-{}-delete",
+        std::process::id()
+    ));
+    let result = collect_family_ids_with_staging(sessions_dir, parent_session_id, &staging);
+    if let Err(error) = fs::remove_dir_all(&staging)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %staging.display(), error = %error, "failed to remove delete staging");
+    }
+    result
+}
+
+fn collect_family_ids_with_staging(
+    sessions_dir: &Path,
+    parent_session_id: &str,
+    staging: &Path,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut queue = VecDeque::from([parent_session_id.to_string()]);
+    let mut staging_ready = false;
+
+    while let Some(id) = queue.pop_front() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let live = family_live_transcript(sessions_dir, parent_session_id, &id);
+        if live.is_file() {
+            ids.push(id.clone());
+            queue.extend(child_session_ids(&live)?);
+            continue;
+        }
+        let archived = family_transcript_archive(sessions_dir, parent_session_id, &id);
+        if !archived.is_file() {
+            continue;
+        }
+        if !staging_ready {
+            fs::create_dir_all(staging).with_context(|| {
+                format!("failed to create delete staging {}", staging.display())
+            })?;
+            staging_ready = true;
+        }
+        let staged = staging.join(format!("{id}.jsonl"));
+        decompress_transcript(&archived, &staged).with_context(|| {
+            format!("failed to read archived transcript {}", archived.display())
+        })?;
+        let records = read_records_allow_partial_tail(&staged)
+            .with_context(|| format!("archived transcript for session {id} is not readable"))?;
+        ids.push(id.clone());
+        queue.extend(child_session_ids_from_records(&records));
+    }
+
+    Ok(ids)
 }
 
 /// Drop archive copies whose session is live again: the live transcript is
@@ -808,8 +904,8 @@ fn remove_stale_archives(sessions_dir: &Path) -> Result<()> {
         if !live.is_file() {
             continue;
         }
-        remove_archive_file(&archive_index::transcript_path(sessions_dir, &session_id));
-        remove_archive_file(&archive_index::artifacts_path(sessions_dir, &session_id));
+        remove_file_if_present(&archive_index::transcript_path(sessions_dir, &session_id));
+        remove_file_if_present(&archive_index::artifacts_path(sessions_dir, &session_id));
         archive_index::remove(sessions_dir, &session_id)?;
     }
 
@@ -825,11 +921,11 @@ fn remove_stale_archives(sessions_dir: &Path) -> Result<()> {
         if !live.is_file() {
             continue;
         }
-        remove_archive_file(&archive_index::child_transcript_path(
+        remove_file_if_present(&archive_index::child_transcript_path(
             sessions_dir,
             &child_id,
         ));
-        remove_archive_file(&archive_index::artifacts_path(sessions_dir, &child_id));
+        remove_file_if_present(&archive_index::artifacts_path(sessions_dir, &child_id));
     }
     Ok(())
 }
@@ -1131,6 +1227,60 @@ mod tests {
             fs::rename(&staging, &archive).unwrap();
             fs::remove_file(&transcript).unwrap();
         }
+    }
+
+    #[test]
+    fn deleting_a_live_family_removes_transcripts_artifacts_and_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path();
+        let (parent_id, parent_path, _child_id, child_path) = write_family(sessions_dir);
+        let parent_artifacts = sessions_dir.join("artifacts").join(&parent_id);
+        fs::create_dir_all(&parent_artifacts).unwrap();
+        fs::write(parent_artifacts.join("blob.txt"), b"x").unwrap();
+
+        let removed = delete_session_family(sessions_dir, &parent_id).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!parent_path.exists());
+        assert!(!child_path.exists());
+        assert!(!parent_artifacts.exists());
+        assert!(list_sessions(sessions_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_an_archived_family_removes_archive_and_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path();
+        let (parent_id, parent_path, child_id, child_path) = write_family(sessions_dir);
+        age(&parent_path, 8);
+        age(&child_path, 8);
+        pass(sessions_dir);
+        assert!(archive_index::rows(sessions_dir).contains_key(&parent_id));
+
+        let removed = delete_session_family(sessions_dir, &parent_id).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!archive_index::transcript_path(sessions_dir, &parent_id).exists());
+        assert!(!archive_index::child_transcript_path(sessions_dir, &child_id).exists());
+        assert!(!archive_index::rows(sessions_dir).contains_key(&parent_id));
+        assert!(list_sessions(sessions_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_locked_member_keeps_the_whole_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path();
+        let (parent_id, parent_path, _child_id, child_path) = write_family(sessions_dir);
+        let _lock = TranscriptWriterLock::try_acquire(&parent_path).unwrap();
+
+        let error = delete_session_family(sessions_dir, &parent_id).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains(&parent_id),
+            "error: {error:#}"
+        );
+        assert!(parent_path.is_file());
+        assert!(child_path.is_file());
     }
 
     #[test]

@@ -504,6 +504,10 @@ pub fn remove_empty_session_file(path: impl AsRef<Path>) -> Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn remove_session_index_row(base_dir: &Path, session_id: &str) {
+    session_index::remove_session(base_dir, session_id);
+}
+
 pub fn resolve_session_id(
     sessions: &[SessionSummary],
     query: &str,

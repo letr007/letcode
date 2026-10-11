@@ -26,6 +26,7 @@ pub enum InputAction {
     DialogToggleSessionScope,
     DialogAccept,
     DialogToggle,
+    DialogDelete,
     DialogCancel,
     Help(HelpAction),
     ConfigEditInsert(char),
@@ -433,6 +434,11 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                 }
                 KeyCode::Esc => InputAction::DialogCancel,
                 KeyCode::Backspace => InputAction::DialogBackspace,
+                KeyCode::Char('d')
+                    if session_picker && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    InputAction::DialogDelete
+                }
                 KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => {
                     InputAction::DialogInsert(ch)
                 }
@@ -1675,6 +1681,29 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Right)),
             InputAction::DialogToggleSessionScope
+        );
+    }
+
+    #[test]
+    fn session_picker_ctrl_d_requests_delete() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::SessionPicker,
+            "Sessions",
+            None,
+            vec![crate::tui::state::DialogItem::new(
+                "session-1",
+                "Work",
+                None,
+            )],
+        ));
+
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            ),
+            InputAction::DialogDelete
         );
     }
 
