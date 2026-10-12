@@ -701,7 +701,8 @@ mod tests {
     fn episode_cuts_define_the_covered_prefix() {
         let sources: Vec<_> = (0..4).map(|i| format!("raw:{i}")).collect();
         for cut in [3usize, 4] {
-            let publication = parse_publication("p", &sources, &tagged_response(&[2, cut])).unwrap();
+            let publication =
+                parse_publication("p", &sources, &tagged_response(&[2, cut])).unwrap();
             assert_eq!(publication.source_ids, sources[..cut]);
             assert_eq!(publication.compartments[0].source_ids, sources[..2]);
             assert_eq!(publication.compartments[1].source_ids, sources[2..cut]);

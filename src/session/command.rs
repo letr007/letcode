@@ -73,18 +73,17 @@ impl SessionCommand {
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)
             | Self::SetFakeClient(_) => (true, ActiveTurnCommandDisposition::Defer),
-            Self::SetModel(_)
-            | Self::SetExpertAllowedModels { .. }
-            | Self::ToggleMcpServer(_) => (false, ActiveTurnCommandDisposition::Defer),
+            Self::SetModel(_) | Self::SetExpertAllowedModels { .. } | Self::ToggleMcpServer(_) => {
+                (false, ActiveTurnCommandDisposition::Defer)
+            }
             Self::Interrupt => (false, ActiveTurnCommandDisposition::Interrupt),
             Self::DelegateSubagent { .. }
             | Self::Compact
             | Self::ResumeSession(_)
             | Self::NewSession => (false, ActiveTurnCommandDisposition::Reject),
-            Self::ShowHistoryTree
-            | Self::Undo
-            | Self::Redo
-            | Self::NavigateHistory { .. } => (true, ActiveTurnCommandDisposition::Reject),
+            Self::ShowHistoryTree | Self::Undo | Self::Redo | Self::NavigateHistory { .. } => {
+                (true, ActiveTurnCommandDisposition::Reject)
+            }
         };
         CommandSchedule { idle, active_turn }
     }

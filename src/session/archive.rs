@@ -828,10 +828,8 @@ pub(crate) fn delete_session_family(sessions_dir: &Path, session_id: &str) -> Re
 
 /// Family ids from the live transcripts when present, the archived copies otherwise.
 fn collect_family_ids(sessions_dir: &Path, parent_session_id: &str) -> Result<Vec<String>> {
-    let staging = staging_root(sessions_dir).join(format!(
-        "{parent_session_id}-{}-delete",
-        std::process::id()
-    ));
+    let staging = staging_root(sessions_dir)
+        .join(format!("{parent_session_id}-{}-delete", std::process::id()));
     let result = collect_family_ids_with_staging(sessions_dir, parent_session_id, &staging);
     if let Err(error) = fs::remove_dir_all(&staging)
         && error.kind() != std::io::ErrorKind::NotFound

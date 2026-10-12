@@ -60,7 +60,10 @@ impl BranchPoller {
                     self.next_refresh = Instant::now() + GIT_BRANCH_REFRESH_INTERVAL;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
                         self.branch_rx = None;
                         self.deadline = None;
                         self.next_refresh = Instant::now() + GIT_BRANCH_STALL_RETRY;
