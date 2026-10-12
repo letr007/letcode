@@ -149,11 +149,7 @@ impl AutoReviewService for JevReviewer {
             let _review_guard = self.review_gate.lock().await;
 
             if self.config.credential.trim().is_empty() {
-                let rationale = missing_credential_rationale(&self.config);
-                return Ok(AutoReviewResolution {
-                    outcome: AutoReviewOutcome::Deny,
-                    reason: rationale,
-                });
+                bail!("{}", missing_credential_rationale(&self.config));
             }
 
             let state = self.build_state(parent, &request);
@@ -240,23 +236,14 @@ impl AutoReviewService for JevReviewer {
                                     .map_err(|_| anyhow!("transcript recorder poisoned"))?;
                                 recorder.record_user_message(prompt.clone())?;
                             }
-                            let (outcome, rationale) = match ask_jev(&client, &config, state).await
-                            {
-                                Ok(answer) => match outcome_for(&answer.choice) {
-                                    Some(outcome) => (outcome, describe(&answer)),
-                                    None => (
-                                        AutoReviewOutcome::Deny,
-                                        format!(
-                                            "jev answered an unknown decision: {}",
-                                            truncate(answer.choice.trim(), TEXT_LIMIT)
-                                        ),
-                                    ),
-                                },
-                                Err(error) => (
-                                    AutoReviewOutcome::Deny,
-                                    format!("jev review failed: {error:#}"),
-                                ),
+                            let answer = ask_jev(&client, &config, state).await?;
+                            let Some(outcome) = outcome_for(&answer.choice) else {
+                                bail!(
+                                    "jev answered an unknown decision: {}",
+                                    truncate(answer.choice.trim(), TEXT_LIMIT)
+                                );
                             };
+                            let rationale = describe(&answer);
                             let reply = review_reply(outcome, &rationale);
                             {
                                 let mut recorder = transcript
@@ -275,43 +262,26 @@ impl AutoReviewService for JevReviewer {
                 )
                 .await;
 
-            let (outcome, rationale, child_session_id) = match summary {
-                Ok(summary) => {
-                    let child_session_id = summary.child_session_id.clone();
-                    self.set_sticky_child_id(&child_session_id);
-                    match captured
-                        .lock()
-                        .ok()
-                        .and_then(|mut captured| captured.take())
-                    {
-                        Some((outcome, rationale)) => (outcome, rationale, child_session_id),
-                        // The run ended without reaching a verdict (timeout or
-                        // cancellation), so the pool's account of it is the reason.
-                        None => (
-                            AutoReviewOutcome::Deny,
-                            format!("jev review failed: {}", summary.summary),
-                            child_session_id,
-                        ),
-                    }
-                }
-                Err(error) => (
-                    AutoReviewOutcome::Deny,
-                    format!("jev review failed: {error:#}"),
-                    self.sticky_child_id().unwrap_or_default(),
-                ),
-            };
+            let summary = summary.map_err(|error| anyhow!("jev review failed: {error:#}"))?;
+            let child_session_id = summary.child_session_id.clone();
+            self.set_sticky_child_id(&child_session_id);
+            let (outcome, rationale) = captured
+                .lock()
+                .map_err(|_| anyhow!("jev review capture poisoned"))?
+                .take()
+                // The run ended without reaching a verdict (timeout or
+                // cancellation), so the pool's account of it is the reason.
+                .ok_or_else(|| anyhow!("jev review failed: {}", summary.summary))?;
 
             let risk = risk_for(outcome);
             if outcome != AutoReviewOutcome::Ask {
-                let reviewer_child_session_id =
-                    (!child_session_id.is_empty()).then_some(child_session_id.as_str());
                 record_auto_decision(
                     &self.parent_transcript,
                     &request,
                     outcome,
                     &rationale,
                     Some(risk),
-                    reviewer_child_session_id,
+                    Some(child_session_id.as_str()),
                 )?;
                 emit_auto_resolution(
                     self.event_tx.as_ref(),
@@ -319,7 +289,7 @@ impl AutoReviewService for JevReviewer {
                     outcome,
                     &rationale,
                     Some(risk),
-                    reviewer_child_session_id,
+                    Some(child_session_id.as_str()),
                 );
             }
             Ok(AutoReviewResolution {

@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -18,9 +18,7 @@ use crate::session::event::PermissionResolutionEvent;
 use crate::session::runner::{
     SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
 };
-#[cfg(test)]
-use crate::subagent::SubagentStatus;
-use crate::subagent::{SubagentPool, SubagentRunGovernance, SubagentRunSummary};
+use crate::subagent::{SubagentPool, SubagentRunGovernance, SubagentRunSummary, SubagentStatus};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{TranscriptEvent, TranscriptRecorder, read_records_allow_partial_tail};
 use futures_util::FutureExt;
@@ -134,6 +132,7 @@ impl StickyAutoReviewer {
         )
     }
 
+    #[cfg(test)]
     fn sticky_child_id(&self) -> String {
         self.inner
             .lock()
@@ -195,15 +194,7 @@ impl AutoReviewService for StickyAutoReviewer {
                 .clone();
             let route = self.resolve_route(parent, &template, takeover.as_deref())?;
             if !self.route_has_api_key(parent, &route)? {
-                let rationale = self.missing_api_key_rationale(&route);
-                let denied = ParsedReview {
-                    outcome: AutoReviewOutcome::Deny,
-                    risk: Some("high".into()),
-                    rationale,
-                };
-                self.record_decision(&request, &denied, "")?;
-                self.emit_resolution(&request, &denied, "");
-                return Ok(denied.into_resolution());
+                bail!("{}", self.missing_api_key_rationale(&route));
             }
 
             let goal = user_goal.or_else(|| self.latest_user_goal());
@@ -292,17 +283,7 @@ impl AutoReviewService for StickyAutoReviewer {
                 .await
             {
                 Ok(summary) => summary,
-                Err(error) => {
-                    let parsed = ParsedReview {
-                        outcome: AutoReviewOutcome::Deny,
-                        rationale: format!("auto-review failed: {error:#}"),
-                        risk: Some("high".into()),
-                    };
-                    let child_id = self.sticky_child_id();
-                    self.record_decision(&request, &parsed, &child_id)?;
-                    self.emit_resolution(&request, &parsed, &child_id);
-                    return Ok(parsed.into_resolution());
-                }
+                Err(error) => return Err(anyhow!("auto-review failed: {error:#}")),
             };
 
             let child_session_id = summary.child_session_id.clone();
@@ -317,8 +298,14 @@ impl AutoReviewService for StickyAutoReviewer {
             let full_output = full_output
                 .lock()
                 .map_err(|_| anyhow!("auto-review output capture poisoned"))?;
+            if summary.status != SubagentStatus::Completed {
+                bail!(
+                    "auto-review did not complete: {}",
+                    one_line(&summary.summary, 160)
+                );
+            }
             let parsed =
-                parse_reviewer_output(&summary, full_output.as_deref(), request.can_allow_always);
+                parse_reviewer_output(&summary, full_output.as_deref(), request.can_allow_always)?;
             if parsed.outcome == AutoReviewOutcome::Ask {
                 // Not a decision: the call goes to the user through the same prompt
                 // `default` mode uses, and that path records the answer. The reviewer's
@@ -505,7 +492,7 @@ fn parse_reviewer_output(
     summary: &SubagentRunSummary,
     full_output: Option<&str>,
     can_allow_always: bool,
-) -> ParsedReview {
+) -> Result<ParsedReview> {
     let raw_candidates = [
         full_output,
         summary.structured_result.raw_excerpt.as_deref(),
@@ -518,17 +505,13 @@ fn parse_reviewer_output(
     ];
     for candidate in raw_candidates.into_iter().flatten() {
         if let Some(parsed) = try_parse_reviewer_json(candidate, can_allow_always) {
-            return parsed;
+            return Ok(parsed);
         }
     }
-    ParsedReview {
-        outcome: AutoReviewOutcome::Deny,
-        rationale: format!(
-            "auto-review returned unparseable output: {}",
-            one_line(&summary.summary, 160)
-        ),
-        risk: Some("high".into()),
-    }
+    Err(anyhow!(
+        "auto-review returned unparseable output: {}",
+        one_line(&summary.summary, 160)
+    ))
 }
 
 fn try_parse_reviewer_json(raw: &str, can_allow_always: bool) -> Option<ParsedReview> {
@@ -694,12 +677,13 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_output_denies() {
-        let denied = parse_reviewer_output(&completed_summary("I allow this"), None, true);
-        assert_eq!(denied.outcome, AutoReviewOutcome::Deny);
+    fn unparseable_output_fails_the_review() {
+        let error = parse_reviewer_output(&completed_summary("I allow this"), None, true)
+            .err()
+            .expect("unparseable output must fail the review");
         assert!(
-            denied
-                .rationale
+            error
+                .to_string()
                 .starts_with("auto-review returned unparseable output")
         );
     }
@@ -710,7 +694,8 @@ mod tests {
             &completed_summary(r#"{"decision":"allow_always","risk":"low","rationale":"safe"}"#),
             None,
             false,
-        );
+        )
+        .expect("parsed");
         assert_eq!(parsed.outcome, AutoReviewOutcome::AllowOnce);
     }
 
@@ -731,7 +716,8 @@ mod tests {
             ),
         ];
         for (raw, expected) in cases {
-            let parsed = parse_reviewer_output(&completed_summary(raw), None, false);
+            let parsed =
+                parse_reviewer_output(&completed_summary(raw), None, false).expect("parsed");
             assert_eq!(parsed.outcome, expected, "{raw}");
         }
     }
@@ -747,14 +733,15 @@ mod tests {
             &completed_summary("truncated reviewer output"),
             Some(&full_output),
             true,
-        );
+        )
+        .expect("parsed");
 
         assert_eq!(parsed.outcome, AutoReviewOutcome::AllowOnce);
         assert_eq!(parsed.rationale, rationale);
     }
 
     #[tokio::test]
-    async fn missing_reviewer_route_credential_denies_before_starting_a_child() {
+    async fn missing_reviewer_route_credential_fails_before_starting_a_child() {
         let dir = std::env::temp_dir().join(format!(
             "letcode-auto-review-credential-{}",
             std::time::SystemTime::now()
@@ -801,18 +788,17 @@ mod tests {
             "Set the provider API key".into(),
         );
 
-        let resolution = reviewer
+        let error = reviewer
             .review(&parent, permission_request(), None)
             .await
-            .expect("credential failure should become a denial");
+            .expect_err("a missing reviewer credential must fail the review");
 
-        assert_eq!(resolution.outcome, AutoReviewOutcome::Deny);
         assert!(
-            resolution
-                .reason
+            error
+                .to_string()
                 .contains("reviewer-provider/reviewer-model")
         );
-        assert!(resolution.reason.contains("Set REVIEWER_API_KEY"));
+        assert!(error.to_string().contains("Set REVIEWER_API_KEY"));
         assert!(reviewer.sticky_child_id().is_empty());
         assert!(
             !crate::transcript::child_sessions_dir(&dir).exists(),

@@ -2662,6 +2662,10 @@ impl Agent {
         .expect("test-seeded protocol state is valid");
     }
 
+    pub(crate) fn has_incomplete_tool_call_groups(&self) -> bool {
+        self.protocol_append_state.has_incomplete_tool_call_groups()
+    }
+
     pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
         // RuntimeSnapshot is the single source of truth. Append via a derived
         // ProtocolFrame and rebuild the snapshot, preserving frame identity.

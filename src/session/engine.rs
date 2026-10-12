@@ -705,6 +705,16 @@ pub(crate) fn record_interrupt_transcript(
     recorder.append_transaction(events)
 }
 
+pub(crate) fn close_failed_turn(
+    agent: &mut Agent,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    subagent_runtime: &SubagentPool,
+) -> Result<()> {
+    derive_interrupt_request(transcript, subagent_runtime)
+        .and_then(|interrupt| record_interrupt_transcript(transcript, &interrupt))
+        .and_then(|()| rehydrate_agent_from_transcript(agent, transcript))
+}
+
 pub(crate) fn rehydrate_agent_from_transcript(
     agent: &mut Agent,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
@@ -2521,7 +2531,7 @@ async fn run_engine_loop(
                         Some(session_transport_tx.clone()),
                     );
                 let historian_control = agent.historian_runtime.clone();
-                let (interrupted, shutdown, interrupt_failure) = {
+                let (interrupted, shutdown, interrupt_failure, turn_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
                     > =
@@ -2541,6 +2551,7 @@ async fn run_engine_loop(
                     let mut interrupted = None;
                     let mut shutdown = false;
                     let mut interrupt_failure = None;
+                    let mut turn_failure = None;
 
                     loop {
                         match select_active_session_operation_with_events(
@@ -2597,7 +2608,8 @@ async fn run_engine_loop(
                             ActiveSessionOperation::RunnerEvent(event) => {
                                 let _ = session_transport_tx.send(event);
                             }
-                            ActiveSessionOperation::Completed(_) => {
+                            ActiveSessionOperation::Completed(result) => {
+                                turn_failure = result.err().map(|error| error.to_string());
                                 forward_queued_runner_events(
                                     &mut runner_event_rx,
                                     &session_transport_tx,
@@ -2721,7 +2733,12 @@ async fn run_engine_loop(
                         }
                     }
 
-                    (interrupted, shutdown, interrupt_failure)
+                    (
+                        interrupted,
+                        shutdown,
+                        interrupt_failure,
+                        turn_failure,
+                    )
                 };
 
                 if let Some(error) = interrupt_failure {
@@ -2840,6 +2857,40 @@ async fn run_engine_loop(
                     deferred_commands.clear();
                     parked_commands.clear();
                     break;
+                }
+                if let Some(failure) = turn_failure
+                    && agent.has_incomplete_tool_call_groups()
+                {
+                    tracing::warn!(
+                        error = %failure,
+                        "failed turn left unfinished tool calls; closing the turn"
+                    );
+                    match close_failed_turn(&mut agent, &transcript, &subagent_runtime) {
+                        Ok(()) => {
+                            if let Err(error) =
+                                send_rehydrated_runtime_context(&session_transport_tx, &agent)
+                            {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new(format!(
+                                        "failed to emit context after the failed turn: {error}"
+                                    )),
+                                ));
+                                deferred_commands.clear();
+                                parked_commands.clear();
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!(
+                                    "failed to close the failed turn: {error}"
+                                )),
+                            ));
+                            deferred_commands.clear();
+                            parked_commands.clear();
+                            break;
+                        }
+                    }
                 }
                 // A terminal turn is now durable. Record its journal frontier;
                 // the periodic worker batches pending turns without adding a model

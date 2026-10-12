@@ -3238,6 +3238,50 @@ fn session_state_consistency_journal_resume_three_way() {
 }
 
 #[test]
+fn closing_a_failed_turn_lets_the_session_continue() {
+    let dir = agents_test_dir();
+    let recorder = TranscriptRecorder::create(&dir).expect("transcript");
+    let transcript = Arc::new(Mutex::new(recorder));
+    let call = HistoryToolCall {
+        call_id: "call-failed".into(),
+        name: "fs__read".into(),
+        arguments_json: r#"{"path":"/tmp/probe.txt"}"#.into(),
+    };
+    {
+        let mut recorder = transcript.lock().expect("lock transcript");
+        recorder.record_user_message("run it").expect("user message");
+        recorder
+            .record_assistant_tool_call_batch(None, None, None, vec![call.clone()])
+            .expect("assistant tool call batch");
+        recorder
+            .record_tool_call_cancelled("call-failed", "fs__read")
+            .expect("tool call cancelled");
+    }
+
+    let mut agent = test_agent();
+    agent
+        .append_assistant_tool_calls("", std::slice::from_ref(&call))
+        .expect("assistant turn");
+    assert!(agent.has_incomplete_tool_call_groups());
+
+    crate::session::engine::close_failed_turn(
+        &mut agent,
+        &transcript,
+        &crate::subagent::SubagentPool::new(),
+    )
+    .expect("close failed turn");
+
+    assert!(!agent.has_incomplete_tool_call_groups());
+    assert!(
+        agent
+            .append_history_item(HistoryItem::user("next prompt"))
+            .is_ok(),
+        "the next prompt must be accepted"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn append_history_item_is_atomic_when_protocol_validation_fails() {
     let mut agent = test_agent();
     agent

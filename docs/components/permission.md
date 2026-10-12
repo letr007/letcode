@@ -55,6 +55,7 @@ flowchart TD
     Decision -->|execute| Allow[放行执行]
     Decision -->|ask_user| Prompt[退回说明 / 升级人工审批]
     Decision -->|refuse| Reject[直接拒绝]
+    Reviewer -.->|不可用| Failed[结束当前 turn]
 ```
 
 系统支持两种审查后端。
@@ -62,7 +63,7 @@ flowchart TD
 - **Typesafe Jev**。在配置中声明 `reviewer = "jev"` 的专用模型路由。审查时向接口发送 choice 评估请求，由后端返回安全概率值，依据放行阈值判定。
 - **内置 `reviewer` 专家**。使用独立的专家模型路由，输出 `execute`、`ask_user` 或 `refuse` 的结构化裁决。判定为 `ask_user` 时，系统先退回请求方补充理由；仍不明确时转人工审批。
 
-审查服务异常或响应损坏时，系统直接拒绝。单次运行的 CLI 模式（如 `--print`）遇审批调用直接失败。
+审查服务异常或响应损坏时，系统不再代行裁决，当前 turn 以错误结束；已经发出的工具调用会被收口，会话可以继续。单次运行的 CLI 模式（如 `--print`）遇审批调用直接失败。
 
 ## 子代理权限继承与路径隔离
 
