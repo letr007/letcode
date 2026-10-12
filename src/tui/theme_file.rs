@@ -132,10 +132,6 @@ pub fn normalize_theme_id(value: &str) -> Option<String> {
         return Some(builtin.as_str().to_string());
     }
     let id = trimmed.to_ascii_lowercase();
-    let id = match id.as_str() {
-        "tokyo-night" | "tokyo_night" => "tokyonight-night".to_string(),
-        _ => id,
-    };
     if !id
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
@@ -348,6 +344,26 @@ mod tests {
         assert_eq!(theme.element_bg, Color::Reset);
         assert_eq!(theme.accent, Color::Rgb(0x01, 0x02, 0x03));
         assert!(!theme.paints_panels());
+    }
+
+    #[test]
+    fn discovered_ids_load_the_discovered_file() {
+        let prefs = temp_prefs_dir("discover-roundtrip");
+        fs::write(
+            theme_file_path(&prefs, "tokyo-night"),
+            r##"label = "Mine"
+accent = "#010203""##,
+        )
+        .expect("write theme");
+
+        let ids = discover_custom_themes(&prefs)
+            .into_iter()
+            .map(|theme| theme.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["tokyo-night"]);
+
+        let theme = load_custom_theme(&prefs, "tokyo-night").expect("load discovered theme");
+        assert_eq!(theme.accent, Color::Rgb(0x01, 0x02, 0x03));
     }
 
     #[test]

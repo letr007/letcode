@@ -303,7 +303,7 @@ letcode 把指令 markdown 载入 agent prompt：
 
 自定义 TUI 主题路径为 `~/.config/letcode/themes/<id>.toml`。
 
-- 文件名 stem 即主题 `id`，由小写 ASCII 字母、数字、`-` 和 `_` 组成。`tokyo-night` 与 `tokyo_night` 会规范化为 `tokyonight-night`。
+- 文件名 stem 即主题 `id`，由小写 ASCII 字母、数字、`-` 和 `_` 组成。
 - 保留 id（文件会被忽略，不能覆盖）：`dark`（别名 `default`）、`plain`、`glass`（别名 `transparent`）、`wireframe`、`rainbow` 和 `light`。
 - 若不存在会写入捆绑主题：`tokyonight-night`、`matrix`、`github-dark`、`anthropic`、`github-light`、`gruvbox-light`、`catppuccin-latte`、`catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`、`tokyonight-storm`、`tokyonight-moon` 和 `tokyonight-day`（可修改，不会覆盖已有文件）。
 - TUI 用 `/theme` 选择，热重载会重新发现主题目录。

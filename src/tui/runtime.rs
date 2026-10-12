@@ -6359,10 +6359,8 @@ fn apply_preferences_theme(state: &mut TuiState, preferences_dir: &Path, theme_i
         Err(error) => {
             tracing::warn!(%error, theme = %id, "failed to load preferred custom theme");
             state.set_theme_name(ThemeName::Dark);
-            state.show_toast(
-                format!("Theme '{id}' unavailable; using dark"),
-                ToastKind::Info,
-            );
+            let message = state.t_fmt("runtime.theme_unavailable", &[("theme", &id)]);
+            state.show_toast(message, ToastKind::Info);
         }
     }
 }
