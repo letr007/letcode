@@ -85,7 +85,7 @@ fn validate_activations(
 }
 
 fn layout(sequence: &ir::MermaidSequence, width: usize) -> Option<canvas::MermaidCanvas> {
-    if sequence.participants.len() > 16 || has_self_message(&sequence.items) {
+    if sequence.participants.len() > 16 {
         return None;
     }
     let mut participants = sequence.participants.iter().collect::<Vec<_>>();
@@ -114,6 +114,9 @@ fn layout(sequence: &ir::MermaidSequence, width: usize) -> Option<canvas::Mermai
     let mut diagram_width =
         centers.last().copied()? + label_widths.last().copied()?.div_ceil(2) + 1;
     diagram_width = diagram_width.max(block_width + 3);
+    if has_self_message(&sequence.items) {
+        diagram_width = diagram_width.max(centers.last().copied()? + 3 + message_width);
+    }
     if diagram_width > width {
         return None;
     }
@@ -178,6 +181,33 @@ fn draw_sequence_items(
                 if autonumber {
                     canvas.blit(*row, 0, &format!("{} ", *message_number));
                     *message_number += 1;
+                }
+                if from == to {
+                    let loop_col = from.checked_add(2)?;
+                    let label_width = display_width(&message.label.text);
+                    if loop_col + 1 + label_width > width {
+                        return None;
+                    }
+                    let line = if message.dashed { '╌' } else { '─' };
+                    canvas.put(from + 1, *row, line);
+                    canvas.put(loop_col, *row, '┐');
+                    *row += 1;
+                    draw_lifelines_active(canvas, *row, width, centers, columns, active);
+                    canvas.put(loop_col, *row, '┘');
+                    canvas.put(from + 1, *row, '◀');
+                    canvas.labels.push(canvas::MermaidCanvasLabel {
+                        row: *row,
+                        col: loop_col + 1,
+                        text: message.label.text.clone(),
+                        source: MermaidSourceSpan::new(message.label.start, message.label.end),
+                    });
+                    if message.deactivate {
+                        deactivate_participant(active, &message.from)?;
+                    }
+                    *row += 1;
+                    draw_lifelines_active(canvas, *row, width, centers, columns, active);
+                    *row += 1;
+                    continue;
                 }
                 let (left, right) = if from < to { (from, to) } else { (to, from) };
                 let line = if message.dashed { '╌' } else { '─' };

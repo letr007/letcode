@@ -323,24 +323,6 @@ fn horizontal_target_entry(
     }
 }
 
-fn horizontal_layer_bounds(
-    id: &str,
-    layer_of: &HashMap<&str, usize>,
-    placements: &PlacementMap<'_>,
-) -> Option<(usize, usize)> {
-    let layer = *layer_of.get(id)?;
-    placements
-        .iter()
-        .filter(|(node_id, _)| layer_of.get(**node_id).copied() == Some(layer))
-        .map(|(_, placement)| (placement.col, placement.col + placement.width))
-        .fold(None, |bounds, (left, right)| {
-            Some(match bounds {
-                Some((min_left, max_right)) => (min_left.min(left), max_right.max(right)),
-                None => (left, right),
-            })
-        })
-}
-
 fn horizontal_channel_bounds(a: usize, b: usize) -> Option<(usize, usize)> {
     let lo = a.min(b).checked_add(1)?;
     let hi = a.max(b).checked_sub(1)?;
@@ -712,10 +694,55 @@ fn route_horizontal_edges(
         .max()?;
     for (feedback_offset, edge_index) in feedback_indices.into_iter().enumerate() {
         let edge = &graph.edges[edge_index];
-        if edge.from == edge.to {
-            return None;
-        }
         let from = placements.get(edge.from.as_str())?;
+        if edge.from == edge.to {
+            if from.height < 3 {
+                return None;
+            }
+            let right = from.col + from.width;
+            let channel = right.checked_add(1)?;
+            let top = from.row + from.height - 1;
+            let bottom = from.row + from.height;
+            let source = (right, top);
+            let target = (right, bottom);
+            let owner = HorizontalRouteOwner::Edge(edge_index);
+            let path = [
+                (source, (channel, top)),
+                ((channel, top), (channel, bottom)),
+                ((channel, bottom), target),
+            ];
+            let path_segments = path
+                .iter()
+                .map(|(from, to)| HorizontalRouteSegment {
+                    from: *from,
+                    to: *to,
+                    owner,
+                })
+                .collect::<Vec<_>>();
+            let mut combined = segments.clone();
+            combined.extend(path_segments.iter().copied());
+            if !horizontal_routes_avoid_nodes(&combined, placements) {
+                return None;
+            }
+            for (from, to) in path {
+                push_horizontal_segment(&mut segments, from, to, owner);
+            }
+            if edge.arrow {
+                arrows.push((target, '◀'));
+            }
+            if edge.reverse_arrow {
+                arrows.push((source, '◀'));
+            }
+            if let Some(label) = &edge.label {
+                feedback_labels.push((
+                    bottom,
+                    channel + 1,
+                    label.text.as_str(),
+                    MermaidSourceSpan::new(label.start, label.end),
+                ));
+            }
+            continue;
+        }
         let to = placements.get(edge.to.as_str())?;
         let source_feedback_count = feedback
             .iter()
@@ -733,21 +760,12 @@ fn route_horizontal_edges(
             HorizontalRouteOwner::Edge(edge_index)
         };
         let bottom_row = feedback_base_row + 2 + feedback_offset * 2;
-        let source_row = from.row + from.height / 2;
-        let target_row = to.row + to.height / 2;
-        let source_port = (from.col + from.width, source_row);
-        let target_port = (to.col + to.width, target_row);
-        let source_layer_right = horizontal_layer_bounds(&edge.from, layer_of, placements)?.1;
-        let target_layer_right = horizontal_layer_bounds(&edge.to, layer_of, placements)?.1;
-        let channel_offset = 1 + feedback_offset * 2;
-        let source_channel = source_layer_right.checked_add(channel_offset)?;
-        let target_channel = target_layer_right.checked_add(channel_offset)?;
+        let source_port = (from.col + from.width / 2, from.row + from.height);
+        let target_port = (to.col + to.width / 2, to.row + to.height);
         let path = [
-            (source_port, (source_channel, source_row)),
-            ((source_channel, source_row), (source_channel, bottom_row)),
-            ((source_channel, bottom_row), (target_channel, bottom_row)),
-            ((target_channel, bottom_row), (target_channel, target_row)),
-            ((target_channel, target_row), target_port),
+            (source_port, (source_port.0, bottom_row)),
+            ((source_port.0, bottom_row), (target_port.0, bottom_row)),
+            ((target_port.0, bottom_row), target_port),
         ];
         let path_segments = path
             .iter()
@@ -766,19 +784,16 @@ fn route_horizontal_edges(
             push_horizontal_segment(&mut segments, from, to, owner);
         }
         if edge.arrow {
-            arrows.push((target_port, '◀'));
+            arrows.push((target_port, '▲'));
         }
         if edge.reverse_arrow {
-            arrows.push((source_port, '◀'));
+            arrows.push((source_port, '▼'));
         }
-        let label_row = bottom_row;
-        let label_start = source_channel;
-        let label_end = target_channel;
         if let Some(label) = &edge.label {
             let label_width = mermaid_label_width(&label.text);
-            let col = centered_mermaid_label_col(label_start, label_end, label_width)?;
+            let col = centered_mermaid_label_col(source_port.0, target_port.0, label_width)?;
             feedback_labels.push((
-                label_row,
+                bottom_row,
                 col,
                 label.text.as_str(),
                 MermaidSourceSpan::new(label.start, label.end),
@@ -1135,13 +1150,60 @@ fn route_mermaid_edges(
     let mut feedback_indices = feedback.iter().copied().collect::<Vec<_>>();
     feedback_indices.sort_unstable();
     for (feedback_offset, edge_index) in feedback_indices.into_iter().enumerate() {
-        let outer_col = outer_col_base.checked_add(feedback_offset * 4)?;
         let edge = &graph.edges[edge_index];
-        if edge.from == edge.to {
-            return None;
-        }
         let from = placements.get(edge.from.as_str())?;
+        if edge.from == edge.to {
+            if from.height < 3 {
+                return None;
+            }
+            let right = from.col + from.width;
+            let channel = right.checked_add(1)?;
+            let top = from.row + from.height - 1;
+            let bottom = from.row + from.height;
+            let source = (right, top);
+            let target = (right, bottom);
+            let owner = HorizontalRouteOwner::Edge(edge_index);
+            let path = [
+                (source, (channel, top)),
+                ((channel, top), (channel, bottom)),
+                ((channel, bottom), target),
+            ];
+            let feedback_segments = path
+                .iter()
+                .map(|(from, to)| HorizontalRouteSegment {
+                    from: *from,
+                    to: *to,
+                    owner,
+                })
+                .collect::<Vec<_>>();
+            if !horizontal_routes_avoid_nodes(&feedback_segments, placements)
+                || !vertical_routes_do_not_cross(&feedback_segments, Some(graph))
+            {
+                return None;
+            }
+            for (from, to) in path {
+                connect_mermaid_route(&mut routes, from, to);
+                push_horizontal_segment(&mut route_segments, from, to, owner);
+            }
+            if edge.arrow {
+                arrows.push((target, '◀'));
+            }
+            if edge.reverse_arrow {
+                arrows.push((source, '◀'));
+            }
+            if let Some(label) = &edge.label {
+                place_multiline_label(
+                    canvas,
+                    bottom,
+                    channel + 1,
+                    &label.text,
+                    MermaidSourceSpan::new(label.start, label.end),
+                );
+            }
+            continue;
+        }
         let to = placements.get(edge.to.as_str())?;
+        let outer_col = outer_col_base.checked_add(feedback_offset * 4)?;
         let source = (from.col + from.width, from.row + from.height / 2);
         let target = (to.col + to.width, to.row + to.height / 2);
         let owner = HorizontalRouteOwner::Edge(edge_index);

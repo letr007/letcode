@@ -1,7 +1,7 @@
 //! Mermaid facade: classify diagrams and expose neutral rendered spans.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{Mutex, OnceLock},
 };
 
@@ -42,6 +42,36 @@ fn source_within_limits(source: &str) -> bool {
 
 fn render_line_count_within_limits(line_count: usize) -> bool {
     line_count <= MAX_RENDER_LINES
+}
+
+fn collect_feedback_edges(outgoing: &[Vec<(usize, usize)>]) -> HashSet<usize> {
+    fn visit(
+        node: usize,
+        outgoing: &[Vec<(usize, usize)>],
+        colors: &mut [u8],
+        feedback: &mut HashSet<usize>,
+    ) {
+        colors[node] = 1;
+        for &(to, edge_index) in &outgoing[node] {
+            match colors[to] {
+                0 => visit(to, outgoing, colors, feedback),
+                1 => {
+                    feedback.insert(edge_index);
+                }
+                _ => {}
+            }
+        }
+        colors[node] = 2;
+    }
+
+    let mut colors = vec![0; outgoing.len()];
+    let mut feedback = HashSet::new();
+    for node in 0..outgoing.len() {
+        if colors[node] == 0 {
+            visit(node, outgoing, &mut colors, &mut feedback);
+        }
+    }
+    feedback
 }
 
 fn render_math_label(label: &str) -> Option<(String, bool)> {

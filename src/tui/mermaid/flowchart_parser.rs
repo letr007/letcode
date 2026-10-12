@@ -439,5 +439,5 @@ fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
 }

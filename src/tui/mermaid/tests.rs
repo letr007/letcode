@@ -1246,9 +1246,11 @@ A[$$\not_a_supported_command$$] --> B[Done]
         let linear_source = concat!(
             "sequenceDiagram\n",
             "participant A as A\n",
-            "A->>A: plain\n",
+            "participant B as B\n",
+            "A->>B: plain\n",
         );
-        let linear = super::super::render(linear_source, 80).unwrap();
+        // 14 columns fit the linear fallback but not the lifeline layout.
+        let linear = super::super::render(linear_source, 14).unwrap();
         let plain = linear
             .lines
             .iter()
@@ -1485,6 +1487,54 @@ A[$$\not_a_supported_command$$] --> B[Done]
     }
 
     #[test]
+    fn er_cycle_routes_the_feedback_edge_back_above_the_middle_entity() {
+        let source = concat!(
+            "erDiagram\n",
+            "A {\n  int id\n}\n",
+            "B {\n  int id\n}\n",
+            "C {\n  int id\n}\n",
+            "A ||--o{ B : r1\n",
+            "B ||--o{ C : r2\n",
+            "C ||--o{ A : r3\n",
+        );
+        let rendered = super::super::render(source, 80).expect("cyclic ER diagram");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        let entity_row = |name: &str| {
+            text.lines()
+                .position(|line| line.contains(name) && line.contains('│'))
+                .unwrap()
+        };
+        let label_row = |label: &str| text.lines().position(|line| line.contains(label)).unwrap();
+        let a = entity_row("A");
+        let b = entity_row("B");
+        let c = entity_row("C");
+        assert!(
+            a < b && b < c,
+            "entities are not layered by dependency:\n{text}"
+        );
+        let r1 = label_row("r1");
+        let r2 = label_row("r2");
+        let r3 = label_row("r3");
+        assert!(
+            a < r1 && r1 < b,
+            "r1 left its corridor between A and B:\n{text}"
+        );
+        assert!(
+            b < r2 && r2 < c,
+            "r2 left its corridor between B and C:\n{text}"
+        );
+        assert!(
+            a < r3 && r3 < c,
+            "r3 did not route back past B to reach A:\n{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("C||--")),
+            "cycle fell back to linear Mermaid source:\n{text}"
+        );
+    }
+
+    #[test]
     fn er_empty_entity_self_relation_uses_readable_linear_fallback() {
         let source = concat!("erDiagram\n", "NODE {\n}\n", "NODE ||--o{ NODE : parent\n",);
         let text = facade_text(source, 40);
@@ -1665,6 +1715,54 @@ A[$$\not_a_supported_command$$] --> B[Done]
         let text = facade_text(source, 80);
         assert!(text.contains("User") && text.contains("Order"), "{text}");
         assert!(text.contains("createOrder"), "{text}");
+    }
+
+    #[test]
+    fn class_cycle_routes_the_feedback_edge_back_above_the_middle_class() {
+        let source = concat!(
+            "classDiagram\n",
+            "class A {\n  +run()\n}\n",
+            "class B {\n  +go()\n}\n",
+            "class C {\n  +stop()\n}\n",
+            "A --> B : r1\n",
+            "B --> C : r2\n",
+            "C --> A : r3\n",
+        );
+        let rendered = super::super::render(source, 80).expect("cyclic class diagram");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        let class_row = |name: &str| {
+            text.lines()
+                .position(|line| line.contains(name) && line.contains('│'))
+                .unwrap()
+        };
+        let label_row = |label: &str| text.lines().position(|line| line.contains(label)).unwrap();
+        let a = class_row("A");
+        let b = class_row("B");
+        let c = class_row("C");
+        assert!(
+            a < b && b < c,
+            "classes are not layered by dependency:\n{text}"
+        );
+        let r1 = label_row("r1");
+        let r2 = label_row("r2");
+        let r3 = label_row("r3");
+        assert!(
+            a < r1 && r1 < b,
+            "r1 left its corridor between A and B:\n{text}"
+        );
+        assert!(
+            b < r2 && r2 < c,
+            "r2 left its corridor between B and C:\n{text}"
+        );
+        assert!(
+            a < r3 && r3 < c,
+            "r3 did not route back past B to reach A:\n{text}"
+        );
+        assert!(
+            !text.contains("C --> A"),
+            "cycle fell back to stacked or linear Mermaid source:\n{text}"
+        );
     }
 
     #[test]
@@ -2978,5 +3076,96 @@ A[$$\not_a_supported_command$$] --> B[Done]
         );
         assert!(super::super::render(duplicate_else, 80).is_none());
         assert!(super::super::render(base, 1).is_none());
+    }
+
+    #[test]
+    fn flowchart_accepts_non_ascii_node_ids() {
+        let source = concat!(
+            "graph TD\n",
+            "需求 --> 设计\n",
+            "设计 --> 验证\n",
+            "验证 -->|不通过| 设计\n",
+        );
+        let rendered = super::super::render(source, 80).expect("non-ASCII node ids");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains('╭'), "{text}");
+        let node_row = text
+            .lines()
+            .position(|line| line.contains("设计") && line.contains('│'))
+            .unwrap();
+        let feedback_row = text
+            .lines()
+            .position(|line| line.contains("不通过"))
+            .unwrap();
+        assert!(feedback_row > node_row, "{text}");
+    }
+
+    #[test]
+    fn flowchart_horizontal_cycle_routes_the_feedback_edge_below_the_nodes() {
+        let source = concat!(
+            "graph LR\n",
+            "A[需求] --> B[设计]\n",
+            "B --> C[实现]\n",
+            "C --> D[验证]\n",
+            "D -->|不通过| B\n",
+            "D -->|通过| E[发布]\n",
+        );
+        let rendered = super::super::render(source, 80).expect("cyclic horizontal flowchart");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains('╭'), "{text}");
+        assert!(!text.contains("需求  ──▶ 设计"), "{text}");
+        let node_row = text
+            .lines()
+            .position(|line| line.contains("设计") && line.contains('│'))
+            .unwrap();
+        let feedback_row = text
+            .lines()
+            .position(|line| line.contains("不通过"))
+            .unwrap();
+        assert!(
+            feedback_row > node_row,
+            "the feedback edge did not route below the nodes:\n{text}"
+        );
+    }
+
+    #[test]
+    fn flowchart_self_loop_renders_beside_its_node() {
+        let source = concat!(
+            "graph TD\n",
+            "A[待机] -->|收到任务| B[执行中]\n",
+            "B -->|未完成| B\n",
+            "B -->|完成| A\n",
+        );
+        let rendered = super::super::render(source, 80).expect("flowchart with a self loop");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains('╭'), "{text}");
+        assert!(
+            !text.contains("执行中  ──未完成 ──▶ 执行中"),
+            "self loop fell back to linear Mermaid source:\n{text}"
+        );
+    }
+
+    #[test]
+    fn state_self_transition_renders_beside_its_state() {
+        let source = concat!(
+            "stateDiagram-v2\n",
+            "[*] --> Locked\n",
+            "Locked --> Unlocked : 密码正确\n",
+            "Unlocked --> Locked : 空闲超时\n",
+            "Unlocked --> Unlocked : 继续操作\n",
+            "Unlocked --> [*] : 关机\n",
+        );
+        let rendered =
+            super::super::render(source, 80).expect("state diagram with a self transition");
+        assert_spans_exact(source, &rendered);
+        let text = facade_text(source, 80);
+        assert!(text.contains('┌'), "{text}");
+        assert!(
+            !text.contains("[ Unlocked ] ──→ [ Unlocked ]"),
+            "self transition fell back to linear Mermaid source:\n{text}"
+        );
     }
 }

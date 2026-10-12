@@ -1,7 +1,7 @@
 use super::state_ir as ir;
 use super::{
-    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits, routing,
-    source_within_limits,
+    MermaidRenderSpan, MermaidSourceSpan, canvas, collect_feedback_edges,
+    render_line_count_within_limits, routing, source_within_limits,
 };
 use crate::tui::measure::display_width;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,36 +24,6 @@ fn endpoint_key(endpoint: &str, from: bool, transition_index: usize) -> String {
 
 fn is_end_state(id: &str) -> bool {
     id == END_STATE || id.starts_with(&format!("{END_STATE}:"))
-}
-
-fn collect_feedback_edges(outgoing: &[Vec<(usize, usize)>]) -> HashSet<usize> {
-    fn visit(
-        node: usize,
-        outgoing: &[Vec<(usize, usize)>],
-        colors: &mut [u8],
-        feedback: &mut HashSet<usize>,
-    ) {
-        colors[node] = 1;
-        for &(to, transition_index) in &outgoing[node] {
-            match colors[to] {
-                0 => visit(to, outgoing, colors, feedback),
-                1 => {
-                    feedback.insert(transition_index);
-                }
-                _ => {}
-            }
-        }
-        colors[node] = 2;
-    }
-
-    let mut colors = vec![0; outgoing.len()];
-    let mut feedback = HashSet::new();
-    for node in 0..outgoing.len() {
-        if colors[node] == 0 {
-            visit(node, outgoing, &mut colors, &mut feedback);
-        }
-    }
-    feedback
 }
 
 pub(super) fn render(source: &str, width: usize) -> Option<Vec<Vec<MermaidRenderSpan>>> {
@@ -499,9 +469,6 @@ fn layout(
     for (transition_index, transition) in transitions.iter().enumerate() {
         let from = index[&endpoint_key(&transition.from.text, true, transition_index)];
         let to = index[&endpoint_key(&transition.to.text, false, transition_index)];
-        if from == to {
-            return None;
-        }
         cycle_outgoing[from].push((to, transition_index));
     }
     let feedback_edges = if allow_cycles {
@@ -757,6 +724,48 @@ fn layout(
         let to_index = index[&endpoint_key(&transition.to.text, false, transition_index)];
         let from = placements[&from_index];
         let to = placements[&to_index];
+        if from_index == to_index {
+            if from.height < 3 {
+                return None;
+            }
+            let right = from.col + from.width;
+            let channel = right.checked_add(1)?;
+            let top = from.row + from.height - 1;
+            let bottom = from.row + from.height;
+            let row_clear = |row: usize, lo: usize, hi: usize| {
+                placements.values().all(|placed| {
+                    row < placed.row
+                        || row >= placed.row + placed.height
+                        || hi < placed.col
+                        || lo >= placed.col + placed.width
+                }) && (lo..=hi).all(|col| !routes.contains_key(&(col, row)))
+            };
+            let col_clear = |col: usize| {
+                placements
+                    .values()
+                    .all(|placed| col < placed.col || col >= placed.col + placed.width)
+            };
+            if !row_clear(top, right, channel)
+                || !row_clear(bottom, right, channel)
+                || !col_clear(channel)
+            {
+                return None;
+            }
+            routes.connect((right, top), (channel, top));
+            routes.connect((channel, top), (channel, bottom));
+            routes.connect((channel, bottom), (right, bottom));
+            canvas.put(right, bottom, '◀');
+            if let Some(label) = &transition.label {
+                canvas.blit(bottom, channel + 1, &label.text);
+                canvas.labels.push(canvas::MermaidCanvasLabel {
+                    row: bottom,
+                    col: channel + 1,
+                    text: label.text.clone(),
+                    source: label.span,
+                });
+            }
+            continue;
+        }
         let from_row = from.row + from.height / 2;
         let to_row = to.row + to.height / 2;
         let label_width = transition

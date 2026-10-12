@@ -2122,11 +2122,7 @@ mod tests {
             .join("\n");
         assert!(!structured_text.contains("╭─ mermaid"), "{structured_text}");
         assert!(structured_text.contains("loop retry"), "{structured_text}");
-        assert!(
-            structured_text.contains("A ──▶ A  again"),
-            "{structured_text}"
-        );
-        assert!(structured_text.contains("end"), "{structured_text}");
+        assert!(structured_text.contains("◀┘again"), "{structured_text}");
 
         let too_wide = rendered(
             "```mermaid\nsequenceDiagram\nparticipant A as A\nparticipant B as B\nA->>B: a message that cannot fit\n```",

@@ -1,7 +1,7 @@
 use super::er_ir as ir;
 use super::{
-    MermaidRenderSpan, MermaidSourceSpan, canvas, render_line_count_within_limits, routing,
-    source_within_limits,
+    MermaidRenderSpan, MermaidSourceSpan, canvas, collect_feedback_edges,
+    render_line_count_within_limits, routing, source_within_limits,
 };
 use crate::tui::measure::display_width;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -70,15 +70,31 @@ fn layout_layered(diagram: &ir::Diagram, width: usize) -> Option<canvas::Mermaid
     if diagram.entities.len() > 24 || diagram.relations.len() > 48 {
         return None;
     }
+    if diagram
+        .relations
+        .iter()
+        .any(|relation| relation.from.text == relation.to.text)
+    {
+        return None;
+    }
     let index = diagram
         .entities
         .iter()
         .enumerate()
         .map(|(index, entity)| (entity.name.text.as_str(), index))
         .collect::<HashMap<_, _>>();
+    let mut cycle_outgoing = vec![Vec::new(); diagram.entities.len()];
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        cycle_outgoing[index[relation.from.text.as_str()]]
+            .push((index[relation.to.text.as_str()], relation_index));
+    }
+    let feedback_edges = collect_feedback_edges(&cycle_outgoing);
     let mut indegree = vec![0usize; diagram.entities.len()];
     let mut outgoing = vec![Vec::new(); diagram.entities.len()];
-    for relation in &diagram.relations {
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        if feedback_edges.contains(&relation_index) {
+            continue;
+        }
         let from = index[relation.from.text.as_str()];
         let to = index[relation.to.text.as_str()];
         outgoing[from].push(to);
@@ -116,9 +132,16 @@ fn layout_layered(diagram: &ir::Diagram, width: usize) -> Option<canvas::Mermaid
             depths[entity] = min_successor_depth.saturating_sub(1);
         }
     }
-    if diagram.relations.iter().any(|relation| {
-        depths[index[relation.to.text.as_str()]] != depths[index[relation.from.text.as_str()]] + 1
-    }) {
+    if diagram
+        .relations
+        .iter()
+        .enumerate()
+        .filter(|(relation_index, _)| !feedback_edges.contains(relation_index))
+        .any(|(_, relation)| {
+            depths[index[relation.to.text.as_str()]]
+                != depths[index[relation.from.text.as_str()]] + 1
+        })
+    {
         return None;
     }
     let mut layers = vec![Vec::new(); depths.iter().copied().max().unwrap_or(0) + 1];
@@ -150,8 +173,25 @@ fn layout_layered(diagram: &ir::Diagram, width: usize) -> Option<canvas::Mermaid
                 + 6 * layer.len().saturating_sub(1)
         })
         .collect::<Vec<_>>();
-    let graph_width = layer_widths.iter().copied().max().unwrap_or(0);
-    if graph_width == 0 || graph_width > width {
+    let layer_width = layer_widths.iter().copied().max().unwrap_or(0);
+    let feedback_slot = feedback_edges
+        .iter()
+        .map(|relation_index| {
+            display_width(&diagram.relations[*relation_index].label.text).max(1) + 4
+        })
+        .max()
+        .unwrap_or(0);
+    let feedback_margin = if feedback_edges.is_empty() {
+        0
+    } else {
+        feedback_edges
+            .len()
+            .saturating_mul(feedback_slot)
+            .saturating_add(4)
+            .saturating_mul(2)
+    };
+    let graph_width = layer_width.saturating_add(feedback_margin);
+    if layer_width == 0 || graph_width > width {
         return None;
     }
 
@@ -188,15 +228,19 @@ fn layout_layered(diagram: &ir::Diagram, width: usize) -> Option<canvas::Mermaid
             let edge_count = diagram
                 .relations
                 .iter()
-                .filter(|relation| depths[index[relation.from.text.as_str()]] == layer_index)
+                .enumerate()
+                .filter(|(relation_index, _)| !feedback_edges.contains(relation_index))
+                .filter(|(_, relation)| depths[index[relation.from.text.as_str()]] == layer_index)
                 .count();
             row += layer_height + edge_count * 2 + 2;
         }
     }
+    let mut routes = routing::RouteGrid::new();
     route_entity_relations(
         &mut canvas,
         diagram,
         &index,
+        &feedback_edges,
         &depths,
         graph_width,
         &placements,
@@ -204,7 +248,19 @@ fn layout_layered(diagram: &ir::Diagram, width: usize) -> Option<canvas::Mermaid
             starts: layer_starts,
             bottoms: layer_bottoms,
         },
+        &mut routes,
     )?;
+    route_feedback_relations(
+        &mut canvas,
+        diagram,
+        &index,
+        &feedback_edges,
+        graph_width,
+        feedback_slot,
+        &placements,
+        &mut routes,
+    )?;
+    paint_entity_routes(&mut canvas, &routes);
     Some(canvas)
 }
 
@@ -355,16 +411,7 @@ fn route_relaxed_relations(
         });
     }
 
-    let mut cells = routes.iter().collect::<Vec<_>>();
-    cells.sort_by_key(|((col, row), _)| (*row, *col));
-    for (&(col, row), &mask) in cells {
-        if !matches!(
-            canvas.rows.get(row).and_then(|line| line.get(col)),
-            Some(canvas::MermaidCell::Char('1' | '○' | '┤' | '◇' | '•'))
-        ) {
-            canvas.put(col, row, routing::route_glyph(mask));
-        }
-    }
+    paint_entity_routes(canvas, &routes);
     Some(())
 }
 
@@ -413,14 +460,19 @@ fn route_entity_relations(
     canvas: &mut canvas::MermaidCanvas,
     diagram: &ir::Diagram,
     index: &HashMap<&str, usize>,
+    feedback_edges: &HashSet<usize>,
     depths: &[usize],
     graph_width: usize,
     placements: &HashMap<usize, PlacedEntity>,
     layer_rows: &LayerRows,
+    routes: &mut routing::RouteGrid,
 ) -> Option<()> {
     let mut outgoing = HashMap::<usize, Vec<usize>>::new();
     let mut incoming = HashMap::<usize, Vec<usize>>::new();
     for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        if feedback_edges.contains(&relation_index) {
+            continue;
+        }
         let from = index[relation.from.text.as_str()];
         let to = index[relation.to.text.as_str()];
         outgoing.entry(from).or_default().push(relation_index);
@@ -428,8 +480,10 @@ fn route_entity_relations(
     }
 
     let mut tracks = HashMap::<usize, routing::TrackAllocator>::new();
-    let mut routes = routing::RouteGrid::new();
     for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        if feedback_edges.contains(&relation_index) {
+            continue;
+        }
         let from_index = index[relation.from.text.as_str()];
         let to_index = index[relation.to.text.as_str()];
         let from = placements[&from_index];
@@ -488,6 +542,10 @@ fn route_entity_relations(
         });
     }
 
+    Some(())
+}
+
+fn paint_entity_routes(canvas: &mut canvas::MermaidCanvas, routes: &routing::RouteGrid) {
     let mut cells = routes.iter().collect::<Vec<_>>();
     cells.sort_by_key(|((col, row), _)| (*row, *col));
     for (&(col, row), &mask) in cells {
@@ -497,6 +555,111 @@ fn route_entity_relations(
         ) {
             canvas.put(col, row, routing::route_glyph(mask));
         }
+    }
+}
+
+fn route_feedback_relations(
+    canvas: &mut canvas::MermaidCanvas,
+    diagram: &ir::Diagram,
+    index: &HashMap<&str, usize>,
+    feedback_edges: &HashSet<usize>,
+    graph_width: usize,
+    slot: usize,
+    placements: &HashMap<usize, PlacedEntity>,
+    routes: &mut routing::RouteGrid,
+) -> Option<()> {
+    let mut left_feedback = 0usize;
+    let mut right_feedback = 0usize;
+    for (relation_index, relation) in diagram.relations.iter().enumerate() {
+        if !feedback_edges.contains(&relation_index) {
+            continue;
+        }
+        let from = placements[&index[relation.from.text.as_str()]];
+        let to = placements[&index[relation.to.text.as_str()]];
+        let from_row = from.row + from.height / 2;
+        let to_row = to.row + to.height / 2;
+        let clear_horizontal = |row: usize, first: usize, last: usize| {
+            let lo = first.min(last);
+            let hi = first.max(last);
+            placements.values().all(|placed| {
+                row < placed.row
+                    || row >= placed.row + placed.height
+                    || hi < placed.col
+                    || lo >= placed.col + placed.width
+            }) && (lo..=hi).all(|col| !routes.contains_key(&(col, row)))
+        };
+        let clear_vertical = |col: usize| {
+            let lo = from_row.min(to_row);
+            let hi = from_row.max(to_row);
+            placements.values().all(|placed| {
+                col < placed.col
+                    || col >= placed.col + placed.width
+                    || hi < placed.row
+                    || lo >= placed.row + placed.height
+            }) && (lo..=hi).all(|row| !routes.contains_key(&(col, row)))
+        };
+        let left =
+            from.col
+                .checked_sub(1)
+                .zip(to.col.checked_sub(1))
+                .and_then(|(from_col, to_col)| {
+                    let outer_col = left_feedback.checked_mul(slot)?;
+                    (clear_horizontal(from_row, outer_col, from_col)
+                        && clear_horizontal(to_row, outer_col, to_col)
+                        && clear_vertical(outer_col))
+                    .then_some((outer_col, (from_col, from_row), (to_col, to_row)))
+                });
+        let right_outer = graph_width.checked_sub(1 + right_feedback * slot)?;
+        let right = (clear_horizontal(from_row, from.col + from.width, right_outer)
+            && clear_horizontal(to_row, to.col + to.width, right_outer)
+            && clear_vertical(right_outer))
+        .then_some((
+            right_outer,
+            (from.col + from.width, from_row),
+            (to.col + to.width, to_row),
+        ));
+        let prefer_left = from.col <= graph_width.saturating_sub(from.col + from.width);
+        let (outer_col, from_port, to_port) = if prefer_left {
+            left.or(right)?
+        } else {
+            right.or(left)?
+        };
+        if outer_col > from_port.0 {
+            right_feedback += 1;
+        } else {
+            left_feedback += 1;
+        }
+        routes.connect(from_port, (outer_col, from_port.1));
+        routes.connect((outer_col, from_port.1), (outer_col, to_port.1));
+        routes.connect((outer_col, to_port.1), to_port);
+        canvas.put(
+            from_port.0,
+            from_port.1,
+            cardinality_icon(&relation.from_cardinality.text),
+        );
+        canvas.put(
+            to_port.0,
+            to_port.1,
+            cardinality_icon(&relation.to_cardinality.text),
+        );
+        let label_width = display_width(&relation.label.text).max(1);
+        let label_col = if outer_col > from_port.0 {
+            outer_col.checked_sub(label_width + 1)?
+        } else {
+            outer_col + 1
+        };
+        let middle = from_port.1.min(to_port.1) + from_port.1.abs_diff(to_port.1) / 2;
+        let label_row = (from_port.1.min(to_port.1)..=from_port.1.max(to_port.1))
+            .filter(|row| canvas.labels.iter().all(|placed| placed.row != *row))
+            .min_by_key(|row| row.abs_diff(middle))
+            .unwrap_or(middle);
+        canvas.blit(label_row, label_col, &relation.label.text);
+        canvas.labels.push(canvas::MermaidCanvasLabel {
+            row: label_row,
+            col: label_col,
+            text: relation.label.text.clone(),
+            source: relation.label.span,
+        });
     }
     Some(())
 }
