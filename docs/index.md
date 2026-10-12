@@ -111,7 +111,7 @@ flowchart TD
 
 ### [Permission](components/permission.md)
 
-实现四种权限运行模式、工具安全分类、会话级授权机制、自动审查以及子代理独占路径锁。
+实现四种权限运行模式、工具安全分类、会话级授权机制、自动审查和子代理独占路径锁。
 
 ### [Subagents](components/subagents.md)
 
