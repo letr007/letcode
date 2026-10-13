@@ -1301,6 +1301,19 @@ fn reviewer_jev_config(
     crate::config::jev_review_for_route(providers, &route)
 }
 
+async fn replace_mcp_session(
+    sessions: &mut HashMap<String, mcp::McpSession>,
+    name: &str,
+    session: Option<mcp::McpSession>,
+) {
+    if let Some(previous) = sessions.remove(name) {
+        previous.shutdown().await;
+    }
+    if let Some(session) = session {
+        sessions.insert(name.to_string(), session);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine_loop(
     agent: Agent,
@@ -1329,6 +1342,7 @@ async fn run_engine_loop(
         &mut config.provider_api_key_hints,
     )));
     let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
+    let mut mcp_sessions: HashMap<String, mcp::McpSession> = HashMap::new();
     let subagent_runtime = subagent_runtime;
     let auto_review_service: std::sync::Arc<dyn crate::agent::AutoReviewService> =
         match jev_reviewer {
@@ -1772,6 +1786,7 @@ async fn run_engine_loop(
                             {
                                 agent.unregister_tool(&tool_name);
                             }
+                            replace_mcp_session(&mut mcp_sessions, &server_name, None).await;
                             let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdated(
                                 mcp::McpServerCatalogEntry {
                                     name: server_name,
@@ -1790,17 +1805,20 @@ async fn run_engine_loop(
                                 .expect("configured MCP server should remain present")
                                 .clone(),
                         );
-                        let discovery = mcp::discover_servers(&one_server)
+                        let mcp::McpServerDiscovery {
+                            mut server,
+                            session,
+                            tools,
+                        } = mcp::discover_servers(&one_server)
                             .await
                             .into_iter()
                             .next()
                             .expect("single MCP server discovery should return one result");
-                        let mut server = discovery.server;
                         let mut catalog_tools = Vec::new();
                         match server.status {
                             mcp::McpServerStatus::Online { .. } => {
                                 let mut registered = Vec::new();
-                                for tool in discovery.tools {
+                                for tool in tools {
                                     let tool_name = tool.name().to_string();
                                     let catalog_entry = tool.catalog_entry();
                                     if let Err(error) = agent.try_register_tool(tool) {
@@ -1825,6 +1843,7 @@ async fn run_engine_loop(
                             }
                             mcp::McpServerStatus::Disabled => unreachable!("enabled server was discovered"),
                         }
+                        replace_mcp_session(&mut mcp_sessions, &server.name, session).await;
                         let _ = session_transport_tx.send(SessionTransportEvent::McpServerToolsUpdated {
                             name: server.name.clone(),
                             tools: catalog_tools,
@@ -2943,7 +2962,11 @@ async fn run_engine_loop(
 
                 let mut servers = Vec::with_capacity(discovery.len());
                 for server_discovery in discovery {
-                    let mut server = server_discovery.server;
+                    let mcp::McpServerDiscovery {
+                        mut server,
+                        session,
+                        tools,
+                    } = server_discovery;
                     let mut catalog_tools = Vec::new();
                     if let mcp::McpServerStatus::Offline { message } = &server.status {
                         let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
@@ -2952,7 +2975,7 @@ async fn run_engine_loop(
                         )));
                     }
                     let mut registered = Vec::new();
-                    for tool in server_discovery.tools {
+                    for tool in tools {
                         let tool_name = tool.name().to_string();
                         let catalog_entry = tool.catalog_entry();
                         if let Err(error) = agent.try_register_tool(tool) {
@@ -2970,6 +2993,7 @@ async fn run_engine_loop(
                         };
                         mcp_registered_tools.insert(server.name.clone(), registered);
                     }
+                    replace_mcp_session(&mut mcp_sessions, &server.name, session).await;
                     let _ = session_transport_tx.send(SessionTransportEvent::McpServerToolsUpdated {
                         name: server.name.clone(),
                         tools: catalog_tools,
@@ -2979,6 +3003,9 @@ async fn run_engine_loop(
                 let _ = session_transport_tx.send(SessionTransportEvent::McpToolsDiscovered(servers));
             }
         }
+    }
+    for (_, session) in std::mem::take(&mut mcp_sessions) {
+        session.shutdown().await;
     }
     if let Err(error) = memory_worker.shutdown().await {
         tracing::warn!(error = %error, "project memory worker shutdown failed");

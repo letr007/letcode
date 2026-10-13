@@ -4,8 +4,10 @@ use futures_util::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 
 use crate::config::{
@@ -38,9 +40,11 @@ pub enum McpServerStatus {
 
 /// Discovery outcome for one configured server. Tool details are available only
 /// to the runtime that registers executable MCP tools; catalog UIs should use
-/// `server` rather than deriving display data from the tools.
+/// `server` rather than deriving display data from the tools. `session` is the
+/// connection shared by `tools`; its owner closes it once the server goes away.
 pub struct McpServerDiscovery {
     pub server: McpServerCatalogEntry,
+    pub session: Option<McpSession>,
     pub tools: Vec<McpTool>,
 }
 
@@ -57,8 +61,7 @@ pub struct McpTool {
     parameters: Value,
     server_name: String,
     tool_name: String,
-    transport: McpTransportConfig,
-    timeout_ms: u64,
+    session: McpSession,
 }
 
 /// Discover every configured MCP server independently, preserving config order.
@@ -83,22 +86,25 @@ pub async fn discover_servers(
                             enabled: false,
                             status: McpServerStatus::Disabled,
                         },
+                        session: None,
                         tools: Vec::new(),
                     },
                 );
             }
             let result = discover_server_tools(name.clone(), server).await;
-            let (status, tools) = match result {
-                Ok(tools) => (
+            let (status, session, tools) = match result {
+                Ok((session, tools)) => (
                     McpServerStatus::Online {
                         tool_count: tools.len(),
                     },
+                    Some(session),
                     tools,
                 ),
                 Err(error) => (
                     McpServerStatus::Offline {
                         message: error.to_string(),
                     },
+                    None,
                     Vec::new(),
                 ),
             };
@@ -110,6 +116,7 @@ pub async fn discover_servers(
                         enabled: true,
                         status,
                     },
+                    session,
                     tools,
                 },
             )
@@ -124,33 +131,16 @@ pub async fn discover_servers(
 async fn discover_server_tools(
     server_name: String,
     server_config: McpServerConfig,
-) -> Result<Vec<McpTool>> {
-    let discovered = match &server_config.transport {
-        McpTransportConfig::Local(local) => {
-            list_local_tools(&server_name, local, server_config.timeout_ms)
-                .await
-                .with_context(|| format!("failed to discover MCP tools from '{server_name}'"))?
-        }
-        McpTransportConfig::Remote(remote) => {
-            list_remote_tools(&server_name, remote, server_config.timeout_ms)
-                .await
-                .with_context(|| {
-                    format!("failed to discover MCP tools from remote '{server_name}'")
-                })?
-        }
-    };
-
-    discovered
+) -> Result<(McpSession, Vec<McpTool>)> {
+    let session = McpSession::new(server_config.transport, server_config.timeout_ms);
+    let discovered = list_tools(&server_name, &session)
+        .await
+        .with_context(|| format!("failed to discover MCP tools from '{server_name}'"))?;
+    let tools = discovered
         .into_iter()
-        .map(|tool| {
-            McpTool::from_discovered(
-                &server_name,
-                server_config.transport.clone(),
-                server_config.timeout_ms,
-                tool,
-            )
-        })
-        .collect()
+        .map(|tool| McpTool::from_discovered(&server_name, session.clone(), tool))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((session, tools))
 }
 
 #[async_trait]
@@ -180,28 +170,41 @@ impl ToolHandler for McpTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        match &self.transport {
-            McpTransportConfig::Local(local) => {
-                call_local_tool(
-                    &self.server_name,
-                    local,
-                    self.timeout_ms,
-                    &self.tool_name,
-                    args,
+        let result = self
+            .session
+            .request(
+                "tools/call",
+                json!({
+                    "name": self.tool_name,
+                    "arguments": args,
+                }),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP server '{}' failed tools/call '{}'",
+                    self.server_name, self.tool_name
                 )
-                .await
-            }
-            McpTransportConfig::Remote(remote) => {
-                call_remote_tool(
-                    &self.server_name,
-                    remote,
-                    self.timeout_ms,
-                    &self.tool_name,
-                    args,
-                )
-                .await
-            }
+            })?;
+
+        if result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!(
+                "MCP tool '{}::{}' returned an error: {}",
+                self.server_name,
+                self.tool_name,
+                mcp_content_text(&result)
+            );
         }
+
+        Ok(json!({
+            "server": self.server_name,
+            "tool": self.tool_name,
+            "content": result.get("content").cloned().unwrap_or(Value::Array(Vec::new())),
+        }))
     }
 }
 
@@ -215,8 +218,7 @@ impl McpTool {
 
     fn from_discovered(
         server_name: &str,
-        transport: McpTransportConfig,
-        timeout_ms: u64,
+        session: McpSession,
         tool: DiscoveredTool,
     ) -> Result<Self> {
         let server_component = sanitize_tool_name_component(server_name);
@@ -236,8 +238,7 @@ impl McpTool {
             parameters: tool.input_schema,
             server_name: server_name.to_string(),
             tool_name: tool.name,
-            transport,
-            timeout_ms,
+            session,
         })
     }
 }
@@ -249,60 +250,7 @@ struct DiscoveredTool {
     input_schema: Value,
 }
 
-async fn list_local_tools(
-    server_name: &str,
-    server: &McpLocalServerConfig,
-    timeout_ms: u64,
-) -> Result<Vec<DiscoveredTool>> {
-    let mut session = LocalMcpSession::start(server, timeout_ms).await?;
-    let result = async {
-        session.initialize().await?;
-
-        let mut cursor = None;
-        let mut tools = Vec::new();
-        loop {
-            let mut params = serde_json::Map::new();
-            if let Some(cursor) = cursor.take() {
-                params.insert("cursor".into(), Value::String(cursor));
-            }
-            let result = session
-                .request("tools/list", Value::Object(params))
-                .await
-                .with_context(|| format!("MCP server '{server_name}' failed tools/list"))?;
-            let listed = result
-                .get("tools")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    anyhow!("MCP server '{server_name}' tools/list result is missing tools[]")
-                })?;
-            for tool in listed {
-                tools.push(discovered_tool_from_value(server_name, tool)?);
-            }
-
-            cursor = result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if cursor.is_none() {
-                break;
-            }
-        }
-
-        Ok(tools)
-    }
-    .await;
-    session.shutdown().await;
-    result
-}
-
-async fn list_remote_tools(
-    server_name: &str,
-    server: &McpRemoteServerConfig,
-    timeout_ms: u64,
-) -> Result<Vec<DiscoveredTool>> {
-    let mut session = RemoteMcpSession::new(server, timeout_ms)?;
-    session.initialize().await?;
-
+async fn list_tools(server_name: &str, session: &McpSession) -> Result<Vec<DiscoveredTool>> {
     let mut cursor = None;
     let mut tools = Vec::new();
     loop {
@@ -313,12 +261,12 @@ async fn list_remote_tools(
         let result = session
             .request("tools/list", Value::Object(params))
             .await
-            .with_context(|| format!("remote MCP server '{server_name}' failed tools/list"))?;
+            .with_context(|| format!("MCP server '{server_name}' failed tools/list"))?;
         let listed = result
             .get("tools")
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                anyhow!("remote MCP server '{server_name}' tools/list result is missing tools[]")
+                anyhow!("MCP server '{server_name}' tools/list result is missing tools[]")
             })?;
         for tool in listed {
             tools.push(discovered_tool_from_value(server_name, tool)?);
@@ -334,91 +282,6 @@ async fn list_remote_tools(
     }
 
     Ok(tools)
-}
-
-async fn call_local_tool(
-    server_name: &str,
-    server: &McpLocalServerConfig,
-    timeout_ms: u64,
-    tool_name: &str,
-    arguments: Value,
-) -> Result<Value> {
-    let mut session = LocalMcpSession::start(server, timeout_ms).await?;
-    let result = async {
-        session.initialize().await?;
-        let result = session
-            .request(
-                "tools/call",
-                json!({
-                    "name": tool_name,
-                    "arguments": arguments,
-                }),
-            )
-            .await
-            .with_context(|| {
-                format!("MCP server '{server_name}' failed tools/call '{tool_name}'")
-            })?;
-
-        if result
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            bail!(
-                "MCP tool '{server_name}::{tool_name}' returned an error: {}",
-                mcp_content_text(&result)
-            );
-        }
-
-        Ok(json!({
-            "server": server_name,
-            "tool": tool_name,
-            "content": result.get("content").cloned().unwrap_or(Value::Array(Vec::new())),
-        }))
-    }
-    .await;
-    session.shutdown().await;
-    result
-}
-
-async fn call_remote_tool(
-    server_name: &str,
-    server: &McpRemoteServerConfig,
-    timeout_ms: u64,
-    tool_name: &str,
-    arguments: Value,
-) -> Result<Value> {
-    let mut session = RemoteMcpSession::new(server, timeout_ms)?;
-    session.initialize().await?;
-    let result = session
-        .request(
-            "tools/call",
-            json!({
-                "name": tool_name,
-                "arguments": arguments,
-            }),
-        )
-        .await
-        .with_context(|| {
-            format!("remote MCP server '{server_name}' failed tools/call '{tool_name}'")
-        })?;
-
-    if result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!(
-            "MCP tool '{server_name}::{tool_name}' returned an error: {}",
-            mcp_content_text(&result)
-        );
-    }
-
-    Ok(json!({
-        "server": server_name,
-        "tool": tool_name,
-        "content": result.get("content").cloned().unwrap_or(Value::Array(Vec::new())),
-    }))
 }
 
 fn discovered_tool_from_value(server_name: &str, tool: &Value) -> Result<DiscoveredTool> {
@@ -444,12 +307,108 @@ fn discovered_tool_from_value(server_name: &str, tool: &Value) -> Result<Discove
     })
 }
 
+/// The connection to one configured MCP server, shared by every tool discovered
+/// from it so the server keeps its session state across calls. A request that
+/// leaves the transport unusable drops the connection, so the next request
+/// reconnects; otherwise the session is reused until `shutdown` closes it.
+#[derive(Clone)]
+pub struct McpSession {
+    inner: Arc<Mutex<McpSessionState>>,
+}
+
+struct McpSessionState {
+    transport: McpTransportConfig,
+    timeout_ms: u64,
+    active: Option<ActiveSession>,
+}
+
+enum ActiveSession {
+    Local(LocalMcpSession),
+    Remote(RemoteMcpSession),
+}
+
+impl McpSession {
+    fn new(transport: McpTransportConfig, timeout_ms: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(McpSessionState {
+                transport,
+                timeout_ms,
+                active: None,
+            })),
+        }
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let mut state = self.inner.lock().await;
+        let mut active = match state.active.take() {
+            Some(active) => active,
+            None => {
+                let transport = state.transport.clone();
+                connect_session(&transport, state.timeout_ms).await?
+            }
+        };
+        let outcome = active.request(method, params).await;
+        if active.is_poisoned() {
+            active.shutdown().await;
+        } else {
+            state.active = Some(active);
+        }
+        outcome
+    }
+
+    /// Closes the connection. Only stdio servers have a shutdown handshake.
+    pub async fn shutdown(&self) {
+        let mut state = self.inner.lock().await;
+        if let Some(mut active) = state.active.take() {
+            active.shutdown().await;
+        }
+    }
+}
+
+async fn connect_session(transport: &McpTransportConfig, timeout_ms: u64) -> Result<ActiveSession> {
+    match transport {
+        McpTransportConfig::Local(local) => {
+            let mut session = LocalMcpSession::start(local, timeout_ms).await?;
+            session.initialize().await?;
+            Ok(ActiveSession::Local(session))
+        }
+        McpTransportConfig::Remote(remote) => {
+            let mut session = RemoteMcpSession::new(remote, timeout_ms)?;
+            session.initialize().await?;
+            Ok(ActiveSession::Remote(session))
+        }
+    }
+}
+
+impl ActiveSession {
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            Self::Local(session) => session.request(method, params).await,
+            Self::Remote(session) => session.request(method, params).await,
+        }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        match self {
+            Self::Local(session) => session.is_poisoned(),
+            Self::Remote(session) => session.is_poisoned(),
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        if let Self::Local(session) = self {
+            session.shutdown().await;
+        }
+    }
+}
+
 struct LocalMcpSession {
     child: Option<ManagedChild>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     timeout: Duration,
+    poisoned: bool,
 }
 
 impl LocalMcpSession {
@@ -488,6 +447,7 @@ impl LocalMcpSession {
             stdout: BufReader::new(stdout),
             next_id: 1,
             timeout: Duration::from_millis(timeout_ms),
+            poisoned: false,
         })
     }
 
@@ -515,13 +475,18 @@ impl LocalMcpSession {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write_json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .await?;
+        if let Err(error) = self
+            .write_json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .await
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
         self.read_response(id).await
     }
 
@@ -553,14 +518,26 @@ impl LocalMcpSession {
     async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
         loop {
             let mut line = String::new();
-            let read = timeout(self.timeout, self.stdout.read_line(&mut line))
-                .await
-                .context("timed out reading MCP response")??;
+            let read = match timeout(self.timeout, self.stdout.read_line(&mut line)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+                Err(_) => return Err(anyhow!("timed out reading MCP response")),
+            };
             if read == 0 {
+                self.poisoned = true;
                 bail!("MCP server closed stdout before responding to request {expected_id}");
             }
-            let message: Value = serde_json::from_str(line.trim_end())
-                .with_context(|| format!("failed to parse MCP JSON-RPC line: {line:?}"))?;
+            let message: Value = match serde_json::from_str(line.trim_end()) {
+                Ok(message) => message,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error)
+                        .with_context(|| format!("failed to parse MCP JSON-RPC line: {line:?}"));
+                }
+            };
             if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
                 continue;
             }
@@ -609,6 +586,10 @@ impl LocalMcpSession {
             child.spawn_reaper();
         }
     }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
 }
 
 async fn drain_mcp_stderr(mut stderr: tokio::process::ChildStderr) {
@@ -636,6 +617,7 @@ struct RemoteMcpSession {
     session_id: Option<String>,
     protocol_version: String,
     next_id: u64,
+    poisoned: bool,
 }
 
 impl RemoteMcpSession {
@@ -657,6 +639,7 @@ impl RemoteMcpSession {
             session_id: None,
             protocol_version: MCP_PROTOCOL_VERSION.to_string(),
             next_id: 1,
+            poisoned: false,
         })
     }
 
@@ -754,6 +737,11 @@ impl RemoteMcpSession {
             .await
             .context("failed to read remote MCP response body")?;
         if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // The server no longer knows this session, so the next request
+                // has to initialize a new one.
+                self.poisoned = true;
+            }
             bail!("remote MCP server returned HTTP {status}: {body}");
         }
         if body.trim().is_empty() {
@@ -764,6 +752,10 @@ impl RemoteMcpSession {
         }
         serde_json::from_str(&body)
             .with_context(|| format!("failed to parse remote MCP JSON response: {body}"))
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 }
 
@@ -903,8 +895,7 @@ mod tests {
         for tool_name in ["checkpoint", "return"] {
             let tool = McpTool::from_discovered(
                 "context",
-                McpTransportConfig::Local(server.clone()),
-                5_000,
+                McpSession::new(McpTransportConfig::Local(server.clone()), 5_000),
                 DiscoveredTool {
                     name: tool_name.into(),
                     description: "reserved-name probe".into(),
@@ -925,6 +916,118 @@ mod tests {
                 format!("unknown tool: {name}")
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn fake_local_server(name: &str, body: &str) -> (McpLocalServerConfig, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "letcode-mcp-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let script = dir.join("server.sh");
+        fs::write(&script, format!("#!/bin/sh\n{body}")).expect("script should be written");
+        let mut permissions = fs::metadata(&script)
+            .expect("metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("permissions should be set");
+        (
+            McpLocalServerConfig {
+                command: vec![script.to_string_lossy().to_string()],
+                environment: IndexMap::new(),
+            },
+            dir,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_stdio_tool_calls_reuse_one_session() {
+        let (server, dir) = fake_local_server(
+            "session-reuse",
+            r#"
+count=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"bump","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      count=$((count + 1))
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$count"
+      ;;
+  esac
+done
+"#,
+        );
+        let session = McpSession::new(McpTransportConfig::Local(server), 5_000);
+
+        let first = session
+            .request("tools/call", json!({"name": "bump", "arguments": {}}))
+            .await
+            .expect("first call should succeed");
+        let second = session
+            .request("tools/call", json!({"name": "bump", "arguments": {}}))
+            .await
+            .expect("second call should succeed");
+
+        assert_eq!(first["content"][0]["text"], "1");
+        assert_eq!(second["content"][0]["text"], "2");
+        session.shutdown().await;
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_stdio_session_reconnects_after_the_server_exits() {
+        let (server, dir) = fake_local_server(
+            "session-reconnect",
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      case "$line" in
+        *'"die":true'*) exit 0 ;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"alive"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let session = McpSession::new(McpTransportConfig::Local(server), 5_000);
+
+        let error = session
+            .request(
+                "tools/call",
+                json!({"name": "probe", "arguments": {"die": true}}),
+            )
+            .await
+            .expect_err("a call whose server exits must fail");
+        assert!(
+            error.to_string().contains("closed stdout"),
+            "unexpected error: {error}"
+        );
+
+        let recovered = session
+            .request("tools/call", json!({"name": "probe", "arguments": {}}))
+            .await
+            .expect("the next call should reconnect");
+        assert_eq!(recovered["content"][0]["text"], "alive");
+        session.shutdown().await;
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
