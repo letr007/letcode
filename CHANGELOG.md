@@ -5,6 +5,26 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Added
+
+- 子代理卡片展开时显示调用方设置的委派参数，包含目标、成功标准、负责路径、允许路径、禁止路径、模型及接管子会话。
+- Mermaid 渲染支持含环图表的分层排版，自环与自调用消息直接在节点旁绘制，不再回退为文本源码。
+- Mermaid 流程图节点 ID 支持非 ASCII 字符。
+
+### Changed
+
+- 输入行以 `@` 开头的文本作为普通提示词处理，专家委派统一由 `agent__*` 工具接管。
+
+### Fixed
+
+- 自动审查异常、凭据缺失或未完成裁决时不再由系统代行拒绝，当前回合以错误结束，并收口未完成的工具调用以保持会话可用。
+- MCP 服务端在工具发现时建立长驻会话，跨工具调用保持连接与服务端状态，初始化握手仅在首次建立时执行。
+- 自定义主题 ID 规范化不再重写 `tokyo-night`，正常加载同名主题文件。
+- 主题不可用时的回退提示跟随界面语言显示。
+- 修复了一个愚蠢的缓存失效问题。
+
 ## [0.22.0] - 2026-10-12
 
 ### Added
@@ -560,7 +580,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/letr007/letcode/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/letr007/letcode/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/letr007/letcode/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/letr007/letcode/compare/v0.19.0...v0.20.0

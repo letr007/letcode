@@ -187,7 +187,6 @@ pub(crate) fn model_request_from_prompt_plan(
             .stable_prefix_end
             .map(|index| StablePrefixMetadata {
                 segment_count: index + 1,
-                fingerprint: prompt_plan.stable_prefix_hash().map(str::to_owned),
             }),
     };
     Ok(request)

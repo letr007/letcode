@@ -730,7 +730,6 @@ pub struct ToolParameters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StablePrefixMetadata {
     pub segment_count: usize,
-    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -831,8 +830,8 @@ pub enum Verbosity {
     High,
 }
 
-/// Request-side cache intent. The adapter derives any provider cache key from
-/// the stable prefix and route-bound identity; callers do not supply a key.
+/// Request-side cache intent. The adapter derives the provider cache key from
+/// route-bound identity alone, so it stays constant as the cached prefix grows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CacheIntent {
     pub enabled: bool,
@@ -3728,10 +3727,7 @@ flags = ["a", "b"]"#,
             enabled: true,
             namespace: Some("cache-b".into()),
             retention: Some(CacheRetention::InMemory),
-            stable_prefix: Some(StablePrefixMetadata {
-                segment_count: 2,
-                fingerprint: Some("prefix".into()),
-            }),
+            stable_prefix: Some(StablePrefixMetadata { segment_count: 2 }),
         };
         assert_eq!(with_retention.retention, Some(CacheRetention::InMemory));
         assert_eq!(
@@ -3873,10 +3869,7 @@ flags = ["a", "b"]"#,
             enabled: true,
             namespace: Some("test-cache".into()),
             retention: Some(CacheRetention::TwentyFourHours),
-            stable_prefix: Some(StablePrefixMetadata {
-                segment_count: 0,
-                fingerprint: Some("stable".into()),
-            }),
+            stable_prefix: Some(StablePrefixMetadata { segment_count: 0 }),
         };
         assert_eq!(cache.retention, Some(CacheRetention::TwentyFourHours));
         assert!(cache.stable_prefix.is_some());

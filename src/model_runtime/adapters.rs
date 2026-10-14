@@ -3460,12 +3460,6 @@ fn cache_key_for_completions(
     }
 
     let namespace = input.cache.namespace.as_deref().unwrap_or("completions");
-    let prefix = input
-        .cache
-        .stable_prefix
-        .as_ref()
-        .and_then(|prefix| prefix.fingerprint.as_deref())
-        .unwrap_or("stable");
     let shape = StableCacheShape {
         model: &request.model,
         tools: &request.tools,
@@ -3485,7 +3479,7 @@ fn cache_key_for_completions(
     })?;
     let digest = crate::request_builder::sha256_hex(&wire);
     Ok(format!(
-        "{namespace}:{}:{}:{prefix}:{digest}",
+        "{namespace}:{}:{}:{digest}",
         binding.identity.profile_identity.as_str(),
         binding.identity.route_identity.as_str()
     ))
@@ -3493,14 +3487,8 @@ fn cache_key_for_completions(
 
 fn cache_key(binding: &ResponsesBinding, input: &ModelRequestInput) -> String {
     let namespace = input.cache.namespace.as_deref().unwrap_or("responses");
-    let fingerprint = input
-        .cache
-        .stable_prefix
-        .as_ref()
-        .and_then(|prefix| prefix.fingerprint.as_deref())
-        .unwrap_or("stable");
     format!(
-        "{namespace}:{}:{}:{fingerprint}",
+        "{namespace}:{}:{}",
         binding.identity.profile_identity.as_str(),
         binding.identity.route_identity.as_str()
     )
@@ -4885,10 +4873,7 @@ mod tests {
             (4, Some(1)),
             (5, Some(1)),
         ] {
-            input.cache.stable_prefix = Some(StablePrefixMetadata {
-                segment_count,
-                fingerprint: None,
-            });
+            input.cache.stable_prefix = Some(StablePrefixMetadata { segment_count });
             let prepared = binding.prepare_request(&input).unwrap();
             let body: Value = serde_json::from_slice(&prepared.body).unwrap();
             assert_eq!(body["messages"].as_array().unwrap().len(), 3);
@@ -5034,10 +5019,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
             enabled: true,
             namespace: None,
             retention: None,
-            stable_prefix: Some(StablePrefixMetadata {
-                segment_count: 3,
-                fingerprint: Some("stable".into()),
-            }),
+            stable_prefix: Some(StablePrefixMetadata { segment_count: 3 }),
         };
         let prepared = binding.prepare_request(&request).unwrap();
         assert_eq!(prepared.protocol_headers["anthropic-version"], "2023-06-01");
@@ -5439,10 +5421,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
         request.cache = CacheIntent {
             enabled: true,
             namespace: Some("chat".into()),
-            stable_prefix: Some(StablePrefixMetadata {
-                segment_count: 2,
-                fingerprint: Some("prefix".into()),
-            }),
+            stable_prefix: Some(StablePrefixMetadata { segment_count: 2 }),
             retention: None,
         };
         let body: Value =
@@ -5458,7 +5437,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
         assert!(
             body["prompt_cache_key"]
                 .as_str()
-                .is_some_and(|key| key.starts_with("chat:standard:route:prefix:"))
+                .is_some_and(|key| key.starts_with("chat:standard:route:"))
         );
         assert_eq!(body["service_tier"], "priority");
 
@@ -5517,10 +5496,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
                 enabled: true,
                 namespace: Some("chat".into()),
                 retention: None,
-                stable_prefix: Some(StablePrefixMetadata {
-                    segment_count: 1,
-                    fingerprint: Some("same-prefix".into()),
-                }),
+                stable_prefix: Some(StablePrefixMetadata { segment_count: 1 }),
             };
             request
         };
@@ -5809,17 +5785,14 @@ anthropic_thinking = { mode = "adaptive" }"#,
             enabled: true,
             namespace: Some("golden".into()),
             retention: Some(CacheRetention::TwentyFourHours),
-            stable_prefix: Some(StablePrefixMetadata {
-                segment_count: 2,
-                fingerprint: Some("abc".into()),
-            }),
+            stable_prefix: Some(StablePrefixMetadata { segment_count: 2 }),
         };
         let body: Value =
             serde_json::from_slice(&binding.prepare_request(&request).unwrap().body).unwrap();
         assert_eq!(body["instructions"], "system one\n\nsystem two");
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["service_tier"], "priority");
-        assert_eq!(body["prompt_cache_key"], "golden:standard:route:abc");
+        assert_eq!(body["prompt_cache_key"], "golden:standard:route");
         assert_eq!(body["prompt_cache_retention"], "24h");
         assert_eq!(body["reasoning"]["effort"], "high");
     }
