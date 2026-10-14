@@ -1,4 +1,3 @@
-use crate::delegation::{delegation_usage_list, find_expert};
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use serde::{Deserialize, Serialize};
@@ -146,7 +145,6 @@ pub enum FakeCommand {
 pub enum CommandIntent {
     Prompt(String),
     Language(Option<String>),
-    Delegate { agent_name: String, task: String },
     Help,
     Exit,
     PermissionShow,
@@ -535,14 +533,6 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         return Ok(CommandIntent::Exit);
     }
 
-    if trimmed.starts_with("@skill(") {
-        return Ok(CommandIntent::Prompt(trimmed.to_string()));
-    }
-
-    if trimmed.starts_with('@') {
-        return parse_delegate_command(trimmed);
-    }
-
     if !trimmed.starts_with('/') {
         return Ok(CommandIntent::Prompt(trimmed.to_string()));
     }
@@ -781,39 +771,6 @@ fn parse_resume(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     }
 }
 
-fn parse_delegate_command(input: &str) -> Result<CommandIntent, CommandParseError> {
-    let trimmed = input.trim();
-    let Some(rest) = trimmed.strip_prefix('@') else {
-        unreachable!();
-    };
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let agent_name = parts.next().unwrap_or_default().trim();
-    let task = parts.next().map(str::trim).unwrap_or_default();
-
-    if agent_name.is_empty() {
-        return Err(CommandParseError::new(format!(
-            "Usage: {}",
-            delegation_usage_list()
-        )));
-    }
-
-    let Some(expert) = find_expert(agent_name) else {
-        return Err(CommandParseError::with_args(
-            "parse.unknown_expert",
-            [("value", agent_name)],
-        ));
-    };
-
-    if task.is_empty() {
-        return Err(CommandParseError::new(format!("Usage: {}", expert.usage)));
-    }
-
-    Ok(CommandIntent::Delegate {
-        agent_name: expert.agent_name.to_string(),
-        task: task.to_string(),
-    })
-}
-
 fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     match parts {
         ["/child"] => Ok(CommandIntent::Child(ChildNavigation::Toggle)),
@@ -1020,17 +977,12 @@ mod tests {
                 [("value", "maybe")]
             ))
         );
-        assert_eq!(
-            parse_command("@fixer"),
-            Err(CommandParseError::new("Usage: @fixer <task>"))
-        );
-        assert_eq!(
-            parse_command("@unknown foo"),
-            Err(CommandParseError::with_args(
-                "parse.unknown_expert",
-                [("value", "unknown")]
-            ))
-        );
+        for input in ["@", "@fixer", "@explorer inspect src/", "@unknown foo"] {
+            assert_eq!(
+                parse_command(input),
+                Ok(CommandIntent::Prompt(input.into()))
+            );
+        }
         assert_eq!(
             parse_command("/explore inspect src/main.rs"),
             Err(CommandParseError::new(

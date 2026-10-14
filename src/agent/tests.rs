@@ -3249,7 +3249,9 @@ fn closing_a_failed_turn_lets_the_session_continue() {
     };
     {
         let mut recorder = transcript.lock().expect("lock transcript");
-        recorder.record_user_message("run it").expect("user message");
+        recorder
+            .record_user_message("run it")
+            .expect("user message");
         recorder
             .record_assistant_tool_call_batch(None, None, None, vec![call.clone()])
             .expect("assistant tool call batch");

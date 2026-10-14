@@ -43,14 +43,6 @@ custom_value = "自定义…"
 discarded = "未保存的改动已丢弃"
 unavailable = "配置文件不可用"
 
-[expert]
-explorer = "委派只读探索任务"
-fixer = "委派实现或修复任务"
-oracle = "委派审查或审计任务"
-designer = "委派用户体验或设计任务"
-librarian = "委派文档或资料整理任务"
-general = "委派通用任务执行"
-
 [help]
 title = "帮助"
 hint_document = "Esc 关闭 · Tab 目录 · ↑↓ 滚动 · PgUp/PgDn 翻页"
@@ -72,7 +64,6 @@ unknown_panel = "未知面板模式。可用值：on 或 off。"
 unknown_theme = "未知主题。用 /theme 查看可用主题，或使用 themes/*.toml 中的主题 ID。"
 unknown_fake = "未知伪装模式：{value}。可用 auto、codex、anthropic 或 off。"
 unknown_child_navigation = "未知子代理导航：{value}。可用 first、next 或 prev。"
-unknown_expert = "未知专家：{value}。可用 @explorer、@fixer、@oracle、@designer、@librarian 或 @general。"
 
 
 [language]

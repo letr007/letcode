@@ -898,7 +898,6 @@ fn parse_repl_command(input: &str) -> ReplCommand {
             "Unsupported: /language and /lang are available only in the TUI.".into(),
         ),
         CommandIntent::Prompt(_)
-        | CommandIntent::Delegate { .. }
         | CommandIntent::PermissionSet(_)
         | CommandIntent::ModelSet(_)
         | CommandIntent::FastToggle
@@ -944,9 +943,6 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
                 "CLI does not support history navigation yet; use the TUI.".into(),
             )
         }
-        SessionCommand::DelegateSubagent { .. } => ReplCommand::Unsupported(
-            "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
-        ),
         SessionCommand::ViewChild { .. } | SessionCommand::ViewParent => ReplCommand::Unsupported(
             "CLI does not support /child yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
         ),

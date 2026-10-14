@@ -278,9 +278,9 @@ mod tests {
             1,
             1,
         );
-        state.set_input("@fi");
+        state.set_input("/fa");
 
         let rendered = draw_panel(&state, 72, 6);
-        assert!(!rendered.contains("@fixer"), "{rendered}");
+        assert!(!rendered.contains("/fast"), "{rendered}");
     }
 }

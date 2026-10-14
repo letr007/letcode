@@ -9,10 +9,6 @@ use super::*;
 #[derive(Debug)]
 pub(crate) enum SessionEngineCommand {
     Prompt(crate::user_content::UserMessageSubmission),
-    DelegateSubagent {
-        agent_name: String,
-        task: String,
-    },
     BackgroundSubagentCompleted {
         parent_session_id: String,
         parent_tool_call_id: Option<String>,
@@ -51,9 +47,6 @@ impl SessionEngineCommand {
     pub(crate) fn from_session_command(command: SessionCommand) -> Self {
         match command {
             SessionCommand::SubmitPrompt(prompt) => Self::Prompt(prompt),
-            SessionCommand::DelegateSubagent { agent_name, task } => {
-                Self::DelegateSubagent { agent_name, task }
-            }
             SessionCommand::Compact => Self::Compact,
             SessionCommand::ShowHistoryTree => Self::ShowHistoryTree,
             SessionCommand::Undo => Self::Undo,
@@ -132,12 +125,6 @@ pub(crate) fn session_engine_command_as_session_command(
             navigation: *navigation,
             anchor_child_session_id: anchor_child_session_id.clone(),
         }),
-        SessionEngineCommand::DelegateSubagent { agent_name, task } => {
-            Some(crate::session::SessionCommand::DelegateSubagent {
-                agent_name: agent_name.clone(),
-                task: task.clone(),
-            })
-        }
         SessionEngineCommand::BackgroundSubagentCompleted { .. }
         | SessionEngineCommand::ContinueSession => None,
         SessionEngineCommand::Compact => Some(crate::session::SessionCommand::Compact),
@@ -306,7 +293,6 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         SessionEngineCommand::SetReasoningEffort(_) => Some(DeferredCommandKey::ReasoningEffort),
         SessionEngineCommand::SetFakeClient(_) => Some(DeferredCommandKey::FakeClient),
         SessionEngineCommand::Prompt(_)
-        | SessionEngineCommand::DelegateSubagent { .. }
         | SessionEngineCommand::BackgroundSubagentCompleted { .. }
         | SessionEngineCommand::ContinueSession
         | SessionEngineCommand::Compact
@@ -435,6 +421,7 @@ pub(crate) async fn next_idle_session_operation(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn select_active_session_operation<T, F>(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,

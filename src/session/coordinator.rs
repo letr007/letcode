@@ -279,7 +279,6 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SubmitPrompt(_)
-            | SessionCommand::DelegateSubagent { .. }
             | SessionCommand::Compact
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
@@ -797,7 +796,6 @@ impl SessionCoordinator {
             | SessionCommand::ViewParent
             | SessionCommand::ViewChild { .. } => CommandOwnership::IdleCoordinator,
             SessionCommand::SubmitPrompt(_)
-            | SessionCommand::DelegateSubagent { .. }
             | SessionCommand::Compact
             | SessionCommand::SetModel(_)
             | SessionCommand::SetExpertAllowedModels { .. }

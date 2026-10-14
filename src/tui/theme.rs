@@ -193,10 +193,6 @@ impl Theme {
         Style::default().bg(self.elevated_bg).fg(self.text)
     }
 
-    pub fn user_style(self) -> Style {
-        Style::default().fg(self.user).bg(self.surface_bg)
-    }
-
     pub fn error_style(self) -> Style {
         Style::default().fg(self.error).bg(self.surface_bg)
     }

@@ -20,7 +20,7 @@ letcode
 - Type a task and press `Enter`. Include the goal and relevant files.
 - Type `/help` or `/?` to open this manual.
 
-Type `/` for command completion or `@` for expert completion.
+Type `/` for command completion.
 Use `↑` / `↓` to choose an entry and `Tab` to insert it.
 Add any arguments before submitting the completed command.
 
@@ -107,27 +107,12 @@ Compaction summarizes history; session logs retain the original records.
 
 ## Experts and child sessions
 
-For direct delegation, start a message with an expert name such as `@explorer`, then a task.
-Keep the task bounded and state the expected result.
-
-- `@explorer` explores repository code without editing it.
-- `@fixer` implements or repairs files within an assigned write scope.
-- `@oracle` analyzes root causes, risks, and verification plans without editing files.
-- `@designer` develops designs and interface decisions without editing files.
-- `@librarian` gathers documentation and reference material without editing files.
-- `@general` handles bounded general-purpose tasks and can edit files within an assigned write scope.
-
-```text
-@explorer Find the authentication entry points without changing files.
-```
-
+The main agent delegates tasks with the `agent__*` tools.
+Specify the task, expected result and target paths to the main agent.
 `fixer` and `general` require non-empty `owned_paths` to acquire write locks.
-The `@fixer <task>` and `@general <task>` shorthands pass only task text and are rejected without assigned paths.
-To use these experts, specify the task and target paths to the main agent so it can delegate.
 
 `/agents` configures expert model choices; it does not start a task.
 `reviewer` handles permission review and `historian` handles context summaries.
-They are internal experts and cannot be invoked with `@`.
 
 `/child` toggles between parent and child views.
 `/child first`, `/child next` and `/child prev` select a child to read.

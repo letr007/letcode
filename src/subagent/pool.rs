@@ -591,30 +591,6 @@ impl SubagentPool {
         ordinal
     }
 
-    pub async fn run_named_governed(
-        &self,
-        parent: &Agent,
-        agent_name: &str,
-        invocation: SubagentInvocation,
-        sessions_dir: impl AsRef<Path>,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender>,
-    ) -> Result<SubagentRunSummary> {
-        self.complete_started_run(self.start_named_governed(
-            parent,
-            agent_name,
-            invocation,
-            sessions_dir,
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            event_sender,
-        )?)
-        .await
-    }
-
     pub fn start_named_governed(
         &self,
         parent: &Agent,

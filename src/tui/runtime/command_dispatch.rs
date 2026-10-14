@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_delegation_reaches_engine_before_projecting_running_state() {
+    fn idle_at_prefixed_prompt_reaches_engine_as_text() {
         let mut runtime = runtime();
         runtime
             .state_mut()
@@ -89,7 +89,7 @@ mod tests {
         let command = runtime
             .handle_input_action(crate::tui::InputAction::Submit)
             .unwrap()
-            .expect("idle delegation produces a command");
+            .expect("idle prompt produces a command");
         let (mut engine, ingress, _egress) = SessionEngine::new();
 
         dispatch_command(&mut runtime, command, &ingress, true);
@@ -97,8 +97,8 @@ mod tests {
         assert!(matches!(
             engine.try_recv_control(),
             Ok(SessionEngineControl::Command(
-                crate::session::engine::SessionEngineCommand::DelegateSubagent { agent_name, task }
-            )) if agent_name == "explorer" && task == "inspect the workspace"
+                crate::session::engine::SessionEngineCommand::Prompt(prompt)
+            )) if prompt.content.text == "@explorer inspect the workspace"
         ));
         assert!(runtime.session_turn_active);
         assert_eq!(runtime.state.phase, AppPhase::Running);
@@ -108,47 +108,38 @@ mod tests {
                 .timeline
                 .items()
                 .iter()
-                .filter(|item| { matches!(item, crate::tui::TimelineItem::Delegation(_)) })
+                .filter(|item| matches!(item, crate::tui::TimelineItem::User(_)))
                 .count(),
             1
         );
     }
 
     #[test]
-    fn compact_and_delegation_reject_active_turn_without_ending_it() {
-        for input in ["/compact", "@explorer inspect the workspace"] {
-            let mut runtime = runtime();
-            runtime.session_turn_active = true;
-            runtime.state.phase = AppPhase::Running;
-            runtime.state_mut().set_input(input);
-            assert!(
-                runtime
-                    .handle_input_action(crate::tui::InputAction::Submit)
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(runtime.state.input_buffer, input);
-            let (mut engine, ingress, _egress) = SessionEngine::new();
-            let command = if input == "/compact" {
-                crate::session::SessionCommand::Compact
-            } else {
-                crate::session::SessionCommand::DelegateSubagent {
-                    agent_name: "explorer".into(),
-                    task: "inspect the workspace".into(),
-                }
-            };
-            dispatch_command(&mut runtime, command, &ingress, true);
-            assert!(matches!(
-                engine.try_recv_control(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ));
-            assert!(runtime.session_turn_active);
-            assert_eq!(runtime.state.phase, AppPhase::Running);
-            assert_eq!(
-                runtime.state.toast().map(|toast| toast.message.clone()),
-                Some(runtime.state.t("runtime.turn_running"))
-            );
-        }
+    fn compact_rejects_active_turn_without_ending_it() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state.phase = AppPhase::Running;
+        runtime.state_mut().set_input("/compact");
+        assert!(
+            runtime
+                .handle_input_action(crate::tui::InputAction::Submit)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(runtime.state.input_buffer, "/compact");
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        let command = crate::session::SessionCommand::Compact;
+        dispatch_command(&mut runtime, command, &ingress, true);
+        assert!(matches!(
+            engine.try_recv_control(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(runtime.session_turn_active);
+        assert_eq!(runtime.state.phase, AppPhase::Running);
+        assert_eq!(
+            runtime.state.toast().map(|toast| toast.message.clone()),
+            Some(runtime.state.t("runtime.turn_running"))
+        );
     }
 
     #[test]

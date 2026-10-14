@@ -1,5 +1,4 @@
 use crate::command::command_metadata;
-use crate::delegation::DELEGATION_EXPERTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommandEntry {
@@ -31,17 +30,8 @@ pub fn slash_query(input: &str) -> Option<String> {
     Some(trimmed_start.trim_end().to_string())
 }
 
-pub fn expert_query(input: &str) -> Option<String> {
-    let trimmed_start = input.trim_start();
-    if !trimmed_start.starts_with('@') {
-        return None;
-    }
-
-    Some(trimmed_start.trim_end().to_string())
-}
-
 pub fn completion_query(input: &str) -> Option<String> {
-    slash_query(input).or_else(|| expert_query(input))
+    slash_query(input)
 }
 
 pub fn matching_slash_commands(input: &str) -> Vec<SlashCommandEntry> {
@@ -55,28 +45,8 @@ pub fn matching_slash_commands(input: &str) -> Vec<SlashCommandEntry> {
         .collect()
 }
 
-pub fn matching_expert_commands(input: &str) -> Vec<SlashCommandEntry> {
-    let Some(query) = expert_query(input) else {
-        return Vec::new();
-    };
-
-    DELEGATION_EXPERTS
-        .iter()
-        .map(|expert| SlashCommandEntry {
-            command: expert.command,
-            insert_text: expert.insert_text,
-            description_key: expert.description_key,
-        })
-        .filter(|entry| entry.command.starts_with(query.as_str()))
-        .collect()
-}
-
 pub fn matching_completion_commands(input: &str) -> Vec<SlashCommandEntry> {
-    if input.trim_start().starts_with('@') {
-        matching_expert_commands(input)
-    } else {
-        matching_slash_commands(input)
-    }
+    matching_slash_commands(input)
 }
 
 #[cfg(test)]

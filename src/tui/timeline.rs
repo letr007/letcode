@@ -25,7 +25,6 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
     User(MessageView),
-    Delegation(DelegationView),
     Reasoning(ReasoningView),
     Assistant(MessageView),
     Tool(ToolView),
@@ -54,10 +53,6 @@ impl TimelineItem {
                 }
                 .into(),
                 text: reasoning.text.clone(),
-            }],
-            Self::Delegation(delegation) => vec![DisplayBlock::StatusLine {
-                label: "delegate".into(),
-                text: format!("@{} — {}", delegation.agent_name, delegation.task),
             }],
             Self::Tool(tool) => {
                 let mut blocks = vec![DisplayBlock::StatusLine {
@@ -287,12 +282,6 @@ pub struct ReasoningView {
     pub duration_ms: Option<u64>,
     pub transition_from: Option<String>,
     pub transition_started_at: Option<std::time::Instant>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DelegationView {
-    pub agent_name: String,
-    pub task: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -988,13 +977,6 @@ impl Timeline {
             }
             self.bump_revision(index);
         }
-    }
-
-    pub fn push_delegation(&mut self, agent_name: impl Into<String>, task: impl Into<String>) {
-        self.push_item(TimelineItem::Delegation(DelegationView {
-            agent_name: agent_name.into(),
-            task: task.into(),
-        }));
     }
 
     pub fn finalize_reasoning(&mut self, event: crate::tui::events::ReasoningDoneEvent) {

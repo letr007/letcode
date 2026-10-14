@@ -24,10 +24,6 @@ pub(crate) enum ActiveTurnCommandDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     SubmitPrompt(UserMessageSubmission),
-    DelegateSubagent {
-        agent_name: String,
-        task: String,
-    },
     Compact,
     ShowHistoryTree,
     Undo,
@@ -77,10 +73,9 @@ impl SessionCommand {
                 (false, ActiveTurnCommandDisposition::Defer)
             }
             Self::Interrupt => (false, ActiveTurnCommandDisposition::Interrupt),
-            Self::DelegateSubagent { .. }
-            | Self::Compact
-            | Self::ResumeSession(_)
-            | Self::NewSession => (false, ActiveTurnCommandDisposition::Reject),
+            Self::Compact | Self::ResumeSession(_) | Self::NewSession => {
+                (false, ActiveTurnCommandDisposition::Reject)
+            }
             Self::ShowHistoryTree | Self::Undo | Self::Redo | Self::NavigateHistory { .. } => {
                 (true, ActiveTurnCommandDisposition::Reject)
             }
@@ -114,9 +109,6 @@ impl SessionCommand {
                     id,
                     crate::user_content::UserMessageContent::from(text),
                 )))
-            }
-            CommandIntent::Delegate { agent_name, task } => {
-                Some(Self::DelegateSubagent { agent_name, task })
             }
             CommandIntent::Compact => Some(Self::Compact),
             CommandIntent::Tree => Some(Self::ShowHistoryTree),

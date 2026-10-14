@@ -86,25 +86,12 @@ impl<'a> TuiSessionCommandAdapter<'a> {
         if deferred {
             self.runtime.project_deferred_setting(&command);
         }
-        match command {
-            SessionCommand::Compact => {
-                self.runtime.state.mark_session_active();
-                self.runtime.state.phase = AppPhase::Running;
-                self.runtime.session_turn_active = true;
-                let message = self.runtime.state.t("runtime.compacting_context");
-                self.runtime.show_toast(message, ToastKind::Info);
-            }
-            SessionCommand::DelegateSubagent { agent_name, task } => {
-                self.runtime.state.mark_session_active();
-                self.runtime.state.phase = AppPhase::Running;
-                self.runtime.session_turn_active = true;
-                self.runtime
-                    .state
-                    .timeline
-                    .push_delegation(agent_name, task);
-                self.runtime.state.toast = None;
-            }
-            _ => {}
+        if command == SessionCommand::Compact {
+            self.runtime.state.mark_session_active();
+            self.runtime.state.phase = AppPhase::Running;
+            self.runtime.session_turn_active = true;
+            let message = self.runtime.state.t("runtime.compacting_context");
+            self.runtime.show_toast(message, ToastKind::Info);
         }
         Ok(())
     }
@@ -120,9 +107,7 @@ impl<'a> TuiSessionCommandAdapter<'a> {
 impl SessionCommandHandler for TuiSessionCommandAdapter<'_> {
     fn handle(&mut self, command: SessionCommand) -> Result<()> {
         match command {
-            SessionCommand::SubmitPrompt(_)
-            | SessionCommand::DelegateSubagent { .. }
-            | SessionCommand::Compact
+            SessionCommand::SubmitPrompt(_) | SessionCommand::Compact
                 if !self.allow_submit_family =>
             {
                 // Mouse path must not start turns or compaction.

@@ -43,14 +43,6 @@ custom_value = "Custom…"
 discarded = "Unsaved changes were discarded"
 unavailable = "Configuration file is unavailable"
 
-[expert]
-explorer = "Delegate a read-only exploration task"
-fixer = "Delegate an implementation or repair task"
-oracle = "Delegate a review or audit task"
-designer = "Delegate UX or design-oriented work"
-librarian = "Delegate documentation or reference gathering"
-general = "Delegate general-purpose task execution"
-
 [help]
 title = "Help"
 hint_document = "Esc close · Tab contents · ↑↓ scroll · PgUp/PgDn page"
@@ -73,7 +65,6 @@ unknown_panel = "Unknown panel mode. Use on or off."
 unknown_theme = "Unknown theme. Use /theme to see the available themes, or a themes/*.toml id."
 unknown_fake = "Unknown fake mode: {value}. Use auto, codex, anthropic, or off."
 unknown_child_navigation = "Unknown child navigation: {value}. Use first, next, or prev."
-unknown_expert = "Unknown expert: {value}. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
 
 
 [language]

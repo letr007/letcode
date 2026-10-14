@@ -11,7 +11,7 @@ letcode
 ## 界面布局
 
 - 时间线显示对话记录、模型回复、思考内容、工具调用卡片和子代理状态。助手文本随输出追加。
-- 输入面板支持多行编辑、输入历史、命令补全和专家补全。面板显示当前模型、服务商、推理强度和权限模式。
+- 输入面板支持多行编辑、输入历史、命令补全。面板显示当前模型、服务商、推理强度和权限模式。
 - 底部状态栏显示执行状态。Token 用量、缓存命中率、输出速率和分支信息按可用宽度显示。
 - 侧边栏显示会话信息、上下文用量、MCP 服务状态和任务清单。先按 `Ctrl+X`，再按 `b` 切换显示。
 
@@ -91,7 +91,7 @@ TUI 内置英文和简体中文。
 - `src/tui/components/help_reader.rs` 渲染帮助面板、目录和正文。
 - `src/tui/input.rs` 映射键盘、鼠标和粘贴事件。
 - `src/command.rs` 定义命令元数据和参数解析。
-- `src/tui/slash.rs` 匹配命令与专家补全条目。
+- `src/tui/slash.rs` 匹配命令补全条目。
 - `src/tui/markdown.rs`、`src/tui/math.rs` 和 `src/tui/mermaid/` 渲染 Markdown、公式和图表。
 - `src/tui/i18n.rs` 提供界面翻译。
 - `src/tui/theme.rs` 和 `src/tui/theme_file.rs` 管理内置与外部主题。

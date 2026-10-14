@@ -3646,7 +3646,7 @@ fn running_turn_preserves_selected_skills_in_queued_prompt() {
 }
 
 #[test]
-fn running_turn_rejects_delegate_commands_without_queueing() {
+fn running_turn_queues_at_prefixed_prompts() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
     runtime.state_mut().set_input("@fixer fix failing test");
@@ -3656,18 +3656,13 @@ fn running_turn_rejects_delegate_commands_without_queueing() {
         .expect("submit succeeds");
 
     assert_eq!(command, None);
-    assert_eq!(runtime.queued_prompts.len(), 0);
-    assert!(runtime.submitted_prompts().is_empty());
-    assert_eq!(runtime.state().input_buffer, "@fixer fix failing test");
-
-    assert!(
-        !runtime
-            .state()
-            .timeline
-            .items()
-            .iter()
-            .any(|item| matches!(item, TimelineItem::Delegation(_)))
+    assert_eq!(runtime.queued_prompts.len(), 1);
+    assert_eq!(
+        runtime.queued_prompts[0].content.text,
+        "@fixer fix failing test"
     );
+    assert_eq!(runtime.submitted_prompts(), &["@fixer fix failing test"]);
+    assert!(runtime.state().input_buffer.is_empty());
 }
 
 #[test]

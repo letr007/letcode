@@ -26,8 +26,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        DelegationView, ErrorView, MessageView, PermissionPromptStatus, PermissionView,
-        ReasoningView, TimelineItem, ToolExecutionStatus, ToolView,
+        ErrorView, MessageView, PermissionPromptStatus, PermissionView, ReasoningView,
+        TimelineItem, ToolExecutionStatus, ToolView,
     },
     transcript_ratatui,
     transcript_render::{
@@ -997,9 +997,6 @@ impl Component<Style> for TimelineItemComponent<'_> {
                 self.next_reasoning,
                 self.compact_reasoning_elapsed_ms,
             ),
-            TimelineItem::Delegation(delegation) => {
-                build_delegation_lines(&mut out, delegation, self.theme, self.width)
-            }
             TimelineItem::Assistant(message) => {
                 let fade = message.is_fading(self.now).then_some(AssistantFade {
                     reveals: &message.reveal_tail,
@@ -1568,28 +1565,6 @@ fn format_elapsed_duration(elapsed_ms: u64) -> String {
             format!("{minutes}m {seconds}s")
         }
     }
-}
-
-fn build_delegation_lines(
-    out: &mut TimelineDocument,
-    delegation: &DelegationView,
-    theme: Theme,
-    width: usize,
-) {
-    let status = format!("delegate @{}", delegation.agent_name);
-    let summary = one_line_snippet(&delegation.task, width.saturating_sub(20).max(1));
-    let summary_len = summary.chars().count();
-    let block = out.add_source(summary.clone());
-    out.push_content(
-        format!("  {status} · "),
-        theme.user_style().add_modifier(Modifier::BOLD),
-        summary,
-        theme.app_style(),
-        SourceRange::new(block, 0, summary_len),
-        "",
-        theme.app_style(),
-        Break::End,
-    );
 }
 
 fn reasoning_title_and_body(text: &str) -> (Option<String>, String) {

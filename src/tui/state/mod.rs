@@ -4857,25 +4857,6 @@ mod tests {
     }
 
     #[test]
-    fn expert_panel_is_hidden_in_child_view() {
-        let mut state = TuiState::default();
-        state.set_input("@or");
-        assert!(state.slash_panel_is_open());
-
-        state.replace_child_timeline_from_records(
-            &[],
-            "parent-session",
-            "child-session",
-            "explorer",
-            0,
-            1,
-            1,
-        );
-
-        assert!(!state.slash_panel_is_open());
-    }
-
-    #[test]
     fn child_view_metadata_prefers_latest_model_change() {
         let records = vec![
             TranscriptRecord {

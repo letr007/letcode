@@ -3514,6 +3514,10 @@ mod historian_config_tests {
         assert!(AgentsConfig::default().config_for("historian").is_some());
         assert!(AgentsConfig::default().route_for("historian").is_none());
         assert!(crate::delegation::is_system_expert("historian"));
-        assert!(crate::delegation::find_expert("historian").is_none());
+        assert!(
+            !crate::delegation::DELEGATION_EXPERTS
+                .iter()
+                .any(|expert| expert.agent_name == "historian")
+        );
     }
 }

@@ -71,5 +71,4 @@ pub use restore::{prepare_resume_package, project_runtime_restore_snapshot_with_
 pub(crate) use runner::PermissionResponse;
 pub(crate) use runner::{
     AgentRunner, RunnerPermissionRequest, RunnerQuestionRequest, SessionTransportEvent,
-    subagent_event_sender,
 };

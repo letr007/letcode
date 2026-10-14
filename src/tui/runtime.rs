@@ -2745,7 +2745,6 @@ impl TuiRuntime {
             crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
-            | crate::session::SessionCommand::DelegateSubagent { .. }
             | crate::session::SessionCommand::Compact
             | crate::session::SessionCommand::ShowHistoryTree
             | crate::session::SessionCommand::Undo
@@ -2791,7 +2790,6 @@ impl TuiRuntime {
             crate::session::SessionCommand::ToggleFastMode
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
-            | crate::session::SessionCommand::DelegateSubagent { .. }
             | crate::session::SessionCommand::Compact
             | crate::session::SessionCommand::ShowHistoryTree
             | crate::session::SessionCommand::Undo
@@ -3174,8 +3172,7 @@ impl TuiRuntime {
             CommandIntent::McpBrowse => self.show_mcp_dialog(),
             CommandIntent::SkillBrowse => self.show_skill_dialog(),
             CommandIntent::ConfigShow => self.show_config_dialog(),
-            CommandIntent::Delegate { .. }
-            | CommandIntent::PermissionSet(_)
+            CommandIntent::PermissionSet(_)
             | CommandIntent::ModelSet(_)
             | CommandIntent::FastToggle
             | CommandIntent::ReasoningSet(_)
@@ -3268,9 +3265,6 @@ impl TuiRuntime {
                 }
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
             }
-            SessionCommand::DelegateSubagent { agent_name, task } => Ok(Some(
-                SubmittedCommand::Runtime(RuntimeCommand::DelegateSubagent { agent_name, task }),
-            )),
             SessionCommand::ToggleMcpServer(server_name) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleMcpServer(server_name),
             ))),
