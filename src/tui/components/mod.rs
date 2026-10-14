@@ -1,5 +1,6 @@
 pub mod choice;
 pub mod composer;
+pub mod delegation_card;
 pub mod dialog;
 pub mod diff_render;
 pub mod footer;

@@ -913,6 +913,14 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_subagent_delegation(
+        &mut self,
+        run_id: String,
+        input: crate::tool::NormalizedSubagentInput,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::SubagentDelegation { run_id, input })
+    }
+
     pub fn record_subagent_lifecycle(
         &mut self,
         run_id: impl Into<String>,

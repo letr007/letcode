@@ -67,8 +67,6 @@ impl NormalizedSubagentInput {
             ));
         }
 
-        lines.push("委派约定：不要递归委派；保持在给定范围内，并简洁报告发现或实现结果。".into());
-
         if tool_name == tool_names::TOOL_AGENT_EXPLORE {
             lines.push("模式：仅只读探索。".into());
         }

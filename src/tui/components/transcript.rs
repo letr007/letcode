@@ -39,8 +39,8 @@ use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
 use super::{
-    composer::one_line_snippet, historian_report, reviewer_cards, structured_subagent, todo_card,
-    tool_card,
+    composer::one_line_snippet, delegation_card, historian_report, reviewer_cards,
+    structured_subagent, todo_card, tool_card,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -1046,6 +1046,19 @@ impl Component<Style> for TimelineItemComponent<'_> {
                         self.translator,
                     );
                 }
+            }
+            TimelineItem::Delegation(delegation) => {
+                append_card_document(
+                    &mut out,
+                    delegation_card::render_delegation_card_document(
+                        delegation,
+                        self.theme,
+                        card_content_width(self.width, self.theme),
+                        self.translator,
+                    ),
+                    self.width,
+                    self.theme,
+                );
             }
             TimelineItem::Todo(todo) => build_todo_card(&mut out, todo, self.theme, self.width),
             TimelineItem::Permission(permission) => {

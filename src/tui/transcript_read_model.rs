@@ -9,7 +9,9 @@ use super::events::{
     AutoContinueChangedEvent, ErrorEvent, TodoSnapshotEvent, ToolFinishedEvent, ToolOutcome,
     ToolStartedEvent, UserMessageEvent,
 };
-use super::timeline::{MessageRole, PermissionPromptStatus, Timeline, restored_tool_summary};
+use super::timeline::{
+    DelegationView, MessageRole, PermissionPromptStatus, Timeline, restored_tool_summary,
+};
 use crate::agent::AutoContinueState;
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
@@ -27,6 +29,8 @@ pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> 
 struct TranscriptTimelineProjection {
     timeline: Timeline,
     current_auto_continue: AutoContinueState,
+    /// The child's delegation prompt is recorded as a user message; the delegation block replaces it.
+    pending_delegation_prompt: bool,
 }
 
 impl TranscriptTimelineProjection {
@@ -34,6 +38,9 @@ impl TranscriptTimelineProjection {
         match &record.event {
             TranscriptEvent::UserMessage { content } => {
                 self.current_auto_continue = AutoContinueState::default();
+                if std::mem::take(&mut self.pending_delegation_prompt) {
+                    return;
+                }
                 self.timeline
                     .push_user_message(UserMessageEvent::from_submission(
                         UserMessageSubmission::new(
@@ -213,6 +220,18 @@ impl TranscriptTimelineProjection {
                     agent_name,
                     summary,
                 );
+            }
+            TranscriptEvent::SubagentDelegation { input, .. } => {
+                self.pending_delegation_prompt = true;
+                self.timeline.push_restored_delegation(DelegationView {
+                    objective: input.objective.clone(),
+                    success_criteria: input.success_criteria.clone(),
+                    owned_paths: input.owned_paths.clone(),
+                    allowed_paths: input.allowed_paths.clone(),
+                    forbidden_paths: input.forbidden_paths.clone(),
+                    model: input.model.clone(),
+                    target_child_session_id: input.target_child_session_id.clone(),
+                });
             }
             TranscriptEvent::SubagentResult { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
@@ -544,6 +563,50 @@ mod tests {
             },
         )]);
         assert!(timeline.items().is_empty());
+    }
+
+    #[test]
+    fn restored_delegation_renders_one_block_instead_of_the_prompt_message() {
+        let input = crate::tool::NormalizedSubagentInput {
+            objective: "implement bounded fix".into(),
+            success_criteria: vec!["tests pass".into()],
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: vec!["docs".into()],
+            owned_paths: vec!["src/tui".into()],
+            timeout_secs: None,
+            max_tool_calls: None,
+            model: Some("NewAPI/deepseek-flash".into()),
+            target_child_session_id: Some("child-42".into()),
+            background: false,
+        };
+        let prompt = input.render_for_delegate(crate::tool_names::TOOL_AGENT_FIXER);
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::SubagentDelegation {
+                    run_id: "run-1".into(),
+                    input,
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::UserMessage {
+                    content: prompt.into(),
+                },
+            ),
+        ]);
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Delegation(delegation)]
+                if delegation.objective == "implement bounded fix"
+                    && delegation.success_criteria == ["tests pass"]
+                    && delegation.owned_paths == ["src/tui"]
+                    && delegation.allowed_paths == ["src"]
+                    && delegation.forbidden_paths == ["docs"]
+                    && delegation.model.as_deref() == Some("NewAPI/deepseek-flash")
+                    && delegation.target_child_session_id.as_deref() == Some("child-42")
+        ));
     }
 
     #[test]

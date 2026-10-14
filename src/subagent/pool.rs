@@ -742,6 +742,17 @@ impl SubagentPool {
         event_sender: Option<SubagentEventSender>,
         takeover_child_session_id: Option<String>,
     ) -> Result<StartedRun> {
+        let mut template = template;
+        if crate::delegation::DELEGATION_EXPERTS
+            .iter()
+            .any(|expert| expert.agent_name == template.name)
+        {
+            template.system_prompt = format!(
+                "{}\n\n委派约定：不要递归委派；保持在给定范围内，并简洁报告发现或实现结果。\n\n{}",
+                template.system_prompt,
+                crate::subagent::REPORT_PROMPT
+            );
+        }
         let scope = SubagentPathScope::from_input(&governance.input)?;
         let path_access = run_path_access(&template, &governance.input, scope.as_ref())?;
         let mut reservation =
@@ -862,6 +873,8 @@ impl SubagentPool {
                     pool_ordinal,
                 )?;
 
+                child_recorder
+                    .record_subagent_delegation(run_id.clone(), governance.input.clone())?;
                 child_agent.install_validated_runtime_snapshot(runtime_snapshot);
                 child_agent.restore_turn_sequence(snapshot.max_turn_id);
 
@@ -903,6 +916,8 @@ impl SubagentPool {
                     task.clone(),
                     pool_ordinal,
                 )?;
+                child_recorder
+                    .record_subagent_delegation(run_id.clone(), governance.input.clone())?;
                 let snapshot = transcript_projection::project_runtime_restore_snapshot(
                     child_session_id.clone(),
                     read_records_allow_partial_tail(child_recorder.path())?,

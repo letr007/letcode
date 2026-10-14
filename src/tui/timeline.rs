@@ -28,6 +28,7 @@ pub enum TimelineItem {
     Reasoning(ReasoningView),
     Assistant(MessageView),
     Tool(ToolView),
+    Delegation(DelegationView),
     Todo(TodoView),
     Permission(PermissionView),
     AutoReview(AutoReviewDecisionView),
@@ -177,7 +178,7 @@ impl TimelineItem {
 
                 blocks
             }
-            Self::Compaction(_) => Vec::new(),
+            Self::Delegation(_) | Self::Compaction(_) => Vec::new(),
         }
     }
 }
@@ -292,6 +293,17 @@ pub struct ToolView {
     pub arguments: Option<String>,
     pub output: Option<String>,
     pub status: ToolExecutionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationView {
+    pub objective: String,
+    pub success_criteria: Vec<String>,
+    pub owned_paths: Vec<String>,
+    pub allowed_paths: Vec<String>,
+    pub forbidden_paths: Vec<String>,
+    pub model: Option<String>,
+    pub target_child_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +655,10 @@ impl Timeline {
             self.rebuild_lookup_indices();
             self.mark_mutated();
         }
+    }
+
+    pub(crate) fn push_restored_delegation(&mut self, view: DelegationView) {
+        self.push_item(TimelineItem::Delegation(view));
     }
 
     pub fn push_user_message(&mut self, event: UserMessageEvent) {

@@ -134,6 +134,10 @@ pub enum TranscriptEvent {
         #[serde(default)]
         pool_ordinal: u32,
     },
+    SubagentDelegation {
+        run_id: String,
+        input: crate::tool::NormalizedSubagentInput,
+    },
     SubagentLifecycle {
         run_id: String,
         parent_session_id: String,

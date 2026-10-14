@@ -2848,9 +2848,10 @@ async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
             .await
             .expect("subagent tool result records");
 
-        assert!(
-            prompts.lock().expect("captured prompt")[0].ends_with(crate::subagent::REPORT_PROMPT)
-        );
+        let prompt = prompts.lock().expect("captured prompt")[0].clone();
+        assert!(prompt.contains("implement bounded fix"));
+        assert!(!prompt.contains(crate::subagent::REPORT_PROMPT));
+        assert!(!prompt.contains("委派约定"));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::EvidenceRecorded(record)

@@ -3300,11 +3300,7 @@ impl Agent {
     }
 
     fn render_subagent_prompt(&self, tool_name: &str, input: &NormalizedSubagentInput) -> String {
-        format!(
-            "{}\n\n{}",
-            input.render_for_delegate(tool_name),
-            crate::subagent::REPORT_PROMPT
-        )
+        input.render_for_delegate(tool_name)
     }
 
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
