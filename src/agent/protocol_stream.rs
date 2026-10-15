@@ -190,6 +190,42 @@ where
     Efut: Future<Output = Result<()>> + Send,
     Afut: Future<Output = Result<PermissionApproval>> + Send,
 {
+    let mut user_content = user_content;
+    loop {
+        let result = run_resolved_user_turn_async(
+            agent,
+            user_content,
+            &mut on_delta,
+            &mut on_event,
+            &mut approve,
+        )
+        .await?;
+        let Some(message) = agent.take_member_message()? else {
+            return Ok(result);
+        };
+        agent.reload_runtime_snapshot_from_provider()?;
+        agent.member_message_recorder.as_ref().ok_or_else(|| {
+            anyhow!("member user recording is unavailable in this execution entry")
+        })?(&message)?;
+        user_content = UserMessageContent::from(message);
+    }
+}
+
+async fn run_resolved_user_turn_async<F, E, A, Dfut, Efut, Afut>(
+    agent: &mut Agent,
+    user_content: UserMessageContent,
+    mut on_delta: F,
+    mut on_event: E,
+    mut approve: A,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Dfut + Send,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    A: FnMut(PermissionRequest) -> Afut + Send,
+    Dfut: Future<Output = Result<()>> + Send,
+    Efut: Future<Output = Result<()>> + Send,
+    Afut: Future<Output = Result<PermissionApproval>> + Send,
+{
     let route = agent
         .resolved_model_route()
         .cloned()
@@ -263,6 +299,7 @@ where
         count_recovered_tool_calls: false,
         reconciled_async_tool_ids: BTreeSet::new(),
         attempt_assistant_persisted: false,
+        user_handoff: false,
     };
     TurnOrchestrator::new(runtime, limits)
         .run(&route, &mut driver)
@@ -298,6 +335,7 @@ struct ResolvedTurnDriver<'a, F, E, A> {
     on_event: &'a mut E,
     approve: &'a mut A,
     tool_call_count: usize,
+    user_handoff: bool,
     continuation_count: usize,
     final_text: String,
     prepared: Option<PreparedResolvedIteration>,
@@ -1332,6 +1370,20 @@ where
         (self.on_event)(AgentEvent::TurnContinuationBoundary)
             .await
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        if self
+            .agent
+            .has_member_message()
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?
+        {
+            self.user_handoff = true;
+            self.agent
+                .finish_member_turn(self.on_event, self.tool_call_count, self.continuation_count)
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
+            return Ok(());
+        }
         let _ = self
             .agent
             .drain_turn_continuations(self.on_event)
@@ -1401,6 +1453,10 @@ where
         Ok(())
     }
 
+    fn user_turn_handoff(&self) -> bool {
+        self.user_handoff
+    }
+
     async fn after_assistant_persisted(
         &mut self,
         _result: &ModelAttemptResult,
@@ -1408,6 +1464,20 @@ where
         (self.on_event)(AgentEvent::TurnContinuationBoundary)
             .await
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        if self
+            .agent
+            .has_member_message()
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?
+        {
+            self.user_handoff = true;
+            self.agent
+                .finish_member_turn(self.on_event, self.tool_call_count, self.continuation_count)
+                .await
+                .map_err(|error| {
+                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
+                })?;
+            return Ok(TurnContinuationDecision::Finalize);
+        }
         if self
             .agent
             .drain_turn_continuations(self.on_event)
@@ -2332,6 +2402,7 @@ parallel_tool_calls = true
             on_event,
             approve,
             tool_call_count: 0,
+            user_handoff: false,
             continuation_count: 0,
             final_text: String::new(),
             prepared: None,

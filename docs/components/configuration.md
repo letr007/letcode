@@ -344,6 +344,31 @@ anthropic_betas = ["context-1m-2025-08-07"]
 - `anthropic_thinking`：Anthropic 思考参数结构，包含 `mode`（`disabled`、`adaptive`、`budget`）与 `budget_tokens`。
 - `anthropic_betas`：发送给 Anthropic 接口的 Beta 特性请求头数组。
 
+## 子代理配置 `[subagents]`
+
+```toml
+[subagents]
+mode = "swarm" # expert | swarm，默认 expert
+max_depth = 3
+max_descendants = 16
+max_pending_messages = 16
+max_message_bytes = 16384
+run_timeout_secs = 600
+```
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `"expert"` | `expert` 由父代理委派，子代理不再委派；`swarm` 支持成员继续委派与同树消息 |
+| `max_depth` | `3` | swarm 最大深度，根为 0，包含上限 |
+| `max_descendants` | `16` | 整树累计唯一已激活后代数，不含根；成员结束不返还，恢复或接管不重复计数 |
+| `max_pending_messages` | `16` | 每会话待处理消息数上限，跨 run 交接保留 |
+| `max_message_bytes` | `16,384` | 单条消息正文的 UTF-8 字节数上限 |
+| `run_timeout_secs` | `600` | swarm 子 run 未指定请求或模板超时时的默认秒数 |
+
+数值字段必须为正整数，超时还须在运行时可表示的期限范围内。非法模式、未知字段与无效数值会报错。swarm 限制不改变 `expert` 的运行行为。
+
+配置在新根会话创建时记录，配置重载只影响后续新根会话。恢复使用原树配置与累计额度。消息接纳、权限与取消规则见[子代理组件](subagents.md#swarm-模式)。
+
 ## 专家路由配置 `[agents.<expert>]`
 
 为特定内置专家指定独立的服务商与模型。配置专家时必须同时填写 `provider` 与 `model`：

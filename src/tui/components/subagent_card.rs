@@ -7,10 +7,10 @@ use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
 use crate::subagent::StructuredSubagentResult;
 use crate::tui::{
     i18n::Translator,
-    measure::{display_width, wrap_text_to_width},
+    measure::{display_width, wrap_text_to_width_with_offsets},
     theme::Theme,
     timeline::{ToolExecutionStatus, ToolView},
-    transcript_render::{Break, CopyJoin, SemanticLine, SemanticSpan},
+    transcript_render::{Break, CopyJoin, Document, SemanticLine, SemanticSpan},
 };
 
 pub(super) fn render_subagent_lines(
@@ -62,8 +62,8 @@ pub(super) fn render_subagent_lines(
                 .as_ref()
                 .map(|result| result.child_session_id.as_str())
         })
-        .map(|id| truncate_display_width(id, 16))
-        .unwrap_or_else(|| translator.t("subagent.child"));
+        .filter(|id| !id.is_empty())
+        .map(|id| truncate_display_width(id, 16));
     let summary = data
         .as_ref()
         .and_then(|data| data.get("summary"))
@@ -82,12 +82,13 @@ pub(super) fn render_subagent_lines(
         .as_ref()
         .and_then(|data| data.get("agent_name"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| subagent_name_from_tool(&tool.name));
+        .unwrap_or_else(|| agent_name_for_subagent_tool(&tool.name).unwrap_or("Subagent"));
     let waiting = data
         .as_ref()
         .and_then(|data| data.get("waiting"))
         .and_then(serde_json::Value::as_bool)
-        == Some(true);
+        == Some(true)
+        || tool.name == crate::tool_names::TOOL_AGENT_WAIT;
     let mut state_flags = data.as_ref().map(subagent_state_flags).unwrap_or_default();
     if let Some(failure_kind) = data
         .as_ref()
@@ -145,19 +146,31 @@ pub(super) fn render_subagent_lines(
     let has_structured_details = structured
         .as_ref()
         .is_some_and(structured_subagent_has_details);
+    let mut header = vec![
+        SemanticSpan::decoration(format!("{status_label}{state_suffix}"), status_style),
+        SemanticSpan::decoration(" ", text_style),
+        SemanticSpan::decoration(
+            agent_name.to_string(),
+            text_style.add_modifier(Modifier::BOLD),
+        ),
+        SemanticSpan::decoration(" ", text_style),
+        SemanticSpan::source(summary, text_style),
+    ];
+    if let Some(child_id) = child_id {
+        header.push(SemanticSpan::decoration(
+            format!(" · /child {child_id}"),
+            muted,
+        ));
+    } else if tool.name == crate::tool_names::TOOL_AGENT_WAIT
+        && let Some(run_id) = tool_arguments(tool)
+            .as_ref()
+            .and_then(|args| args.get("run_id"))
+            .and_then(serde_json::Value::as_str)
+    {
+        header.push(SemanticSpan::source(format!(" · {run_id}"), muted));
+    }
     lines.push(render_card_line_with_guide(
-        &[
-            SemanticSpan::decoration(format!("{status_label}{state_suffix}"), status_style),
-            SemanticSpan::decoration(" ", text_style),
-            SemanticSpan::decoration(
-                agent_name.to_string(),
-                text_style.add_modifier(Modifier::BOLD),
-            ),
-            SemanticSpan::decoration(" ", text_style),
-            SemanticSpan::source(summary, text_style),
-            SemanticSpan::decoration(" · ", muted),
-            SemanticSpan::decoration(format!("/child {child_id}"), muted),
-        ],
+        &header,
         Style::default().bg(theme.root_bg),
         theme.card_guide(),
         theme,
@@ -246,6 +259,125 @@ pub(super) fn render_subagent_lines(
     lines
 }
 
+pub(super) fn render_subagent_send_document(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+    expanded: bool,
+    translator: &Translator,
+) -> Document<Style> {
+    let mut document = Document::default();
+    if width == 0 {
+        return document;
+    }
+    let args = tool_arguments(tool);
+    let data = tool_output_data(tool);
+    let target = args
+        .as_ref()
+        .and_then(|args| args.get("session_id"))
+        .or_else(|| data.as_ref().and_then(|data| data.get("session_id")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let message = args
+        .as_ref()
+        .and_then(|args| args.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let queued = tool.status == ToolExecutionStatus::Succeeded
+        && data.as_ref().and_then(|data| data.get("accepted"))
+            == Some(&serde_json::Value::Bool(true));
+    let state = if queued {
+        translator.t("status.queued")
+    } else {
+        subagent_status_label(tool.status, translator)
+    };
+    let active = matches!(
+        tool.status,
+        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+    );
+    let state = if active {
+        format!("{} {state}", PROCESS_FRAMES[frame % PROCESS_FRAMES.len()])
+    } else {
+        state
+    };
+    let accent = if queued {
+        theme.warning
+    } else if matches!(
+        tool.status,
+        ToolExecutionStatus::Failed | ToolExecutionStatus::Cancelled
+    ) {
+        theme.error
+    } else {
+        theme.notice
+    };
+    document.push_semantic_line(render_card_line_with_guide(
+        &[
+            SemanticSpan::decoration(state, root_status_style(accent, theme)),
+            SemanticSpan::decoration(
+                format!(" {} ", translator.t("subagent.send")),
+                root_text_style(theme).add_modifier(Modifier::BOLD),
+            ),
+            SemanticSpan::source(target, root_text_style(theme)),
+        ],
+        Style::default().bg(theme.root_bg),
+        theme.card_guide(),
+        theme,
+        width,
+        Break::HardBreak,
+    ));
+    let hint = translator.t(if expanded {
+        "subagent.collapse"
+    } else {
+        "subagent.expand"
+    });
+    document.push_semantic_line(render_subagent_compact_line(
+        &hint,
+        root_muted_style(theme),
+        theme,
+        width,
+        Break::HardBreak,
+    ));
+    if expanded {
+        super::delegation_card::push_wrapped_card_line(
+            &mut document,
+            "",
+            message,
+            root_text_style(theme),
+            theme,
+            width,
+        );
+        if matches!(
+            tool.status,
+            ToolExecutionStatus::Failed | ToolExecutionStatus::Cancelled
+        ) {
+            super::delegation_card::push_wrapped_card_line(
+                &mut document,
+                "",
+                tool.output.as_deref().unwrap_or(&tool.summary),
+                root_status_style(theme.error, theme),
+                theme,
+                width,
+            );
+        }
+    } else {
+        document.push_semantic_line(render_card_line_with_guide(
+            &[SemanticSpan::source(
+                one_line_snippet(message),
+                root_text_style(theme),
+            )],
+            Style::default().bg(theme.root_bg),
+            theme.card_guide(),
+            theme,
+            width,
+            Break::End,
+        ));
+    }
+    document.finish();
+    debug_assert!(document.validate());
+    document
+}
+
 pub(super) fn render_subagent_compact_line(
     text: &str,
     muted: Style,
@@ -272,34 +404,49 @@ pub(super) fn render_subagent_wrapped_field(
     width: usize,
 ) {
     let label_text = format!("{label}: ");
-    let label_width = display_width(&label_text);
+    let label_chars = label_text.chars().collect::<Vec<_>>();
     let content_width = width
         .saturating_sub(display_width(TOOL_GUIDE_GLYPH).saturating_add(2))
         .max(1);
-    let value_width = content_width.saturating_sub(label_width).max(1);
     for value in values {
-        let wrapped = wrap_text_to_width(value, value_width);
-        for (index, chunk) in wrapped.into_iter().enumerate() {
-            let prefix = if index == 0 {
-                label_text.clone()
-            } else {
-                " ".repeat(label_width)
-            };
-            let mut segments = vec![SemanticSpan::decoration(prefix, muted)];
-            if !chunk.is_empty() {
-                segments.push(SemanticSpan::source_with_join(
-                    chunk,
+        let text = format!("{label_text}{value}");
+        let chars = text.chars().collect::<Vec<_>>();
+        let wrapped = wrap_text_to_width_with_offsets(&text, content_width);
+        for (index, chunk) in wrapped.iter().enumerate() {
+            let mut segments = Vec::new();
+            let prefix_end = chunk.source_end_char.min(label_chars.len());
+            if chunk.source_start_char < prefix_end {
+                segments.push(SemanticSpan::decoration(
+                    label_chars[chunk.source_start_char..prefix_end]
+                        .iter()
+                        .collect::<String>(),
                     muted,
-                    CopyJoin::Space,
                 ));
             }
+            let value_start = chunk.source_start_char.max(label_chars.len());
+            if value_start < chunk.source_end_char {
+                segments.push(SemanticSpan::source_with_join(
+                    chars[value_start..chunk.source_end_char]
+                        .iter()
+                        .collect::<String>(),
+                    muted,
+                    CopyJoin::Concat,
+                ));
+            }
+            let boundary = if index + 1 == wrapped.len()
+                || wrapped[index + 1].source_start_char > chunk.source_end_char
+            {
+                Break::HardBreak
+            } else {
+                Break::SoftWrap
+            };
             lines.push(render_card_line_with_guide(
                 &segments,
                 Style::default().bg(theme.root_bg),
                 theme.card_guide(),
                 theme,
                 width,
-                Break::HardBreak,
+                boundary,
             ));
         }
     }
@@ -343,10 +490,6 @@ pub(super) fn subagent_task(tool: &ToolView) -> Option<String> {
 
 pub(super) fn is_subagent_tool(name: &str) -> bool {
     is_subagent_tool_name(name)
-}
-
-pub(super) fn subagent_name_from_tool(name: &str) -> &str {
-    agent_name_for_subagent_tool(name).expect("tool card received unknown subagent tool")
 }
 
 pub(super) fn subagent_status_label(

@@ -5,6 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Added
+
+- 新增可选的 `swarm` 子代理模式，支持成员继续委派、查询整树名册，以及向同树会话发送消息。默认仍为 `expert`。
+- 新增 `[subagents]` 配置，可设置树深度、累计成员额度、待处理消息数、正文字节数与单次 run 默认超时。恢复会话保留原树配置与累计额度。
+
 ## [0.23.0] - 2026-10-15
 
 ### Added

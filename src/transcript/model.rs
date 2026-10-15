@@ -121,6 +121,9 @@ pub enum TranscriptEvent {
     SessionWorkspace {
         root: String,
     },
+    SessionSubagentsPolicy {
+        policy: crate::config::SubagentsConfig,
+    },
     SessionTitle {
         title: String,
     },
@@ -133,6 +136,10 @@ pub enum TranscriptEvent {
         summary: String,
         #[serde(default)]
         pool_ordinal: u32,
+    },
+    SubagentActivated {
+        run_id: String,
+        member: crate::subagent::SwarmMember,
     },
     SubagentDelegation {
         run_id: String,

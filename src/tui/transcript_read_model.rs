@@ -234,10 +234,12 @@ impl TranscriptTimelineProjection {
                 });
             }
             TranscriptEvent::SubagentResult { .. }
+            | TranscriptEvent::SubagentActivated { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::LlmRequestTelemetry { .. }
             | TranscriptEvent::SessionStarted { .. }
             | TranscriptEvent::SessionWorkspace { .. }
+            | TranscriptEvent::SessionSubagentsPolicy { .. }
             | TranscriptEvent::SessionTitle { .. }
             | TranscriptEvent::ContextBranchCreated { .. }
             | TranscriptEvent::ContextBranchSummary { .. }
@@ -607,6 +609,66 @@ mod tests {
                     && delegation.model.as_deref() == Some("NewAPI/deepseek-flash")
                     && delegation.target_child_session_id.as_deref() == Some("child-42")
         ));
+    }
+
+    #[test]
+    fn restored_message_run_wait_remains_a_subagent_card() {
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "wait-message".into(),
+                    name: crate::tool_names::TOOL_AGENT_WAIT.into(),
+                    args: json!({"run_id": "message-run"}),
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "wait-message".into(),
+                    name: crate::tool_names::TOOL_AGENT_WAIT.into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        crate::tool_names::TOOL_AGENT_WAIT,
+                        json!({
+                            "run_id": "message-run",
+                            "child_session_id": "child-message",
+                            "agent_name": "explorer",
+                            "status": "completed",
+                            "summary": "message processed",
+                            "active": false,
+                        }),
+                    ),
+                },
+            ),
+        ]);
+        let tool = timeline
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tool.status, ToolExecutionStatus::Succeeded);
+        let document = crate::tui::components::tool_card::render_tool_card_document(
+            tool,
+            crate::tui::theme::Theme::dark(),
+            120,
+            0,
+            false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+        );
+        let rendered = crate::tui::transcript_ratatui::document_to_ratatui(&document)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("completed explorer message processed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/child child-message"), "{rendered}");
     }
 
     #[test]

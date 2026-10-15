@@ -32,3 +32,4 @@ pub const TOOL_AGENT_JOBS: &str = "agent__jobs";
 pub const TOOL_AGENT_STATUS: &str = "agent__status";
 pub const TOOL_AGENT_WAIT: &str = "agent__wait";
 pub const TOOL_AGENT_CANCEL: &str = "agent__cancel";
+pub const TOOL_AGENT_SEND: &str = "agent__send";

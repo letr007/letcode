@@ -178,6 +178,7 @@ impl AgentRunner {
         let mut self_ = self;
         if let Some(transcript) = self_.transcript.clone() {
             self_.subagent_delegate = Some(Arc::new(RunnerSubagentDelegate {
+                child_completions: None,
                 runtime,
                 sessions_dir,
                 transcript,
@@ -219,6 +220,13 @@ impl AgentRunner {
             background_event_tx,
             Some(background_child_started_tx),
         )
+    }
+
+    pub(crate) fn prepare_subagent_runtime(&self, agent: &mut Agent) -> Result<()> {
+        if let Some(delegate) = self.subagent_delegate.clone() {
+            agent.set_subagent_delegate(delegate);
+        }
+        agent.prepare_subagent_runtime()
     }
 
     #[cfg(test)]
@@ -408,6 +416,8 @@ where {
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
+        agent.prepare_subagent_runtime()?;
+        self.install_member_message_recorder(agent);
         let continuation_queue = Arc::clone(&turn_continuation_queue);
         let mut continuation_guard = agent.turn_continuation_provider_guard(Arc::new(move || {
             let mut queue = continuation_queue
@@ -633,6 +643,8 @@ where {
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
+        agent.prepare_subagent_runtime()?;
+        self.install_member_message_recorder(agent);
         if record_user_prompt {
             let user_event = UserMessageEvent::from_submission(prompt.clone());
             self.emit(SessionTransportEvent::UserMessage(user_event))?;
@@ -709,6 +721,8 @@ where {
             Arc::new(tokio::sync::Mutex::new(ToolBatchReconciliation::default()));
         let child_live_text = self.child_live_text.clone();
         let delta_live_text = child_live_text.clone();
+        let required_turn_close =
+            agent.subagents_policy().mode == crate::config::SubagentMode::Swarm;
         let response = agent
             .run_stream_content_with_interactions_async(
                 prompt_content.clone(),
@@ -777,7 +791,7 @@ where {
                                             AgentEvent::TurnStarted(_)
                                                 | AgentEvent::ToolExecutionSummary(_)
                                                 | AgentEvent::TurnFinalized(_)
-                                        ) => {
+                                        ) && !(required_turn_close && matches!(event, AgentEvent::TurnFinalized(_))) => {
                                             warn!(error = %error, "failed to record agent audit event; continuing runner");
                                             JournalEffect {
                                                 persisted: false,
@@ -1351,6 +1365,42 @@ where {
         })
     }
 
+    fn install_member_message_recorder(&self, agent: &mut Agent) {
+        let transcript = self.transcript.clone();
+        let sender = self.event_tx.clone();
+        let child = self.child_session_id.clone();
+        let origin = self.permission_origin.clone();
+        let parent_call = self.parent_tool_call_id.clone();
+        agent.set_member_message_recorder(Arc::new(move |message| {
+            let submission = UserMessageSubmission::new(
+                crate::subagent::generate_message_id(),
+                UserMessageContent::from(message),
+            );
+            let event =
+                SessionTransportEvent::UserMessage(UserMessageEvent::from_submission(submission));
+            let event = match &child {
+                Some(child) => wrap_child_session_transport_event(
+                    child.clone(),
+                    origin.clone(),
+                    parent_call.clone(),
+                    event,
+                ),
+                None => event,
+            };
+            send_optional_event(&sender, event)?;
+            record_transcript(&transcript, |recorder| {
+                recorder.record_user_message(message)
+            })?;
+            emit_context_projection_updates(
+                &sender,
+                &transcript,
+                child.as_deref(),
+                origin.as_deref(),
+                parent_call.as_deref(),
+            )
+        }));
+    }
+
     fn emit(&self, event: SessionTransportEvent) -> Result<()> {
         let event = if let Some(child_session_id) = &self.child_session_id {
             if let Some(live_text) = &self.child_live_text {
@@ -1793,6 +1843,7 @@ parallel_tool_calls = true
         .expect("credential test factory");
         parent.set_subagent_child_factory(Arc::new(factory));
         RunnerSubagentDelegate {
+            child_completions: None,
             runtime: SubagentPool::new(),
             sessions_dir: std::env::temp_dir(),
             transcript: temp_transcript(),

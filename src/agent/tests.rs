@@ -989,8 +989,8 @@ fn active_epoch_rejects_non_append_changes_without_advancing() {
     ));
 }
 
-#[test]
-fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
+#[tokio::test]
+async fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
     let tools = active_epoch_tools();
     let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
     let mut prelude = vec![PromptMessage::developer("kernel")];
@@ -1031,6 +1031,107 @@ fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
         .preview_active_epoch(ApiProtocol::Completions, &prelude, &changed_tools)
         .expect("evidence change rebuilds cold");
     assert!(matches!(envelope.transition, ActiveEpochTransition::Cold));
+
+    for protocol in [
+        ApiProtocol::Responses,
+        ApiProtocol::Completions,
+        ApiProtocol::Anthropic,
+    ] {
+        let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+        install_active_epoch_route(&mut agent, protocol);
+        let route = agent.resolved_model_route().unwrap().clone();
+        let mut previous_budget: Option<crate::request_builder::BudgetReport> = None;
+        for catalog in [&tools[..], &[], &tools[..], &changed_tools[..]] {
+            if previous_budget.is_some() {
+                assert!(matches!(
+                    agent.prepare_active_epoch(protocol, &[], catalog).unwrap(),
+                    ActiveEpochPreparation::ColdRequired(
+                        ColdRequiredReason::ToolDefinitionsChanged
+                    )
+                ));
+            }
+            let prepared = super::compaction::prepare_request_build(
+                &mut agent,
+                protocol,
+                &[],
+                0,
+                catalog,
+                &mut |_| std::future::ready(Ok(())),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                prepared.epoch_preview.transition,
+                ActiveEpochTransition::Cold
+            ));
+            assert_eq!(
+                prepared.build.budget,
+                agent
+                    .preview_active_epoch(protocol, &[], catalog)
+                    .unwrap()
+                    .build
+                    .budget
+            );
+            if let Some(previous) = previous_budget {
+                assert_ne!(
+                    prepared.build.budget.estimated_tools_tokens,
+                    previous.estimated_tools_tokens
+                );
+                assert_ne!(
+                    prepared.build.budget.input_budget_tokens,
+                    previous.input_budget_tokens
+                );
+            }
+            let observe = |agent: &Agent, preview: &ActiveEpochPreview| {
+                let request = crate::model_runtime::projection::model_request_from_prompt_plan(
+                    &route,
+                    &agent.active_model_metadata(),
+                    &preview.build.prompt_plan,
+                    catalog,
+                )
+                .unwrap();
+                let request = route.binding.prepare_request(&request).unwrap();
+                let inspection = route
+                    .binding
+                    .inspect_prepared_request(&request, None)
+                    .unwrap();
+                crate::request_builder::observe_prepared_model_request(
+                    &inspection,
+                    &preview.build.prompt_plan,
+                )
+                .unwrap()
+            };
+            let observation = observe(&agent, &prepared.epoch_preview);
+            previous_budget = Some(prepared.build.budget);
+            agent
+                .commit_resolved_active_epoch(prepared.epoch_preview, observation)
+                .unwrap();
+            agent
+                .append_history_item(HistoryItem::user("next"))
+                .unwrap();
+            let ActiveEpochPreparation::Warm(warm) =
+                agent.prepare_active_epoch(protocol, &[], catalog).unwrap()
+            else {
+                panic!("unchanged tools must preserve the active epoch");
+            };
+            let observation = observe(&agent, &warm);
+            let before = agent.active_epoch.clone();
+            let mut changed_shape = observation.clone();
+            changed_shape.cohort.request_shape_digest.push('x');
+            assert!(
+                agent
+                    .commit_resolved_active_epoch(warm.clone(), changed_shape)
+                    .is_err()
+            );
+            assert_eq!(agent.active_epoch, before);
+            agent
+                .commit_resolved_active_epoch(warm, observation)
+                .unwrap();
+            agent
+                .append_history_item(HistoryItem::user("next"))
+                .unwrap();
+        }
+    }
 }
 
 #[test]
@@ -5874,4 +5975,36 @@ async fn audit_event_failures_do_not_fail_tool_execution() {
         record.rejection,
         Some(ToolExecutionRejection::InvalidJsonArguments)
     );
+    for mode in [
+        crate::config::SubagentMode::Expert,
+        crate::config::SubagentMode::Swarm,
+    ] {
+        let mut agent = test_agent();
+        agent.set_subagents_policy(crate::config::SubagentsConfig {
+            mode,
+            ..Default::default()
+        });
+        let mut finalized = 0;
+        let result = agent
+            .continue_or_finalize_no_tool_reply(
+                &mut |event| {
+                    assert!(matches!(event, AgentEvent::TurnFinalized(_)));
+                    finalized += 1;
+                    std::future::ready(Err(anyhow!("turn close rejected")))
+                },
+                0,
+                &mut 0,
+            )
+            .await;
+        assert_eq!(finalized, 1);
+        match mode {
+            crate::config::SubagentMode::Expert => assert!(!result.unwrap()),
+            crate::config::SubagentMode::Swarm => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("turn close rejected")
+            ),
+        }
+    }
 }

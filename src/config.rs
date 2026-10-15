@@ -482,6 +482,23 @@ pub struct SubagentsConfig {
     pub run_timeout_secs: u64,
 }
 
+impl SubagentsConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        positive_usize("subagents.max_depth", self.max_depth)?;
+        positive_usize("subagents.max_descendants", self.max_descendants)?;
+        positive_usize("subagents.max_pending_messages", self.max_pending_messages)?;
+        positive_usize("subagents.max_message_bytes", self.max_message_bytes)?;
+        positive_u64("subagents.run_timeout_secs", self.run_timeout_secs)?;
+        if std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(self.run_timeout_secs))
+            .is_none()
+        {
+            bail!("subagents.run_timeout_secs exceeds the supported deadline range");
+        }
+        Ok(())
+    }
+}
+
 impl Default for SubagentsConfig {
     fn default() -> Self {
         Self {
@@ -1558,37 +1575,18 @@ fn build_mcp_server_config(
 
 fn build_subagents_config(raw: RawSubagentsConfig) -> Result<SubagentsConfig> {
     let defaults = SubagentsConfig::default();
-    let run_timeout_secs = positive_u64(
-        "subagents.run_timeout_secs",
-        raw.run_timeout_secs.unwrap_or(defaults.run_timeout_secs),
-    )?;
-    if std::time::Instant::now()
-        .checked_add(std::time::Duration::from_secs(run_timeout_secs))
-        .is_none()
-    {
-        bail!("subagents.run_timeout_secs exceeds the supported deadline range");
-    }
-    Ok(SubagentsConfig {
+    let config = SubagentsConfig {
         mode: raw.mode.unwrap_or(defaults.mode),
-        max_depth: positive_usize(
-            "subagents.max_depth",
-            raw.max_depth.unwrap_or(defaults.max_depth),
-        )?,
-        max_descendants: positive_usize(
-            "subagents.max_descendants",
-            raw.max_descendants.unwrap_or(defaults.max_descendants),
-        )?,
-        max_pending_messages: positive_usize(
-            "subagents.max_pending_messages",
-            raw.max_pending_messages
-                .unwrap_or(defaults.max_pending_messages),
-        )?,
-        max_message_bytes: positive_usize(
-            "subagents.max_message_bytes",
-            raw.max_message_bytes.unwrap_or(defaults.max_message_bytes),
-        )?,
-        run_timeout_secs,
-    })
+        max_depth: raw.max_depth.unwrap_or(defaults.max_depth),
+        max_descendants: raw.max_descendants.unwrap_or(defaults.max_descendants),
+        max_pending_messages: raw
+            .max_pending_messages
+            .unwrap_or(defaults.max_pending_messages),
+        max_message_bytes: raw.max_message_bytes.unwrap_or(defaults.max_message_bytes),
+        run_timeout_secs: raw.run_timeout_secs.unwrap_or(defaults.run_timeout_secs),
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 fn build_agents_config(

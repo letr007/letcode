@@ -22,7 +22,7 @@ letcode is a terminal coding Agent built for developer productivity. Powered by 
 
 ## Key Features
 
-- **Multi-Expert Collaboration**: Six built-in subagents (`explorer`, `fixer`, `oracle`, `designer`, `librarian`, `general`) coordinated by a concurrent pool with path-based exclusive locking.
+- **Multi-Expert Collaboration**: Six built-in subagents (`explorer`, `fixer`, `oracle`, `designer`, `librarian`, `general`) coordinated by a concurrent pool with path-based locking. The default `expert` mode keeps delegation with the parent; opt-in `swarm` mode adds recursive delegation and same-tree session messaging with shared tree limits. See [Subagents](docs/components/subagents.md).
 - **Terminal-Native Rich Rendering**: Streams Markdown, renders LaTeX math formulas, and draws Mermaid vector diagrams (flowcharts, sequence diagrams, state diagrams) natively in the terminal grid.
 - **Native Multi-Protocol Support**: Full native support for OpenAI Responses, Chat Completions, and Anthropic Messages protocols, including full-duplex WebSocket streaming for Responses.
 - **Layered Security & Permission Model**: Four operational modes (`safe`, `default`, `auto`, `yolo`) with session-scoped grant tables and parameter fingerprinting.
@@ -75,7 +75,7 @@ Export your API key in your shell:
 export OPENAI_API_KEY="your-api-key"
 ```
 
-For advanced settings (multi-provider routing, timeouts, retries, MCP services, and environment disguises), see the [Configuration Reference Manual](docs/components/configuration.md).
+For advanced settings (multi-provider routing, subagent modes, timeouts, retries, MCP services, and environment disguises), see the [Configuration Reference Manual](docs/components/configuration.md).
 
 ### 3. Run
 

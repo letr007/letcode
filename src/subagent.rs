@@ -1,7 +1,11 @@
 mod pool;
 mod result;
 mod route_factory;
+pub(crate) mod swarm;
+pub use swarm::SwarmMember;
 
+pub(crate) use pool::generate_run_id as generate_message_id;
+pub(crate) use pool::{MessageDelegateFactory, MessageHost};
 pub use pool::{SubagentJob, SubagentPool, SubagentRunGovernance};
 pub(crate) use result::REPORT_PROMPT;
 pub use result::{
@@ -34,6 +38,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("subagent/message_tests.rs");
 
     #[test]
     fn text_with_a_closing_brace_before_an_opening_brace_is_not_a_candidate() {
@@ -41,14 +46,86 @@ mod tests {
         assert!(try_parse_structured_subagent_result(text).is_none());
     }
 
-    #[test]
-    fn cancel_active_covers_starting_reservations() {
+    #[tokio::test]
+    async fn cancel_active_covers_starting_reservations() {
+        use crate::session::engine::{
+            SessionEngineCommand, SessionEngineControl, wait_for_subagent_cancel_settle,
+        };
+        use std::collections::VecDeque;
+        use std::time::Duration;
         let runtime = SubagentPool::new();
         let reservation = runtime.starting_reservation_for_test();
         let run_id = reservation.run_id().to_string();
         assert_eq!(runtime.cancel_active_run_ids(), vec![run_id]);
         let cancel_rx = reservation.activate();
-        assert!(cancel_rx.blocking_recv().is_ok());
+        assert!(cancel_rx.await.is_ok());
+
+        for (settles, requests_shutdown) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let runtime = SubagentPool::new();
+            let reservation = runtime.starting_reservation_for_test();
+            let run_id = reservation.run_id().to_string();
+            runtime.cancel_active();
+            let (control, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+            control
+                .send(SessionEngineControl::Command(
+                    SessionEngineCommand::SetModel("queued".into()),
+                ))
+                .unwrap();
+            if requests_shutdown {
+                control.send(SessionEngineControl::Shutdown).unwrap();
+            }
+            let (parent_done, parent_done_rx) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let worker = tokio::spawn(async move {
+                parent_done_rx.await.unwrap();
+                if !settles {
+                    release_rx.await.unwrap();
+                }
+                drop(reservation);
+            });
+            let parent = async move {
+                parent_done.send(()).unwrap();
+            };
+            tokio::pin!(parent);
+            let mut deferred = VecDeque::new();
+            let result = wait_for_subagent_cancel_settle(
+                &mut control_rx,
+                &mut deferred,
+                parent.as_mut(),
+                &runtime,
+                Duration::from_millis(200),
+            )
+            .await;
+            assert_eq!(result.shutdown, requests_shutdown);
+            assert_eq!(result.settled, settles);
+            assert_eq!(
+                result.remaining_run_ids,
+                if settles {
+                    Vec::new()
+                } else {
+                    vec![run_id.clone()]
+                }
+            );
+            assert!(
+                matches!(deferred.pop_front(), Some(SessionEngineCommand::SetModel(model)) if model == "queued")
+            );
+            assert!(deferred.is_empty());
+            if !settles {
+                assert_eq!(
+                    runtime
+                        .active_jobs()
+                        .into_iter()
+                        .map(|job| job.run_id)
+                        .collect::<Vec<_>>(),
+                    [run_id]
+                );
+                release.send(()).unwrap();
+            }
+            worker.await.unwrap();
+            assert!(!runtime.is_running());
+        }
     }
 
     use crate::config::ApiProtocol;
@@ -67,6 +144,25 @@ mod tests {
     fn temp_sessions_dir() -> PathBuf {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("{}-{id}", generate_run_id()))
+    }
+
+    fn install_delegate(
+        parent: &mut Agent,
+        runtime: &SubagentPool,
+        sessions_dir: &std::path::Path,
+        recorder: Arc<Mutex<TranscriptRecorder>>,
+    ) {
+        crate::session::runner::AgentRunner::silent_with_transcript(recorder)
+            .with_subagent_runtime(
+                runtime.clone(),
+                sessions_dir.to_path_buf(),
+                Default::default(),
+                Default::default(),
+                String::new(),
+                None,
+                None,
+            )
+            .install_subagent_delegate_for_test(parent);
     }
 
     fn no_event_sender() -> Option<crate::subagent_events::SubagentEventSender> {
@@ -174,9 +270,23 @@ mod tests {
     #[tokio::test]
     async fn new_child_starts_with_canonical_runtime_snapshot() {
         let runtime = SubagentPool::new();
+        let mut parent = test_agent();
+        parent.set_subagents_policy(crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_depth: 8,
+            ..Default::default()
+        });
+        let expected_policy = parent.subagents_policy().clone();
+        let sessions_dir = temp_sessions_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+        recorder.record_session_started("gpt-test").unwrap();
+        recorder.record_subagents_policy(&expected_policy).unwrap();
+        let parent_id = recorder.session_id().to_string();
+        let recorder = Arc::new(Mutex::new(recorder));
+        install_delegate(&mut parent, &runtime, &sessions_dir, recorder.clone());
         let started = runtime
             .start_named_governed(
-                &test_agent(),
+                &parent,
                 "explorer",
                 crate::agent::SubagentInvocation {
                     prompt: "inspect".into(),
@@ -184,17 +294,28 @@ mod tests {
                     model: None,
                     parent_tool_call_id: None,
                 },
-                temp_sessions_dir(),
-                "parent-session".into(),
+                sessions_dir,
+                parent_id,
                 "turn-1".into(),
-                None,
+                Some(recorder),
                 None,
             )
             .expect("child run starts");
         let expected_session_id = started.receipt().child_session_id.clone();
 
         let result = runtime
-            .complete_started_run_with_executor(started, move |agent, _, _, _, _, _| {
+            .complete_started_run_with_executor(started, move |agent, _, transcript, _, _, _| {
+                assert_eq!(agent.subagents_policy(), &expected_policy);
+                let records =
+                    crate::transcript::read_records(transcript.lock().unwrap().path()).unwrap();
+                assert_eq!(
+                    crate::transcript::restore_subagents_policy(&records).unwrap(),
+                    expected_policy
+                );
+                assert!(records.iter().any(|record| matches!(
+                    record.event,
+                    crate::transcript::TranscriptEvent::SubagentDelegation { .. }
+                )));
                 let snapshot = agent.runtime_snapshot_for_test();
                 assert_eq!(
                     snapshot.session_id.as_deref(),
@@ -218,6 +339,7 @@ mod tests {
         let agent = test_agent();
         for template in AgentTemplate::catalog() {
             let child = AgentFactory::create_child(&agent, &template);
+            assert_eq!(child.subagents_policy(), agent.subagents_policy());
             let tool_names = child
                 .tool_definitions_for_test()
                 .into_iter()
@@ -240,6 +362,201 @@ mod tests {
                     template.name
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn swarm_children_delegate_readonly_work_through_both_execution_entries() {
+        use crate::model_runtime::{ProtocolRegistry, RuntimeConfig};
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        for (sender_backed, background) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                timeout(Duration::from_secs(5), async move {
+                    for request_index in 0..if background { 4 } else { 3 } {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        let body = loop {
+                            let mut chunk = [0u8; 4096];
+                            let read = socket.read(&mut chunk).await.unwrap();
+                            assert!(read > 0);
+                            request.extend_from_slice(&chunk[..read]);
+                            if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let headers = std::str::from_utf8(&request[..at]).unwrap();
+                                let length = headers.lines().find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                                }).unwrap();
+                                if request.len() >= at + 4 + length {
+                                    break serde_json::from_slice::<serde_json::Value>(&request[at + 4..at + 4 + length]).unwrap();
+                                }
+                            }
+                        };
+                        assert!(!body.to_string().contains("不要递归委派"));
+                        assert!(!body.to_string().contains("不要继续委派"));
+                        let tools = body["tools"].as_array().unwrap();
+                        let can_delegate = tools.iter().any(|tool| tool["name"] == "agent__explore");
+                        if !background {
+                            assert_eq!(can_delegate, request_index != 1);
+                        }
+                        assert!(!tools.iter().any(|tool| tool["name"] == "agent__fixer"));
+                        assert!(tools.iter().any(|tool| tool["name"] == "agent__jobs"));
+                        let events = if request_index == 0 {
+                            let args = json!({"objective":"nested readonly task", "background":background}).to_string();
+                            vec![
+                                json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"agent__explore"}}),
+                                json!({"type":"response.function_call_arguments.done","item_id":"item-1","arguments":args}),
+                                json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"agent__explore","arguments":args}}),
+                            ]
+                        } else if background && can_delegate && !body["input"].as_array().unwrap().iter().any(|item| item["name"] == "agent__wait") {
+                            let run_id = body["input"].as_array().unwrap().iter().filter_map(|item| {
+                                let output: serde_json::Value = serde_json::from_str(item["output"].as_str()?).ok()?;
+                                output["data"]["run_id"].as_str().map(str::to_owned)
+                            }).next().unwrap();
+                            let args = json!({"run_id":run_id}).to_string();
+                            vec![
+                                json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item-wait","call_id":"call-wait","name":"agent__wait"}}),
+                                json!({"type":"response.function_call_arguments.done","item_id":"item-wait","arguments":args}),
+                                json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item-wait","call_id":"call-wait","name":"agent__wait","arguments":args}}),
+                            ]
+                        } else {
+                            vec![json!({"type":"response.output_text.delta","delta":"done"})]
+                        };
+                        let mut events = events;
+                        events.push(json!({"type":"response.completed","response":{"id":format!("resp-{request_index}"),"status":"completed"}}));
+                        let body: String = events.iter().map(|event| format!("data: {event}\n\n")).collect();
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    }
+                }).await.unwrap();
+            });
+            let catalog = RuntimeConfig::from_toml(&format!(
+                r#"active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model.capabilities]
+tools = true
+parallel_tool_calls = true
+[providers.test.models.model.capabilities.generation]
+parallel_tool_calls = true
+"#
+            ))
+            .unwrap()
+            .resolve(&ProtocolRegistry::builtins())
+            .unwrap();
+            let mut parent = Agent::new("model", 4, 8);
+            parent.set_subagents_policy(crate::config::SubagentsConfig {
+                mode: crate::config::SubagentMode::Swarm,
+                max_depth: 2,
+                ..Default::default()
+            });
+            parent.set_model_route_authority(
+                ModelRoute::new("test", "model"),
+                Arc::new(catalog.route("test", "model").unwrap().clone()),
+            );
+            parent.set_resolved_runtime_catalog(Some(catalog.clone()));
+            if sender_backed {
+                let factory = ExpertRouteFactory::new_with_policies(
+                    [("explorer".into(), None, Vec::new(), None)],
+                    &indexmap::IndexMap::from([(
+                        "test".into(),
+                        test_provider(
+                            &format!("http://{address}"),
+                            "key",
+                            ApiProtocol::Responses,
+                            &["model"],
+                        ),
+                    )]),
+                    &RetryConfig::default(),
+                )
+                .unwrap()
+                .with_runtime_catalog(catalog);
+                let factory = Arc::new(factory);
+                parent.set_primary_route_factory(factory.clone());
+                parent.set_subagent_child_factory(factory);
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut recorder = TranscriptRecorder::create(dir.path()).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            recorder
+                .record_subagents_policy(parent.subagents_policy())
+                .unwrap();
+            let root_id = recorder.session_id().to_string();
+            let recorder = Arc::new(Mutex::new(recorder));
+            let runtime = SubagentPool::new();
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner = if sender_backed {
+                crate::session::runner::AgentRunner::with_transcript(
+                    events.clone(),
+                    recorder.clone(),
+                )
+            } else {
+                crate::session::runner::AgentRunner::silent_with_transcript(recorder.clone())
+            }
+            .with_subagent_runtime(
+                runtime.clone(),
+                dir.path().into(),
+                indexmap::IndexMap::from([("test/model".into(), true)]),
+                Default::default(),
+                String::new(),
+                Some(control_tx),
+                sender_backed.then(|| events.clone()),
+            );
+            runner.install_subagent_delegate_for_test(&mut parent);
+            let started = runtime
+                .start_named_governed(
+                    &parent,
+                    "explorer",
+                    crate::agent::SubagentInvocation {
+                        prompt: "outer readonly task".into(),
+                        input: test_governance().input,
+                        model: None,
+                        parent_tool_call_id: None,
+                    },
+                    dir.path(),
+                    root_id,
+                    "turn-1".into(),
+                    Some(recorder.clone()),
+                    sender_backed.then(|| crate::session::runner::subagent_event_sender(events)),
+                )
+                .unwrap();
+            let result = timeout(
+                Duration::from_secs(5),
+                runtime.complete_started_run(started),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                result.status,
+                SubagentStatus::Completed,
+                "{}",
+                result.summary
+            );
+            server.await.unwrap();
+            let records = read_records(recorder.lock().unwrap().path()).unwrap();
+            let snapshot = runtime.swarm_snapshot(dir.path(), &records).unwrap();
+            assert_eq!(snapshot.members.len(), 2);
+            let grandchild = snapshot
+                .members
+                .values()
+                .find(|member| member.depth == 2)
+                .unwrap();
+            assert_eq!(grandchild.parent_session_id, result.child_session_id);
+            assert!(control_rx.try_recv().is_err());
+            assert!(!runtime.is_running());
         }
     }
 
@@ -1095,23 +1412,141 @@ base_url = "https://test.example.invalid/v1"
     }
 
     #[tokio::test]
+    async fn takeover_uses_expert_policy_for_legacy_child_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent_recorder = TranscriptRecorder::create(dir.path()).unwrap();
+        let parent_id = parent_recorder.session_id().to_string();
+        let mut child_recorder =
+            TranscriptRecorder::create(crate::transcript::child_sessions_dir(dir.path())).unwrap();
+        let child_id = child_recorder.session_id().to_string();
+        child_recorder
+            .record_session_started("primary/shared")
+            .unwrap();
+        for recorder in [&mut parent_recorder, &mut child_recorder] {
+            recorder
+                .record_subagent_started(
+                    "legacy-run",
+                    &parent_id,
+                    "turn-1",
+                    &child_id,
+                    "explorer",
+                    "inspect",
+                    1,
+                )
+                .unwrap();
+            recorder
+                .record_subagent_result(
+                    "legacy-run",
+                    &parent_id,
+                    "turn-1",
+                    &child_id,
+                    "explorer",
+                    "completed",
+                    "done",
+                )
+                .unwrap();
+        }
+        drop(child_recorder);
+        let mut parent = test_agent();
+        use_resolved_runtime_catalog(&mut parent);
+        parent.set_subagents_policy(crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            ..Default::default()
+        });
+        let factory = ExpertRouteFactory::new_with_policies(
+            [(
+                "explorer".into(),
+                Some(ModelRoute::new("primary", "shared")),
+                Vec::new(),
+                None,
+            )],
+            &indexmap::IndexMap::from([(
+                "primary".into(),
+                test_provider(
+                    "http://127.0.0.1:1/v1",
+                    "key",
+                    ApiProtocol::Responses,
+                    &["shared"],
+                ),
+            )]),
+            &RetryConfig::default(),
+        )
+        .unwrap()
+        .with_runtime_catalog(resolved_runtime_catalog());
+        let factory = Arc::new(factory);
+        parent.set_primary_route_factory(factory.clone());
+        parent.set_subagent_child_factory(factory);
+        let mut governance = test_governance();
+        governance.input.target_child_session_id = Some(child_id.clone());
+        let result = SubagentPool::new()
+            .run_with_executor(
+                &parent,
+                AgentTemplate::explorer(),
+                "continue".into(),
+                governance,
+                dir.path().to_path_buf(),
+                parent_id,
+                "turn-2".into(),
+                Some(Arc::new(Mutex::new(parent_recorder))),
+                None,
+                Some(child_id),
+                |agent, _, transcript, _, _, _| {
+                    assert_eq!(
+                        agent.subagents_policy(),
+                        &crate::config::SubagentsConfig::default()
+                    );
+                    let records = read_records(transcript.lock().unwrap().path()).unwrap();
+                    assert!(records.iter().any(|record| matches!(
+                        record.event,
+                        crate::transcript::TranscriptEvent::SubagentDelegation { .. }
+                    )));
+                    async { Ok("done".into()) }.boxed()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, SubagentStatus::Completed);
+    }
+
+    #[tokio::test]
     async fn takeover_restores_full_runtime_snapshot_before_appending_prompt() {
         let runtime = SubagentPool::new();
         let sessions_dir = temp_sessions_dir();
         let parent_recorder = Arc::new(Mutex::new(
-            TranscriptRecorder::create(temp_sessions_dir()).expect("create parent recorder"),
+            TranscriptRecorder::create(&sessions_dir).expect("create parent recorder"),
         ));
         let parent_session_id = parent_recorder
             .lock()
             .expect("lock parent recorder")
             .session_id()
             .to_string();
+        let mut parent = test_agent();
+        parent.set_subagents_policy(crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_depth: 7,
+            max_descendants: 1,
+            ..Default::default()
+        });
+        parent_recorder
+            .lock()
+            .unwrap()
+            .record_subagents_policy(parent.subagents_policy())
+            .unwrap();
+        install_delegate(
+            &mut parent,
+            &runtime,
+            &sessions_dir,
+            parent_recorder.clone(),
+        );
+        let mut initial_governance = test_governance();
+        initial_governance.input.allowed_paths = vec!["src".into()];
+        initial_governance.input.forbidden_paths = vec!["src/subagent".into()];
         let first = runtime
             .run_with_executor(
-                &test_agent(),
+                &parent,
                 AgentTemplate::explorer(),
                 "inspect initial state".into(),
-                test_governance(),
+                initial_governance,
                 sessions_dir.clone(),
                 parent_session_id.clone(),
                 "turn-1".into(),
@@ -1174,10 +1609,23 @@ base_url = "https://test.example.invalid/v1"
             .with_runtime_catalog(resolved_runtime_catalog()),
         );
         let mut takeover_parent = test_agent();
+        takeover_parent.set_subagents_policy(parent.subagents_policy().clone());
         use_resolved_runtime_catalog(&mut takeover_parent);
         takeover_parent.set_primary_route(takeover_route);
         takeover_parent.set_primary_route_factory(factory.clone());
         takeover_parent.set_subagent_child_factory(factory);
+        install_delegate(
+            &mut takeover_parent,
+            &runtime,
+            &sessions_dir,
+            parent_recorder.clone(),
+        );
+        assert!(
+            takeover_parent
+                .tool_definitions_for_test()
+                .iter()
+                .any(|tool| tool.name == "agent__explore")
+        );
         let mut takeover_governance = test_governance();
         takeover_governance.input.target_child_session_id = Some(first.child_session_id.clone());
         let resumed_child_session_id = first.child_session_id.clone();
@@ -1187,10 +1635,10 @@ base_url = "https://test.example.invalid/v1"
                 AgentTemplate::explorer(),
                 "continue inspection".into(),
                 takeover_governance,
-                sessions_dir,
+                sessions_dir.clone(),
                 parent_session_id,
                 "turn-2".into(),
-                Some(parent_recorder),
+                Some(Arc::clone(&parent_recorder)),
                 no_event_sender(),
                 Some(resumed_child_session_id.clone()),
                 move |agent,
@@ -1202,6 +1650,21 @@ base_url = "https://test.example.invalid/v1"
                     async move {
                         assert_eq!(child_session_id, resumed_child_session_id);
                         assert_eq!(agent.model(), "child-resume-model");
+                        assert_eq!(
+                            agent.subagents_policy().mode,
+                            crate::config::SubagentMode::Swarm
+                        );
+                        assert_eq!(agent.subagents_policy().max_depth, 7);
+                        let scope = agent.delegation_scope().unwrap();
+                        assert!(scope.permits_read([
+                            std::fs::canonicalize("src/subagent.rs").unwrap().as_path()
+                        ]));
+                        for path in ["Cargo.toml", "src/subagent/pool.rs"] {
+                            assert!(
+                                !scope
+                                    .permits_read([std::fs::canonicalize(path).unwrap().as_path()])
+                            );
+                        }
                         assert!(agent.history_for_test().iter().any(|item| matches!(
                             item,
                             crate::request_builder::HistoryItem::ToolOutput { call_id, .. }
@@ -1224,6 +1687,13 @@ base_url = "https://test.example.invalid/v1"
             .expect("takeover succeeds");
 
         assert_eq!(resumed.child_session_id, first.child_session_id);
+        let records = read_records(parent_recorder.lock().unwrap().path()).unwrap();
+        let restored = SubagentPool::new()
+            .swarm_snapshot(&sessions_dir, &records)
+            .unwrap();
+        assert_eq!(restored.members.len(), 1);
+        assert_eq!(restored.runs.len(), 2);
+        assert_eq!(restored.members[&first.child_session_id].pool_ordinal, 1);
     }
 
     #[tokio::test]

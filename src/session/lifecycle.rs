@@ -80,6 +80,7 @@ pub fn cleanup_empty_session_file(path: PathBuf) -> Result<bool> {
 /// install via restore-snapshot.
 pub struct PreparedNewSession {
     pub session_id: String,
+    pub subagents_policy: crate::config::SubagentsConfig,
     pub recorder: TranscriptRecorder,
     pub snapshot: RuntimeRestoreSnapshot,
     pub runtime_context: RuntimeActiveContext,
@@ -93,7 +94,9 @@ pub fn prepare_new_session_package(
     sessions_dir: impl AsRef<Path>,
     model: impl Into<String>,
     workspace: Option<&Path>,
+    subagents_policy: &crate::config::SubagentsConfig,
 ) -> Result<PreparedNewSession> {
+    subagents_policy.validate()?;
     let sessions_dir = sessions_dir.as_ref();
     let mut recorder = bootstrap_new_transcript(sessions_dir, model, workspace)?;
     recorder.set_current_context_branch_id(None);
@@ -101,6 +104,7 @@ pub fn prepare_new_session_package(
     let new_path = recorder.path().to_path_buf();
 
     let prepare_result = (|| -> Result<PreparedNewSession> {
+        recorder.record_subagents_policy(subagents_policy)?;
         let records = read_records(&new_path)?;
         let snapshot = project_runtime_restore_snapshot_with_children(
             session_id.clone(),
@@ -114,6 +118,7 @@ pub fn prepare_new_session_package(
         let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
         Ok(PreparedNewSession {
             session_id: session_id.clone(),
+            subagents_policy: subagents_policy.clone(),
             recorder,
             snapshot,
             runtime_context,
@@ -194,6 +199,7 @@ impl PreparedNewSessionInstall {
         let old_path_at_commit = replace_live_transcript(live, prepared.recorder)
             .expect("live transcript lock must remain healthy after preparation");
         debug_assert_eq!(old_path_at_commit, old_path);
+        agent.set_subagents_policy(prepared.subagents_policy);
         agent.install_new_session_runtime_snapshot(runtime_snapshot, prepared.snapshot.max_turn_id);
         apply_prepared_context_scope(agent, prepared_scope);
         if let Some(prepared_route) = prepared_route {

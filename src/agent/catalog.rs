@@ -253,6 +253,20 @@ impl AgentTemplate {
         ]
     }
 
+    pub(crate) fn for_mode(mut self, mode: crate::config::SubagentMode) -> Self {
+        if mode == crate::config::SubagentMode::Swarm {
+            self.system_prompt = match self.name.as_str() {
+                "explorer" => "你是只读 explorer 子代理。调查分配的仓库任务，给出可追溯结论。只能使用只读工具，不修改文件，不运行写命令。",
+                "oracle" => "你是只读 oracle 子代理。分析根因、风险、方案和验证证据，不修改文件，不运行写命令。",
+                "designer" => "你是只读 designer 子代理。阅读实现，整理接口、设计方案、命名与变更边界，不修改文件，不运行写命令。",
+                "librarian" => "你是只读 librarian 子代理。检索资料与仓库证据，给出紧凑且可追溯的引用，不修改文件，不运行写命令。",
+                "general" => "你是可读可写的 general 子代理。完成分配的通用任务，只编辑 owned_paths 内的文件。",
+                _ => return self,
+            }.into();
+        }
+        self
+    }
+
     pub fn capability_contract(&self) -> SubagentCapabilityContract {
         SubagentCapabilityContract {
             name: self.name.clone(),

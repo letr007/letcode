@@ -99,14 +99,18 @@ fn wrap_text_with_offsets(text: &str, width: usize) -> Vec<WrappedChunk> {
                 source_end_char: line_start_char,
             });
         } else {
+            let mut byte_pos = 0;
             let mut pos = line_start_char;
             for chunk in &wrapped {
+                let start = byte_pos + line[byte_pos..].find(chunk).unwrap();
+                pos += line[byte_pos..start].chars().count();
                 let n = chunk.chars().count();
                 chunks.push(WrappedChunk {
                     text: chunk.clone(),
                     source_start_char: pos,
                     source_end_char: pos + n,
                 });
+                byte_pos = start + chunk.len();
                 pos += n;
             }
         }
@@ -190,7 +194,11 @@ fn wrap_line_to_width(line: &str, width: usize) -> Vec<String> {
     for grapheme in line.graphemes(true) {
         let grapheme_width = display_width(grapheme);
 
-        if grapheme_width > width && current.is_empty() {
+        if grapheme_width > width {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
             if !emitted_tiny_width_placeholder {
                 rows.push(String::new());
                 emitted_tiny_width_placeholder = true;
@@ -233,6 +241,20 @@ mod tests {
     fn wraps_using_display_cell_width() {
         assert_eq!(wrap_text_to_width("a你b", 2), vec!["a", "你", "b"]);
         assert_eq!(wrap_text_to_width("a你b", 3), vec!["a你", "b"]);
+        for width in [1, 2, 3] {
+            let source = "a你b";
+            for chunk in wrap_text_to_width_with_offsets(source, width) {
+                assert!(display_width(&chunk.text) <= width);
+                assert_eq!(
+                    chunk.text,
+                    source
+                        .chars()
+                        .skip(chunk.source_start_char)
+                        .take(chunk.source_end_char - chunk.source_start_char)
+                        .collect::<String>()
+                );
+            }
+        }
     }
 
     #[test]

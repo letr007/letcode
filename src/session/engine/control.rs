@@ -10,9 +10,14 @@ use super::*;
 pub(crate) enum SessionEngineCommand {
     Prompt(crate::user_content::UserMessageSubmission),
     BackgroundSubagentCompleted {
+        generation: Option<u64>,
         parent_session_id: String,
         parent_tool_call_id: Option<String>,
         result: Result<crate::subagent::SubagentRunSummary, String>,
+    },
+    SwarmMessageReady {
+        root_session_id: String,
+        generation: u64,
     },
     ContinueSession,
     Compact,
@@ -145,7 +150,7 @@ pub(crate) fn session_engine_command_as_session_command(
         SessionEngineCommand::ToggleMcpServer(server_name) => Some(
             crate::session::SessionCommand::ToggleMcpServer(server_name.clone()),
         ),
-        SessionEngineCommand::Prompt(_) => None,
+        SessionEngineCommand::Prompt(_) | SessionEngineCommand::SwarmMessageReady { .. } => None,
         #[cfg(test)]
         SessionEngineCommand::InspectHistory(_) => None,
     }
@@ -185,11 +190,15 @@ pub(crate) fn handle_active_turn_command(
     change_notice_sent: &mut bool,
 ) {
     if let SessionEngineCommand::BackgroundSubagentCompleted {
+        generation,
         parent_session_id,
         parent_tool_call_id,
         result,
     } = &command
     {
+        if *generation != subagent_runtime.swarm_generation(parent_session_id) {
+            return;
+        }
         // Only the model delivery waits for this operation to finish.
         observe_background_subagent_completion(
             transcript,
@@ -294,6 +303,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         SessionEngineCommand::SetFakeClient(_) => Some(DeferredCommandKey::FakeClient),
         SessionEngineCommand::Prompt(_)
         | SessionEngineCommand::BackgroundSubagentCompleted { .. }
+        | SessionEngineCommand::SwarmMessageReady { .. }
         | SessionEngineCommand::ContinueSession
         | SessionEngineCommand::Compact
         | SessionEngineCommand::ShowHistoryTree
@@ -614,47 +624,51 @@ where
     }
 }
 
-/// Polls the parent run until every running subagent has settled (its
-/// completion teardown ran) or the bounded settle window expires.
-///
-/// Callers must signal `cancel_active()` before calling this. During the settle
-/// window the parent run remains live and polled: this lets the inline
-/// subagent future complete `complete_started_run`, record its cancelled
-/// terminal state, and release its active slot. Commands received during this
-/// wait are retained for the outer loop rather than being consumed or lost.
-///
-/// Returns whether shutdown was requested while waiting.
+pub(crate) struct SubagentCancelSettle {
+    pub(crate) shutdown: bool,
+    pub(crate) settled: bool,
+    pub(crate) remaining_run_ids: Vec<String>,
+}
+
 pub(crate) async fn wait_for_subagent_cancel_settle<T, F>(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
     mut run: Pin<&mut F>,
     subagent_runtime: &SubagentPool,
-) -> bool
+    settle_timeout: Duration,
+) -> SubagentCancelSettle
 where
     F: Future<Output = T> + ?Sized,
 {
-    let timeout = tokio::time::sleep(SUBAGENT_CANCEL_SETTLE_TIMEOUT);
+    let timeout = tokio::time::sleep(settle_timeout);
     tokio::pin!(timeout);
     let mut cancel_tick = tokio::time::interval(SUBAGENT_CANCEL_SETTLE_POLL_INTERVAL);
     let mut shutdown = false;
+    let mut run_completed = false;
+    let mut control_open = true;
 
     loop {
         if !subagent_runtime.is_running() {
-            return shutdown;
+            return SubagentCancelSettle {
+                shutdown,
+                settled: true,
+                remaining_run_ids: Vec::new(),
+            };
         }
 
         tokio::select! {
             biased;
             _ = &mut timeout => {
-                // Bounded fallback: the caller will drop the parent run, which
-                // force-cancels any child that could not settle cooperatively.
-                return shutdown;
+                return SubagentCancelSettle {
+                    shutdown, settled: !subagent_runtime.is_running(),
+                    remaining_run_ids: subagent_runtime.active_jobs().into_iter().map(|job| job.run_id).collect(),
+                };
             }
-            control = control_rx.recv() => match control {
-                Some(SessionEngineControl::Interrupt) => {
-                    // Keep waiting; the first interrupt already initiated cancellation.
-                }
-                Some(SessionEngineControl::Shutdown) | None => {
+            control = control_rx.recv(), if control_open => match control {
+                Some(SessionEngineControl::Interrupt) => {}
+                Some(SessionEngineControl::Shutdown) => shutdown = true,
+                None => {
+                    control_open = false;
                     shutdown = true;
                 }
                 Some(SessionEngineControl::Command(command)) => {
@@ -666,12 +680,7 @@ where
                 // attempted to start another subagent during cancellation.
                 subagent_runtime.cancel_active();
             }
-            _ = run.as_mut() => {
-                // The parent turn completed before the pool observed guard
-                // release. Its future is settled, so no further child work can
-                // be driven by this run.
-                return shutdown;
-            }
+            _ = run.as_mut(), if !run_completed => run_completed = true,
         }
     }
 }

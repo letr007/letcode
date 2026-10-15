@@ -1134,6 +1134,10 @@ pub trait TurnDriver: Send {
 
     async fn execute_tools(&mut self, tools: &[CompletedToolCall]) -> Result<(), ModelFailure>;
 
+    fn user_turn_handoff(&self) -> bool {
+        false
+    }
+
     async fn recover_iteration(
         &mut self,
         partial: &ModelAttemptSnapshot,
@@ -1271,6 +1275,15 @@ impl TurnOrchestrator {
                         error = failure_with_cleanup(error, cleanup);
                     }
                     return Err(error);
+                }
+                if driver.user_turn_handoff() {
+                    driver.finalize(&result).await?;
+                    return Ok(TurnResult {
+                        final_attempt: result,
+                        iterations: iteration + 1,
+                        tool_calls: total_tools,
+                        recovery_attempts,
+                    });
                 }
                 iteration += 1;
                 continue;

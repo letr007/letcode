@@ -61,11 +61,6 @@ pub(crate) fn workspace_root_for_subagent_lock() -> Result<PathBuf> {
     workspace_root()
 }
 
-pub(crate) fn canonical_subagent_lock_root(path: &str) -> Result<PathBuf> {
-    canonical_existing_path(path)
-        .ok_or_else(|| anyhow!("subagent lock path cannot be resolved: {path}"))
-}
-
 pub(crate) fn canonical_subagent_observed_path(path: &str) -> Result<PathBuf> {
     let root = workspace_root()?;
     let candidate = join_workspace_path(&root, path);

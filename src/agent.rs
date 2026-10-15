@@ -161,6 +161,7 @@ struct ActiveEpoch {
     request_shape_digest: String,
     observation: crate::request_builder::LogicalRequestObservation,
     committed_plan: crate::request_builder::prompt_plan::PromptPlan,
+    tools: Vec<crate::request_builder::ToolSpec>,
     protocol_frontier_count: usize,
     protocol_frontier_token: u64,
     protocol_append_generation: u64,
@@ -176,6 +177,7 @@ pub(super) enum ColdRequiredReason {
     NoActiveEpoch,
     TurnChanged,
     RequestProjectionChanged,
+    ToolDefinitionsChanged,
     ProtocolFrontierChanged,
     TruncatedOrReselected,
     EvidenceChanged,
@@ -527,6 +529,41 @@ impl PreparedPrimaryRouteInstall {
 }
 
 pub trait SubagentDelegate: Send + Sync {
+    fn prepare(&self, _agent: &Agent) -> Result<()> {
+        Ok(())
+    }
+
+    fn has_user_message(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn take_user_message(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn send<'a>(
+        &'a self,
+        _parent: &'a Agent,
+        args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        self.control(tool_names::TOOL_AGENT_SEND, args)
+    }
+
+    fn for_child(
+        &self,
+        _transcript: Arc<Mutex<crate::transcript::TranscriptRecorder>>,
+    ) -> Result<Arc<dyn SubagentDelegate>> {
+        bail!("recursive delegation is unavailable in this subagent runtime")
+    }
+
+    fn can_delegate(&self) -> bool {
+        true
+    }
+
+    fn take_completed(&self) -> Result<Vec<crate::subagent::SubagentRunSummary>> {
+        Ok(Vec::new())
+    }
+
     fn run_named<'a>(
         &'a self,
         parent: &'a Agent,
@@ -683,6 +720,7 @@ pub(crate) type TurnContinuationProvider =
 
 pub struct Agent {
     model: String,
+    subagents_policy: crate::config::SubagentsConfig,
     primary_route: Option<ModelRoute>,
     default_protocol: ApiProtocol,
     model_protocols: HashMap<String, ApiProtocol>,
@@ -703,7 +741,7 @@ pub struct Agent {
     last_historian_work: Option<String>,
     history_budget_limit: Option<u64>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
-    /// Run-local directory authorization for delegated children. Never inherited.
+    /// Run-local directory authorization for delegated children.
     subagent_path_scope: Option<Arc<SubagentPathScope>>,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
@@ -715,6 +753,8 @@ pub struct Agent {
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
     turn_continuation_provider: Option<TurnContinuationProvider>,
+    member_message_recorder: Option<Arc<dyn Fn(&str) -> Result<()> + Send + Sync>>,
+    member_message_start: bool,
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
     provider_usage_anchor: Option<ProviderUsageAnchor>,
@@ -739,6 +779,26 @@ pub struct Agent {
 }
 
 impl AgentFactory {
+    pub(crate) fn launch_seed(parent: &Agent) -> Agent {
+        let mut template = AgentTemplate::general();
+        template.system_prompt.clear();
+        let mut seed = Self::create_child_with_parts(
+            parent,
+            &template,
+            parent.model.clone(),
+            parent.default_protocol,
+            parent.model_protocols.clone(),
+            parent.model_catalog.clone(),
+            parent.retry_config.clone(),
+            parent.resolved_model_route.clone(),
+            parent.resolved_runtime_catalog.clone(),
+            parent.max_tool_calls,
+        );
+        seed.primary_route = parent.primary_route.clone();
+        seed.prelude = parent.prelude.clone();
+        seed
+    }
+
     #[cfg(test)]
     pub fn create_child(parent: &Agent, template: &AgentTemplate) -> Agent {
         Self::create_child_with_max_tool_calls(parent, template, None)
@@ -794,6 +854,34 @@ impl AgentFactory {
             child.set_primary_route(route);
         }
         Ok(child)
+    }
+
+    pub(crate) fn create_resumed_child(
+        parent: &Agent,
+        template: &AgentTemplate,
+        route: ModelRoute,
+        max_tool_calls: Option<usize>,
+    ) -> Result<Agent> {
+        if parent.subagent_child_factory.is_some() {
+            return Self::create_child_with_route_and_max_tool_calls(
+                parent,
+                template,
+                Some(route),
+                true,
+                max_tool_calls,
+            );
+        }
+        anyhow::ensure!(
+            parent.primary_route.as_ref() == Some(&route),
+            "recorded member route is unavailable in this runtime"
+        );
+        Self::create_child_with_route_and_max_tool_calls(
+            parent,
+            template,
+            None,
+            false,
+            max_tool_calls,
+        )
     }
 
     pub fn resolve_subagent_route(
@@ -925,6 +1013,7 @@ impl AgentFactory {
 
         Agent {
             model: model.clone(),
+            subagents_policy: parent.subagents_policy.clone(),
             primary_route: None,
             default_protocol,
             model_protocols,
@@ -967,6 +1056,8 @@ impl AgentFactory {
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
             turn_continuation_provider: None,
+            member_message_recorder: None,
+            member_message_start: false,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -1187,6 +1278,11 @@ impl Agent {
                 ColdRequiredReason::RequestProjectionChanged,
             ));
         }
+        if previous.tools != tools {
+            return Ok(ActiveEpochPreparation::ColdRequired(
+                ColdRequiredReason::ToolDefinitionsChanged,
+            ));
+        }
         if previous.budget.truncated {
             return Ok(ActiveEpochPreparation::ColdRequired(
                 ColdRequiredReason::TruncatedOrReselected,
@@ -1266,13 +1362,13 @@ impl Agent {
             frozen.as_ref(),
             Some(policy),
         )?;
-        self.active_epoch_preview_from_build(planned, ActiveEpochTransition::Cold)
+        self.active_epoch_preview_from_build(planned, tools, ActiveEpochTransition::Cold)
     }
 
     fn preview_warm_active_epoch(
         &self,
         _protocol: ApiProtocol,
-        _tools: &[crate::request_builder::ToolSpec],
+        tools: &[crate::request_builder::ToolSpec],
         previous: &ActiveEpoch,
         suffix: &[crate::protocol_frames::ProtocolFrame],
     ) -> Result<ActiveEpochPreview> {
@@ -1344,6 +1440,7 @@ impl Agent {
         }
         self.active_epoch_preview_from_build(
             rebuilt,
+            tools,
             ActiveEpochTransition::Append {
                 added: suffix.len(),
             },
@@ -1353,6 +1450,7 @@ impl Agent {
     fn active_epoch_preview_from_build(
         &self,
         build: crate::request_builder::BuildResult,
+        tools: &[crate::request_builder::ToolSpec],
         _transition: ActiveEpochTransition,
     ) -> Result<ActiveEpochPreview> {
         let observation = observe_logical_request(&build);
@@ -1366,6 +1464,7 @@ impl Agent {
                 turn_id: self.turn.turn_id,
                 request_shape_digest: observation.cohort.request_shape_digest.clone(),
                 committed_plan,
+                tools: tools.to_vec(),
                 protocol_frontier_count: self.protocol_append_state.frame_count(),
                 protocol_frontier_token: self.protocol_append_state.frontier_token(),
                 protocol_append_generation: self.protocol_append_state.generation(),
@@ -1425,6 +1524,7 @@ impl Agent {
         let model = model.into();
         Self {
             model: model.clone(),
+            subagents_policy: crate::config::SubagentsConfig::default(),
             primary_route: None,
             default_protocol: ApiProtocol::Responses,
             model_protocols: HashMap::new(),
@@ -1464,6 +1564,8 @@ impl Agent {
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
             turn_continuation_provider: None,
+            member_message_recorder: None,
+            member_message_start: false,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -1694,6 +1796,26 @@ impl Agent {
 
     pub(crate) fn compaction_config(&self) -> &CompactionConfig {
         &self.compaction_config
+    }
+
+    pub(crate) fn subagents_policy(&self) -> &crate::config::SubagentsConfig {
+        &self.subagents_policy
+    }
+
+    pub(crate) fn set_subagents_policy(&mut self, policy: crate::config::SubagentsConfig) {
+        let swarm_prelude = DEFAULT_AGENT_PRELUDE.replace(
+            "保持委派受控：避免递归委派，避免不必要的多智能体编排",
+            "保持委派受控：按共享深度和累计额度委派，避免不必要的多智能体编排",
+        );
+        for message in &mut self.prelude {
+            if message.text == DEFAULT_AGENT_PRELUDE || message.text == swarm_prelude {
+                message.text = match policy.mode {
+                    crate::config::SubagentMode::Expert => DEFAULT_AGENT_PRELUDE.into(),
+                    crate::config::SubagentMode::Swarm => swarm_prelude.clone(),
+                };
+            }
+        }
+        self.subagents_policy = policy;
     }
 
     pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
@@ -1985,7 +2107,7 @@ impl Agent {
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
         if self.subagent_delegate.is_some() {
-            tools.extend(subagent_control_tool_specs());
+            tools.extend(subagent_control_tool_specs(self.subagents_policy().mode));
         }
         let policy = ProtectedContextPolicy::from_configured_reserve(
             None,
@@ -2018,6 +2140,67 @@ impl Agent {
             Some(policy),
         )?;
         Ok(build)
+    }
+
+    pub(crate) fn mark_member_message_start(&mut self) {
+        self.member_message_start = true;
+    }
+
+    pub(crate) fn take_initial_member_message(&mut self) -> Result<Option<String>> {
+        if !std::mem::take(&mut self.member_message_start) {
+            return Ok(None);
+        }
+        self.take_member_message()?
+            .map(Some)
+            .ok_or_else(|| anyhow!("member message run has no pending work"))
+    }
+
+    pub(crate) fn set_member_message_recorder(
+        &mut self,
+        recorder: Arc<dyn Fn(&str) -> Result<()> + Send + Sync>,
+    ) {
+        self.member_message_recorder = Some(recorder);
+    }
+
+    pub(crate) fn prepare_subagent_runtime(&self) -> Result<()> {
+        if let Some(delegate) = &self.subagent_delegate {
+            delegate.prepare(self)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_member_message(&self) -> Result<bool> {
+        self.subagent_delegate
+            .as_ref()
+            .map(|delegate| delegate.has_user_message())
+            .transpose()
+            .map(|value| value.unwrap_or(false))
+    }
+
+    pub(crate) fn take_member_message(&self) -> Result<Option<String>> {
+        self.subagent_delegate
+            .as_ref()
+            .map(|delegate| delegate.take_user_message())
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn delegation_scope(&self) -> Option<&SubagentPathScope> {
+        self.subagent_path_scope.as_deref()
+    }
+
+    pub(crate) fn child_delegate(
+        &self,
+        transcript: Arc<Mutex<crate::transcript::TranscriptRecorder>>,
+    ) -> Result<Arc<dyn SubagentDelegate>> {
+        self.subagent_delegate
+            .as_ref()
+            .ok_or_else(|| anyhow!("recursive delegation is unavailable in this runtime"))?
+            .for_child(transcript)
+    }
+
+    pub(crate) fn permits_delegation_write(&self) -> bool {
+        self.tools.scope() == crate::permission::ToolScope::FullAccess
     }
 
     #[cfg(test)]
@@ -2552,10 +2735,19 @@ impl Agent {
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
     {
-        let Some(provider) = self.turn_continuation_provider.as_ref() else {
-            return Ok(false);
-        };
-        let messages = provider()?;
+        let mut messages = self
+            .turn_continuation_provider
+            .as_ref()
+            .map(|provider| provider())
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(delegate) = &self.subagent_delegate {
+            messages.extend(delegate.take_completed()?.into_iter().map(|result| {
+                PendingTurnContinuation {
+                    result: Some(result),
+                }
+            }));
+        }
         self.apply_turn_continuations(messages)
     }
 
@@ -2925,6 +3117,7 @@ impl Agent {
     pub fn session_title_agent(&self) -> Agent {
         Agent {
             model: self.model.clone(),
+            subagents_policy: self.subagents_policy.clone(),
             primary_route: None,
             default_protocol: self.default_protocol,
             model_protocols: self.model_protocols.clone(),
@@ -2957,6 +3150,8 @@ impl Agent {
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
             turn_continuation_provider: None,
+            member_message_recorder: None,
+            member_message_start: false,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -3264,6 +3459,15 @@ impl Agent {
             );
         };
 
+        if tool_name == tool_names::TOOL_AGENT_SEND {
+            if self.subagents_policy().mode != crate::config::SubagentMode::Swarm {
+                return ToolResult::err(tool_name, "member messaging requires swarm mode");
+            }
+            return match delegate.send(self, args).await {
+                Ok(result) => result,
+                Err(error) => ToolResult::err(tool_name, error.to_string()),
+            };
+        }
         if is_subagent_control_tool_name(tool_name) {
             return match delegate.control(tool_name, args).await {
                 Ok(result) => result,
@@ -3315,7 +3519,7 @@ impl Agent {
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
         if self.subagent_delegate.is_some() {
-            specs.extend(subagent_control_tool_specs());
+            specs.extend(subagent_control_tool_specs(self.subagents_policy().mode));
         }
         specs
     }
@@ -3919,21 +4123,41 @@ impl Agent {
 
         let validation_advisory_emitted = self.emit_validation_advisory_if_needed(on_event).await?;
 
-        Self::emit_audit_event(
-            on_event,
-            AgentEvent::TurnFinalized(self.turn_finalized_event(
-                "completed",
-                tool_call_count,
-                *continuation_count,
-                validation_advisory_emitted,
-            )),
-            "turn_finalized",
-        )
-        .await;
+        let finalized = AgentEvent::TurnFinalized(self.turn_finalized_event(
+            "completed",
+            tool_call_count,
+            *continuation_count,
+            validation_advisory_emitted,
+        ));
+        if self.subagents_policy().mode == crate::config::SubagentMode::Swarm {
+            on_event(finalized).await?;
+        } else {
+            Self::emit_audit_event(on_event, finalized, "turn_finalized").await;
+        }
 
         self.finish_current_turn()?;
 
         Ok(false)
+    }
+
+    async fn finish_member_turn<E, Efut>(
+        &mut self,
+        on_event: &mut E,
+        tool_calls: usize,
+        continuations: usize,
+    ) -> Result<()>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        on_event(AgentEvent::TurnFinalized(self.turn_finalized_event(
+            "completed",
+            tool_calls,
+            continuations,
+            false,
+        )))
+        .await?;
+        self.finish_current_turn()
     }
 
     async fn emit_validation_advisory_if_needed<E, Efut>(&self, on_event: &mut E) -> Result<bool>
@@ -4266,12 +4490,27 @@ fn permission_class_for_tool_call(
 /// will only fail after approval.
 fn is_executable_tool(agent: &Agent, tool_name: &str) -> bool {
     if is_subagent_control_tool_name(tool_name) {
-        return agent.subagent_delegate.is_some();
+        return agent.subagent_delegate.is_some()
+            && (tool_name != tool_names::TOOL_AGENT_SEND
+                || agent.subagents_policy().mode == crate::config::SubagentMode::Swarm);
     }
     match subagent_catalog_entry_by_tool_name(tool_name) {
-        Some(_) => agent.subagent_delegate.is_some(),
+        Some(_) => {
+            agent
+                .subagent_delegate
+                .as_ref()
+                .is_some_and(|delegate| delegate.can_delegate())
+                && tool_scope_allows(agent, tool_name)
+        }
         None => agent.tools.contains(tool_name),
     }
+}
+
+fn tool_scope_allows(agent: &Agent, tool_name: &str) -> bool {
+    agent.tools.scope().allows_tool(tool_name)
+        || is_subagent_control_tool_name(tool_name)
+        || (agent.subagents_policy().mode == crate::config::SubagentMode::Swarm
+            && is_read_only_subagent_tool_name(tool_name))
 }
 
 fn subagent_tool_permission_class(
@@ -4301,14 +4540,21 @@ pub(crate) fn is_subagent_control_tool_name(name: &str) -> bool {
             | tool_names::TOOL_AGENT_STATUS
             | tool_names::TOOL_AGENT_WAIT
             | tool_names::TOOL_AGENT_CANCEL
+            | tool_names::TOOL_AGENT_SEND
     )
 }
 
-fn subagent_control_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
-    vec![
+fn subagent_control_tool_specs(
+    mode: crate::config::SubagentMode,
+) -> Vec<crate::request_builder::ToolSpec> {
+    let mut specs = vec![
         crate::request_builder::ToolSpec {
             name: tool_names::TOOL_AGENT_JOBS.into(),
-            description: "List subagent jobs for the current parent session, including active and terminal runs.".into(),
+            description: if mode == crate::config::SubagentMode::Swarm {
+                "List root and all-depth swarm member identities and latest statuses."
+            } else {
+                "List subagent jobs for the current parent session, including active and terminal runs."
+            }.into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {},
@@ -4319,9 +4565,25 @@ fn subagent_control_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
         },
         crate::request_builder::ToolSpec {
             name: tool_names::TOOL_AGENT_STATUS.into(),
-            description: "Get one existing subagent run by run_id without starting or taking over work.".into(),
-            parameters: subagent_run_id_schema(),
-            strict: true,
+            description: if mode == crate::config::SubagentMode::Swarm {
+                "Get identity and status for a historical run_id or the latest state for a session_id, including the root. Supply exactly one selector."
+            } else {
+                "Get one existing subagent run by run_id without starting or taking over work."
+            }.into(),
+            parameters: if mode == crate::config::SubagentMode::Swarm {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                        "session_id": {"type": "string", "minLength": 1, "pattern": "\\S"}
+                    },
+                    "oneOf": [{"required": ["run_id"]}, {"required": ["session_id"]}],
+                    "additionalProperties": false
+                })
+            } else {
+                subagent_run_id_schema()
+            },
+            strict: mode != crate::config::SubagentMode::Swarm,
         },
         crate::request_builder::ToolSpec {
             name: tool_names::TOOL_AGENT_WAIT.into(),
@@ -4335,7 +4597,19 @@ fn subagent_control_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
             parameters: subagent_run_id_schema(),
             strict: true,
         },
-    ]
+    ];
+    if mode == crate::config::SubagentMode::Swarm {
+        specs.push(crate::request_builder::ToolSpec {
+            name: tool_names::TOOL_AGENT_SEND.into(),
+            description: "Queue a message for a session_id in this swarm. Accepted means queued, not processed.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{
+                "session_id":{"type":"string","minLength":1},
+                "message":{"type":"string","minLength":1}
+            },"required":["session_id","message"],"additionalProperties":false}),
+            strict: true,
+        });
+    }
+    specs
 }
 
 fn subagent_run_id_schema() -> Value {

@@ -913,6 +913,14 @@ impl TranscriptRecorder {
         })
     }
 
+    pub(crate) fn record_subagent_activation(
+        &mut self,
+        run_id: String,
+        member: crate::subagent::SwarmMember,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::SubagentActivated { run_id, member })
+    }
+
     pub fn record_subagent_delegation(
         &mut self,
         run_id: String,
@@ -1502,6 +1510,15 @@ impl TranscriptRecorder {
         self.append_record(event, unix_timestamp_ms(), context_branch_id, true)
     }
 
+    pub(crate) fn record_subagents_policy(
+        &mut self,
+        policy: &crate::config::SubagentsConfig,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::SessionSubagentsPolicy {
+            policy: policy.clone(),
+        })
+    }
+
     pub fn append_metadata(&mut self, event: TranscriptEvent) -> Result<()> {
         self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
     }
@@ -1762,6 +1779,8 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
     matches!(
         event,
         TranscriptEvent::SessionStarted { .. }
+            | TranscriptEvent::SessionSubagentsPolicy { .. }
+            | TranscriptEvent::SubagentActivated { .. }
             | TranscriptEvent::ModelChanged { .. }
             | TranscriptEvent::ReasoningEffortChanged { .. }
             | TranscriptEvent::SubagentLifecycle { .. }

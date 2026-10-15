@@ -78,12 +78,15 @@ impl SubagentEventSender {
 
 pub async fn run_child_prompt(
     mut agent: Agent,
-    prompt: String,
+    mut prompt: String,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     sender: Option<SubagentEventSender>,
     child_session_id: String,
     permission_origin: Option<String>,
 ) -> Result<String> {
+    if let Some(message) = agent.take_initial_member_message()? {
+        prompt = message;
+    }
     if let Some(sender) = sender {
         return sender
             .run_child_prompt(
@@ -118,6 +121,12 @@ pub async fn run_child_prompt(
         }));
     }
 
+    let user_transcript = transcript.clone();
+    agent.set_member_message_recorder(Arc::new(move |message| {
+        record_transcript(&user_transcript, |recorder| {
+            recorder.record_user_message(message)
+        })
+    }));
     record_transcript(&transcript, |recorder| {
         recorder.record_user_message(prompt.clone())
     })?;
@@ -201,6 +210,9 @@ pub async fn run_child_prompt(
             let error_message = format!("{error:#}");
             record_transcript(&transcript, |recorder| {
                 recorder.record_error(error_message.clone())
+            })
+            .map_err(|record_error| {
+                anyhow!("{error_message}; failed to record child error: {record_error:#}")
             })?;
             Err(error)
         }

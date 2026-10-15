@@ -141,10 +141,12 @@ pub(crate) use journal::{
     JOURNAL_SCHEMA_VERSION, JOURNAL_TRANSACTION_COMMIT, JournalRecordEnvelope, JournalScope,
     JournalSink, JournalTransactionCommit, LEGACY_JOURNAL_SCHEMA_VERSION,
     content_tail_is_uncommitted_transaction, journal_payload_digest, journal_scope_for,
-    parse_records_content, scan_transcript_content, serialize_journal_record,
-    transcript_file_fingerprint, transcript_records_match, validate_journal_entries,
+    scan_transcript_content, serialize_journal_record, transcript_file_fingerprint,
+    transcript_records_match, validate_journal_entries,
 };
-pub(crate) use journal::{ParsedJournalLine, parse_journal_line, transaction_fields};
+pub(crate) use journal::{
+    ParsedJournalLine, parse_journal_line, parse_records_content, transaction_fields,
+};
 pub use journal::{
     read_records, read_records_allow_partial_tail, read_resumable_records_with_fingerprint,
 };
@@ -262,6 +264,24 @@ pub fn workspace_root(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+pub(crate) fn restore_subagents_policy(
+    records: &[TranscriptRecord],
+) -> Result<crate::config::SubagentsConfig> {
+    let mut restored = None;
+    for record in records {
+        if let TranscriptEvent::SessionSubagentsPolicy { policy } = &record.event {
+            policy
+                .validate()
+                .context("invalid session subagents policy")?;
+            if restored.is_some_and(|previous| previous != policy) {
+                anyhow::bail!("conflicting session subagents policy snapshots");
+            }
+            restored = Some(policy);
+        }
+    }
+    Ok(restored.cloned().unwrap_or_default())
 }
 
 pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> {

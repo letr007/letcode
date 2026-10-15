@@ -2735,6 +2735,54 @@ fn list_sessions_persists_and_reuses_sidecar_index() {
 }
 
 #[test]
+fn subagents_policy_is_durable_metadata_outside_session_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut recorder = TranscriptRecorder::create(dir.path()).unwrap();
+    recorder.record_session_started("test/model").unwrap();
+    let policy = crate::config::SubagentsConfig {
+        mode: crate::config::SubagentMode::Swarm,
+        max_depth: 5,
+        ..Default::default()
+    };
+    recorder.record_subagents_policy(&policy).unwrap();
+    recorder
+        .record_subagent_activation(
+            "run".into(),
+            crate::subagent::SwarmMember {
+                root_session_id: "root".into(),
+                parent_session_id: "root".into(),
+                child_session_id: recorder.session_id().to_string(),
+                depth: 1,
+                agent_name: "explorer".into(),
+                pool_ordinal: 1,
+            },
+        )
+        .unwrap();
+    let records = read_records(recorder.path()).unwrap();
+    for metadata in &records[1..] {
+        assert!(metadata.context_branch_id.is_none());
+        assert!(!metadata.event.is_session_content());
+        assert!(!metadata.event.is_session_history_entry());
+        assert!(super::recorder::requires_durable_commit(&metadata.event));
+    }
+    assert_eq!(restore_subagents_policy(&records).unwrap(), policy);
+    let snapshot = project_runtime_restore_snapshot(
+        recorder.session_id().to_string(),
+        records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .unwrap();
+    assert!(snapshot.snapshot.active_protocol_frames().is_empty());
+    let path = recorder.path().to_path_buf();
+    drop(recorder);
+    assert!(remove_empty_session_file(path).unwrap());
+}
+
+#[test]
 fn remove_empty_session_file_only_deletes_empty_transcripts() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-remove-empty-test-{}",

@@ -153,6 +153,33 @@ impl SubagentPathScope {
         }))
     }
 
+    pub(crate) fn narrowed_from(mut self, parent: &Self) -> Result<Self> {
+        let reads = self.allowed_roots.iter().chain(&self.owned_roots);
+        if self.allowed_roots.is_empty() && self.owned_roots.is_empty() {
+            self.allowed_roots = parent.allowed_roots.clone();
+            self.allowed_roots.extend(parent.owned_roots.clone());
+        } else {
+            anyhow::ensure!(
+                parent.permits_read(reads.map(PathBuf::as_path)),
+                "delegated read scope exceeds parent scope"
+            );
+        }
+        anyhow::ensure!(
+            parent.permits_write(self.owned_roots.iter().map(PathBuf::as_path)),
+            "delegated write scope exceeds parent scope"
+        );
+        self.forbidden_roots.extend(parent.forbidden_roots.clone());
+        self.forbidden_roots.sort();
+        self.forbidden_roots.dedup();
+        Ok(self)
+    }
+
+    pub(crate) fn read_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.allowed_roots.clone();
+        roots.extend(self.owned_roots.clone());
+        roots
+    }
+
     pub(crate) fn permits_read<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> bool {
         for path in paths {
             if self.is_forbidden(path) {
@@ -536,11 +563,11 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
         "properties": {
             "task": {
                 "type": ["string", "null"],
-                "description": task_description
+                "description": format!("{task_description}。objective 的兼容别名；两者同时提供时仅采用 objective，完整任务应写在同一字段")
             },
             "objective": {
                 "type": ["string", "null"],
-                "description": "更明确的委派目标；未提供时兼容旧版 task 输入"
+                "description": "完整委派目标与必要步骤；优先于 task，两者不会合并。未提供时使用 task"
             },
             "success_criteria": {
                 "type": ["array", "null"],

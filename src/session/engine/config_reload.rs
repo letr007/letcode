@@ -258,8 +258,9 @@ pub(crate) fn apply_config_reload(
 
     // Global config writes for non-reloadable fields (for example MCP enabled state)
     // and duplicate watcher events land here with no runtime delta. Stay silent.
-    let new_session_default_unchanged =
-        engine_config.new_session_default_route == next_new_session_default_route;
+    let new_session_default_unchanged = engine_config.new_session_default_route
+        == next_new_session_default_route
+        && engine_config.new_session_subagents_policy == config.subagents;
     if !reload_has_runtime_delta(
         runtime_fingerprint_unchanged,
         maps_unchanged,
@@ -344,6 +345,7 @@ pub(crate) fn apply_config_reload(
     engine_config.providers = session_providers;
     engine_config.global_retry = next_global_retry;
     engine_config.new_session_default_route = next_new_session_default_route;
+    engine_config.new_session_subagents_policy = config.subagents;
     agent.set_resolved_runtime_catalog(Some(next_runtime_catalog.clone()));
     engine_config.runtime_catalog = next_runtime_catalog;
     let _ = event_tx.send(SessionTransportEvent::ModelCatalogUpdated(catalog_event));

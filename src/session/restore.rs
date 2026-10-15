@@ -106,6 +106,7 @@ pub fn project_runtime_restore_snapshot_with_children(
 /// with legacy branch adopted. Agent restore remains the caller's job.
 pub struct PreparedResume {
     pub session_id: String,
+    pub subagents_policy: crate::config::SubagentsConfig,
     #[allow(dead_code)]
     pub records: Vec<TranscriptRecord>,
     pub snapshot: RuntimeRestoreSnapshot,
@@ -161,6 +162,10 @@ pub fn prepare_resume_package(
         );
     }
     let (mut records, mut recorder) = load_and_open_for_resume(sessions_dir, &session_id)?;
+    let subagents_policy = crate::transcript::restore_subagents_policy(&records)?;
+    if subagents_policy.mode == crate::config::SubagentMode::Swarm {
+        crate::subagent::swarm::project(sessions_dir, &records)?;
+    }
     let mut snapshot = project_runtime_restore_snapshot_with_children(
         session_id.clone(),
         records.clone(),
@@ -199,6 +204,7 @@ pub fn prepare_resume_package(
 
     Ok(PreparedResume {
         session_id,
+        subagents_policy,
         records,
         snapshot,
         recorder,
@@ -227,6 +233,7 @@ pub(crate) fn apply_prepared_resume_to_agent(
     let _ = apply_restored_reasoning_effort(agent, &prepared.snapshot.records);
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     apply_prepared_context_scope(agent, prepared_scope);
+    agent.set_subagents_policy(prepared.subagents_policy.clone());
     Ok(())
 }
 
@@ -500,6 +507,7 @@ impl PreparedRoutedResumeInstall {
         apply_prepared_restored_route(agent, route);
         apply_restored_permission_mode(agent, prepared.snapshot.latest_permission_mode.as_deref());
         let _ = apply_restored_reasoning_effort(agent, &prepared.snapshot.records);
+        agent.set_subagents_policy(prepared.subagents_policy);
         agent.install_validated_runtime_snapshot(runtime_snapshot);
         agent.restore_turn_sequence(prepared.snapshot.max_turn_id);
         apply_prepared_context_scope(agent, prepared_scope);
@@ -1329,6 +1337,119 @@ protocol = "responses"
     }
 
     #[test]
+    fn subagents_policy_resumes_saved_values_and_defaults_legacy_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_depth: 7,
+            max_descendants: 20,
+            max_pending_messages: 8,
+            max_message_bytes: 1000,
+            run_timeout_secs: 200,
+        };
+        for policy in [Some(saved.clone()), None] {
+            let mut target = TranscriptRecorder::create(dir.path()).unwrap();
+            target.record_session_started("gpt-5.5").unwrap();
+            if let Some(policy) = &policy {
+                target.record_subagents_policy(policy).unwrap();
+            }
+            let target_id = target.session_id().to_string();
+            drop(target);
+            let mut agent = test_agent();
+            agent.set_subagents_policy(crate::config::SubagentsConfig {
+                mode: crate::config::SubagentMode::Swarm,
+                max_depth: 2,
+                ..Default::default()
+            });
+            let live = Arc::new(Mutex::new(TranscriptRecorder::create(dir.path()).unwrap()));
+            let prepared = prepare_resume_package(dir.path(), &target_id).unwrap();
+            let install = prepare_routed_resume_install(&agent, &live, prepared, None).unwrap();
+            assert_eq!(agent.subagents_policy().max_depth, 2);
+            install.commit(&mut agent, &live);
+            assert_eq!(agent.subagents_policy(), &policy.unwrap_or_default());
+            assert_eq!(live.lock().unwrap().session_id(), target_id);
+        }
+    }
+
+    #[test]
+    fn subagents_policy_prepare_rejects_invalid_snapshots_without_changing_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        let active_policy = crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_depth: 9,
+            ..Default::default()
+        };
+        agent.set_subagents_policy(active_policy.clone());
+        let mut live_recorder = TranscriptRecorder::create(dir.path()).unwrap();
+        live_recorder
+            .record_subagents_policy(&active_policy)
+            .unwrap();
+        let live_id = live_recorder.session_id().to_string();
+        let live = Arc::new(Mutex::new(live_recorder));
+        let snapshot = serde_json::to_value(crate::config::SubagentsConfig::default()).unwrap();
+        let mut malformed = snapshot.clone();
+        malformed.as_object_mut().unwrap().remove("max_depth");
+        let mut invalid_mode = snapshot.clone();
+        invalid_mode["mode"] = serde_json::json!("other");
+        let mut invalid = vec![malformed, invalid_mode];
+        for field in [
+            "max_depth",
+            "max_descendants",
+            "max_pending_messages",
+            "max_message_bytes",
+            "run_timeout_secs",
+        ] {
+            let mut policy = snapshot.clone();
+            policy[field] = serde_json::json!(0);
+            invalid.push(policy);
+        }
+        let mut huge_timeout = snapshot;
+        huge_timeout["run_timeout_secs"] = serde_json::json!(u64::MAX);
+        invalid.push(huge_timeout);
+        for policy in invalid {
+            let mut target = TranscriptRecorder::create(dir.path()).unwrap();
+            target.record_session_started("gpt-5.5").unwrap();
+            let target_id = target.session_id().to_string();
+            let path = target.path().to_path_buf();
+            drop(target);
+            let record = serde_json::json!({
+                "journal_schema_version": JOURNAL_SCHEMA_VERSION,
+                "event_id": format!("{target_id}:2"), "scope": "global",
+                "base_revision": 1, "resulting_revision": 2,
+                "session_id": target_id, "sequence": 2, "timestamp_ms": 0,
+                "kind": "session_subagents_policy", "policy": policy,
+            });
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+                "{record}"
+            )
+            .unwrap();
+            let error = prepare_resume_package(dir.path(), &target_id)
+                .err()
+                .expect("invalid policy must fail preparation");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("policy")
+                    || message.contains("max_depth")
+                    || message.contains("unknown variant"),
+                "{message}"
+            );
+            assert_eq!(agent.subagents_policy(), &active_policy);
+            let live = live.lock().unwrap();
+            assert_eq!(live.session_id(), live_id);
+            assert_eq!(
+                crate::transcript::restore_subagents_policy(
+                    &crate::transcript::read_records(live.path()).unwrap()
+                )
+                .unwrap(),
+                active_policy
+            );
+        }
+    }
+
+    #[test]
     fn token_usage_preparation_failure_leaves_live_session_and_agent_unchanged() {
         let sessions_dir = temp_dir();
         let mut target =
@@ -1336,6 +1457,12 @@ protocol = "responses"
         target
             .record_session_started("primary/shared")
             .expect("record target session start");
+        target
+            .record_subagents_policy(&crate::config::SubagentsConfig {
+                mode: crate::config::SubagentMode::Swarm,
+                ..Default::default()
+            })
+            .unwrap();
         let target_session_id = target.session_id().to_string();
         drop(target);
 
@@ -1383,6 +1510,10 @@ protocol = "responses"
         let error = install_prepared_routed_resume_for_agent(&mut agent, &live, prepared)
             .expect_err("token usage preparation must fail before commit");
         assert!(error.to_string().contains("duplicate evidence id"));
+        assert_eq!(
+            agent.subagents_policy(),
+            &crate::config::SubagentsConfig::default()
+        );
         assert_eq!(agent.model(), "gpt-5.5");
         assert_eq!(
             agent.primary_route(),

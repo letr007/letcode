@@ -446,6 +446,7 @@ pub fn is_internal_tool(tool: &str) -> bool {
             | tool_names::TOOL_AGENT_STATUS
             | tool_names::TOOL_AGENT_WAIT
             | tool_names::TOOL_AGENT_CANCEL
+            | tool_names::TOOL_AGENT_SEND
     )
 }
 
@@ -476,7 +477,8 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_AGENT_JOBS
         | tool_names::TOOL_AGENT_STATUS
         | tool_names::TOOL_AGENT_WAIT
-        | tool_names::TOOL_AGENT_CANCEL => ToolPermissionClass::Preview,
+        | tool_names::TOOL_AGENT_CANCEL
+        | tool_names::TOOL_AGENT_SEND => ToolPermissionClass::Preview,
         tool_names::TOOL_AGENT_FIXER
         | tool_names::TOOL_AGENT_GENERAL
         | tool_names::TOOL_FS_WRITE
@@ -500,6 +502,7 @@ mod tests {
             tool_names::TOOL_AGENT_STATUS,
             tool_names::TOOL_AGENT_WAIT,
             tool_names::TOOL_AGENT_CANCEL,
+            tool_names::TOOL_AGENT_SEND,
         ] {
             assert!(is_internal_tool(tool));
             assert_eq!(classify_tool(tool), ToolPermissionClass::Preview);

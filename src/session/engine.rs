@@ -152,6 +152,7 @@ pub struct SessionEngineConfig {
     pub route_api_key_configured: indexmap::IndexMap<String, bool>,
     /// Global default route used only when starting a new session.
     pub new_session_default_route: ModelRoute,
+    pub new_session_subagents_policy: crate::config::SubagentsConfig,
     /// Resolved expert default routes derived from the configuration.
     pub expert_default_routes: indexmap::IndexMap<String, ModelRoute>,
     /// Provider-qualified routes allowed for per-invocation expert selection and takeover.
@@ -1627,11 +1628,13 @@ async fn run_engine_loop(
                 }
 
                 if let SessionEngineCommand::BackgroundSubagentCompleted {
+                    generation,
                     parent_session_id,
                     parent_tool_call_id,
                     result,
                 } = command
                 {
+                    if generation != subagent_runtime.swarm_generation(&parent_session_id) { continue; }
                     if !observe_background_subagent_completion(
                         &transcript,
                         &subagent_runtime,
@@ -1795,6 +1798,16 @@ async fn run_engine_loop(
                         let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdated(server));
                         continue;
                     }
+                    SessionEngineCommand::SwarmMessageReady { root_session_id, generation } => {
+                        if subagent_runtime.swarm_generation(&root_session_id) != Some(generation) { continue; }
+                        if !transcript.lock().is_ok_and(|recorder| recorder.session_id() == root_session_id) { continue; }
+                        let message = match subagent_runtime.take_member_message(&root_session_id, &root_session_id) {
+                            Ok(Some(message)) => message,
+                            Ok(None) => continue,
+                            Err(error) => { let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error.to_string()))); continue; }
+                        };
+                        crate::user_content::UserMessageSubmission::new(crate::subagent::generate_message_id(), crate::user_content::UserMessageContent::from(message))
+                    }
                     SessionEngineCommand::Prompt(prompt) => prompt,
                     SessionEngineCommand::ContinueSession => {
                         crate::user_content::UserMessageSubmission::new(
@@ -1905,6 +1918,46 @@ async fn run_engine_loop(
                             ));
                             continue;
                         }
+                        if current_session_id.as_deref() == Some(session_id.as_str())
+                            && agent.subagents_policy().mode == crate::config::SubagentMode::Swarm {
+                            subagent_runtime.cancel_active_run_ids();
+                            if !subagent_runtime.wait_until_idle().await {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new("failed to settle swarm before reloading the current session")));
+                                continue;
+                            }
+                            let restored = (|| -> Result<()> {
+                                rehydrate_agent_from_transcript(&mut agent, &transcript)?;
+                                let recorder = transcript.lock().map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                                let records = read_records(recorder.path())?;
+                                let snapshot = crate::session::restore::project_runtime_restore_snapshot_with_children(
+                                    session_id.clone(), records.clone(),
+                                    crate::transcript::transcript_projection::SessionContextCursor { branch_id: recorder.current_context_branch_id().map(str::to_string), leaf_sequence: None }, &config.sessions_dir)?;
+                                drop(recorder);
+                                let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+                                subagent_runtime.resume_swarm(&config.sessions_dir, &records)?;
+                                let runner = AgentRunner::with_transcript(session_transport_tx.clone(), transcript.clone())
+                                    .with_child_live_text(child_live_text.clone())
+                                    .with_subagent_runtime(subagent_runtime.clone(), config.sessions_dir.clone(),
+                                        route_api_key_configured.lock().unwrap_or_else(|error| error.into_inner()).clone(),
+                                        provider_api_key_hints.lock().unwrap_or_else(|error| error.into_inner()).clone(),
+                                        config.api_key_hint.clone(), Some(control_tx.clone()), Some(session_transport_tx.clone()));
+                                runner.prepare_subagent_runtime(&mut agent)?;
+                                auto_review_service.clear_sticky();
+                                let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
+                                    session_id: session_id.clone(), branch_id: snapshot.branch_id,
+                                    messages: crate::session::restore::restored_messages_from_protocol_frames(&snapshot.snapshot.active_protocol_frames()),
+                                    records, evidence_count: snapshot.snapshot.evidence.len(), model_id: Some(agent.route_display_name()), token_usage: None,
+                                    runtime_context,
+                                    expert_models: config.expert_default_routes.iter().map(|(name, route)| (name.clone(), route.display_name())).collect(),
+                                });
+                                Ok(())
+                            })();
+                            if let Err(error) = restored {
+                                subagent_runtime.cancel_active_run_ids();
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to reload current swarm session: {error}"))));
+                            }
+                            continue;
+                        }
                         let prepared = match crate::session::prepare_resume_package(
                             &config.sessions_dir,
                             session_id,
@@ -1969,6 +2022,23 @@ async fn run_engine_loop(
                             }
                             prepared_install.commit(&mut agent, &transcript).1
                         };
+                        if agent.subagents_policy().mode == crate::config::SubagentMode::Swarm {
+                            if let Err(error) = subagent_runtime.resume_swarm(&config.sessions_dir, &resumed_event_records) {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to open resumed swarm: {error}"))));
+                                continue;
+                            }
+                            let runner = AgentRunner::with_transcript(session_transport_tx.clone(), transcript.clone())
+                                .with_child_live_text(child_live_text.clone())
+                                .with_subagent_runtime(subagent_runtime.clone(), config.sessions_dir.clone(),
+                                    route_api_key_configured.lock().unwrap_or_else(|error| error.into_inner()).clone(),
+                                    provider_api_key_hints.lock().unwrap_or_else(|error| error.into_inner()).clone(),
+                                    config.api_key_hint.clone(), Some(control_tx.clone()), Some(session_transport_tx.clone()));
+                            if let Err(error) = runner.prepare_subagent_runtime(&mut agent) {
+                                subagent_runtime.cancel_active_run_ids();
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to prepare resumed swarm: {error}"))));
+                                continue;
+                            }
+                        }
                         if fast_mode_auto_disabled {
                             let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
                             let _ = session_transport_tx.send(SessionTransportEvent::Notice(
@@ -2054,6 +2124,7 @@ async fn run_engine_loop(
                             &config.sessions_dir,
                             new_session_route.display_name(),
                             config.workspace_dir.as_deref(),
+                            &config.new_session_subagents_policy,
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -2152,6 +2223,11 @@ async fn run_engine_loop(
                     active_route_has_api_key(&agent, &route_api_keys)
                 };
                 if !active_route_has_credentials {
+                    if let Ok(recorder) = transcript.lock() {
+                        let root = recorder.session_id().to_string();
+                        drop(recorder);
+                        subagent_runtime.fail_member_messages(&root, &root, "route credentials unavailable", false);
+                    }
                     let route_display_name = agent.route_display_name();
                     {
                         let provider_hints = provider_api_key_hints
@@ -2195,6 +2271,7 @@ async fn run_engine_loop(
                         Some(session_transport_tx.clone()),
                     );
                 let historian_control = agent.historian_runtime.clone();
+                let swarm_mode = agent.subagents_policy().mode == crate::config::SubagentMode::Swarm;
                 let (interrupted, shutdown, interrupt_failure, turn_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
@@ -2250,16 +2327,22 @@ async fn run_engine_loop(
                                     }
                                 };
                                 interrupted = Some(interrupt);
-                                if is_shutdown && subagent_runtime.is_running() {
-                                    subagent_runtime.cancel_active();
-                                    let settle_shutdown = wait_for_subagent_cancel_settle(
+                                if is_shutdown || swarm_mode { subagent_runtime.cancel_active(); }
+                                if (is_shutdown || swarm_mode) && subagent_runtime.is_running() {
+                                    let settlement = wait_for_subagent_cancel_settle(
                                         &mut control_rx,
                                         &mut deferred_commands,
                                         run.as_mut(),
                                         &subagent_runtime,
+                                        SUBAGENT_CANCEL_SETTLE_TIMEOUT,
                                     )
                                     .await;
-                                    shutdown = is_shutdown || settle_shutdown;
+                                    shutdown = is_shutdown || settlement.shutdown;
+                                    if !settlement.settled {
+                                        let residual_runs = settlement.remaining_run_ids;
+                                        let detail = if residual_runs.is_empty() { "pending member recovery owners".to_string() } else { format!("run_ids: {}", residual_runs.join(", ")) };
+                                        let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("subagent cancellation did not settle within the bounded wait; remaining {detail}"))));
+                                    }
                                 } else {
                                     shutdown = is_shutdown;
                                 }
@@ -2282,6 +2365,9 @@ async fn run_engine_loop(
                                 break;
                             }
                             ActiveSessionOperation::Command(command) => match command {
+                                Some(command @ SessionEngineCommand::SwarmMessageReady { .. }) => {
+                                    parked_commands.push_back(command);
+                                }
                                 Some(SessionEngineCommand::Prompt(prompt)) => {
                                     if let Ok(mut queue) = turn_continuation_queue.lock() {
                                         queue.mark_user_prompt_queued();
@@ -2317,10 +2403,12 @@ async fn run_engine_loop(
                                     visible_child_view_state = None;
                                 }
                                 Some(SessionEngineCommand::BackgroundSubagentCompleted {
+                                    generation,
                                     parent_session_id,
                                     parent_tool_call_id,
                                     result,
                                 }) => {
+                                    if generation != subagent_runtime.swarm_generation(&parent_session_id) { continue; }
                                     if !observe_background_subagent_completion(
                                         &transcript,
                                         &subagent_runtime,
@@ -2522,6 +2610,12 @@ async fn run_engine_loop(
                     parked_commands.clear();
                     break;
                 }
+                if let Some(failure) = &turn_failure
+                    && let Ok(recorder) = transcript.lock() {
+                    let root = recorder.session_id().to_string();
+                    drop(recorder);
+                    subagent_runtime.fail_member_messages(&root, &root, failure, false);
+                }
                 if let Some(failure) = turn_failure
                     && agent.has_incomplete_tool_call_groups()
                 {
@@ -2649,6 +2743,14 @@ async fn run_engine_loop(
             }
         }
     }
+    if agent.subagents_policy().mode == crate::config::SubagentMode::Swarm {
+        subagent_runtime.cancel_active();
+        if !subagent_runtime.wait_until_idle().await {
+            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                "subagent runs remain active after shutdown cancellation",
+            )));
+        }
+    }
     for (_, session) in std::mem::take(&mut mcp_sessions) {
         session.shutdown().await;
     }
@@ -2684,6 +2786,9 @@ pub(crate) fn observe_background_subagent_completion(
     parent_tool_call_id: Option<String>,
     result: &Result<crate::subagent::SubagentRunSummary, String>,
 ) -> bool {
+    if subagent_runtime.member_scope_stopped(parent_session_id) {
+        return false;
+    }
     let Ok(summary) = result else {
         return true;
     };
@@ -2746,6 +2851,7 @@ pub(crate) fn format_background_subagent_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("engine/messaging_tests.rs");
     use crate::agent::PrimaryRouteFactory;
     use crate::request_builder::ModelReasoningEffort;
     use crate::session::runner::{
@@ -3168,6 +3274,9 @@ generation = { reasoning = true }
 reasoning_efforts = ["high"]
 [providers.test.models.default]
 [providers.test.models.expert]
+[subagents]
+mode = "swarm"
+max_depth = 4
 "#,
             )
             .unwrap();
@@ -3215,6 +3324,7 @@ reasoning_efforts = ["high"]
                         ("test/expert".into(), true),
                     ]),
                     new_session_default_route: ModelRoute::new("test", "default"),
+                    new_session_subagents_policy: config.subagents.clone(),
                     expert_default_routes: indexmap::IndexMap::from([
                         ("explorer".into(), ModelRoute::new("test", "default")),
                         ("reviewer".into(), ModelRoute::new("test", "default")),
@@ -3262,6 +3372,10 @@ reasoning_efforts = ["high"]
 
             let records =
                 crate::transcript::read_records(transcript.lock().unwrap().path()).unwrap();
+            assert_eq!(
+                crate::transcript::restore_subagents_policy(&records).unwrap(),
+                config.subagents
+            );
             assert_eq!(
                 crate::transcript::restore_latest_fake_client(&records),
                 Some(crate::fake::FakeClient::Codex)
@@ -3781,6 +3895,7 @@ base_url = "http://127.0.0.1:1"
             model_routes,
             route_api_key_configured,
             new_session_default_route,
+            new_session_subagents_policy: crate::config::SubagentsConfig::default(),
             expert_default_routes,
             expert_allowed_models,
             expert_reasoning_efforts,
@@ -3792,6 +3907,121 @@ base_url = "http://127.0.0.1:1"
             mcp_config: indexmap::IndexMap::new(),
             runtime_catalog,
         }
+    }
+
+    #[test]
+    fn subagents_policy_reload_updates_new_sessions_and_keeps_active_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("letcode.toml");
+        fs::write(
+            &path,
+            r#"
+active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "http://127.0.0.1:1/v1"
+[providers.test.models.model]
+"#,
+        )
+        .unwrap();
+        let initial = AppConfig::load_from_path(&path).unwrap();
+        let mut engine_config =
+            crate::session_engine_config(&initial, Default::default(), String::new(), None);
+        let mut agent = Agent::new("model", 1, 1);
+        agent.set_primary_route(initial.active_route());
+        let mut keys = std::mem::take(&mut engine_config.route_api_key_configured);
+        let mut hints = std::mem::take(&mut engine_config.provider_api_key_hints);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        apply_config_reload(
+            &mut agent,
+            &mut engine_config,
+            initial.clone(),
+            &mut keys,
+            &mut hints,
+            &tx,
+        )
+        .unwrap();
+        while rx.try_recv().is_ok() {}
+        let prepared = crate::session::prepare_new_session_package(
+            dir.path(),
+            agent.route_display_name(),
+            None,
+            &initial.subagents,
+        )
+        .unwrap();
+        let original_id = prepared.session_id.clone();
+        let live = Arc::new(StdMutex::new(prepared.recorder));
+        live.lock()
+            .unwrap()
+            .record_user_message("keep original session")
+            .unwrap();
+        let mut changed = initial;
+        changed.subagents = crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_depth: 6,
+            run_timeout_secs: 20,
+            ..Default::default()
+        };
+        let expected = changed.subagents.clone();
+        apply_config_reload(
+            &mut agent,
+            &mut engine_config,
+            changed.clone(),
+            &mut keys,
+            &mut hints,
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            agent.subagents_policy(),
+            &crate::config::SubagentsConfig::default()
+        );
+        assert_eq!(engine_config.new_session_subagents_policy, expected);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionTransportEvent::ModelCatalogUpdated(_))
+        ));
+        assert!(rx.try_recv().is_err());
+        apply_config_reload(
+            &mut agent,
+            &mut engine_config,
+            changed,
+            &mut keys,
+            &mut hints,
+            &tx,
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        let prepared = crate::session::prepare_new_session_package(
+            dir.path(),
+            agent.route_display_name(),
+            None,
+            &engine_config.new_session_subagents_policy,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::transcript::restore_subagents_policy(&prepared.snapshot.records).unwrap(),
+            expected
+        );
+        crate::session::lifecycle::prepare_new_session_install_with_route(
+            &agent, &live, prepared, None,
+        )
+        .unwrap()
+        .commit(&mut agent, &live);
+        assert_eq!(agent.subagents_policy(), &expected);
+        let resumed = crate::session::prepare_resume_package(dir.path(), &original_id).unwrap();
+        crate::session::restore::prepare_routed_resume_install(&agent, &live, resumed, None)
+            .unwrap()
+            .commit(&mut agent, &live);
+        assert_eq!(
+            agent.subagents_policy(),
+            &crate::config::SubagentsConfig::default()
+        );
+        assert_eq!(engine_config.new_session_subagents_policy, expected);
     }
 
     #[test]
@@ -4974,6 +5204,7 @@ max_output_tokens = 4096
             let mut events = engine.take_event_egress().into_receiver();
 
             let completion = || SessionEngineCommand::BackgroundSubagentCompleted {
+                generation: None,
                 parent_session_id: session_id.clone(),
                 parent_tool_call_id: Some("call-1".into()),
                 result: Ok(crate::subagent::SubagentRunSummary {
@@ -5249,6 +5480,7 @@ max_output_tokens = 4096
 
             ingress
                 .submit_transitional(SessionEngineCommand::BackgroundSubagentCompleted {
+                    generation: None,
                     parent_session_id: session_id.clone(),
                     parent_tool_call_id: Some("call-1".into()),
                     result: Ok(crate::subagent::SubagentRunSummary {

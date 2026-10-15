@@ -121,7 +121,7 @@ fn prepare_parallel_tool_call(
     let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
     if agent.tools.parallelism(&call.name) != ToolParallelism::Parallel
         || !is_executable_tool(agent, &call.name)
-        || !agent.tools.scope().allows_tool(&call.name)
+        || !tool_scope_allows(agent, &call.name)
         || external_workspace_access_for_tool(&call.name, &args).is_some()
     {
         return Err(anyhow::anyhow!(
@@ -731,7 +731,7 @@ where
         );
         return Ok(SubagentPreflight::Rejected(record));
     }
-    if !agent.tools.scope().allows_tool(&call.name) {
+    if !tool_scope_allows(agent, &call.name) {
         let record = ToolExecutionRecord::new(
             call,
             Some(args),
@@ -869,7 +869,7 @@ where
         return Ok(record);
     }
 
-    if !agent.tools.scope().allows_tool(&call.name) && !is_subagent_control_tool_name(&call.name) {
+    if !tool_scope_allows(agent, &call.name) {
         let output = ToolResult::err(
             &call.name,
             agent.tools.scope().rejection_message(&call.name),

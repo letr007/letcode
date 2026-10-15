@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
         .map(|(model_id, model)| (model_id.clone(), model.protocol))
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
+    agent.set_subagents_policy(config.subagents.clone());
     agent.set_compaction_config(config.global.compaction.clone());
     agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
     agent.set_tool_parallelism(
@@ -245,6 +246,7 @@ async fn main() -> Result<()> {
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
         recorder.record_session_started(active_route.display_name())?;
+        recorder.record_subagents_policy(agent.subagents_policy())?;
         recorder.record_session_workspace(transcript::workspace_root(&workspace_dir))?;
         sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
     }
@@ -376,6 +378,7 @@ fn session_engine_config(
             })
             .collect(),
         new_session_default_route: config.active_route(),
+        new_session_subagents_policy: config.subagents.clone(),
         expert_default_routes: supported_agent_names()
             .filter_map(|agent_name| {
                 config
@@ -942,6 +945,7 @@ mod tests {
                 &invalid_sessions_dir,
                 agent.route_display_name(),
                 None,
+                &config::SubagentsConfig::default(),
             )?;
             let prepared = session::lifecycle::prepare_new_session_install_with_route(
                 &agent, &recorder, prepared, None,

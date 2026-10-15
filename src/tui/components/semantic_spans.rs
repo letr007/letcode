@@ -630,7 +630,10 @@ pub(super) fn render_card_line_with_guide(
 
     let mut spans = vec![
         SemanticSpan::decoration(TOOL_GUIDE_GLYPH, guide_style),
-        SemanticSpan::decoration("  ", leading_pad_style),
+        SemanticSpan::decoration(
+            " ".repeat(width.saturating_sub(guide_width).min(2)),
+            leading_pad_style,
+        ),
     ];
     let mut remaining = width.saturating_sub(prefix_width);
 

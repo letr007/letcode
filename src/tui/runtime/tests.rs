@@ -5812,6 +5812,7 @@ fn a_background_completion_does_not_suppress_the_queued_change_notice() {
     enqueue_deferred_command(
         &mut parked_commands,
         SessionEngineCommand::BackgroundSubagentCompleted {
+            generation: None,
             parent_session_id: "parent".into(),
             parent_tool_call_id: None,
             result: Err("failed".into()),
@@ -5874,6 +5875,7 @@ fn active_turn_reports_a_background_completion_before_parking_it() {
 
     crate::session::engine::handle_active_turn_command(
         SessionEngineCommand::BackgroundSubagentCompleted {
+            generation: None,
             parent_session_id: session_id,
             parent_tool_call_id: Some("call-1".into()),
             result: Ok(completed_run_summary()),

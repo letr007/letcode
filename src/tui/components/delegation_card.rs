@@ -20,15 +20,14 @@ pub fn render_delegation_card_document(
     translator: &Translator,
 ) -> Document<Style> {
     let mut document = Document::default();
-    let width = width.saturating_sub(GUTTER_WIDTH);
     if width == 0 {
         return document;
     }
 
-    push_delegation_line(
+    push_wrapped_card_line(
         &mut document,
-        "",
         &translator.t("subagent.delegation"),
+        "",
         heading_style(theme),
         theme,
         width,
@@ -99,7 +98,7 @@ fn push_delegation_field(
     let Some(first) = values.next() else {
         return;
     };
-    push_delegation_line(
+    push_wrapped_card_line(
         document,
         &format!("{label}  "),
         first,
@@ -108,11 +107,11 @@ fn push_delegation_field(
         width,
     );
     for value in values {
-        push_delegation_line(document, "· ", value, value_style(theme), theme, width);
+        push_wrapped_card_line(document, "· ", value, value_style(theme), theme, width);
     }
 }
 
-fn push_delegation_line(
+pub(super) fn push_wrapped_card_line(
     document: &mut Document<Style>,
     prefix: &str,
     text: &str,
@@ -126,8 +125,19 @@ fn push_delegation_line(
         .iter()
         .chain(text_chars.iter())
         .collect::<String>();
-    let block = document.add_source(full.clone());
-    let chunks = wrap_text_to_width_with_offsets(&full, width);
+    if width <= GUTTER_WIDTH {
+        document.push_semantic_line(super::semantic_spans::render_card_line_with_guide(
+            &[],
+            Style::default().bg(theme.root_bg),
+            theme.card_guide(),
+            theme,
+            width,
+            Break::HardBreak,
+        ));
+        return;
+    }
+    let block = document.add_source(text);
+    let chunks = wrap_text_to_width_with_offsets(&full, width - GUTTER_WIDTH);
     let guide = Style::default().fg(theme.card_guide()).bg(theme.root_bg);
     let fill = Style::default().bg(theme.root_bg);
 
@@ -141,10 +151,13 @@ fn push_delegation_line(
         let end = chunk.source_end_char;
         let prefix_end = prefix_len.min(end);
         if start < prefix_end {
-            spans.push(Span::source(
+            spans.push(Span::decoration(
                 prefix_chars[start..prefix_end].iter().collect::<String>(),
-                label_style(theme),
-                SourceRange::new(block, start, prefix_end),
+                if text.is_empty() {
+                    text_style
+                } else {
+                    label_style(theme)
+                },
             ));
         }
         let text_start = start.max(prefix_len);
@@ -154,7 +167,7 @@ fn push_delegation_line(
                     .iter()
                     .collect::<String>(),
                 text_style,
-                SourceRange::new(block, text_start, end),
+                SourceRange::new(block, text_start - prefix_len, end - prefix_len),
             ));
         }
         let used = spans.iter().map(|span| display_width(&span.text)).sum();
@@ -163,7 +176,9 @@ fn push_delegation_line(
         }
         document.push_line(
             Line { spans },
-            if index + 1 == chunks.len() {
+            if index + 1 == chunks.len()
+                || chunks[index + 1].source_start_char > chunk.source_end_char
+            {
                 Break::HardBreak
             } else {
                 Break::SoftWrap
@@ -212,7 +227,7 @@ mod tests {
 
     #[test]
     fn delegation_card_respects_display_width_with_cjk_content() {
-        for width in [10usize, 18, 32, 80] {
+        for width in [0usize, 1, 2, 3, 4, 10, 18, 32, 80] {
             let document =
                 render_delegation_card_document(&view(), Theme::dark(), width, &translator());
             assert!(document.validate());
@@ -238,6 +253,13 @@ mod tests {
             .collect::<String>();
         assert!(copied.contains("完成结构化委派块渲染"));
         assert!(copied.contains("NewAPI/deepseek-flash"));
+        assert!(
+            !document
+                .source_blocks
+                .iter()
+                .any(|block| block.source == translator().t("subagent.delegation"))
+        );
+        assert!(!copied.contains(&translator().t("subagent.field_objective")));
     }
 
     fn translator() -> Translator {

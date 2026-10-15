@@ -74,7 +74,12 @@ fn tool_presentation_impl(
 
     let class = crate::permission::classify_tool(tool_name);
 
-    if is_subagent_tool_name(tool_name) {
+    if is_subagent_tool_name(tool_name)
+        || matches!(
+            tool_name,
+            crate::tool_names::TOOL_AGENT_SEND | crate::tool_names::TOOL_AGENT_WAIT
+        )
+    {
         return ToolPresentation::CompactCard;
     }
 

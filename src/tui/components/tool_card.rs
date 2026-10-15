@@ -303,7 +303,17 @@ pub fn render_tool_card_document(
     if tool_card_details(tool, &policy).is_none() {
         return document;
     }
-    let lines = if is_subagent_tool(&tool.name) {
+    if tool.name == crate::tool_names::TOOL_AGENT_SEND {
+        return render_subagent_send_document(
+            tool,
+            theme,
+            width,
+            frame,
+            expanded_output,
+            translator,
+        );
+    }
+    let lines = if is_subagent_tool(&tool.name) || tool.name == crate::tool_names::TOOL_AGENT_WAIT {
         render_subagent_lines(tool, theme, width, frame, expanded_output, translator)
     } else {
         let body = render_tool_body_lines(tool, theme, width, frame, expanded_output);
@@ -1192,6 +1202,76 @@ mod tests {
                 expanded_text.contains(item),
                 "missing {item}: {expanded_text}"
             );
+        }
+    }
+
+    #[test]
+    fn send_card_shows_queue_acceptance_and_copyable_message() {
+        let message = "完整消息，保留空格  和换行\nsecond line";
+        let tool = ToolView {
+            call_id: "send-call".into(),
+            name: crate::tool_names::TOOL_AGENT_SEND.into(),
+            summary: "agent__send completed".into(),
+            arguments: Some(serde_json::json!({"session_id": "child-target", "message": message}).to_string()),
+            output: Some(serde_json::json!({"data": {"session_id": "child-target", "accepted": true, "queued": 1}}).to_string()),
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let translator = crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En);
+        for width in [0, 1, 2, 3, 4, 5, 10, 32, 80] {
+            for expanded in [false, true] {
+                let document = render_tool_card_document(
+                    &tool,
+                    Theme::dark(),
+                    width,
+                    0,
+                    expanded,
+                    &translator,
+                );
+                assert!(document.validate());
+                for span in document.lines.iter().flat_map(|line| &line.spans) {
+                    if let Some(source) = span.source {
+                        assert_eq!(
+                            span.text,
+                            document.source_blocks[source.block_index]
+                                .source
+                                .chars()
+                                .skip(source.start)
+                                .take(source.end - source.start)
+                                .collect::<String>()
+                        );
+                    }
+                }
+                let lines = crate::tui::transcript_ratatui::document_to_ratatui(&document);
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| crate::tui::measure::display_width(&line.to_string()) <= width)
+                );
+                if width == 80 {
+                    let rendered = lines
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(rendered.contains("queued send child-target"), "{rendered}");
+                    assert!(!rendered.contains("completed"), "{rendered}");
+                    if expanded {
+                        assert!(
+                            document
+                                .source_blocks
+                                .iter()
+                                .any(|block| block.source == message)
+                        );
+                        assert!(
+                            document
+                                .breaks
+                                .contains(&crate::tui::transcript_render::Break::HardBreak)
+                        );
+                    } else {
+                        assert!(rendered.contains("expand"), "{rendered}");
+                    }
+                }
+            }
         }
     }
 
