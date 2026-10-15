@@ -1342,7 +1342,7 @@ protocol = "responses"
         let saved = crate::config::SubagentsConfig {
             mode: crate::config::SubagentMode::Swarm,
             max_depth: 7,
-            max_descendants: 20,
+            max_concurrent: 20,
             max_pending_messages: 8,
             max_message_bytes: 1000,
             run_timeout_secs: 200,
@@ -1395,7 +1395,7 @@ protocol = "responses"
         let mut invalid = vec![malformed, invalid_mode];
         for field in [
             "max_depth",
-            "max_descendants",
+            "max_concurrent",
             "max_pending_messages",
             "max_message_bytes",
             "run_timeout_secs",

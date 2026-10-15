@@ -151,6 +151,7 @@ impl SubagentPool {
                 "target is stopping"
             );
             let active = active.is_some();
+            let occupied = state.swarm_occupancy(&root);
             let authority = state.swarms.get_mut(&root).expect("restored authority");
             anyhow::ensure!(!authority.fenced, "swarm root is stopping");
             anyhow::ensure!(
@@ -173,10 +174,16 @@ impl SubagentPool {
                 mailbox.pending.len() < snapshot.policy.max_pending_messages,
                 "target message queue is full"
             );
+            let wake = !active && !mailbox.waking;
+            if wake && target != root && occupied >= snapshot.policy.max_concurrent {
+                return Err(SubagentCapacityExceeded {
+                    limit: snapshot.policy.max_concurrent,
+                }
+                .into());
+            }
             mailbox.pending.push_back(format!(
                 "[Swarm message from session_id={caller} to session_id={target}]\n\n{message}"
             ));
-            let wake = !active && !mailbox.waking;
             if wake {
                 mailbox.waking = true;
                 mailbox.wake_cancelled = false;

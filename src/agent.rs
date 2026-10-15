@@ -1805,7 +1805,7 @@ impl Agent {
     pub(crate) fn set_subagents_policy(&mut self, policy: crate::config::SubagentsConfig) {
         let swarm_prelude = DEFAULT_AGENT_PRELUDE.replace(
             "保持委派受控：避免递归委派，避免不必要的多智能体编排",
-            "保持委派受控：按共享深度和累计额度委派，避免不必要的多智能体编排",
+            "保持委派受控：按递归深度和并发上限委派，避免不必要的多智能体编排",
         );
         for message in &mut self.prelude {
             if message.text == DEFAULT_AGENT_PRELUDE || message.text == swarm_prelude {

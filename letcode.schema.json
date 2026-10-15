@@ -249,11 +249,17 @@
           "default": 3,
           "description": "Inclusive descendant depth limit. The root has depth 0."
         },
-        "max_descendants": {
+        "max_concurrent": {
           "type": "integer",
           "minimum": 1,
           "default": 16,
-          "description": "Cumulative number of activated descendants across the run tree."
+          "description": "Maximum concurrent descendants per root, including starting runs and message wakeups."
+        },
+        "max_descendants": {
+          "type": "integer",
+          "minimum": 1,
+          "deprecated": true,
+          "description": "Compatibility alias for max_concurrent."
         },
         "max_pending_messages": {
           "type": "integer",

@@ -59,6 +59,29 @@ impl RunnerSubagentDelegate {
         ToolResult::err_with_data(tool_name, error_message, data)
     }
 
+    fn capacity_result(
+        tool_name: &str,
+        agent_name: Option<&str>,
+        session_id: Option<String>,
+        error: &crate::subagent::SubagentCapacityExceeded,
+    ) -> ToolResult {
+        ToolResult::err_with_data(
+            tool_name,
+            error.to_string(),
+            json!({
+                "agent_name": agent_name,
+                "session_id": session_id,
+                "status": "not_started",
+                "started": false,
+                "active": false,
+                "accepted": false,
+                "reason": "concurrency_limit",
+                "max_concurrent": error.limit,
+                "summary": error.to_string(),
+            }),
+        )
+    }
+
     fn route_display_name(
         &self,
         parent: &Agent,
@@ -421,12 +444,27 @@ impl SubagentDelegate for RunnerSubagentDelegate {
             let message = args["message"]
                 .as_str()
                 .ok_or_else(|| anyhow!("message must be a string"))?;
-            let pending = self.runtime.enqueue_member_message(
+            let pending = match self.runtime.enqueue_member_message(
                 &self.sessions_dir,
                 &self.parent_records()?,
                 target,
                 message,
-            )?;
+            ) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    if let Some(capacity) =
+                        error.downcast_ref::<crate::subagent::SubagentCapacityExceeded>()
+                    {
+                        return Ok(Self::capacity_result(
+                            crate::tool_names::TOOL_AGENT_SEND,
+                            None,
+                            Some(target.to_string()),
+                            capacity,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
             Ok(ToolResult::ok(
                 crate::tool_names::TOOL_AGENT_SEND,
                 json!({"session_id": target, "accepted":true,"queued":pending}),
@@ -716,6 +754,16 @@ impl SubagentDelegate for RunnerSubagentDelegate {
             let started = match started {
                 Ok(started) => started,
                 Err(error) => {
+                    if let Some(capacity) =
+                        error.downcast_ref::<crate::subagent::SubagentCapacityExceeded>()
+                    {
+                        return Ok(Self::capacity_result(
+                            tool_name,
+                            Some(agent_name),
+                            target_child_session_id,
+                            capacity,
+                        ));
+                    }
                     return Ok(Self::hard_failure_result(
                         tool_name,
                         agent_name,
@@ -1226,6 +1274,30 @@ mod tests {
             assert_eq!(std::fs::read(&live_path).unwrap(), live_content);
         }
         std::fs::write(child_path, original).unwrap();
+    }
+
+    #[test]
+    fn capacity_result_reports_not_started_without_a_run_failure() {
+        for tool in [
+            crate::tool_names::TOOL_AGENT_EXPLORE,
+            crate::tool_names::TOOL_AGENT_SEND,
+        ] {
+            let result = RunnerSubagentDelegate::capacity_result(
+                tool,
+                Some("explorer"),
+                Some("child".into()),
+                &crate::subagent::SubagentCapacityExceeded { limit: 1 },
+            );
+            assert!(!result.ok);
+            assert!(result.error.unwrap().message.contains("no run was started"));
+            let data = result.data.unwrap();
+            assert_eq!(data["status"], "not_started");
+            assert_eq!(data["started"], false);
+            assert_eq!(data["active"], false);
+            assert_eq!(data["accepted"], false);
+            assert_eq!(data["max_concurrent"], 1);
+            assert!(data.get("failure_kind").is_none());
+        }
     }
 
     #[test]

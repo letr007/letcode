@@ -46,7 +46,7 @@ sessions_dir = "{}"
 [subagents]
 mode = "swarm"
 max_depth = 2
-max_descendants = 3
+max_concurrent = 3
 [providers.test]
 protocol = "responses"
 default_model = "model"

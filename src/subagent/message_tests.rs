@@ -513,7 +513,7 @@ tools = true
         root_agent.set_resolved_runtime_catalog(Some(catalog.clone()));
         root_agent.set_subagents_policy(crate::config::SubagentsConfig {
             mode: crate::config::SubagentMode::Swarm,
-            max_descendants: 3,
+            max_concurrent: 3,
             ..Default::default()
         });
         let factory = Arc::new(

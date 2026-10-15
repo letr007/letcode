@@ -476,7 +476,8 @@ pub enum SubagentMode {
 pub struct SubagentsConfig {
     pub mode: SubagentMode,
     pub max_depth: usize,
-    pub max_descendants: usize,
+    #[serde(alias = "max_descendants")]
+    pub max_concurrent: usize,
     pub max_pending_messages: usize,
     pub max_message_bytes: usize,
     pub run_timeout_secs: u64,
@@ -485,7 +486,7 @@ pub struct SubagentsConfig {
 impl SubagentsConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         positive_usize("subagents.max_depth", self.max_depth)?;
-        positive_usize("subagents.max_descendants", self.max_descendants)?;
+        positive_usize("subagents.max_concurrent", self.max_concurrent)?;
         positive_usize("subagents.max_pending_messages", self.max_pending_messages)?;
         positive_usize("subagents.max_message_bytes", self.max_message_bytes)?;
         positive_u64("subagents.run_timeout_secs", self.run_timeout_secs)?;
@@ -504,7 +505,7 @@ impl Default for SubagentsConfig {
         Self {
             mode: SubagentMode::default(),
             max_depth: 3,
-            max_descendants: 16,
+            max_concurrent: 16,
             max_pending_messages: 16,
             max_message_bytes: 16384,
             run_timeout_secs: 600,
@@ -966,7 +967,8 @@ struct RawRetryConfig {
 struct RawSubagentsConfig {
     mode: Option<SubagentMode>,
     max_depth: Option<usize>,
-    max_descendants: Option<usize>,
+    #[serde(alias = "max_descendants")]
+    max_concurrent: Option<usize>,
     max_pending_messages: Option<usize>,
     max_message_bytes: Option<usize>,
     run_timeout_secs: Option<u64>,
@@ -1578,7 +1580,7 @@ fn build_subagents_config(raw: RawSubagentsConfig) -> Result<SubagentsConfig> {
     let config = SubagentsConfig {
         mode: raw.mode.unwrap_or(defaults.mode),
         max_depth: raw.max_depth.unwrap_or(defaults.max_depth),
-        max_descendants: raw.max_descendants.unwrap_or(defaults.max_descendants),
+        max_concurrent: raw.max_concurrent.unwrap_or(defaults.max_concurrent),
         max_pending_messages: raw
             .max_pending_messages
             .unwrap_or(defaults.max_pending_messages),
@@ -1970,7 +1972,7 @@ base_url = "https://example.invalid/v1"
         let expected = SubagentsConfig {
             mode: SubagentMode::Expert,
             max_depth: 3,
-            max_descendants: 16,
+            max_concurrent: 16,
             max_pending_messages: 16,
             max_message_bytes: 16384,
             run_timeout_secs: 600,
@@ -2002,11 +2004,11 @@ base_url = "https://example.invalid/v1"
                 },
             ),
             (
-                "max_depth = 1\nmax_descendants = 2\nmax_pending_messages = 3\nmax_message_bytes = 4\nrun_timeout_secs = 5",
+                "max_depth = 1\nmax_concurrent = 2\nmax_pending_messages = 3\nmax_message_bytes = 4\nrun_timeout_secs = 5",
                 SubagentsConfig {
                     mode: SubagentMode::Swarm,
                     max_depth: 1,
-                    max_descendants: 2,
+                    max_concurrent: 2,
                     max_pending_messages: 3,
                     max_message_bytes: 4,
                     run_timeout_secs: 5,
@@ -2023,10 +2025,27 @@ base_url = "https://example.invalid/v1"
             let snapshot =
                 serde_json::to_value(&loaded.subagents).expect("serialize configuration");
             assert_eq!(snapshot["mode"], "swarm");
+            assert_eq!(snapshot["max_concurrent"], expected.max_concurrent);
+            assert!(snapshot.get("max_descendants").is_none());
             assert_eq!(
-                serde_json::from_value::<SubagentsConfig>(snapshot).unwrap(),
+                serde_json::from_value::<SubagentsConfig>(snapshot.clone()).unwrap(),
                 expected
             );
+            let mut legacy = snapshot;
+            let limit = legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("max_concurrent")
+                .unwrap();
+            legacy["max_descendants"] = limit;
+            assert_eq!(
+                serde_json::from_value::<SubagentsConfig>(legacy).unwrap(),
+                expected
+            );
+            let legacy_text = text.replace("max_concurrent", "max_descendants");
+            let loaded =
+                AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &legacy_text).unwrap();
+            assert_eq!(loaded.subagents, expected);
         }
     }
 
@@ -2036,7 +2055,12 @@ base_url = "https://example.invalid/v1"
             ("mode = \"invalid-mode\"", "invalid-mode"),
             ("unknown_limit = 1", "unknown field `unknown_limit`"),
             ("max_depth = 0", "subagents.max_depth"),
-            ("max_descendants = 0", "subagents.max_descendants"),
+            ("max_concurrent = 0", "subagents.max_concurrent"),
+            ("max_descendants = 0", "subagents.max_concurrent"),
+            (
+                "max_concurrent = 1\nmax_descendants = 2",
+                "duplicate field `max_concurrent`",
+            ),
             ("max_pending_messages = 0", "subagents.max_pending_messages"),
             ("max_message_bytes = 0", "subagents.max_message_bytes"),
             ("run_timeout_secs = 0", "subagents.run_timeout_secs"),

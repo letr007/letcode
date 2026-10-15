@@ -63,6 +63,23 @@ pub struct SubagentPool {
     next_ordinal: Arc<Mutex<u32>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct SubagentCapacityExceeded {
+    pub(crate) limit: usize,
+}
+
+impl std::fmt::Display for SubagentCapacityExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "swarm concurrency limit reached ({}); no run was started; wait for an active member to finish",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for SubagentCapacityExceeded {}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SubagentJob {
     pub active: bool,
@@ -128,6 +145,33 @@ struct SubagentPoolState {
 }
 
 impl SubagentPoolState {
+    fn swarm_occupancy(&self, root: &str) -> usize {
+        let mut sessions = std::collections::HashSet::new();
+        let mut starting = 0;
+        for slot in self
+            .active_by_run
+            .values()
+            .filter(|slot| slot.swarm_root.as_deref() == Some(root))
+        {
+            let target = if slot.child.child_session_id.is_empty() {
+                slot.takeover_child_session_id.as_deref()
+            } else {
+                Some(slot.child.child_session_id.as_str())
+            };
+            if let Some(target) = target {
+                sessions.insert(target);
+            } else {
+                starting += 1;
+            }
+        }
+        if let Some(authority) = self.swarms.get(root) {
+            sessions.extend(authority.mailboxes.iter().filter_map(|(target, mailbox)| {
+                (target != root && mailbox.waking).then_some(target.as_str())
+            }));
+        }
+        sessions.len() + starting
+    }
+
     fn swarm_scope_is_stopping(&self, root: &str, session: &str) -> bool {
         let mut ancestor = Some(session);
         while let Some(session) = ancestor {
@@ -198,7 +242,6 @@ struct ActiveSlot {
     path_access: RunPathAccess,
     takeover_child_session_id: Option<String>,
     swarm_root: Option<String>,
-    new_member: bool,
     parent_run_id: Option<String>,
 }
 
@@ -276,7 +319,6 @@ impl RunReservation {
             .ok_or_else(|| anyhow!("subagent run reservation disappeared"))?;
         slot.cancel = Some(cancel);
         slot.child = child;
-        slot.new_member = false;
         if slot.cancellation_requested
             && let Some(cancel) = slot.cancel.take()
         {
@@ -513,25 +555,12 @@ impl SubagentPool {
             .lock()
             .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
         let authority = &state.swarms[&snapshot.root.session_id];
-        let reserved = state
-            .active_by_run
-            .values()
-            .filter(|slot| {
-                slot.swarm_root.as_deref() == Some(snapshot.root.session_id.as_str())
-                    && slot.new_member
-            })
-            .count();
-        let can_take_over = snapshot.latest_jobs().iter().any(|job| {
-            job.parent_session_id.as_deref() == Some(caller.session_id.as_str()) && !job.active
-        });
         Ok(!authority.fenced
             && !authority
                 .mailboxes
                 .get(&caller.session_id)
                 .is_some_and(|mailbox| mailbox.stopped)
-            && (depth as usize) < snapshot.policy.max_depth
-            && (authority.members.len().saturating_add(reserved) < snapshot.policy.max_descendants
-                || can_take_over))
+            && (depth as usize) < snapshot.policy.max_depth)
     }
 
     fn activate_run(
@@ -860,13 +889,7 @@ impl SubagentPool {
                 anyhow::ensure!(!slot.cancellation_requested, "swarm parent run is stopping");
                 parent_run_id = Some(run.clone());
             }
-            let reserved = state
-                .active_by_run
-                .values()
-                .filter(|slot| {
-                    slot.swarm_root.as_deref() == Some(admission.root_session_id) && slot.new_member
-                })
-                .count();
+            let occupied = state.swarm_occupancy(admission.root_session_id);
             let authority = state
                 .swarms
                 .entry(admission.root_session_id.to_string())
@@ -899,12 +922,19 @@ impl SubagentPool {
                     authority.members.contains_key(target),
                     "takeover failed: swarm child is not activated"
                 );
-            } else {
-                anyhow::ensure!(
-                    authority.members.len().saturating_add(reserved)
-                        < admission.policy.max_descendants,
-                    "swarm cumulative descendant budget exhausted"
-                );
+            }
+            let wake_reserved = admission.message_resume
+                && takeover_child_session_id.is_some_and(|target| {
+                    authority
+                        .mailboxes
+                        .get(target)
+                        .is_some_and(|mailbox| mailbox.waking)
+                });
+            if !wake_reserved && occupied >= admission.policy.max_concurrent {
+                return Err(SubagentCapacityExceeded {
+                    limit: admission.policy.max_concurrent,
+                }
+                .into());
             }
             swarm_root = Some(admission.root_session_id.to_string());
             parent_session_id = admission.parent_session_id.to_string();
@@ -935,7 +965,6 @@ impl SubagentPool {
                 },
                 path_access,
                 takeover_child_session_id: takeover_child_session_id.map(str::to_string),
-                new_member: swarm_root.is_some() && takeover_child_session_id.is_none(),
                 swarm_root,
                 parent_run_id,
             },
@@ -1267,7 +1296,7 @@ impl SubagentPool {
             .any(|expert| expert.agent_name == template.name)
         {
             let contract = if swarm_parent.is_some() {
-                "可在共享深度和累计额度内委派；只读角色只能委派只读任务；保持父作用域并简洁报告结果。"
+                "可在递归深度和并发上限内委派；只读角色只能委派只读任务；保持父作用域并简洁报告结果。"
             } else {
                 "不要递归委派；保持在给定范围内，并简洁报告发现或实现结果。"
             };
@@ -2527,7 +2556,7 @@ mod swarm_tests {
         let pool = SubagentPool::new();
         let policy = crate::config::SubagentsConfig {
             mode: crate::config::SubagentMode::Swarm,
-            max_descendants: 1,
+            max_concurrent: 1,
             ..Default::default()
         };
         let barrier = std::sync::Barrier::new(2);
@@ -2568,8 +2597,22 @@ mod swarm_tests {
             reservations
                 .iter()
                 .filter_map(|reservation| reservation.as_ref().err())
-                .all(|error| error.to_string().contains("budget exhausted"))
+                .all(|error| error.is::<SubagentCapacityExceeded>())
         );
+        let other_root = pool
+            .reserve_governed_run(
+                RunPathAccess::Read(Vec::new()),
+                None,
+                Some(SwarmAdmission {
+                    root_session_id: "other-root",
+                    parent_session_id: "other-root",
+                    depth: 1,
+                    policy: &policy,
+                    message_resume: false,
+                }),
+            )
+            .unwrap();
+        drop(other_root);
         drop(reservations);
         let reservation = pool
             .reserve_governed_run(
@@ -2589,10 +2632,10 @@ mod swarm_tests {
     }
 
     #[test]
-    fn activated_members_keep_the_frozen_root_budget_after_restore() {
+    fn terminal_members_release_capacity_and_restore_the_frozen_root_limit() {
         let (dir, runtime, mut parent, recorder) = fixture(crate::config::SubagentsConfig {
             mode: crate::config::SubagentMode::Swarm,
-            max_descendants: 1,
+            max_concurrent: 1,
             ..Default::default()
         });
         let mut invalid = invocation(serde_json::json!({"objective":"inspect"}));
@@ -2629,6 +2672,16 @@ mod swarm_tests {
         drop(started);
         parent.set_subagents_policy(crate::config::SubagentsConfig::default());
         for runtime in [runtime, SubagentPool::new()] {
+            let started = start(
+                &runtime,
+                &parent,
+                dir.path(),
+                &recorder,
+                serde_json::json!({"objective":"inspect"}),
+            )
+            .unwrap();
+            let target = started.receipt.child_session_id.clone();
+            assert_eq!(started.run.child_agent.subagents_policy().max_concurrent, 1);
             let error = start(
                 &runtime,
                 &parent,
@@ -2638,9 +2691,124 @@ mod swarm_tests {
             )
             .err()
             .unwrap();
-            assert!(error.to_string().contains("budget exhausted"), "{error}");
-            assert_eq!(runtime.state.lock().unwrap().swarms[&root].members.len(), 1);
+            assert!(error.is::<SubagentCapacityExceeded>(), "{error}");
+            assert!(runtime.state.lock().unwrap().swarms[&root].members.len() >= 2);
+            drop(started);
+            let restored = SubagentPool::new();
+            let busy = start(
+                &restored,
+                &parent,
+                dir.path(),
+                &recorder,
+                serde_json::json!({"objective":"inspect"}),
+            )
+            .unwrap();
+            let error = start(
+                &restored,
+                &parent,
+                dir.path(),
+                &recorder,
+                serde_json::json!({"objective":"resume", "target_child_session_id":target}),
+            )
+            .err()
+            .unwrap();
+            assert!(error.is::<SubagentCapacityExceeded>(), "{error}");
+            drop(busy);
         }
+    }
+
+    #[tokio::test]
+    async fn message_wakeups_share_capacity_with_starting_and_active_runs() {
+        let (dir, runtime, parent, recorder) = fixture(crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_concurrent: 1,
+            ..Default::default()
+        });
+        let root = recorder.lock().unwrap().session_id().to_string();
+        let dormant = start(
+            &runtime,
+            &parent,
+            dir.path(),
+            &recorder,
+            serde_json::json!({"objective":"inspect"}),
+        )
+        .unwrap();
+        let target = dormant.receipt.child_session_id.clone();
+        runtime
+            .complete_started_run_with_executor(dormant, |_, _, _, _, _, _| {
+                Box::pin(async { Ok("done".into()) })
+            })
+            .await
+            .unwrap();
+        let busy = start(
+            &runtime,
+            &parent,
+            dir.path(),
+            &recorder,
+            serde_json::json!({"objective":"inspect"}),
+        )
+        .unwrap();
+        let records = read_records_allow_partial_tail(recorder.lock().unwrap().path()).unwrap();
+        let error = runtime
+            .enqueue_member_message(dir.path(), &records, &target, "hello")
+            .unwrap_err();
+        assert!(error.is::<SubagentCapacityExceeded>(), "{error}");
+        assert!(!runtime.member_message_pending(&root, &target).unwrap());
+        assert!(runtime.swarm_can_delegate(dir.path(), &records).unwrap());
+        let active = busy.receipt.child_session_id.clone();
+        assert_eq!(
+            runtime
+                .enqueue_member_message(dir.path(), &records, &active, "hello")
+                .unwrap(),
+            1
+        );
+        assert!(
+            runtime
+                .take_member_message(&root, &active)
+                .unwrap()
+                .is_some()
+        );
+        drop(busy);
+        assert_eq!(
+            runtime
+                .enqueue_member_message(dir.path(), &records, &target, "first")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .enqueue_member_message(dir.path(), &records, &target, "second")
+                .unwrap(),
+            2
+        );
+        assert_eq!(runtime.state.lock().unwrap().swarm_occupancy(&root), 1);
+        let waking = runtime
+            .reserve_governed_run(
+                RunPathAccess::Read(Vec::new()),
+                Some(&target),
+                Some(SwarmAdmission {
+                    root_session_id: &root,
+                    parent_session_id: &root,
+                    depth: 1,
+                    policy: parent.subagents_policy(),
+                    message_resume: true,
+                }),
+            )
+            .unwrap();
+        assert_eq!(runtime.state.lock().unwrap().swarm_occupancy(&root), 1);
+        let error = start(
+            &runtime,
+            &parent,
+            dir.path(),
+            &recorder,
+            serde_json::json!({"objective":"inspect"}),
+        )
+        .err()
+        .unwrap();
+        assert!(error.is::<SubagentCapacityExceeded>(), "{error}");
+        drop(waking);
+        runtime.fail_member_messages(&root, &target, "message execution stopped", false);
+        assert_eq!(runtime.state.lock().unwrap().swarm_occupancy(&root), 0);
     }
 
     #[tokio::test]

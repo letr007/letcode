@@ -51,8 +51,8 @@ fn targets() -> Result<Vec<Target>> {
             injection: Injection::Default(json!(subagents.max_depth)),
         },
         Target {
-            pointer: &["definitions", "subagents", "properties", "max_descendants"],
-            injection: Injection::Default(json!(subagents.max_descendants)),
+            pointer: &["definitions", "subagents", "properties", "max_concurrent"],
+            injection: Injection::Default(json!(subagents.max_concurrent)),
         },
         Target {
             pointer: &[
@@ -531,7 +531,7 @@ mod tests {
         );
         for (field, expected) in [
             ("max_depth", 3),
-            ("max_descendants", 16),
+            ("max_concurrent", 16),
             ("max_pending_messages", 16),
             ("max_message_bytes", 16384),
             ("run_timeout_secs", 600),

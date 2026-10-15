@@ -5,7 +5,7 @@ pub(crate) mod swarm;
 pub use swarm::SwarmMember;
 
 pub(crate) use pool::generate_run_id as generate_message_id;
-pub(crate) use pool::{MessageDelegateFactory, MessageHost};
+pub(crate) use pool::{MessageDelegateFactory, MessageHost, SubagentCapacityExceeded};
 pub use pool::{SubagentJob, SubagentPool, SubagentRunGovernance};
 pub(crate) use result::REPORT_PROMPT;
 pub use result::{
@@ -1524,7 +1524,7 @@ base_url = "https://test.example.invalid/v1"
         parent.set_subagents_policy(crate::config::SubagentsConfig {
             mode: crate::config::SubagentMode::Swarm,
             max_depth: 7,
-            max_descendants: 1,
+            max_concurrent: 1,
             ..Default::default()
         });
         parent_recorder
