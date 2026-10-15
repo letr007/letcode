@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{ApiProtocol, PromptCacheRetention, RawMcpServerKind};
+use super::{ApiProtocol, PromptCacheRetention, RawMcpServerKind, SubagentMode, SubagentsConfig};
 use crate::model_runtime::strategy::ModelStrategyId;
 use crate::model_runtime::{
     AuthScheme, ProviderFlavor, ProviderReviewerBackend, StructuredOutputSupport,
@@ -36,7 +36,46 @@ struct Target {
 
 fn targets() -> Result<Vec<Target>> {
     let archive = SessionArchiveConfig::default();
+    let subagents = SubagentsConfig::default();
     Ok(vec![
+        Target {
+            pointer: &["definitions", "subagents", "properties", "mode"],
+            injection: Injection::Enum(wire_values(&[SubagentMode::Expert, SubagentMode::Swarm])?),
+        },
+        Target {
+            pointer: &["definitions", "subagents", "properties", "mode"],
+            injection: Injection::Default(wire(&subagents.mode)?),
+        },
+        Target {
+            pointer: &["definitions", "subagents", "properties", "max_depth"],
+            injection: Injection::Default(json!(subagents.max_depth)),
+        },
+        Target {
+            pointer: &["definitions", "subagents", "properties", "max_descendants"],
+            injection: Injection::Default(json!(subagents.max_descendants)),
+        },
+        Target {
+            pointer: &[
+                "definitions",
+                "subagents",
+                "properties",
+                "max_pending_messages",
+            ],
+            injection: Injection::Default(json!(subagents.max_pending_messages)),
+        },
+        Target {
+            pointer: &[
+                "definitions",
+                "subagents",
+                "properties",
+                "max_message_bytes",
+            ],
+            injection: Injection::Default(json!(subagents.max_message_bytes)),
+        },
+        Target {
+            pointer: &["definitions", "subagents", "properties", "run_timeout_secs"],
+            injection: Injection::Default(json!(subagents.run_timeout_secs)),
+        },
         Target {
             pointer: &["definitions", "protocol"],
             // An omitted protocol resolves to completions at load time.
@@ -467,6 +506,52 @@ mod tests {
     fn committed_schema_matches_rust_authorities() {
         let rendered = apply_all(SCHEMA_JSON).expect("render schema").0;
         assert_eq!(rendered, SCHEMA_JSON);
+    }
+
+    #[test]
+    fn subagents_editor_schema_exposes_modes_and_defaults() {
+        assert_eq!(
+            super::super::field_enum(&["subagents", "mode"]),
+            Some(vec!["expert".to_string(), "swarm".to_string()])
+        );
+        assert_eq!(
+            super::super::default_value(&["subagents", "mode"])
+                .unwrap()
+                .as_str(),
+            Some("expert")
+        );
+        let schema: Value = serde_json::from_str(SCHEMA_JSON).unwrap();
+        assert_eq!(
+            schema["properties"]["subagents"]["$ref"],
+            "#/definitions/subagents"
+        );
+        assert_eq!(
+            schema["definitions"]["subagents"]["additionalProperties"],
+            false
+        );
+        for (field, expected) in [
+            ("max_depth", 3),
+            ("max_descendants", 16),
+            ("max_pending_messages", 16),
+            ("max_message_bytes", 16384),
+            ("run_timeout_secs", 600),
+        ] {
+            assert_eq!(
+                super::super::default_value(&["subagents", field])
+                    .unwrap()
+                    .as_integer(),
+                Some(expected),
+                "{field}"
+            );
+            assert_eq!(
+                schema["definitions"]["subagents"]["properties"][field]["minimum"],
+                1
+            );
+            assert_eq!(
+                schema["definitions"]["subagents"]["properties"][field]["type"],
+                "integer"
+            );
+        }
     }
 
     #[test]

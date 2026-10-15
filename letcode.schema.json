@@ -25,6 +25,7 @@
       "additionalProperties": { "$ref": "#/definitions/mcpServer" }
     },
     "agents": { "$ref": "#/definitions/agents" },
+    "subagents": { "$ref": "#/definitions/subagents" },
     "providers": {
       "type": "object",
       "description": "Model providers, one table per provider name.",
@@ -230,6 +231,49 @@
           }
         }
       ]
+    },
+    "subagents": {
+      "type": "object",
+      "description": "Subagent mode and limits for a swarm run.",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["expert", "swarm"],
+          "default": "expert",
+          "description": "Subagent execution mode."
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "description": "Inclusive descendant depth limit. The root has depth 0."
+        },
+        "max_descendants": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 16,
+          "description": "Cumulative number of activated descendants across the run tree."
+        },
+        "max_pending_messages": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 16,
+          "description": "Pending message queue capacity per member."
+        },
+        "max_message_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 16384,
+          "description": "Maximum UTF-8 body size of one message in bytes."
+        },
+        "run_timeout_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 600,
+          "description": "Timeout for one swarm run in seconds. Must fit the platform deadline range."
+        }
+      }
     },
     "agents": {
       "type": "object",

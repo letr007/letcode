@@ -139,6 +139,7 @@ pub struct AppConfig {
     pub active_provider: String,
     pub global: GlobalConfig,
     pub agents: AgentsConfig,
+    pub subagents: SubagentsConfig,
     pub permissions: PermissionsConfig,
     pub tools: ToolsConfig,
     pub mcp: IndexMap<String, McpServerConfig>,
@@ -344,6 +345,7 @@ impl AppConfig {
         let tools = build_tools_config(raw.tools.unwrap_or_default())?;
         let fake = build_fake_config(raw.fake.unwrap_or_default())?;
         let agents = build_agents_config(raw.agents.unwrap_or_default(), &providers)?;
+        let subagents = build_subagents_config(raw.subagents.unwrap_or_default())?;
         let mcp = raw
             .mcp
             .into_iter()
@@ -357,6 +359,7 @@ impl AppConfig {
             active_provider,
             global,
             agents,
+            subagents,
             permissions,
             tools,
             mcp,
@@ -457,6 +460,38 @@ impl ModelRoute {
             bail!("model route '{value}' must use provider/model form");
         }
         Ok(Self::new(provider, model))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentMode {
+    #[default]
+    Expert,
+    Swarm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentsConfig {
+    pub mode: SubagentMode,
+    pub max_depth: usize,
+    pub max_descendants: usize,
+    pub max_pending_messages: usize,
+    pub max_message_bytes: usize,
+    pub run_timeout_secs: u64,
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            mode: SubagentMode::default(),
+            max_depth: 3,
+            max_descendants: 16,
+            max_pending_messages: 16,
+            max_message_bytes: 16384,
+            run_timeout_secs: 600,
+        }
     }
 }
 
@@ -796,6 +831,8 @@ struct RawAppConfig {
     #[serde(default)]
     agents: Option<RawAgentsConfig>,
     #[serde(default)]
+    subagents: Option<RawSubagentsConfig>,
+    #[serde(default)]
     permissions: Option<RawPermissionsConfig>,
     #[serde(default)]
     tools: Option<RawToolsConfig>,
@@ -905,6 +942,17 @@ struct RawRetryConfig {
     exponential_backoff: Option<bool>,
     backoff_multiplier: Option<f32>,
     jitter_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSubagentsConfig {
+    mode: Option<SubagentMode>,
+    max_depth: Option<usize>,
+    max_descendants: Option<usize>,
+    max_pending_messages: Option<usize>,
+    max_message_bytes: Option<usize>,
+    run_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1508,6 +1556,41 @@ fn build_mcp_server_config(
     ))
 }
 
+fn build_subagents_config(raw: RawSubagentsConfig) -> Result<SubagentsConfig> {
+    let defaults = SubagentsConfig::default();
+    let run_timeout_secs = positive_u64(
+        "subagents.run_timeout_secs",
+        raw.run_timeout_secs.unwrap_or(defaults.run_timeout_secs),
+    )?;
+    if std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(run_timeout_secs))
+        .is_none()
+    {
+        bail!("subagents.run_timeout_secs exceeds the supported deadline range");
+    }
+    Ok(SubagentsConfig {
+        mode: raw.mode.unwrap_or(defaults.mode),
+        max_depth: positive_usize(
+            "subagents.max_depth",
+            raw.max_depth.unwrap_or(defaults.max_depth),
+        )?,
+        max_descendants: positive_usize(
+            "subagents.max_descendants",
+            raw.max_descendants.unwrap_or(defaults.max_descendants),
+        )?,
+        max_pending_messages: positive_usize(
+            "subagents.max_pending_messages",
+            raw.max_pending_messages
+                .unwrap_or(defaults.max_pending_messages),
+        )?,
+        max_message_bytes: positive_usize(
+            "subagents.max_message_bytes",
+            raw.max_message_bytes.unwrap_or(defaults.max_message_bytes),
+        )?,
+        run_timeout_secs,
+    })
+}
+
 fn build_agents_config(
     raw: RawAgentsConfig,
     providers: &IndexMap<String, ProviderConfig>,
@@ -1882,6 +1965,98 @@ base_url = "https://example.invalid/v1"
             "[protocol_settings]",
             &format!("[providers.{provider}.models.\"{model}\".protocol_settings]"),
         )
+    }
+
+    #[test]
+    fn subagents_defaults_to_expert_and_preserves_expert_routing() {
+        let expected = SubagentsConfig {
+            mode: SubagentMode::Expert,
+            max_depth: 3,
+            max_descendants: 16,
+            max_pending_messages: 16,
+            max_message_bytes: 16384,
+            run_timeout_secs: 600,
+        };
+        for section in ["", "[subagents]", "[subagents]\nmode = \"expert\""] {
+            let text = format!("{}\n{section}\n", config("openai", "model", ""));
+            let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+                .expect("expert configuration loads");
+            assert_eq!(loaded.subagents, expected);
+            assert_eq!(
+                loaded.expert_route_for("explorer"),
+                Some(ModelRoute::new("openai", "model"))
+            );
+            assert_eq!(
+                loaded.global.tool_timeout_secs,
+                Some(DEFAULT_TOOL_TIMEOUT_SECS)
+            );
+        }
+    }
+
+    #[test]
+    fn subagents_parses_swarm_and_numeric_overrides() {
+        for (fields, expected) in [
+            (
+                "",
+                SubagentsConfig {
+                    mode: SubagentMode::Swarm,
+                    ..SubagentsConfig::default()
+                },
+            ),
+            (
+                "max_depth = 1\nmax_descendants = 2\nmax_pending_messages = 3\nmax_message_bytes = 4\nrun_timeout_secs = 5",
+                SubagentsConfig {
+                    mode: SubagentMode::Swarm,
+                    max_depth: 1,
+                    max_descendants: 2,
+                    max_pending_messages: 3,
+                    max_message_bytes: 4,
+                    run_timeout_secs: 5,
+                },
+            ),
+        ] {
+            let text = format!(
+                "{}\n[subagents]\nmode = \"swarm\"\n{fields}\n",
+                config("openai", "model", "")
+            );
+            let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+                .expect("swarm configuration loads");
+            assert_eq!(loaded.subagents, expected);
+            let snapshot =
+                serde_json::to_value(&loaded.subagents).expect("serialize configuration");
+            assert_eq!(snapshot["mode"], "swarm");
+            assert_eq!(
+                serde_json::from_value::<SubagentsConfig>(snapshot).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn subagents_rejects_invalid_fields_and_limits() {
+        for (fields, message) in [
+            ("mode = \"invalid-mode\"", "invalid-mode"),
+            ("unknown_limit = 1", "unknown field `unknown_limit`"),
+            ("max_depth = 0", "subagents.max_depth"),
+            ("max_descendants = 0", "subagents.max_descendants"),
+            ("max_pending_messages = 0", "subagents.max_pending_messages"),
+            ("max_message_bytes = 0", "subagents.max_message_bytes"),
+            ("run_timeout_secs = 0", "subagents.run_timeout_secs"),
+            ("max_depth = -1", "max_depth"),
+            ("max_message_bytes = 1.5", "max_message_bytes"),
+            (
+                "run_timeout_secs = 9223372036854775807",
+                "subagents.run_timeout_secs",
+            ),
+        ] {
+            let text = format!("{}\n[subagents]\n{fields}\n", config("openai", "model", ""));
+            let error = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+                .expect_err("invalid subagent configuration is rejected");
+            assert!(
+                format!("{error:#}").contains(message),
+                "{fields}: {error:#}"
+            );
+        }
     }
 
     #[test]
