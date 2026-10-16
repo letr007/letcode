@@ -87,6 +87,12 @@ impl ModelTransport for TurnLocalResponsesTransport {
             *self.session.lock().await = None;
         }
         let mut session_guard = self.session.lock().await;
+        if session_guard
+            .as_ref()
+            .is_some_and(|session| session.is_closed())
+        {
+            *session_guard = None;
+        }
         if session_guard.is_none() {
             // Incremental continuation relies on state cached by this connection.
             self.reset_chain().await;
@@ -2206,10 +2212,13 @@ tools = true
 
     #[tokio::test]
     async fn websocket_reconnect_starts_full_context_then_resumes_incremental_input() {
-        for drop_partial in [false, true] {
+        for (drop_partial, close_idle) in [(false, false), (true, false), (false, true)] {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
                 let route = route_for_local_server(listener.local_addr().unwrap());
+                let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+                let (pong_tx, pong_rx) = tokio::sync::oneshot::channel();
+                let (close_tx, close_rx) = tokio::sync::oneshot::channel();
                 let server = async {
                     let (stream, _) = listener.accept().await.unwrap();
                     let mut socket = accept_async(stream).await.unwrap();
@@ -2220,21 +2229,30 @@ tools = true
                         ))
                         .await
                         .unwrap();
-                    let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
-                        panic!("expected incremental request");
-                    };
-                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    assert_eq!(value["previous_response_id"], "resp-old");
-                    assert_eq!(value["input"].as_array().unwrap().len(), 1);
-                    if drop_partial {
-                        socket
-                            .send(Message::Text(
-                                r#"{"type":"response.output_text.delta","delta":"partial"}"#.into(),
-                            ))
-                            .await
-                            .unwrap();
-                    } else {
+                    if close_idle {
+                        idle_rx.await.unwrap();
+                        socket.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
+                        assert_eq!(socket.next().await.unwrap().unwrap(), Message::Pong(vec![1, 2, 3].into()));
+                        pong_tx.send(()).unwrap();
+                        close_rx.await.unwrap();
                         socket.send(Message::Close(None)).await.unwrap();
+                    } else {
+                        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                            panic!("expected incremental request");
+                        };
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(value["previous_response_id"], "resp-old");
+                        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+                        if drop_partial {
+                            socket
+                                .send(Message::Text(
+                                    r#"{"type":"response.output_text.delta","delta":"partial"}"#.into(),
+                                ))
+                                .await
+                                .unwrap();
+                        } else {
+                            socket.send(Message::Close(None)).await.unwrap();
+                        }
                     }
                     let (stream, _) = listener.accept().await.unwrap();
                     let mut reconnected = accept_async(stream).await.unwrap();
@@ -2258,16 +2276,28 @@ tools = true
                     let transport = TurnLocalResponsesTransport::new();
                     drain_response(transport.send_prepared(&route, request.clone()).await.unwrap()).await;
                     transport.set_next_prompt_unit_start(1).await;
-                    let mut interrupted = transport.send_prepared(&route, request.clone()).await.unwrap();
-                    let chunk = interrupted.next_chunk().await.unwrap();
-                    if drop_partial {
-                        assert!(chunk.is_ok());
+                    if close_idle {
+                        idle_tx.send(()).unwrap();
+                        pong_rx.await.unwrap();
+                        close_tx.send(()).unwrap();
+                        loop {
+                            if transport.session.lock().await.as_ref().unwrap().is_closed() {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
                     } else {
-                        let error = chunk.unwrap_err();
-                        assert_eq!(error.code.as_deref(), Some("websocket_closed_before_terminal"));
-                        assert_eq!(error.retry_hint, RetryHint::Retryable);
+                        let mut interrupted = transport.send_prepared(&route, request.clone()).await.unwrap();
+                        let chunk = interrupted.next_chunk().await.unwrap();
+                        if drop_partial {
+                            assert!(chunk.is_ok());
+                        } else {
+                            let error = chunk.unwrap_err();
+                            assert_eq!(error.code.as_deref(), Some("websocket_closed_before_terminal"));
+                            assert_eq!(error.retry_hint, RetryHint::Retryable);
+                        }
+                        drop(interrupted);
                     }
-                    drop(interrupted);
                     drain_response(transport.send_prepared(&route, request.clone()).await.unwrap()).await;
                     transport.set_next_prompt_unit_start(1).await;
                     drain_response(transport.send_prepared(&route, request).await.unwrap()).await;

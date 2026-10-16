@@ -3,17 +3,28 @@ use futures_util::{SinkExt, StreamExt};
 use std::error::Error as StdError;
 use std::io::ErrorKind;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{WebSocketStream, tungstenite::handshake::derive_accept_key};
 
 type Socket = WebSocketStream<reqwest::Upgraded>;
 
-/// A turn-local, single-lane WebSocket session. Callers own the session and
-/// must await each send before reading or sending the next frame.
 pub(crate) struct TurnLocalWsSession {
-    socket: Socket,
-    last_sent_text_bytes: Option<usize>,
+    outgoing: mpsc::Sender<WsSend>,
+    incoming: mpsc::Receiver<Result<Vec<u8>, ModelFailure>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct WsSend {
+    text: String,
+    completed: oneshot::Sender<Result<(), ModelFailure>>,
+}
+
+impl Drop for TurnLocalWsSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl TurnLocalWsSession {
@@ -86,9 +97,14 @@ impl TurnLocalWsSession {
         let socket =
             WebSocketStream::from_raw_socket(upgraded, tungstenite::protocol::Role::Client, None)
                 .await;
+        let (outgoing, requests) = mpsc::channel(1);
+        let (events, incoming) = mpsc::channel(1);
+        let secrets = secrets.iter().map(|secret| (*secret).to_string()).collect();
+        let task = tokio::spawn(drive_socket(socket, requests, events, secrets));
         Ok(Self {
-            socket,
-            last_sent_text_bytes: None,
+            outgoing,
+            incoming,
+            task,
         })
     }
 
@@ -102,67 +118,92 @@ impl TurnLocalWsSession {
                 .with_code("websocket_frame_utf8")
         })?;
         let text_bytes = text.len();
-        self.socket
-            .send(Message::Text(text.into()))
+        let closed = || {
+            ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+                .with_code("websocket_send_failed")
+                .with_retry_hint(RetryHint::Retryable)
+                .with_detail_redacted(
+                    format!("WebSocket connection closed before send; request_bytes={text_bytes}"),
+                    secrets,
+                )
+        };
+        let (completed, result) = oneshot::channel();
+        self.outgoing
+            .send(WsSend { text, completed })
             .await
-            .map_err(|error| {
-                ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
-                    .with_code("websocket_send_failed")
-                    .with_retry_hint(RetryHint::Retryable)
-                    .with_detail_redacted(format!("{error}; request_bytes={text_bytes}"), secrets)
-            })?;
-        self.last_sent_text_bytes = Some(text_bytes);
-        Ok(())
+            .map_err(|_| closed())?;
+        result.await.map_err(|_| closed())?
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.outgoing.is_closed() || self.task.is_finished()
     }
 
     pub(crate) async fn next_text(&mut self, secrets: &[&str]) -> Result<Vec<u8>, ModelFailure> {
-        loop {
-            match self.socket.next().await {
-                Some(Ok(Message::Text(text))) => return Ok(text.as_bytes().to_vec()),
-                Some(Ok(Message::Ping(payload))) => {
-                    self.socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|error| {
-                            ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
-                                .with_code("websocket_pong_failed")
-                                .with_retry_hint(RetryHint::Retryable)
-                                .with_detail_redacted(error.to_string(), secrets)
-                        })?;
+        self.incoming
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(websocket_close_failure(None, None, secrets)))
+    }
+}
+
+async fn drive_socket(
+    mut socket: Socket,
+    mut requests: mpsc::Receiver<WsSend>,
+    events: mpsc::Sender<Result<Vec<u8>, ModelFailure>>,
+    secrets: Vec<String>,
+) {
+    let secrets = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut last_sent_text_bytes = None;
+    let failure = loop {
+        tokio::select! {
+            biased;
+            message = socket.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    if events.send(Ok(text.as_bytes().to_vec())).await.is_err() {
+                        return;
+                    }
                 }
-                Some(Ok(Message::Pong(_))) => {}
+                // Tungstenite flushes queued Pong replies on the next read or write.
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(frame))) => {
-                    return Err(websocket_close_failure(
-                        frame,
-                        self.last_sent_text_bytes,
-                        secrets,
-                    ));
+                    requests.close();
+                    let _ = socket.flush().await;
+                    break websocket_close_failure(frame, last_sent_text_bytes, &secrets);
                 }
-                None => {
-                    return Err(websocket_close_failure(
-                        None,
-                        self.last_sent_text_bytes,
-                        secrets,
-                    ));
-                }
+                None => break websocket_close_failure(None, last_sent_text_bytes, &secrets),
                 Some(Ok(Message::Binary(_))) => {
-                    return Err(ModelFailure::new(
-                        FailurePhase::Decode,
-                        FailureKind::MalformedResponse,
-                    )
-                    .with_code("websocket_binary_frame"));
+                    break ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
+                        .with_code("websocket_binary_frame");
                 }
                 Some(Ok(Message::Frame(_))) => {}
                 Some(Err(error)) => {
-                    return Err(websocket_io_failure(
-                        error,
-                        self.last_sent_text_bytes,
-                        secrets,
-                    ));
+                    break websocket_io_failure(error, last_sent_text_bytes, &secrets);
                 }
+            },
+            request = requests.recv() => {
+                let Some(WsSend { text, completed }) = request else {
+                    return;
+                };
+                let text_bytes = text.len();
+                let result = socket.send(Message::Text(text.into())).await.map_err(|error| {
+                    ModelFailure::new(FailurePhase::Transport, FailureKind::Http)
+                        .with_code("websocket_send_failed")
+                        .with_retry_hint(RetryHint::Retryable)
+                        .with_detail_redacted(format!("{error}; request_bytes={text_bytes}"), &secrets)
+                });
+                let failure = result.as_ref().err().cloned();
+                let _ = completed.send(result);
+                if let Some(failure) = failure {
+                    break failure;
+                }
+                last_sent_text_bytes = Some(text_bytes);
             }
         }
-    }
+    };
+    drop(requests);
+    drop(socket);
+    let _ = events.send(Err(failure)).await;
 }
 
 const MAX_HANDSHAKE_ERROR_SOURCES: usize = 8;
