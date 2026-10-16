@@ -204,7 +204,6 @@ struct SwarmAuthority {
     next_ordinal: u32,
     mailboxes: std::collections::HashMap<String, messaging::Mailbox>,
     message_host: Option<Arc<MessageHost>>,
-    fenced: bool,
     generation: u64,
 }
 
@@ -419,7 +418,7 @@ impl Drop for ActiveRunGuard {
         if self.terminal {
             return;
         }
-        self.runtime.fence_swarm(Some(&self.run_id));
+        self.runtime.stop_swarm_members(Some(&self.run_id));
         let context = &self.terminal_context;
         let mut summary = build_runtime_summary(
             &self.run_id,
@@ -537,32 +536,6 @@ impl SubagentPool {
         Ok(snapshot)
     }
 
-    pub(crate) fn swarm_can_delegate(
-        &self,
-        sessions_dir: &Path,
-        records: &[crate::transcript::TranscriptRecord],
-    ) -> Result<bool> {
-        let snapshot = self.swarm_snapshot(sessions_dir, records)?;
-        let caller = records
-            .first()
-            .ok_or_else(|| anyhow!("missing swarm session records"))?;
-        let depth = snapshot
-            .members
-            .get(&caller.session_id)
-            .map_or(0, |member| member.depth);
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
-        let authority = &state.swarms[&snapshot.root.session_id];
-        Ok(!authority.fenced
-            && !authority
-                .mailboxes
-                .get(&caller.session_id)
-                .is_some_and(|mailbox| mailbox.stopped)
-            && (depth as usize) < snapshot.policy.max_depth)
-    }
-
     fn activate_run(
         &self,
         reservation: RunReservation,
@@ -656,7 +629,7 @@ impl SubagentPool {
     }
 
     pub fn cancel_active_run_ids(&self) -> Vec<String> {
-        self.fence_swarm(None);
+        self.stop_swarm_members(None);
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
@@ -720,7 +693,7 @@ impl SubagentPool {
                 .map(|slot| slot.swarm_root.is_some())
         });
         if swarm == Some(true) {
-            self.fence_swarm(Some(run_id));
+            self.stop_swarm_members(Some(run_id));
             return true;
         }
         let Ok(mut state) = self.state.lock() else {
@@ -898,7 +871,6 @@ impl SubagentPool {
                 anyhow::ensure!(policy == admission.policy, "conflicting swarm root policy");
             }
             authority.policy = Some(admission.policy.clone());
-            anyhow::ensure!(!authority.fenced, "swarm root is stopping");
             anyhow::ensure!(
                 !authority
                     .mailboxes
@@ -2754,7 +2726,6 @@ mod swarm_tests {
             .unwrap_err();
         assert!(error.is::<SubagentCapacityExceeded>(), "{error}");
         assert!(!runtime.member_message_pending(&root, &target).unwrap());
-        assert!(runtime.swarm_can_delegate(dir.path(), &records).unwrap());
         let active = busy.receipt.child_session_id.clone();
         assert_eq!(
             runtime
@@ -2819,6 +2790,7 @@ mod swarm_tests {
             run_timeout_secs: 10,
             ..Default::default()
         });
+        let root_tools = parent.tool_definitions_for_test();
         for seconds in [0, u64::MAX] {
             let mut invalid = invocation(serde_json::json!({"objective":"inspect"}));
             invalid.input.timeout_secs = Some(seconds);
@@ -3141,6 +3113,7 @@ mod swarm_tests {
         )
         .unwrap();
         let stopped_target = stopped.receipt().child_session_id.clone();
+        let stopped_tools = stopped.run.child_agent.tool_definitions_for_test();
         runtime
             .enqueue_member_message(
                 dir.path(),
@@ -3163,6 +3136,10 @@ mod swarm_tests {
             )
             .unwrap();
         assert!(runtime.cancel_run(stopped.run_id()));
+        assert_eq!(
+            stopped.run.child_agent.tool_definitions_for_test(),
+            stopped_tools
+        );
         assert!(
             runtime
                 .resume_swarm(dir.path(), &root_records)
@@ -3211,13 +3188,16 @@ mod swarm_tests {
             .unwrap();
         assert!(runtime.wait_until_idle().await);
         runtime.cancel_active();
-        parent.prepare_subagent_runtime().unwrap();
-        assert!(runtime.member_scope_stopped(&root_id));
-        assert!(
-            runtime
-                .enqueue_member_message(dir.path(), &root_records, &root_id, "late root")
-                .is_err()
-        );
+        assert_eq!(parent.tool_definitions_for_test(), root_tools);
+        let fresh = start(
+            &runtime,
+            &parent,
+            dir.path(),
+            &recorder,
+            serde_json::json!({"objective":"inspect"}),
+        )
+        .unwrap();
+        drop(fresh);
 
         let (dir, runtime, parent, recorder) = fixture(crate::config::SubagentsConfig::default());
         let expert = start(

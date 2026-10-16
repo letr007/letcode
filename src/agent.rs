@@ -556,10 +556,6 @@ pub trait SubagentDelegate: Send + Sync {
         bail!("recursive delegation is unavailable in this subagent runtime")
     }
 
-    fn can_delegate(&self) -> bool {
-        true
-    }
-
     fn take_completed(&self) -> Result<Vec<crate::subagent::SubagentRunSummary>> {
         Ok(Vec::new())
     }
@@ -4467,13 +4463,7 @@ fn is_executable_tool(agent: &Agent, tool_name: &str) -> bool {
                 || agent.subagents_policy().mode == crate::config::SubagentMode::Swarm);
     }
     match subagent_catalog_entry_by_tool_name(tool_name) {
-        Some(_) => {
-            agent
-                .subagent_delegate
-                .as_ref()
-                .is_some_and(|delegate| delegate.can_delegate())
-                && tool_scope_allows(agent, tool_name)
-        }
+        Some(_) => agent.subagent_delegate.is_some() && tool_scope_allows(agent, tool_name),
         None => agent.tools.contains(tool_name),
     }
 }

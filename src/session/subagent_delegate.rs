@@ -486,20 +486,6 @@ impl SubagentDelegate for RunnerSubagentDelegate {
         Ok(Arc::new(delegate))
     }
 
-    fn can_delegate(&self) -> bool {
-        self.parent_records()
-            .and_then(|records| {
-                if crate::transcript::restore_subagents_policy(&records)?.mode
-                    != crate::config::SubagentMode::Swarm
-                {
-                    return Ok(true);
-                }
-                self.runtime
-                    .swarm_can_delegate(&self.sessions_dir, &records)
-            })
-            .unwrap_or(false)
-    }
-
     fn take_completed(&self) -> Result<Vec<crate::subagent::SubagentRunSummary>> {
         let Some(queue) = &self.child_completions else {
             return Ok(Vec::new());

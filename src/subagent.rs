@@ -379,6 +379,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 timeout(Duration::from_secs(5), async move {
+                    let mut expected_tools = None;
                     for request_index in 0..if background { 4 } else { 3 } {
                         let (mut socket, _) = listener.accept().await.unwrap();
                         let mut request = Vec::new();
@@ -401,12 +402,14 @@ mod tests {
                         assert!(!body.to_string().contains("不要递归委派"));
                         assert!(!body.to_string().contains("不要继续委派"));
                         let tools = body["tools"].as_array().unwrap();
-                        let can_delegate = tools.iter().any(|tool| tool["name"] == "agent__explore");
-                        if !background {
-                            assert_eq!(can_delegate, request_index != 1);
-                        }
+                        assert!(tools.iter().any(|tool| tool["name"] == "agent__explore"));
                         assert!(!tools.iter().any(|tool| tool["name"] == "agent__fixer"));
                         assert!(tools.iter().any(|tool| tool["name"] == "agent__jobs"));
+                        assert_eq!(expected_tools.get_or_insert_with(|| tools.clone()), tools);
+                        let background_run_id = body["input"].as_array().unwrap().iter().filter_map(|item| {
+                            let output: serde_json::Value = serde_json::from_str(item["output"].as_str()?).ok()?;
+                            output["data"]["run_id"].as_str().map(str::to_owned)
+                        }).next().filter(|_| background && !body["input"].as_array().unwrap().iter().any(|item| item["name"] == "agent__wait"));
                         let events = if request_index == 0 {
                             let args = json!({"objective":"nested readonly task", "background":background}).to_string();
                             vec![
@@ -414,11 +417,7 @@ mod tests {
                                 json!({"type":"response.function_call_arguments.done","item_id":"item-1","arguments":args}),
                                 json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"agent__explore","arguments":args}}),
                             ]
-                        } else if background && can_delegate && !body["input"].as_array().unwrap().iter().any(|item| item["name"] == "agent__wait") {
-                            let run_id = body["input"].as_array().unwrap().iter().filter_map(|item| {
-                                let output: serde_json::Value = serde_json::from_str(item["output"].as_str()?).ok()?;
-                                output["data"]["run_id"].as_str().map(str::to_owned)
-                            }).next().unwrap();
+                        } else if let Some(run_id) = background_run_id {
                             let args = json!({"run_id":run_id}).to_string();
                             vec![
                                 json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item-wait","call_id":"call-wait","name":"agent__wait"}}),

@@ -71,7 +71,6 @@ impl SubagentPool {
             .ok_or_else(|| anyhow!("swarm generation exhausted"))?;
         authority.mailboxes.clear();
         authority.message_host = None;
-        authority.fenced = false;
         Ok(())
     }
 
@@ -93,9 +92,7 @@ impl SubagentPool {
             .swarms
             .get_mut(&snapshot.root.session_id)
             .expect("restored authority");
-        if !authority.fenced {
-            authority.message_host = Some(Arc::new(host));
-        }
+        authority.message_host = Some(Arc::new(host));
         Ok(())
     }
 
@@ -153,7 +150,6 @@ impl SubagentPool {
             let active = active.is_some();
             let occupied = state.swarm_occupancy(&root);
             let authority = state.swarms.get_mut(&root).expect("restored authority");
-            anyhow::ensure!(!authority.fenced, "swarm root is stopping");
             anyhow::ensure!(
                 !authority
                     .mailboxes
@@ -410,7 +406,6 @@ impl SubagentPool {
         Ok(state
             .swarms
             .get(root)
-            .filter(|authority| !authority.fenced)
             .and_then(|authority| authority.mailboxes.get(target))
             .is_some_and(|mailbox| !mailbox.stopped && !mailbox.pending.is_empty()))
     }
@@ -420,11 +415,7 @@ impl SubagentPool {
             .state
             .lock()
             .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
-        let Some(authority) = state
-            .swarms
-            .get_mut(root)
-            .filter(|authority| !authority.fenced)
-        else {
+        let Some(authority) = state.swarms.get_mut(root) else {
             return Ok(None);
         };
         let Some(mailbox) = authority
@@ -440,18 +431,26 @@ impl SubagentPool {
 
     pub(crate) fn member_scope_stopped(&self, session_id: &str) -> bool {
         self.state.lock().is_ok_and(|state| {
-            state.swarms.iter().any(|(root, authority)| {
-                (root == session_id || authority.members.contains_key(session_id))
-                    && (authority.fenced
-                        || authority
-                            .mailboxes
-                            .get(session_id)
-                            .is_some_and(|mailbox| mailbox.stopped))
+            state.swarms.values().any(|authority| {
+                authority
+                    .mailboxes
+                    .get(session_id)
+                    .is_some_and(|mailbox| mailbox.stopped)
             })
         })
     }
 
-    pub(super) fn fence_swarm(&self, run_id: Option<&str>) {
+    pub(crate) fn close_swarm_sessions(&self) {
+        self.cancel_active();
+        if let Ok(mut state) = self.state.lock() {
+            for (root, authority) in &mut state.swarms {
+                authority.mailboxes.entry(root.clone()).or_default().stopped = true;
+                authority.message_host = None;
+            }
+        }
+    }
+
+    pub(super) fn stop_swarm_members(&self, run_id: Option<&str>) {
         let targets = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -472,18 +471,15 @@ impl SubagentPool {
                 {
                     continue;
                 }
-                if run_id.is_none() {
-                    authority.fenced = true;
-                    targets.push((root.clone(), root.clone()));
-                }
                 let mut pending = scope
                     .as_ref()
                     .map_or_else(|| vec![root.clone()], |(_, session)| vec![session.clone()]);
                 while let Some(target) = pending.pop() {
                     let mailbox = authority.mailboxes.entry(target.clone()).or_default();
-                    mailbox.stopped = true;
                     if &target == root {
                         mailbox.waking = false;
+                    } else {
+                        mailbox.stopped = true;
                     }
                     mailbox.execution_sender = None;
                     targets.push((root.clone(), target.clone()));
@@ -516,14 +512,7 @@ impl SubagentPool {
             targets
         };
         for (root, target) in &targets {
-            self.fail_member_messages(root, target, "scope stopped", true);
-        }
-        if run_id.is_none()
-            && let Ok(mut state) = self.state.lock()
-        {
-            for authority in state.swarms.values_mut() {
-                authority.message_host = None;
-            }
+            self.fail_member_messages(root, target, "scope stopped", target != root);
         }
     }
 
@@ -632,7 +621,7 @@ impl SubagentPool {
                 return;
             };
             mailbox.wake_cancelled = false;
-            mailbox.waking = !authority.fenced && !mailbox.stopped && !mailbox.pending.is_empty();
+            mailbox.waking = !mailbox.stopped && !mailbox.pending.is_empty();
             if mailbox.waking {
                 authority.message_host.clone()
             } else {

@@ -1931,7 +1931,7 @@ async fn run_engine_loop(
                         }
                         if current_session_id.as_deref() == Some(session_id.as_str())
                             && agent.subagents_policy().mode == crate::config::SubagentMode::Swarm {
-                            subagent_runtime.cancel_active_run_ids();
+                            subagent_runtime.close_swarm_sessions();
                             if !subagent_runtime.wait_until_idle().await {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new("failed to settle swarm before reloading the current session")));
                                 continue;
@@ -1964,7 +1964,7 @@ async fn run_engine_loop(
                                 Ok(())
                             })();
                             if let Err(error) = restored {
-                                subagent_runtime.cancel_active_run_ids();
+                                subagent_runtime.close_swarm_sessions();
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to reload current swarm session: {error}"))));
                             }
                             continue;
@@ -2024,7 +2024,7 @@ async fn run_engine_loop(
                             .latest_permission_mode
                             .is_some();
                         let token_usage = {
-                            subagent_runtime.cancel_active_run_ids();
+                            subagent_runtime.close_swarm_sessions();
                             if !subagent_runtime.wait_until_idle().await {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     ErrorEvent::new("failed to cancel active subagents before resuming session"),
@@ -2045,7 +2045,7 @@ async fn run_engine_loop(
                                     provider_api_key_hints.lock().unwrap_or_else(|error| error.into_inner()).clone(),
                                     config.api_key_hint.clone(), Some(control_tx.clone()), Some(session_transport_tx.clone()));
                             if let Err(error) = runner.prepare_subagent_runtime(&mut agent) {
-                                subagent_runtime.cancel_active_run_ids();
+                                subagent_runtime.close_swarm_sessions();
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to prepare resumed swarm: {error}"))));
                                 continue;
                             }
@@ -2171,7 +2171,7 @@ async fn run_engine_loop(
                                 .map(|(name, route)| (name.clone(), route.display_name()))
                                 .collect(),
                         };
-                        subagent_runtime.cancel_active_run_ids();
+                        subagent_runtime.close_swarm_sessions();
                         if !subagent_runtime.wait_until_idle().await {
                             let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                 ErrorEvent::new("failed to cancel active subagents before starting new session"),
@@ -2282,7 +2282,6 @@ async fn run_engine_loop(
                         Some(session_transport_tx.clone()),
                     );
                 let historian_control = agent.historian_runtime.clone();
-                let swarm_mode = agent.subagents_policy().mode == crate::config::SubagentMode::Swarm;
                 let (interrupted, shutdown, interrupt_failure, turn_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
@@ -2338,8 +2337,8 @@ async fn run_engine_loop(
                                     }
                                 };
                                 interrupted = Some(interrupt);
-                                if is_shutdown || swarm_mode { subagent_runtime.cancel_active(); }
-                                if (is_shutdown || swarm_mode) && subagent_runtime.is_running() {
+                                if is_shutdown { subagent_runtime.cancel_active(); }
+                                if is_shutdown && subagent_runtime.is_running() {
                                     let settlement = wait_for_subagent_cancel_settle(
                                         &mut control_rx,
                                         &mut deferred_commands,
@@ -2755,7 +2754,7 @@ async fn run_engine_loop(
         }
     }
     if agent.subagents_policy().mode == crate::config::SubagentMode::Swarm {
-        subagent_runtime.cancel_active();
+        subagent_runtime.close_swarm_sessions();
         if !subagent_runtime.wait_until_idle().await {
             let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
                 "subagent runs remain active after shutdown cancellation",
@@ -2822,6 +2821,9 @@ pub(crate) fn observe_background_subagent_completion(
         {
             emit_child_terminal(session_transport_tx, &summary.child_session_id);
         }
+        return false;
+    }
+    if subagent_runtime.member_scope_stopped(&summary.child_session_id) {
         return false;
     }
     if background_deliveries
